@@ -29,8 +29,18 @@ from wmh.harness.pi_runner_backend import (
 )
 from wmh.harness.runner_link import params_schema
 from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.failure_attribution import (
+    ProviderFailureAttribution,
+    ProviderFailureOwner,
+    ProviderFailureReason,
+    ProviderFailureStage,
+)
 from wmh.providers.models import resolve_provider_model
-from wmh.providers.process_worker import ProviderProcessWorker, ProviderWorkerUnavailable
+from wmh.providers.process_worker import (
+    ProviderProcessWorker,
+    ProviderWorkerFailure,
+    ProviderWorkerUnavailable,
+)
 from wmh.providers.receipt import (
     ProviderResponseIdentity,
     freeze_provider_response_identity,
@@ -62,6 +72,10 @@ _PREFLIGHT_INSTRUCTION = (
 )
 _MAX_RESULT_BYTES = 256 * 1024
 _RESULT_NAME = "provider-route-preflight-result.json"
+
+
+class _ProviderRouteRequestContractError(RuntimeError):
+    """The production Pi request differed from the exact normalized dispatch contract."""
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -300,25 +314,39 @@ def _wire_tool_schemas(agent: HarnessDoc) -> tuple[JsonObject, ...]:
     if agent.execution_hash != _DEFAULT_AGENT_EXECUTION_HASH:
         raise RuntimeError("default Pi baseline execution hash changed")
     _, tools, _, _ = assemble_pi_harness(agent)
-    schemas = tuple(
-        cast(
-            "JsonObject",
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": params_schema(tool),
-            },
+    schemas: list[JsonObject] = []
+    for tool in tools:
+        parameters = params_schema(tool)
+        if tool.name == "submit":
+            # runner_live owns submit termination and intentionally narrows the host ToolSpec to
+            # the model-visible answer value. Keep this exact with Session.buildTools rather than
+            # accepting the host-only argument description as an equivalent wire schema.
+            parameters = {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            }
+        schemas.append(
+            cast(
+                "JsonObject",
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": parameters,
+                    # Pi's OpenAI-compatible transport explicitly serializes this default.
+                    "strict": False,
+                },
+            )
         )
-        for tool in tools
-    )
-    if tuple(schema["name"] for schema in schemas) != (
+    frozen_schemas = tuple(schemas)
+    if tuple(schema["name"] for schema in frozen_schemas) != (
         "bash",
         "read_file",
         "write_file",
         "submit",
     ):
         raise RuntimeError("default Pi baseline tool schemas changed")
-    return schemas
+    return frozen_schemas
 
 
 def _validated_request_contract(
@@ -327,7 +355,13 @@ def _validated_request_contract(
     system_prompt: str,
     wire_tools: tuple[JsonObject, ...],
 ) -> tuple[JsonObject, tuple[JsonObject, ...]]:
-    """Bind the exact prompt-free request structure observed before paid dispatch."""
+    """Bind the exact normalized request consumed by the provider worker.
+
+    LiveSession applies its trusted allowlist and constructs this provider-neutral ChatRequest once;
+    the same object is passed to ``worker.complete_chat``. Raw runner encodings that normalize to an
+    identical request are intentionally outside this contract and remain separately bound by the
+    pinned runner source and attestation.
+    """
     expected_fields = {
         "messages",
         "tools",
@@ -336,7 +370,10 @@ def _validated_request_contract(
     }
     expected_messages = (
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": _PREFLIGHT_INSTRUCTION},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": _PREFLIGHT_INSTRUCTION}],
+        },
     )
     observed_messages = tuple(
         message.model_dump(mode="json", exclude_none=True) for message in request.messages
@@ -362,7 +399,9 @@ def _validated_request_contract(
         or request.stream is not False
         or request.stream_options is not None
     ):
-        raise RuntimeError("provider route preflight observed a drifted Pi request")
+        raise _ProviderRouteRequestContractError(
+            "provider route preflight observed a drifted Pi request"
+        )
     observed_schemas = tuple(
         cast("JsonObject", observed_tool["function"])
         for observed_tool in observed_tools
@@ -372,6 +411,7 @@ def _validated_request_contract(
         {
             "field_set": sorted(expected_fields),
             "message_roles": ["system", "user"],
+            "message_content_formats": ["string", "text_parts"],
             "message_content_digests": [
                 _canonical_digest(system_prompt),
                 _canonical_digest(_PREFLIGHT_INSTRUCTION),
@@ -485,11 +525,20 @@ def _run_provider_route_preflight(
             raise ProviderWorkerUnavailable(
                 "provider route preflight forbids a second provider dispatch"
             )
-        request_contract, request_tools = _validated_request_contract(
-            request,
-            system_prompt=system_prompt,
-            wire_tools=wire_tools,
-        )
+        try:
+            request_contract, request_tools = _validated_request_contract(
+                request,
+                system_prompt=system_prompt,
+                wire_tools=wire_tools,
+            )
+        except _ProviderRouteRequestContractError:
+            raise ProviderWorkerFailure(
+                ProviderFailureAttribution(
+                    ProviderFailureOwner.INFRASTRUCTURE,
+                    ProviderFailureReason.CONFIGURATION,
+                    ProviderFailureStage.REQUEST_TRANSLATION,
+                )
+            ) from None
         provider_calls = 1
         observed_request_contract = request_contract
         observed_wire_tools = request_tools

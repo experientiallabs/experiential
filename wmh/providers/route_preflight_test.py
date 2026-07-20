@@ -24,8 +24,13 @@ from wmh.harness.pi_runner_backend import (
     ManagedRunnerChannel,
     e2b_runner_resource_class,
 )
-from wmh.harness.runner_link import TokenUsage
+from wmh.harness.runner_link import TokenUsage, params_schema
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmh.providers.failure_attribution import (
+    ProviderFailureOwner,
+    ProviderFailureReason,
+    ProviderFailureStage,
+)
 from wmh.providers.receipt import (
     ProviderResponseIdentity,
     build_chat_provider_receipt,
@@ -388,6 +393,40 @@ def _runner_builder(
     return runner
 
 
+def _production_pi_request_body(agent: HarnessDoc, instruction: str) -> JsonObject:
+    """Mirror runner_live plus Pi's OpenAI-compatible request serialization."""
+    system_prompt, tools, _, _ = assemble_pi_harness(agent)
+    wire_functions: list[JsonObject] = []
+    for tool in tools:
+        parameters = params_schema(tool)
+        if tool.name == "submit":
+            parameters = {
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+            }
+        wire_functions.append(
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": parameters,
+                "strict": False,
+            }
+        )
+    return {
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": instruction}],
+            },
+        ],
+        "temperature": 0.7,
+        "max_completion_tokens": 4096,
+        "tools": [{"type": "function", "function": function} for function in wire_functions],
+    }
+
+
 def _install_run_turn(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -412,23 +451,11 @@ def _install_run_turn(
         )
         with runner_factory() as channel:
             assert channel is not None
-            schemas = mod._wire_tool_schemas(agent)
-            system_prompt, _, _, _ = assemble_pi_harness(agent)
             request = ChatRequest.model_validate(
-                {
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": instruction + (" drift" if drift_request else ""),
-                        },
-                    ],
-                    "temperature": 0.7,
-                    "max_completion_tokens": 4096,
-                    "tools": [
-                        {"type": "function", "function": schema} for schema in schemas
-                    ],
-                }
+                _production_pi_request_body(
+                    agent,
+                    instruction + (" drift" if drift_request else ""),
+                )
             )
             response = worker_fn(request, TurnDeadline.after(provider_call_timeout_s))
             response_validator(response)
@@ -442,6 +469,62 @@ def _install_run_turn(
         )
 
     monkeypatch.setattr(mod, "run_pi_turn", run)
+
+
+def test_production_pi_wire_fixture_matches_exact_normalized_route_contract() -> None:
+    agent = mod.default_agent("provider-route-preflight")
+    system_prompt, _, _, _ = assemble_pi_harness(agent)
+    request = ChatRequest.model_validate(
+        _production_pi_request_body(agent, mod._PREFLIGHT_INSTRUCTION)
+    )
+
+    contract, observed_schemas = mod._validated_request_contract(
+        request,
+        system_prompt=system_prompt,
+        wire_tools=mod._wire_tool_schemas(agent),
+    )
+
+    assert contract["message_content_formats"] == ["string", "text_parts"]
+    assert all(schema["strict"] is False for schema in observed_schemas)
+    submit = cast("JsonObject", observed_schemas[-1])
+    parameters = cast("JsonObject", submit["parameters"])
+    properties = cast("JsonObject", parameters["properties"])
+    answer = cast("JsonObject", properties["answer"])
+    assert answer == {"type": "string"}
+
+
+@pytest.mark.parametrize(
+    "drift",
+    ["string_user_content", "missing_function_strict", "host_submit_description"],
+)
+def test_near_miss_pi_wire_contract_is_rejected(drift: str) -> None:
+    agent = mod.default_agent("provider-route-preflight")
+    system_prompt, _, _, _ = assemble_pi_harness(agent)
+    body = _production_pi_request_body(agent, mod._PREFLIGHT_INSTRUCTION)
+    if drift == "string_user_content":
+        messages = cast("list[JsonObject]", body["messages"])
+        messages[1]["content"] = mod._PREFLIGHT_INSTRUCTION
+    else:
+        tools = cast("list[JsonObject]", body["tools"])
+        function = cast("JsonObject", tools[-1]["function"])
+        if drift == "missing_function_strict":
+            function.pop("strict")
+        else:
+            parameters = cast("JsonObject", function["parameters"])
+            properties = cast("JsonObject", parameters["properties"])
+            answer = cast("JsonObject", properties["answer"])
+            answer["description"] = "your final answer or a summary of what you did"
+    request = ChatRequest.model_validate(body)
+
+    with pytest.raises(
+        mod._ProviderRouteRequestContractError,
+        match="drifted Pi request",
+    ):
+        mod._validated_request_contract(
+            request,
+            system_prompt=system_prompt,
+            wire_tools=mod._wire_tool_schemas(agent),
+        )
 
 
 @pytest.mark.parametrize("provider", [ProviderKind.BEDROCK, ProviderKind.AZURE_OPENAI])
@@ -519,7 +602,7 @@ def test_drifted_pi_request_is_rejected_before_provider_dispatch(
         return worker
 
     _install_run_turn(monkeypatch, drift_request=True)
-    with pytest.raises(RuntimeError, match="drifted Pi request"):
+    with pytest.raises(mod.ProviderWorkerFailure) as caught:
         mod._run_provider_route_preflight(
             spec,
             create_rate_authority=rate_authority,
@@ -528,6 +611,9 @@ def test_drifted_pi_request_is_rejected_before_provider_dispatch(
             require_production_runner=False,
         )
 
+    assert caught.value.attribution.owner is ProviderFailureOwner.INFRASTRUCTURE
+    assert caught.value.attribution.reason is ProviderFailureReason.CONFIGURATION
+    assert caught.value.attribution.stage is ProviderFailureStage.REQUEST_TRANSLATION
     assert workers[0].dispatch.calls == 0
 
 
