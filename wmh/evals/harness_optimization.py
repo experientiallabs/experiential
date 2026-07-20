@@ -42,7 +42,11 @@ from wmh.evals.partition import (
     freeze_confirmation_candidate,
     open_confirmation_once,
 )
-from wmh.evals.study_journal import StudyPhase, StudyRunCheckpointIdentity
+from wmh.evals.study_journal import (
+    MAX_STUDY_RUN_CHECKPOINT_SEQUENCE,
+    StudyPhase,
+    StudyRunCheckpointIdentity,
+)
 from wmh.evals.study_lifecycle import (
     CandidatePublishedPayload,
     ConfirmationOpenedPayload,
@@ -54,10 +58,13 @@ from wmh.harness.create import (
     CreateProgress,
     ProposalRecord,
     SearchCheckpoint,
+    SearchConfiguration,
     SearchProposalBatchWitness,
     SearchResult,
+    freeze_search_configuration,
     search_harness,
     search_result_from_completed_checkpoint,
+    validate_consumed_search_proposal_batch_witness,
 )
 from wmh.harness.delta import HarnessDelta
 from wmh.harness.doc import HarnessDoc, SurfaceKind
@@ -95,7 +102,7 @@ class DiscoverySearchPlan(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     candidate_name: str = Field(default="optimized", min_length=1, max_length=256)
-    iterations: StrictInt = Field(ge=0)
+    iterations: StrictInt = Field(ge=0, le=MAX_STUDY_RUN_CHECKPOINT_SEQUENCE)
     proposal_batch_size: StrictInt = Field(default=1, ge=1)
     attempts_per_task: StrictInt = Field(ge=1)
     scorer_configuration_id: str = Field(min_length=1, max_length=1_024)
@@ -537,7 +544,7 @@ def run_harness_optimization_search(
     on_proposal_batch_witness: Callable[[SearchProposalBatchWitness], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> SearchResult:
-    """Run the predeclared discovery search without any held-out scorer or adaptive matrix."""
+    """Run discovery as sequential crash-fenced slices until its terminal checkpoint."""
     study = HarnessOptimizationDiscoveryContract.model_validate(discovery.model_dump(mode="json"))
     if (
         authorization.protocol_digest != study.protocol.digest
@@ -546,28 +553,43 @@ def run_harness_optimization_search(
     ):
         raise ValueError("discovery authorization differs from the optimization protocol")
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
-    plan = study.protocol.search
-    lifecycle.claim_run(
-        StudyPhase.DISCOVERY_RUNNING,
-        authorization.search_run_id,
-        payload_digest=authorization.digest,
-        resume=resume_from is not None,
+    current = (
+        SearchCheckpoint.model_validate(resume_from.model_dump(mode="json"))
+        if resume_from is not None
+        else None
     )
-    return lifecycle.call_in_phase(
+    recovered_witness = (
+        SearchProposalBatchWitness.model_validate(
+            resume_proposal_batch_witness.model_dump(mode="json")
+        )
+        if resume_proposal_batch_witness is not None
+        else None
+    )
+    lifecycle.call_in_phase(
         StudyPhase.DISCOVERY_RUNNING,
-        lambda: search_harness(
-            plan.candidate_name,
-            study.baseline.model_copy(deep=True),
-            scorer,
-            proposer,
-            search_run_id=authorization.search_run_id,
-            iterations=plan.iterations,
-            proposal_batch_size=plan.proposal_batch_size,
-            screen_proposals=plan.screen_proposals,
-            holdout_scorer=None,
-            confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
-            resume_from=resume_from,
-            resume_proposal_batch_witness=resume_proposal_batch_witness,
+        lambda: None,
+        payload_digest=authorization.digest,
+    )
+    needs_proposal_slice = (
+        study.protocol.search.iterations > 0
+        if current is None
+        else current.completed_iteration < study.protocol.search.iterations
+    )
+    if needs_proposal_slice and (
+        on_proposal_batch_prepare is None or on_proposal_batch_witness is None
+    ):
+        raise ValueError(
+            "paid discovery searches require durable proposal prepare and witness callbacks"
+        )
+    while True:
+        sliced = run_harness_optimization_search_slice(
+            discovery,
+            scorer=scorer,
+            proposer=proposer,
+            lifecycle=lifecycle,
+            authorization=authorization,
+            resume_from=current,
+            resume_proposal_batch_witness=recovered_witness,
             on_progress=on_progress,
             on_note=on_note,
             on_proposal=on_proposal,
@@ -576,9 +598,11 @@ def run_harness_optimization_search(
             on_proposal_batch_prepare=on_proposal_batch_prepare,
             on_proposal_batch_witness=on_proposal_batch_witness,
             should_cancel=should_cancel,
-        ),
-        payload_digest=authorization.digest,
-    )
+        )
+        if sliced.result is not None:
+            return sliced.result
+        current = sliced.checkpoint
+        recovered_witness = None
 
 
 def run_harness_optimization_search_slice(
@@ -590,6 +614,10 @@ def run_harness_optimization_search_slice(
     authorization: DiscoveryRunningPayload,
     resume_from: SearchCheckpoint | None = None,
     resume_proposal_batch_witness: SearchProposalBatchWitness | None = None,
+    on_progress: CreateProgress | None = None,
+    on_note: Callable[[str], None] | None = None,
+    on_proposal: Callable[[ProposalRecord], None] | None = None,
+    on_accept: Callable[[HarnessDoc, HarnessDelta, float], None] | None = None,
     on_checkpoint: Callable[[SearchCheckpoint], None],
     on_proposal_batch_prepare: Callable[[SearchProposalBatchWitness], None] | None = None,
     on_proposal_batch_witness: Callable[[SearchProposalBatchWitness], None] | None = None,
@@ -611,6 +639,10 @@ def run_harness_optimization_search_slice(
         resume_from: Latest caller-persisted search checkpoint, or none for the initial slice.
         resume_proposal_batch_witness: Exact prepared or completed transaction recovered after a
             crash around the next proposer call.
+        on_progress: Optional aggregate search progress callback.
+        on_note: Optional informational search note callback.
+        on_proposal: Optional proposal audit callback.
+        on_accept: Optional accepted-candidate callback.
         on_checkpoint: Required durable checkpoint persistence callback.
         on_proposal_batch_prepare: Durable pre-proposer transaction callback, required for paid
             slices.
@@ -635,11 +667,26 @@ def run_harness_optimization_search_slice(
         raise ValueError("discovery authorization differs from the optimization protocol")
     _validate_search_component_bindings(study, scorer=scorer, proposer=proposer)
     plan = study.protocol.search
+    runtime_configuration = freeze_search_configuration(
+        search_run_id=authorization.search_run_id,
+        name=plan.candidate_name,
+        seed_doc=study.baseline,
+        scorer=scorer,
+        proposer=proposer,
+        iterations=plan.iterations,
+        proposal_batch_size=plan.proposal_batch_size,
+        screen_proposals=plan.screen_proposals,
+        holdout_scorer=None,
+        confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
+    )
+    runtime_configuration_digest = _canonical_digest(runtime_configuration.model_dump(mode="json"))
     resumed = (
         SearchCheckpoint.model_validate(resume_from.model_dump(mode="json"))
         if resume_from is not None
         else None
     )
+    if resume_proposal_batch_witness is not None and resumed is None:
+        raise ValueError("resume_proposal_batch_witness requires resume_from")
 
     def _checkpoint_identity(checkpoint: SearchCheckpoint) -> StudyRunCheckpointIdentity:
         return StudyRunCheckpointIdentity(
@@ -654,8 +701,14 @@ def run_harness_optimization_search_slice(
             scorer=scorer,
             proposer=proposer,
             search_run_id=authorization.search_run_id,
+            expected_configuration=runtime_configuration,
         )
         if resumed.completed_iteration == plan.iterations:
+            if resume_proposal_batch_witness is not None:
+                validate_consumed_search_proposal_batch_witness(
+                    resume_proposal_batch_witness,
+                    resumed,
+                )
             return lifecycle.reconcile_slice(
                 StudyPhase.DISCOVERY_RUNNING,
                 authorization.search_run_id,
@@ -664,8 +717,9 @@ def run_harness_optimization_search_slice(
                     result=search_result_from_completed_checkpoint(resumed),
                 ),
                 payload_digest=authorization.digest,
-                configuration_digest=authorization.search_configuration_digest,
+                configuration_digest=runtime_configuration_digest,
                 resume_from=_checkpoint_identity(resumed),
+                checkpoint_identity=_checkpoint_identity,
             )
     if should_cancel is not None and should_cancel():
         raise HarnessSearchCancelled("harness search cancelled before slice admission")
@@ -693,6 +747,7 @@ def run_harness_optimization_search_slice(
             scorer=scorer,
             proposer=proposer,
             search_run_id=authorization.search_run_id,
+            expected_configuration=runtime_configuration,
         )
         on_checkpoint(frozen.model_copy(deep=True))
         committed = frozen
@@ -717,6 +772,10 @@ def run_harness_optimization_search_slice(
                 confirm_narrow_vetoes=plan.confirm_narrow_vetoes,
                 resume_from=resumed,
                 resume_proposal_batch_witness=resume_proposal_batch_witness,
+                on_progress=on_progress,
+                on_note=on_note,
+                on_proposal=on_proposal,
+                on_accept=on_accept,
                 on_checkpoint=_persist_checkpoint,
                 on_proposal_batch_prepare=on_proposal_batch_prepare,
                 on_proposal_batch_witness=on_proposal_batch_witness,
@@ -743,7 +802,7 @@ def run_harness_optimization_search_slice(
         authorization.search_run_id,
         _run,
         payload_digest=authorization.digest,
-        configuration_digest=authorization.search_configuration_digest,
+        configuration_digest=runtime_configuration_digest,
         resume_from=(_checkpoint_identity(resumed) if resumed is not None else None),
         checkpoint_identity=_checkpoint_identity,
     )
@@ -986,10 +1045,13 @@ def _validate_search_slice_checkpoint(
     scorer: HarnessScorer,
     proposer: DeltaProposer,
     search_run_id: str,
+    expected_configuration: SearchConfiguration,
 ) -> None:
     """Bind a resumable checkpoint to the exact frozen plan and runtime components."""
     plan = prepared.protocol.search
     config = checkpoint.configuration
+    if config != expected_configuration:
+        raise ValueError("search slice checkpoint configuration differs from the exact runtime")
     if (
         config.search_run_id != search_run_id
         or config.name != plan.candidate_name

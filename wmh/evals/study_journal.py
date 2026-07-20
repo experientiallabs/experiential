@@ -32,8 +32,12 @@ _RUN_CLAIM_PATTERN = re.compile(r"^run-claim-(?P<phase>[a-z_]+)\.json$")
 _RUN_CHECKPOINT_PATTERN = re.compile(
     r"^run-checkpoint-(?P<phase>[a-z_]+)-(?P<sequence>[0-9]{8})\.json$"
 )
+_RUN_SLICE_INTENT_PATTERN = re.compile(
+    r"^run-slice-intent-(?P<phase>[a-z_]+)-(?P<sequence>[0-9]{8})\.json$"
+)
 _TEMPORARY_PATTERN = re.compile(r"^\.tmp-(?P<target>.+)-(?P<nonce>[0-9a-f]{32})$")
 _ResultT = TypeVar("_ResultT")
+MAX_STUDY_RUN_CHECKPOINT_SEQUENCE = 99_999_999
 
 
 class StudyPhase(StrEnum):
@@ -205,7 +209,6 @@ class StudyRunClaim(BaseModel):
     phase: StudyPhase
     authorization_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
     run_id: str = Field(min_length=1, max_length=512)
-    configuration_digest: str | None = Field(default=None, pattern=_DIGEST_PATTERN)
 
     @model_validator(mode="after")
     def _validate_claim(self) -> Self:
@@ -222,7 +225,7 @@ class StudyRunCheckpointIdentity(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    sequence: StrictInt = Field(ge=0, le=99_999_999)
+    sequence: StrictInt = Field(ge=0, le=MAX_STUDY_RUN_CHECKPOINT_SEQUENCE)
     checkpoint_digest: str = Field(pattern=_DIGEST_PATTERN)
 
     @model_validator(mode="after")
@@ -264,6 +267,52 @@ class StudyRunCheckpointRecord(BaseModel):
     def digest(self) -> str:
         """Return the append-only record identity used by its successor."""
         return self.record_digest
+
+
+class StudyRunSliceIntentRecord(BaseModel):
+    """Immutable pre-dispatch authority for exactly one run checkpoint sequence."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    intent_version: Literal["1"] = "1"
+    journal_genesis_digest: str = Field(pattern=_DIGEST_PATTERN)
+    study_id: str = Field(min_length=1, max_length=512)
+    phase: StudyPhase
+    authorization_payload_digest: str = Field(pattern=_DIGEST_PATTERN)
+    run_id: str = Field(min_length=1, max_length=512)
+    configuration_digest: str = Field(pattern=_DIGEST_PATTERN)
+    checkpoint_sequence: StrictInt = Field(
+        ge=0,
+        le=MAX_STUDY_RUN_CHECKPOINT_SEQUENCE,
+    )
+    previous_checkpoint_record_digest: str | None = Field(
+        default=None,
+        pattern=_DIGEST_PATTERN,
+    )
+    intent_digest: str = Field(pattern=_DIGEST_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_intent(self) -> Self:
+        for field in ("study_id", "run_id"):
+            value = getattr(self, field)
+            if value != value.strip():
+                raise ValueError(
+                    f"study run slice intent {field} cannot have surrounding whitespace"
+                )
+            validate_durable_text(value, field=f"study run slice intent {field}")
+        if self.checkpoint_sequence == 0 and self.previous_checkpoint_record_digest is not None:
+            raise ValueError("first study run slice intent cannot name a previous checkpoint")
+        if self.checkpoint_sequence > 0 and self.previous_checkpoint_record_digest is None:
+            raise ValueError("later study run slice intent must name its previous checkpoint")
+        payload = self.model_dump(mode="json", exclude={"intent_digest"})
+        if self.intent_digest != _canonical_digest(payload):
+            raise ValueError("study run slice intent digest is inconsistent")
+        return self
+
+    @property
+    def digest(self) -> str:
+        """Return the canonical identity of this pre-dispatch authority."""
+        return self.intent_digest
 
 
 class ExternalCommitmentPublisher(Protocol):
@@ -475,6 +524,20 @@ def append_study_phase_derived(
                 raise ValueError("study journal is terminal and cannot accept another phase")
             expected = ", ".join(phase.value for phase in allowed)
             raise ValueError(f"next study phase must be one of: {expected}")
+        if existing is None and requested_phase is not StudyPhase.STOPPED and records:
+            checkpoints_by_phase = _load_run_checkpoints_locked(store, directory_descriptor)
+            intents_by_phase = _load_run_slice_intents_locked(
+                store,
+                directory_descriptor,
+                checkpoints_by_phase=checkpoints_by_phase,
+            )
+            if any(
+                len(intents) > len(checkpoints_by_phase.get(intent_phase, ()))
+                for intent_phase, intents in intents_by_phase.items()
+            ):
+                raise ValueError(
+                    "study phase cannot advance with an ambiguous durable slice intent"
+                )
 
         _verify_external_chain_locked(
             store,
@@ -624,6 +687,7 @@ def call_in_study_slice(
         configuration_digest=configuration_digest,
         resume_from=resume_from,
         publisher=publisher,
+        prepare_next=True,
     ) as (directory_descriptor, claim, checkpoints):
         result, checkpoint = operation()
         frozen_checkpoint = StudyRunCheckpointIdentity.model_validate(
@@ -634,11 +698,7 @@ def call_in_study_slice(
             raise ValueError(
                 "study slice did not return exactly the next durable checkpoint sequence"
             )
-        if (
-            checkpoints
-            and frozen_checkpoint.checkpoint_digest == checkpoints[-1].checkpoint.checkpoint_digest
-        ):
-            raise ValueError("study slice did not advance the durable checkpoint identity")
+        _require_checkpoint_digest_advance(checkpoints, frozen_checkpoint)
         _append_run_checkpoint_locked(
             store,
             directory_descriptor,
@@ -691,6 +751,7 @@ def reconcile_study_slice(
         configuration_digest=configuration_digest,
         resume_from=resume_from,
         publisher=publisher,
+        prepare_next=False,
     ):
         return operation()
 
@@ -705,6 +766,7 @@ def _locked_study_slice(
     configuration_digest: str,
     resume_from: StudyRunCheckpointIdentity | None,
     publisher: ExternalCommitmentPublisher,
+    prepare_next: bool,
 ) -> Iterator[tuple[int, StudyRunClaim, tuple[StudyRunCheckpointRecord, ...]]]:
     """Admit one exact fresh, resumed, or completed-reconciliation slice."""
     requested_phase = StudyPhase(phase)
@@ -716,7 +778,6 @@ def _locked_study_slice(
         phase=requested_phase,
         authorization_payload_digest=authorization_payload_digest,
         run_id=run_id,
-        configuration_digest=configuration_digest,
     )
     resumed = (
         StudyRunCheckpointIdentity.model_validate(resume_from.model_dump(mode="json"))
@@ -747,14 +808,39 @@ def _locked_study_slice(
             resume=resumed is not None,
             allow_uncheckpointed_reentry=resumed is None and not checkpoints,
         )
+        intents_by_phase = _load_run_slice_intents_locked(
+            store,
+            directory_descriptor,
+            checkpoints_by_phase=checkpoints_by_phase,
+        )
+        intents = intents_by_phase.get(requested_phase, ())
+        if intents and intents[0].configuration_digest != configuration_digest:
+            raise ValueError(
+                "study phase is already claimed by a different run identity or configuration"
+            )
         reconciled = _reconcile_resume_checkpoint_locked(
             store,
             directory_descriptor,
             claim=claim,
             configuration_digest=configuration_digest,
             checkpoints=checkpoints,
+            intents=intents,
             resume_from=resumed,
         )
+        if len(intents) > len(reconciled):
+            raise ValueError(
+                "study run has an ambiguous durable slice intent without its exact persisted "
+                "checkpoint"
+            )
+        if prepare_next:
+            _append_run_slice_intent_locked(
+                store,
+                directory_descriptor,
+                claim=claim,
+                configuration_digest=configuration_digest,
+                checkpoint_sequence=len(reconciled),
+                previous=reconciled[-1] if reconciled else None,
+            )
         yield directory_descriptor, claim, reconciled
 
 
@@ -799,6 +885,8 @@ def _load_records_locked(
             continue
         if _RUN_CHECKPOINT_PATTERN.fullmatch(name) is not None:
             continue
+        if _RUN_SLICE_INTENT_PATTERN.fullmatch(name) is not None:
+            continue
         match = _RECORD_PATTERN.fullmatch(name)
         if match is None:
             if _is_valid_temporary_name(name):
@@ -836,7 +924,12 @@ def _load_records_locked(
         if records and record.publication.published_at < records[-1].publication.published_at:
             raise ValueError("study journal publication timestamps move backwards")
         records.append(record)
-    _load_run_checkpoints_locked(store, directory_descriptor)
+    checkpoints_by_phase = _load_run_checkpoints_locked(store, directory_descriptor)
+    _load_run_slice_intents_locked(
+        store,
+        directory_descriptor,
+        checkpoints_by_phase=checkpoints_by_phase,
+    )
     return tuple(records)
 
 
@@ -907,6 +1000,10 @@ def _run_checkpoint_name(phase: StudyPhase, sequence: int) -> str:
     return f"run-checkpoint-{phase.value}-{sequence:08d}.json"
 
 
+def _run_slice_intent_name(phase: StudyPhase, sequence: int) -> str:
+    return f"run-slice-intent-{phase.value}-{sequence:08d}.json"
+
+
 def _claim_study_run_locked(
     store: StudyJournalStore,
     directory_descriptor: int,
@@ -965,6 +1062,7 @@ def _load_run_checkpoints_locked(
             raise ValueError("study run checkpoints exist without a durable run claim") from None
         claim = _validate_run_claim_payload(store, claim_name, claim_payload)
         records: list[StudyRunCheckpointRecord] = []
+        checkpoint_digests: set[str] = set()
         configuration_digest: str | None = None
         for expected_sequence, (sequence, name) in enumerate(sorted(names)):
             if sequence != expected_sequence:
@@ -981,18 +1079,89 @@ def _load_run_checkpoints_locked(
                 or record.previous_record_digest != previous_digest
                 or record.authorization_payload_digest != claim.authorization_payload_digest
                 or record.run_id != claim.run_id
-                or (
-                    claim.configuration_digest is not None
-                    and record.configuration_digest != claim.configuration_digest
-                )
             ):
                 raise ValueError("study run checkpoint differs from its chain position")
+            if record.checkpoint.checkpoint_digest in checkpoint_digests:
+                raise ValueError("study run checkpoint chain repeats a checkpoint identity")
+            checkpoint_digests.add(record.checkpoint.checkpoint_digest)
             if configuration_digest is None:
                 configuration_digest = record.configuration_digest
             elif record.configuration_digest != configuration_digest:
                 raise ValueError("study run checkpoint configuration changed across resume")
             records.append(record)
         loaded[phase] = tuple(records)
+    return loaded
+
+
+def _load_run_slice_intents_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    *,
+    checkpoints_by_phase: dict[StudyPhase, tuple[StudyRunCheckpointRecord, ...]],
+) -> dict[StudyPhase, tuple[StudyRunSliceIntentRecord, ...]]:
+    """Load the append-only pre-dispatch authority chain for every claimed run."""
+    names_by_phase: dict[StudyPhase, list[tuple[int, str]]] = {}
+    for name in os.listdir(directory_descriptor):
+        match = _RUN_SLICE_INTENT_PATTERN.fullmatch(name)
+        if match is None:
+            continue
+        try:
+            phase = StudyPhase(match.group("phase"))
+        except ValueError as exc:
+            raise ValueError(f"study journal contains unknown run slice intent {name!r}") from exc
+        names_by_phase.setdefault(phase, []).append((int(match.group("sequence")), name))
+
+    loaded: dict[StudyPhase, tuple[StudyRunSliceIntentRecord, ...]] = {}
+    for phase, names in names_by_phase.items():
+        claim_name = _run_claim_name(phase)
+        try:
+            claim_payload = _read_regular_file_at(directory_descriptor, claim_name)
+        except FileNotFoundError:
+            raise ValueError("study run slice intents exist without a durable run claim") from None
+        claim = _validate_run_claim_payload(store, claim_name, claim_payload)
+        checkpoints = checkpoints_by_phase.get(phase, ())
+        intents: list[StudyRunSliceIntentRecord] = []
+        configuration_digest: str | None = None
+        for expected_sequence, (sequence, name) in enumerate(sorted(names)):
+            if sequence != expected_sequence:
+                raise ValueError("study run slice intents are missing, duplicated, or out of order")
+            intent = _validate_run_slice_intent_payload(
+                store,
+                name,
+                _read_regular_file_at(directory_descriptor, name),
+            )
+            previous_checkpoint_digest = (
+                checkpoints[sequence - 1].digest
+                if sequence > 0 and sequence <= len(checkpoints)
+                else None
+            )
+            if (
+                intent.phase is not phase
+                or intent.checkpoint_sequence != sequence
+                or intent.previous_checkpoint_record_digest != previous_checkpoint_digest
+                or intent.authorization_payload_digest != claim.authorization_payload_digest
+                or intent.run_id != claim.run_id
+            ):
+                raise ValueError("study run slice intent differs from its chain position")
+            if sequence > len(checkpoints):
+                raise ValueError("study run slice intent skips its durable checkpoint sequence")
+            if configuration_digest is None:
+                configuration_digest = intent.configuration_digest
+            elif intent.configuration_digest != configuration_digest:
+                raise ValueError("study run slice intent configuration changed across resume")
+            if sequence < len(checkpoints):
+                checkpoint = checkpoints[sequence]
+                if checkpoint.configuration_digest != intent.configuration_digest:
+                    raise ValueError("study run slice intent differs from its durable checkpoint")
+            intents.append(intent)
+        if len(intents) < len(checkpoints):
+            raise ValueError("study run checkpoint exists without its durable slice intent")
+        if len(intents) > len(checkpoints) + 1:
+            raise ValueError("study run has more than one unconsumed slice intent")
+        loaded[phase] = tuple(intents)
+    for phase, checkpoints in checkpoints_by_phase.items():
+        if checkpoints and phase not in loaded:
+            raise ValueError("study run checkpoint exists without its durable slice intent")
     return loaded
 
 
@@ -1003,6 +1172,7 @@ def _reconcile_resume_checkpoint_locked(
     claim: StudyRunClaim,
     configuration_digest: str,
     checkpoints: tuple[StudyRunCheckpointRecord, ...],
+    intents: tuple[StudyRunSliceIntentRecord, ...],
     resume_from: StudyRunCheckpointIdentity | None,
 ) -> tuple[StudyRunCheckpointRecord, ...]:
     """Match the latest record or append one checkpoint recovered after a crash."""
@@ -1021,6 +1191,15 @@ def _reconcile_resume_checkpoint_locked(
         return checkpoints
     if resume_from.sequence != len(checkpoints):
         raise ValueError("resume checkpoint skips a durable checkpoint sequence")
+    if len(intents) != len(checkpoints) + 1:
+        raise ValueError("resume checkpoint has no matching durable slice intent")
+    recovered_intent = intents[-1]
+    if (
+        recovered_intent.checkpoint_sequence != resume_from.sequence
+        or recovered_intent.configuration_digest != configuration_digest
+    ):
+        raise ValueError("resume checkpoint differs from its durable slice intent")
+    _require_checkpoint_digest_advance(checkpoints, resume_from)
     recovered = _append_run_checkpoint_locked(
         store,
         directory_descriptor,
@@ -1030,6 +1209,57 @@ def _reconcile_resume_checkpoint_locked(
         previous=checkpoints[-1] if checkpoints else None,
     )
     return (*checkpoints, recovered)
+
+
+def _require_checkpoint_digest_advance(
+    checkpoints: tuple[StudyRunCheckpointRecord, ...],
+    checkpoint: StudyRunCheckpointIdentity,
+) -> None:
+    if any(
+        checkpoint.checkpoint_digest == record.checkpoint.checkpoint_digest
+        for record in checkpoints
+    ):
+        raise ValueError("study slice did not advance the durable checkpoint identity")
+
+
+def _append_run_slice_intent_locked(
+    store: StudyJournalStore,
+    directory_descriptor: int,
+    *,
+    claim: StudyRunClaim,
+    configuration_digest: str,
+    checkpoint_sequence: int,
+    previous: StudyRunCheckpointRecord | None,
+) -> StudyRunSliceIntentRecord:
+    """Persist one immutable slice authority before any caller work can begin."""
+    payload = {
+        "intent_version": "1",
+        "journal_genesis_digest": store.genesis.digest,
+        "study_id": store.genesis.study_id,
+        "phase": claim.phase.value,
+        "authorization_payload_digest": claim.authorization_payload_digest,
+        "run_id": claim.run_id,
+        "configuration_digest": configuration_digest,
+        "checkpoint_sequence": checkpoint_sequence,
+        "previous_checkpoint_record_digest": previous.digest if previous is not None else None,
+    }
+    intent = StudyRunSliceIntentRecord.model_validate(
+        {**payload, "intent_digest": _canonical_digest(payload)}
+    )
+    name = _run_slice_intent_name(claim.phase, checkpoint_sequence)
+    _publish_regular_file_once_at(
+        directory_descriptor,
+        name,
+        _canonical_json_bytes(intent.model_dump(mode="json")),
+    )
+    persisted = _validate_run_slice_intent_payload(
+        store,
+        name,
+        _read_regular_file_at(directory_descriptor, name),
+    )
+    if persisted != intent:
+        raise RuntimeError("study run slice intent append did not persist exact evidence")
+    return intent
 
 
 def _append_run_checkpoint_locked(
@@ -1123,6 +1353,34 @@ def _validate_run_checkpoint_payload(
     ):
         raise ValueError("study run checkpoint belongs to another journal or sequence")
     return record
+
+
+def _validate_run_slice_intent_payload(
+    store: StudyJournalStore,
+    name: str,
+    payload: bytes,
+) -> StudyRunSliceIntentRecord:
+    """Parse one intent record and bind it to its canonical journal filename."""
+    match = _RUN_SLICE_INTENT_PATTERN.fullmatch(name)
+    if match is None:
+        raise ValueError("study run slice intent filename is not canonical")
+    try:
+        filename_phase = StudyPhase(match.group("phase"))
+        filename_sequence = int(match.group("sequence"))
+        intent = StudyRunSliceIntentRecord.model_validate_json(payload)
+    except ValueError as exc:
+        raise ValueError("study run slice intent is invalid") from exc
+    if payload != _canonical_json_bytes(intent.model_dump(mode="json")):
+        raise ValueError("study run slice intent is not canonical")
+    if (
+        intent.phase is not filename_phase
+        or intent.checkpoint_sequence != filename_sequence
+        or name != _run_slice_intent_name(intent.phase, intent.checkpoint_sequence)
+        or intent.journal_genesis_digest != store.genesis.digest
+        or intent.study_id != store.genesis.study_id
+    ):
+        raise ValueError("study run slice intent belongs to another journal or sequence")
+    return intent
 
 
 def _require_current_phase_locked(
@@ -1438,6 +1696,14 @@ def _is_valid_temporary_name(name: str) -> bool:
             return False
         sequence = int(checkpoint_match.group("sequence"))
         return target == _run_checkpoint_name(phase, sequence)
+    intent_match = _RUN_SLICE_INTENT_PATTERN.fullmatch(target)
+    if intent_match is not None:
+        try:
+            phase = StudyPhase(intent_match.group("phase"))
+        except ValueError:
+            return False
+        sequence = int(intent_match.group("sequence"))
+        return target == _run_slice_intent_name(phase, sequence)
     record_match = _RECORD_PATTERN.fullmatch(target)
     if record_match is None:
         return False
