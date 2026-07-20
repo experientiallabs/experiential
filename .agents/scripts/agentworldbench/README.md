@@ -120,6 +120,38 @@ search on terminal — convenient, as live-fetch vs recorded data was a validity
 Ops note: judge stage initially no-op'd silently — the /tmp eval-repo clone had been purged by
 the tmp cleaner; their code now lives pinned under `.wmh/qwen-agentworld` (same @354f733).
 
+## Attribution experiments (2026-07-19/20) — the loop-closers
+
+**Exp B — swe delta decomposition**: `swe-bench-max` served plain-RAG (no `--max-fidelity`)
+scored **64.96** → of the +13.34 swe gain, **+11.57 (86%) is the haiku→Opus serve model**;
+reason+verify adds +1.77 at 2.2× infer cost ($67→$145). 472/472, $67.25.
+
+**Exp A — their 35B fed FULL history** (`awb_infer_history.py`: history as alternating chat
+turns — documented deviation from their shipped history-blind infer; everything else theirs;
+same pinned judge; vLLM 0.23.0 TP=2 on h100-dev-box-8, temp 0). 2,170/2,170, 9 judge failures:
+
+| domain | 35B blind (shipped) | **35B + history** | Δ history | wmh-max |
+|---|---:|---:|---:|---:|
+| MCP | 44.83 | **65.87** | +21.04 | 55.37 |
+| Search | 38.50 | 42.69 | +4.19 | **44.46** |
+| Terminal | 27.29 | 54.52 | +27.23 | 53.56 |
+| SWE | 44.66 | 61.03 | +16.37 | **66.73** |
+| Android | 47.35 | 61.62 | +14.27 | 59.72 |
+| Web | 52.88 | 59.13 | +6.25 | 56.93 |
+| OS | 54.87 | 54.97 | +0.10 | 53.47 |
+| **Macro** | 44.34 | **57.12** | **+12.78** | 55.75 |
+
+**Corrected headline (supersedes the D80-era "wmh beats their released 35B" claim):** that gap
+was ~entirely their shipped protocol starving the model of history. Under equal information and
+one judge, **their purpose-trained 35B modestly beats our best config, 57.12 vs 55.75 (−1.37)**,
+winning 5/7 domains — dominated by trained-in environment priors (MCP +10.5 over us). wmh wins
+where serve-model muscle (SWE, Opus) or scaffolding (Search) dominates. Their published 56.39
+(gpt-5.2 judge) is consistent with our 57.12 under a harsher judge, suggesting their reported
+numbers were produced WITH history — i.e. the released `eval.py infer` does not reproduce their
+paper protocol. A 35B open-weight model matching frontier-model world-modeling at equal
+information is genuinely strong — and the honest takeaway for wmh is that our differentiation
+is scaffolding + real-env grounding, not fidelity-per-parameter on their metric.
+
 ## Anchor row: Qwen-AgentWorld-35B-A3B, same judge (2026-07-11)
 
 Their released model, served per their README (vLLM `--language-model-only --reasoning-parser
