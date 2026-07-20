@@ -7,6 +7,8 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,7 +74,12 @@ from wmh.evals.harness_optimization_test import (
     _prepare,
     _Scorer,
 )
-from wmh.evals.study_journal import StudyJournalStore, StudyPhase
+from wmh.evals.study_journal import (
+    ExternalPublicationReceipt,
+    StudyJournalStore,
+    StudyPhase,
+    StudyPhaseCommitment,
+)
 from wmh.evals.study_lifecycle import (
     ConfirmationFrozenPayload,
     ConfirmationOpenedPayload,
@@ -113,6 +120,76 @@ from wmh.tracking.rate_limit import (
 )
 
 runner = CliRunner()
+
+
+def _assert_reader_recovers_post_link_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    final: Path,
+    publish: Callable[[], object],
+    read: Callable[[], None],
+) -> object:
+    """Force a reader between pre-link recovery and a paused winner's staging unlink."""
+    reader_recovered = threading.Event()
+    winner_linked = threading.Event()
+    reader_finished = threading.Event()
+    reader_threads: set[int] = set()
+    real_link = os.link
+    real_recover = coordinator_module._recover_atomic_publication_aliases
+
+    def controlled_recover(path: Path) -> None:
+        real_recover(path)
+        if path == final and threading.get_ident() in reader_threads:
+            assert not final.exists()
+            reader_recovered.set()
+            assert winner_linked.wait(timeout=5)
+
+    def controlled_link(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if Path(os.fsdecode(destination)) != final:
+            real_link(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+            return
+        assert reader_recovered.wait(timeout=5)
+        real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+        winner_linked.set()
+        assert reader_finished.wait(timeout=5)
+
+    def run_reader() -> None:
+        reader_threads.add(threading.get_ident())
+        try:
+            read()
+        finally:
+            reader_finished.set()
+
+    monkeypatch.setattr(os, "link", controlled_link)
+    monkeypatch.setattr(
+        coordinator_module,
+        "_recover_atomic_publication_aliases",
+        controlled_recover,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publisher = executor.submit(publish)
+        reader = executor.submit(run_reader)
+        reader.result(timeout=10)
+        return publisher.result(timeout=10)
 
 
 class _NoDispatchToolProvider:
@@ -1282,6 +1359,83 @@ def test_append_only_evidence_preserves_a_live_pre_link_staging_file(
     assert not tuple(final.parent.glob(f".publish-{final.name}-*"))
 
 
+def test_artifact_reader_recovers_when_winner_links_after_initial_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    study_id = "artifact-reader-race-study"
+    published_at = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id=study_id,
+        clock=lambda: published_at,
+    )
+    content = {"kind": "protocol", "value": 6}
+    digest = _canonical_digest(content)
+    publication = StudyArtifactPublication.create(
+        artifact_digest=digest,
+        publisher="wmh-local-study-evidence",
+        publication_id=f"artifact-{digest.removeprefix('sha256:')}",
+        immutable_locator=f"wmh-local-study://{study_id}/artifact/{digest}",
+        published_at=published_at,
+        evidence={"kind": "protocol"},
+    )
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+
+    persisted = _assert_reader_recovers_post_link_alias(
+        monkeypatch,
+        final=final,
+        publish=lambda: store.publish_artifact(
+            kind="protocol",
+            artifact_digest=digest,
+            content=content,
+        ),
+        read=lambda: store.verify_artifact(publication),
+    )
+
+    assert persisted == publication
+    assert os.lstat(final).st_nlink == 1
+
+
+def test_commitment_reader_recovers_when_winner_links_after_initial_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    study_id = "commitment-reader-race-study"
+    published_at = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id=study_id,
+        clock=lambda: published_at,
+    )
+    commitment = StudyPhaseCommitment(
+        journal_genesis_digest=_digest("reader-race-genesis"),
+        study_id=study_id,
+        sequence=0,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("reader-race-payload"),
+    )
+    receipt = ExternalPublicationReceipt(
+        commitment_digest=commitment.digest,
+        publisher="wmh-local-study-evidence",
+        publication_id="phase-000",
+        immutable_locator=f"wmh-local-study://{study_id}/phase/0",
+        published_at=published_at,
+        evidence={"sequence": 0, "phase": StudyPhase.PREPARATION_PLANNED.value},
+    )
+    final = tmp_path / "evidence" / "commitments" / "phase-000.json"
+
+    persisted = _assert_reader_recovers_post_link_alias(
+        monkeypatch,
+        final=final,
+        publish=lambda: store.publish(commitment),
+        read=lambda: store.verify(commitment, receipt),
+    )
+
+    assert persisted == receipt
+    assert os.lstat(final).st_nlink == 1
+
+
 def test_append_only_evidence_recovers_post_link_crash_alias(tmp_path: Path) -> None:
     store = LocalStudyEvidenceStore(
         tmp_path / "evidence",
@@ -1296,7 +1450,7 @@ def test_append_only_evidence_recovers_post_link_crash_alias(tmp_path: Path) -> 
         content=content,
     )
     final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
-    alias = final.parent / f".publish-{final.name}-interrupted"
+    alias = final.parent / f".publish-{final.name}-{'0' * 32}"
     os.link(final, alias)
 
     assert os.lstat(final).st_nlink == 2
@@ -1304,6 +1458,59 @@ def test_append_only_evidence_recovers_post_link_crash_alias(tmp_path: Path) -> 
 
     assert not alias.exists()
     assert os.lstat(final).st_nlink == 1
+
+
+def test_append_only_evidence_rejects_a_malformed_same_inode_staging_alias(
+    tmp_path: Path,
+) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="malformed-alias-study",
+    )
+    content = {"kind": "protocol", "value": 7}
+    digest = _canonical_digest(content)
+    publication = store.publish_artifact(
+        kind="protocol",
+        artifact_digest=digest,
+        content=content,
+    )
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    malformed = final.parent / f".publish-{final.name}-interrupted"
+    os.link(final, malformed)
+
+    with pytest.raises(ValueError, match="exactly one link"):
+        store.verify_artifact(publication)
+
+    assert malformed.exists()
+    assert os.lstat(final).st_nlink == 2
+
+
+def test_append_only_evidence_rejects_an_unexplained_hardlink_beside_a_valid_alias(
+    tmp_path: Path,
+) -> None:
+    store = LocalStudyEvidenceStore(
+        tmp_path / "evidence",
+        study_id="unexplained-hardlink-study",
+    )
+    content = {"kind": "protocol", "value": 8}
+    digest = _canonical_digest(content)
+    publication = store.publish_artifact(
+        kind="protocol",
+        artifact_digest=digest,
+        content=content,
+    )
+    final = tmp_path / "evidence" / "artifacts" / f"artifact-{digest.removeprefix('sha256:')}.json"
+    recognized = final.parent / f".publish-{final.name}-{'1' * 32}"
+    unrelated = tmp_path / "unrelated-hardlink.json"
+    os.link(final, recognized)
+    os.link(final, unrelated)
+
+    with pytest.raises(ValueError, match="exactly one link"):
+        store.verify_artifact(publication)
+
+    assert recognized.exists()
+    assert unrelated.exists()
+    assert os.lstat(final).st_nlink == 3
 
 
 def test_concurrent_identical_artifact_publication_returns_one_persisted_receipt(
@@ -1384,6 +1591,89 @@ def test_concurrent_identical_artifact_publication_returns_one_persisted_receipt
 
     assert first == second
     store.verify_artifact(first)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="multiprocess publication stress requires POSIX")
+def test_identical_commitment_publication_is_idempotent_across_24_processes(
+    tmp_path: Path,
+) -> None:
+    study_id = "multiprocess-commitment-study"
+    evidence_dir = tmp_path / "evidence"
+    store = LocalStudyEvidenceStore(evidence_dir, study_id=study_id)
+    commitment = StudyPhaseCommitment(
+        journal_genesis_digest=_digest("multiprocess-genesis"),
+        study_id=study_id,
+        sequence=0,
+        phase=StudyPhase.PREPARATION_PLANNED,
+        payload_digest=_digest("multiprocess-payload"),
+    )
+    raw_commitment = commitment.model_dump_json()
+    ready_dir = tmp_path / "ready"
+    ready_dir.mkdir()
+    start = tmp_path / "start"
+    child_code = """
+import sys
+import time
+from pathlib import Path
+
+from wmh.evals.harness_optimization_coordinator import LocalStudyEvidenceStore
+from wmh.evals.study_journal import StudyPhaseCommitment
+
+evidence_dir, raw_commitment, ready, start = sys.argv[1:]
+commitment = StudyPhaseCommitment.model_validate_json(raw_commitment)
+store = LocalStudyEvidenceStore(Path(evidence_dir), study_id=commitment.study_id)
+Path(ready).touch()
+while not Path(start).exists():
+    time.sleep(0.001)
+sys.stdout.write(store.publish(commitment).model_dump_json())
+"""
+    processes: list[subprocess.Popen[str]] = []
+    communicated: set[int] = set()
+    receipts: list[str] = []
+    try:
+        for index in range(24):
+            processes.append(
+                subprocess.Popen(  # noqa: S603 - exact interpreter and fixed local script
+                    [
+                        sys.executable,
+                        "-c",
+                        child_code,
+                        str(evidence_dir),
+                        raw_commitment,
+                        str(ready_dir / str(index)),
+                        str(start),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+        deadline = time.monotonic() + 30
+        while len(tuple(ready_dir.iterdir())) != len(processes) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(tuple(ready_dir.iterdir())) == len(processes)
+        start.touch()
+        for index, process in enumerate(processes):
+            stdout, stderr = process.communicate(timeout=30)
+            communicated.add(index)
+            assert process.returncode == 0, stderr
+            receipts.append(stdout)
+    finally:
+        start.touch(exist_ok=True)
+        for index, process in enumerate(processes):
+            if index in communicated:
+                continue
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+    parsed = tuple(ExternalPublicationReceipt.model_validate_json(receipt) for receipt in receipts)
+    assert len({receipt.digest for receipt in parsed}) == 1
+    persisted = parsed[0]
+    store.verify(commitment, persisted)
+    final = evidence_dir / "commitments" / "phase-000.json"
+    assert os.lstat(final).st_nlink == 1
+    assert not tuple(final.parent.glob(f".publish-{final.name}-*"))
 
 
 def test_coordinator_reconciles_terminal_discovery_checkpoint_before_freeze(

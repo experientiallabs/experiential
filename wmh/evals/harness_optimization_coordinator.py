@@ -1821,24 +1821,54 @@ def _require_private_regular_file(path: Path) -> None:
 
 
 def _read_optional_private_regular_file(path: Path) -> bytes | None:
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-    except FileNotFoundError:
-        return None
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"study state file must be a regular file: {path}")
-        if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) != _PRIVATE_FILE_MODE:
-            raise ValueError(f"study state file must be current-uid mode 0600: {path}")
-        if metadata.st_nlink != 1:
-            raise ValueError(f"study state file must have exactly one link: {path}")
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            descriptor = -1
-            return handle.read()
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    recovery_identity: tuple[int, int] | None = None
+    for recovery_attempt in range(2):
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            if recovery_identity is not None:
+                raise ValueError(
+                    f"study state file disappeared during alias recovery: {path}"
+                ) from None
+            return None
+        try:
+            metadata = os.fstat(descriptor)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if recovery_identity is not None and identity != recovery_identity:
+                raise ValueError(f"study state file changed during alias recovery: {path}")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"study state file must be a regular file: {path}")
+            if (
+                metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != _PRIVATE_FILE_MODE
+            ):
+                raise ValueError(f"study state file must be current-uid mode 0600: {path}")
+            if metadata.st_nlink != 1:
+                recovered = recovery_attempt == 0 and _recover_open_publication_aliases(
+                    path,
+                    descriptor=descriptor,
+                    expected_identity=identity,
+                )
+                if recovered:
+                    recovery_identity = identity
+                    continue
+                # The winner may remove its own alias after this descriptor's first fstat but
+                # before recovery can observe the staging name. That needs no retry: read the same
+                # already-open inode only after its path binding now proves the normal private
+                # single-link state. Any unexplained link that remains still fails closed.
+                if not _opened_file_is_bound_single_link(
+                    path,
+                    descriptor=descriptor,
+                    expected_identity=identity,
+                ):
+                    raise ValueError(f"study state file must have exactly one link: {path}")
+            with os.fdopen(descriptor, "rb", closefd=True) as handle:
+                descriptor = -1
+                return handle.read()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+    raise AssertionError("unreachable")
 
 
 def _atomic_write_private_json(path: Path, value: JsonValue) -> None:
@@ -1937,37 +1967,180 @@ def _recover_atomic_publication_aliases(path: Path) -> None:
         not stat.S_ISREG(published.st_mode) or stat.S_ISLNK(published.st_mode)
     ):
         raise ValueError(f"study evidence file must be a regular file: {path}")
-    prefix = f".publish-{path.name}-"
     changed = False
+    published_identity: tuple[int, int] | None = None
+    if published is not None:
+        published_identity = (published.st_dev, published.st_ino)
+        _remove_explained_publication_aliases(
+            path,
+            published=published,
+            expected_identity=published_identity,
+        )
+    prefix = f".publish-{path.name}-"
     for candidate in path.parent.glob(prefix + "*"):
         try:
             staged = os.lstat(candidate)
         except FileNotFoundError:
             continue
-        published_alias = published is not None and (staged.st_dev, staged.st_ino) == (
-            published.st_dev,
-            published.st_ino,
-        )
-        if not published_alias:
-            owner_pid = _publication_staging_owner_pid(path, candidate)
-            if owner_pid is None or _process_is_alive(owner_pid):
-                continue
-            # A dead pre-link publisher cannot run its finally block. Only remove the exact private
-            # regular file shape created above; malformed or hard-linked staging evidence remains a
-            # fail-closed integrity error rather than becoming a cleanup primitive.
-            _require_private_regular_file(candidate)
+        if published_identity == (staged.st_dev, staged.st_ino):
+            # A malformed alias or an alias accompanied by an unrelated hard link was deliberately
+            # left in place above so the final file's single-link validation remains fail closed.
+            continue
+        owner_pid = _publication_staging_owner_pid(path, candidate)
+        if owner_pid is None or _process_is_alive(owner_pid):
+            continue
+        # A dead pre-link publisher cannot run its finally block. Only remove the exact private
+        # regular file shape created above; malformed or hard-linked staging evidence remains a
+        # fail-closed integrity error rather than becoming a cleanup primitive.
+        _require_private_regular_file(candidate)
         try:
             candidate.unlink()
         except FileNotFoundError:
-            # Concurrent recovery of the same post-link alias is already the desired state.
             continue
         changed = True
     if changed:
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        _fsync_directory(path.parent)
+
+
+def _recover_open_publication_aliases(
+    path: Path,
+    *,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Recover one explained post-link window and require the opened inode to become private."""
+    try:
+        published = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if (published.st_dev, published.st_ino) != expected_identity:
+        return False
+    if not _remove_explained_publication_aliases(
+        path,
+        published=published,
+        expected_identity=expected_identity,
+    ):
+        return False
+    return _opened_file_is_bound_single_link(
+        path,
+        descriptor=descriptor,
+        expected_identity=expected_identity,
+    )
+
+
+def _opened_file_is_bound_single_link(
+    path: Path,
+    *,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Return whether an opened private inode is now its path's sole hard link."""
+    refreshed = os.fstat(descriptor)
+    if (refreshed.st_dev, refreshed.st_ino) != expected_identity or refreshed.st_nlink != 1:
+        return False
+    try:
+        rebound = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    return (rebound.st_dev, rebound.st_ino) == expected_identity and rebound.st_nlink == 1
+
+
+def _remove_explained_publication_aliases(
+    path: Path,
+    *,
+    published: os.stat_result,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Remove aliases only when canonical staging names explain every extra inode link."""
+    if (published.st_dev, published.st_ino) != expected_identity:
+        return False
+    if published.st_nlink == 1:
+        return False
+    aliases = _publication_aliases_explaining_links(
+        path,
+        published=published,
+        expected_identity=expected_identity,
+    )
+    if aliases is None:
+        return False
+    changed = False
+    for candidate in aliases:
         try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+            current = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        if (current.st_dev, current.st_ino) != expected_identity:
+            if changed:
+                _fsync_directory(path.parent)
+            return False
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            continue
+        changed = True
+    if changed:
+        _fsync_directory(path.parent)
+    return True
+
+
+def _publication_aliases_explaining_links(
+    path: Path,
+    *,
+    published: os.stat_result,
+    expected_identity: tuple[int, int],
+) -> tuple[Path, ...] | None:
+    """Return exact same-inode staging aliases iff they account for every extra hard link."""
+    aliases: list[Path] = []
+    prefix = f".publish-{path.name}-"
+    for candidate in path.parent.glob(prefix + "*"):
+        try:
+            staged = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        if (staged.st_dev, staged.st_ino) != expected_identity:
+            continue
+        if not _is_recognized_publication_staging_path(path, candidate):
+            return None
+        aliases.append(candidate)
+    return tuple(aliases) if len(aliases) == published.st_nlink - 1 else None
+
+
+def _is_recognized_publication_staging_path(path: Path, candidate: Path) -> bool:
+    """Recognize current PID-qualified and prior exact UUID publication staging names."""
+    prefix = f".publish-{path.name}-"
+    if not candidate.name.startswith(prefix):
+        return False
+    suffix = candidate.name.removeprefix(prefix)
+    if _is_publication_nonce(suffix):
+        return True
+    pid_prefix = "pid-"
+    if not suffix.startswith(pid_prefix):
+        return False
+    pid_text, separator, nonce = suffix.removeprefix(pid_prefix).partition("-")
+    return (
+        separator == "-"
+        and _canonical_process_id(pid_text) is not None
+        and _is_publication_nonce(nonce)
+    )
+
+
+def _is_publication_nonce(value: str) -> bool:
+    return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
+
+
+def _canonical_process_id(value: str) -> int | None:
+    if not value.isdecimal() or value.startswith("0"):
+        return None
+    pid = int(value)
+    return pid if 0 < pid <= 2_147_483_647 else None
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _publication_staging_owner_pid(path: Path, candidate: Path) -> int | None:
@@ -1977,16 +2150,9 @@ def _publication_staging_owner_pid(path: Path, candidate: Path) -> int | None:
         return None
     suffix = candidate.name.removeprefix(prefix)
     pid_text, separator, nonce = suffix.partition("-")
-    if (
-        not separator
-        or not pid_text.isdecimal()
-        or pid_text.startswith("0")
-        or len(nonce) != 32
-        or any(character not in "0123456789abcdef" for character in nonce)
-    ):
+    if not separator or not _is_publication_nonce(nonce):
         return None
-    pid = int(pid_text)
-    return pid if 0 < pid <= 2_147_483_647 else None
+    return _canonical_process_id(pid_text)
 
 
 def _process_is_alive(pid: int) -> bool:
