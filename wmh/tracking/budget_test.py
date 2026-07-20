@@ -2016,8 +2016,16 @@ def test_budgeted_chat_accepts_responses_sdk_null_usage_detail_placeholders(
     assert reservation.charged_nano_usd == 11 * 2 + 7 * 5
 
 
+@pytest.mark.parametrize(
+    "input_tokens_details",
+    [
+        {"cached_tokens": 3},
+        {"cached_tokens": 3, "cache_write_tokens": 4},
+    ],
+)
 def test_budgeted_chat_accepts_exact_responses_inclusive_usage_breakdowns(
     tmp_path: Path,
+    input_tokens_details: dict[str, int],
 ) -> None:
     provider, ledger = _budgeted_provider(
         tmp_path,
@@ -2027,7 +2035,7 @@ def test_budgeted_chat_accepts_exact_responses_inclusive_usage_breakdowns(
                     "prompt_tokens": 11,
                     "completion_tokens": 7,
                     "total_tokens": 18,
-                    "input_tokens_details": {"cached_tokens": 3},
+                    "input_tokens_details": input_tokens_details,
                     "output_tokens_details": {"reasoning_tokens": 5},
                 }
             )
@@ -2052,6 +2060,12 @@ def test_budgeted_chat_accepts_exact_responses_inclusive_usage_breakdowns(
     [
         {"input_tokens_details": {"cached_tokens": 3, "future_tokens": 1}},
         {"input_tokens_details": {"cached_tokens": True}},
+        {"input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": True}},
+        {"input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": -1}},
+        {"input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 12}},
+        {"input_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 8}},
+        {"input_tokens_details": {"cache_write_tokens": 3}},
+        {"input_tokens_details": ["cached_tokens"]},
         {"output_tokens_details": {"reasoning_tokens": 8}},
     ],
 )
@@ -2206,7 +2220,7 @@ def test_budgeted_azure_reasoning_completion_identity_and_usage_details_settle_e
                 "input_tokens": 11,
                 "output_tokens": 7,
                 "total_tokens": 18,
-                "input_tokens_details": {"cached_tokens": 3},
+                "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2},
                 "output_tokens_details": {"reasoning_tokens": 5},
             }
         ),

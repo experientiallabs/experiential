@@ -88,12 +88,22 @@ _KNOWN_NULL_USAGE_DETAIL_PLACEHOLDERS = frozenset(
         "prompt_tokens_details",
     }
 )
-# Responses reports these exact nested counts as subsets of the already-priced primary totals.
-# Keep the schema closed: an added container, child field, invalid count, or count larger than its
-# parent remains unpriced usage and forfeits the reservation.
+# Responses reports these exact nested counts as distinct subsets of the already-priced primary
+# totals. Keep the schema closed: an added container, child field, invalid count, or individual or
+# aggregate count larger than its parent remains unpriced usage and forfeits the reservation.
 _INCLUSIVE_USAGE_BREAKDOWNS = (
-    ("input_tokens_details", "cached_tokens", "input"),
-    ("output_tokens_details", "reasoning_tokens", "output"),
+    (
+        "input_tokens_details",
+        frozenset({"cached_tokens"}),
+        frozenset({"cached_tokens", "cache_write_tokens"}),
+        "input",
+    ),
+    (
+        "output_tokens_details",
+        frozenset({"reasoning_tokens"}),
+        frozenset({"reasoning_tokens"}),
+        "output",
+    ),
 )
 _PROVIDER_TARIFF_EVIDENCE_CONTRACTS = {
     "aws_bedrock_public_catalog_v1": (
@@ -2889,13 +2899,21 @@ class BudgetedProvider:
             or total != input_tokens + output_tokens
         ):
             extras["total_tokens"] = total
-        for container, detail, parent in _INCLUSIVE_USAGE_BREAKDOWNS:
+        for container, required_details, allowed_details, parent in _INCLUSIVE_USAGE_BREAKDOWNS:
             value = extras.get(container)
-            if not isinstance(value, Mapping) or set(value) != {detail}:
+            if not isinstance(value, Mapping):
                 continue
-            count = value[detail]
+            details = set(value)
+            if not required_details <= details <= allowed_details:
+                continue
             parent_count = input_tokens if parent == "input" else output_tokens
-            if type(count) is int and 0 <= count <= parent_count:
+            counts: list[int] = []
+            for detail in details:
+                count = value[detail]
+                if type(count) is not int or not 0 <= count <= parent_count:
+                    break
+                counts.append(count)
+            if len(counts) == len(details) and sum(counts) <= parent_count:
                 extras.pop(container)
         if not extras:
             return

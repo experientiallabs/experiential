@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 from typing import cast
 
 import httpx
@@ -19,7 +20,16 @@ from wmh.providers.base import (
     ProviderKind,
     TokenUsage,
 )
-from wmh.providers.receipt import validate_chat_provider_receipt
+from wmh.providers.receipt import ProviderResponseIdentity, validate_chat_provider_receipt
+from wmh.tracking._testing import synthetic_provider_cost_meter, synthetic_tariff_provenance
+from wmh.tracking.budget import (
+    BudgetAccount,
+    BudgetedProvider,
+    BudgetPolicy,
+    BudgetScope,
+    ReservationStatus,
+    SpendLedger,
+)
 
 
 class _FakeMessage:
@@ -128,11 +138,13 @@ class _FakeResponsesResponse:
         *,
         usage: dict[str, object] | None = None,
         system_fingerprint: str | None = None,
+        response_model: str = "gpt-5.5-2026-06-01",
     ) -> None:
         self.tool_name = tool_name
         self.text = text
         self.usage = usage or {"input_tokens": 11, "output_tokens": 7}
         self.system_fingerprint = system_fingerprint
+        self.response_model = response_model
 
     def model_dump(self, *, mode: str) -> dict[str, object]:
         assert mode == "json"
@@ -164,7 +176,7 @@ class _FakeResponsesResponse:
             )
         response: dict[str, object] = {
             "id": "response-azure-1",
-            "model": "gpt-5.5-2026-06-01",
+            "model": self.response_model,
             "status": "completed",
             "output": output,
             "usage": self.usage,
@@ -182,6 +194,7 @@ class _FakeResponses:
         text: str | None = None,
         usage: dict[str, object] | None = None,
         system_fingerprint: str | None = None,
+        response_model: str = "gpt-5.5-2026-06-01",
         headers: dict[str, str] | None = None,
         error: Exception | None = None,
     ) -> None:
@@ -189,6 +202,7 @@ class _FakeResponses:
         self.text = text
         self.usage = usage
         self.system_fingerprint = system_fingerprint
+        self.response_model = response_model
         self.headers = (
             {"apim-request-id": "provider-request-azure-responses-1"}
             if headers is None
@@ -209,6 +223,7 @@ class _FakeResponses:
             self.text,
             usage=self.usage,
             system_fingerprint=self.system_fingerprint,
+            response_model=self.response_model,
         )
 
 
@@ -543,6 +558,102 @@ def test_structured_gpt55_reasoning_uses_azure_v1_responses(
         "call_id": "call-1",
         "output": "/workspace",
     }
+
+
+def test_budgeted_structured_reasoning_settles_openai_246_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _reasoning_config()
+    responses = _FakeResponses(
+        usage={
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "total_tokens": 18,
+            "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2},
+            "output_tokens_details": {"reasoning_tokens": 5},
+        },
+        response_model="gpt55-deploy",
+    )
+    azure = AzureOpenAIProvider(config)
+    monkeypatch.setattr(
+        azure,
+        "_get_responses_client",
+        lambda: _FakeResponsesClient(responses),
+    )
+    provenance = synthetic_tariff_provenance(config)
+    policy = BudgetPolicy(
+        study_id="azure-responses-usage-contract",
+        manifest_digest="sha256:" + "a" * 64,
+        hard_limit_nano_usd=100_000,
+        phase_limits_nano_usd={"search": 100_000},
+        meters={
+            "proposer": synthetic_provider_cost_meter(
+                provider_config=config,
+                provenance=provenance,
+                input_nano_usd_per_token=1,
+                output_nano_usd_per_token=1,
+            )
+        },
+    )
+    ledger_path = tmp_path / "azure-responses-usage-contract.sqlite3"
+    ledger = SpendLedger(ledger_path, policy)
+    provider = BudgetedProvider(
+        azure,
+        BudgetAccount(
+            ledger_path=ledger_path,
+            ledger_identity=ledger.ledger_identity,
+            policy=policy,
+            scope=BudgetScope(
+                phase="search",
+                category="proposer",
+                run_id="azure-responses-usage-contract",
+            ),
+            meter_id="proposer",
+        ),
+        response_identity=ProviderResponseIdentity(
+            provider=ProviderKind.AZURE_OPENAI,
+            response_model="gpt55-deploy",
+        ),
+        id_factory=lambda: "azure-responses-usage-contract-1",
+    )
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "inspect"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "run a command",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "max_completion_tokens": 64,
+            }
+        )
+    )
+
+    assert response.model == "gpt55-deploy"
+    assert response.system_fingerprint is None
+    assert response.provider_receipt is not None
+    assert response.provider_receipt.provider_request_id == "provider-request-azure-responses-1"
+    assert response.provider_receipt.requested_model == "gpt55-deploy"
+    assert response.provider_receipt.response_model == "gpt55-deploy"
+    assert response.usage is not None
+    assert response.usage.model_extra == {
+        "total_tokens": 18,
+        "input_tokens_details": {"cached_tokens": 3, "cache_write_tokens": 2},
+        "output_tokens_details": {"reasoning_tokens": 5},
+    }
+    [reservation] = ledger.reservations()
+    assert reservation.status is ReservationStatus.SETTLED
+    assert reservation.input_tokens == 11
+    assert reservation.output_tokens == 7
+    assert reservation.charged_nano_usd == 18
 
 
 def test_responses_client_uses_trusted_azure_key_and_normalized_v1_route(
