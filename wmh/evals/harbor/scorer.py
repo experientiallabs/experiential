@@ -41,6 +41,10 @@ from wmh.evals.harbor.tasks import (
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import resolve_e2b_template
 from wmh.harness.pi_runtime import PI_RUNNER_DIR, PI_RUNNER_HOST
+from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    validate_episode_timeout_s,
+)
 from wmh.harness.scoring import (
     ArtifactReader,
     EvaluationArtifact,
@@ -55,7 +59,7 @@ from wmh.providers.base import ProviderConfig
 _INDEX_PATH = "raw/index.json"
 _REQUIRED_JOB_FILES = frozenset({"config.json", "lock.json", "result.json", "job.log"})
 _REQUIRED_TRIAL_FILES = frozenset({"config.json", "lock.json", "result.json", "trial.log"})
-_HARBOR_SCORER_VERSION = "2"
+_HARBOR_SCORER_VERSION = "3"
 _CHECKSUM_PATTERN = r"^[0-9a-f]{64}$"
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -91,6 +95,14 @@ class HarborJobRunner:
             return executor.submit(lambda: asyncio.run(run_job())).result()
 
 
+def _validate_episode_timeout_sec(value: object) -> float:
+    """Validate the scorer-facing spelling while sharing the runtime's numeric contract."""
+    try:
+        return validate_episode_timeout_s(value)
+    except ValueError as error:
+        raise ValueError("episode_timeout_sec must be a finite positive number") from error
+
+
 class HarborScorer:
     """Evaluate exact harness candidates through Harbor's official verifier lifecycle."""
 
@@ -102,6 +114,7 @@ class HarborScorer:
         provider_config: ProviderConfig,
         reward_key: str,
         environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
+        episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
         runner: HarborRunner | None = None,
@@ -157,6 +170,9 @@ class HarborScorer:
             raise ValueError("harness_backend must be local or e2b")
         if harness_backend == "local" and e2b_template is not None:
             raise ValueError("e2b_template requires harness_backend='e2b'")
+        episode_timeout_sec = _validate_episode_timeout_sec(episode_timeout_sec)
+        if harness_backend == "local" and episode_timeout_sec != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
+            raise ValueError("episode_timeout_sec requires harness_backend='e2b'")
         effective_agent_concurrency = template.n_concurrent or job_config.n_concurrent_trials
         if harness_backend == "local" and effective_agent_concurrency > 1:
             raise ValueError(
@@ -179,6 +195,7 @@ class HarborScorer:
         )
         self._reward_key = reward_key
         self._environment_command_timeout_sec = environment_command_timeout_sec
+        self._episode_timeout_sec = episode_timeout_sec
         self._harness_backend = harness_backend
         if harness_backend == "local":
             self._local_runner_identity = {
@@ -204,6 +221,7 @@ class HarborScorer:
         provider_config: ProviderConfig,
         reward_key: str,
         environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
+        episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
         runner: HarborRunner | None = None,
@@ -211,6 +229,9 @@ class HarborScorer:
         """Resolve exact task bytes before constructing a scorer that can incur spend."""
         if len(job_config.datasets) != 1 or job_config.tasks:
             raise ValueError("HarborScorer requires exactly one dataset and no direct tasks")
+        episode_timeout_sec = _validate_episode_timeout_sec(episode_timeout_sec)
+        if harness_backend == "local" and episode_timeout_sec != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
+            raise ValueError("episode_timeout_sec requires harness_backend='e2b'")
         task_set = await resolve_harbor_task_set(job_config.datasets[0], task_ids)
         return cls(
             job_config=job_config,
@@ -218,6 +239,7 @@ class HarborScorer:
             provider_config=provider_config,
             reward_key=reward_key,
             environment_command_timeout_sec=environment_command_timeout_sec,
+            episode_timeout_sec=episode_timeout_sec,
             harness_backend=harness_backend,
             e2b_template=e2b_template,
             runner=runner,
@@ -286,6 +308,7 @@ class HarborScorer:
             "e2b_template": self._e2b_template,
             "local_runner": self._local_runner_identity,
             "environment_command_timeout_sec": self._environment_command_timeout_sec,
+            "episode_timeout_sec": self._episode_timeout_sec,
         }
         return ScoreContext(
             task_set_digest=_digest_json(task_payload),
@@ -372,6 +395,7 @@ class HarborScorer:
                     "harness_backend": self._harness_backend,
                     "e2b_template": self._e2b_template,
                     "command_timeout_sec": self._environment_command_timeout_sec,
+                    "episode_timeout_sec": self._episode_timeout_sec,
                 },
             },
             deep=True,

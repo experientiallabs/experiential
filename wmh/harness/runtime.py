@@ -11,6 +11,7 @@ the same types the rest of the harness uses.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -46,6 +47,9 @@ DEFAULT_MAX_TURNS = 20  # small shell tasks converge well before this; raise for
 # Per-call output budget used by the pi runtimes. This remains separate from the turn cap: a
 # reasoning model can exhaust one response before it emits a tool call even when many turns remain.
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
+# Host-enforced wall budget for one evaluated harness episode. Backends may carry additional
+# resource leases, but none may undercut this budget once a caller selects a larger value.
+DEFAULT_EVAL_EPISODE_TIMEOUT_S = 300.0
 
 # Per-observation cap in the judge-facing transcript. Generous rather than tight: gold evidence
 # routinely lives deep in long outputs (`cat` of a produced file, `ls -R`), and truncating it away
@@ -56,6 +60,16 @@ _NUDGE = (
     "[ERROR] that reply was not a single valid JSON tool call. Reply with EXACTLY one JSON "
     'object: {"tool": "<tool name>", "arguments": {...}}'
 )
+
+
+def validate_episode_timeout_s(value: object) -> float:
+    """Return one finite positive episode timeout, rejecting booleans and non-numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("episode_timeout_s must be a finite positive number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("episode_timeout_s must be a finite positive number")
+    return timeout
 
 
 class HarnessSearchCancelled(RuntimeError):

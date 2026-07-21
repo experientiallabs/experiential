@@ -185,6 +185,7 @@ def test_execute_resolves_one_scorer_request_and_neutral_archive(
         harness_backend="e2b",
         e2b_template="template-x",
         environment_command_timeout_sec=240,
+        episode_timeout_sec=12_000,
     )
 
     [scorer_call] = scorer_calls
@@ -192,13 +193,16 @@ def test_execute_resolves_one_scorer_request_and_neutral_archive(
     assert scorer_call["provider_config"] == agent_config
     assert scorer_call["harness_backend"] == "e2b"
     assert scorer_call["e2b_template"] == "template-x"
+    assert scorer_call["episode_timeout_sec"] == 12_000
     [scored_call] = scored_calls
     assert scored_call[1] == (target,)
     assert scored_call[2] is request
     assert archived == [(run_dir / "scores", outcome.result)]
     assert outcome.archive_manifest == run_dir / "scores/manifest.json"
     inputs = json.loads((run_dir / "inputs.json").read_text(encoding="utf-8"))
+    assert inputs["schema_version"] == 2
     assert inputs["score_request"] == request.model_dump(mode="json")
+    assert inputs["episode_timeout_sec"] == 12_000
     assert inputs["targets"] == [
         {
             "document_hash": target.harness.doc_hash,
@@ -310,6 +314,37 @@ def test_cli_resolves_default_then_immutable_stored_version_with_agent_role(
     assert agent_config.kind is ProviderKind.ANTHROPIC
     assert "models.meta" not in invoked.output
 
+    e2b_invoked = runner.invoke(
+        app,
+        [
+            "harness",
+            "score",
+            "--include-default",
+            "--harbor-config",
+            str(config_path),
+            "--task-ids",
+            str(task_ids_path),
+            "--reward-key",
+            "reward",
+            "--attempts",
+            "1",
+            "--harness-backend",
+            "e2b",
+            "--episode-timeout",
+            "12000",
+            "--result-out",
+            str(tmp_path / "e2b-run"),
+            "--root",
+            str(root),
+            "--yes",
+        ],
+    )
+
+    assert e2b_invoked.exit_code == 0, e2b_invoked.output
+    assert calls[-1]["harness_backend"] == "e2b"
+    assert calls[-1]["episode_timeout_sec"] == 12_000
+    assert "episode timeout=12000s" in e2b_invoked.output
+
 
 def test_cli_requires_a_target_before_model_or_scorer_resolution(tmp_path: Path) -> None:
     config_path, task_ids_path = _write_inputs(tmp_path)
@@ -373,3 +408,5 @@ def test_cli_help_is_proposer_free_and_requires_only_agent_role() -> None:
     assert "models.meta" not in invoked.output
     assert "proposer" not in invoked.output.lower()
     assert "world model" not in invoked.output.lower()
+    assert "--episode-timeout" in invoked.output
+    assert "seconds" in invoked.output

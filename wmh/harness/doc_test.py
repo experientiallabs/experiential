@@ -348,3 +348,23 @@ def test_transport_retries_reaches_e2b_pi_runtime() -> None:
     assert isinstance(runtime, E2BPiRuntime)
     assert runtime._transport_retries == 0  # noqa: SLF001 - pins public policy passthrough
     pool.close()
+
+
+def test_episode_timeout_reaches_e2b_pi_runtime_and_rejects_local_noop() -> None:
+    from wmh.harness.pi_e2b import E2BPiRuntime
+
+    runtime = _pi_doc().runtime(
+        _stub_provider(),
+        backend="e2b",
+        episode_timeout_s=12_000,
+    )
+
+    assert isinstance(runtime, E2BPiRuntime)
+    assert runtime._episode_timeout_s == 12_000  # noqa: SLF001 - public policy passthrough
+    runtime.close()
+    with pytest.raises(ValueError, match="episode_timeout_s applies only to e2b pi-node"):
+        _pi_doc().runtime(
+            _stub_provider(),
+            backend="local",
+            episode_timeout_s=12_000,
+        )

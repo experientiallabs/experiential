@@ -19,11 +19,15 @@ from harbor.models.task.config import MCPServerConfig
 from wmh.core.types import Action, ActionKind, JsonObject, Observation
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.environment import is_env_action
-from wmh.harness.runtime import RunResult
+from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    RunResult,
+    validate_episode_timeout_s,
+)
 from wmh.providers.base import ProviderConfig
 from wmh.providers.registry import get_provider
 
-WMH_HARBOR_AGENT_VERSION = "2"
+WMH_HARBOR_AGENT_VERSION = "3"
 WMH_HARBOR_AGENT_IMPORT_PATH = "wmh.evals.harbor.agent:WmhHarborAgent"
 # Keep every task command finite and leave cleanup headroom beneath the local Pi process cap. The
 # local shim also joins active request handlers, so a late-starting command cannot outlive runtime
@@ -121,6 +125,7 @@ class WmhHarborAgent(BaseAgent):
         provider_config: JsonObject,
         harness_backend: Literal["local", "e2b"] = "local",
         e2b_template: str | None = None,
+        episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     ) -> None:
         if extra_env:
             raise ValueError("WMH Harbor evaluation does not inject agent environment variables")
@@ -136,6 +141,15 @@ class WmhHarborAgent(BaseAgent):
             raise ValueError("harness_backend must be local or e2b")
         if harness_backend == "local" and e2b_template is not None:
             raise ValueError("e2b_template requires harness_backend='e2b'")
+        try:
+            self._episode_timeout_sec = validate_episode_timeout_s(episode_timeout_sec)
+        except ValueError as error:
+            raise ValueError("episode_timeout_sec must be a finite positive number") from error
+        if (
+            harness_backend == "local"
+            and self._episode_timeout_sec != DEFAULT_EVAL_EPISODE_TIMEOUT_S
+        ):
+            raise ValueError("episode_timeout_sec requires harness_backend='e2b'")
         self._harness = HarnessDoc.model_validate(harness)
         self._provider_config = ProviderConfig.model_validate(provider_config)
         expected_model_name = f"{self._provider_config.kind.value}/{self._provider_config.model}"
@@ -174,6 +188,9 @@ class WmhHarborAgent(BaseAgent):
             backend=self._harness_backend,
             e2b_template=self._e2b_template,
             pi_transport=self._pi_transport,
+            episode_timeout_s=(
+                self._episode_timeout_sec if self._harness_backend == "e2b" else None
+            ),
             # A real task environment is mutable, so an E2B transport failure must not replay
             # the whole episode against already-mutated state. Local Pi has no replay wrapper.
             transport_retries=0 if self._harness_backend == "e2b" else None,

@@ -49,6 +49,10 @@ from wmh.harness.project_proposer import (
     CandidateProposer,
     ProjectCandidateProposer,
 )
+from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    validate_episode_timeout_s,
+)
 from wmh.harness.source_tree import HarnessSourceTree
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import ProviderConfig, ToolCallingProvider
@@ -130,6 +134,12 @@ def optimize_harness(
         max=MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         help="Maximum seconds for one command in the Harbor-owned task environment.",
     ),
+    episode_timeout_sec: float = typer.Option(
+        DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+        "--episode-timeout",
+        min=0.001,
+        help="Maximum seconds for one evaluated E2B harness episode.",
+    ),
     project_timeout_sec: float = typer.Option(
         DEFAULT_PROJECT_TIMEOUT_S,
         "--project-timeout",
@@ -188,6 +198,15 @@ def optimize_harness(
         )
     if not reward_key:
         raise typer.BadParameter("--reward-key must be nonempty")
+    try:
+        episode_timeout_sec = validate_episode_timeout_s(episode_timeout_sec)
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--episode-timeout") from error
+    if harness_backend == "local" and episode_timeout_sec != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
+        raise typer.BadParameter(
+            "--episode-timeout requires --harness-backend e2b",
+            param_hint="--episode-timeout",
+        )
 
     job_config = load_harbor_config(Path(harbor_config))
     task_ids = load_task_ids(Path(task_ids_file))
@@ -211,7 +230,8 @@ def optimize_harness(
     _console.print(
         f"fixed search: 1 seed + {iterations} proposal slot(s), {len(task_ids)} task(s), "
         f"{attempts} attempt(s) -> up to {score_cells} requested score cells; "
-        f"ceiling={max_score_cells}; evaluated Pi backend={harness_backend}; proposer project=e2b"
+        f"ceiling={max_score_cells}; evaluated Pi backend={harness_backend}; "
+        f"episode timeout={episode_timeout_sec:g}s; proposer project=e2b"
     )
     if not yes:
         if not _console.is_terminal:
@@ -243,6 +263,7 @@ def optimize_harness(
         max_history_bytes=max_history_bytes,
         resume=resume,
         max_new_boundaries=max_new_boundaries,
+        episode_timeout_sec=episode_timeout_sec,
     )
     if isinstance(outcome, HarnessOptimizeProgress):
         completed = len(outcome.result.iterations) + 1
@@ -282,6 +303,7 @@ def _execute_optimization(
     max_history_bytes: int,
     resume: bool,
     max_new_boundaries: int | None = None,
+    episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
 ) -> HarnessOptimizeOutcome | HarnessOptimizeProgress:
     """Resolve one immutable scorer request, execute it, and publish evidence before winner."""
     if max_new_boundaries is not None and (
@@ -314,6 +336,7 @@ def _execute_optimization(
                 provider_config=agent_config,
                 reward_key=reward_key,
                 environment_command_timeout_sec=environment_command_timeout_sec,
+                episode_timeout_sec=episode_timeout_sec,
                 harness_backend=harness_backend,
                 e2b_template=e2b_template if harness_backend == "e2b" else None,
             )
@@ -355,6 +378,7 @@ def _execute_optimization(
             harness_backend=harness_backend,
             e2b_template=e2b_template or None,
             environment_command_timeout_sec=environment_command_timeout_sec,
+            episode_timeout_sec=episode_timeout_sec,
             project_timeout_sec=project_timeout_sec,
             max_source_files=DEFAULT_SOURCE_TREE_MAX_FILES,
             max_source_bytes=DEFAULT_SOURCE_TREE_MAX_BYTES,

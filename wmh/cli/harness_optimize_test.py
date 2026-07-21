@@ -262,6 +262,7 @@ def _checkpoint_identity(
         harness_backend="local",
         e2b_template=None,
         environment_command_timeout_sec=300,
+        episode_timeout_sec=300,
         project_timeout_sec=900,
         max_source_files=module.DEFAULT_SOURCE_TREE_MAX_FILES,
         max_source_bytes=module.DEFAULT_SOURCE_TREE_MAX_BYTES,
@@ -378,6 +379,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
         harness_backend="e2b",
         e2b_template="template-x",
         environment_command_timeout_sec=300,
+        episode_timeout_sec=12_000,
         project_timeout_sec=900,
         max_history_candidates=20,
         max_history_bytes=1_000_000,
@@ -389,6 +391,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert scorer_call["provider_config"] == agent_config
     assert scorer_call["harness_backend"] == "e2b"
     assert scorer_call["e2b_template"] == "template-x"
+    assert scorer_call["episode_timeout_sec"] == 12_000
     assert cast(JobConfig, scorer_call["job_config"]).jobs_dir == run_dir / "harbor"
     assert len(project_calls) == 3
     assert len({id(project) for project in projects}) == 3
@@ -417,6 +420,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert outcome.saved.doc_hash == result.best.candidate.doc_hash
     assert (root / "harnesses/selected/aliases.toml").exists()
     assert json.loads((run_dir / "inputs.json").read_text())["iterations"] == 3
+    assert json.loads((run_dir / "inputs.json").read_text())["episode_timeout_sec"] == 12_000
     written = json.loads((run_dir / "outcome.json").read_text())
     assert written["best_candidate_id"] == "candidate-0000"
     assert written["project_sandbox_usage"] == {"count": 3, "seconds": 37.5}
@@ -502,6 +506,7 @@ def test_execute_stops_ready_then_resumes_without_publishing_partial_work(
         "harness_backend": "local",
         "e2b_template": None,
         "environment_command_timeout_sec": 300,
+        "episode_timeout_sec": 300.0,
         "project_timeout_sec": 900,
         "max_history_candidates": 20,
         "max_history_bytes": 1_000_000,
@@ -612,6 +617,7 @@ def test_execute_resumes_ready_seed_at_next_slot_without_rescoring(
         harness_backend="local",
         e2b_template=None,
         environment_command_timeout_sec=300,
+        episode_timeout_sec=300,
         project_timeout_sec=900,
         max_source_files=module.DEFAULT_SOURCE_TREE_MAX_FILES,
         max_source_bytes=module.DEFAULT_SOURCE_TREE_MAX_BYTES,
@@ -727,6 +733,82 @@ def test_execute_resumes_ready_seed_at_next_slot_without_rescoring(
     assert propose_calls == [("candidate-0000",)]
     assert len(outcome.result.iterations) == 1
     assert outcome.result.iterations[0].error is not None
+
+
+def test_resume_rejects_episode_timeout_drift_before_any_score_or_project_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    root = tmp_path / ".wmh"
+    seed = _source("seed")
+    request = _request()
+    job_config = _job_config(tmp_path)
+    meta_config, agent_config = _configs()
+    identity = _checkpoint_identity(
+        run_dir=run_dir,
+        root=root,
+        job_config=job_config,
+        seed=seed,
+        request=request,
+        iterations=1,
+        max_score_cells=2,
+        meta_config=meta_config,
+        agent_config=agent_config,
+    ).model_copy(
+        update={
+            "harness_backend": "e2b",
+            "e2b_template": "template",
+            "episode_timeout_sec": 300,
+        }
+    )
+    with PopulationCheckpointStore.create(run_dir, identity=identity, seed=seed):
+        pass
+
+    class FakeScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> FakeScorer:
+            return cls()
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            assert attempts == 1
+            return request
+
+        def score(self, *_args: object, **_kwargs: object) -> HarnessScore:
+            raise AssertionError("identity drift must fail before scoring")
+
+    class NoProject:
+        @classmethod
+        def create(cls, **_kwargs: object) -> None:
+            raise AssertionError("identity drift must fail before project creation")
+
+    monkeypatch.setattr(module, "HarborScorer", FakeScorer)
+    monkeypatch.setattr(module, "AgentProject", NoProject)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+
+    with pytest.raises(PopulationCheckpointError, match="episode_timeout_sec"):
+        _execute_optimization(
+            name="selected",
+            root=str(root),
+            run_dir=run_dir,
+            job_config=job_config,
+            task_ids=("task-a",),
+            reward_key="reward",
+            iterations=1,
+            attempts=1,
+            max_score_cells=2,
+            seed=None,
+            seed_reference=None,
+            meta_config=meta_config,
+            agent_config=agent_config,
+            harness_backend="e2b",
+            e2b_template="template",
+            environment_command_timeout_sec=300,
+            episode_timeout_sec=12_000,
+            project_timeout_sec=900,
+            max_history_candidates=20,
+            max_history_bytes=1_000_000,
+            resume=True,
+        )
 
 
 def test_execute_resumes_mixed_prefix_at_next_id_without_replaying_scores(
@@ -1225,6 +1307,7 @@ def test_execute_resumes_exact_publication_after_alias_before_complete(
         "harness_backend": "local",
         "e2b_template": None,
         "environment_command_timeout_sec": 300,
+        "episode_timeout_sec": 300.0,
         "project_timeout_sec": 900,
         "max_history_candidates": 20,
         "max_history_bytes": 1_000_000,
@@ -1625,6 +1708,10 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
             "1",
             "--max-score-cells",
             "3",
+            "--harness-backend",
+            "e2b",
+            "--episode-timeout",
+            "12000",
             "--max-new-boundaries",
             "1",
             "--result-out",
@@ -1637,6 +1724,9 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
 
     assert partial.exit_code == 0, partial.output
     assert calls[-1]["max_new_boundaries"] == 1
+    assert calls[-1]["harness_backend"] == "e2b"
+    assert calls[-1]["episode_timeout_sec"] == 12_000
+    assert "episode timeout=12000s" in " ".join(partial.output.split())
     assert "checkpointed" in partial.output
     assert "no winner published" in partial.output
     assert "--resume --result-out" in partial.output
@@ -1703,3 +1793,5 @@ def test_cli_help_preserves_model_roles_seed_syntax_and_local_output_wording() -
     assert "models.agent" in invoked.output
     assert "name@ref" in invoked.output
     assert "Local run directory" in invoked.output
+    assert "--episode-timeout" in invoked.output
+    assert "seconds" in invoked.output

@@ -21,6 +21,10 @@ from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
 from wmh.evals.harbor.scorer import HarborScorer
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, resolve_e2b_template
+from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    validate_episode_timeout_s,
+)
 from wmh.harness.score_archive import write_score_archive
 from wmh.harness.score_batch import (
     HarnessScoreBatch,
@@ -94,6 +98,12 @@ def score_harness_command(
         max=MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         help="Maximum seconds for one command in the Harbor-owned task environment.",
     ),
+    episode_timeout_sec: float = typer.Option(
+        DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+        "--episode-timeout",
+        min=0.001,
+        help="Maximum seconds for one evaluated E2B harness episode.",
+    ),
     result_out: str | None = typer.Option(
         None,
         "--result-out",
@@ -116,6 +126,15 @@ def score_harness_command(
         )
     if not reward_key:
         raise typer.BadParameter("--reward-key must be nonempty")
+    try:
+        episode_timeout_sec = validate_episode_timeout_s(episode_timeout_sec)
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--episode-timeout") from error
+    if harness_backend == "local" and episode_timeout_sec != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
+        raise typer.BadParameter(
+            "--episode-timeout requires --harness-backend e2b",
+            param_hint="--episode-timeout",
+        )
 
     targets = _resolve_targets(
         root,
@@ -135,7 +154,8 @@ def score_harness_command(
     _console.print(
         f"scoring {len(targets)} harness(es), {len(task_ids)} task(s), "
         f"{attempts} attempt(s) -> {score_cells} requested score cells; "
-        f"evaluated harness backend={harness_backend}"
+        f"evaluated harness backend={harness_backend}; "
+        f"episode timeout={episode_timeout_sec:g}s"
     )
     if not yes:
         if not _console.is_terminal:
@@ -154,6 +174,7 @@ def score_harness_command(
         harness_backend=cast("Literal['local', 'e2b']", harness_backend),
         e2b_template=(effective_e2b_template or "") if harness_backend == "e2b" else None,
         environment_command_timeout_sec=environment_command_timeout_sec,
+        episode_timeout_sec=episode_timeout_sec,
     )
     for entry in outcome.result.entries:
         _console.print(
@@ -176,6 +197,7 @@ def _execute_scoring(
     harness_backend: Literal["local", "e2b"],
     e2b_template: str | None,
     environment_command_timeout_sec: int,
+    episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
 ) -> HarnessScoreOutcome:
     """Resolve one immutable scorer request, score every target, and archive evidence."""
     validate_score_targets(targets)
@@ -192,6 +214,7 @@ def _execute_scoring(
             provider_config=agent_config,
             reward_key=reward_key,
             environment_command_timeout_sec=environment_command_timeout_sec,
+            episode_timeout_sec=episode_timeout_sec,
             harness_backend=harness_backend,
             e2b_template=e2b_template if harness_backend == "e2b" else None,
         )
@@ -199,13 +222,14 @@ def _execute_scoring(
     request = scorer.request(attempts=attempts)
     run_dir.mkdir(parents=True, exist_ok=False)
     inputs: JsonObject = {
-        "schema_version": 1,
+        "schema_version": 2,
         "score_request": request.model_dump(mode="json"),
         "harbor_job_template": effective_job_config.model_dump(mode="json"),
         "agent_provider": agent_config.model_dump(mode="json"),
         "harness_backend": harness_backend,
         "e2b_template": e2b_template or None,
         "environment_command_timeout_sec": environment_command_timeout_sec,
+        "episode_timeout_sec": episode_timeout_sec,
         "targets": [
             {
                 "label": target.label,

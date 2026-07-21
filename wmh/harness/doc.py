@@ -39,11 +39,13 @@ from wmh.harness.code_runtime import (
     compile_harness_code,
 )
 from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MAX_TURNS,
     DEFAULT_SYSTEM_PROMPT,
     AgentRuntime,
     Runtime,
+    validate_episode_timeout_s,
 )
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import DEFAULT_TOOLS, READ_SKILL, render_tools, resolve_tools
@@ -273,6 +275,7 @@ class HarnessDoc(BaseModel):
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
         pi_transport: Literal["ssh", "link"] | None = None,
+        episode_timeout_s: float | None = None,
         transport_retries: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
@@ -290,6 +293,8 @@ class HarnessDoc(BaseModel):
         `code:runtime` surface drives episodes with the harness's own in-process program; with
         neither, the fixed baseline loop runs. `transport_retries` controls whole-episode replay
         only for the E2B pi-node backend; omitting it preserves that runtime's one-retry default.
+        `episode_timeout_s` controls the E2B pi-node episode wall budget; omitting it preserves
+        the 300-second default, and other execution modes reject it instead of silently ignoring it.
         All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
@@ -304,6 +309,10 @@ class HarnessDoc(BaseModel):
         if pi_transport not in (None, "ssh", "link"):
             raise ValueError("pi_transport must be ssh or link")
         runtime_kind = self.runtime_kind()
+        if episode_timeout_s is not None:
+            episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
+            if backend != "e2b" or runtime_kind != "pi-node":
+                raise ValueError("episode_timeout_s applies only to e2b pi-node execution")
         if pi_transport is not None and (backend != "local" or runtime_kind != "pi-node"):
             raise ValueError("pi_transport applies only to local pi-node execution")
         if transport_retries is not None and (backend != "e2b" or runtime_kind != "pi-node"):
@@ -345,6 +354,11 @@ class HarnessDoc(BaseModel):
                     pool=e2b_pool,
                     max_turns=self.max_turns(),
                     max_output_tokens=self.max_output_tokens(),
+                    episode_timeout_s=(
+                        DEFAULT_EVAL_EPISODE_TIMEOUT_S
+                        if episode_timeout_s is None
+                        else episode_timeout_s
+                    ),
                     transport_retries=(1 if transport_retries is None else transport_retries),
                     should_cancel=should_cancel,
                 )

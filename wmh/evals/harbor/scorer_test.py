@@ -50,6 +50,7 @@ from wmh.evals.harbor.scorer import (
 )
 from wmh.evals.harbor.tasks import ResolvedHarborTaskSet, resolve_harbor_task_set
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.pi_e2b import DEFAULT_EVAL_EPISODE_TIMEOUT_S
 from wmh.harness.scoring import ScoreRequest, score_harness
 from wmh.providers.base import ProviderConfig, ProviderKind
 
@@ -153,6 +154,7 @@ def _executed_agent(
     harness_backend: str,
     e2b_template: str | None = None,
     environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
+    episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
 ) -> AgentConfig:
     return job_config.agents[0].model_copy(
         update={
@@ -168,6 +170,7 @@ def _executed_agent(
                 "harness_backend": harness_backend,
                 "e2b_template": e2b_template,
                 "command_timeout_sec": environment_command_timeout_sec,
+                "episode_timeout_sec": float(episode_timeout_sec),
             },
         },
         deep=True,
@@ -188,6 +191,7 @@ def _trial(
     harness_backend: Literal["local", "e2b"] = "local",
     e2b_template: str | None = None,
     environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
+    episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
 ) -> TrialResult:
     candidate = candidate or HarnessDoc.baseline()
     provider = provider or _provider()
@@ -215,6 +219,7 @@ def _trial(
             harness_backend=harness_backend,
             e2b_template=e2b_template,
             environment_command_timeout_sec=environment_command_timeout_sec,
+            episode_timeout_sec=episode_timeout_sec,
         ),
         environment=job_config.environment,
         verifier=job_config.verifier,
@@ -346,6 +351,7 @@ def _scorer(
     harness_backend: Literal["local", "e2b"] = "local",
     e2b_template: str | None = None,
     environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
+    episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
 ) -> tuple[HarborScorer, _Runner]:
     job_config = job_config or _job_config(tmp_path)
     dataset_path = job_config.datasets[0].path
@@ -359,6 +365,7 @@ def _scorer(
         provider_config=provider or _provider(),
         reward_key=reward_key,
         environment_command_timeout_sec=environment_command_timeout_sec,
+        episode_timeout_sec=episode_timeout_sec,
         harness_backend=harness_backend,
         e2b_template=e2b_template,
         runner=runner,
@@ -854,6 +861,94 @@ def test_environment_command_timeout_is_injected_and_execution_drift_is_rejected
             drift_scorer,
             HarnessDoc.baseline(),
             request=drift_scorer.request(attempts=1),
+        )
+
+
+def test_episode_timeout_is_evidence_bound_injected_and_drift_checked(tmp_path: Path) -> None:
+    timeout_sec = 12_000
+    job_dir = tmp_path / "completed-job"
+    trials = [
+        _trial(
+            job_dir,
+            task_id,
+            1,
+            score=1,
+            harness_backend="e2b",
+            e2b_template="",
+            episode_timeout_sec=timeout_sec,
+        )
+        for task_id in ("task-a", "task-b")
+    ]
+    scorer, runner = _scorer(
+        tmp_path,
+        _run(tmp_path, trials),
+        harness_backend="e2b",
+        e2b_template="",
+        episode_timeout_sec=timeout_sec,
+    )
+
+    score_harness(scorer, HarnessDoc.baseline(), request=scorer.request(attempts=1))
+
+    assert runner.configs[0].agents[0].kwargs["episode_timeout_sec"] == timeout_sec
+    assert (
+        scorer.context().execution_config_digest
+        != _scorer(
+            tmp_path / "default",
+            _run(tmp_path / "default", []),
+            harness_backend="e2b",
+            e2b_template="",
+        )[0]
+        .context()
+        .execution_config_digest
+    )
+
+    drift_path = tmp_path / "drift"
+    drift_job_dir = drift_path / "completed-job"
+    drift_trials = [
+        _trial(
+            drift_job_dir,
+            task_id,
+            1,
+            score=1,
+            harness_backend="e2b",
+            e2b_template="",
+            episode_timeout_sec=timeout_sec - 1,
+        )
+        for task_id in ("task-a", "task-b")
+    ]
+    drift_scorer, _ = _scorer(
+        drift_path,
+        _run(drift_path, drift_trials),
+        harness_backend="e2b",
+        e2b_template="",
+        episode_timeout_sec=timeout_sec,
+    )
+    with pytest.raises(ValueError, match="different agent config|execution config"):
+        score_harness(
+            drift_scorer,
+            HarnessDoc.baseline(),
+            request=drift_scorer.request(attempts=1),
+        )
+
+
+@pytest.mark.parametrize("invalid", [True, 0, -1, float("inf")])
+def test_scorer_rejects_invalid_episode_timeout(tmp_path: Path, invalid: object) -> None:
+    with pytest.raises(ValueError, match="episode_timeout_sec"):
+        _scorer(
+            tmp_path,
+            _run(tmp_path, []),
+            harness_backend="e2b",
+            episode_timeout_sec=cast("float", invalid),
+        )
+
+
+def test_scorer_rejects_nondefault_episode_timeout_for_local_backend(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="episode_timeout_sec requires harness_backend='e2b'"):
+        _scorer(
+            tmp_path,
+            _run(tmp_path, []),
+            harness_backend="local",
+            episode_timeout_sec=12_000,
         )
 
 

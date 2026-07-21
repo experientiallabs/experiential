@@ -148,6 +148,8 @@ def test_repeated_cancellation_cannot_detach_abort_drain_or_close(
         model_name="bedrock/worker-model",
         harness=HarnessDoc.baseline().model_dump(mode="json"),
         provider_config=_provider_config().model_dump(mode="json"),
+        harness_backend="e2b",
+        episode_timeout_sec=12_000,
     )
 
     async def run() -> None:
@@ -389,6 +391,7 @@ def test_agent_runs_the_exact_candidate_and_persists_its_trace(
         *,
         backend: str = "local",
         e2b_template: str | None = None,
+        episode_timeout_s: float | None = None,
         transport_retries: int | None = None,
         **_kwargs: object,
     ) -> _Runtime:
@@ -396,6 +399,7 @@ def test_agent_runs_the_exact_candidate_and_persists_its_trace(
         observed["provider"] = actual_provider
         observed["backend"] = backend
         observed["template"] = e2b_template
+        observed["episode_timeout_s"] = episode_timeout_s
         observed["transport_retries"] = transport_retries
         return _Runtime()
 
@@ -408,6 +412,7 @@ def test_agent_runs_the_exact_candidate_and_persists_its_trace(
         provider_config=_provider_config().model_dump(mode="json"),
         harness_backend="e2b",
         e2b_template="runner-template",
+        episode_timeout_sec=12_000,
     )
     context = AgentContext()
 
@@ -424,6 +429,7 @@ def test_agent_runs_the_exact_candidate_and_persists_its_trace(
         "provider": provider,
         "backend": "e2b",
         "template": "runner-template",
+        "episode_timeout_s": 12_000,
         "transport_retries": 0,
         "task_id": observed["task_id"],
         "instruction": "solve it",

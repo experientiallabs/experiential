@@ -198,6 +198,7 @@ def _identity(root: Path, seed: HarnessSourceTree) -> PopulationCheckpointIdenti
         harness_backend="e2b",
         e2b_template="template",
         environment_command_timeout_sec=300,
+        episode_timeout_sec=300,
         project_timeout_sec=900,
         max_source_files=100,
         max_source_bytes=1_000_000,

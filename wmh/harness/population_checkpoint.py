@@ -29,12 +29,12 @@ from wmh.harness.project_proposer import (
     EvaluatedCandidate,
     validate_candidate_turn,
 )
-from wmh.harness.runtime import TokenUsage
+from wmh.harness.runtime import TokenUsage, validate_episode_timeout_s
 from wmh.harness.scoring import HarnessScore, HarnessScoreReport, ScoreRequest
 from wmh.harness.source_tree import HarnessSourceFile, HarnessSourceTree
 from wmh.providers.base import ProviderConfig
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _CHECKPOINT_DIR = "checkpoint"
 _IDENTITY_FILE = "identity.json"
@@ -60,7 +60,7 @@ class PopulationCheckpointIdentity(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = _SCHEMA_VERSION
+    schema_version: Literal[2] = _SCHEMA_VERSION
     output_name: str = Field(min_length=1, max_length=512)
     artifact_root: str = Field(min_length=1)
     seed_reference: str | None = None
@@ -76,6 +76,7 @@ class PopulationCheckpointIdentity(BaseModel):
     harness_backend: Literal["local", "e2b"]
     e2b_template: str | None = None
     environment_command_timeout_sec: int = Field(strict=True, ge=1)
+    episode_timeout_sec: float = Field(gt=0)
     project_timeout_sec: float = Field(gt=0)
     max_source_files: int = Field(strict=True, ge=1)
     max_source_bytes: int = Field(strict=True, ge=1)
@@ -88,6 +89,11 @@ class PopulationCheckpointIdentity(BaseModel):
         if isinstance(value, bool):
             raise ValueError("checkpoint counts must be integers, not booleans")
         return value
+
+    @field_validator("episode_timeout_sec", mode="before")
+    @classmethod
+    def _validate_episode_timeout(cls, value: object) -> float:
+        return validate_episode_timeout_s(value)
 
     @model_validator(mode="after")
     def _validate_score_cell_plan(self) -> PopulationCheckpointIdentity:
@@ -149,7 +155,7 @@ class PopulationCheckpointControl(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = _SCHEMA_VERSION
+    schema_version: Literal[2] = _SCHEMA_VERSION
     identity_hash: str = Field(pattern=_SHA256_PATTERN)
     state: Literal["ready", "in_progress", "complete"]
     committed_step: int = Field(strict=True, ge=-1)
@@ -218,7 +224,7 @@ class _FileRecord(BaseModel):
 class _SeedManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = _SCHEMA_VERSION
+    schema_version: Literal[2] = _SCHEMA_VERSION
     source_tree_hash: str
     files: tuple[_FileRecord, ...]
 
@@ -226,7 +232,7 @@ class _SeedManifest(BaseModel):
 class _BoundaryManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = _SCHEMA_VERSION
+    schema_version: Literal[2] = _SCHEMA_VERSION
     index: int = Field(strict=True, ge=0)
     previous_manifest_hash: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     outcome: Literal["seed", "scored", "invalid"]

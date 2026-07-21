@@ -1100,6 +1100,9 @@ class _FakePool:
         self.close_failures = 0
         _FakePool.instances.append(self)
 
+    def assert_episode_timeout(self, episode_timeout_s: float) -> None:
+        assert episode_timeout_s == 300
+
     def usage(self) -> SandboxUsage:
         return SandboxUsage(count=len(self.channels), seconds=1.5 * len(self.channels))
 

@@ -56,11 +56,13 @@ from wmh.harness.e2b_sandbox import (
 from wmh.harness.environment import AgentEnvironment
 from wmh.harness.runner_link import RunnerLink, WorkerFn
 from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MAX_TURNS,
     RunResult,
     RuntimeCancelled,
     StopReason,
+    validate_episode_timeout_s,
 )
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import ToolSpec
@@ -123,17 +125,21 @@ _DURABLE_STDOUT_SILENCE_GRACE_S = 45.0
 # and therefore leave renewal disabled.
 TRANSPORT_KEEPALIVE_TYPE = "transport_keepalive"
 _SANDBOX_TIMEOUT_REFRESH_S = 300.0
-# Renewal must not turn mutated agent code into an unbounded cost leak. A legitimate slow episode
-# may cross the base 15-minute lease, but one cell still gets a hard one-hour sandbox lifetime.
+# Renewal must not turn mutated agent code into an unbounded cost leak. The default hard lifetime
+# is one hour; a longer episode budget adds one default lease for in-flight work and cleanup.
 MAX_EVAL_EPISODE_LIFETIME_S = 3_600.0
-# A score cell must finish much sooner than the E2B lease-renewal safety cap. This wall budget is
-# host-enforced by RunnerLink and may be exceeded only by one already-running provider/tool call.
-DEFAULT_EVAL_EPISODE_TIMEOUT_S = 300.0
 _MAX_RETIRE_WORKERS = 16
 
 _HTTPCORE_REMOTE_STREAM_RESET = re.compile(
     r"<StreamReset stream_id:\d+, error_code:\d+, remote_reset:True>"
 )
+
+
+def _episode_lease_lifetime_s(episode_timeout_s: float) -> float:
+    """Keep the legacy default, or cover one synchronous call plus cleanup after the watchdog."""
+    if episode_timeout_s <= DEFAULT_EVAL_EPISODE_TIMEOUT_S:
+        return DEFAULT_SANDBOX_TIMEOUT_S
+    return episode_timeout_s + DEFAULT_SANDBOX_TIMEOUT_S
 
 
 class _Eof:
@@ -1136,12 +1142,24 @@ class E2BSandboxPool:
         metadata: dict[str, str] | None = None,
         sandbox_factory: SandboxFactory | None = None,
         hello_timeout: float = HELLO_TIMEOUT_S,
+        episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     ) -> None:
+        self._episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
+        lease_lifetime_s = _episode_lease_lifetime_s(self._episode_timeout_s)
+        self._sandbox_timeout_s = max(
+            math.ceil(DEFAULT_SANDBOX_TIMEOUT_S),
+            math.ceil(lease_lifetime_s),
+        )
+        self._max_episode_lifetime_s = max(
+            MAX_EVAL_EPISODE_LIFETIME_S,
+            lease_lifetime_s,
+        )
         self._template = resolve_e2b_template(template)
         self._factory = sandbox_factory or default_sandbox_factory(
             api_key=api_key,
             template=self._template if self._template is not None else "",
             metadata=metadata,
+            timeout=self._sandbox_timeout_s,
         )
         self._hello_timeout = hello_timeout
         self._lock = threading.Lock()
@@ -1176,7 +1194,7 @@ class E2BSandboxPool:
                     break
                 sandbox, channel = self._idle.pop()
             try:
-                sandbox.set_timeout(int(DEFAULT_SANDBOX_TIMEOUT_S))
+                sandbox.set_timeout(self._sandbox_timeout_s)
             except Exception:  # noqa: BLE001 - a dead idle sandbox is expected after long gaps
                 self._retire(sandbox)
                 continue
@@ -1206,6 +1224,20 @@ class E2BSandboxPool:
                 return sandbox, channel
         self._retire(sandbox)  # closed while we were bootstrapping: don't leak the sandbox
         raise RuntimeError("E2BSandboxPool is closed")
+
+    def assert_episode_timeout(self, episode_timeout_s: float) -> None:
+        """Reject a runtime budget that this shared pool cannot keep alive."""
+        requested = validate_episode_timeout_s(episode_timeout_s)
+        required_lifetime = _episode_lease_lifetime_s(requested)
+        required_lease = max(math.ceil(DEFAULT_SANDBOX_TIMEOUT_S), math.ceil(required_lifetime))
+        if (
+            self._sandbox_timeout_s < required_lease
+            or self._max_episode_lifetime_s < required_lifetime
+        ):
+            raise ValueError(
+                "shared E2BSandboxPool episode timeout is too small; construct the pool "
+                f"with episode_timeout_s >= {requested:g}"
+            )
 
     def release(self, sandbox: SandboxHandle, channel: E2BStdioChannel, *, healthy: bool) -> None:
         """Return a sandbox for reuse, or discard it after a failed episode."""
@@ -1324,11 +1356,10 @@ class E2BSandboxPool:
         )
 
     def _start_runner(self, sandbox: SandboxHandle) -> E2BStdioChannel:
-        # Bootstrap can consume much of the creation-time lease on a template-less sandbox. Reset
-        # it immediately before the long-lived runner starts; subsequent in-flight heartbeats keep
-        # extending it while an episode is active.
-        timeout = int(DEFAULT_SANDBOX_TIMEOUT_S)
-        sandbox.set_timeout(timeout)
+        # The creation factory gives bootstrap and startup the configured lease. Reset only after
+        # the hello handshake so the next episode receives the full budget; subsequent in-flight
+        # heartbeats keep extending it while the episode is active.
+        timeout = self._sandbox_timeout_s
         # timeout=0 = no command-connection limit (SDK-documented): the runner must outlive every
         # episode on this sandbox; the sandbox's own lifetime is the real bound.
         handle = sandbox.commands.run(START_CMD, background=True, stdin=True, timeout=0)
@@ -1337,8 +1368,10 @@ class E2BSandboxPool:
             sandbox,
             cast("CommandHandle", handle),
             sandbox_timeout_s=timeout,
+            max_episode_lifetime_s=self._max_episode_lifetime_s,
         )
         self._await_hello(channel)
+        sandbox.set_timeout(timeout)
         return channel
 
     def _await_hello(self, channel: E2BStdioChannel) -> None:
@@ -1396,8 +1429,7 @@ class E2BPiRuntime:
             raise ValueError("max_output_tokens must be >= 1")
         if not 0.0 <= temperature <= 2.0:
             raise ValueError("temperature must be in [0, 2]")
-        if episode_timeout_s <= 0:
-            raise ValueError("episode_timeout_s must be positive")
+        episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
         if (
             isinstance(transport_retries, bool)
             or not isinstance(transport_retries, int)
@@ -1418,9 +1450,16 @@ class E2BPiRuntime:
         self._should_cancel = should_cancel
         self._aborted = threading.Event()
         self._owns_pool = pool is None
-        self._pool = pool or E2BSandboxPool(
-            template=template, api_key=api_key, hello_timeout=hello_timeout
-        )
+        if pool is None:
+            self._pool = E2BSandboxPool(
+                template=template,
+                api_key=api_key,
+                hello_timeout=hello_timeout,
+                episode_timeout_s=episode_timeout_s,
+            )
+        else:
+            pool.assert_episode_timeout(episode_timeout_s)
+            self._pool = pool
 
     def run(self, task_id: str, instruction: str, environment: AgentEnvironment) -> RunResult:
         if self._cancel_requested():
