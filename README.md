@@ -6,6 +6,12 @@ builds task-specific harnesses for stronger performance at lower cost.
 
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
+<p align="center">
+  🚀 <a href="https://platform.experientiallabs.ai">Platform</a> |
+  📚 <a href="https://github.com/experientiallabs/world-model-harness/tree/main/docs">Docs</a> |
+  🐛 <a href="https://github.com/experientiallabs/world-model-harness/issues">Issues</a>
+</p>
+
 ## Getting started
 
 ### Local setup
