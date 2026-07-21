@@ -282,6 +282,39 @@ def test_project_proposer_history_is_append_only_and_previous_trace_remains_visi
     assert len(project.run_calls) == 2
 
 
+def test_partial_history_write_cannot_be_reused_for_a_different_candidate() -> None:
+    class _HistoryWriteFailsOnceProject(_FakeProject):
+        def __init__(self) -> None:
+            super().__init__([_source("proposal")])
+            self.failed = False
+
+        def write_text(self, path: str, content: str) -> None:
+            if path.endswith("evaluation/report.json") and not self.failed:
+                self.failed = True
+                raise RuntimeError("history write interrupted")
+            super().write_text(path, content)
+
+    project = _HistoryWriteFailsOnceProject()
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    original = _evaluated("original", source=_source("original"))
+
+    with pytest.raises(RuntimeError, match="history write interrupted"):
+        proposer.propose((original,))
+
+    assert project.files["history/candidate-0000/source/SYSTEM.md"] == "original"
+    changed = _evaluated("changed", source=_source("changed"))
+    with pytest.raises(ValueError, match="already bound to another candidate"):
+        proposer.propose((changed,))
+    assert project.files["history/candidate-0000/source/SYSTEM.md"] == "original"
+    assert project.run_calls == []
+
+    recovered = proposer.propose((original,))
+
+    assert recovered.candidate_id == "candidate-0001"
+    assert len(project.run_calls) == 1
+
+
 def test_pre_turn_stage_failure_does_not_advance_proposal_identity() -> None:
     class _StageFailsOnceProject(_FakeProject):
         def __init__(self) -> None:

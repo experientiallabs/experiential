@@ -35,6 +35,8 @@ class CandidateProject(Protocol):
 
     def write_text(self, path: str, content: str) -> None: ...
 
+    def read_text(self, path: str) -> str: ...
+
     def stage_source_tree(
         self,
         tree: HarnessSourceTree,
@@ -195,7 +197,11 @@ class ProjectCandidateProposer:
         if len(fingerprints) < len(self._history_fingerprints):
             raise ValueError("candidate proposal history must preserve its append-only prefix")
 
-        self._materialize_history(frozen_history, start=len(self._history_fingerprints))
+        self._materialize_history(
+            frozen_history,
+            fingerprints=fingerprints,
+            start=len(self._history_fingerprints),
+        )
         self._history_fingerprints = fingerprints
         self._write_history_manifest(frozen_history)
         self._check_cancelled(should_cancel)
@@ -329,11 +335,13 @@ class ProjectCandidateProposer:
         self,
         history: Sequence[EvaluatedCandidate],
         *,
+        fingerprints: Sequence[str],
         start: int,
     ) -> None:
         """Append every new complete candidate and exact artifact byte to the project."""
         for index, evaluated in enumerate(history[start:], start=start):
             directory = f"history/candidate-{index:04d}"
+            self._bind_history_slot(directory, fingerprints[index])
             self._write_source_tree(f"{directory}/source", evaluated.source)
             self._project.write_text(
                 f"{directory}/evaluation/report.json",
@@ -357,6 +365,20 @@ class ProjectCandidateProposer:
             self._project.write_text(
                 f"{directory}/evaluation/artifacts.json",
                 _json(artifact_manifest),
+            )
+
+    def _bind_history_slot(self, directory: str, fingerprint: str) -> None:
+        """Bind one history index before non-atomic writes so retries cannot mix candidates."""
+        identity_path = f"{directory}/fingerprint.txt"
+        try:
+            existing = self._project.read_text(identity_path)
+        except FileNotFoundError:
+            self._project.write_text(identity_path, fingerprint)
+            return
+        if existing != fingerprint:
+            raise ValueError(
+                f"{directory} is already bound to another candidate after a partial write; "
+                "retry with the original history or create a fresh project"
             )
 
     def _write_history_manifest(self, history: Sequence[EvaluatedCandidate]) -> None:
