@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
+from wmh.core.types import JsonObject
+from wmh.harness.archive_io import (
+    copy_score_artifacts,
+    publish_json_manifest,
+    relative_path,
+    write_source_tree,
+    write_text,
+)
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.population import PopulationOptimizationResult
 from wmh.harness.runtime import TokenUsage
-from wmh.harness.source_tree import HarnessSourceTree
 
 _SCHEMA_VERSION = 1
 
@@ -37,7 +43,7 @@ def write_population_archive(
         raise ValueError("population archive candidates use different score requests")
 
     root.mkdir(parents=True)
-    population_entries: list[dict[str, object]] = []
+    population_entries: list[JsonObject] = []
     population_ids: set[str] = set()
     for index, evaluated in enumerate(result.population):
         if evaluated.candidate_id in population_ids:
@@ -45,41 +51,30 @@ def write_population_archive(
         population_ids.add(evaluated.candidate_id)
         candidate_dir = root / "population" / f"{index:04d}"
         source_dir = candidate_dir / "source"
-        _write_source_tree(source_dir, evaluated.source)
+        write_source_tree(source_dir, evaluated.source)
         report_path = candidate_dir / "score.json"
-        _write_text(report_path, evaluated.score.report.model_dump_json(indent=2))
+        write_text(report_path, evaluated.score.report.model_dump_json(indent=2))
         artifacts_dir = candidate_dir / "artifacts"
-        for artifact in evaluated.score.report.artifacts:
-            content = evaluated.score.artifacts.read_bytes(artifact.path)
-            if len(content) != artifact.size_bytes:
-                raise ValueError(f"artifact {artifact.path!r} size differs from its score manifest")
-            digest = "sha256:" + hashlib.sha256(content).hexdigest()
-            if digest != artifact.content_hash:
-                raise ValueError(
-                    f"artifact {artifact.path!r} content differs from its score manifest"
-                )
-            target = artifacts_dir / artifact.path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
+        copy_score_artifacts(artifacts_dir, evaluated.score)
         population_entries.append(
             {
                 "index": index,
                 "candidate_id": evaluated.candidate_id,
                 "document_hash": evaluated.candidate.doc_hash,
                 "source_tree_hash": evaluated.source.tree_hash,
-                "source_path": _relative(root, source_dir),
-                "score_path": _relative(root, report_path),
-                "artifacts_path": _relative(root, artifacts_dir),
+                "source_path": relative_path(root, source_dir),
+                "score_path": relative_path(root, report_path),
+                "artifacts_path": relative_path(root, artifacts_dir),
             }
         )
 
-    iteration_entries: list[dict[str, object]] = []
+    iteration_entries: list[JsonObject] = []
     for expected_index, iteration in enumerate(result.iterations, 1):
         if iteration.index != expected_index:
             raise ValueError("population archive iterations must be contiguous and one-indexed")
         iteration_dir = root / "iterations" / f"{iteration.index:04d}"
         events_path = iteration_dir / "events.json"
-        entry: dict[str, object] = {}
+        entry: JsonObject = {}
         if iteration.error is not None:
             events = iteration.error.events
             usage = iteration.error.worker_usage
@@ -90,14 +85,14 @@ def write_population_archive(
                     "outcome": "invalid",
                     "error": str(iteration.error),
                     "worker_usage": _usage(usage),
-                    "events_path": _relative(root, events_path),
+                    "events_path": relative_path(root, events_path),
                 }
             )
             if iteration.error.source is not None:
                 source_dir = iteration_dir / "source"
-                _write_source_tree(source_dir, iteration.error.source)
+                write_source_tree(source_dir, iteration.error.source)
                 entry["source_tree_hash"] = iteration.error.source.tree_hash
-                entry["source_path"] = _relative(root, source_dir)
+                entry["source_path"] = relative_path(root, source_dir)
         else:
             assert iteration.proposal is not None
             assert iteration.evaluation is not None
@@ -110,14 +105,14 @@ def write_population_archive(
                     "document_hash": iteration.proposal.candidate.doc_hash,
                     "source_tree_hash": iteration.proposal.source.tree_hash,
                     "worker_usage": _usage(iteration.proposal.worker_usage),
-                    "events_path": _relative(root, events_path),
+                    "events_path": relative_path(root, events_path),
                 }
             )
         _write_events(events_path, events)
         iteration_entries.append(entry)
 
     manifest_path = root / "manifest.json"
-    manifest = {
+    manifest: JsonObject = {
         "schema_version": _SCHEMA_VERSION,
         "score_request": request.model_dump(mode="json"),
         "best_candidate_id": result.best.candidate_id,
@@ -125,33 +120,19 @@ def write_population_archive(
         "population": population_entries,
         "iterations": iteration_entries,
     }
-    manifest_temp = manifest_path.with_name(f"{manifest_path.name}.tmp")
-    _write_text(manifest_temp, json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    manifest_temp.replace(manifest_path)
-    return manifest_path
-
-
-def _write_source_tree(destination: Path, source: HarnessSourceTree) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    for item in source.files:
-        target = destination / item.path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(item.content, encoding="utf-8")
+    return publish_json_manifest(manifest_path, manifest)
 
 
 def _write_events(path: Path, events: tuple[SessionEvent, ...]) -> None:
     payload = [{"kind": event.kind, "payload": event.payload} for event in events]
-    _write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def _usage(usage: TokenUsage | None) -> dict[str, int] | None:
-    return usage.model_dump(mode="json") if usage is not None else None
-
-
-def _write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-
-
-def _relative(root: Path, path: Path) -> str:
-    return path.relative_to(root).as_posix()
+def _usage(usage: TokenUsage | None) -> JsonObject | None:
+    if usage is None:
+        return None
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "calls": usage.calls,
+    }

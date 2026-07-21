@@ -3,25 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
 
 import typer
-import yaml
 from harbor.models.job.config import JobConfig
-from pydantic import ValidationError
 from rich.console import Console
 from rich.prompt import Confirm
 
 from wmh.agents.default import default_agent
 from wmh.agents.optimizer import optimizer_agent
 from wmh.agents.project import DEFAULT_PROJECT_TIMEOUT_S, AgentProject
+from wmh.cli.harbor_inputs import load_harbor_config, load_task_ids, write_json_atomic
 from wmh.cli.model_roles import resolve_required_model_config
 from wmh.config import ARTIFACT_DIR
 from wmh.config.store import validate_name
+from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
 from wmh.evals.harbor.scorer import HarborScorer
 from wmh.harness.doc import HarnessDoc
@@ -33,7 +32,6 @@ from wmh.harness.project_proposer import (
     DEFAULT_MAX_HISTORY_CANDIDATES,
     ProjectCandidateProposer,
 )
-from wmh.harness.scoring import ScoreRequest
 from wmh.harness.source_tree import HarnessSourceTree
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import ProviderConfig, ToolCallingProvider
@@ -145,8 +143,8 @@ def optimize_harness(
     if not reward_key:
         raise typer.BadParameter("--reward-key must be nonempty")
 
-    job_config = _load_harbor_config(Path(harbor_config))
-    task_ids = _load_task_ids(Path(task_ids_file))
+    job_config = load_harbor_config(Path(harbor_config))
+    task_ids = load_task_ids(Path(task_ids_file))
     meta_config = resolve_required_model_config(root, "meta")
     agent_config = resolve_required_model_config(root, "agent")
     seed_source = _resolve_seed_source(root, seed)
@@ -233,30 +231,28 @@ def _execute_optimization(
         )
     )
     request = scorer.request(attempts=attempts)
+    inputs: JsonObject = {
+        "schema_version": 1,
+        "seed_source_tree_hash": seed.tree_hash,
+        "iterations": iterations,
+        "score_request": request.model_dump(mode="json"),
+        "harbor_job_template": effective_job_config.model_dump(mode="json"),
+        "meta_provider": meta_config.model_dump(mode="json"),
+        "agent_provider": agent_config.model_dump(mode="json"),
+        "harness_backend": harness_backend,
+        "e2b_template": e2b_template or None,
+        "environment_command_timeout_sec": environment_command_timeout_sec,
+        "project_timeout_sec": project_timeout_sec,
+        "max_history_candidates": max_history_candidates,
+        "max_history_bytes": max_history_bytes,
+    }
     meta_provider = get_provider(meta_config)
     if not isinstance(meta_provider, ToolCallingProvider):
         raise typer.BadParameter("settings [models.meta] provider lacks structured tool calling")
     # Only claim the requested output path after all read-only setup validation succeeds. Once
     # execution can incur spend, an incomplete directory remains deliberate failure evidence.
     run_dir.mkdir(parents=True, exist_ok=False)
-    _write_json_atomic(
-        run_dir / "inputs.json",
-        {
-            "schema_version": 1,
-            "seed_source_tree_hash": seed.tree_hash,
-            "iterations": iterations,
-            "score_request": request.model_dump(mode="json"),
-            "harbor_job_template": effective_job_config.model_dump(mode="json"),
-            "meta_provider": meta_config.model_dump(mode="json"),
-            "agent_provider": agent_config.model_dump(mode="json"),
-            "harness_backend": harness_backend,
-            "e2b_template": e2b_template or None,
-            "environment_command_timeout_sec": environment_command_timeout_sec,
-            "project_timeout_sec": project_timeout_sec,
-            "max_history_candidates": max_history_candidates,
-            "max_history_bytes": max_history_bytes,
-        },
-    )
+    write_json_atomic(run_dir / "inputs.json", inputs)
     with AgentProject.create(
         timeout=project_timeout_sec,
         template=e2b_template,
@@ -279,19 +275,17 @@ def _execute_optimization(
     archive_manifest = write_population_archive(run_dir / "population", result)
     selected = result.best.candidate.model_copy(update={"name": name, "version": 0})
     saved = HarnessStore(root).save_version(selected, alias=CHAMPION_ALIAS)
-    _write_json_atomic(
-        run_dir / "outcome.json",
-        {
-            "schema_version": 1,
-            "best_candidate_id": result.best.candidate_id,
-            "best_score": result.best_score,
-            "best_document_hash": result.best.candidate.doc_hash,
-            "saved_harness": saved.name,
-            "saved_version": saved.version,
-            "archive_manifest": archive_manifest.relative_to(run_dir).as_posix(),
-            "project_sandbox_usage": project_usage.model_dump(mode="json"),
-        },
-    )
+    outcome: JsonObject = {
+        "schema_version": 1,
+        "best_candidate_id": result.best.candidate_id,
+        "best_score": result.best_score,
+        "best_document_hash": result.best.candidate.doc_hash,
+        "saved_harness": saved.name,
+        "saved_version": saved.version,
+        "archive_manifest": archive_manifest.relative_to(run_dir).as_posix(),
+        "project_sandbox_usage": project_usage.model_dump(mode="json"),
+    }
+    write_json_atomic(run_dir / "outcome.json", outcome)
     return HarnessOptimizeOutcome(
         result=result,
         saved=saved,
@@ -299,39 +293,6 @@ def _execute_optimization(
         archive_manifest=archive_manifest,
         project_usage=project_usage,
     )
-
-
-def _load_harbor_config(path: Path) -> JobConfig:
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-        return JobConfig.model_validate(raw)
-    except (OSError, yaml.YAMLError, ValidationError, ValueError, TypeError) as error:
-        raise typer.BadParameter(f"cannot load Harbor config from {path}: {error}") from error
-
-
-def _load_task_ids(path: Path) -> tuple[str, ...]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise typer.BadParameter(f"cannot load task IDs from {path}: {error}") from error
-    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
-        raise typer.BadParameter("task ID file must contain one JSON string list")
-    try:
-        # Reuse the canonical task identity validation without inventing a parallel CLI policy.
-        validated = ScoreRequest.model_validate(
-            {
-                "context": {
-                    "task_set_digest": "sha256:" + "0" * 64,
-                    "evaluator_digest": "sha256:" + "0" * 64,
-                    "execution_config_digest": "sha256:" + "0" * 64,
-                },
-                "task_ids": raw,
-                "attempts": 1,
-            }
-        )
-    except ValidationError as error:
-        raise typer.BadParameter(f"invalid task ID file: {error}") from error
-    return validated.task_ids
 
 
 def _resolve_seed_source(root: str, seed: str | None) -> HarnessSourceTree:
@@ -342,13 +303,3 @@ def _resolve_seed_source(root: str, seed: str | None) -> HarnessSourceTree:
         return HarnessSourceTree.from_doc(HarnessStore(root).load(name, ref or None))
     except (FileNotFoundError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
-
-
-def _write_json_atomic(path: Path, value: object) -> None:
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)

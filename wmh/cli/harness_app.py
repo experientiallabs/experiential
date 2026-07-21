@@ -2,10 +2,11 @@
 
 A harness is the scaffold an agent runs with: prompt surfaces, a tool policy, loop parameters, and
 skills, stored as immutable numbered versions with movable aliases (`champion` is what runs by
-default). `init` writes the baseline as v1; `list`/`show` inspect what exists; `create` searches
-for a better harness by **inverting the world model** — delta variants are scored closed-loop
-against it and gated on non-regression, so the environment model the traces built now steers what
-the agent's scaffold should be. Run one closed-loop with
+default). `init` writes the baseline as v1; `list`/`show` inspect what exists; `score` evaluates
+complete harnesses with an external scorer; `create` searches for a better harness by **inverting
+the world model**. Delta variants are scored closed-loop against it and gated on non-regression,
+so the environment model the traces built now steers what the agent's scaffold should be. Run one
+closed-loop with
 `wmh eval <tasks> --mode closed-loop --harness <name>[@ref]`.
 """
 
@@ -35,7 +36,7 @@ from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider
 
 harness_app = typer.Typer(
-    help="Named, versioned agent harnesses: create, optimize, initialize, list, and inspect.",
+    help="Named agent harnesses: initialize, inspect, create, optimize, and score.",
     no_args_is_help=True,
 )
 _console = Console()

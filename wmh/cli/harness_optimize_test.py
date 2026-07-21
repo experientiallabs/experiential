@@ -506,7 +506,7 @@ def test_cli_rejects_nonexact_task_id_manifests(tmp_path: Path, payload: str) ->
     path.write_text(payload, encoding="utf-8")
 
     with pytest.raises(typer.BadParameter):
-        module._load_task_ids(path)
+        module.load_task_ids(path)
 
 
 def test_cli_help_preserves_model_roles_seed_syntax_and_local_output_wording() -> None:
