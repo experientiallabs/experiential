@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
@@ -200,15 +201,20 @@ _REACHABLE_ERROR_MARKERS = (
 )
 
 
-def verify_via_ping(provider: Provider) -> VerifyResult:
+def verify_via_ping(provider: Provider, ping: Callable[[], object] | None = None) -> VerifyResult:
     """Shared `verify()`: one cheap short completion, reporting failure as ok=False.
 
     Every backend's verify() is identical apart from its kind/model (both on the config), so they
-    all delegate here. Never raises — `verify_all` relies on that to not crash startup.
+    all delegate here. `ping` substitutes the probe call when the config dispatches through a
+    route plain `complete` would not exercise (e.g. a structured Responses branch). Never
+    raises; `verify_all` relies on that to not crash startup.
     """
     cfg = provider.config
     try:
-        provider.complete("", _PING_MESSAGES, max_tokens=PING_MAX_TOKENS)
+        if ping is None:
+            provider.complete("", _PING_MESSAGES, max_tokens=PING_MAX_TOKENS)
+        else:
+            ping()
     except Exception as exc:  # noqa: BLE001 - verify reports failure, never raises
         # A max-tokens/output-limit error confirms reachability: the request reached the model
         # (auth + model id are valid) and only failed because a reasoning model consumed the 1-token

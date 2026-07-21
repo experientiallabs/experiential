@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import os
 from typing import TYPE_CHECKING
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
-from wmh.providers import _openai_common
+from wmh.providers import _openai_common, _responses_common
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    PING_MAX_TOKENS,
     ChatRequest,
     ChatResponse,
     Completion,
@@ -27,7 +28,18 @@ from wmh.providers.base import (
 )
 
 if TYPE_CHECKING:
-    from openai import AzureOpenAI
+    from openai import AzureOpenAI, OpenAI
+
+
+# One read-only verify probe for reasoning configs, sent through the same structured Responses
+# route real calls use. PING_MAX_TOKENS leaves room for a reasoning prelude; base's
+# reachable-error forgiveness covers models that still exhaust it.
+_REASONING_PING = ChatRequest.model_validate(
+    {
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_completion_tokens": PING_MAX_TOKENS,
+    }
+)
 
 
 class AzureOpenAIProvider:
@@ -36,7 +48,25 @@ class AzureOpenAIProvider:
     def __init__(self, config: ProviderConfig) -> None:
         self.config = config
         self._client: AzureOpenAI | None = None
+        self._responses_client: OpenAI | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
+
+    def _resolved_endpoint(self) -> tuple[str, bool]:
+        """Return the endpoint and whether it came from untrusted model configuration."""
+        env_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        endpoint = self.config.endpoint or env_endpoint
+        if not endpoint:
+            raise ValueError(
+                "AzureOpenAIProvider needs an endpoint: set config.endpoint or "
+                "AZURE_OPENAI_ENDPOINT."
+            )
+        # Compare canonically so a trailing slash or host-casing difference between the config
+        # value and the trusted env endpoint doesn't misclassify the same Azure resource as an
+        # untrusted host (which would strip the real key and break the call).
+        is_config_endpoint = self.config.endpoint is not None and not _same_endpoint(
+            self.config.endpoint, env_endpoint
+        )
+        return endpoint, is_config_endpoint
 
     def _get_client(self) -> AzureOpenAI:
         # Lazy: construct on first use. api_version must be supplied by config; the endpoint and
@@ -47,22 +77,10 @@ class AzureOpenAIProvider:
             if self.config.api_version is None:
                 raise ValueError("AzureOpenAIProvider requires config.api_version to be set.")
 
-            env_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-            endpoint = self.config.endpoint or env_endpoint
-            if not endpoint:
-                raise ValueError(
-                    "AzureOpenAIProvider needs an endpoint: set config.endpoint or "
-                    "AZURE_OPENAI_ENDPOINT."
-                )
+            endpoint, is_config_endpoint = self._resolved_endpoint()
 
             from openai import AzureOpenAI
 
-            # Compare canonically so a trailing slash or host-casing difference between the config
-            # value and the trusted env endpoint doesn't misclassify the same Azure resource as an
-            # untrusted host (which would strip the real key and break the call).
-            is_config_endpoint = self.config.endpoint is not None and not _same_endpoint(
-                self.config.endpoint, env_endpoint
-            )
             if is_config_endpoint:
                 # A config-controlled endpoint (config.toml can come from an untrusted model
                 # bundle) is an untrusted host. NEVER let the SDK fall back to the real
@@ -81,6 +99,31 @@ class AzureOpenAIProvider:
                     azure_endpoint=endpoint,
                 )
         return self._client
+
+    def _get_responses_client(self) -> OpenAI:
+        """Create the Azure v1 client used by configured structured reasoning calls."""
+        if self._responses_client is None:
+            endpoint, is_config_endpoint = self._resolved_endpoint()
+            if is_config_endpoint:
+                api_key = os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed"
+            else:
+                api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+                if not api_key:
+                    raise ValueError(
+                        "AzureOpenAIProvider needs AZURE_OPENAI_API_KEY for the v1 Responses API."
+                    )
+
+            from openai import OpenAI
+
+            self._responses_client = OpenAI(
+                api_key=api_key,
+                base_url=_responses_base_url(endpoint),
+                timeout=240.0,
+                # A lost SDK response may already be billed. Keep one WMH proposer turn equal to
+                # one provider dispatch so usage and the operator's hard budget stay observable.
+                max_retries=0,
+            )
+        return self._responses_client
 
     def _deployment(self) -> str:
         # On Azure, the `model` arg to the API is the deployment name, not the base model id.
@@ -106,6 +149,16 @@ class AzureOpenAIProvider:
             request,
             forward_temperature=self._forward_temperature,
         )
+        if self.config.reasoning_effort is not None:
+            # Structured reasoning needs Azure's native v1 Responses route: encrypted-reasoning
+            # replay and reasoning.effort are not part of the api-versioned chat-completions API.
+            return _responses_common.complete_chat(
+                self._get_responses_client().responses,
+                self._deployment(),
+                request,
+                reasoning_effort=self.config.reasoning_effort,
+                allow_sampling=False,
+            )
         return _openai_common.complete_chat(
             self._get_client().chat.completions,
             self._deployment(),
@@ -123,6 +176,10 @@ class AzureOpenAIProvider:
         )
 
     def verify(self) -> VerifyResult:
+        if self.config.reasoning_effort is not None:
+            # A reasoning config dispatches through the Azure v1 Responses route; a plain
+            # chat-completions ping would prove the wrong endpoint and api surface.
+            return verify_via_ping(self, ping=lambda: self.complete_chat(_REASONING_PING))
         return verify_via_ping(self)
 
 
@@ -143,3 +200,12 @@ def _same_endpoint(a: str, b: str | None) -> bool:
         pb.path.rstrip("/"),
         pb.query,
     )
+
+
+def _responses_base_url(endpoint: str) -> str:
+    """Normalize an Azure resource endpoint onto its native v1 route."""
+    parsed = urlsplit(endpoint)
+    path = parsed.path.rstrip("/")
+    if not path.lower().endswith("/openai/v1"):
+        path = f"{path}/openai/v1"
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/", parsed.query, ""))

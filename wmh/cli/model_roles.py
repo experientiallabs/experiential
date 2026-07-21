@@ -56,5 +56,6 @@ def resolve_opt_in_model_provider(
         endpoint=configured.endpoint,
         deployment=configured.deployment,
         api_version=api_version,
+        reasoning_effort=configured.reasoning_effort,
     )
     return get_provider(config), configured.model

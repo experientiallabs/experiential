@@ -61,6 +61,48 @@ class _FakeChat:
         self.completions = completions
 
 
+class _FakeResponsesResponse:
+    def __init__(self, tool_name: str = "bash") -> None:
+        self.tool_name = tool_name
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return {
+            "model": "gpt-5.5-2026-06-01",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "reasoning-1",
+                    "summary": [],
+                    "encrypted_content": "ciphertext-1",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": self.tool_name,
+                    "arguments": '{"command":"pwd"}',
+                    "status": "completed",
+                },
+            ],
+            "usage": {"input_tokens": 11, "output_tokens": 7},
+        }
+
+
+class _FakeResponses:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> _FakeResponsesResponse:
+        self.calls.append(kwargs)
+        return _FakeResponsesResponse()
+
+
+class _FakeResponsesClient:
+    def __init__(self, responses: _FakeResponses) -> None:
+        self.responses = responses
+
+
 class _FakeEmbeddingItem:
     def __init__(self, embedding: list[float]) -> None:
         self.embedding = embedding
@@ -97,6 +139,10 @@ def _config() -> ProviderConfig:
         deployment="gpt55-deploy",
         api_version="2024-10-21",
     )
+
+
+def _reasoning_config() -> ProviderConfig:
+    return _config().model_copy(update={"reasoning_effort": "high"})
 
 
 def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -139,6 +185,198 @@ def test_structured_chat_applies_model_temperature_capability(
     )
 
     assert ("temperature" in chat.last_kwargs) is expects_temperature
+
+
+def test_structured_reasoning_uses_azure_v1_and_replays_tool_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _FakeResponses()
+    provider = AzureOpenAIProvider(_reasoning_config())
+    monkeypatch.setattr(
+        provider,
+        "_get_responses_client",
+        lambda: _FakeResponsesClient(responses),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("reasoning tools must not use chat")),
+    )
+
+    first = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "inspect"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "description": "run a command",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+                "temperature": 0.3,
+                "top_p": 0.7,
+                "max_completion_tokens": 4096,
+            }
+        )
+    )
+
+    assert responses.calls[0] == {
+        "model": "gpt55-deploy",
+        "input": [{"role": "user", "content": "inspect"}],
+        "stream": False,
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+        "max_output_tokens": 4096,
+        "tools": [
+            {
+                "type": "function",
+                "name": "bash",
+                "description": "run a command",
+                "parameters": {"type": "object"},
+            }
+        ],
+        "reasoning": {"effort": "high"},
+    }
+    assert first.choices[0].finish_reason == "tool_calls"
+    assert first.choices[0].message.tool_calls is not None
+    assert first.choices[0].message.tool_calls[0].function.name == "bash"
+    assert first.token_usage().input_tokens == 11
+    assert first.token_usage().output_tokens == 7
+
+    assistant = first.choices[0].message.model_dump(mode="json", exclude_none=True)
+    provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [
+                    {"role": "user", "content": "inspect"},
+                    assistant,
+                    {"role": "tool", "tool_call_id": "call-1", "content": "/workspace"},
+                ],
+                "max_completion_tokens": 4096,
+            }
+        )
+    )
+
+    assert len(responses.calls) == 2
+    assert responses.calls[1]["input"] == [
+        {"role": "user", "content": "inspect"},
+        {"role": "assistant", "content": ""},
+        {
+            "type": "reasoning",
+            "id": "reasoning-1",
+            "summary": [],
+            "encrypted_content": "ciphertext-1",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "bash",
+            "arguments": '{"command":"pwd"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "/workspace",
+        },
+    ]
+    assert responses.calls[1]["reasoning"] == {"effort": "high"}
+
+
+def test_responses_client_uses_trusted_key_and_normalized_v1_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[dict[str, object]] = []
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            constructed.append(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://Trusted.openai.azure.com")
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    provider = AzureOpenAIProvider(
+        _reasoning_config().model_copy(update={"endpoint": "https://trusted.openai.azure.com/"})
+    )
+
+    first = provider._get_responses_client()
+    second = provider._get_responses_client()
+
+    assert first is second
+    assert constructed == [
+        {
+            "api_key": "az-real-secret",
+            "base_url": "https://trusted.openai.azure.com/openai/v1/",
+            "timeout": 240.0,
+            "max_retries": 0,
+        }
+    ]
+
+
+def test_untrusted_responses_endpoint_never_receives_real_azure_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[dict[str, object]] = []
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            constructed.append(kwargs)
+
+    monkeypatch.setattr("openai.OpenAI", _FakeOpenAI)
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "az-real-secret")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "endpoint-token")
+    provider = AzureOpenAIProvider(
+        _reasoning_config().model_copy(update={"endpoint": "https://untrusted.example"})
+    )
+
+    provider._get_responses_client()
+
+    assert constructed[0]["api_key"] == "endpoint-token"
+    assert constructed[0]["base_url"] == "https://untrusted.example/openai/v1/"
+
+
+def test_reasoning_verify_pings_the_responses_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    responses = _FakeResponses()
+    provider = AzureOpenAIProvider(_reasoning_config())
+    monkeypatch.setattr(
+        provider,
+        "_get_responses_client",
+        lambda: _FakeResponsesClient(responses),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("reasoning verify must not use chat")),
+    )
+
+    result = provider.verify()
+
+    assert result.ok is True
+    assert len(responses.calls) == 1
+    assert responses.calls[0]["reasoning"] == {"effort": "high"}
+    assert responses.calls[0]["max_output_tokens"] == 2048
+
+
+def test_reasoning_verify_treats_an_exhausted_ping_budget_as_reachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incomplete max_output_tokens response proves auth and route; verify must pass."""
+
+    class _ExhaustedClient:
+        class responses:  # noqa: N801 - mimic the SDK attribute path
+            @staticmethod
+            def create(**kwargs: object) -> object:
+                raise ValueError("Responses API returned incomplete response: max_output_tokens")
+
+    provider = AzureOpenAIProvider(_reasoning_config())
+    monkeypatch.setattr(provider, "_get_responses_client", lambda: _ExhaustedClient())
+
+    assert provider.verify().ok is True
 
 
 def test_missing_deployment_raises(monkeypatch: pytest.MonkeyPatch) -> None:
