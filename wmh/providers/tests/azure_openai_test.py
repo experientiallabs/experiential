@@ -358,6 +358,7 @@ def test_reasoning_verify_probes_the_structured_tool_route(
     assert len(responses.calls) == 1
     assert responses.calls[0]["reasoning"] == {"effort": "high"}
     assert responses.calls[0]["tool_choice"] == "required"
+    assert responses.calls[0]["max_output_tokens"] == 256
 
 
 def test_missing_deployment_raises(monkeypatch: pytest.MonkeyPatch) -> None:

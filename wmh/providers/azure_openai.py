@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from openai import AzureOpenAI, OpenAI
 
 
+_STRUCTURED_VERIFY_MAX_TOKENS = 256
 _STRUCTURED_TOOL_PING = ChatRequest.model_validate(
     {
         "messages": [{"role": "user", "content": "Call health_check exactly once."}],
@@ -49,7 +50,9 @@ _STRUCTURED_TOOL_PING = ChatRequest.model_validate(
             }
         ],
         "tool_choice": "required",
-        "max_completion_tokens": 2048,
+        # Verification exercises one required zero-argument call. Keep routine checks bounded
+        # while leaving enough output space for a short reasoning prelude and the tool payload.
+        "max_completion_tokens": _STRUCTURED_VERIFY_MAX_TOKENS,
         "store": False,
     }
 )
