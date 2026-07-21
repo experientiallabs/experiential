@@ -487,7 +487,18 @@ class AgentProject:
             f"id -u {self._shell_user} >/dev/null\n"
             f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
         )
-        self._sandbox.commands.run(command, user="root", timeout=30)
+        result = self._sandbox.commands.run(command, user="root", timeout=30)
+        exit_code = int(getattr(result, "exit_code", 0) or 0)
+        if exit_code != 0:
+            detail = str(
+                getattr(result, "stderr", "")
+                or getattr(result, "stdout", "")
+                or "shell setup command returned no output"
+            )
+            raise RuntimeError(
+                f"project shell workspace setup failed with exit {exit_code}: "
+                f"{_capped(detail).content}"
+            )
         self._shell_ready_sandbox_id = id(self._sandbox)
 
     def _emit_session_event(self, event: SessionEvent) -> None:

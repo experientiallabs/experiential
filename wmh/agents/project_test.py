@@ -1567,9 +1567,38 @@ def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
         command for command in sandbox.commands.runs if "useradd --system" in command
     )
     assert "useradd --system --user-group --no-create-home" in shell_setup
-    assert PROJECT_SHELL_USER in shell_setup
+    assert project._shell_user != PROJECT_SHELL_USER  # noqa: SLF001
+    assert f"id -u {project._shell_user}" in shell_setup  # noqa: SLF001
+    assert shell_setup.count(project._shell_user) == 3  # noqa: SLF001
     assert "mkdir -p /home/user/project/.scratch" in shell_setup
     assert "chmod 1777 /home/user/project/.scratch" in shell_setup
+
+
+def test_project_shell_setup_nonzero_exit_fails_closed_and_remains_retryable() -> None:
+    class _SetupFails(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setup_calls = 0
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background, kwargs
+            self.runs.append(cmd)
+            if "useradd --system" in cmd:
+                self.setup_calls += 1
+                return _Output(stderr="useradd rejected the shell identity", exit_code=9)
+            return _Output()
+
+    sandbox = _Sandbox()
+    commands = _SetupFails()
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    for _attempt in range(2):
+        with pytest.raises(RuntimeError, match="workspace setup failed with exit 9"):
+            project._prepare_shell_workspace()  # noqa: SLF001
+
+    assert commands.setup_calls == 2
+    assert project._shell_ready_sandbox_id is None  # noqa: SLF001
 
 
 def test_project_rejects_agents_with_uncontained_tools() -> None:
