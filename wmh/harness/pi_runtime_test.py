@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from socket import socket
+from typing import cast
+
+import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, Observation
@@ -15,7 +21,13 @@ from wmh.harness.doc import (
     Surface,
     SurfaceKind,
 )
-from wmh.harness.pi_runtime import PiRuntime, _Episode, _params_schema
+from wmh.harness.pi_runtime import (
+    PiRuntime,
+    _Episode,
+    _params_schema,
+    _ShimHandler,
+    _ShimServer,
+)
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
@@ -118,6 +130,41 @@ def test_read_skill_is_runtime_local_and_does_not_consume_environment_budget() -
     assert found == {"content": "wc -w <path>", "is_error": False}
     assert missing == {"content": "no skill named 'ghost'", "is_error": True}
     assert env.actions == []
+
+
+def test_local_shim_close_waits_for_active_environment_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler_started = threading.Event()
+    release_handler = threading.Event()
+    close_finished = threading.Event()
+    server = _ShimServer(("127.0.0.1", 0), _ShimHandler, bind_and_activate=False)
+
+    def blocking_request(_request: object, _client_address: object) -> None:
+        handler_started.set()
+        assert release_handler.wait(timeout=2)
+
+    monkeypatch.setattr(server, "process_request_thread", blocking_request)
+    server.process_request(cast("socket", object()), ("127.0.0.1", 1))
+    assert handler_started.wait(timeout=1)
+
+    def close_server() -> None:
+        server.server_close()
+        close_finished.set()
+
+    close_thread = threading.Thread(target=close_server)
+    close_thread.start()
+    try:
+        time.sleep(0.05)
+        assert _ShimServer.daemon_threads is False
+        assert close_finished.is_set() is False
+        assert close_thread.is_alive()
+    finally:
+        release_handler.set()
+        close_thread.join(timeout=2)
+
+    assert close_thread.is_alive() is False
+    assert close_finished.is_set()
 
 
 def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
