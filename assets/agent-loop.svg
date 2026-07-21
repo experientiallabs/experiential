@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
-  <title id="title">World model, worker agent, and optimizer agent</title>
-  <desc id="description">A world model sits above a worker agent and optimizer agent. Bidirectional arrows connect all three.</desc>
+  <title id="title">World model, worker agent, and optimizer</title>
+  <desc id="description">A world model sits above a worker agent and optimizer. Bidirectional arrows connect all three.</desc>
 
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -31,7 +31,7 @@
   <text class="box-copy" x="220" y="437">Runs tasks</text>
 
   <rect class="box" x="590" y="360" width="300" height="108" rx="12" stroke="#f5a623"/>
-  <text class="box-title" x="740" y="406">Optimizer agent</text>
+  <text class="box-title" x="740" y="406">Optimizer</text>
   <text class="box-copy" x="740" y="437">Improves the harness</text>
 
   <path class="edge" d="M 382 148 C 320 220 265 285 250 360" stroke="#0070f3" marker-start="url(#arrow-blue)" marker-end="url(#arrow-blue)"/>

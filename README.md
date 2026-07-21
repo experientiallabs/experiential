@@ -4,7 +4,7 @@
 includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
 builds task-specific harnesses for stronger performance at lower cost.
 
-![World model, worker agent, and optimizer agent connected in a continuous improvement loop](assets/agent-loop.svg)
+![World model, worker agent, and optimizer connected in a continuous improvement loop](assets/agent-loop.svg)
 
 ## Getting started
 
@@ -96,7 +96,7 @@ wmh run --attach
 wmh run --end
 ```
 
-## Worker and optimizer agents in E2B sandboxes
+## Worker agents and optimizers in E2B sandboxes
 
 WMH can run the real [pi](https://github.com/earendil-works/pi) worker inside isolated
 [E2B](https://e2b.dev) sandboxes while the world model supplies the environment. Optimization and
