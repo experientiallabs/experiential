@@ -64,8 +64,10 @@ _RECOVERABLE_SESSION_MARKERS = (
 )
 
 # One trusted in-sandbox walk turning a project directory into bounded {path: base64} JSON.
-# Regular files only (symlinks, sockets, and pipes are skipped); path and byte bounds are
-# enforced in-sandbox so the host never downloads more than the declared budget.
+# Only regular files are captured; every non-regular entry (symlink, socket, pipe) is COUNTED
+# in the payload's `skipped` list so the host can reject a candidate that would otherwise be
+# silently thinner than what the agent built. Path and byte bounds are enforced in-sandbox so
+# the host never downloads more than the declared budget.
 _SNAPSHOT_SOURCE_TREE_SCRIPT = r"""
 import base64
 import json
@@ -87,15 +89,21 @@ if not os.path.isdir(root):
     fail("source directory does not exist: " + root)
 
 files = []
+skipped = []
 total_bytes = 0
 for current, directories, names in os.walk(root, topdown=True, followlinks=False):
     directories.sort()
     names.sort()
+    for name in directories:
+        path = os.path.join(current, name)
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            skipped.append(os.path.relpath(path, root).replace(os.sep, "/"))
     for name in names:
         path = os.path.join(current, name)
-        if not stat.S_ISREG(os.lstat(path).st_mode):
-            continue
         relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            skipped.append(relative)
+            continue
         if len(relative.encode("utf-8")) > max_path_bytes:
             fail("file path exceeds " + str(max_path_bytes) + " bytes: " + relative)
         if len(files) >= max_files:
@@ -112,7 +120,7 @@ for current, directories, names in os.walk(root, topdown=True, followlinks=False
             }
         )
 
-json.dump({"files": files}, sys.stdout, separators=(",", ":"))
+json.dump({"files": files, "skipped": sorted(skipped)}, sys.stdout, separators=(",", ":"))
 """
 
 
@@ -136,6 +144,9 @@ class _EncodedSourceSnapshot(BaseModel):
     """The trusted sandbox script's wire representation."""
 
     files: tuple[_EncodedSourceFile, ...]
+    # Non-regular entries (symlinks, sockets, pipes) the walk refused to capture. A candidate
+    # containing them is invalid, not silently thinner, so the host raises on a nonzero count.
+    skipped: tuple[str, ...] = ()
 
 
 class ChannelFactory(Protocol):
@@ -329,7 +340,9 @@ class AgentProject:
 
         A single in-sandbox python walk emits every regular file as base64 JSON on stdout;
         the host decodes and validates it into a :class:`HarnessSourceTree`. Bound breaches,
-        non-UTF-8 content, and invalid paths raise with the offending path in the message.
+        non-UTF-8 content, invalid paths, and non-regular entries (symlinks, sockets, pipes)
+        all raise with the offending path in the message: a candidate is captured exactly or
+        rejected, never silently thinner.
         """
         if self._closing:
             raise RuntimeError("cannot snapshot a source tree in a closed project")
@@ -889,6 +902,12 @@ def _head_tail(content: str, cap: int) -> str:
 def _decode_source_tree_snapshot(payload: str) -> HarnessSourceTree:
     """Decode bounded base64 JSON from the trusted snapshot script."""
     encoded = _EncodedSourceSnapshot.model_validate_json(payload)
+    if encoded.skipped:
+        names = ", ".join(encoded.skipped)
+        raise ValueError(
+            f"directory contains {len(encoded.skipped)} non-regular entr(y/ies) that cannot "
+            f"be part of a portable source tree: {names}; replace them with regular files"
+        )
     files: list[HarnessSourceFile] = []
     for item in encoded.files:
         try:

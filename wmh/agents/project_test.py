@@ -1383,12 +1383,15 @@ def test_snapshot_source_tree_surfaces_in_sandbox_failures() -> None:
         project.snapshot_source_tree("candidate", max_files=10, max_bytes=1_000)
 
 
-def test_snapshot_script_walks_regular_files_within_bounds(tmp_path: Path) -> None:
-    """The trusted in-sandbox walk itself: sorted regular files, symlinks skipped, bounds."""
+def test_snapshot_script_walks_regular_files_and_counts_skipped_entries(
+    tmp_path: Path,
+) -> None:
+    """The trusted in-sandbox walk: sorted regular files, symlinks REPORTED, bounds."""
     (tmp_path / "src").mkdir()
     (tmp_path / "SYSTEM.md").write_text("hi", encoding="utf-8")
     (tmp_path / "src" / "loop.ts").write_text("x", encoding="utf-8")
     (tmp_path / "link.md").symlink_to(tmp_path / "SYSTEM.md")
+    (tmp_path / "link-dir").symlink_to(tmp_path / "src")
     script = project_module._SNAPSHOT_SOURCE_TREE_SCRIPT
 
     done = subprocess.run(
@@ -1399,6 +1402,8 @@ def test_snapshot_script_walks_regular_files_within_bounds(tmp_path: Path) -> No
     )
     data = json.loads(done.stdout)
     assert [item["path"] for item in data["files"]] == ["SYSTEM.md", "src/loop.ts"]
+    # Non-regular entries are counted, never silently dropped from the candidate.
+    assert data["skipped"] == ["link-dir", "link.md"]
 
     over = subprocess.run(
         [sys.executable, "-c", script, str(tmp_path), "10", "1", "1024"],
@@ -1407,6 +1412,14 @@ def test_snapshot_script_walks_regular_files_within_bounds(tmp_path: Path) -> No
     )
     assert over.returncode == 2
     assert "byte bound" in over.stderr
+
+
+def test_snapshot_source_tree_rejects_candidates_with_non_regular_entries() -> None:
+    payload = json.dumps({"files": [], "skipped": ["candidate/link.md"]})
+    project, _commands = _scripted_project([_Output(stdout=payload)])
+
+    with pytest.raises(RuntimeError, match="candidate/link.md"):
+        project.snapshot_source_tree("candidate", max_files=10, max_bytes=1_000)
 
 
 def test_run_retry_recoverable_false_is_single_attempt_and_closes_the_session() -> None:
