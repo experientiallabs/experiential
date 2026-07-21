@@ -6,7 +6,7 @@ from typing import Literal
 
 import typer
 
-from wmh.config.settings import load_settings
+from wmh.config.settings import ModelRole, load_settings
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 from wmh.providers.registry import get_provider
 
@@ -38,6 +38,27 @@ def resolve_opt_in_model_provider(
     configured = load_settings(root).models.resolve(role)
     if configured is None:
         return fallback, None
+    config = _model_config(configured, role=role)
+    return get_provider(config), configured.model
+
+
+def resolve_required_model_config(root: str, role: OptInModelRole) -> ProviderConfig:
+    """Resolve one opt-in role a workflow requires (no fallback provider exists for it).
+
+    The harbor optimize flow has no world model whose provider could stand in, so its
+    ``agent`` (worker) and ``meta`` (proposer) roles must be configured explicitly.
+    """
+    configured = load_settings(root).models.resolve(role)
+    if configured is None:
+        raise typer.BadParameter(
+            f"settings [models.{role}] must be configured in <root>/settings.toml for this "
+            f"workflow; add a [models.{role}] table with provider and model"
+        )
+    return _model_config(configured, role=role)
+
+
+def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderConfig:
+    """Turn one configured role into provider-neutral config with the Azure default."""
     try:
         kind = ProviderKind(configured.provider)
     except ValueError:
@@ -49,7 +70,7 @@ def resolve_opt_in_model_provider(
     api_version = configured.api_version
     if api_version is None and kind is ProviderKind.AZURE_OPENAI:
         api_version = _DEFAULT_AZURE_API_VERSION
-    config = ProviderConfig(
+    return ProviderConfig(
         kind=kind,
         model=configured.model,
         region=configured.region,
@@ -58,4 +79,3 @@ def resolve_opt_in_model_provider(
         api_version=api_version,
         reasoning_effort=configured.reasoning_effort,
     )
-    return get_provider(config), configured.model

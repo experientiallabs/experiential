@@ -9,18 +9,25 @@ advertises. Flag validation, task loading, and the harness store are real.
 from __future__ import annotations
 
 import importlib
+import json
 import shlex
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner, Result
 
 from wmh.cli import app
+from wmh.cli.harness_app import _HarborRunConfig
 from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.create import CreateResult, DeltaArchive
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.population import CandidateProposal, EvaluatedCandidate, candidate_slot_id
 from wmh.harness.proposer import ProviderDeltaProposer
+from wmh.harness.scoring import ScoreCell, ScoreReport, ScoreRequest
+from wmh.harness.source_tree import HarnessSourceFile, HarnessSourceTree
+from wmh.harness.store import HarnessStore
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 # The Typer object `harness_app` shadows the submodule name on plain attribute access; go
@@ -363,3 +370,235 @@ def test_optimize_rejects_unknown_backend(tmp_path: Path) -> None:
     result = _invoke(tmp_path, "--backend", "banana")
     assert result.exit_code == 2  # usage error, not a traceback
     assert "choose local or e2b" in result.output
+
+
+# -- the harbor environment: dispatch, durable state, resume, and publication ------------------
+
+
+_HARBOR_JOB_YAML = """\
+job_name: template
+jobs_dir: jobs
+environment:
+  type: docker
+agents:
+  - {}
+datasets:
+  - path: tasks
+"""
+
+
+class _FakeHarborScorer:
+    """Passes every cell; the report matrix comes from the recorded run config."""
+
+    def __init__(self, task_ids: tuple[str, ...], attempts: int) -> None:
+        self._request = ScoreRequest(task_ids=task_ids, attempts=attempts)
+
+    @property
+    def request(self) -> ScoreRequest:
+        return self._request
+
+    def score(
+        self,
+        doc: HarnessDoc,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> ScoreReport:
+        del should_cancel
+        cells = tuple(
+            ScoreCell(task_id=task_id, attempt=attempt, reward=1.0, passed=True)
+            for task_id in self._request.task_ids
+            for attempt in range(1, self._request.attempts + 1)
+        )
+        return ScoreReport(
+            doc_hash=doc.doc_hash,
+            request=self._request,
+            reward_mode="positive-binary",
+            cells=cells,
+        )
+
+
+class _FakeHarborProposer:
+    """Returns the seed tree with a rewritten SYSTEM.md, one candidate per slot."""
+
+    def propose(
+        self,
+        population: Sequence[EvaluatedCandidate],
+        *,
+        slot: int,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> CandidateProposal:
+        del should_cancel
+        files = {
+            item.path: item.content
+            for item in population[0].source.files
+            if item.path != "SYSTEM.md"
+        }
+        files["SYSTEM.md"] = f"improved by slot {slot}"
+        tree = HarnessSourceTree(
+            files=tuple(
+                HarnessSourceFile(path=path, content=content) for path, content in files.items()
+            )
+        )
+        candidate_id = candidate_slot_id(slot)
+        return CandidateProposal(
+            candidate_id=candidate_id, source=tree, candidate=tree.to_doc(candidate_id)
+        )
+
+
+def _harbor_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Write harbor inputs + role settings and fake the scorer/proposer builder seams."""
+    (tmp_path / "job.yaml").write_text(_HARBOR_JOB_YAML, encoding="utf-8")
+    (tmp_path / "tasks.json").write_text('["t1"]', encoding="utf-8")
+    root = tmp_path / ".wmh"
+    role = ModelRole(provider="azure", model="gpt-5.5", endpoint="https://x.example")
+    save_settings(ProjectSettings(models=ModelsSettings(meta=role, agent=role)), root)
+    captured: dict[str, object] = {}
+
+    def fake_scorer(
+        config: _HarborRunConfig, *, run_dir: Path, provider_config: ProviderConfig
+    ) -> _FakeHarborScorer:
+        del run_dir
+        captured["config"] = config
+        captured["provider_config"] = provider_config
+        return _FakeHarborScorer(config.task_ids, config.attempts)
+
+    def fake_proposer(
+        *, run_dir: Path, meta_config: ProviderConfig, e2b_template: str | None
+    ) -> _FakeHarborProposer:
+        del run_dir
+        captured["meta_config"] = meta_config
+        captured["proposer_e2b_template"] = e2b_template
+        return _FakeHarborProposer()
+
+    monkeypatch.setattr(harness_app_module, "_build_harbor_scorer", fake_scorer)
+    monkeypatch.setattr(harness_app_module, "_build_harbor_proposer", fake_proposer)
+    return captured
+
+
+def _invoke_harbor(tmp_path: Path, *extra: str) -> Result:
+    return runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--harbor-config",
+            str(tmp_path / "job.yaml"),
+            "--task-ids",
+            str(tmp_path / "tasks.json"),
+            "--iterations",
+            "1",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+            *extra,
+        ],
+    )
+
+
+def test_harbor_dispatch_runs_the_population_and_publishes_the_winner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _harbor_project(tmp_path, monkeypatch)
+
+    result = _invoke_harbor(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, _HarborRunConfig)
+    assert config.task_ids == ("t1",)
+    assert config.attempts == 1
+    assert config.reward_mode == "positive-binary"  # the harbor default, not scoring "raw"
+    assert config.backend == "local"
+    run_config = json.loads((tmp_path / "run" / "run-config.json").read_text(encoding="utf-8"))
+    assert run_config["agent"] == "pi"
+    assert run_config["iterations"] == 1
+    state = json.loads((tmp_path / "run" / "state.json").read_text(encoding="utf-8"))
+    assert [entry["candidate_id"] for entry in state["outcomes"]] == [
+        "candidate-0000",
+        "candidate-0001",
+    ]
+    # Winner publication: a lineage-less doc lands as pi v1 with the champion alias.
+    store = HarnessStore(str(tmp_path / ".wmh"))
+    saved = store.load("pi")
+    assert saved.version == 1
+    assert store.aliases("pi")["champion"] == 1
+    assert "optimized" in result.output
+
+
+def test_harbor_checkpoint_then_resume_completes_and_rejects_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _harbor_project(tmp_path, monkeypatch)
+
+    first = _invoke_harbor(tmp_path, "--max-iterations-this-run", "1")
+    assert first.exit_code == 0, first.output
+    assert "checkpointed" in first.output
+    assert not HarnessStore(str(tmp_path / ".wmh")).exists("pi")
+
+    conflict = _invoke_harbor(tmp_path, "--resume", "--reward-mode", "raw")
+    assert conflict.exit_code == 2
+    flat = " ".join(conflict.output.split())  # rich wraps (and boxes) the error line
+    assert "conflicting" in flat
+    assert "--reward-mode" in flat
+
+    resumed = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--resume",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert resumed.exit_code == 0, resumed.output
+    assert "optimized" in resumed.output
+    assert HarnessStore(str(tmp_path / ".wmh")).load("pi").version == 1
+
+
+def test_harbor_errors_when_a_world_model_is_named_harbor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _harbor_project(tmp_path, monkeypatch)
+    model_dir = tmp_path / ".wmh" / "models" / "harbor"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.toml").write_text("", encoding="utf-8")
+
+    result = _invoke_harbor(tmp_path)
+
+    assert result.exit_code == 2
+    assert "rename" in result.output
+
+
+def test_harbor_requires_a_run_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _harbor_project(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--harbor-config",
+            str(tmp_path / "job.yaml"),
+            "--task-ids",
+            str(tmp_path / "tasks.json"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--run-dir is required" in result.output
+
+
+def test_world_model_path_rejects_harbor_only_flags(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["optimize", "made", "--run-dir", str(tmp_path / "run"), "--root", str(tmp_path)],
+    )
+    assert result.exit_code == 2
+    assert "apply only to the harbor environment" in result.output

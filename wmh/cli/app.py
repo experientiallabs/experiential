@@ -536,6 +536,11 @@ def build(
         validate_name(params.name)
     except ValueError as err:
         raise typer.BadParameter(str(err)) from None
+    if params.name == "harbor":
+        raise typer.BadParameter(
+            "world model name 'harbor' is reserved: `wmh optimize <agent> harbor` selects "
+            "the harbor benchmark environment; choose another name"
+        )
     try:
         tier = FidelityTier(params.fidelity)
     except ValueError:

@@ -346,6 +346,16 @@ def test_build_rejects_invalid_name_flag_with_friendly_error(tmp_path) -> None: 
     assert "invalid world model name" in result.output
 
 
+def test_build_rejects_the_reserved_harbor_name(tmp_path) -> None:  # noqa: ANN001
+    """`harbor` is the optimize environment literal, so no world model may claim it."""
+    result = runner.invoke(
+        app,
+        ["build", "--name", "harbor", "--file", _traces_file(tmp_path), "--no-interactive"],
+    )
+    assert result.exit_code == 2
+    assert "reserved" in result.output
+
+
 def test_examples_run_rejects_invalid_name_with_friendly_error() -> None:
     result = runner.invoke(app, ["examples", "run", "tau bench"])
     assert result.exit_code == 2  # usage error, not a ValueError traceback
