@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
   <title id="title">World model, runtime agent, and optimizer</title>
-  <desc id="description">A world model sits above a runtime agent and optimizer. Bidirectional arrows connect all three.</desc>
+  <desc id="description">The world model sits above the runtime agent and optimizer; bidirectional arrows connect all three.</desc>
 
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">

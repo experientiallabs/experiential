@@ -4,7 +4,7 @@
 includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
 builds task-specific harnesses for stronger performance at lower cost.
 
-![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/agent-loop.svg)
+![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
 ## Getting started
 
