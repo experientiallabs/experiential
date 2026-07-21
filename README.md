@@ -4,27 +4,9 @@
 includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
 builds task-specific harnesses for stronger performance at lower cost.
 
-```mermaid
-flowchart TB
-    world["World model<br/>Simulates the environment"]
-    worker["Worker agent<br/>Runs tasks"]
-    optimizer["Optimizer agent<br/>Improves the harness"]
-
-    world <-->|"actions / observations"| worker
-    world <-->|"evaluation / feedback"| optimizer
-    worker <-->|"traces / harness updates"| optimizer
-
-    classDef world fill:#ffffff,stroke:#0070f3,color:#0a0a0a,stroke-width:2px
-    classDef worker fill:#ffffff,stroke:#7928ca,color:#0a0a0a,stroke-width:2px
-    classDef optimizer fill:#ffffff,stroke:#f5a623,color:#0a0a0a,stroke-width:2px
-
-    class world world
-    class worker worker
-    class optimizer optimizer
-    linkStyle 0 stroke:#0070f3,stroke-width:2px
-    linkStyle 1 stroke:#f5a623,stroke-width:2px
-    linkStyle 2 stroke:#7928ca,stroke-width:2px
-```
+<p align="center">
+  <img src="docs/assets/agent-loop.svg" alt="World model, worker agent, and optimizer agent connected in a continuous improvement loop" width="900">
+</p>
 
 ## Getting started
 
