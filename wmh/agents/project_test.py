@@ -7,7 +7,7 @@ from llm_waterfall import ChatResponse
 
 from wmh.agents import project as project_module
 from wmh.agents.meta import meta_agent
-from wmh.agents.project import AgentProject
+from wmh.agents.project import PROJECT_SHELL_USER, AgentProject
 from wmh.core.types import JsonObject
 from wmh.harness import e2b_sandbox as e2b_sandbox_module
 from wmh.harness.doc import TOOL_POLICY_ID, HarnessDoc
@@ -1264,17 +1264,21 @@ def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
     assert outcome.is_error is False
     assert outcome.content == "inspected\nwarning\n"
     assert emitted == [("stdout", "inspected\n"), ("stderr", "warning\n")]
-    [call] = commands.calls
-    assert call == {
-        "user": "nobody",
+    agent_call, cleanup_call = commands.calls
+    assert agent_call == {
+        "user": PROJECT_SHELL_USER,
         "cwd": "/home/user/project/.scratch",
         "timeout": 60.0,
     }
-    [command] = commands.runs
+    assert cleanup_call == {"user": "root", "timeout": 10.0}
+    command, cleanup_command = commands.runs
     assert command.startswith("env -i ")
     assert "setpriv --no-new-privs" in command
     assert "timeout --kill-after=3s 50s" in command
     assert "pwd && rg TODO ../candidates" in command
+    assert "wmh-project-shell-quiescence" in cleanup_command
+    assert f"pkill -STOP -u {PROJECT_SHELL_USER}" in cleanup_command
+    assert f"pkill -KILL -u {PROJECT_SHELL_USER}" in cleanup_command
 
 
 def test_project_bash_bounds_streams_before_live_session_publication() -> None:
@@ -1309,7 +1313,9 @@ def test_project_bash_surfaces_nonzero_exit_with_bounded_streams() -> None:
 
     class _FailingCommands(_Commands):
         def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
-            del cmd, background, kwargs
+            del background, kwargs
+            if "wmh-project-shell-quiescence" in cmd:
+                return _Output()
             raise _CommandError("non-zero")
 
     sandbox = _Sandbox()
@@ -1324,6 +1330,85 @@ def test_project_bash_surfaces_nonzero_exit_with_bounded_streams() -> None:
     assert outcome.is_error is True
     assert outcome.content == "partial outputcommand failed\n[exit 7]"
     assert emitted == [("stdout", "partial output"), ("stderr", "command failed")]
+
+
+def test_project_bash_cleanup_failure_taints_the_project() -> None:
+    class _CleanupFailCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background, kwargs
+            if "wmh-project-shell-quiescence" in cmd:
+                raise RuntimeError("cleanup transport failed")
+            return _Output(stdout="command completed")
+
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    sandbox.commands = _CleanupFailCommands()
+
+    outcome = project._execute_tool("bash", {"command": "setsid sleep 30 &"}, lambda *_: None)
+
+    assert outcome.is_error is True
+    assert "could not prove project shell quiescence" in outcome.content
+    blocked = project._execute_tool("bash", {"command": "true"}, lambda *_: None)
+    assert blocked.is_error is True
+    assert "project shell is tainted" in blocked.content
+    with pytest.raises(RuntimeError, match="project shell is tainted"):
+        project.run(meta_agent(), _Provider(), "continue", timeout=1)
+
+
+def test_project_bash_cleanup_failure_stops_before_another_provider_call() -> None:
+    class _CleanupFailCommands(_Commands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background, kwargs
+            if "wmh-project-shell-quiescence" in cmd:
+                raise RuntimeError("cleanup transport failed")
+            return _Output(stdout="command completed")
+
+    class _CountingProvider(_MeteredProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_chat(self, request: object) -> ChatResponse:
+            self.calls += 1
+            return super().complete_chat(request)
+
+    base = meta_agent()
+    shell_agent = HarnessDoc(
+        name="shell-agent",
+        surfaces=[
+            surface.model_copy(update={"content": "bash\nsubmit"})
+            if surface.id == TOOL_POLICY_ID
+            else surface
+            for surface in base.surfaces
+        ],
+    )
+    channel = _Channel()
+    channel.inbound = [
+        {"type": "state", "status": "idle"},
+        {"type": "state", "status": "running"},
+        {
+            "type": "tool_request",
+            "req_id": 1,
+            "name": "bash",
+            "arguments": {"command": "setsid sleep 30 &"},
+        },
+        {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+    ]
+    sandbox = _Sandbox()
+    sandbox.commands = _CleanupFailCommands()
+    provider = _CountingProvider()
+    project = AgentProject(
+        sandbox,
+        channel_factory=lambda sandbox, workspace: channel,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(RuntimeError, match="project shell is tainted"):
+        project.run(shell_agent, provider, "inspect", timeout=1)
+
+    assert provider.calls == 0
+    assert channel.inbound == [
+        {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}}
+    ]
 
 
 def test_project_bash_cannot_publish_or_mutate_authoritative_files() -> None:
@@ -1397,10 +1482,13 @@ def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
     )
 
     assert project.run(shell_agent, _Provider(), "inspect", timeout=1).answer == "done"
-    assert any(
-        command == "mkdir -p /home/user/project/.scratch && chmod 1777 /home/user/project/.scratch"
-        for command in sandbox.commands.runs
+    shell_setup = next(
+        command for command in sandbox.commands.runs if "useradd --system" in command
     )
+    assert "useradd --system --user-group --no-create-home" in shell_setup
+    assert PROJECT_SHELL_USER in shell_setup
+    assert "mkdir -p /home/user/project/.scratch" in shell_setup
+    assert "chmod 1777 /home/user/project/.scratch" in shell_setup
 
 
 def test_project_rejects_agents_with_uncontained_tools() -> None:

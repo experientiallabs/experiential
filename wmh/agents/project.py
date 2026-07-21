@@ -35,9 +35,11 @@ from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
 PROJECT_SCRATCH_DIR = ".scratch"
+PROJECT_SHELL_USER = "wmh-project-shell"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
 _BASH_TIMEOUT_S = 60.0
 _BASH_PROCESS_TIMEOUT_S = 50
+_SHELL_QUIESCENCE_TIMEOUT_S = 10.0
 _BASH_STREAM_CAP = 7_000
 _OUTPUT_CAP = 16_000
 _PROJECT_TOOLS = frozenset({"bash", "read_file", "write_file", "submit"})
@@ -157,6 +159,7 @@ class AgentProject:
         self._session_provider: ToolCallingProvider | None = None
         self._network_locked_sandbox_id: int | None = None
         self._shell_ready_sandbox_id: int | None = None
+        self._shell_quiescence_error: str | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
         # ``None`` preserves the historical unrestricted project-tool behavior. A concrete set is
         # one logical run's exact, project-relative write grant; it is cleared even when the turn
@@ -253,6 +256,7 @@ class AgentProject:
         """
         if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
+        self._ensure_project_shell_healthy()
         _check_cancelled(should_cancel)
         if self._active_event_sink is not None:
             raise RuntimeError("a project agent turn is already running")
@@ -354,6 +358,9 @@ class AgentProject:
                     self._close_agent_session()
                     raise TimeoutError(f"project agent did not finish within {timeout:g}s")
                 running = session.pump(timeout=min(0.5, remaining))
+                # A tool pump may fail to prove that detached shell processes were killed. Stop
+                # before the next frame can trigger another paid provider call or project tool.
+                self._ensure_project_shell_healthy()
                 # A pump can synchronously run one provider completion. Observe cancellation as
                 # soon as it returns, before consuming a second model or tool request.
                 self._cancel_turn_if_requested(session, should_cancel)
@@ -369,6 +376,7 @@ class AgentProject:
                 raise _ProjectAgentTurnError(
                     f"project agent turn ended with reason: {turn_terminal_reason}"
                 )
+            self._ensure_project_shell_healthy()
         finally:
             self._active_event_sink = None
         return AgentProjectRun(answer=answer, events=tuple(events), worker_usage=TokenUsage())
@@ -456,8 +464,16 @@ class AgentProject:
         if self._shell_ready_sandbox_id == id(self._sandbox):
             return
         scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
-        command = f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
-        self._sandbox.commands.run(command, timeout=30)
+        command = (
+            "set -eu\n"
+            f"if ! id -u {PROJECT_SHELL_USER} >/dev/null 2>&1; then\n"
+            f"  useradd --system --user-group --no-create-home "
+            f"--shell /usr/sbin/nologin {PROJECT_SHELL_USER}\n"
+            "fi\n"
+            f"id -u {PROJECT_SHELL_USER} >/dev/null\n"
+            f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
+        )
+        self._sandbox.commands.run(command, user="root", timeout=30)
         self._shell_ready_sandbox_id = id(self._sandbox)
 
     def _emit_session_event(self, event: SessionEvent) -> None:
@@ -622,9 +638,10 @@ class AgentProject:
         """Run one bounded command as an unprivileged user in disposable scratch space.
 
         The project tree is owned by the ordinary sandbox user and is readable but not writable
-        by ``nobody``. Shell commands start in a sticky scratch directory and receive an empty
-        environment, no network, no privilege escalation, and bounded process and output streams.
-        Durable candidate outputs must cross the separate exact-file ``write_file`` grant.
+        by the dedicated project-shell user. Shell commands start in a sticky scratch directory
+        and receive an empty environment, no network, no privilege escalation, and bounded process
+        and output streams. Durable outputs must cross the separate exact-file ``write_file``
+        grant.
         """
         filter_command = f"node -e {shlex.quote(_BASH_FILTER_SCRIPT)}"
         script = (
@@ -639,24 +656,40 @@ class AgentProject:
         wrapped = (
             "env -i PATH=/usr/local/bin:/usr/bin:/bin "
             f"HOME={shlex.quote(scratch)} TMPDIR={shlex.quote(scratch)} "
-            "USER=nobody LOGNAME=nobody "
+            f"USER={PROJECT_SHELL_USER} LOGNAME={PROJECT_SHELL_USER} "
             "setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all "
             f"--bounding-set=-all bash --noprofile --norc -c {shlex.quote(script)}"
         )
+        stdout = ""
+        stderr = ""
+        exit_code = 1
+        cleanup_error: str | None = None
         try:
-            result = self._sandbox.commands.run(
-                wrapped,
-                user="nobody",
-                cwd=scratch,
-                timeout=_BASH_TIMEOUT_S,
-            )
-            stdout = _bounded_bash_stream(str(getattr(result, "stdout", "") or ""))
-            stderr = _bounded_bash_stream(str(getattr(result, "stderr", "") or ""))
-            exit_code = int(getattr(result, "exit_code", 0) or 0)
-        except Exception as error:  # noqa: BLE001 - E2B reports non-zero exits as exceptions
-            stdout = _bounded_bash_stream(str(getattr(error, "stdout", "") or ""))
-            stderr = _bounded_bash_stream(str(getattr(error, "stderr", "") or str(error)))
-            exit_code = int(getattr(error, "exit_code", 1) or 1)
+            try:
+                result = self._sandbox.commands.run(
+                    wrapped,
+                    user=PROJECT_SHELL_USER,
+                    cwd=scratch,
+                    timeout=_BASH_TIMEOUT_S,
+                )
+                stdout = _bounded_bash_stream(str(getattr(result, "stdout", "") or ""))
+                stderr = _bounded_bash_stream(str(getattr(result, "stderr", "") or ""))
+                exit_code = int(getattr(result, "exit_code", 0) or 0)
+            except Exception as error:  # noqa: BLE001 - E2B non-zero exits raise
+                stdout = _bounded_bash_stream(str(getattr(error, "stdout", "") or ""))
+                stderr = _bounded_bash_stream(str(getattr(error, "stderr", "") or str(error)))
+                exit_code = int(getattr(error, "exit_code", 1) or 1)
+        finally:
+            try:
+                self._quiesce_project_shell()
+            except Exception as error:  # noqa: BLE001 - taint on unproven process cleanup
+                cleanup_error = _capped(str(error)).content
+                self._shell_quiescence_error = cleanup_error
+
+        if cleanup_error is not None:
+            suffix = f"could not prove project shell quiescence: {cleanup_error}"
+            stderr = f"{stderr}\n{suffix}" if stderr else suffix
+            exit_code = exit_code or 1
 
         if stdout:
             emit("stdout", stdout)
@@ -673,6 +706,11 @@ class AgentProject:
         arguments: JsonObject,
         emit: Callable[[str, str], None],
     ) -> ToolOutcome:
+        if self._shell_quiescence_error is not None:
+            return ToolOutcome(
+                content=f"project shell is tainted: {self._shell_quiescence_error}",
+                is_error=True,
+            )
         try:
             if name == "bash":
                 return self._run_bash(str(arguments.get("command", "")), emit)
@@ -702,6 +740,26 @@ class AgentProject:
             return ToolOutcome(content=f"{name} failed: {error}", is_error=True)
         return ToolOutcome(content=f"tool {name!r} not available", is_error=True)
 
+    def _quiesce_project_shell(self) -> None:
+        """Kill every dedicated shell-user process and fail if any process remains."""
+        result = self._sandbox.commands.run(
+            _project_shell_quiescence_command(),
+            user="root",
+            timeout=_SHELL_QUIESCENCE_TIMEOUT_S,
+        )
+        exit_code = int(getattr(result, "exit_code", 0) or 0)
+        if exit_code != 0:
+            stderr = str(getattr(result, "stderr", "") or "quiescence command failed")
+            raise RuntimeError(stderr)
+
+    def _ensure_project_shell_healthy(self) -> None:
+        """Reject further agent work after unproven shell cleanup."""
+        if self._shell_quiescence_error is not None:
+            raise RuntimeError(
+                "project shell is tainted after cleanup failure; close it and create a new "
+                f"project: {self._shell_quiescence_error}"
+            )
+
     def _reject_reserved_scratch(self, absolute: str) -> None:
         """Keep Bash scratch outside the authoritative host-mediated file namespace."""
         relative = PurePosixPath(self._relative_path(absolute))
@@ -728,6 +786,27 @@ class AgentProject:
         if writable_files is None:
             return None
         return frozenset(self._relative_path(self._absolute_path(path)) for path in writable_files)
+
+
+def _project_shell_quiescence_command() -> str:
+    """Build the root-only stop, kill, and absence-proof command."""
+    return (
+        "set -eu\n"
+        "# wmh-project-shell-quiescence\n"
+        "for attempt in 1 2 3; do\n"
+        f"  if ! pgrep -u {PROJECT_SHELL_USER} >/dev/null; then break; fi\n"
+        f"  pkill -STOP -u {PROJECT_SHELL_USER} || true\n"
+        "done\n"
+        f"pkill -KILL -u {PROJECT_SHELL_USER} || true\n"
+        "for attempt in 1 2 3; do\n"
+        f"  if ! pgrep -u {PROJECT_SHELL_USER} >/dev/null; then break; fi\n"
+        "  sleep 0.05\n"
+        "done\n"
+        f"if pgrep -u {PROJECT_SHELL_USER} >/dev/null; then\n"
+        "  echo 'could not prove project shell quiescence' >&2\n"
+        "  exit 70\n"
+        "fi\n"
+    )
 
 
 def _start_channel(sandbox: SandboxHandle, workspace: str) -> Channel:
