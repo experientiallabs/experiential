@@ -304,6 +304,83 @@ def test_execute_closes_project_and_never_publishes_winner_after_optimizer_error
     assert not (tmp_path / "local-run/outcome.json").exists()
 
 
+def test_execute_does_not_claim_result_directory_when_scorer_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class BrokenScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> BrokenScorer:
+            raise ValueError("invalid scorer configuration")
+
+    meta_config, agent_config = _configs()
+    monkeypatch.setattr(module, "HarborScorer", BrokenScorer)
+    run_dir = tmp_path / "local-run"
+
+    with pytest.raises(ValueError, match="invalid scorer configuration"):
+        _execute_optimization(
+            name="unpublished",
+            root=str(tmp_path / ".wmh"),
+            run_dir=run_dir,
+            job_config=_job_config(tmp_path),
+            task_ids=("task-a",),
+            reward_key="reward",
+            iterations=1,
+            attempts=1,
+            seed=_source("seed"),
+            meta_config=meta_config,
+            agent_config=agent_config,
+            harness_backend="local",
+            e2b_template=None,
+            environment_command_timeout_sec=240,
+            project_timeout_sec=900,
+            max_history_candidates=20,
+            max_history_bytes=1_000_000,
+        )
+
+    assert not run_dir.exists()
+
+
+def test_execute_does_not_claim_result_directory_for_non_tool_meta_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> FakeScorer:
+            return cls()
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            assert attempts == 1
+            return _request()
+
+    meta_config, agent_config = _configs()
+    monkeypatch.setattr(module, "HarborScorer", FakeScorer)
+    monkeypatch.setattr(module, "get_provider", lambda config: object())
+    run_dir = tmp_path / "local-run"
+
+    with pytest.raises(typer.BadParameter, match="structured tool calling"):
+        _execute_optimization(
+            name="unpublished",
+            root=str(tmp_path / ".wmh"),
+            run_dir=run_dir,
+            job_config=_job_config(tmp_path),
+            task_ids=("task-a",),
+            reward_key="reward",
+            iterations=1,
+            attempts=1,
+            seed=_source("seed"),
+            meta_config=meta_config,
+            agent_config=agent_config,
+            harness_backend="local",
+            e2b_template=None,
+            environment_command_timeout_sec=240,
+            project_timeout_sec=900,
+            max_history_candidates=20,
+            max_history_bytes=1_000_000,
+        )
+
+    assert not run_dir.exists()
+
+
 def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

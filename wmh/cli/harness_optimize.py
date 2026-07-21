@@ -215,7 +215,6 @@ def _execute_optimization(
     max_history_bytes: int,
 ) -> HarnessOptimizeOutcome:
     """Resolve one immutable scorer request, execute it, and publish evidence before winner."""
-    run_dir.mkdir(parents=True, exist_ok=False)
     effective_job_config = JobConfig.model_validate(
         job_config.model_copy(
             update={"jobs_dir": run_dir / "harbor"},
@@ -234,6 +233,12 @@ def _execute_optimization(
         )
     )
     request = scorer.request(attempts=attempts)
+    meta_provider = get_provider(meta_config)
+    if not isinstance(meta_provider, ToolCallingProvider):
+        raise typer.BadParameter("settings [models.meta] provider lacks structured tool calling")
+    # Only claim the requested output path after all read-only setup validation succeeds. Once
+    # execution can incur spend, an incomplete directory remains deliberate failure evidence.
+    run_dir.mkdir(parents=True, exist_ok=False)
     _write_json_atomic(
         run_dir / "inputs.json",
         {
@@ -252,10 +257,6 @@ def _execute_optimization(
             "max_history_bytes": max_history_bytes,
         },
     )
-
-    meta_provider = get_provider(meta_config)
-    if not isinstance(meta_provider, ToolCallingProvider):
-        raise typer.BadParameter("settings [models.meta] provider lacks structured tool calling")
     with AgentProject.create(
         timeout=project_timeout_sec,
         template=e2b_template,
