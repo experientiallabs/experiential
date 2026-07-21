@@ -64,6 +64,33 @@ essentially confirmed (+0.029). H4 (b=16) not run.
 - T3 strong-reflect arm wasn't in the driver (OpenAI executor + Bedrock reflector is
   supported by the code; it just wasn't bought). Finding 3 rests on the two Haiku cells.
 
+## Round 2: E1-E3 complete (2026-07-20)
+
+All arms same harness (rubric-v2, seeds 0,1, test-cap 40, #97 split). E1 executor is Opus
+4.8 default-account primary + waterfall ladder (4.8@endflow verified impossible,
+AccessDeniedException; endflow is 4.6-gen only). Round-2 spend ~$195 (+~$60 lost restarting
+E3 after a mid-run kill).
+
+| exp | question | result |
+|---|---|---|
+| E1 | in-harness frontier lift + parity stress | Opus 4.8 RAG 0.875 (.870/.881); +GEPA **0.892** (.872/.912), +0.017 for $87 build (VPD ~0.2) |
+| E2 | config vs executor | tier config on Mini x terminal = **0.708 = the RAG anchor** (0.709); winning config = +0.051. The lift is 100% config |
+| E3 | spend (H4) | Haiku x tau b=16 = **0.894** (.895/.893) vs b=8's 0.893: saturated at b=8 |
+
+**R2.1: the parity claim survives the strongest attack.** Give Opus 4.8 the identical
+winning-config GEPA and it reaches 0.892 - statistically the same as Haiku+GEPA's 0.893.
+Both converge on tau's unknowable-record ceiling (~0.89); the frontier model cannot buy
+past it either. The $34 Haiku build genuinely matches the $87 Opus build AND the
+un-GEPA'd frontier. Caveat: Opus's seeds spread .872/.912, the noisiest cell in the study.
+**R2.2: cheap-executor GEPA is ~4x frontier VPD, now measured in one harness** (0.87 vs 0.2
+milli-pts/$), replacing the #97 cross-reference.
+**R2.3: the executor x corpus headroom is only harvestable at the winning config.** Tier
+config (b=4, mb=3, val=24 greedy) collects ZERO of Mini x terminal's +0.051. Consequence:
+`wmh build`'s tier GEPA spend is wasted at every tier as configured; either plumb
+mb=8/val=90-inclusive into build or ship search-only tiers.
+**R2.4: don't buy b=16.** +0.001 over b=8 for ~2x the cost. #163's budget-50 tau model is
+now best explained by its era/config, not by budget scaling.
+
 ## Round 2 / E4: headroom probe v1 FAILS validation (2026-07-20)
 
 All 5 cells probed ($3.64 total, `probe_*.json`). The probe does NOT rank-order the measured

@@ -1,8 +1,11 @@
 # GEPA value-per-dollar: targeted cheap-executor confirmation
 
-**STATUS: RUN 2026-07-19/20, $200.87.** Results + verdict:
-`../research/gepa_vpd_results/analysis.md`. Headline: T3 +0.051 / T2 +0.029 (tau parity
-with Opus-RAG) / T1 +0.010; strong-reflector arm negative in both cells.
+**STATUS: BOTH ROUNDS RUN 2026-07-19/20, ~$460 total.** Results + verdict:
+`../research/gepa_vpd_results/analysis.md`. Round 1: T3 +0.051 / T2 +0.029 (tau parity
+with Opus-RAG) / T1 +0.010; strong-reflector negative in both cells. Round 2: parity
+survives Opus 4.8 getting the same GEPA (0.892 vs 0.893, both at tau's ceiling); the lift
+is 100% optimizer config (tier config harvests ZERO); spend saturates at b=8; headroom
+probe v1 fails validation.
 
 Supersedes the 5-arm x 3-benchmark sweep version of this proposal. The sweep is unnecessary:
 the #98 grid + #97 scaling JSONs already locate where GEPA pays; this buys ONLY the

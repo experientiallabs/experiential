@@ -16,7 +16,12 @@ mkdir -p "$OUT"
 RUN="uv run python .agents/scripts/run_gepa_scaling.py"
 HAIKU=us.anthropic.claude-haiku-4-5-20251001-v1:0
 MINI=openai/gpt-5.4-mini
-OPUS=us.anthropic.claude-opus-4-7
+# E1 executor = Opus 4.8 (the frontier the parity claim is about), default account primary +
+# the shared waterfall ladder on capacity errors. 4.8@endflow is NOT possible: verified
+# 2026-07-20, AccessDeniedException (endflow account is 4.6-generation only). Caveat: 4.8
+# throttles under GEPA call volume (why #97 used 4.7), so heavy failover can mix ladder
+# models into this cell's rollouts; the judge stays pinned 4.8 regardless.
+OPUS=us.anthropic.claude-opus-4-8
 COMMON="--examples packages/environment-capture --counts 100000 --seeds 0,1 \
   --sample-turns sampled --test-cap 40 --concurrency 8"
 WINNING="--budgets 8 --minibatch 8 --gepa-val-steps 90 --val-fill inclusive --recheck-steps 30"
