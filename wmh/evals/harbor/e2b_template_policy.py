@@ -2,7 +2,7 @@
 
 The template alias replaces harbor's content-only name with a resource-complete identity:
 harbor's native naming has no resource qualification, so two tasks sharing environment content
-but differing in cpu/memory would collide on one alias. The digest input is FROZEN — a fleet of
+but differing in cpu/memory would collide on one alias. The digest input is FROZEN: a fleet of
 templates already exists on the E2B account under this exact derivation, and byte-identical
 naming is what lets a new run reuse them instead of re-paying every build.
 

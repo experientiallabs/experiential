@@ -3,8 +3,8 @@
 `HarborScorer` implements the `wmh.harness.scoring.Scorer` protocol: one exact `HarnessDoc`
 candidate becomes one harbor job (the WMH agent bridge + a pinned task list), harbor owns the
 task environments and the verifier lifecycle, and the verifier rewards project into a
-`ScoreReport`. Harbor's own job directory is the artifact record — each cell points at its trial
-directory; nothing is re-read, re-hashed, or copied.
+`ScoreReport`. Harbor's own job directory is the artifact record, and each cell points at its
+trial directory; nothing is re-read, re-hashed, or copied.
 
 Two operational behaviors matter most here:
 
@@ -16,7 +16,7 @@ Two operational behaviors matter most here:
 - **Candidate outcomes vs infra failures.** A trial that raised (e.g. AgentTimeoutError) but
   still carries a written verifier reward is a CANDIDATE outcome: it becomes a scored cell with
   a note. The scorer raises (`HarborRewardMissingError`) only when verifier evidence or the
-  configured reward is absent — that is an infrastructure failure no reward can stand in for.
+  configured reward is absent; that is an infrastructure failure no reward can stand in for.
 """
 
 from __future__ import annotations
@@ -272,7 +272,7 @@ class HarborScorer:
 
         `job_template` supplies the run directory (`jobs_dir`), the task environment config,
         and harbor tuning (timeouts, concurrency); it must carry exactly one dataset, no direct
-        tasks, and an untouched default agent + retry config — the scorer owns those.
+        tasks, and an untouched default agent + retry config (the scorer owns those).
         """
         if len(job_template.datasets) != 1 or job_template.tasks:
             raise ValueError("HarborScorer requires exactly one dataset and no direct tasks")

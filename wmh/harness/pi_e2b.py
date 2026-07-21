@@ -1483,11 +1483,11 @@ class E2BPiRuntime:
                     raise
                 if transport_failures >= self._transport_retries:
                     raise
-                # Transport death (stream drop, sandbox lifetime, dead runner) — the failed
+                # Transport death (stream drop, sandbox lifetime, dead runner): the failed
                 # attempt's sandbox was already discarded on release. Replay on a fresh
                 # sandbox up to the configured budget: the environment session may replay the
                 # dead attempt's opening steps, which for the world-model sim beats failing a
-                # whole search wave over one dropped connection — while a side-effectful real
+                # whole search wave over one dropped connection, while a side-effectful real
                 # environment sets transport_retries=0 to forbid replay. pi-level failures
                 # come back as RunResults (episode_error), never as exceptions, so this
                 # retries infrastructure only.

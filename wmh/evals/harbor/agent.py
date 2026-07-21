@@ -3,7 +3,7 @@
 Harbor instantiates `WmhHarborAgent` from an import path plus JSON kwargs, so one serialized
 candidate (the `HarnessDoc`), one provider config, and the execution knobs travel through
 harbor's own trial machinery unchanged. The agent rebuilds the runtime host-side and drives it
-against `HarborAgentEnvironment`, a synchronous adapter over harbor's async task environment —
+against `HarborAgentEnvironment`, a synchronous adapter over harbor's async task environment:
 the real container is the environment; the worker LLM and tool routing stay host-side.
 
 Two properties here are load-bearing for the optimizer:

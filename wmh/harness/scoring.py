@@ -3,7 +3,7 @@
 A `Scorer` runs one exact `HarnessDoc` candidate against a fixed task-by-attempt matrix and
 returns a `ScoreReport` of raw evaluator rewards plus their pass interpretation. The contract is
 deliberately small: the optimizer loop (PR C) ranks candidates by `ScoreReport.score` and reads
-per-trial artifacts straight from each cell's `artifact_dir` — the evaluator's own output
+per-trial artifacts straight from each cell's `artifact_dir`; the evaluator's own output
 directory is the record, so the report carries paths, not copied or hashed evidence.
 
 Reward interpretation is frozen protocol (paper semantics): `positive-binary` counts a trial as
