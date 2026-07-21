@@ -375,9 +375,21 @@ class AgentProject:
         self._prepare_shell_workspace()
         stage_name = f"stage-{self._next_source_stage:06d}"
         self._next_source_stage += 1
-        relative = f"{PROJECT_SCRATCH_DIR}/source-stages/{stage_name}"
+        stages_relative = f"{PROJECT_SCRATCH_DIR}/source-stages"
+        stages_absolute = self._absolute_path(stages_relative)
+        relative = f"{stages_relative}/{stage_name}"
         absolute = self._absolute_path(relative)
-        self._sandbox.commands.run(f"mkdir -p {shlex.quote(absolute)}", timeout=30)
+        # The stage sits several directories below the project root; every component from the root
+        # down to the stage's parent must be traversable by the unprivileged shell user or it
+        # cannot reach the stage by absolute path (templates create these with a restrictive
+        # umask). The stage itself is then chowned to the shell user with tight file modes below.
+        self._sandbox.commands.run(
+            f"mkdir -p {shlex.quote(absolute)} "
+            f"&& chmod o+x {shlex.quote(self.workspace)} "
+            f"{shlex.quote(self._absolute_path(PROJECT_SCRATCH_DIR))} {shlex.quote(stages_absolute)}",
+            user="root",
+            timeout=30,
+        )
         if copy_from is not None:
             source_absolute = self._absolute_path(copy_from)
             copy_result = self._sandbox.commands.run(
