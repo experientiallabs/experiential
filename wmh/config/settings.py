@@ -30,6 +30,7 @@ class ModelRole(BaseModel):
     endpoint: str | None = None  # Azure OpenAI / custom base URL
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version (azure roles get a default)
+    reasoning_effort: str | None = None  # structured reasoning effort, when supported
 
 
 class ModelsSettings(BaseModel):

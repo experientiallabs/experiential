@@ -8,7 +8,11 @@ import pytest
 import typer
 
 import wmh.cli.model_roles as model_roles_module
-from wmh.cli.model_roles import OptInModelRole, resolve_opt_in_model_provider
+from wmh.cli.model_roles import (
+    OptInModelRole,
+    resolve_opt_in_model_provider,
+    resolve_required_model_config,
+)
 from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -80,6 +84,7 @@ def test_configured_role_forwards_fields_and_defaults_the_azure_api_version(
                     region="us-east-2",
                     endpoint="https://x.example",
                     deployment="gpt-5-5",
+                    reasoning_effort="high",
                 )
             )
         ),
@@ -105,6 +110,16 @@ def test_configured_role_forwards_fields_and_defaults_the_azure_api_version(
     assert config.endpoint == "https://x.example"
     assert config.deployment == "gpt-5-5"
     assert config.api_version == "2024-05-01-preview"
+    assert config.reasoning_effort == "high"
+
+
+@pytest.mark.parametrize("role", ["agent", "meta"])
+def test_required_model_config_rejects_an_unset_role(tmp_path: Path, role: OptInModelRole) -> None:
+    with pytest.raises(
+        typer.BadParameter,
+        match=rf"settings \[models\.{role}\] must be configured",
+    ):
+        resolve_required_model_config(str(tmp_path / ".wmh"), role)
 
 
 def test_explicit_api_version_overrides_the_azure_default(

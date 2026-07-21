@@ -35,7 +35,7 @@ from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider
 
 harness_app = typer.Typer(
-    help="Named, versioned agent harnesses (.wmh/harnesses): create, init, list, show.",
+    help="Named, versioned agent harnesses: create, optimize, initialize, list, and inspect.",
     no_args_is_help=True,
 )
 _console = Console()

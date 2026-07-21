@@ -6,7 +6,7 @@ from typing import Literal
 
 import typer
 
-from wmh.config.settings import load_settings
+from wmh.config.settings import ModelRole, load_settings
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 from wmh.providers.registry import get_provider
 
@@ -35,9 +35,26 @@ def resolve_opt_in_model_provider(
     Raises:
         typer.BadParameter: The configured provider kind is unknown.
     """
-    configured = load_settings(root).models.resolve(role)
-    if configured is None:
+    config = _resolve_model_config(root, role)
+    if config is None:
         return fallback, None
+    return get_provider(config), config.model
+
+
+def resolve_required_model_config(root: str, role: OptInModelRole) -> ProviderConfig:
+    """Resolve one explicitly configured opt-in model role into provider-neutral config."""
+    config = _resolve_model_config(root, role)
+    if config is None:
+        raise typer.BadParameter(f"settings [models.{role}] must be configured")
+    return config
+
+
+def _resolve_model_config(root: str, role: OptInModelRole) -> ProviderConfig | None:
+    configured = load_settings(root).models.resolve(role)
+    return None if configured is None else _model_config(configured, role=role)
+
+
+def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderConfig:
     try:
         kind = ProviderKind(configured.provider)
     except ValueError:
@@ -49,12 +66,12 @@ def resolve_opt_in_model_provider(
     api_version = configured.api_version
     if api_version is None and kind is ProviderKind.AZURE_OPENAI:
         api_version = _DEFAULT_AZURE_API_VERSION
-    config = ProviderConfig(
+    return ProviderConfig(
         kind=kind,
         model=configured.model,
         region=configured.region,
         endpoint=configured.endpoint,
         deployment=configured.deployment,
         api_version=api_version,
+        reasoning_effort=configured.reasoning_effort,
     )
-    return get_provider(config), configured.model
