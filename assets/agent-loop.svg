@@ -32,7 +32,7 @@
 
   <rect class="box" x="590" y="360" width="300" height="108" rx="12" stroke="#f5a623"/>
   <text class="box-title" x="740" y="406">Optimizer</text>
-  <text class="box-copy" x="740" y="437">Improves the harness</text>
+  <text class="box-copy" x="740" y="437">Improves the agent</text>
 
   <path class="edge" d="M 382 148 C 320 220 265 285 250 360" stroke="#0070f3" marker-start="url(#arrow-blue)" marker-end="url(#arrow-blue)"/>
   <path class="edge" d="M 578 148 C 640 220 695 285 710 360" stroke="#f5a623" marker-start="url(#arrow-orange)" marker-end="url(#arrow-orange)"/>
