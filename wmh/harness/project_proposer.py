@@ -658,7 +658,12 @@ def _proposal_request(
         "Your candidate output directory is ALREADY POPULATED with the current harness's\n"
         f"complete source tree:\n`{absolute_stage}`\n\n"
         "Edit it in place to satisfy the objective. Do not delete SYSTEM.md or config.toml,\n"
-        "and the final directory must remain a complete standalone harness source tree."
+        "and the final directory must remain a complete standalone harness source tree.\n\n"
+        "Work efficiently and finish: the tree is already complete, so do NOT re-read every\n"
+        "file. Make the SMALLEST change that satisfies the objective, then call submit. You have\n"
+        "a bounded turn budget, so prioritize making your edit and submitting over exploring\n"
+        "exhaustively; a submitted focused edit beats an unsubmitted investigation. Before\n"
+        "submitting, confirm SYSTEM.md and config.toml still exist in the output directory."
         if stage_from_seed
         else (
             "Your only candidate output is this initially empty directory:\n"

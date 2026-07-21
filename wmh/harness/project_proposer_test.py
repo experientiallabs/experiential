@@ -868,6 +868,7 @@ def test_stage_from_seed_prepopulates_output_with_the_seed_source() -> None:
     instruction = project.run_calls[0].instruction
     assert "ALREADY POPULATED" in instruction
     assert "Do not delete SYSTEM.md or config.toml" in instruction
+    assert "then call submit" in instruction
     assert "initially empty directory" not in instruction
 
 
