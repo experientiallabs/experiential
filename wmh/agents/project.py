@@ -376,13 +376,24 @@ class AgentProject:
                 f"{absolute}/{item.path}",
                 item.content,
             )
-        self._sandbox.commands.run(
-            f"chown -R {PROJECT_SHELL_USER}:{PROJECT_SHELL_USER} {shlex.quote(absolute)} "
+        permission_result = self._sandbox.commands.run(
+            f"chown -R {self._shell_user}:{self._shell_user} {shlex.quote(absolute)} "
             f"&& find {shlex.quote(absolute)} -type d -exec chmod 700 {{}} + "
             f"&& find {shlex.quote(absolute)} -type f -exec chmod 600 {{}} +",
             user="root",
             timeout=30,
         )
+        exit_code = int(getattr(permission_result, "exit_code", 0) or 0)
+        if exit_code != 0:
+            detail = str(
+                getattr(permission_result, "stderr", "")
+                or getattr(permission_result, "stdout", "")
+                or "stage permission command returned no output"
+            )
+            raise RuntimeError(
+                f"project source stage permission setup failed with exit {exit_code}: "
+                f"{_capped(detail).content}"
+            )
         stage = ProjectSourceStage(
             path=relative,
             sandbox_generation=self._sandbox_generation,

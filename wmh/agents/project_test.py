@@ -1692,15 +1692,45 @@ def test_project_stages_and_snapshots_a_complete_source_tree_once() -> None:
         sandbox.files.values["/home/user/project/.scratch/source-stages/stage-000001/SYSTEM.md"]
         == seed.file_map()["SYSTEM.md"]
     )
+    permission_command, permission_options = next(
+        call for call in commands.calls if call[0].startswith("chown -R ")
+    )
+    assert permission_options == {"user": "root", "timeout": 30}
+    assert (
+        f"chown -R {project._shell_user}:{project._shell_user} "  # noqa: SLF001
+        "/home/user/project/.scratch/source-stages/stage-000001"
+    ) in permission_command
     snapshot_command, snapshot_options = next(
         call for call in commands.calls if "wmh-project-source-snapshot" in call[0]
     )
     assert snapshot_options == {"user": "root", "timeout": 60.0}
-    assert f"pkill -STOP -u {PROJECT_SHELL_USER}" in snapshot_command
-    assert f"pkill -KILL -u {PROJECT_SHELL_USER}" in snapshot_command
-    assert f"pgrep -u {PROJECT_SHELL_USER}" in snapshot_command
+    assert f"pkill -STOP -u {project._shell_user}" in snapshot_command  # noqa: SLF001
+    assert f"pkill -KILL -u {project._shell_user}" in snapshot_command  # noqa: SLF001
+    assert f"pgrep -u {project._shell_user}" in snapshot_command  # noqa: SLF001
     with pytest.raises(RuntimeError, match="already been snapshotted"):
         project.snapshot_source_tree(stage)
+
+
+def test_project_source_stage_permission_nonzero_exit_fails_closed() -> None:
+    class _PermissionFails(_SourceTreeCommands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            if cmd.startswith("chown -R "):
+                self.runs.append(cmd)
+                self.calls.append((cmd, dict(kwargs)))
+                return _Output(stderr="chown rejected the project shell user", exit_code=13)
+            return super().run(cmd, background, **kwargs)
+
+    sandbox = _Sandbox()
+    commands = _PermissionFails(sandbox.files)
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    with pytest.raises(RuntimeError, match="stage permission setup failed with exit 13"):
+        project.stage_source_tree(HarnessSourceTree(files=()))
+
+    permission_command = next(command for command in commands.runs if command.startswith("chown"))
+    assert f"{project._shell_user}:{project._shell_user}" in permission_command  # noqa: SLF001
+    assert project._source_stages == {}  # noqa: SLF001
 
 
 def test_project_snapshot_preserves_candidate_deletions() -> None:
