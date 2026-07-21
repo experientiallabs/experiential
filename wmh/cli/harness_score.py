@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -16,11 +19,20 @@ from rich.prompt import Confirm
 from wmh.agents.default import default_agent
 from wmh.cli.harbor_inputs import load_harbor_config, load_task_ids, write_json_atomic
 from wmh.cli.model_roles import resolve_required_model_config
+from wmh.cli.scorer_preparation import (
+    preparation_staging_path,
+    publish_preparation_artifact,
+    remove_preparation_staging,
+)
 from wmh.config import ARTIFACT_DIR
 from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
 from wmh.evals.harbor.canonical import canonical_harbor_job_config
-from wmh.evals.harbor.scorer import HarborScorer
+from wmh.evals.harbor.scorer import (
+    HarborRewardMode,
+    HarborScorer,
+    normalize_harbor_reward_mode,
+)
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, resolve_e2b_template
 from wmh.harness.runtime import (
     DEFAULT_EVAL_EPISODE_TIMEOUT_S,
@@ -80,6 +92,11 @@ def score_harness_command(
         "--reward-key",
         help="Official Harbor verifier reward field to score.",
     ),
+    reward_mode: str = typer.Option(
+        "raw",
+        "--reward-mode",
+        help="Interpret rewards as raw values or strict positive-binary successes.",
+    ),
     attempts: int = typer.Option(..., min=1, help="Attempts per exact task and harness."),
     harness_backend: str = typer.Option(
         "local",
@@ -128,6 +145,10 @@ def score_harness_command(
     if not reward_key:
         raise typer.BadParameter("--reward-key must be nonempty")
     try:
+        normalized_reward_mode = normalize_harbor_reward_mode(reward_mode)
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--reward-mode") from error
+    try:
         episode_timeout_sec = validate_episode_timeout_s(episode_timeout_sec)
     except ValueError as error:
         raise typer.BadParameter(str(error), param_hint="--episode-timeout") from error
@@ -143,6 +164,8 @@ def score_harness_command(
         harnesses=tuple(harnesses or ()),
     )
     validate_score_targets(targets)
+    if not yes and not _console.is_terminal:
+        raise typer.BadParameter("pass --yes to acknowledge the execution matrix")
     job_config = load_harbor_config(Path(harbor_config))
     task_ids = load_task_ids(Path(task_ids_file))
     agent_config = resolve_required_model_config(root, "agent")
@@ -156,11 +179,18 @@ def score_harness_command(
         f"scoring {len(targets)} harness(es), {len(task_ids)} task(s), "
         f"{attempts} attempt(s) -> {score_cells} requested score cells; "
         f"evaluated harness backend={harness_backend}; "
-        f"episode timeout={episode_timeout_sec:g}s"
+        f"episode timeout={episode_timeout_sec:g}s; "
+        f"reward mode={normalized_reward_mode.replace('_', '-')}"
     )
-    if not yes:
-        if not _console.is_terminal:
-            raise typer.BadParameter("pass --yes to acknowledge the execution matrix")
+
+    def before_preparation(summary: JsonObject | None) -> None:
+        if summary is not None:
+            _console.print(
+                "task-environment preparation: "
+                + json.dumps(summary, sort_keys=True, separators=(",", ":"))
+            )
+        if yes:
+            return
         if not Confirm.ask("Proceed?", default=False):
             raise typer.Exit(0)
 
@@ -169,6 +199,7 @@ def score_harness_command(
         job_config=job_config,
         task_ids=task_ids,
         reward_key=reward_key,
+        reward_mode=normalized_reward_mode,
         attempts=attempts,
         targets=targets,
         agent_config=agent_config,
@@ -176,6 +207,7 @@ def score_harness_command(
         e2b_template=(effective_e2b_template or "") if harness_backend == "e2b" else None,
         environment_command_timeout_sec=environment_command_timeout_sec,
         episode_timeout_sec=episode_timeout_sec,
+        before_preparation=before_preparation,
     )
     for entry in outcome.result.entries:
         _console.print(
@@ -199,6 +231,8 @@ def _execute_scoring(
     e2b_template: str | None,
     environment_command_timeout_sec: int,
     episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    reward_mode: HarborRewardMode = "raw",
+    before_preparation: Callable[[JsonObject | None], None] | None = None,
 ) -> HarnessScoreOutcome:
     """Resolve one immutable scorer request, score every target, and archive evidence."""
     validate_score_targets(targets)
@@ -214,23 +248,49 @@ def _execute_scoring(
             task_ids=task_ids,
             provider_config=agent_config,
             reward_key=reward_key,
+            reward_mode=reward_mode,
             environment_command_timeout_sec=environment_command_timeout_sec,
             episode_timeout_sec=episode_timeout_sec,
             harness_backend=harness_backend,
             e2b_template=e2b_template if harness_backend == "e2b" else None,
         )
     )
+    preparation_summary = scorer.preparation_summary()
+    if before_preparation is not None:
+        before_preparation(preparation_summary)
+    staging_path: Path | None = None
+    if scorer.preparation_required:
+        staging_path = preparation_staging_path(run_dir)
+        asyncio.run(scorer.prepare(staging_path))
     request = scorer.request(attempts=attempts)
+    preparation_hash = scorer.preparation_artifact_hash
+    preparation_bytes = scorer.preparation_artifact_bytes()
+    if (preparation_hash is None) != (preparation_bytes is None):
+        raise RuntimeError("scorer preparation artifact and hash must be provided together")
+    if preparation_bytes is not None and (
+        "sha256:" + hashlib.sha256(preparation_bytes).hexdigest() != preparation_hash
+    ):
+        raise RuntimeError("scorer preparation artifact hash differs")
     run_dir.mkdir(parents=True, exist_ok=False)
+    if preparation_bytes is not None:
+        if staging_path is None:
+            raise RuntimeError("scorer preparation staging path is missing")
+        artifact_path = publish_preparation_artifact(run_dir, preparation_bytes)
+        scorer.bind_preparation(artifact_path)
+        remove_preparation_staging(staging_path)
+    asyncio.run(scorer.verify_preparation())
     inputs: JsonObject = {
-        "schema_version": 2,
+        "schema_version": 3,
         "score_request": request.model_dump(mode="json"),
+        "evaluator_policy": scorer.evaluator_policy(),
         "harbor_job_template": canonical_harbor_job_config(effective_job_config),
         "agent_provider": agent_config.model_dump(mode="json"),
         "harness_backend": harness_backend,
         "e2b_template": e2b_template or None,
         "environment_command_timeout_sec": environment_command_timeout_sec,
         "episode_timeout_sec": episode_timeout_sec,
+        "scorer_preparation_artifact_hash": preparation_hash,
+        "scorer_preparation_summary": preparation_summary,
         "targets": [
             {
                 "label": target.label,

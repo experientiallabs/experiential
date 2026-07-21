@@ -42,6 +42,7 @@ _IDENTITY_FILE = "identity.json"
 _CONTROL_FILE = "control.json"
 _LOCK_FILE = "run.lock"
 _MANIFEST_FILE = "manifest.json"
+_SCORER_PREPARATION_FILE = "scorer-preparation.bin"
 
 
 class PopulationCheckpointError(RuntimeError):
@@ -67,6 +68,7 @@ class PopulationCheckpointIdentity(BaseModel):
     seed_reference: str | None = None
     seed_source_tree_hash: str = Field(min_length=1)
     score_request: ScoreRequest
+    evaluator_policy: JsonObject = Field(default_factory=dict)
     iterations: int = Field(strict=True, ge=1)
     planned_score_cells: int = Field(strict=True, ge=1)
     max_score_cells: int = Field(strict=True, ge=1)
@@ -76,6 +78,10 @@ class PopulationCheckpointIdentity(BaseModel):
     optimizer_document_hash: str = Field(min_length=1)
     harness_backend: Literal["local", "e2b"]
     e2b_template: str | None = None
+    scorer_preparation_artifact_hash: str | None = Field(
+        default=None,
+        pattern=_SHA256_PATTERN,
+    )
     project_e2b_create_rate_policy: JsonObject
     environment_command_timeout_sec: int = Field(strict=True, ge=1)
     episode_timeout_sec: float = Field(gt=0)
@@ -329,10 +335,21 @@ class PopulationCheckpointStore:
         *,
         identity: PopulationCheckpointIdentity,
         seed: HarnessSourceTree,
+        scorer_preparation_artifact: bytes | None = None,
     ) -> PopulationCheckpointStore:
         """Create and lock one new empty optimization prefix."""
         if seed.tree_hash != identity.seed_source_tree_hash:
             raise ValueError("checkpoint seed source does not match its identity")
+        expected_preparation_hash = identity.scorer_preparation_artifact_hash
+        if (expected_preparation_hash is None) != (scorer_preparation_artifact is None):
+            raise ValueError(
+                "checkpoint scorer preparation artifact and identity must be provided together"
+            )
+        if (
+            scorer_preparation_artifact is not None
+            and _sha256_bytes(scorer_preparation_artifact) != expected_preparation_hash
+        ):
+            raise ValueError("checkpoint scorer preparation artifact hash differs")
         run_dir.mkdir(parents=True, exist_ok=False)
         root = run_dir / _CHECKPOINT_DIR
         root.mkdir()
@@ -341,6 +358,11 @@ class PopulationCheckpointStore:
             identity_path = root / _IDENTITY_FILE
             _write_json_durable(identity_path, identity.model_dump(mode="json"))
             identity_hash = _hash_file(identity_path)
+            if scorer_preparation_artifact is not None:
+                _write_bytes_durable(
+                    root / _SCORER_PREPARATION_FILE,
+                    scorer_preparation_artifact,
+                )
             seed_dir = root / "seed"
             write_source_tree(seed_dir / "source", seed)
             _sync_tree(seed_dir)
@@ -359,7 +381,10 @@ class PopulationCheckpointStore:
                 known_score_cells=0,
             )
             _write_json_durable(root / _CONTROL_FILE, control.model_dump(mode="json"))
-            return cls(run_dir, lock_file, identity, control, seed, None)
+            store = cls(run_dir, lock_file, identity, control, seed, None)
+            store._validate_layout()
+            store._verify_scorer_preparation_artifact()
+            return store
         except BaseException:
             _release_lock(lock_file)
             raise
@@ -399,6 +424,7 @@ class PopulationCheckpointStore:
             seed = _read_seed(root / "seed", identity)
             store = cls(run_dir, lock_file, identity, control, seed, None)
             store._validate_layout()
+            store._verify_scorer_preparation_artifact()
             store._result = store._load_committed_result()
             if resumable_cleanup:
                 if store._result is None or control.committed_step < 0:
@@ -433,6 +459,13 @@ class PopulationCheckpointStore:
     def result(self) -> PopulationOptimizationResult | None:
         """Return the fully verified committed prefix, if the seed was scored."""
         return self._result
+
+    @property
+    def scorer_preparation_artifact_path(self) -> Path | None:
+        """Return the checkpoint-owned scorer preparation artifact path when present."""
+        if self.identity.scorer_preparation_artifact_hash is None:
+            return None
+        return self.root / _SCORER_PREPARATION_FILE
 
     @property
     def publication_id(self) -> str:
@@ -807,6 +840,8 @@ class PopulationCheckpointStore:
 
     def _validate_layout(self) -> None:
         allowed = {_IDENTITY_FILE, _CONTROL_FILE, _LOCK_FILE, "seed", "steps"}
+        if self.identity.scorer_preparation_artifact_hash is not None:
+            allowed.add(_SCORER_PREPARATION_FILE)
         actual = {path.name for path in self.root.iterdir()}
         if not actual.issubset(allowed):
             raise PopulationCheckpointError("checkpoint contains unexpected top-level paths")
@@ -817,6 +852,22 @@ class PopulationCheckpointStore:
         )
         if actual_steps != expected_steps:
             raise PopulationCheckpointError("checkpoint step directories differ from control")
+
+    def _verify_scorer_preparation_artifact(self) -> None:
+        expected = self.identity.scorer_preparation_artifact_hash
+        path = self.root / _SCORER_PREPARATION_FILE
+        if expected is None:
+            if path.exists() or path.is_symlink():
+                raise PopulationCheckpointError(
+                    "checkpoint contains an unexpected scorer preparation artifact"
+                )
+            return
+        if path.is_symlink() or not path.is_file():
+            raise PopulationCheckpointError(
+                "checkpoint scorer preparation artifact is not a regular file"
+            )
+        if _hash_file(path) != expected:
+            raise PopulationCheckpointError("checkpoint scorer preparation artifact hash differs")
 
     def _total_segment_usage(self, segment: SandboxUsage | None) -> SandboxUsage | None:
         if segment is None:
@@ -1099,11 +1150,15 @@ def _verify_file_records(
 
 
 def _write_json_durable(path: Path, value: JsonValue) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp-{uuid4().hex}")
     content = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
+    _write_bytes_durable(path, content)
+
+
+def _write_bytes_durable(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp-{uuid4().hex}")
     with temporary.open("xb") as handle:
         handle.write(content)
         handle.flush()
@@ -1176,7 +1231,11 @@ def _is_atomic_metadata_tail(root: Path, path: Path) -> bool:
     canonical_name = match.group(1)
     relative_parent = path.parent.relative_to(root)
     if relative_parent == Path("."):
-        return canonical_name in {_IDENTITY_FILE, _CONTROL_FILE}
+        return canonical_name in {
+            _IDENTITY_FILE,
+            _CONTROL_FILE,
+            _SCORER_PREPARATION_FILE,
+        }
     if relative_parent == Path("seed"):
         return canonical_name == _MANIFEST_FILE
     parts = relative_parent.parts

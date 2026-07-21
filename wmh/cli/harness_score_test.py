@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -38,6 +40,30 @@ class _Reader:
     def read_bytes(self, path: str) -> bytes:
         assert path == "raw/result.json"
         return b"{}"
+
+
+class _NoPreparationScorer:
+    """Test scorer contract for local task environments with no preparation."""
+
+    @property
+    def preparation_required(self) -> bool:
+        return False
+
+    def preparation_summary(self) -> None:
+        return None
+
+    @property
+    def preparation_artifact_hash(self) -> None:
+        return None
+
+    def preparation_artifact_bytes(self) -> None:
+        return None
+
+    async def verify_preparation(self) -> None:
+        return None
+
+    def evaluator_policy(self) -> dict[str, object]:
+        return {}
 
 
 def _source(prompt: str) -> HarnessSourceTree:
@@ -134,7 +160,7 @@ def test_execute_resolves_one_scorer_request_and_neutral_archive(
     request = _request()
     scorer_calls: list[dict[str, object]] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **kwargs: object) -> FakeScorer:
             scorer_calls.append(kwargs)
@@ -194,14 +220,16 @@ def test_execute_resolves_one_scorer_request_and_neutral_archive(
     assert scorer_call["harness_backend"] == "e2b"
     assert scorer_call["e2b_template"] == "template-x"
     assert scorer_call["episode_timeout_sec"] == 12_000
+    assert scorer_call["reward_mode"] == "raw"
     [scored_call] = scored_calls
     assert scored_call[1] == (target,)
     assert scored_call[2] is request
     assert archived == [(run_dir / "scores", outcome.result)]
     assert outcome.archive_manifest == run_dir / "scores/manifest.json"
     inputs = json.loads((run_dir / "inputs.json").read_text(encoding="utf-8"))
-    assert inputs["schema_version"] == 2
+    assert inputs["schema_version"] == 3
     assert inputs["score_request"] == request.model_dump(mode="json")
+    assert inputs["evaluator_policy"] == {}
     assert inputs["episode_timeout_sec"] == 12_000
     retry = inputs["harbor_job_template"]["retry"]
     assert retry["exclude_exceptions"] == sorted(retry["exclude_exceptions"])
@@ -215,6 +243,194 @@ def test_execute_resolves_one_scorer_request_and_neutral_archive(
         }
     ]
     assert "meta_provider" not in inputs
+
+
+def test_execute_prepares_binds_and_verifies_before_scoring(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    receipt = b'{"complete":true}\n'
+    receipt_hash = "sha256:" + hashlib.sha256(receipt).hexdigest()
+    summary = {"schema_version": 1, "unique_template_count": 1}
+    events: list[str] = []
+    run_dir = tmp_path / "run"
+
+    class PreparedScorer:
+        def __init__(self) -> None:
+            self.artifact_path: Path | None = None
+
+        @classmethod
+        async def create(cls, **_kwargs: object) -> PreparedScorer:
+            events.append("create")
+            return cls()
+
+        @property
+        def preparation_required(self) -> bool:
+            return True
+
+        def preparation_summary(self) -> dict[str, int]:
+            events.append("summary")
+            return summary
+
+        async def prepare(self, artifact_path: Path) -> None:
+            events.append("prepare")
+            assert not run_dir.exists()
+            artifact_path.write_bytes(receipt)
+            self.artifact_path = artifact_path
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            events.append("request")
+            assert attempts == 1
+            assert self.artifact_path is not None
+            return request
+
+        @property
+        def preparation_artifact_hash(self) -> str:
+            events.append("hash")
+            return receipt_hash
+
+        def preparation_artifact_bytes(self) -> bytes:
+            events.append("bytes")
+            assert self.artifact_path is not None
+            return self.artifact_path.read_bytes()
+
+        def bind_preparation(self, artifact_path: Path) -> None:
+            events.append("bind")
+            assert artifact_path.read_bytes() == receipt
+            self.artifact_path = artifact_path
+
+        async def verify_preparation(self) -> None:
+            events.append("verify")
+            assert self.artifact_path == run_dir / "scorer-preparation.bin"
+
+        def evaluator_policy(self) -> dict[str, object]:
+            return {
+                "reward_key": "reward",
+                "reward_interpretation": {
+                    "mode": "positive_binary",
+                    "threshold": 0.0,
+                    "comparator": "gt",
+                },
+            }
+
+    target = HarnessScoreTarget(
+        label="candidate@v1",
+        harness=_source("p").to_doc("candidate"),
+    )
+
+    def before_preparation(observed: object) -> None:
+        events.append("confirm")
+        assert observed == summary
+
+    def fake_score_harnesses(
+        scorer: object,
+        targets: tuple[HarnessScoreTarget, ...],
+        *,
+        request: ScoreRequest,
+    ) -> HarnessScoreBatch:
+        events.append("score")
+        assert isinstance(scorer, PreparedScorer)
+        assert request == _request()
+        return _batch(targets)
+
+    monkeypatch.setattr(module, "HarborScorer", PreparedScorer)
+    monkeypatch.setattr(module, "score_harnesses", fake_score_harnesses)
+
+    _execute_scoring(
+        run_dir=run_dir,
+        job_config=_job_config(tmp_path),
+        task_ids=("task-a",),
+        reward_key="reward",
+        attempts=1,
+        targets=(target,),
+        agent_config=ProviderConfig(kind=ProviderKind.ANTHROPIC, model="agent-model"),
+        harness_backend="e2b",
+        e2b_template="template-x",
+        environment_command_timeout_sec=240,
+        episode_timeout_sec=12_000,
+        reward_mode="positive_binary",
+        before_preparation=before_preparation,
+    )
+
+    assert events == [
+        "create",
+        "summary",
+        "confirm",
+        "prepare",
+        "request",
+        "hash",
+        "bytes",
+        "bind",
+        "verify",
+        "score",
+    ]
+    assert (run_dir / "scorer-preparation.bin").read_bytes() == receipt
+    assert not (tmp_path / ".run.scorer-preparation.bin").exists()
+    inputs = json.loads((run_dir / "inputs.json").read_text(encoding="utf-8"))
+    assert inputs["scorer_preparation_artifact_hash"] == receipt_hash
+    assert inputs["scorer_preparation_summary"] == summary
+    assert inputs["evaluator_policy"]["reward_interpretation"]["mode"] == ("positive_binary")
+
+
+def test_execute_preserves_audit_staging_when_preparation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    staging_path = tmp_path / ".run.scorer-preparation.bin"
+    score_calls = 0
+
+    class BrokenPreparationScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> BrokenPreparationScorer:
+            return cls()
+
+        @property
+        def preparation_required(self) -> bool:
+            return True
+
+        def preparation_summary(self) -> dict[str, int]:
+            return {"schema_version": 1}
+
+        async def prepare(self, artifact_path: Path) -> None:
+            assert artifact_path == staging_path
+            artifact_path.write_bytes(b'{"complete":false}\n')
+            raise RuntimeError("provider preparation failed")
+
+    def fake_score_harnesses(*_args: object, **_kwargs: object) -> HarnessScoreBatch:
+        nonlocal score_calls
+        score_calls += 1
+        raise AssertionError("preparation failure must precede scoring")
+
+    monkeypatch.setattr(module, "HarborScorer", BrokenPreparationScorer)
+    monkeypatch.setattr(module, "score_harnesses", fake_score_harnesses)
+    target = HarnessScoreTarget(
+        label="candidate@v1",
+        harness=_source("p").to_doc("candidate"),
+    )
+
+    with pytest.raises(RuntimeError, match="provider preparation failed"):
+        _execute_scoring(
+            run_dir=run_dir,
+            job_config=_job_config(tmp_path),
+            task_ids=("task-a",),
+            reward_key="reward",
+            attempts=1,
+            targets=(target,),
+            agent_config=ProviderConfig(
+                kind=ProviderKind.ANTHROPIC,
+                model="agent-model",
+            ),
+            harness_backend="e2b",
+            e2b_template="template-x",
+            environment_command_timeout_sec=240,
+            episode_timeout_sec=12_000,
+        )
+
+    assert not run_dir.exists()
+    assert staging_path.read_bytes() == b'{"complete":false}\n'
+    assert score_calls == 0
 
 
 def test_execute_does_not_claim_result_directory_when_scorer_setup_fails(
@@ -294,6 +510,8 @@ def test_cli_resolves_default_then_immutable_stored_version_with_agent_role(
             str(task_ids_path),
             "--reward-key",
             "reward",
+            "--reward-mode",
+            "positive-binary",
             "--attempts",
             "1",
             "--result-out",
@@ -311,6 +529,7 @@ def test_cli_resolves_default_then_immutable_stored_version_with_agent_role(
     assert targets[1].harness.version == 2
     assert targets[1].harness.doc_hash == selected.doc_hash
     assert call["harness_backend"] == "local"
+    assert call["reward_mode"] == "positive_binary"
     assert call["e2b_template"] is None
     agent_config = cast(ProviderConfig, call["agent_config"])
     assert agent_config.kind is ProviderKind.ANTHROPIC
@@ -345,6 +564,7 @@ def test_cli_resolves_default_then_immutable_stored_version_with_agent_role(
     assert e2b_invoked.exit_code == 0, e2b_invoked.output
     assert calls[-1]["harness_backend"] == "e2b"
     assert calls[-1]["episode_timeout_sec"] == 12_000
+    assert calls[-1]["reward_mode"] == "raw"
     assert "episode timeout=12000s" in e2b_invoked.output
 
 
@@ -374,10 +594,21 @@ def test_cli_requires_a_target_before_model_or_scorer_resolution(tmp_path: Path)
     assert "--include-default or at least one --harness" in invoked.output
 
 
-def test_cli_requires_explicit_confirmation_in_noninteractive_mode(tmp_path: Path) -> None:
+def test_cli_requires_explicit_confirmation_in_noninteractive_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     root = tmp_path / ".wmh"
     _agent_settings(root)
     config_path, task_ids_path = _write_inputs(tmp_path)
+    execute_calls = 0
+
+    def unreachable_execute(**_kwargs: object) -> HarnessScoreOutcome:
+        nonlocal execute_calls
+        execute_calls += 1
+        raise AssertionError("missing --yes must fail before scorer execution")
+
+    monkeypatch.setattr(module, "_execute_scoring", unreachable_execute)
 
     invoked = runner.invoke(
         app,
@@ -400,6 +631,63 @@ def test_cli_requires_explicit_confirmation_in_noninteractive_mode(tmp_path: Pat
 
     assert invoked.exit_code == 2
     assert "pass --yes" in invoked.output
+    assert execute_calls == 0
+
+
+def test_cli_displays_preparation_summary_before_interactive_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / ".wmh"
+    _agent_settings(root)
+    config_path, task_ids_path = _write_inputs(tmp_path)
+    events: list[str] = []
+
+    class TerminalConsole:
+        is_terminal = True
+
+        def print(self, value: object) -> None:
+            text = str(value)
+            events.append("summary" if text.startswith("task-environment") else "matrix")
+
+    def confirm(*_args: object, **_kwargs: object) -> bool:
+        events.append("confirm")
+        return False
+
+    def fake_execute(**kwargs: object) -> HarnessScoreOutcome:
+        events.append("execute")
+        callback = cast(
+            Callable[[dict[str, int]], None],
+            kwargs["before_preparation"],
+        )
+        callback({"schema_version": 1, "unique_template_count": 3})
+        raise AssertionError("declined confirmation must stop scorer execution")
+
+    monkeypatch.setattr(module, "_console", TerminalConsole())
+    monkeypatch.setattr(module.Confirm, "ask", confirm)
+    monkeypatch.setattr(module, "_execute_scoring", fake_execute)
+
+    invoked = runner.invoke(
+        app,
+        [
+            "harness",
+            "score",
+            "--include-default",
+            "--harbor-config",
+            str(config_path),
+            "--task-ids",
+            str(task_ids_path),
+            "--reward-key",
+            "reward",
+            "--attempts",
+            "1",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert invoked.exit_code == 0, invoked.output
+    assert events == ["matrix", "execute", "summary", "confirm"]
 
 
 def test_cli_help_is_proposer_free_and_requires_only_agent_role() -> None:
@@ -411,4 +699,5 @@ def test_cli_help_is_proposer_free_and_requires_only_agent_role() -> None:
     assert "proposer" not in invoked.output.lower()
     assert "world model" not in invoked.output.lower()
     assert "--episode-timeout" in invoked.output
+    assert "--reward-mode" in invoked.output
     assert "seconds" in invoked.output

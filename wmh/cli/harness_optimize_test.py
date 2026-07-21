@@ -10,7 +10,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import Literal, TypedDict, cast
 
 import pytest
 import typer
@@ -65,6 +65,34 @@ runner = CliRunner()
 _DIGEST = "sha256:" + "a" * 64
 
 
+class _OptimizeCommonArguments(TypedDict):
+    name: str
+    root: str
+    run_dir: Path
+    job_config: JobConfig
+    task_ids: tuple[str, ...]
+    reward_key: str
+    iterations: int
+    attempts: int
+    max_score_cells: int
+    seed_reference: str | None
+    meta_config: ProviderConfig
+    agent_config: ProviderConfig
+    harness_backend: Literal["local", "e2b"]
+    e2b_template: str | None
+    environment_command_timeout_sec: int
+    episode_timeout_sec: float
+    project_timeout_sec: float
+    max_history_candidates: int
+    max_history_bytes: int
+    max_new_boundaries: int | None
+
+
+class _OptimizeArguments(_OptimizeCommonArguments):
+    seed: HarnessSourceTree | None
+    resume: bool
+
+
 class _Reader:
     def read_bytes(self, path: str) -> bytes:
         assert path == "raw/result.json"
@@ -92,6 +120,30 @@ class _Project:
 
     def usage(self) -> SandboxUsage:
         return SandboxUsage(count=1, seconds=12.5)
+
+
+class _NoPreparationScorer:
+    """Test scorer contract for local task environments with no preparation."""
+
+    @property
+    def preparation_required(self) -> bool:
+        return False
+
+    def preparation_summary(self) -> None:
+        return None
+
+    @property
+    def preparation_artifact_hash(self) -> None:
+        return None
+
+    def preparation_artifact_bytes(self) -> None:
+        return None
+
+    async def verify_preparation(self) -> None:
+        return None
+
+    def evaluator_policy(self) -> dict[str, object]:
+        return {}
 
 
 def _source(prompt: str) -> HarnessSourceTree:
@@ -435,7 +487,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     request = _request()
     scorer_calls: list[dict[str, object]] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **kwargs: object) -> FakeScorer:
             scorer_calls.append(kwargs)
@@ -538,6 +590,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert scorer_call["harness_backend"] == "e2b"
     assert scorer_call["e2b_template"] == "template-x"
     assert scorer_call["episode_timeout_sec"] == 12_000
+    assert scorer_call["reward_mode"] == "raw"
     assert cast(JobConfig, scorer_call["job_config"]).jobs_dir == run_dir / "harbor"
     assert len(project_calls) == 3
     assert len({id(project) for project in projects}) == 3
@@ -568,6 +621,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     inputs = json.loads((run_dir / "inputs.json").read_text())
     assert inputs["iterations"] == 3
     assert inputs["episode_timeout_sec"] == 12_000
+    assert inputs["evaluator_policy"] == {}
     retry = inputs["harbor_job_template"]["retry"]
     assert retry["exclude_exceptions"] == sorted(retry["exclude_exceptions"])
     written = json.loads((run_dir / "outcome.json").read_text())
@@ -575,6 +629,386 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert written["project_sandbox_usage"] == {"count": 3, "seconds": 37.5}
     assert written["known_score_cells"] == 1
     assert written["max_score_cells"] == 4
+
+
+def test_execute_checkpoints_preparation_then_resumes_inspect_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    seed = _source("seed")
+    receipt = b'{"complete":true}\n'
+    receipt_hash = "sha256:" + hashlib.sha256(receipt).hexdigest()
+    summary = {"schema_version": 1, "unique_template_count": 1}
+    run_dir = tmp_path / "run"
+    events: list[str] = []
+
+    class PreparedScorer:
+        mismatch_hash = False
+
+        def __init__(self) -> None:
+            self.artifact_path: Path | None = None
+
+        @classmethod
+        async def create(cls, **_kwargs: object) -> PreparedScorer:
+            events.append("create")
+            return cls()
+
+        @property
+        def preparation_required(self) -> bool:
+            return True
+
+        def preparation_summary(self) -> dict[str, int]:
+            events.append("summary")
+            return summary
+
+        async def prepare(self, artifact_path: Path) -> None:
+            events.append("prepare")
+            assert artifact_path == tmp_path / ".run.scorer-preparation.bin"
+            assert not run_dir.exists()
+            artifact_path.write_bytes(receipt)
+            self.artifact_path = artifact_path
+
+        def load_preparation(self, artifact_path: Path) -> None:
+            events.append("load")
+            assert artifact_path.read_bytes() == receipt
+            self.artifact_path = artifact_path
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            events.append("request")
+            assert attempts == 1
+            assert self.artifact_path is not None
+            return request
+
+        @property
+        def preparation_artifact_hash(self) -> str:
+            events.append("hash")
+            if self.mismatch_hash:
+                return "sha256:" + "b" * 64
+            return receipt_hash
+
+        def preparation_artifact_bytes(self) -> bytes:
+            events.append("bytes")
+            assert self.artifact_path is not None
+            return self.artifact_path.read_bytes()
+
+        def bind_preparation(self, artifact_path: Path) -> None:
+            events.append("bind")
+            assert artifact_path.read_bytes() == receipt
+            self.artifact_path = artifact_path
+
+        async def verify_preparation(self) -> None:
+            events.append("verify")
+            assert self.artifact_path == run_dir / "checkpoint/scorer-preparation.bin"
+
+        def evaluator_policy(self) -> dict[str, object]:
+            return {
+                "reward_key": "reward",
+                "reward_interpretation": {
+                    "mode": "positive_binary",
+                    "threshold": 0.0,
+                    "comparator": "gt",
+                },
+            }
+
+    class FakeOptimizer:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def optimize(self, **kwargs: object) -> PopulationOptimizationResult:
+            resumed = cast(PopulationOptimizationResult | None, kwargs["resume"])
+            before_step = cast(Callable[[int], None], kwargs["before_step"])
+            on_boundary = cast(
+                Callable[[PopulationOptimizationResult], None],
+                kwargs["on_boundary"],
+            )
+            if resumed is None:
+                step = 0
+                boundary = _result(seed)
+            else:
+                step = 1
+                boundary = _result_with_invalid_iterations(1, seed_source=seed)
+            events.append("boundary")
+            before_step(step)
+            on_boundary(boundary)
+            return boundary
+
+    class FakeProjectFactory:
+        @classmethod
+        def create(cls, **_kwargs: object) -> _Project:
+            events.append("project")
+            return _Project()
+
+    def confirm(observed: object) -> None:
+        events.append("confirm")
+        assert observed == summary
+
+    meta_config, agent_config = _configs()
+    monkeypatch.setattr(module, "HarborScorer", PreparedScorer)
+    monkeypatch.setattr(module, "HarnessPopulationOptimizer", FakeOptimizer)
+    monkeypatch.setattr(module, "AgentProject", FakeProjectFactory)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+    arguments: _OptimizeCommonArguments = {
+        "name": "selected",
+        "root": str(tmp_path / ".wmh"),
+        "run_dir": run_dir,
+        "job_config": _job_config(tmp_path),
+        "task_ids": ("task-a",),
+        "reward_key": "reward",
+        "iterations": 1,
+        "attempts": 1,
+        "max_score_cells": 2,
+        "seed_reference": None,
+        "meta_config": meta_config,
+        "agent_config": agent_config,
+        "harness_backend": "e2b",
+        "e2b_template": "template-x",
+        "environment_command_timeout_sec": 300,
+        "episode_timeout_sec": 12_000,
+        "project_timeout_sec": 900,
+        "max_history_candidates": 20,
+        "max_history_bytes": 1_000_000,
+        "max_new_boundaries": 1,
+    }
+
+    progress = _execute_optimization(
+        **arguments,
+        seed=seed,
+        resume=False,
+        before_preparation=confirm,
+    )
+
+    assert isinstance(progress, HarnessOptimizeProgress)
+    assert events == [
+        "create",
+        "summary",
+        "confirm",
+        "prepare",
+        "request",
+        "hash",
+        "bytes",
+        "bind",
+        "verify",
+        "boundary",
+    ]
+    artifact_path = run_dir / "checkpoint/scorer-preparation.bin"
+    assert artifact_path.read_bytes() == receipt
+    assert not (tmp_path / ".run.scorer-preparation.bin").exists()
+    identity = json.loads((run_dir / "checkpoint/identity.json").read_text())
+    assert identity["scorer_preparation_artifact_hash"] == receipt_hash
+
+    events.clear()
+    PreparedScorer.mismatch_hash = True
+    with pytest.raises(
+        PopulationCheckpointError,
+        match="scorer_preparation_artifact_hash",
+    ):
+        _execute_optimization(
+            **arguments,
+            seed=None,
+            resume=True,
+            before_preparation=confirm,
+        )
+    assert events == ["create", "summary", "confirm", "load", "request", "hash"]
+
+    events.clear()
+    PreparedScorer.mismatch_hash = False
+    outcome = _execute_optimization(
+        **arguments,
+        seed=None,
+        resume=True,
+        before_preparation=confirm,
+    )
+
+    assert isinstance(outcome, HarnessOptimizeOutcome)
+    assert events == [
+        "create",
+        "summary",
+        "confirm",
+        "load",
+        "request",
+        "hash",
+        "verify",
+        "project",
+        "boundary",
+    ]
+
+
+def test_execute_preparation_failure_leaves_only_audit_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    staging_path = tmp_path / ".run.scorer-preparation.bin"
+    events: list[str] = []
+
+    class BrokenPreparationScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> BrokenPreparationScorer:
+            events.append("create")
+            return cls()
+
+        @property
+        def preparation_required(self) -> bool:
+            return True
+
+        def preparation_summary(self) -> dict[str, int]:
+            events.append("summary")
+            return {"schema_version": 1}
+
+        async def prepare(self, artifact_path: Path) -> None:
+            events.append("prepare")
+            assert artifact_path == staging_path
+            artifact_path.write_bytes(b'{"complete":false}\n')
+            raise RuntimeError("provider preparation failed")
+
+    class UnreachedOptimizer:
+        def __init__(self, *_args: object) -> None:
+            raise AssertionError("preparation failure must precede the seed boundary")
+
+    class UnreachedProject:
+        @classmethod
+        def create(cls, **_kwargs: object) -> None:
+            raise AssertionError("preparation failure must precede project creation")
+
+    def confirm(_summary: object) -> None:
+        events.append("confirm")
+
+    meta_config, agent_config = _configs()
+    monkeypatch.setattr(module, "HarborScorer", BrokenPreparationScorer)
+    monkeypatch.setattr(module, "HarnessPopulationOptimizer", UnreachedOptimizer)
+    monkeypatch.setattr(module, "AgentProject", UnreachedProject)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+
+    with pytest.raises(RuntimeError, match="provider preparation failed"):
+        _execute_optimization(
+            name="selected",
+            root=str(tmp_path / ".wmh"),
+            run_dir=run_dir,
+            job_config=_job_config(tmp_path),
+            task_ids=("task-a",),
+            reward_key="reward",
+            iterations=1,
+            attempts=1,
+            max_score_cells=2,
+            seed=_source("seed"),
+            seed_reference=None,
+            meta_config=meta_config,
+            agent_config=agent_config,
+            harness_backend="e2b",
+            e2b_template="template-x",
+            environment_command_timeout_sec=300,
+            episode_timeout_sec=12_000,
+            project_timeout_sec=900,
+            max_history_candidates=20,
+            max_history_bytes=1_000_000,
+            resume=False,
+            before_preparation=confirm,
+        )
+
+    assert events == ["create", "summary", "confirm", "prepare"]
+    assert not run_dir.exists()
+    assert staging_path.read_bytes() == b'{"complete":false}\n'
+
+
+def test_execute_verification_failure_stops_before_seed_or_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    receipt = b'{"complete":true}\n'
+    receipt_hash = "sha256:" + hashlib.sha256(receipt).hexdigest()
+    events: list[str] = []
+
+    class UnverifiedScorer:
+        def __init__(self) -> None:
+            self.artifact_path: Path | None = None
+
+        @classmethod
+        async def create(cls, **_kwargs: object) -> UnverifiedScorer:
+            return cls()
+
+        @property
+        def preparation_required(self) -> bool:
+            return True
+
+        def preparation_summary(self) -> dict[str, int]:
+            return {"schema_version": 1}
+
+        async def prepare(self, artifact_path: Path) -> None:
+            artifact_path.write_bytes(receipt)
+            self.artifact_path = artifact_path
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            assert attempts == 1
+            return _request()
+
+        @property
+        def preparation_artifact_hash(self) -> str:
+            return receipt_hash
+
+        def preparation_artifact_bytes(self) -> bytes:
+            assert self.artifact_path is not None
+            return self.artifact_path.read_bytes()
+
+        def bind_preparation(self, artifact_path: Path) -> None:
+            self.artifact_path = artifact_path
+
+        async def verify_preparation(self) -> None:
+            events.append("verify")
+            raise RuntimeError("provider mapping changed")
+
+        def evaluator_policy(self) -> dict[str, object]:
+            return {}
+
+    class UnreachedOptimizer:
+        def __init__(self, *_args: object) -> None:
+            events.append("seed")
+            raise AssertionError("verification failure must precede the seed boundary")
+
+    class UnreachedProject:
+        @classmethod
+        def create(cls, **_kwargs: object) -> None:
+            events.append("project")
+            raise AssertionError("verification failure must precede project creation")
+
+    meta_config, agent_config = _configs()
+    monkeypatch.setattr(module, "HarborScorer", UnverifiedScorer)
+    monkeypatch.setattr(module, "HarnessPopulationOptimizer", UnreachedOptimizer)
+    monkeypatch.setattr(module, "AgentProject", UnreachedProject)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+
+    with pytest.raises(RuntimeError, match="provider mapping changed"):
+        _execute_optimization(
+            name="selected",
+            root=str(tmp_path / ".wmh"),
+            run_dir=run_dir,
+            job_config=_job_config(tmp_path),
+            task_ids=("task-a",),
+            reward_key="reward",
+            iterations=1,
+            attempts=1,
+            max_score_cells=2,
+            seed=_source("seed"),
+            seed_reference=None,
+            meta_config=meta_config,
+            agent_config=agent_config,
+            harness_backend="e2b",
+            e2b_template="template-x",
+            environment_command_timeout_sec=300,
+            episode_timeout_sec=12_000,
+            project_timeout_sec=900,
+            max_history_candidates=20,
+            max_history_bytes=1_000_000,
+            resume=False,
+        )
+
+    assert events == ["verify"]
+    assert (run_dir / "checkpoint/scorer-preparation.bin").read_bytes() == receipt
+    assert not (tmp_path / ".run.scorer-preparation.bin").exists()
+    control = json.loads((run_dir / "checkpoint/control.json").read_text())
+    assert control["committed_step"] == -1
+    assert control["state"] == "ready"
 
 
 def test_execute_stops_ready_then_resumes_without_publishing_partial_work(
@@ -587,7 +1021,7 @@ def test_execute_stops_ready_then_resumes_without_publishing_partial_work(
     optimizer_resumes: list[PopulationOptimizationResult | None] = []
     projects: list[_Project] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -639,7 +1073,7 @@ def test_execute_stops_ready_then_resumes_without_publishing_partial_work(
     monkeypatch.setattr(module, "write_population_archive", fake_archive)
     root = tmp_path / ".wmh"
     run_dir = tmp_path / "run"
-    arguments = {
+    arguments: _OptimizeCommonArguments = {
         "name": "selected",
         "root": str(root),
         "run_dir": run_dir,
@@ -697,7 +1131,7 @@ def test_execute_rejects_score_cell_plan_before_scorer_or_run_mutation(
 ) -> None:
     scorer_calls: list[dict[str, object]] = []
 
-    class UnreachedScorer:
+    class UnreachedScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **kwargs: object) -> UnreachedScorer:
             scorer_calls.append(kwargs)
@@ -782,7 +1216,7 @@ def test_execute_resumes_ready_seed_at_next_slot_without_rescoring(
 
     score_calls: list[str] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -914,7 +1348,7 @@ def test_resume_rejects_episode_timeout_drift_before_any_score_or_project_spend(
     with PopulationCheckpointStore.create(run_dir, identity=identity, seed=seed):
         pass
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -959,6 +1393,91 @@ def test_resume_rejects_episode_timeout_drift_before_any_score_or_project_spend(
             max_history_bytes=1_000_000,
             resume=True,
         )
+
+
+def test_resume_rejects_evaluator_policy_drift_before_verification_or_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    root = tmp_path / ".wmh"
+    seed = _source("seed")
+    request = _request()
+    job_config = _job_config(tmp_path)
+    meta_config, agent_config = _configs()
+    identity = _checkpoint_identity(
+        run_dir=run_dir,
+        root=root,
+        job_config=job_config,
+        seed=seed,
+        request=request,
+        iterations=1,
+        max_score_cells=2,
+        meta_config=meta_config,
+        agent_config=agent_config,
+    )
+    with PopulationCheckpointStore.create(run_dir, identity=identity, seed=seed):
+        pass
+    events: list[str] = []
+
+    class PositiveModeScorer(_NoPreparationScorer):
+        @classmethod
+        async def create(cls, **kwargs: object) -> PositiveModeScorer:
+            assert kwargs["reward_mode"] == "positive_binary"
+            return cls()
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            assert attempts == 1
+            return request
+
+        def evaluator_policy(self) -> dict[str, object]:
+            return {
+                "reward_interpretation": {
+                    "mode": "positive_binary",
+                    "threshold": 0.0,
+                    "comparator": "gt",
+                }
+            }
+
+        async def verify_preparation(self) -> None:
+            events.append("verify")
+
+    class NoProject:
+        @classmethod
+        def create(cls, **_kwargs: object) -> None:
+            events.append("project")
+            raise AssertionError("evaluator drift must fail before project creation")
+
+    monkeypatch.setattr(module, "HarborScorer", PositiveModeScorer)
+    monkeypatch.setattr(module, "AgentProject", NoProject)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+
+    with pytest.raises(PopulationCheckpointError, match="evaluator_policy"):
+        _execute_optimization(
+            name="selected",
+            root=str(root),
+            run_dir=run_dir,
+            job_config=job_config,
+            task_ids=("task-a",),
+            reward_key="reward",
+            reward_mode="positive_binary",
+            iterations=1,
+            attempts=1,
+            max_score_cells=2,
+            seed=None,
+            seed_reference=None,
+            meta_config=meta_config,
+            agent_config=agent_config,
+            harness_backend="local",
+            e2b_template=None,
+            environment_command_timeout_sec=300,
+            project_timeout_sec=900,
+            max_history_candidates=20,
+            max_history_bytes=1_000_000,
+            resume=True,
+        )
+
+    assert events == []
 
 
 def test_execute_resumes_mixed_prefix_at_next_id_without_replaying_scores(
@@ -1039,7 +1558,7 @@ def test_execute_resumes_mixed_prefix_at_next_id_without_replaying_scores(
     proposed = _valid_proposal("candidate-0003", proposed_source)
     score_calls: list[str] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1155,7 +1674,7 @@ def test_execute_uses_fresh_project_and_restores_committed_prefix_for_each_slot(
     seed = _source("seed")
     score_calls: list[str] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1307,7 +1826,7 @@ def test_execute_finalizes_fully_committed_ready_prefix_without_project_or_score
     score_calls: list[str] = []
     project_calls: list[dict[str, object]] = []
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1401,7 +1920,7 @@ def test_execute_resumes_exact_publication_after_alias_before_complete(
             usage=SandboxUsage(count=1, seconds=2.0),
         )
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1440,7 +1959,7 @@ def test_execute_resumes_exact_publication_after_alias_before_complete(
     monkeypatch.setattr(module, "AgentProject", UnreachedProjectFactory)
     monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
     monkeypatch.setattr(PopulationCheckpointStore, "mark_complete", fail_once)
-    arguments = {
+    arguments: _OptimizeArguments = {
         "name": "selected",
         "root": str(root),
         "run_dir": run_dir,
@@ -1509,7 +2028,7 @@ def test_project_teardown_failure_keeps_final_boundary_nonresumable(
 ) -> None:
     request = _request()
 
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1601,7 +2120,7 @@ def test_project_teardown_failure_keeps_final_boundary_nonresumable(
 def test_execute_closes_project_and_never_publishes_winner_after_optimizer_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1673,7 +2192,7 @@ def test_execute_closes_project_and_never_publishes_winner_after_optimizer_error
 def test_execute_does_not_claim_result_directory_when_scorer_setup_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class BrokenScorer:
+    class BrokenScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> BrokenScorer:
             raise ValueError("invalid scorer configuration")
@@ -1712,7 +2231,7 @@ def test_execute_does_not_claim_result_directory_when_scorer_setup_fails(
 def test_execute_does_not_claim_result_directory_for_non_tool_meta_provider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class FakeScorer:
+    class FakeScorer(_NoPreparationScorer):
         @classmethod
         async def create(cls, **_kwargs: object) -> FakeScorer:
             return cls()
@@ -1811,6 +2330,8 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
             str(task_ids_path),
             "--reward-key",
             "reward",
+            "--reward-mode",
+            "positive-binary",
             "--iterations",
             "2",
             "--attempts",
@@ -1829,6 +2350,7 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
     assert "optimized" in invoked.output
     [call] = calls
     assert call["harness_backend"] == "local"
+    assert call["reward_mode"] == "positive_binary"
     assert call["iterations"] == 2
     assert call["task_ids"] == ("task-a",)
     assert call["e2b_template"] == "template-from-env"
@@ -1876,6 +2398,7 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
     assert calls[-1]["max_new_boundaries"] == 1
     assert calls[-1]["harness_backend"] == "e2b"
     assert calls[-1]["episode_timeout_sec"] == 12_000
+    assert calls[-1]["reward_mode"] == "raw"
     assert "episode timeout=12000s" in " ".join(partial.output.split())
     assert "checkpointed" in partial.output
     assert "no winner published" in partial.output
@@ -1944,4 +2467,5 @@ def test_cli_help_preserves_model_roles_seed_syntax_and_local_output_wording() -
     assert "name@ref" in invoked.output
     assert "Local run directory" in invoked.output
     assert "--episode-timeout" in invoked.output
+    assert "--reward-mode" in invoked.output
     assert "seconds" in invoked.output

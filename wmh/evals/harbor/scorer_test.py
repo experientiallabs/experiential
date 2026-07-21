@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Callable
+import subprocess
+import sys
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
@@ -35,6 +37,7 @@ from harbor.models.trial.result import (
 from harbor.models.verifier.result import VerifierResult
 from harbor.tasks.client import TaskDownloadResult
 
+import wmh.evals.harbor.e2b_template_readiness as readiness_module
 import wmh.evals.harbor.scorer as scorer_module
 from wmh.evals.harbor.agent import (
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
@@ -53,11 +56,18 @@ from wmh.evals.harbor.scorer import (
 from wmh.evals.harbor.tasks import ResolvedHarborTaskSet, resolve_harbor_task_set
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.pi_e2b import DEFAULT_EVAL_EPISODE_TIMEOUT_S
-from wmh.harness.scoring import ScoreRequest, score_harness
+from wmh.harness.population import HarnessPopulationOptimizer
+from wmh.harness.project_proposer import CandidateProposal, EvaluatedCandidate
+from wmh.harness.runtime import TokenUsage
+from wmh.harness.scoring import HarnessScore, ScoreRequest, score_harness
+from wmh.harness.source_tree import HarnessSourceTree
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 _JOB_ID = UUID("00000000-0000-4000-8000-000000000001")
 _OPAQUE_SUFFIXES = ("a7Hm2Ks", "m4Vx8Pa", "z9Tc3Wb")
+_PREPARATION_BYTES = b'{"complete":true}\n'
+_PREPARATION_HASH = "sha256:" + hashlib.sha256(_PREPARATION_BYTES).hexdigest()
+_MAPPING_DIGEST = "sha256:" + "d" * 64
 
 
 def _sha256(value: str) -> str:
@@ -117,6 +127,56 @@ class _Runner:
         )
         (destination / "lock.json").write_text(job_lock.model_dump_json(), encoding="utf-8")
         return self.run_result
+
+
+class _FakeReadinessPlan:
+    def __init__(self) -> None:
+        self.mapping_digest = _MAPPING_DIGEST
+        self.receipt_file_hash = _PREPARATION_HASH
+        self.verified = False
+        self.verify_calls = 0
+        self.fail_verify_call: int | None = None
+
+    @classmethod
+    def create(cls, **_kwargs: object) -> _FakeReadinessPlan:
+        return cls()
+
+    async def prepare(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_PREPARATION_BYTES)
+        self.verified = True
+
+    def load_complete_receipt(self, path: Path) -> None:
+        if path.read_bytes() != _PREPARATION_BYTES:
+            raise RuntimeError("invalid preparation")
+        self.verified = False
+
+    async def verify(self) -> None:
+        self.verify_calls += 1
+        if self.fail_verify_call == self.verify_calls:
+            raise RuntimeError("prepared mapping changed")
+        self.verified = True
+
+    def receipt_bytes(self) -> bytes:
+        return _PREPARATION_BYTES
+
+    def identity_payload(self) -> dict[str, object]:
+        return {"schema_version": 1, "policy": {"resource_qualified_alias": True}}
+
+
+def _install_fake_readiness(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        readiness_module,
+        "E2BTemplateReadinessPlan",
+        _FakeReadinessPlan,
+    )
+
+
+def _prepare_fake_scorer(scorer: HarborScorer, path: Path) -> _FakeReadinessPlan:
+    asyncio.run(scorer.prepare(path))
+    plan = scorer._e2b_readiness
+    assert isinstance(plan, _FakeReadinessPlan)
+    return plan
 
 
 def _provider(model: str = "worker-model") -> ProviderConfig:
@@ -351,6 +411,8 @@ def _scorer(
     job_config: JobConfig | None = None,
     provider: ProviderConfig | None = None,
     reward_key: str = "reward",
+    reward_mode: Literal["raw", "positive_binary"] = "raw",
+    task_ids: tuple[str, ...] = ("task-a", "task-b"),
     harness_backend: Literal["local", "e2b"] = "local",
     e2b_template: str | None = None,
     environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
@@ -360,13 +422,14 @@ def _scorer(
     dataset_path = job_config.datasets[0].path
     assert dataset_path is not None
     _ensure_task_dataset(dataset_path)
-    task_set = asyncio.run(resolve_harbor_task_set(job_config.datasets[0], ("task-a", "task-b")))
+    task_set = asyncio.run(resolve_harbor_task_set(job_config.datasets[0], task_ids))
     runner = _Runner(run, task_set)
     scorer = HarborScorer(
         job_config=job_config,
         task_set=task_set,
         provider_config=provider or _provider(),
         reward_key=reward_key,
+        reward_mode=reward_mode,
         environment_command_timeout_sec=environment_command_timeout_sec,
         episode_timeout_sec=episode_timeout_sec,
         harness_backend=harness_backend,
@@ -380,9 +443,36 @@ def _request(scorer: HarborScorer, *, attempts: int = 2) -> ScoreRequest:
     return scorer.request(attempts=attempts)
 
 
+def test_local_scorer_module_import_does_not_require_e2b_sdk() -> None:
+    script = """
+import importlib.abc
+import sys
+
+class BlockE2B(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == "e2b" or fullname.startswith("e2b."):
+            raise ImportError("e2b import blocked")
+        return None
+
+sys.meta_path.insert(0, BlockE2B())
+import wmh.evals.harbor.scorer
+"""
+    result = subprocess.run(  # noqa: S603 - fixed interpreter and inline import smoke
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[3],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_fake_readiness(monkeypatch)
     job_dir = tmp_path / "completed-job"
     job_config = _job_config(tmp_path, backend=EnvironmentType.E2B)
     candidate = HarnessDoc.baseline("candidate")
@@ -398,6 +488,7 @@ def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
         job_config=job_config,
         harness_backend="local",
     )
+    plan = _prepare_fake_scorer(scorer, tmp_path / "preparation.json")
 
     scored = score_harness(scorer, candidate, request=_request(scorer))
 
@@ -413,6 +504,8 @@ def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
     assert config.n_attempts == 2
     assert config.environment.type is None
     assert config.environment.import_path == WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
+    assert config.environment.kwargs["require_prebuilt"] is True
+    assert config.environment.kwargs["preparation_digest"] == _MAPPING_DIGEST
     assert config.datasets == []
     assert [task.get_task_id().get_name() for task in config.tasks] == [
         "task-a",
@@ -424,6 +517,205 @@ def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
     assert config.agents[0].kwargs["harness_backend"] == "local"
     assert config.agents[0].kwargs["command_timeout_sec"] == MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
     assert "secret" not in json.dumps(config.agents[0].kwargs).lower()
+    assert plan.verify_calls == 2
+
+
+def test_positive_binary_reward_mode_uses_strict_positive_success_and_preserves_raw(
+    tmp_path: Path,
+) -> None:
+    job_dir = tmp_path / "completed-job"
+    trials = [
+        _trial(job_dir, "task-a", 1, score=0.0),
+        _trial(job_dir, "task-b", 1, score=0.25),
+        _trial(job_dir, "task-c", 1, score=1.0),
+    ]
+    scorer, runner = _scorer(
+        tmp_path,
+        _run(tmp_path, trials),
+        reward_mode="positive_binary",
+        task_ids=("task-a", "task-b", "task-c"),
+    )
+
+    scored = score_harness(
+        scorer,
+        HarnessDoc.baseline(),
+        request=scorer.request(attempts=1),
+    )
+
+    assert [cell.score for cell in scored.report.cells] == [0.0, 1.0, 1.0]
+    assert [cell.passed for cell in scored.report.cells] == [False, True, True]
+    assert scored.report.score == pytest.approx(2 / 3)
+    assert scored.report.pass_rate == pytest.approx(2 / 3)
+    index = json.loads(scored.artifacts.read_bytes("raw/index.json"))
+    indexed_sources = {entry["source_path"]: entry["artifact_path"] for entry in index["files"]}
+    fractional_trial = next(trial for trial in trials if trial.task_id.get_name() == "task-b")
+    reward_artifact = indexed_sources[f"{fractional_trial.trial_name}/verifier/reward.json"]
+    raw_reward = json.loads(scored.artifacts.read_bytes(reward_artifact))
+    assert raw_reward["rewards"]["reward"] == 0.25
+    assert runner.configs
+
+
+def test_reward_mode_changes_identity_and_actual_optimizer_winner(
+    tmp_path: Path,
+) -> None:
+    config = _job_config(tmp_path)
+    dataset = config.datasets[0]
+    assert dataset.path is not None
+    _ensure_task_dataset(dataset.path)
+    task_set = asyncio.run(resolve_harbor_task_set(dataset, ("task-a", "task-b")))
+    raw = HarborScorer(
+        job_config=config,
+        task_set=task_set,
+        provider_config=_provider(),
+        reward_key="reward",
+        reward_mode="raw",
+    )
+    positive = HarborScorer(
+        job_config=config,
+        task_set=task_set,
+        provider_config=_provider(),
+        reward_key="reward",
+        reward_mode="positive_binary",
+    )
+
+    assert raw.context().task_set_digest == positive.context().task_set_digest
+    assert raw.context().execution_config_digest == positive.context().execution_config_digest
+    assert raw.context().evaluator_digest != positive.context().evaluator_digest
+    evaluation_root = tmp_path / "evaluation"
+
+    def evaluate(
+        candidate_id: str,
+        rewards: tuple[float, float],
+        reward_mode: Literal["raw", "positive_binary"],
+    ) -> tuple[HarnessSourceTree, HarnessScore]:
+        source = HarnessSourceTree.from_doc(HarnessDoc.baseline(candidate_id))
+        candidate = source.to_doc(candidate_id)
+        job_config = _job_config(evaluation_root)
+        job_dir = evaluation_root / "completed-job"
+        trials = [
+            _trial(
+                job_dir,
+                task_id,
+                1,
+                score=reward,
+                candidate=candidate,
+                job_config=job_config,
+            )
+            for task_id, reward in zip(("task-a", "task-b"), rewards, strict=True)
+        ]
+        scorer, _ = _scorer(
+            evaluation_root,
+            _run(evaluation_root, trials),
+            job_config=job_config,
+            reward_mode=reward_mode,
+        )
+        return source, score_harness(
+            scorer,
+            candidate,
+            request=scorer.request(attempts=1),
+        )
+
+    _, raw_a = evaluate("candidate-0000", (1.0, 0.0), "raw")
+    _, raw_b = evaluate("candidate-0001", (0.4, 0.4), "raw")
+    source_a, positive_a = evaluate(
+        "candidate-0000",
+        (1.0, 0.0),
+        "positive_binary",
+    )
+    source_b, positive_b = evaluate(
+        "candidate-0001",
+        (0.4, 0.4),
+        "positive_binary",
+    )
+    assert raw_a.report.score > raw_b.report.score
+    assert positive_b.report.score > positive_a.report.score
+    assert positive_a.report.request == positive_b.report.request
+
+    proposal = CandidateProposal(
+        candidate_id="candidate-0001",
+        source=source_b,
+        candidate=source_b.to_doc("candidate-0001"),
+        events=(),
+        worker_usage=TokenUsage(input_tokens=0, output_tokens=0, calls=0),
+    )
+
+    class FixedProposer:
+        def propose(
+            self,
+            history: Sequence[EvaluatedCandidate],
+            *,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> CandidateProposal:
+            del should_cancel
+            assert [item.candidate_id for item in history] == ["candidate-0000"]
+            return proposal
+
+    class FixedScorer:
+        def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScore:
+            assert request == positive_a.report.request
+            if candidate.name == "candidate-0000":
+                return positive_a
+            assert candidate.name == "candidate-0001"
+            return positive_b
+
+    result = HarnessPopulationOptimizer(FixedProposer(), FixedScorer()).optimize(
+        seed=source_a,
+        request=positive_a.report.request,
+        iterations=1,
+    )
+
+    assert result.best.candidate_id == "candidate-0001"
+    assert result.best_score == 1.0
+
+
+def test_scorer_preparation_verification_fails_before_runner_spend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_readiness(monkeypatch)
+    job_config = _job_config(tmp_path, backend=EnvironmentType.E2B)
+    scorer, runner = _scorer(
+        tmp_path,
+        _run(tmp_path, []),
+        job_config=job_config,
+    )
+    plan = _prepare_fake_scorer(scorer, tmp_path / "preparation.json")
+    plan.fail_verify_call = 1
+
+    with pytest.raises(RuntimeError, match="mapping changed"):
+        score_harness(
+            scorer,
+            HarnessDoc.baseline(),
+            request=scorer.request(attempts=1),
+        )
+
+    assert runner.configs == []
+
+
+def test_scorer_post_verification_discards_completed_harbor_score(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_readiness(monkeypatch)
+    job_config = _job_config(tmp_path, backend=EnvironmentType.E2B)
+    candidate = HarnessDoc.baseline()
+    job_dir = tmp_path / "completed-job"
+    trials = [
+        _trial(job_dir, task_id, 1, score=1, candidate=candidate, job_config=job_config)
+        for task_id in ("task-a", "task-b")
+    ]
+    scorer, runner = _scorer(
+        tmp_path,
+        _run(tmp_path, trials),
+        job_config=job_config,
+    )
+    plan = _prepare_fake_scorer(scorer, tmp_path / "preparation.json")
+    plan.fail_verify_call = 2
+
+    with pytest.raises(RuntimeError, match="mapping changed"):
+        score_harness(scorer, candidate, request=scorer.request(attempts=1))
+
+    assert len(runner.configs) == 1
 
 
 def test_scorer_rewrites_builtin_e2b_environment_without_losing_options(
@@ -431,7 +723,6 @@ def test_scorer_rewrites_builtin_e2b_environment_without_losing_options(
 ) -> None:
     environment = EnvironmentConfig(
         type=EnvironmentType.E2B,
-        force_build=True,
         override_cpus=2,
         override_memory_mb=2048,
         env={"VISIBLE": "value"},
@@ -448,6 +739,20 @@ def test_scorer_rewrites_builtin_e2b_environment_without_losing_options(
     assert rewritten.model_dump(exclude={"type", "import_path"}) == environment.model_dump(
         exclude={"type", "import_path"}
     )
+
+
+def test_scorer_rejects_task_e2b_force_build_before_preparation(tmp_path: Path) -> None:
+    config = _job_config(tmp_path, backend=EnvironmentType.E2B).model_copy(
+        update={
+            "environment": EnvironmentConfig(
+                type=EnvironmentType.E2B,
+                force_build=True,
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="does not allow force_build"):
+        _scorer(tmp_path, _run(tmp_path, []), job_config=config)
 
 
 def test_scorer_rejects_ambiguous_builtin_and_custom_e2b_environment(
@@ -470,6 +775,7 @@ def test_e2b_create_policy_is_bound_only_when_an_e2b_path_is_active(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_fake_readiness(monkeypatch)
     local, _ = _scorer(tmp_path / "local", _run(tmp_path / "local", []))
     task_e2b, _ = _scorer(
         tmp_path / "task-e2b",
@@ -482,6 +788,9 @@ def test_e2b_create_policy_is_bound_only_when_an_e2b_path_is_active(
         harness_backend="e2b",
         e2b_template="runner-template",
     )
+    with pytest.raises(RuntimeError, match="preparation is not loaded"):
+        task_e2b.context()
+    _prepare_fake_scorer(task_e2b, tmp_path / "task-e2b" / "preparation.json")
     local_digest = local.context().execution_config_digest
     task_digest = task_e2b.context().execution_config_digest
     worker_digest = worker_e2b.context().execution_config_digest
@@ -593,6 +902,7 @@ def test_scorer_uses_only_the_configured_official_reward_key(tmp_path: Path) -> 
         request=_request(scorer, attempts=1),
     )
     assert [cell.score for cell in scored.report.cells] == [0.25, 0.75]
+    assert [cell.passed for cell in scored.report.cells] == [False, False]
 
     wrong_path = tmp_path / "wrong"
     wrong_job_dir = wrong_path / "completed-job"
@@ -837,6 +1147,7 @@ def test_context_commits_to_tasks_evaluator_backend_model_and_harbor_version(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _install_fake_readiness(monkeypatch)
     run = _run(tmp_path, [])
     base, _ = _scorer(tmp_path, run)
     original = base.context()
@@ -874,6 +1185,10 @@ def test_context_commits_to_tasks_evaluator_backend_model_and_harbor_version(
         tmp_path / "task-backend",
         run,
         job_config=_job_config(tmp_path, backend=EnvironmentType.E2B),
+    )
+    _prepare_fake_scorer(
+        changed_task_backend,
+        tmp_path / "task-backend-preparation.json",
     )
     monkeypatch.setattr(harbor, "__version__", "0.20.0+changed")
     changed_version = base.context()

@@ -45,7 +45,7 @@ otel = ["opentelemetry-proto>=1.24"]
 viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # E2B execution is opt-in and independently selectable for the pi-node harness process and Harbor
 # task environments. Local execution remains the default and imports neither E2B integration.
-e2b = ["e2b>=2.25.0", "harbor[e2b]==0.20.0"]
+e2b = ["e2b==2.31.0", "harbor[e2b]==0.20.0"]
 # Context connectors (`wmh.connect`): the MCP client SDK backs the Notion connector's
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
 # lazily (wmh.connect.notion), same contract as the e2b extra above.

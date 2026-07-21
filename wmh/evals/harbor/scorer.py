@@ -8,11 +8,11 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Protocol, Self, TypeVar
+from typing import TYPE_CHECKING, Literal, Protocol, Self, TypeVar, cast
 from uuid import UUID, uuid4
 
 import harbor
@@ -26,6 +26,7 @@ from harbor.models.trial.config import TrialConfig
 from harbor.models.trial.result import TrialResult
 from pydantic import BaseModel
 
+from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import (
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     WMH_HARBOR_AGENT_IMPORT_PATH,
@@ -33,6 +34,7 @@ from wmh.evals.harbor.agent import (
     WmhHarborAgent,
 )
 from wmh.evals.harbor.canonical import normalize_harbor_json
+from wmh.evals.harbor.e2b_template_policy import WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
 from wmh.evals.harbor.tasks import (
     HarborTaskIdentity,
     ResolvedHarborTaskSet,
@@ -59,13 +61,18 @@ from wmh.harness.scoring import (
 )
 from wmh.providers.base import ProviderConfig
 
+if TYPE_CHECKING:
+    from wmh.evals.harbor.e2b_template_readiness import E2BTemplateReadinessPlan
+
 _INDEX_PATH = "raw/index.json"
 _REQUIRED_JOB_FILES = frozenset({"config.json", "lock.json", "result.json", "job.log"})
 _REQUIRED_TRIAL_FILES = frozenset({"config.json", "lock.json", "result.json", "trial.log"})
-_HARBOR_SCORER_VERSION = "4"
-WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH = "wmh.evals.harbor.e2b_environment:WmhE2BEnvironment"
+HarborRewardMode = Literal["raw", "positive_binary"]
+
+_HARBOR_SCORER_VERSION = "6"
 _CHECKSUM_PATTERN = r"^[0-9a-f]{64}$"
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_AsyncT = TypeVar("_AsyncT")
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,20 @@ class HarborJobRunner:
             return asyncio.run(run_job())
         with ThreadPoolExecutor(max_workers=1) as executor:
             return executor.submit(lambda: asyncio.run(run_job())).result()
+
+
+def _run_async_blocking(factory: Callable[[], Awaitable[_AsyncT]]) -> _AsyncT:
+    """Run one async validation from synchronous scoring, including event-loop callers."""
+
+    async def await_result() -> _AsyncT:
+        return await factory()
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(await_result())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(lambda: asyncio.run(await_result())).result()
 
 
 def _validate_episode_timeout_sec(value: object) -> float:
@@ -141,6 +162,7 @@ class HarborScorer:
         task_set: ResolvedHarborTaskSet,
         provider_config: ProviderConfig,
         reward_key: str,
+        reward_mode: HarborRewardMode = "raw",
         environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         harness_backend: Literal["local", "e2b"] = "local",
@@ -185,6 +207,7 @@ class HarborScorer:
             )
         if not reward_key:
             raise ValueError("reward_key must be nonempty")
+        reward_mode = normalize_harbor_reward_mode(reward_mode)
         if (
             isinstance(environment_command_timeout_sec, bool)
             or not isinstance(environment_command_timeout_sec, int)
@@ -223,10 +246,22 @@ class HarborScorer:
             provider_config.model_dump(mode="python")
         )
         self._reward_key = reward_key
+        self._reward_mode = reward_mode
         self._environment_command_timeout_sec = environment_command_timeout_sec
         self._episode_timeout_sec = episode_timeout_sec
         self._harness_backend = harness_backend
         self._task_environment_uses_paced_e2b = task_environment_uses_paced_e2b
+        self._e2b_readiness: E2BTemplateReadinessPlan | None = None
+        self._preparation_loaded = False
+        if task_environment_uses_paced_e2b:
+            from wmh.evals.harbor.e2b_template_readiness import (
+                E2BTemplateReadinessPlan,
+            )
+
+            self._e2b_readiness = E2BTemplateReadinessPlan.create(
+                job_config=self._job_config,
+                task_set=self._task_set,
+            )
         if harness_backend == "local":
             self._local_runner_identity = {
                 "transport": "ssh",
@@ -250,6 +285,7 @@ class HarborScorer:
         task_ids: tuple[str, ...],
         provider_config: ProviderConfig,
         reward_key: str,
+        reward_mode: HarborRewardMode = "raw",
         environment_command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         harness_backend: Literal["local", "e2b"] = "local",
@@ -268,6 +304,7 @@ class HarborScorer:
             task_set=task_set,
             provider_config=provider_config,
             reward_key=reward_key,
+            reward_mode=reward_mode,
             environment_command_timeout_sec=environment_command_timeout_sec,
             episode_timeout_sec=episode_timeout_sec,
             harness_backend=harness_backend,
@@ -278,6 +315,80 @@ class HarborScorer:
     def context(self) -> ScoreContext:
         """Build the frozen context expected from exact resolved Harbor task identities."""
         return self._context(self._task_set.identities)
+
+    def evaluator_policy(self) -> JsonObject:
+        """Return the explicit evaluator policy persisted beside opaque score digests."""
+        return {
+            "evaluator": "harbor",
+            "harbor_version": harbor.__version__,
+            "adapter": {
+                "agent_version": WMH_HARBOR_AGENT_VERSION,
+                "scorer_version": _HARBOR_SCORER_VERSION,
+            },
+            "reward_key": self._reward_key,
+            "reward_interpretation": _reward_interpretation_payload(self._reward_mode),
+            "verifier": self._job_config.verifier.model_dump(mode="json"),
+        }
+
+    @property
+    def preparation_required(self) -> bool:
+        """Whether scoring requires a durable task-environment preparation artifact."""
+        return self._e2b_readiness is not None
+
+    async def prepare(self, artifact_path: Path) -> None:
+        """Prepare a new scorer artifact before checkpoint or scoring evidence exists."""
+        if self._e2b_readiness is None:
+            raise RuntimeError("this scorer does not require preparation")
+        if self._preparation_loaded:
+            raise RuntimeError("scorer preparation is already loaded")
+        await self._e2b_readiness.prepare(artifact_path)
+        self._preparation_loaded = True
+
+    def load_preparation(self, artifact_path: Path) -> None:
+        """Load complete local preparation evidence without provider access."""
+        if self._e2b_readiness is None:
+            raise RuntimeError("this scorer does not require preparation")
+        if self._preparation_loaded:
+            raise RuntimeError("scorer preparation is already loaded")
+        self._e2b_readiness.load_complete_receipt(artifact_path)
+        self._preparation_loaded = True
+
+    def bind_preparation(self, artifact_path: Path) -> None:
+        """Bind a prepared scorer to an identical checkpoint-owned artifact copy."""
+        if self._e2b_readiness is None or not self._preparation_loaded:
+            raise RuntimeError("scorer preparation is not loaded")
+        self._e2b_readiness.rebind_complete_receipt(artifact_path)
+
+    async def verify_preparation(self) -> None:
+        """Inspect the current provider mapping without permitting any builds."""
+        if self._e2b_readiness is None:
+            return
+        if not self._preparation_loaded:
+            raise RuntimeError("scorer preparation is not loaded")
+        await self._e2b_readiness.verify()
+
+    def preparation_artifact_bytes(self) -> bytes | None:
+        """Return exact complete preparation bytes for generic checkpoint ownership."""
+        if self._e2b_readiness is None:
+            return None
+        if not self._preparation_loaded:
+            raise RuntimeError("scorer preparation is not loaded")
+        return self._e2b_readiness.receipt_bytes()
+
+    def preparation_summary(self) -> JsonObject | None:
+        """Return task-opaque aggregate preparation evidence without provider access."""
+        if self._e2b_readiness is None:
+            return None
+        return self._e2b_readiness.aggregate_payload()
+
+    @property
+    def preparation_artifact_hash(self) -> str | None:
+        """Return the exact preparation artifact hash included in checkpoint identity."""
+        if self._e2b_readiness is None:
+            return None
+        if not self._preparation_loaded:
+            raise RuntimeError("scorer preparation is not loaded")
+        return self._e2b_readiness.receipt_file_hash
 
     def request(self, *, attempts: int) -> ScoreRequest:
         """Build the only exact score request accepted by this resolved scorer."""
@@ -305,15 +416,7 @@ class HarborScorer:
                 for task_id, identity in sorted(identities.items())
             ],
         }
-        evaluator_payload = {
-            "harbor_version": harbor.__version__,
-            "adapter": {
-                "agent_version": WMH_HARBOR_AGENT_VERSION,
-                "scorer_version": _HARBOR_SCORER_VERSION,
-            },
-            "reward_key": self._reward_key,
-            "verifier": self._job_config.verifier.model_dump(mode="python"),
-        }
+        evaluator_payload = self.evaluator_policy()
         execution_payload = {
             "job": self._job_config.model_dump(
                 mode="python",
@@ -340,12 +443,23 @@ class HarborScorer:
             "environment_command_timeout_sec": self._environment_command_timeout_sec,
             "episode_timeout_sec": self._episode_timeout_sec,
             "e2b_create_rate": self._e2b_create_rate_identity(),
+            "task_environment_preparation": self._preparation_identity(),
         }
         return ScoreContext(
             task_set_digest=_digest_json(task_payload),
             evaluator_digest=_digest_json(evaluator_payload),
             execution_config_digest=_digest_json(execution_payload),
         )
+
+    def _preparation_identity(self) -> JsonObject | None:
+        if self._e2b_readiness is None:
+            return None
+        if not self._preparation_loaded:
+            raise RuntimeError("scorer preparation is not loaded")
+        return {
+            "plan": self._e2b_readiness.identity_payload(),
+            "mapping_digest": self._e2b_readiness.mapping_digest,
+        }
 
     def _e2b_create_rate_identity(self) -> dict[str, object] | None:
         consumers = []
@@ -365,59 +479,67 @@ class HarborScorer:
         if request != self.request(attempts=request.attempts):
             raise ValueError("score request differs from the scorer's resolved task set")
         self._task_set.verify()
-        config = self._candidate_job(candidate, request=request)
-        run = self._runner.run(config)
-        grouped = self._validate_run(
-            run,
-            candidate=candidate,
-            request=request,
-            expected_config=config,
-        )
-        manifests, reader, source_paths, observed_identities = _collect_artifacts(
-            run,
-            expected_config=config,
-            grouped=grouped,
-        )
-        if self._context(observed_identities) != request.context:
-            raise ValueError("Harbor resolved task or execution context differs from the request")
-        trial_names = {trial.trial_name for trials in grouped.values() for trial in trials}
-        shared_paths = {
-            artifact_path
-            for source_path, artifact_path in source_paths.items()
-            if source_path.split("/", 1)[0] not in trial_names
-        }
-        cells: list[ScoreCell] = []
-        for task_id in request.task_ids:
-            for attempt, trial in enumerate(grouped[task_id], 1):
-                score = _official_reward(trial, reward_key=self._reward_key)
-                trial_prefix = f"{trial.trial_name}/"
-                cell_paths = {
-                    _INDEX_PATH,
-                    *shared_paths,
-                    *(
-                        artifact_path
-                        for source_path, artifact_path in source_paths.items()
-                        if source_path.startswith(trial_prefix)
-                    ),
-                }
-                cells.append(
-                    ScoreCell(
-                        task_id=task_id,
-                        attempt=attempt,
-                        score=score,
-                        passed=score == 1.0,
-                        summary=_trial_summary(trial),
-                        artifact_paths=tuple(sorted(cell_paths)),
-                    )
+        _run_async_blocking(self.verify_preparation)
+        try:
+            config = self._candidate_job(candidate, request=request)
+            run = self._runner.run(config)
+            grouped = self._validate_run(
+                run,
+                candidate=candidate,
+                request=request,
+                expected_config=config,
+            )
+            manifests, reader, source_paths, observed_identities = _collect_artifacts(
+                run,
+                expected_config=config,
+                grouped=grouped,
+            )
+            if self._context(observed_identities) != request.context:
+                raise ValueError(
+                    "Harbor resolved task or execution context differs from the request"
                 )
-        report = HarnessScoreReport(
-            source_run_id=str(run.result.id),
-            candidate_doc_hash=candidate.doc_hash,
-            request=request,
-            cells=tuple(cells),
-            artifacts=tuple(manifests),
-        )
-        return HarnessScore(report=report, artifacts=reader)
+            trial_names = {trial.trial_name for trials in grouped.values() for trial in trials}
+            shared_paths = {
+                artifact_path
+                for source_path, artifact_path in source_paths.items()
+                if source_path.split("/", 1)[0] not in trial_names
+            }
+            cells: list[ScoreCell] = []
+            for task_id in request.task_ids:
+                for attempt, trial in enumerate(grouped[task_id], 1):
+                    raw_reward = _official_reward(trial, reward_key=self._reward_key)
+                    score, passed = _interpret_reward(raw_reward, self._reward_mode)
+                    trial_prefix = f"{trial.trial_name}/"
+                    cell_paths = {
+                        _INDEX_PATH,
+                        *shared_paths,
+                        *(
+                            artifact_path
+                            for source_path, artifact_path in source_paths.items()
+                            if source_path.startswith(trial_prefix)
+                        ),
+                    }
+                    cells.append(
+                        ScoreCell(
+                            task_id=task_id,
+                            attempt=attempt,
+                            score=score,
+                            passed=passed,
+                            summary=_trial_summary(trial),
+                            artifact_paths=tuple(sorted(cell_paths)),
+                        )
+                    )
+            report = HarnessScoreReport(
+                source_run_id=str(run.result.id),
+                candidate_doc_hash=candidate.doc_hash,
+                request=request,
+                cells=tuple(cells),
+                artifacts=tuple(manifests),
+            )
+            return HarnessScore(report=report, artifacts=reader)
+        finally:
+            self._task_set.verify()
+            _run_async_blocking(self.verify_preparation)
 
     def _candidate_job(self, candidate: HarnessDoc, *, request: ScoreRequest) -> JobConfig:
         template = self._job_config.agents[0]
@@ -444,6 +566,20 @@ class HarborScorer:
             },
             deep=True,
         )
+        environment = self._job_config.environment
+        if self._e2b_readiness is not None:
+            if not self._preparation_loaded or not self._e2b_readiness.verified:
+                raise RuntimeError("scorer preparation was not verified before Harbor execution")
+            environment = environment.model_copy(
+                update={
+                    "kwargs": {
+                        **environment.kwargs,
+                        "require_prebuilt": True,
+                        "preparation_digest": self._e2b_readiness.mapping_digest,
+                    }
+                },
+                deep=True,
+            )
         return JobConfig.model_validate(
             self._job_config.model_copy(
                 update={
@@ -454,6 +590,7 @@ class HarborScorer:
                     "datasets": [],
                     "tasks": direct_tasks,
                     "agents": [agent],
+                    "environment": environment,
                 },
                 deep=True,
             ).model_dump(mode="python")
@@ -785,6 +922,27 @@ def _validate_trial_lock(lock: TrialLock, trial: TrialResult) -> None:
 def _validate_dataset_origin(requested: DatasetConfig, resolved: DatasetConfig) -> None:
     if requested.model_dump(mode="json") != resolved.model_dump(mode="json"):
         raise ValueError("resolved Harbor task set came from a different dataset selector")
+
+
+def normalize_harbor_reward_mode(value: str) -> HarborRewardMode:
+    """Normalize the CLI spelling into the scorer's canonical reward mode."""
+    normalized = value.replace("-", "_")
+    if normalized not in {"raw", "positive_binary"}:
+        raise ValueError("reward mode must be raw or positive-binary")
+    return cast("HarborRewardMode", normalized)
+
+
+def _reward_interpretation_payload(mode: HarborRewardMode) -> JsonObject:
+    if mode == "raw":
+        return {"mode": "raw", "threshold": 1.0, "comparator": "eq"}
+    return {"mode": "positive_binary", "threshold": 0.0, "comparator": "gt"}
+
+
+def _interpret_reward(value: float, mode: HarborRewardMode) -> tuple[float, bool]:
+    if mode == "raw":
+        return value, value == 1.0
+    passed = value > 0.0
+    return float(passed), passed
 
 
 def _official_reward(trial: TrialResult, *, reward_key: str) -> float:

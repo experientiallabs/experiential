@@ -69,6 +69,9 @@ def test_resolver_selects_literal_task_ids_without_fnmatch_semantics(tmp_path: P
 
     assert task_set.task_ids == ("task[1]",)
     assert [task.get_task_id().get_name() for task in task_set.task_configs()] == ["task[1]"]
+    definition, definition_path = task_set.task_inputs()[0]
+    assert definition.schema_version == "1.0"
+    assert definition_path == (dataset_path / "task[1]").resolve()
     assert task_set.requested_dataset_config().path == dataset_path
     assert task_set.resolved_dataset_config().task_names is None
 

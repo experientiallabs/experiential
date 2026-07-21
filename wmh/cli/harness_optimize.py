@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,12 +29,20 @@ from wmh.agents.project import (
 )
 from wmh.cli.harbor_inputs import load_harbor_config, load_task_ids, write_json_atomic
 from wmh.cli.model_roles import resolve_required_model_config
+from wmh.cli.scorer_preparation import (
+    preparation_staging_path,
+    remove_preparation_staging,
+)
 from wmh.config import ARTIFACT_DIR
 from wmh.config.store import validate_name
 from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
 from wmh.evals.harbor.canonical import canonical_harbor_job_config
-from wmh.evals.harbor.scorer import HarborScorer
+from wmh.evals.harbor.scorer import (
+    HarborRewardMode,
+    HarborScorer,
+    normalize_harbor_reward_mode,
+)
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import (
     E2B_TEMPLATE_ENV,
@@ -108,6 +117,11 @@ def optimize_harness(
         ...,
         "--reward-key",
         help="Official Harbor verifier reward field to optimize.",
+    ),
+    reward_mode: str = typer.Option(
+        "raw",
+        "--reward-mode",
+        help="Interpret rewards as raw values or strict positive-binary successes.",
     ),
     iterations: int = typer.Option(..., min=1, help="Fixed number of singular proposal slots."),
     attempts: int = typer.Option(..., min=1, help="Attempts per exact task and candidate."),
@@ -205,6 +219,10 @@ def optimize_harness(
     if not reward_key:
         raise typer.BadParameter("--reward-key must be nonempty")
     try:
+        normalized_reward_mode = normalize_harbor_reward_mode(reward_mode)
+    except ValueError as error:
+        raise typer.BadParameter(str(error), param_hint="--reward-mode") from error
+    try:
         episode_timeout_sec = validate_episode_timeout_s(episode_timeout_sec)
     except ValueError as error:
         raise typer.BadParameter(str(error), param_hint="--episode-timeout") from error
@@ -213,6 +231,8 @@ def optimize_harness(
             "--episode-timeout requires --harness-backend e2b",
             param_hint="--episode-timeout",
         )
+    if not yes and not _console.is_terminal:
+        raise typer.BadParameter("pass --yes to acknowledge the execution matrix")
 
     job_config = load_harbor_config(Path(harbor_config))
     task_ids = load_task_ids(Path(task_ids_file))
@@ -237,11 +257,18 @@ def optimize_harness(
         f"fixed search: 1 seed + {iterations} proposal slot(s), {len(task_ids)} task(s), "
         f"{attempts} attempt(s) -> up to {score_cells} requested score cells; "
         f"ceiling={max_score_cells}; evaluated Pi backend={harness_backend}; "
-        f"episode timeout={episode_timeout_sec:g}s; proposer project=e2b"
+        f"episode timeout={episode_timeout_sec:g}s; "
+        f"reward mode={normalized_reward_mode.replace('_', '-')}; proposer project=e2b"
     )
-    if not yes:
-        if not _console.is_terminal:
-            raise typer.BadParameter("pass --yes to acknowledge the execution matrix")
+
+    def before_preparation(summary: JsonObject | None) -> None:
+        if summary is not None:
+            _console.print(
+                "task-environment preparation: "
+                + json.dumps(summary, sort_keys=True, separators=(",", ":"))
+            )
+        if yes:
+            return
         if not Confirm.ask("Proceed?", default=False):
             raise typer.Exit(0)
 
@@ -252,6 +279,7 @@ def optimize_harness(
         job_config=job_config,
         task_ids=task_ids,
         reward_key=reward_key,
+        reward_mode=normalized_reward_mode,
         iterations=iterations,
         attempts=attempts,
         max_score_cells=max_score_cells,
@@ -270,6 +298,7 @@ def optimize_harness(
         resume=resume,
         max_new_boundaries=max_new_boundaries,
         episode_timeout_sec=episode_timeout_sec,
+        before_preparation=before_preparation,
     )
     if isinstance(outcome, HarnessOptimizeProgress):
         completed = len(outcome.result.iterations) + 1
@@ -310,6 +339,8 @@ def _execute_optimization(
     resume: bool,
     max_new_boundaries: int | None = None,
     episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    reward_mode: HarborRewardMode = "raw",
+    before_preparation: Callable[[JsonObject | None], None] | None = None,
 ) -> HarnessOptimizeOutcome | HarnessOptimizeProgress:
     """Resolve one immutable scorer request, execute it, and publish evidence before winner."""
     if max_new_boundaries is not None and (
@@ -330,6 +361,11 @@ def _execute_optimization(
         ).model_dump(mode="python")
     )
     optimizer = optimizer_agent()
+    meta_provider = get_provider(meta_config)
+    if not isinstance(meta_provider, ToolCallingProvider):
+        raise typer.BadParameter("settings [models.meta] provider lacks structured tool calling")
+    if not resume and seed is None:
+        raise ValueError("new optimization requires a resolved seed source")
     with ExitStack() as stack:
         checkpoint: PopulationCheckpointStore | None = None
         if resume:
@@ -341,12 +377,34 @@ def _execute_optimization(
                 task_ids=task_ids,
                 provider_config=agent_config,
                 reward_key=reward_key,
+                reward_mode=reward_mode,
                 environment_command_timeout_sec=environment_command_timeout_sec,
                 episode_timeout_sec=episode_timeout_sec,
                 harness_backend=harness_backend,
                 e2b_template=e2b_template if harness_backend == "e2b" else None,
             )
         )
+        preparation_summary = scorer.preparation_summary()
+        if before_preparation is not None:
+            before_preparation(preparation_summary)
+
+        staging_path: Path | None = None
+        if checkpoint is not None:
+            seed_source = checkpoint.seed
+            if scorer.preparation_required:
+                artifact_path = checkpoint.scorer_preparation_artifact_path
+                if artifact_path is None:
+                    raise PopulationCheckpointError(
+                        "checkpoint is missing its scorer preparation artifact"
+                    )
+                scorer.load_preparation(artifact_path)
+        else:
+            assert seed is not None
+            seed_source = seed
+            if scorer.preparation_required:
+                staging_path = preparation_staging_path(run_dir)
+                asyncio.run(scorer.prepare(staging_path))
+
         request = scorer.request(attempts=attempts)
         if request.task_ids != task_ids or request.attempts != attempts:
             raise ValueError("resolved score request differs from the declared task matrix")
@@ -357,23 +415,13 @@ def _execute_optimization(
                 f"max_score_cells={max_score_cells}"
             )
 
-        meta_provider = get_provider(meta_config)
-        if not isinstance(meta_provider, ToolCallingProvider):
-            raise typer.BadParameter(
-                "settings [models.meta] provider lacks structured tool calling"
-            )
-        if checkpoint is not None:
-            seed_source = checkpoint.seed
-        else:
-            if seed is None:
-                raise ValueError("new optimization requires a resolved seed source")
-            seed_source = seed
         identity = PopulationCheckpointIdentity(
             output_name=name,
             artifact_root=str(Path(root).resolve()),
             seed_reference=seed_reference,
             seed_source_tree_hash=seed_source.tree_hash,
             score_request=request,
+            evaluator_policy=scorer.evaluator_policy(),
             iterations=iterations,
             planned_score_cells=planned_score_cells,
             max_score_cells=max_score_cells,
@@ -383,6 +431,7 @@ def _execute_optimization(
             optimizer_document_hash=optimizer.doc_hash,
             harness_backend=harness_backend,
             e2b_template=e2b_template or None,
+            scorer_preparation_artifact_hash=scorer.preparation_artifact_hash,
             project_e2b_create_rate_policy=e2b_create_rate_policy_payload(),
             environment_command_timeout_sec=environment_command_timeout_sec,
             episode_timeout_sec=episode_timeout_sec,
@@ -393,16 +442,27 @@ def _execute_optimization(
             max_history_bytes=max_history_bytes,
         )
         if checkpoint is None:
+            preparation_artifact = scorer.preparation_artifact_bytes()
             checkpoint = stack.enter_context(
                 PopulationCheckpointStore.create(
                     run_dir,
                     identity=identity,
                     seed=seed_source,
+                    scorer_preparation_artifact=preparation_artifact,
                 )
             )
+            if scorer.preparation_required:
+                checkpoint_artifact = checkpoint.scorer_preparation_artifact_path
+                if checkpoint_artifact is None or staging_path is None:
+                    raise PopulationCheckpointError(
+                        "checkpoint did not retain scorer preparation evidence"
+                    )
+                scorer.bind_preparation(checkpoint_artifact)
+                remove_preparation_staging(staging_path)
             write_json_atomic(run_dir / "inputs.json", identity.model_dump(mode="json"))
         else:
             checkpoint.assert_identity(identity)
+        asyncio.run(scorer.verify_preparation())
 
         result = checkpoint.result
         project_usage = checkpoint.control.project_sandbox_usage

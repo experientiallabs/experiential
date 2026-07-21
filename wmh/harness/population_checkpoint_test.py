@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -252,6 +253,88 @@ def test_checkpoint_appends_exact_boundaries_and_restores_without_replay(tmp_pat
         assert resumed.result.iterations[1].error is not None
         assert resumed.result.iterations[1].error.reason == "incomplete candidate"
         assert resumed.result.iterations[1].error.worker_usage is None
+
+
+def test_checkpoint_owns_and_verifies_exact_scorer_preparation_artifact(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    seed = _source("seed")
+    receipt = b'{"complete":true}\n'
+    receipt_hash = "sha256:" + hashlib.sha256(receipt).hexdigest()
+    identity = _identity(tmp_path / "root", seed).model_copy(
+        update={"scorer_preparation_artifact_hash": receipt_hash}
+    )
+
+    with PopulationCheckpointStore.create(
+        run_dir,
+        identity=identity,
+        seed=seed,
+        scorer_preparation_artifact=receipt,
+    ) as store:
+        assert store.scorer_preparation_artifact_path is not None
+        assert store.scorer_preparation_artifact_path.read_bytes() == receipt
+
+    with PopulationCheckpointStore.open(run_dir) as resumed:
+        assert resumed.scorer_preparation_artifact_path is not None
+        assert resumed.scorer_preparation_artifact_path.read_bytes() == receipt
+
+
+@pytest.mark.parametrize("provide_receipt", [False, True])
+def test_checkpoint_rejects_preparation_artifact_identity_mismatch_before_create(
+    tmp_path: Path,
+    provide_receipt: bool,
+) -> None:
+    seed = _source("seed")
+    receipt = b'{"complete":true}\n'
+    identity = _identity(tmp_path / "root", seed)
+    if not provide_receipt:
+        identity = identity.model_copy(update={"scorer_preparation_artifact_hash": _DIGEST_A})
+
+    with pytest.raises(ValueError, match="preparation artifact"):
+        PopulationCheckpointStore.create(
+            tmp_path / "run",
+            identity=identity,
+            seed=seed,
+            scorer_preparation_artifact=receipt if provide_receipt else None,
+        )
+
+    assert not (tmp_path / "run").exists()
+
+
+def test_checkpoint_rejects_tampered_or_linked_preparation_artifact(tmp_path: Path) -> None:
+    seed = _source("seed")
+    receipt = b'{"complete":true}\n'
+    receipt_hash = "sha256:" + hashlib.sha256(receipt).hexdigest()
+
+    def create_run(run_dir: Path) -> Path:
+        identity = _identity(tmp_path / f"root-{run_dir.name}", seed).model_copy(
+            update={"scorer_preparation_artifact_hash": receipt_hash}
+        )
+        store = PopulationCheckpointStore.create(
+            run_dir,
+            identity=identity,
+            seed=seed,
+            scorer_preparation_artifact=receipt,
+        )
+        path = store.scorer_preparation_artifact_path
+        assert path is not None
+        store.close()
+        return path
+
+    tampered_run = tmp_path / "tampered"
+    create_run(tampered_run).write_bytes(b'{"complete":false}\n')
+    with pytest.raises(PopulationCheckpointError, match="preparation artifact"):
+        PopulationCheckpointStore.open(tampered_run)
+
+    linked_run = tmp_path / "linked"
+    linked_path = create_run(linked_run)
+    linked_path.unlink()
+    target = tmp_path / "outside.json"
+    target.write_bytes(receipt)
+    linked_path.symlink_to(target)
+    with pytest.raises(PopulationCheckpointError, match="preparation artifact"):
+        PopulationCheckpointStore.open(linked_run)
 
 
 def test_checkpoint_lock_has_one_local_owner(tmp_path: Path) -> None:

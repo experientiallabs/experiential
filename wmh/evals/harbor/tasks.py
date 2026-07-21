@@ -11,6 +11,7 @@ from typing import Protocol
 
 from harbor.models.job.config import DatasetConfig
 from harbor.models.job.lock import build_trial_lock
+from harbor.models.task.config import TaskConfig as TaskDefinitionConfig
 from harbor.models.task.id import GitTaskId, PackageTaskId
 from harbor.models.task.task import Task
 from harbor.models.trial.config import TaskConfig, TrialConfig
@@ -53,6 +54,7 @@ class _ResolvedTask:
     task_id: str
     identity: HarborTaskIdentity
     config_json: str
+    definition_json: str
     download_json: str
 
     @classmethod
@@ -69,10 +71,14 @@ class _ResolvedTask:
             update={"path": download.path.resolve(strict=True)},
             deep=True,
         )
+        definition_snapshot = TaskDefinitionConfig.model_validate(
+            Task(download_snapshot.path).config.model_dump(mode="python")
+        )
         return cls(
             task_id=snapshot.get_task_id().get_name(),
             identity=HarborTaskIdentity.model_validate(identity),
             config_json=snapshot.model_dump_json(),
+            definition_json=definition_snapshot.model_dump_json(),
             download_json=download_snapshot.model_dump_json(),
         )
 
@@ -81,6 +87,9 @@ class _ResolvedTask:
 
     def download(self) -> TaskDownloadResult:
         return TaskDownloadResult.model_validate_json(self.download_json)
+
+    def definition(self) -> TaskDefinitionConfig:
+        return TaskDefinitionConfig.model_validate_json(self.definition_json)
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,10 @@ class ResolvedHarborTaskSet:
 
     def task_configs(self) -> list[TaskConfig]:
         return [record.config() for record in self._tasks]
+
+    def task_inputs(self) -> tuple[tuple[TaskDefinitionConfig, Path], ...]:
+        """Return frozen task definitions paired with verified download directories."""
+        return tuple((record.definition(), record.download().path) for record in self._tasks)
 
     def verify(self) -> None:
         """Re-hash every resolved task before a candidate job can incur spend."""
