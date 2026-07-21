@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 import logging
 import shlex
-import shutil
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
 from typing import Protocol
@@ -136,11 +135,11 @@ class ProjectCandidateProposer:
         _check_cancelled(should_cancel)
         candidate_id = candidate_slot_id(slot)
         slot_dir = self._run_dir / PROPOSALS_DIR / f"slot-{slot:04d}"
-        # An uncommitted leftover from a crashed attempt at this same slot is stale evidence;
-        # committed earlier slots are never touched.
-        if slot_dir.exists():
-            shutil.rmtree(slot_dir)
-        slot_dir.mkdir(parents=True)
+        # A crashed earlier attempt at this same slot is still evidence: move it aside into
+        # attempt-K/ (never delete it) so the redone turn starts clean but later slots and
+        # humans can still read what happened.
+        _set_aside_prior_attempt(slot_dir)
+        slot_dir.mkdir(parents=True, exist_ok=True)
         try:
             return self._propose(
                 tuple(population),
@@ -218,7 +217,8 @@ class ProjectCandidateProposer:
                 for item in source.files:
                     target = slot_dir / "source" / item.path
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(item.content, encoding="utf-8")
+                    # Exact bytes: newline translation would silently change content hashes.
+                    target.write_bytes(item.content.encode("utf-8"))
 
             failures: list[str] = []
             if run_error is not None:
@@ -274,7 +274,6 @@ class ProjectCandidateProposer:
             report = evaluated.report
             cells: list[dict[str, JsonValue]] = []
             budget = self._max_candidate_history_bytes
-            truncated = False
             for cell in report.cells:
                 trial_dir = f"{directory}/trials/{cell.task_id}/attempt-{cell.attempt}"
                 cells.append(
@@ -287,16 +286,7 @@ class ProjectCandidateProposer:
                         "trial_dir": trial_dir,
                     }
                 )
-                if truncated:
-                    continue
                 budget = self._copy_trial_evidence(project, trial_dir, cell, budget)
-                if budget <= 0:
-                    truncated = True
-                    project.write_text(
-                        f"{directory}/trials/TRUNCATED.md",
-                        "Raw trial evidence for this candidate reached the byte budget; "
-                        "later trials were omitted.",
-                    )
             project.write_text(
                 f"{directory}/report.json",
                 _json(
@@ -342,8 +332,17 @@ class ProjectCandidateProposer:
         cell: ScoreCell,
         budget: int,
     ) -> int:
-        """Copy one trial's transcript and verifier output (never harbor's ceremony files)."""
+        """Copy one trial's transcript and verifier output (never harbor's ceremony files).
+
+        Every gap is marked where the proposer will look: a trial with no recorded artifact
+        directory gets `NO-EVIDENCE.md`, and a trial whose files were truncated or omitted by
+        the byte budget gets `EVIDENCE-TRUNCATED.md` naming exactly what is incomplete.
+        """
         if not cell.artifact_dir:
+            project.write_text(
+                f"{trial_dir}/NO-EVIDENCE.md",
+                "This trial recorded no artifact directory; no raw evidence was captured.",
+            )
             return budget
         artifact_dir = Path(cell.artifact_dir)
         sources: list[tuple[Path, str]] = []
@@ -357,15 +356,24 @@ class ProjectCandidateProposer:
                 for path in sorted(verifier_dir.rglob("*"))
                 if path.is_file()
             )
+        incomplete: list[str] = []
         for host_path, target in sources:
             if budget <= 0:
-                break
+                incomplete.append(f"omitted (byte budget reached): {target}")
+                continue
             try:
-                content = _read_evidence(host_path, self._max_history_file_bytes)
+                content, was_truncated = _read_evidence(host_path, self._max_history_file_bytes)
             except OSError as error:
-                content = f"[unreadable evidence file: {error}]"
+                content, was_truncated = f"[unreadable evidence file: {error}]", False
             project.write_text(target, content)
             budget -= len(content.encode("utf-8"))
+            if was_truncated:
+                incomplete.append(f"head/tail truncated: {target}")
+        if incomplete:
+            project.write_text(
+                f"{trial_dir}/EVIDENCE-TRUNCATED.md",
+                "This trial's raw evidence is incomplete:\n" + "\n".join(incomplete),
+            )
         return budget
 
     def _materialize_prior_proposals(self, project: CandidateProject, slot: int) -> None:
@@ -374,19 +382,29 @@ class ProjectCandidateProposer:
         if not proposals_root.is_dir():
             return
         budget = self._max_candidate_history_bytes
+        omitted: list[str] = []
         for slot_dir in sorted(proposals_root.iterdir()):
             if not slot_dir.is_dir() or slot_dir.name == f"slot-{slot:04d}":
                 continue
             for path in sorted(slot_dir.rglob("*")):
-                if not path.is_file() or budget <= 0:
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(proposals_root).as_posix()
+                if budget <= 0:
+                    omitted.append(relative)
                     continue
                 try:
-                    content = _read_evidence(path, self._max_history_file_bytes)
+                    content, _was_truncated = _read_evidence(path, self._max_history_file_bytes)
                 except OSError as error:
                     content = f"[unreadable evidence file: {error}]"
-                relative = path.relative_to(proposals_root).as_posix()
                 project.write_text(f"{PROPOSALS_DIR}/{relative}", content)
                 budget -= len(content.encode("utf-8"))
+        if omitted:
+            project.write_text(
+                f"{PROPOSALS_DIR}/TRUNCATED.md",
+                "Prior proposal evidence beyond the byte budget was omitted:\n"
+                + "\n".join(omitted),
+            )
 
     def _write_events(self, slot_dir: Path, events: Sequence[SessionEvent]) -> None:
         _write_json(
@@ -395,30 +413,85 @@ class ProjectCandidateProposer:
         )
 
 
+# In-sandbox syntax validation for candidate .ts/.js files. `node --check` cannot be used for
+# TypeScript: it does NOT strip types under --check (verified on node 22.23), so it falsely
+# rejects valid TS including the seed's own vendored files. `stripTypeScriptTypes` (node >=
+# 22.13) fully parses TS module grammar and throws on syntax errors, and plain JS is a subset
+# of that grammar, so one code path validates both. When the sandbox's node predates it, the
+# script reports the skip marker and validation is SKIPPED rather than false-rejecting every
+# candidate.
+_TS_VALIDATION_SKIP_MARKER = "typescript-validation-skipped"
+_TS_CHECK_SCRIPT = f"""\
+const {{ readFileSync }} = require('node:fs');
+let strip;
+try {{
+  ({{ stripTypeScriptTypes: strip }} = require('node:module'));
+}} catch {{}}
+if (typeof strip !== 'function') {{
+  console.log('{_TS_VALIDATION_SKIP_MARKER}: node:module.stripTypeScriptTypes unavailable');
+  process.exit(0);
+}}
+let failed = false;
+for (const path of process.argv.slice(1)) {{
+  try {{
+    strip(readFileSync(path, 'utf8'));
+  }} catch (error) {{
+    failed = true;
+    console.error(path + ': ' + (error && error.message ? error.message : String(error)));
+  }}
+}}
+process.exit(failed ? 1 : 0);
+"""
+
+
 def _interface_errors(project: CandidateProject, source: HarnessSourceTree) -> list[str]:
-    """The paper's interface-validation gate: node syntax-checks every candidate code file.
+    """The paper's interface-validation gate: parse-check every candidate code file.
 
-    A candidate that cannot parse must never burn a paid evaluation, so each `.ts`/`.js` file
-    is checked with `node --experimental-strip-types --check` inside the project sandbox (the
-    pi template ships node). Failures preserve node's stderr as slot evidence.
+    A candidate that cannot parse must never burn a paid evaluation. One in-sandbox node
+    invocation strips/parses every `.ts`/`.js` file via `node:module.stripTypeScriptTypes`
+    (which throws on bad syntax); failures preserve node's per-file error as slot evidence.
     """
-    errors: list[str] = []
-    for item in source.files:
-        if not item.path.endswith((".ts", ".js")):
-            continue
-        staged = f"{CANDIDATE_STAGE_DIR}/{item.path}"
-        result = project.run_bash(f"node --experimental-strip-types --check {shlex.quote(staged)}")
-        if result.exit_code != 0:
-            detail = result.stderr or result.stdout or f"exit {result.exit_code}"
-            errors.append(f"interface validation failed for {item.path}: {detail}")
-    return errors
+    staged = [
+        f"{CANDIDATE_STAGE_DIR}/{item.path}"
+        for item in source.files
+        if item.path.endswith((".ts", ".js"))
+    ]
+    if not staged:
+        return []
+    quoted_paths = " ".join(shlex.quote(path) for path in staged)
+    result = project.run_bash(f"node -e {shlex.quote(_TS_CHECK_SCRIPT)} {quoted_paths}")
+    if result.exit_code == 0:
+        if _TS_VALIDATION_SKIP_MARKER in result.stdout:
+            logger.warning("candidate interface validation skipped: %s", result.stdout.strip())
+        return []
+    detail = result.stderr or result.stdout or f"exit {result.exit_code}"
+    return [f"interface validation failed: {detail}"]
 
 
-def _read_evidence(path: Path, max_bytes: int) -> str:
-    """Read one evidence file, head/tail-truncating oversized content with a marker."""
+def _set_aside_prior_attempt(slot_dir: Path) -> None:
+    """Move a crashed prior attempt's evidence into `attempt-K/` instead of deleting it."""
+    if not slot_dir.is_dir():
+        return
+    prior = [path for path in slot_dir.iterdir() if not path.name.startswith("attempt-")]
+    if not prior:
+        return
+    attempt_count = sum(
+        1 for path in slot_dir.iterdir() if path.is_dir() and path.name.startswith("attempt-")
+    )
+    attempt_dir = slot_dir / f"attempt-{attempt_count + 1}"
+    attempt_dir.mkdir()
+    for path in prior:
+        path.rename(attempt_dir / path.name)
+
+
+def _read_evidence(path: Path, max_bytes: int) -> tuple[str, bool]:
+    """Read one evidence file, head/tail-truncating oversized content with a marker.
+
+    Returns the content and whether it was truncated.
+    """
     size = path.stat().st_size
     if size <= max_bytes:
-        return path.read_bytes().decode("utf-8", errors="replace")
+        return path.read_bytes().decode("utf-8", errors="replace"), False
     half = max_bytes // 2
     with path.open("rb") as handle:
         head = handle.read(half)
@@ -428,7 +501,7 @@ def _read_evidence(path: Path, max_bytes: int) -> str:
         head.decode("utf-8", errors="replace")
         + f"\n... {size - max_bytes} bytes truncated ...\n"
         + tail.decode("utf-8", errors="replace")
-    )
+    ), True
 
 
 def _proposal_request(
@@ -474,8 +547,9 @@ another (`a` next to `a/b.ts`). One bad filename invalidates the whole candidate
 carefully instead of spending this slot on cosmetics.
 
 Do not modify immutable project paths. When the candidate is complete, call submit. The host
-snapshots the directory once after this turn, syntax-checks every `.ts`/`.js` file with
-`node --experimental-strip-types --check`, and will not ask for a repair.
+snapshots the directory once after this turn, parse-checks every `.ts`/`.js` file with node's
+TypeScript syntax stripper (a syntax error anywhere invalidates the candidate), and will not ask
+for a repair.
 
 This turn's immutable request and trace are stored under `{PROPOSALS_DIR}/slot-{slot:04d}/`.
 """
