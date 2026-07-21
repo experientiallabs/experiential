@@ -196,3 +196,69 @@ def test_proposer_returning_the_wrong_slot_identity_is_a_bug(tmp_path: Path) -> 
     scorer = _FakeScorer({"seed": (1.0, 0.0), "v2": (1.0, 1.0)})
     with pytest.raises(ValueError, match="expected 'candidate-0001'"):
         optimize(_tree("seed"), scorer, _WrongIdProposer(), 1, run_dir=tmp_path)
+
+
+class _FlakyScorer:
+    """Delegates to a real fake scorer but dies once on a chosen candidate (infra crash)."""
+
+    def __init__(self, inner: _FakeScorer, *, fail_on: str) -> None:
+        self._inner = inner
+        self._fail_on = fail_on
+        self._failed = False
+
+    @property
+    def request(self) -> ScoreRequest:
+        return self._inner.request
+
+    def score(
+        self,
+        doc: HarnessDoc,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> ScoreReport:
+        if doc.system_prompt() == self._fail_on and not self._failed:
+            self._failed = True
+            raise RuntimeError("score infra died")
+        return self._inner.score(doc, should_cancel=should_cancel)
+
+
+def test_accepted_proposal_is_checkpointed_before_scoring_and_resumed_as_pending(
+    tmp_path: Path,
+) -> None:
+    """A crash mid-score must rescore the SAME candidate, never repay a proposer turn."""
+    scorer = _FakeScorer({"seed": (1.0, 0.0), "v2": (1.0, 1.0)})
+    with pytest.raises(RuntimeError, match="score infra died"):
+        optimize(
+            _tree("seed"),
+            _FlakyScorer(scorer, fail_on="v2"),
+            _ScriptedProposer([_tree("v2")]),
+            1,
+            run_dir=tmp_path,
+        )
+
+    # Resume: the pending checkpoint short-circuits the proposer entirely.
+    untouched = _ScriptedProposer([])
+    resumed = optimize(_tree("seed"), scorer, untouched, 1, run_dir=tmp_path)
+
+    assert untouched.slots == []
+    assert resumed.completed is True
+    evaluated = resumed.outcomes[1].evaluated
+    assert evaluated is not None
+    assert evaluated.source == _tree("v2")  # the exact checkpointed candidate was rescored
+    assert not (tmp_path / "candidates" / "candidate-0001" / "pending.json").exists()
+
+
+def test_commit_clears_stale_source_leftovers_from_a_crashed_attempt(tmp_path: Path) -> None:
+    """Leftover files from an earlier attempt must never merge into a redone slot's tree."""
+    junk = tmp_path / "candidates" / "candidate-0001" / "source" / "junk.md"
+    junk.parent.mkdir(parents=True)
+    junk.write_text("leftover", encoding="utf-8")
+    scorer = _FakeScorer({"seed": (1.0, 0.0), "v2": (1.0, 1.0)})
+
+    optimize(_tree("seed"), scorer, _ScriptedProposer([_tree("v2")]), 1, run_dir=tmp_path)
+
+    reloaded = PopulationRunState(tmp_path).load()  # doc-hash re-verification must hold
+    evaluated = reloaded[1].evaluated
+    assert evaluated is not None
+    assert evaluated.source == _tree("v2")
+    assert not junk.exists()

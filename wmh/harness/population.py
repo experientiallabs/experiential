@@ -10,15 +10,20 @@ earliest candidate winning ties.
 Durable state is the run directory. After every boundary (the scored seed, one scored proposal,
 or one consumed invalid slot) the outcome's evidence lands under `candidates/candidate-NNNN/`
 (`source/`, `report.json`, and `proposal.json` or `error.json`) and the ordered index is
-committed by an atomic tmp+rename of `state.json`. Resuming reloads that state and continues at
-the first missing slot, so an interrupted run re-pays at most one boundary (and the harbor
-scorer's own trial-level resume usually far less).
+committed by an atomic tmp+rename of `state.json`. An ACCEPTED proposal is additionally
+checkpointed (`source/` + `proposal.json` + `pending.json`) BEFORE its evaluation starts, so a
+crash mid-score resumes by rescoring the exact same candidate instead of paying a fresh proposer
+turn whose different doc hash would also orphan the part-paid evaluator job. Resuming reloads
+state and continues at the first missing slot, so an interrupted run re-pays at most one
+boundary (and the harbor scorer's own trial-level resume usually far less).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 _STATE_FILE = "state.json"
 _CANDIDATES_DIR = "candidates"
+_PENDING_FILE = "pending.json"
 
 
 def candidate_slot_id(slot: int) -> str:
@@ -142,14 +148,25 @@ class PopulationResult:
 
 
 def write_json_atomic(path: Path, value: JsonValue) -> None:
-    """Write deterministic JSON through a same-directory tmp+rename."""
+    """Write deterministic JSON through a same-directory fsynced tmp+rename.
+
+    The temp file is fsynced before the rename and the directory after it: without both, a
+    power loss can persist the rename while the data blocks are lost, leaving a truncated or
+    empty state file behind an apparently successful commit.
+    """
     temporary = path.with_name(f"{path.name}.tmp")
     temporary.parent.mkdir(parents=True, exist_ok=True)
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    payload = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
     temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 class PopulationRunState:
@@ -192,19 +209,70 @@ class PopulationRunState:
             try:
                 report = ScoreReport.model_validate_json(report_path.read_text(encoding="utf-8"))
                 source = _read_source_tree(directory / "source")
+                evaluated = EvaluatedCandidate(candidate_id, source, report)
             except (OSError, ValueError) as error:
                 raise ValueError(
-                    f"run dir {self.run_dir} is missing evidence for {candidate_id}: {error}"
+                    f"run dir {self.run_dir} holds corrupt or missing evidence for "
+                    f"{candidate_id}: {error}"
                 ) from error
             outcomes.append(
                 SlotOutcome(
                     slot=index,
                     candidate_id=candidate_id,
-                    evaluated=EvaluatedCandidate(candidate_id, source, report),
+                    evaluated=evaluated,
                     evidence_dir=str(entry.get("evidence_dir") or ""),
                 )
             )
         return tuple(outcomes)
+
+    def record_pending(self, proposal: CandidateProposal, *, evidence_dir: str = "") -> None:
+        """Durably checkpoint one ACCEPTED proposal before its paid evaluation starts.
+
+        The source tree and proposal record land first; the atomic `pending.json` marker is
+        written last, so a marker's presence implies complete candidate bytes. A crash between
+        this checkpoint and the boundary commit resumes by rescoring this exact candidate.
+        """
+        directory = self.candidate_dir(proposal.candidate_id)
+        _write_candidate_source(directory / "source", proposal.source)
+        write_json_atomic(
+            directory / "proposal.json",
+            {
+                "candidate_id": proposal.candidate_id,
+                "doc_hash": proposal.candidate.doc_hash,
+                "tree_hash": proposal.source.tree_hash,
+                "evidence_dir": evidence_dir,
+            },
+        )
+        write_json_atomic(
+            directory / _PENDING_FILE,
+            {
+                "candidate_id": proposal.candidate_id,
+                "doc_hash": proposal.candidate.doc_hash,
+                "tree_hash": proposal.source.tree_hash,
+            },
+        )
+
+    def load_pending(self, slot: int) -> HarnessSourceTree | None:
+        """The checkpointed-but-unscored candidate for `slot`, or None when there is none."""
+        candidate_id = candidate_slot_id(slot)
+        directory = self.candidate_dir(candidate_id)
+        marker_path = directory / _PENDING_FILE
+        if not marker_path.is_file():
+            return None
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            source = _read_source_tree(directory / "source")
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"run dir {self.run_dir} holds a corrupt pending candidate {candidate_id}: "
+                f"{error}; delete {directory} to redo the proposal"
+            ) from error
+        if not isinstance(marker, dict) or marker.get("tree_hash") != source.tree_hash:
+            raise ValueError(
+                f"pending candidate {candidate_id} in {self.run_dir} does not match its "
+                f"recorded tree hash; delete {directory} to redo the proposal"
+            )
+        return source
 
     def commit(self, outcomes: Sequence[SlotOutcome]) -> None:
         """Persist the newest outcome's evidence, then atomically commit the ordered index."""
@@ -221,10 +289,7 @@ class PopulationRunState:
                 },
             )
         else:
-            for item in latest.evaluated.source.files:
-                target = directory / "source" / item.path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(item.content, encoding="utf-8")
+            _write_candidate_source(directory / "source", latest.evaluated.source)
             write_json_atomic(
                 directory / "report.json", latest.evaluated.report.model_dump(mode="json")
             )
@@ -242,6 +307,9 @@ class PopulationRunState:
             self.run_dir / _STATE_FILE,
             {"outcomes": [_state_entry(outcome) for outcome in outcomes]},
         )
+        # Cleared only AFTER the state commit: a crash in between leaves a stale marker for an
+        # already-committed slot, which load_pending never consults again.
+        (directory / _PENDING_FILE).unlink(missing_ok=True)
 
 
 def optimize(
@@ -305,34 +373,43 @@ def optimize(
         _check_cancelled(should_cancel)
         slot = len(outcomes)
         candidate_id = candidate_slot_id(slot)
-        population = tuple(
-            outcome.evaluated for outcome in outcomes if outcome.evaluated is not None
-        )
-        try:
-            proposal = proposer.propose(population, slot=slot, should_cancel=should_cancel)
-        except CandidateProposalError as error:
-            logger.info("slot %d consumed by an invalid proposal: %s", slot, error.reason)
-            record(
-                SlotOutcome(
-                    slot=slot,
-                    candidate_id=candidate_id,
-                    reason=error.reason,
-                    evidence_dir=error.evidence_dir,
+        # A pending checkpoint means this slot's proposal was already accepted and paid for;
+        # skip straight to (re)scoring it instead of buying a fresh proposer turn whose new
+        # doc hash would also orphan the part-paid evaluator job.
+        source = state.load_pending(slot)
+        if source is None:
+            population = tuple(
+                outcome.evaluated for outcome in outcomes if outcome.evaluated is not None
+            )
+            try:
+                proposal = proposer.propose(population, slot=slot, should_cancel=should_cancel)
+            except CandidateProposalError as error:
+                logger.info("slot %d consumed by an invalid proposal: %s", slot, error.reason)
+                record(
+                    SlotOutcome(
+                        slot=slot,
+                        candidate_id=candidate_id,
+                        reason=error.reason,
+                        evidence_dir=error.evidence_dir,
+                    )
                 )
-            )
-            continue
-        if proposal.candidate_id != candidate_id:
-            raise ValueError(
-                f"proposer returned {proposal.candidate_id!r} for slot {slot}; "
-                f"expected {candidate_id!r}"
-            )
+                continue
+            if proposal.candidate_id != candidate_id:
+                raise ValueError(
+                    f"proposer returned {proposal.candidate_id!r} for slot {slot}; "
+                    f"expected {candidate_id!r}"
+                )
+            state.record_pending(proposal)
+            source = proposal.source
+        else:
+            logger.info("slot %d resumes its checkpointed pending candidate", slot)
         _check_cancelled(should_cancel)
-        report = scorer.score(proposal.candidate, should_cancel=should_cancel)
+        report = scorer.score(source.to_doc(candidate_id), should_cancel=should_cancel)
         record(
             SlotOutcome(
                 slot=slot,
                 candidate_id=candidate_id,
-                evaluated=EvaluatedCandidate(candidate_id, proposal.source, report),
+                evaluated=EvaluatedCandidate(candidate_id, source, report),
             )
         )
 
@@ -396,11 +473,28 @@ def _state_entry(outcome: SlotOutcome) -> dict[str, JsonValue]:
     }
 
 
+def _write_candidate_source(directory: Path, source: HarnessSourceTree) -> None:
+    """Replace one candidate's source dir with exact bytes (no leftovers, no newline drift).
+
+    Clearing first matters: a crashed prior attempt's leftover files would otherwise merge into
+    a redone slot's tree and fail doc-hash re-verification on every later load. Bytes are
+    written and read without newline translation so content hashes round-trip exactly.
+    """
+    if directory.exists():
+        shutil.rmtree(directory)
+    for item in source.files:
+        target = directory / item.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(item.content.encode("utf-8"))
+
+
 def _read_source_tree(directory: Path) -> HarnessSourceTree:
+    # read_bytes + exact decode: Path.read_text's universal newlines would fold \r into \n and
+    # silently change content hashes on every resume.
     files = [
         HarnessSourceFile(
             path=path.relative_to(directory).as_posix(),
-            content=path.read_text(encoding="utf-8"),
+            content=path.read_bytes().decode("utf-8"),
         )
         for path in sorted(directory.rglob("*"))
         if path.is_file()
