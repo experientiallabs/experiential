@@ -282,6 +282,12 @@ class BuildManager:
 
     def start(self, request: BuildRouteRequest) -> str:
         """Validate and launch a build, returning its id. Raises before spending anything."""
+        if request.name == "harbor":
+            # Mirrors the `wmh build` CLI guard: the literal is the optimize environment.
+            raise ValueError(
+                "world model name 'harbor' is reserved: `wmh optimize <agent> harbor` selects "
+                "the harbor benchmark environment; choose another name"
+            )
         config = HarnessConfig.for_build(
             serve_provider=ProviderKind(request.provider),
             serve_model=request.model,

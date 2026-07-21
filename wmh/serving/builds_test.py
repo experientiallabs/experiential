@@ -182,6 +182,14 @@ def test_start_rejects_upload_symlink_escape(tmp_path: Path) -> None:
         manager.start(request)
 
 
+def test_start_rejects_the_reserved_harbor_name(tmp_path: Path) -> None:
+    # Same reservation as the `wmh build` CLI: 'harbor' is the optimize environment literal.
+    manager, _ = _manager(tmp_path)
+    request = _request(tmp_path)
+    with pytest.raises(ValueError, match="reserved"):
+        manager.start(request.model_copy(update={"name": "harbor"}))
+
+
 def test_start_rejects_existing_model_name(tmp_path: Path) -> None:
     model_dir = tmp_path / ".wmh" / "models" / "fresh"
     model_dir.mkdir(parents=True)
