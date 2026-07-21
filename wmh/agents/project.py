@@ -397,6 +397,10 @@ class AgentProject:
         are not constrained by an agent turn's grant. ``retry_recoverable=False``
         makes the run exactly one agent attempt: a transport failure closes the
         session and propagates instead of transparently replaying paid work.
+        A bash-capable agent REQUIRES it: shell writes bypass the replayable
+        host mirror, so a replayed turn would land on a replacement sandbox
+        missing those edits, and that mismatch is rejected here, not silently
+        downgraded.
         """
         if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
@@ -407,6 +411,12 @@ class AgentProject:
         if unsupported:
             names = ", ".join(sorted(unsupported))
             raise ValueError(f"project agents cannot use uncontained tools: {names}")
+        if retry_recoverable and "bash" in agent.tools():
+            raise ValueError(
+                "bash-capable project agents must run with retry_recoverable=False: shell "
+                "writes bypass the replayable host file mirror, so a transparently retried "
+                "turn could replay onto a replacement sandbox missing those edits"
+            )
         write_grant = self._normalize_writable_files(writable_files)
         usage_before = self._total_worker_usage()
         self._active_writable_files = write_grant
@@ -769,9 +779,9 @@ class AgentProject:
         try:
             if name == "bash":
                 # Agent bash writes bypass the host-side file mirror, so a sandbox replacement
-                # would silently lose them. That is sound only because bash-driven proposal
-                # turns run with retry_recoverable=False: a dead transport ends the turn
-                # instead of replaying it onto a replacement sandbox.
+                # would silently lose them. That is sound only because run() ENFORCES that a
+                # bash-capable agent runs with retry_recoverable=False: a dead transport ends
+                # the turn instead of replaying it onto a replacement sandbox.
                 result = self.run_bash(str(arguments.get("command", "")))
                 body = result.stdout
                 if result.stderr:

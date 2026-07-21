@@ -13,6 +13,7 @@ from llm_waterfall import ChatResponse
 
 from wmh.agents import project as project_module
 from wmh.agents.meta import meta_agent
+from wmh.agents.optimizer import optimizer_agent
 from wmh.agents.project import AgentProject
 from wmh.core.types import JsonObject
 from wmh.harness import e2b_sandbox as e2b_sandbox_module
@@ -1450,3 +1451,18 @@ def test_run_retry_recoverable_false_is_single_attempt_and_closes_the_session() 
 
     assert replacement.killed is False
     assert project._session is None  # the poisoned session is never reused by a later run
+
+
+def test_bash_capable_agents_must_run_single_attempt() -> None:
+    """Shell writes bypass the replayable host mirror, so a transparently retried turn could
+    replay onto a replacement sandbox missing them; run() rejects that combination outright
+    instead of silently downgrading the retry."""
+    project = AgentProject(_Sandbox(), channel_factory=lambda sandbox, workspace: _Channel())
+
+    with pytest.raises(ValueError, match="retry_recoverable=False"):
+        project.run(optimizer_agent(), _Provider(), "propose", timeout=1)
+
+    result = project.run(
+        optimizer_agent(), _Provider(), "propose", timeout=1, retry_recoverable=False
+    )
+    assert result.answer == "finished"
