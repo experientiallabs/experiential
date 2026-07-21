@@ -26,32 +26,14 @@ from pathlib import Path
 import tomli_w
 
 from wmh.config.store import validate_name
-from wmh.harness.doc import (
-    CODE_RUNTIME_ID,
-    MAX_OUTPUT_TOKENS_ID,
-    MAX_TURNS_ID,
-    RUNTIME_KIND_ID,
-    TEMPERATURE_ID,
-    TOOL_POLICY_ID,
-    HarnessDoc,
-    Surface,
-    SurfaceKind,
-)
-from wmh.harness.pi_vendor import code_surface_id
-from wmh.harness.skills import Skill
+from wmh.harness.doc import HarnessDoc
+from wmh.harness.source_tree import SYSTEM_FILE, HarnessSourceFile, HarnessSourceTree
 
 HARNESSES_DIR = "harnesses"
 CHAMPION_ALIAS = "champion"
 
 _DOC_FILE = "doc.json"
-_SYSTEM_FILE = "SYSTEM.md"
-_CONFIG_FILE = "config.toml"
-_RUNTIME_FILE = "runtime.py"
-_SKILLS_DIR = "skills"
 _ALIASES_FILE = "aliases.toml"
-
-# Top-level render filenames a pathful code surface must not shadow (skills/ is guarded by prefix).
-_RESERVED_FILES = frozenset({_DOC_FILE, _SYSTEM_FILE, _CONFIG_FILE, _RUNTIME_FILE})
 
 
 class HarnessStore:
@@ -162,34 +144,7 @@ class HarnessStore:
 
 def _render(doc: HarnessDoc) -> dict[str, str]:
     """Render the document to its file export (relative path -> content)."""
-    files = {
-        _SYSTEM_FILE: doc.system_prompt(),
-        _CONFIG_FILE: tomli_w.dumps(
-            {
-                "harness": {
-                    "tools": doc.tools(),
-                    "max_turns": doc.max_turns(),
-                    "max_output_tokens": doc.max_output_tokens(),
-                    "temperature": doc.temperature(),
-                    "runtime_kind": doc.runtime_kind(),
-                }
-            }
-        ),
-    }
-    for skill in doc.skills():
-        files[f"{_SKILLS_DIR}/{skill.name}.md"] = skill.to_markdown()
-    code = doc.surface(CODE_RUNTIME_ID)
-    if code is not None:
-        files[_RUNTIME_FILE] = code.content
-    # Pathful code surfaces (a pi-node harness's vendored source) render to their own paths, so
-    # the export is the harness's real directory tree — what the agent view browses and what an
-    # execution sandbox downloads. Their `code_surface_id` is recovered from the path on reparse.
-    for surface in doc.code_files():
-        assert surface.path is not None  # code_files() only returns pathful surfaces
-        if surface.path in _RESERVED_FILES or surface.path.startswith(f"{_SKILLS_DIR}/"):
-            raise ValueError(f"code surface path {surface.path!r} collides with a reserved file")
-        files[surface.path] = surface.content
-    return files
+    return HarnessSourceTree.from_doc(doc).file_map()
 
 
 def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
@@ -198,87 +153,14 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
     The whole `SYSTEM.md` becomes one `prompt:core` surface — section boundaries are not
     recoverable from a rendered prompt, which is exactly why `doc.json` is the authoritative form.
     """
-    system_path = directory / _SYSTEM_FILE
-    if not system_path.exists():
-        raise ValueError(f"harness dir {directory} has neither {_DOC_FILE} nor {_SYSTEM_FILE}")
-    surfaces = [
-        Surface(
-            id="prompt:core",
-            kind=SurfaceKind.PROMPT,
-            content=system_path.read_text(encoding="utf-8"),
-        )
-    ]
-    config_path = directory / _CONFIG_FILE
-    if config_path.exists():
-        config = tomllib.loads(config_path.read_text(encoding="utf-8")).get("harness", {})
-        if "tools" in config:
-            surfaces.append(
-                Surface(
-                    id=TOOL_POLICY_ID,
-                    kind=SurfaceKind.TOOL_POLICY,
-                    content="\n".join(str(t) for t in config["tools"]),
-                )
-            )
-        if "max_turns" in config:
-            surfaces.append(
-                Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content=str(config["max_turns"]))
-            )
-        if "max_output_tokens" in config:
-            surfaces.append(
-                Surface(
-                    id=MAX_OUTPUT_TOKENS_ID,
-                    kind=SurfaceKind.PARAM,
-                    content=str(config["max_output_tokens"]),
-                )
-            )
-        if "temperature" in config:
-            surfaces.append(
-                Surface(
-                    id=TEMPERATURE_ID, kind=SurfaceKind.PARAM, content=str(config["temperature"])
-                )
-            )
-        # runtime_kind classifies the harness (pi-node vs in-process); a default "kit-python" is
-        # implicit, so only a non-default value needs its own surface on reconstruction.
-        if config.get("runtime_kind") and config["runtime_kind"] != "kit-python":
-            surfaces.append(
-                Surface(
-                    id=RUNTIME_KIND_ID,
-                    kind=SurfaceKind.PARAM,
-                    content=str(config["runtime_kind"]),
-                )
-            )
-    runtime_path = directory / _RUNTIME_FILE
-    if runtime_path.exists():
-        surfaces.append(
-            Surface(
-                id=CODE_RUNTIME_ID,
-                kind=SurfaceKind.CODE,
-                content=runtime_path.read_text(encoding="utf-8"),
-            )
-        )
-    skills_dir = directory / _SKILLS_DIR
-    if skills_dir.exists():
-        for path in sorted(skills_dir.glob("*.md")):
-            skill = Skill.from_markdown(path.read_text(encoding="utf-8"))
-            surfaces.append(
-                Surface(
-                    id=f"skill:{skill.name}", kind=SurfaceKind.SKILL, content=skill.to_markdown()
-                )
-            )
-    # Everything else under the dir is a pathful code surface (a pi-node harness's source tree):
-    # the inverse of `_render`'s per-path write, keyed back to its `code_surface_id`.
+    files: list[HarnessSourceFile] = []
     for path in sorted(directory.rglob("*")):
         if not path.is_file():
             continue
         rel = path.relative_to(directory).as_posix()
-        if rel in _RESERVED_FILES or rel == _ALIASES_FILE or rel.startswith(f"{_SKILLS_DIR}/"):
+        if rel in {_DOC_FILE, _ALIASES_FILE}:
             continue
-        surfaces.append(
-            Surface(
-                id=code_surface_id(rel),
-                kind=SurfaceKind.CODE,
-                path=rel,
-                content=path.read_text(encoding="utf-8"),
-            )
-        )
-    return HarnessDoc(name=name, surfaces=surfaces)
+        files.append(HarnessSourceFile(path=rel, content=path.read_text(encoding="utf-8")))
+    if not files:
+        raise ValueError(f"harness dir {directory} has neither {_DOC_FILE} nor {SYSTEM_FILE}")
+    return HarnessSourceTree(files=tuple(files)).to_doc(name)
