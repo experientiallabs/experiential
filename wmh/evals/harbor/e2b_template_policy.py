@@ -15,6 +15,10 @@ from harbor.environments.definition import SNAPSHOT_HASH_LEN
 E2B_TEMPLATE_POLICY_VERSION = "1"
 E2B_TEMPLATE_BUILD_CONCURRENCY = 10
 E2B_TEMPLATE_BUILD_CONCURRENCY_LIMIT = 20
+E2B_TEMPLATE_BUILD_STATUS_POLL_INTERVAL_MS = 1_000
+E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS = (250, 500, 1_000, 2_000, 4_000)
+E2B_TEMPLATE_BUILD_STRATEGY = "single-submit-exact-build-status-v1"
+E2B_TEMPLATE_BUILD_STATUS_RETRY_ERRORS = "httpx.TransportError,e2b.exceptions.RateLimitException"
 E2B_DEFAULT_CPU_COUNT = 2
 E2B_DEFAULT_MEMORY_MB = 1024
 WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH = "wmh.evals.harbor.e2b_environment:WmhE2BEnvironment"
@@ -160,7 +164,10 @@ def qualify_harbor_e2b_template_name(
     return f"wmh-hb-v1-{digest}"
 
 
-def e2b_template_readiness_policy_payload() -> dict[str, int | str | bool]:
+def e2b_template_readiness_policy_payload() -> dict[
+    str,
+    int | str | bool | tuple[int, ...],
+]:
     """Return the frozen readiness policy included in scorer identity."""
     return {
         "schema_version": E2B_TEMPLATE_POLICY_VERSION,
@@ -170,6 +177,11 @@ def e2b_template_readiness_policy_payload() -> dict[str, int | str | bool]:
         "default_memory_mb": E2B_DEFAULT_MEMORY_MB,
         "build_concurrency": E2B_TEMPLATE_BUILD_CONCURRENCY,
         "build_concurrency_limit": E2B_TEMPLATE_BUILD_CONCURRENCY_LIMIT,
+        "build_strategy": E2B_TEMPLATE_BUILD_STRATEGY,
+        "build_submit_once": True,
+        "build_status_poll_interval_ms": E2B_TEMPLATE_BUILD_STATUS_POLL_INTERVAL_MS,
+        "build_status_retry_delays_ms": E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS,
+        "build_status_retry_errors": E2B_TEMPLATE_BUILD_STATUS_RETRY_ERRORS,
         "resource_qualified_alias": True,
         "force_build": False,
         "task_storage_policy": "provider_default_unenforced",

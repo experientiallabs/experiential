@@ -5,15 +5,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
-from e2b.template.types import BuildInfo
+from e2b.exceptions import BuildException, RateLimitException
+from e2b.template.types import BuildInfo, TemplateBuildStatus
 from harbor.models.job.config import DatasetConfig, JobConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig, TaskConfig
 from harbor.tasks.client import TaskDownloadResult
 
+import wmh.evals.harbor.e2b_environment as e2b_environment_module
+import wmh.evals.harbor.e2b_template_policy as template_policy
 import wmh.evals.harbor.e2b_template_readiness as readiness
 from wmh.evals.harbor.e2b_environment import WmhE2BEnvironment
 from wmh.evals.harbor.e2b_template_control import (
@@ -217,13 +223,44 @@ def test_plan_accepts_task_storage_as_unenforced_provider_default(tmp_path: Path
     )
 
     payload = plan.identity_payload()
-    policy_payload = cast("dict[str, int | str | bool]", payload["policy"])
+    policy_payload = cast(
+        "dict[str, int | str | bool | list[int]]",
+        payload["policy"],
+    )
     assert policy_payload["task_storage_policy"] == "provider_default_unenforced"
     assert policy_payload["override_storage_policy"] == "reject"
+    assert policy_payload["build_submit_once"] is True
+    assert policy_payload["build_strategy"] == "single-submit-exact-build-status-v1"
+    assert policy_payload["build_status_retry_delays_ms"] == [
+        250,
+        500,
+        1_000,
+        2_000,
+        4_000,
+    ]
+    assert policy_payload["build_status_retry_errors"] == (
+        "httpx.TransportError,e2b.exceptions.RateLimitException"
+    )
     assert "storage" not in json.dumps(payload["templates"], sort_keys=True)
     assert payload["context_resource_histogram"] == [
         {"cpu_count": 2, "memory_mb": 1024, "count": 1}
     ]
+
+
+def test_status_retry_schedule_changes_readiness_plan_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = _two_template_plan(tmp_path)
+    monkeypatch.setattr(
+        template_policy,
+        "E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS",
+        (1, 2, 3),
+    )
+    changed = _two_template_plan(tmp_path)
+
+    assert changed.plan_digest != original.plan_digest
+    assert changed.identity_payload()["policy"] != original.identity_payload()["policy"]
 
 
 @pytest.mark.parametrize(
@@ -374,6 +411,418 @@ def test_prepare_persists_partial_success_but_requires_a_fresh_run_path(
     receipt = asyncio.run(fresh.prepare(tmp_path / "fresh" / "e2b-readiness.json"))
     assert receipt.complete
     assert len(builds) - previous_build_count == 1
+
+
+def test_prepare_poll_read_failure_keeps_receipt_incomplete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks_root = tmp_path / "tasks"
+    task_dir = _task(tasks_root, "private-a", dockerfile="FROM alpine:3.20\n")
+    plan = readiness.E2BTemplateReadinessPlan.create(
+        job_config=_job(tmp_path),
+        task_set=_task_set(tasks_root, [task_dir]),
+    )
+    receipt_path = tmp_path / "run" / "e2b-readiness.json"
+    submissions = 0
+    status_calls = 0
+
+    async def inspect(
+        _template_name: str,
+        *,
+        expected_cpu_count: int,
+        expected_memory_mb: int,
+    ) -> E2BTemplateControlIdentity:
+        del expected_cpu_count, expected_memory_mb
+        raise E2BTemplateNotFound("qualified alias absent")
+
+    async def build(**kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        name = cast("str", kwargs["name"])
+        return BuildInfo(
+            template_id="template-id",
+            build_id="build-id",
+            name=name,
+            alias=name,
+            tags=[],
+        )
+
+    async def get_status(_build_info: BuildInfo, logs_offset: int = 0) -> object:
+        nonlocal status_calls
+        assert logs_offset == 0
+        status_calls += 1
+        raise httpx.ReadError(
+            "template status connection closed",
+            request=httpx.Request("GET", "https://provider.invalid/build-status"),
+        )
+
+    monkeypatch.setattr(readiness, "inspect_e2b_template", inspect)
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module,
+        "E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS",
+        (0, 0),
+    )
+
+    with pytest.raises(httpx.ReadError, match="status connection closed"):
+        asyncio.run(plan.prepare(receipt_path))
+
+    partial = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert submissions == 1
+    assert status_calls == 3
+    assert partial["complete"] is False
+    assert partial["entries"] == []
+
+
+@pytest.mark.parametrize(
+    "first_failure",
+    [
+        httpx.ReadError(
+            "template status connection closed",
+            request=httpx.Request("GET", "https://provider.invalid/build-status"),
+        ),
+        RateLimitException("template status rate limited"),
+    ],
+    ids=["read-error", "rate-limit"],
+)
+def test_prepare_recovers_status_get_and_commits_exact_complete_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_failure: Exception,
+) -> None:
+    tasks_root = tmp_path / "tasks"
+    task_dir = _task(tasks_root, "private-a", dockerfile="FROM alpine:3.20\n")
+    plan = readiness.E2BTemplateReadinessPlan.create(
+        job_config=_job(tmp_path),
+        task_set=_task_set(tasks_root, [task_dir]),
+    )
+    receipt_path = tmp_path / "run" / "e2b-readiness.json"
+    submissions = 0
+    status_calls = 0
+    inspections = 0
+    built: BuildInfo | None = None
+
+    async def inspect(
+        _template_name: str,
+        *,
+        expected_cpu_count: int,
+        expected_memory_mb: int,
+    ) -> E2BTemplateControlIdentity:
+        nonlocal inspections
+        inspections += 1
+        if inspections == 1:
+            raise E2BTemplateNotFound("qualified alias absent")
+        assert built is not None
+        return E2BTemplateControlIdentity(
+            template_id=built.template_id,
+            build_id=built.build_id,
+            cpu_count=expected_cpu_count,
+            memory_mb=expected_memory_mb,
+        )
+
+    async def build(**kwargs: object) -> BuildInfo:
+        nonlocal submissions, built
+        submissions += 1
+        name = cast("str", kwargs["name"])
+        built = BuildInfo(
+            template_id="template-id",
+            build_id="build-id",
+            name=name,
+            alias=name,
+            tags=[],
+        )
+        return built
+
+    async def get_status(build_info: BuildInfo, logs_offset: int = 0) -> object:
+        nonlocal status_calls
+        assert build_info is built
+        assert logs_offset == 0
+        status_calls += 1
+        if status_calls == 1:
+            raise first_failure
+        return SimpleNamespace(
+            template_id=build_info.template_id,
+            build_id=build_info.build_id,
+            status=TemplateBuildStatus.READY,
+            log_entries=[],
+            reason=None,
+        )
+
+    monkeypatch.setattr(readiness, "inspect_e2b_template", inspect)
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module,
+        "E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS",
+        (0,),
+    )
+
+    receipt = asyncio.run(plan.prepare(receipt_path))
+
+    assert receipt.complete
+    assert receipt.built_count == 1
+    assert receipt.ready_before_count == 0
+    assert len(receipt.entries) == 1
+    assert submissions == 1
+    assert status_calls == 2
+    assert inspections == 3
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_error", "expected_status_calls"),
+    [
+        ("ambiguous-submit", httpx.ReadError, 0),
+        ("terminal-error", BuildException, 1),
+        ("unknown-status", BuildException, 1),
+        ("mapping-mismatch", RuntimeError, 1),
+    ],
+)
+def test_prepare_build_failure_modes_never_fabricate_complete_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+    expected_error: type[Exception],
+    expected_status_calls: int,
+) -> None:
+    tasks_root = tmp_path / "tasks"
+    task_dir = _task(tasks_root, "private-a", dockerfile="FROM alpine:3.20\n")
+    plan = readiness.E2BTemplateReadinessPlan.create(
+        job_config=_job(tmp_path),
+        task_set=_task_set(tasks_root, [task_dir]),
+    )
+    receipt_path = tmp_path / "run" / "e2b-readiness.json"
+    submissions = 0
+    status_calls = 0
+    inspections = 0
+
+    async def inspect(
+        _template_name: str,
+        *,
+        expected_cpu_count: int,
+        expected_memory_mb: int,
+    ) -> E2BTemplateControlIdentity:
+        nonlocal inspections
+        inspections += 1
+        if failure_mode == "mapping-mismatch" and inspections == 2:
+            return E2BTemplateControlIdentity(
+                template_id="different-template-id",
+                build_id="build-id",
+                cpu_count=expected_cpu_count,
+                memory_mb=expected_memory_mb,
+            )
+        raise E2BTemplateNotFound("qualified alias absent")
+
+    async def build(**kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        if failure_mode == "ambiguous-submit":
+            raise httpx.ReadError(
+                "template submission response lost",
+                request=httpx.Request("POST", "https://provider.invalid/build"),
+            )
+        name = cast("str", kwargs["name"])
+        return BuildInfo(
+            template_id="template-id",
+            build_id="build-id",
+            name=name,
+            alias=name,
+            tags=[],
+        )
+
+    async def get_status(build_info: BuildInfo, logs_offset: int = 0) -> object:
+        nonlocal status_calls
+        assert logs_offset == 0
+        status_calls += 1
+        status: object = TemplateBuildStatus.READY
+        if failure_mode == "terminal-error":
+            status = TemplateBuildStatus.ERROR
+        elif failure_mode == "unknown-status":
+            status = "future-provider-status"
+        return SimpleNamespace(
+            template_id=build_info.template_id,
+            build_id=build_info.build_id,
+            status=status,
+            log_entries=[],
+            reason=None,
+        )
+
+    monkeypatch.setattr(readiness, "inspect_e2b_template", inspect)
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+
+    with pytest.raises(expected_error):
+        asyncio.run(plan.prepare(receipt_path))
+
+    partial = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert submissions == 1
+    assert status_calls == expected_status_calls
+    assert partial["complete"] is False
+    assert partial["entries"] == []
+
+
+def test_prepare_outer_build_timeout_cancels_exact_poll_without_resubmission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks_root = tmp_path / "tasks"
+    task_dir = _task(tasks_root, "private-a", dockerfile="FROM alpine:3.20\n")
+    plan = readiness.E2BTemplateReadinessPlan.create(
+        job_config=_job(tmp_path),
+        task_set=_task_set(tasks_root, [task_dir]),
+    )
+    plan._specs = (replace(plan._specs[0], build_timeout_sec=0.01),)
+    receipt_path = tmp_path / "run" / "e2b-readiness.json"
+    submissions = 0
+    status_calls = 0
+
+    async def inspect(
+        _template_name: str,
+        *,
+        expected_cpu_count: int,
+        expected_memory_mb: int,
+    ) -> E2BTemplateControlIdentity:
+        del expected_cpu_count, expected_memory_mb
+        raise E2BTemplateNotFound("qualified alias absent")
+
+    async def build(**kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        name = cast("str", kwargs["name"])
+        return BuildInfo(
+            template_id="template-id",
+            build_id="build-id",
+            name=name,
+            alias=name,
+            tags=[],
+        )
+
+    async def get_status(_build_info: BuildInfo, logs_offset: int = 0) -> object:
+        nonlocal status_calls
+        assert logs_offset == 0
+        status_calls += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(readiness, "inspect_e2b_template", inspect)
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(plan.prepare(receipt_path))
+
+    partial = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert submissions == 1
+    assert status_calls == 1
+    assert partial["complete"] is False
+    assert partial["entries"] == []
+
+
+def test_prepare_cancellation_keeps_receipt_incomplete_without_resubmission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tasks_root = tmp_path / "tasks"
+    task_dir = _task(tasks_root, "private-a", dockerfile="FROM alpine:3.20\n")
+    plan = readiness.E2BTemplateReadinessPlan.create(
+        job_config=_job(tmp_path),
+        task_set=_task_set(tasks_root, [task_dir]),
+    )
+    receipt_path = tmp_path / "run" / "e2b-readiness.json"
+    submissions = 0
+    status_calls = 0
+
+    async def inspect(
+        _template_name: str,
+        *,
+        expected_cpu_count: int,
+        expected_memory_mb: int,
+    ) -> E2BTemplateControlIdentity:
+        del expected_cpu_count, expected_memory_mb
+        raise E2BTemplateNotFound("qualified alias absent")
+
+    monkeypatch.setattr(readiness, "inspect_e2b_template", inspect)
+
+    async def scenario() -> None:
+        nonlocal submissions, status_calls
+        status_started = asyncio.Event()
+
+        async def build(**kwargs: object) -> BuildInfo:
+            nonlocal submissions
+            submissions += 1
+            name = cast("str", kwargs["name"])
+            return BuildInfo(
+                template_id="template-id",
+                build_id="build-id",
+                name=name,
+                alias=name,
+                tags=[],
+            )
+
+        async def get_status(_build_info: BuildInfo, logs_offset: int = 0) -> object:
+            nonlocal status_calls
+            assert logs_offset == 0
+            status_calls += 1
+            status_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr(
+            e2b_environment_module.AsyncTemplate,
+            "build_in_background",
+            staticmethod(build),
+        )
+        monkeypatch.setattr(
+            e2b_environment_module.AsyncTemplate,
+            "get_build_status",
+            staticmethod(get_status),
+        )
+        task = asyncio.create_task(plan.prepare(receipt_path))
+        await status_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    partial = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert submissions == 1
+    assert status_calls == 1
+    assert partial["complete"] is False
+    assert partial["entries"] == []
 
 
 def test_existing_partial_receipt_rejects_before_provider_calls(

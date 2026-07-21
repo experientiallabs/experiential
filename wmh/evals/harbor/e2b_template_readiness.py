@@ -87,7 +87,7 @@ class E2BTemplateReadinessReceipt(BaseModel):
     build_concurrency: int = Field(strict=True, ge=1)
     context_resource_histogram: tuple[E2BTemplateResourceCount, ...]
     template_resource_histogram: tuple[E2BTemplateResourceCount, ...]
-    policy: dict[str, int | str | bool]
+    policy: dict[str, int | str | bool | tuple[int, ...]]
     entries: tuple[E2BTemplateReadinessEntry, ...]
 
     @field_validator("complete", mode="before")

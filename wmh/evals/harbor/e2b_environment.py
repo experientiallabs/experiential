@@ -12,9 +12,11 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Literal, override
 
+import httpx
 from e2b import AsyncSandbox, AsyncTemplate, Template
+from e2b.exceptions import BuildException, RateLimitException
 from e2b.template.main import TemplateClass
-from e2b.template.types import BuildInfo
+from e2b.template.types import BuildInfo, TemplateBuildStatus, TemplateBuildStatusResponse
 from harbor.environments.e2b import E2BEnvironment
 from harbor.models.task.config import (
     EnvironmentConfig,
@@ -24,9 +26,10 @@ from harbor.models.task.config import (
 )
 from harbor.models.trial.config import ResourceMode, ServiceVolumeConfig
 from harbor.models.trial.paths import TrialPaths
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 from wmh.evals.harbor.e2b_template_policy import (
+    E2B_TEMPLATE_BUILD_STATUS_POLL_INTERVAL_MS,
+    E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS,
     E2BTemplateResources,
     e2b_template_resource_digest,
     qualify_harbor_e2b_template_name,
@@ -37,6 +40,46 @@ from wmh.harness.e2b_sandbox import acquire_e2b_create_slot_async
 _CREATE_ATTEMPTS = 2
 _CREATE_RETRY_DELAY_S = 1.0
 _PREPARATION_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+async def _get_template_build_status(
+    build_info: BuildInfo,
+    *,
+    logs_offset: int,
+) -> TemplateBuildStatusResponse:
+    """Retry only the idempotent GET for one already-submitted exact build."""
+    for attempt in range(len(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS) + 1):
+        try:
+            return await AsyncTemplate.get_build_status(build_info, logs_offset=logs_offset)
+        except (httpx.TransportError, RateLimitException):
+            if attempt == len(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS):
+                raise
+            await asyncio.sleep(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS[attempt] / 1_000)
+    raise AssertionError("unreachable template build status retry state")
+
+
+async def _wait_for_template_build(build_info: BuildInfo) -> None:
+    """Wait for one submitted build without ever replaying its submission."""
+    logs_offset = 0
+    while True:
+        response = await _get_template_build_status(build_info, logs_offset=logs_offset)
+        if (
+            response.template_id != build_info.template_id
+            or response.build_id != build_info.build_id
+        ):
+            raise RuntimeError("E2B template build status identity disagreement")
+        logs_offset += len(response.log_entries)
+        if response.status is TemplateBuildStatus.READY:
+            return
+        if response.status is TemplateBuildStatus.ERROR:
+            message = response.reason.message if response.reason else "E2B template build failed"
+            raise BuildException(message)
+        if response.status not in (
+            TemplateBuildStatus.BUILDING,
+            TemplateBuildStatus.WAITING,
+        ):
+            raise BuildException("E2B template build returned an unknown status")
+        await asyncio.sleep(E2B_TEMPLATE_BUILD_STATUS_POLL_INTERVAL_MS / 1_000)
 
 
 @dataclass(frozen=True)
@@ -227,20 +270,23 @@ class WmhE2BEnvironment(E2BEnvironment):
             dockerfile_content_or_path=str(self._environment_definition_path)
         )
 
-    @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        reraise=True,
-    )
     @override
     async def _create_template(self) -> BuildInfo:
-        """Build with Harbor's source semantics while retaining provider identity."""
-        return await AsyncTemplate.build(
+        """Submit once and poll the exact build without replaying submission.
+
+        A submission transport failure has an unknown outcome and propagates. Once E2B
+        returns ``BuildInfo``, only idempotent status GETs for that identity are retried.
+        A fresh run after an ambiguous submission is safe only after separate provider
+        reconciliation proves there are no active builds; an alias 404 is insufficient.
+        """
+        build_info = await AsyncTemplate.build_in_background(
             template=self._template_definition(),
             name=self._template_name,
             cpu_count=self._template_resources.cpu_count,
             memory_mb=self._template_resources.memory_mb,
         )
+        await _wait_for_template_build(build_info)
+        return build_info
 
     @override
     async def _create_sandbox(self) -> None:

@@ -6,6 +6,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from harbor.models.task.config import EnvironmentConfig
 from harbor.models.trial.paths import TrialPaths
@@ -13,6 +14,13 @@ from harbor.models.trial.paths import TrialPaths
 pytest.importorskip("e2b")
 
 from e2b import AsyncSandbox  # noqa: E402
+from e2b.exceptions import BuildException, RateLimitException  # noqa: E402
+from e2b.template.types import (  # noqa: E402
+    BuildInfo,
+    BuildStatusReason,
+    TemplateBuildStatus,
+    TemplateBuildStatusResponse,
+)
 
 import wmh.evals.harbor.e2b_environment as e2b_environment_module  # noqa: E402
 from wmh.evals.harbor.e2b_environment import (  # noqa: E402
@@ -45,6 +53,32 @@ def _environment(
         task_env_config=task_config or EnvironmentConfig(cpus=2, memory_mb=2048),
         require_prebuilt=require_prebuilt,
         preparation_digest=preparation_digest,
+    )
+
+
+def _build_info(environment: WmhE2BEnvironment) -> BuildInfo:
+    return BuildInfo(
+        template_id="template-id",
+        build_id="build-id",
+        name=environment.template_name,
+        alias=environment.template_name,
+        tags=[],
+    )
+
+
+def _build_status(
+    build_info: BuildInfo,
+    status: TemplateBuildStatus,
+    *,
+    reason: BuildStatusReason | None = None,
+) -> TemplateBuildStatusResponse:
+    return TemplateBuildStatusResponse(
+        template_id=build_info.template_id,
+        build_id=build_info.build_id,
+        status=status,
+        log_entries=[],
+        logs=[],
+        reason=reason,
     )
 
 
@@ -166,12 +200,21 @@ def test_harbor_e2b_task_storage_is_not_sent_to_provider(
         task_config=EnvironmentConfig(cpus=2, memory_mb=2048, storage_mb=4096),
     )
     calls: list[dict[str, object]] = []
+    build_info = _build_info(environment)
 
-    async def build(**kwargs: object) -> object:
+    async def build(**kwargs: object) -> BuildInfo:
         calls.append(kwargs)
-        return object()
+        return build_info
 
-    monkeypatch.setattr(e2b_environment_module.AsyncTemplate, "build", staticmethod(build))
+    async def wait(observed: BuildInfo) -> None:
+        assert observed is build_info
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(e2b_environment_module, "_wait_for_template_build", wait)
 
     asyncio.run(environment._create_template())
 
@@ -182,6 +225,270 @@ def test_harbor_e2b_task_storage_is_not_sent_to_provider(
     assert calls[0]["memory_mb"] == 2048
     assert calls[0]["template"] is not None
     assert "storage_mb" not in calls[0]
+
+
+@pytest.mark.parametrize(
+    "first_failure",
+    [
+        httpx.ReadError(
+            "template status connection closed",
+            request=httpx.Request("GET", "https://provider.invalid/build-status"),
+        ),
+        RateLimitException("template status rate limited"),
+    ],
+    ids=["read-error", "rate-limit"],
+)
+def test_harbor_e2b_template_status_retry_never_replays_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_failure: Exception,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions = 0
+    status_calls = 0
+
+    async def build(**_kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        return build_info
+
+    async def get_status(observed: BuildInfo, logs_offset: int = 0) -> object:
+        nonlocal status_calls
+        assert observed is build_info
+        assert logs_offset == 0
+        status_calls += 1
+        if status_calls == 1:
+            raise first_failure
+        return _build_status(build_info, TemplateBuildStatus.READY)
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module,
+        "E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS",
+        (0,),
+    )
+
+    assert asyncio.run(environment._create_template()) is build_info
+    assert submissions == 1
+    assert status_calls == 2
+
+
+def test_harbor_e2b_building_status_advances_log_offset_for_exact_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions = 0
+    observed_offsets: list[int] = []
+
+    async def build(**_kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        return build_info
+
+    async def get_status(observed: BuildInfo, logs_offset: int = 0) -> object:
+        assert observed is build_info
+        observed_offsets.append(logs_offset)
+        if len(observed_offsets) == 1:
+            return SimpleNamespace(
+                template_id=build_info.template_id,
+                build_id=build_info.build_id,
+                status=TemplateBuildStatus.BUILDING,
+                log_entries=[object(), object()],
+            )
+        return _build_status(build_info, TemplateBuildStatus.READY)
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module,
+        "E2B_TEMPLATE_BUILD_STATUS_POLL_INTERVAL_MS",
+        0,
+    )
+
+    assert asyncio.run(environment._create_template()) is build_info
+    assert submissions == 1
+    assert observed_offsets == [0, 2]
+
+
+def test_harbor_e2b_ambiguous_template_submission_never_polls_or_replays(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    submissions = 0
+
+    async def build(**_kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        raise httpx.ReadError(
+            "template submission response lost",
+            request=httpx.Request("POST", "https://provider.invalid/build"),
+        )
+
+    async def unexpected_status(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("ambiguous submission must not be polled")
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(unexpected_status),
+    )
+
+    with pytest.raises(httpx.ReadError, match="submission response lost"):
+        asyncio.run(environment._create_template())
+
+    assert submissions == 1
+
+
+def test_harbor_e2b_terminal_template_error_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions = 0
+    status_calls = 0
+
+    async def build(**_kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        return build_info
+
+    async def get_status(observed: BuildInfo, logs_offset: int = 0) -> object:
+        nonlocal status_calls
+        assert observed is build_info
+        assert logs_offset == 0
+        status_calls += 1
+        return _build_status(
+            build_info,
+            TemplateBuildStatus.ERROR,
+            reason=BuildStatusReason(
+                message="provider build failed",
+                step=None,
+                log_entries=[],
+            ),
+        )
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+
+    with pytest.raises(BuildException, match="provider build failed"):
+        asyncio.run(environment._create_template())
+
+    assert submissions == 1
+    assert status_calls == 1
+
+
+def test_harbor_e2b_unknown_template_status_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions = 0
+
+    async def build(**_kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        return build_info
+
+    async def get_status(observed: BuildInfo, logs_offset: int = 0) -> object:
+        assert observed is build_info
+        assert logs_offset == 0
+        return SimpleNamespace(
+            template_id=build_info.template_id,
+            build_id=build_info.build_id,
+            status="future-provider-status",
+            log_entries=[],
+        )
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+
+    with pytest.raises(BuildException, match="unknown status"):
+        asyncio.run(environment._create_template())
+
+    assert submissions == 1
+
+
+def test_harbor_e2b_template_status_identity_mismatch_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions = 0
+
+    async def build(**_kwargs: object) -> BuildInfo:
+        nonlocal submissions
+        submissions += 1
+        return build_info
+
+    async def get_status(_observed: BuildInfo, logs_offset: int = 0) -> object:
+        assert logs_offset == 0
+        return SimpleNamespace(
+            template_id=build_info.template_id,
+            build_id="different-build-id",
+            status=TemplateBuildStatus.READY,
+            log_entries=[],
+        )
+
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "build_in_background",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        e2b_environment_module.AsyncTemplate,
+        "get_build_status",
+        staticmethod(get_status),
+    )
+
+    with pytest.raises(RuntimeError, match="identity disagreement"):
+        asyncio.run(environment._create_template())
+
+    assert submissions == 1
 
 
 def test_harbor_e2b_resource_mismatch_kills_without_retry(
