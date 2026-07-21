@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -15,7 +16,12 @@ from rich.prompt import Confirm
 
 from wmh.agents.default import default_agent
 from wmh.agents.optimizer import optimizer_agent
-from wmh.agents.project import DEFAULT_PROJECT_TIMEOUT_S, AgentProject
+from wmh.agents.project import (
+    DEFAULT_PROJECT_TIMEOUT_S,
+    DEFAULT_SOURCE_TREE_MAX_BYTES,
+    DEFAULT_SOURCE_TREE_MAX_FILES,
+    AgentProject,
+)
 from wmh.cli.harbor_inputs import load_harbor_config, load_task_ids, write_json_atomic
 from wmh.cli.model_roles import resolve_required_model_config
 from wmh.config import ARTIFACT_DIR
@@ -27,9 +33,15 @@ from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage, resolve_e2b_template
 from wmh.harness.population import HarnessPopulationOptimizer, PopulationOptimizationResult
 from wmh.harness.population_archive import write_population_archive
+from wmh.harness.population_checkpoint import (
+    PopulationCheckpointIdentity,
+    PopulationCheckpointStateError,
+    PopulationCheckpointStore,
+)
 from wmh.harness.project_proposer import (
     DEFAULT_MAX_HISTORY_BYTES,
     DEFAULT_MAX_HISTORY_CANDIDATES,
+    CandidateProposer,
     ProjectCandidateProposer,
 )
 from wmh.harness.source_tree import HarnessSourceTree
@@ -48,7 +60,7 @@ class HarnessOptimizeOutcome:
     saved: HarnessDoc
     run_dir: Path
     archive_manifest: Path
-    project_usage: SandboxUsage
+    project_usage: SandboxUsage | None
 
 
 def register(app: typer.Typer) -> None:
@@ -75,6 +87,12 @@ def optimize_harness(
     ),
     iterations: int = typer.Option(..., min=1, help="Fixed number of singular proposal slots."),
     attempts: int = typer.Option(..., min=1, help="Attempts per exact task and candidate."),
+    max_score_cells: int = typer.Option(
+        ...,
+        "--max-score-cells",
+        min=1,
+        help="Required ceiling for the fixed task-by-attempt score-cell plan.",
+    ),
     seed: str | None = typer.Option(
         None,
         "--seed",
@@ -121,6 +139,11 @@ def optimize_harness(
         "--result-out",
         help="Local run directory (default: <root>/runs/<opaque-id>).",
     ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Continue one exact ready checkpoint at --result-out without replaying work.",
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project artifact root and harness store."),
     yes: bool = typer.Option(False, "--yes", help="Acknowledge the displayed execution matrix."),
 ) -> None:
@@ -147,17 +170,25 @@ def optimize_harness(
     task_ids = load_task_ids(Path(task_ids_file))
     meta_config = resolve_required_model_config(root, "meta")
     agent_config = resolve_required_model_config(root, "agent")
-    seed_source = _resolve_seed_source(root, seed)
+    seed_source = None if resume else _resolve_seed_source(root, seed)
     effective_e2b_template = resolve_e2b_template(e2b_template)
+    if resume and result_out is None:
+        raise typer.BadParameter("--resume requires an explicit --result-out")
     run_dir = Path(result_out) if result_out is not None else Path(root) / "runs" / uuid4().hex
-    if run_dir.exists():
+    if resume and not run_dir.is_dir():
+        raise typer.BadParameter(f"resume result directory does not exist: {run_dir}")
+    if not resume and run_dir.exists():
         raise typer.BadParameter(f"result directory already exists: {run_dir}")
 
     score_cells = (iterations + 1) * len(task_ids) * attempts
+    if score_cells > max_score_cells:
+        raise typer.BadParameter(
+            f"planned {score_cells} score cells exceed --max-score-cells={max_score_cells}"
+        )
     _console.print(
         f"fixed search: 1 seed + {iterations} proposal slot(s), {len(task_ids)} task(s), "
         f"{attempts} attempt(s) -> up to {score_cells} requested score cells; "
-        f"evaluated Pi backend={harness_backend}; proposer project=e2b"
+        f"ceiling={max_score_cells}; evaluated Pi backend={harness_backend}; proposer project=e2b"
     )
     if not yes:
         if not _console.is_terminal:
@@ -174,7 +205,9 @@ def optimize_harness(
         reward_key=reward_key,
         iterations=iterations,
         attempts=attempts,
+        max_score_cells=max_score_cells,
         seed=seed_source,
+        seed_reference=seed,
         meta_config=meta_config,
         agent_config=agent_config,
         harness_backend=cast("Literal['local', 'e2b']", harness_backend),
@@ -185,6 +218,7 @@ def optimize_harness(
         project_timeout_sec=project_timeout_sec,
         max_history_candidates=max_history_candidates,
         max_history_bytes=max_history_bytes,
+        resume=resume,
     )
     _console.print(
         f"[green]optimized[/green] [bold]{name}[/bold] v{outcome.saved.version} "
@@ -202,7 +236,9 @@ def _execute_optimization(
     reward_key: str,
     iterations: int,
     attempts: int,
-    seed: HarnessSourceTree,
+    max_score_cells: int,
+    seed: HarnessSourceTree | None,
+    seed_reference: str | None,
     meta_config: ProviderConfig,
     agent_config: ProviderConfig,
     harness_backend: Literal["local", "e2b"],
@@ -211,88 +247,173 @@ def _execute_optimization(
     project_timeout_sec: float,
     max_history_candidates: int,
     max_history_bytes: int,
+    resume: bool,
 ) -> HarnessOptimizeOutcome:
     """Resolve one immutable scorer request, execute it, and publish evidence before winner."""
+    planned_from_inputs = (iterations + 1) * len(task_ids) * attempts
+    if planned_from_inputs > max_score_cells:
+        raise typer.BadParameter(
+            f"planned {planned_from_inputs} score cells exceed max_score_cells={max_score_cells}"
+        )
     effective_job_config = JobConfig.model_validate(
         job_config.model_copy(
             update={"jobs_dir": run_dir / "harbor"},
             deep=True,
         ).model_dump(mode="python")
     )
-    scorer = asyncio.run(
-        HarborScorer.create(
-            job_config=effective_job_config,
-            task_ids=task_ids,
-            provider_config=agent_config,
-            reward_key=reward_key,
-            environment_command_timeout_sec=environment_command_timeout_sec,
-            harness_backend=harness_backend,
-            e2b_template=e2b_template if harness_backend == "e2b" else None,
+    optimizer = optimizer_agent()
+    with ExitStack() as stack:
+        checkpoint: PopulationCheckpointStore | None = None
+        if resume:
+            checkpoint = stack.enter_context(PopulationCheckpointStore.open(run_dir))
+
+        scorer = asyncio.run(
+            HarborScorer.create(
+                job_config=effective_job_config,
+                task_ids=task_ids,
+                provider_config=agent_config,
+                reward_key=reward_key,
+                environment_command_timeout_sec=environment_command_timeout_sec,
+                harness_backend=harness_backend,
+                e2b_template=e2b_template if harness_backend == "e2b" else None,
+            )
         )
-    )
-    request = scorer.request(attempts=attempts)
-    inputs: JsonObject = {
-        "schema_version": 1,
-        "seed_source_tree_hash": seed.tree_hash,
-        "iterations": iterations,
-        "score_request": request.model_dump(mode="json"),
-        "harbor_job_template": effective_job_config.model_dump(mode="json"),
-        "meta_provider": meta_config.model_dump(mode="json"),
-        "agent_provider": agent_config.model_dump(mode="json"),
-        "harness_backend": harness_backend,
-        "e2b_template": e2b_template or None,
-        "environment_command_timeout_sec": environment_command_timeout_sec,
-        "project_timeout_sec": project_timeout_sec,
-        "max_history_candidates": max_history_candidates,
-        "max_history_bytes": max_history_bytes,
-    }
-    meta_provider = get_provider(meta_config)
-    if not isinstance(meta_provider, ToolCallingProvider):
-        raise typer.BadParameter("settings [models.meta] provider lacks structured tool calling")
-    # Only claim the requested output path after all read-only setup validation succeeds. Once
-    # execution can incur spend, an incomplete directory remains deliberate failure evidence.
-    run_dir.mkdir(parents=True, exist_ok=False)
-    write_json_atomic(run_dir / "inputs.json", inputs)
-    with AgentProject.create(
-        timeout=project_timeout_sec,
-        template=e2b_template,
-        metadata={"wmh_component": "harness_optimize"},
-    ) as project:
-        proposer = ProjectCandidateProposer(
-            project,
-            optimizer_agent(),
-            meta_provider,
+        request = scorer.request(attempts=attempts)
+        if request.task_ids != task_ids or request.attempts != attempts:
+            raise ValueError("resolved score request differs from the declared task matrix")
+        planned_score_cells = (iterations + 1) * len(request.task_ids) * request.attempts
+        if planned_score_cells > max_score_cells:
+            raise typer.BadParameter(
+                f"resolved plan has {planned_score_cells} score cells, exceeding "
+                f"max_score_cells={max_score_cells}"
+            )
+
+        meta_provider = get_provider(meta_config)
+        if not isinstance(meta_provider, ToolCallingProvider):
+            raise typer.BadParameter(
+                "settings [models.meta] provider lacks structured tool calling"
+            )
+        if checkpoint is not None:
+            seed_source = checkpoint.seed
+        else:
+            if seed is None:
+                raise ValueError("new optimization requires a resolved seed source")
+            seed_source = seed
+        identity = PopulationCheckpointIdentity(
+            output_name=name,
+            artifact_root=str(Path(root).resolve()),
+            seed_reference=seed_reference,
+            seed_source_tree_hash=seed_source.tree_hash,
+            score_request=request,
+            iterations=iterations,
+            planned_score_cells=planned_score_cells,
+            max_score_cells=max_score_cells,
+            harbor_job_template=effective_job_config.model_dump(mode="json"),
+            meta_provider=meta_config,
+            agent_provider=agent_config,
+            optimizer_document_hash=optimizer.doc_hash,
+            harness_backend=harness_backend,
+            e2b_template=e2b_template or None,
+            environment_command_timeout_sec=environment_command_timeout_sec,
+            project_timeout_sec=project_timeout_sec,
+            max_source_files=DEFAULT_SOURCE_TREE_MAX_FILES,
+            max_source_bytes=DEFAULT_SOURCE_TREE_MAX_BYTES,
             max_history_candidates=max_history_candidates,
             max_history_bytes=max_history_bytes,
         )
-        result = HarnessPopulationOptimizer(proposer, scorer).optimize(
-            seed=seed,
-            request=request,
-            iterations=iterations,
-        )
-    project_usage = project.usage()
+        if checkpoint is None:
+            checkpoint = stack.enter_context(
+                PopulationCheckpointStore.create(
+                    run_dir,
+                    identity=identity,
+                    seed=seed_source,
+                )
+            )
+            write_json_atomic(run_dir / "inputs.json", identity.model_dump(mode="json"))
+        else:
+            checkpoint.assert_identity(identity)
 
-    archive_manifest = write_population_archive(run_dir / "population", result)
-    selected = result.best.candidate.model_copy(update={"name": name, "version": 0})
-    saved = HarnessStore(root).save_version(selected, alias=CHAMPION_ALIAS)
-    outcome: JsonObject = {
-        "schema_version": 1,
-        "best_candidate_id": result.best.candidate_id,
-        "best_score": result.best_score,
-        "best_document_hash": result.best.candidate.doc_hash,
-        "saved_harness": saved.name,
-        "saved_version": saved.version,
-        "archive_manifest": archive_manifest.relative_to(run_dir).as_posix(),
-        "project_sandbox_usage": project_usage.model_dump(mode="json"),
-    }
-    write_json_atomic(run_dir / "outcome.json", outcome)
-    return HarnessOptimizeOutcome(
-        result=result,
-        saved=saved,
-        run_dir=run_dir,
-        archive_manifest=archive_manifest,
-        project_usage=project_usage,
-    )
+        result = checkpoint.result
+        project_usage = checkpoint.control.project_sandbox_usage
+        if result is None:
+            checkpoint.begin_setup()
+            result = HarnessPopulationOptimizer(
+                cast("CandidateProposer", object()),
+                scorer,
+            ).optimize(
+                seed=seed_source,
+                request=request,
+                iterations=iterations,
+                resume=None,
+                before_step=checkpoint.before_step,
+                on_boundary=checkpoint.commit_boundary,
+                max_new_boundaries=1,
+            )
+            checkpoint.finish_project_segment(SandboxUsage())
+            project_usage = checkpoint.control.project_sandbox_usage
+
+        while checkpoint.control.committed_step < iterations:
+            checkpoint.begin_setup()
+            with AgentProject.create(
+                timeout=project_timeout_sec,
+                template=e2b_template,
+                metadata={"wmh_component": "harness_optimize"},
+            ) as project:
+                proposer = ProjectCandidateProposer(
+                    project,
+                    optimizer,
+                    meta_provider,
+                    max_history_candidates=max_history_candidates,
+                    max_history_bytes=max_history_bytes,
+                )
+                result = HarnessPopulationOptimizer(proposer, scorer).optimize(
+                    seed=seed_source,
+                    request=request,
+                    iterations=iterations,
+                    resume=result,
+                    before_step=checkpoint.before_step,
+                    on_boundary=checkpoint.commit_boundary,
+                    max_new_boundaries=1,
+                )
+            project_usage = project.usage()
+            checkpoint.finish_project_segment(project_usage)
+            project_usage = checkpoint.control.project_sandbox_usage
+        if result is None:
+            raise PopulationCheckpointStateError("checkpoint has no completed seed boundary")
+
+        checkpoint.begin_finalization()
+        archive_manifest = write_population_archive(run_dir / "population", result)
+        selected = result.best.candidate.model_copy(update={"name": name, "version": 0})
+        saved = HarnessStore(root).save_version(selected, alias=CHAMPION_ALIAS)
+        outcome: JsonObject = {
+            "schema_version": 2,
+            "best_candidate_id": result.best.candidate_id,
+            "best_score": result.best_score,
+            "best_document_hash": result.best.candidate.doc_hash,
+            "saved_harness": saved.name,
+            "saved_version": saved.version,
+            "archive_manifest": archive_manifest.relative_to(run_dir).as_posix(),
+            "planned_score_cells": planned_score_cells,
+            "max_score_cells": max_score_cells,
+            "known_score_cells": checkpoint.control.known_score_cells,
+            "project_sandbox_usage": (
+                project_usage.model_dump(mode="json") if project_usage is not None else None
+            ),
+        }
+        outcome_path = run_dir / "outcome.json"
+        write_json_atomic(outcome_path, outcome)
+        checkpoint.mark_complete(
+            saved=saved,
+            archive_manifest=archive_manifest,
+            outcome_path=outcome_path,
+        )
+        return HarnessOptimizeOutcome(
+            result=result,
+            saved=saved,
+            run_dir=run_dir,
+            archive_manifest=archive_manifest,
+            project_usage=project_usage,
+        )
 
 
 def _resolve_seed_source(root: str, seed: str | None) -> HarnessSourceTree:

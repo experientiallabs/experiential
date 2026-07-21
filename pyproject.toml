@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.26",
     "httpx>=0.27",
     "rich>=13.7",
+    "filelock>=3.0",
     # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
     # read core behind `wmh download` (stdlib-only; pushing needs the member's fetch extra).
     # RELEASE ORDER: environment-capture must be published to PyPI before any wmh release —

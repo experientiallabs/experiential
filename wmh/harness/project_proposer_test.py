@@ -348,7 +348,7 @@ def test_project_proposer_restores_exact_valid_and_invalid_turns_before_continui
         if path.startswith("proposals/")
     }
     assert restored_trace == original_trace
-    assert len(restored_project.staged) == 2
+    assert restored_project.staged == [first.source, invalid.source]
 
     third = restored.propose((seed, scored_first))
     assert third.candidate_id == "candidate-0003"

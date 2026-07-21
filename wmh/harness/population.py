@@ -127,6 +127,7 @@ class HarnessPopulationOptimizer:
         resume: PopulationOptimizationResult | None = None,
         before_step: Callable[[int], None] | None = None,
         on_boundary: Callable[[PopulationOptimizationResult], None] | None = None,
+        max_new_boundaries: int | None = None,
     ) -> PopulationOptimizationResult:
         """Evaluate an append-only population and select by primary score only.
 
@@ -136,7 +137,14 @@ class HarnessPopulationOptimizer:
         """
         if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
             raise ValueError("iterations must be a positive integer")
+        if max_new_boundaries is not None and (
+            isinstance(max_new_boundaries, bool)
+            or not isinstance(max_new_boundaries, int)
+            or max_new_boundaries < 1
+        ):
+            raise ValueError("max_new_boundaries must be a positive integer")
         _check_cancelled(should_cancel)
+        new_boundaries = 0
         if resume is None:
             if before_step is not None:
                 before_step(0)
@@ -154,6 +162,7 @@ class HarnessPopulationOptimizer:
             result = _result(population, outcomes)
             if on_boundary is not None:
                 on_boundary(result)
+            new_boundaries += 1
         else:
             _validate_resume(resume, seed=seed, request=request, iterations=iterations)
             population = list(resume.population)
@@ -168,6 +177,8 @@ class HarnessPopulationOptimizer:
                 _check_cancelled(should_cancel)
 
         for index in range(len(outcomes) + 1, iterations + 1):
+            if max_new_boundaries is not None and new_boundaries >= max_new_boundaries:
+                break
             _check_cancelled(should_cancel)
             if before_step is not None:
                 before_step(index)
@@ -181,6 +192,7 @@ class HarnessPopulationOptimizer:
                 result = _result(population, outcomes)
                 if on_boundary is not None:
                     on_boundary(result)
+                new_boundaries += 1
                 continue
 
             known_ids = {item.candidate_id for item in population}
@@ -211,6 +223,7 @@ class HarnessPopulationOptimizer:
             result = _result(population, outcomes)
             if on_boundary is not None:
                 on_boundary(result)
+            new_boundaries += 1
 
         _check_cancelled(should_cancel)
         return _result(population, outcomes)

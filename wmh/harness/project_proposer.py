@@ -210,7 +210,7 @@ class ProjectCandidateProposer:
             candidate_id = f"candidate-{index:04d}"
             proposal_dir = f"proposals/{candidate_id}"
             stage = self._project.stage_source_tree(
-                HarnessSourceTree(files=()),
+                turn.source or HarnessSourceTree(files=()),
                 max_files=self._max_source_files,
                 max_bytes=self._max_source_bytes,
             )
@@ -393,7 +393,7 @@ class ProjectCandidateProposer:
             expected_id = f"candidate-{index:04d}"
             if turn.candidate_id != expected_id:
                 raise ValueError("restored proposal candidate_id values must match consumed slots")
-            self._validate_trace(turn)
+            validate_candidate_turn(turn)
             if isinstance(turn, CandidateProposal):
                 if population_index >= len(history):
                     raise ValueError("restored proposal is missing its evaluated history entry")
@@ -408,44 +408,6 @@ class ProjectCandidateProposer:
         if population_index != len(history):
             raise ValueError("restored history contains an evaluation without a proposal turn")
         return fingerprints
-
-    @staticmethod
-    def _validate_trace(turn: CandidateProposal | CandidateProposalError) -> None:
-        if not turn.request:
-            raise ValueError("restored proposal request is missing")
-        validate_durable_text(turn.request, field="restored proposal request")
-        if not turn.status_json:
-            raise ValueError("restored proposal status_json is missing")
-        validate_durable_text(turn.status_json, field="restored proposal status_json")
-        try:
-            status = json.loads(turn.status_json)
-        except json.JSONDecodeError as error:
-            raise ValueError("restored proposal status_json is invalid") from error
-        if not isinstance(status, dict):
-            raise ValueError("restored proposal status_json must contain an object")
-        if status.get("candidate_id") != turn.candidate_id:
-            raise ValueError("restored proposal status candidate_id differs")
-        expected_valid = isinstance(turn, CandidateProposal)
-        if status.get("valid") is not expected_valid:
-            raise ValueError("restored proposal status validity differs")
-        expected_source_hash = turn.source.tree_hash if turn.source is not None else None
-        if status.get("source_tree_hash") != expected_source_hash:
-            raise ValueError("restored proposal status source hash differs")
-        candidate_hash: str | None = None
-        if turn.source is not None:
-            try:
-                candidate_hash = turn.source.to_doc(turn.candidate_id).doc_hash
-            except (TypeError, ValueError):
-                pass
-        if status.get("candidate_doc_hash") != candidate_hash:
-            raise ValueError("restored proposal status document hash differs")
-        if isinstance(turn, CandidateProposal):
-            if not any(event.kind == "submit" for event in turn.events):
-                raise ValueError("restored valid proposal trace has no submit event")
-            if turn.candidate.name != turn.candidate_id:
-                raise ValueError("restored proposal document name differs")
-            if candidate_hash != turn.candidate.doc_hash:
-                raise ValueError("restored proposal source and document differ")
 
     def _validate_history_bounds(self, history: Sequence[EvaluatedCandidate]) -> None:
         """Reject unbounded evaluator-controlled history before reading or writing its bytes."""
@@ -586,6 +548,45 @@ class ProjectCandidateProposer:
     def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
         if should_cancel is not None and should_cancel():
             raise HarnessSearchCancelled("harness search cancelled")
+
+
+def validate_candidate_turn(turn: CandidateProposal | CandidateProposalError) -> None:
+    """Validate one exact proposal trace before durable restore or checkpointing."""
+    if not turn.request:
+        raise ValueError("restored proposal request is missing")
+    validate_durable_text(turn.request, field="restored proposal request")
+    if not turn.status_json:
+        raise ValueError("restored proposal status_json is missing")
+    validate_durable_text(turn.status_json, field="restored proposal status_json")
+    try:
+        status = json.loads(turn.status_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("restored proposal status_json is invalid") from error
+    if not isinstance(status, dict):
+        raise ValueError("restored proposal status_json must contain an object")
+    if status.get("candidate_id") != turn.candidate_id:
+        raise ValueError("restored proposal status candidate_id differs")
+    expected_valid = isinstance(turn, CandidateProposal)
+    if status.get("valid") is not expected_valid:
+        raise ValueError("restored proposal status validity differs")
+    expected_source_hash = turn.source.tree_hash if turn.source is not None else None
+    if status.get("source_tree_hash") != expected_source_hash:
+        raise ValueError("restored proposal status source hash differs")
+    candidate_hash: str | None = None
+    if turn.source is not None:
+        try:
+            candidate_hash = turn.source.to_doc(turn.candidate_id).doc_hash
+        except (TypeError, ValueError):
+            pass
+    if status.get("candidate_doc_hash") != candidate_hash:
+        raise ValueError("restored proposal status document hash differs")
+    if isinstance(turn, CandidateProposal):
+        if not any(event.kind == "submit" for event in turn.events):
+            raise ValueError("restored valid proposal trace has no submit event")
+        if turn.candidate.name != turn.candidate_id:
+            raise ValueError("restored proposal document name differs")
+        if candidate_hash != turn.candidate.doc_hash:
+            raise ValueError("restored proposal source and document differ")
 
 
 def _proposal_request(

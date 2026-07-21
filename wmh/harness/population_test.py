@@ -597,3 +597,43 @@ def test_boundary_failure_stops_before_the_next_spend_step() -> None:
 
     assert len(scorer.calls) == 1
     assert proposer.histories == []
+
+
+def test_optimizer_can_commit_exactly_one_new_boundary_per_invocation() -> None:
+    seed_proposer = _Proposer([_proposal("candidate-0001", "unreached")])
+    seed_scorer = _Scorer([(0.2, False)])
+    seed_result = HarnessPopulationOptimizer(seed_proposer, seed_scorer).optimize(
+        seed=_source("seed"),
+        request=_request(),
+        iterations=3,
+        max_new_boundaries=1,
+    )
+
+    assert seed_result.iterations == ()
+    assert len(seed_scorer.calls) == 1
+    assert seed_proposer.histories == []
+
+    resumed_proposer = _ResumableProposer([_proposal("candidate-0001", "first")])
+    resumed_scorer = _Scorer([(0.8, True)])
+    first_result = HarnessPopulationOptimizer(resumed_proposer, resumed_scorer).optimize(
+        seed=_source("seed"),
+        request=_request(),
+        iterations=3,
+        resume=seed_result,
+        max_new_boundaries=1,
+    )
+
+    assert len(first_result.iterations) == 1
+    assert first_result.iterations[0].candidate_id == "candidate-0001"
+    assert len(resumed_scorer.calls) == 1
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_optimizer_requires_a_positive_new_boundary_limit(value: int) -> None:
+    with pytest.raises(ValueError, match="max_new_boundaries"):
+        HarnessPopulationOptimizer(_Proposer([]), _Scorer([])).optimize(
+            seed=_source("seed"),
+            request=_request(),
+            iterations=1,
+            max_new_boundaries=value,
+        )
