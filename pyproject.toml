@@ -1,7 +1,7 @@
 [project]
 name = "world-model-harness"
 version = "0.1.0"
-description = "Docker as an LLM: a frontier model acts as your agent's environment, reconstructed from OTel traces."
+description = "Run agents, build world models from traces, and optimize agent harnesses."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -26,11 +26,6 @@ dependencies = [
     "anthropic>=0.39",
     "openai>=1.40",
     "boto3>=1.34",
-    # Failover chains across backends/accounts (wmh.providers.waterfall wraps llm-waterfall);
-    # core for the same reason as the SDKs above: `wmh.providers` imports it unconditionally.
-    # Resolves from the workspace member in-repo ([tool.uv.sources]); RELEASE ORDER: publish
-    # llm-waterfall to PyPI before any wmh release, like environment-capture.
-    "llm-waterfall",
     "python-multipart>=0.0.9",  # FastAPI UploadFile for the build-your-own traces upload
 ]
 
@@ -62,7 +57,8 @@ dev = [
 # gate covers their tests. Both members have graduated to [project.dependencies] —
 # environment-capture when `wmh download` started consuming it, llm-waterfall when
 # wmh.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
-# members' heavy extras.
+# members' heavy extras. The flagship wheel includes llm_waterfall's import package, while the
+# workspace dependency keeps its own metadata and extras available for development and testing.
 dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]
@@ -73,12 +69,21 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["wmh"]
+packages = ["wmh", "packages/llm-waterfall/llm_waterfall"]
+exclude = ["**/*_test.py"]
+force-include = { "packages/llm-waterfall/LICENSE" = "llm_waterfall/LICENSE" }
 
 [tool.hatch.build.targets.sdist]
-# The flagship sdist ships the flagship only — not workspace members (independently packaged),
-# not the agents' workspace, not the website.
-include = ["/wmh", "/README.md", "/pyproject.toml", "/conftest.py"]
+# Publish one flagship distribution. llm_waterfall is bundled because WMH imports it as a core
+# implementation module; the environment-capture dependency already resolves from PyPI.
+include = [
+    "/wmh",
+    "/packages/llm-waterfall/llm_waterfall",
+    "/packages/llm-waterfall/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/conftest.py",
+]
 
 [tool.uv.workspace]
 # The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members live

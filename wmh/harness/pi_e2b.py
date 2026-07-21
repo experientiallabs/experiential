@@ -3,7 +3,7 @@
 For pi-node harnesses the agent *process* itself must run for real (its multi-file TypeScript
 source — context forking, dropping, summarizing — is the thing under search), while the worker LLM
 and the tool routing stay host-side. The ENVIRONMENT is whatever `AgentEnvironment` the eval
-binds; in `wmh harness create` / `wmh eval` that is the world-model simulation — the sandbox is
+binds; in `wmh optimize` / `wmh eval` that is the world-model simulation. The sandbox is
 purely the compute substrate for the harness process, and its filesystem is never an environment.
 
 `E2BStdioChannel` carries the existing RunnerLink frame protocol over an E2B background command's

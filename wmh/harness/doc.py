@@ -417,7 +417,7 @@ def code_baseline(name: str = "baseline") -> HarnessDoc:
     """The baseline harness with its loop as an editable `code:runtime` surface.
 
     Behaviorally equivalent to `HarnessDoc.baseline()` — same prompt, tools, and one-call-per-turn
-    loop — but the loop is data, so `wmh harness create` can propose structural changes to it.
+    loop, but the loop is data, so `wmh optimize` can propose structural changes to it.
     """
     base = HarnessDoc.baseline(name)
     code = Surface(id=CODE_RUNTIME_ID, kind=SurfaceKind.CODE, content=DEFAULT_RUNTIME_CODE)

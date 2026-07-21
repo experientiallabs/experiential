@@ -1,4 +1,4 @@
-"""CLI tests for `wmh harness create`: the harness-backend wiring, driven via CliRunner.
+"""CLI tests for `wmh optimize`: optimizer-backend wiring, driven via CliRunner.
 
 The search itself is faked (`create_harness` is monkeypatched to a recorder) — these tests pin
 the WIRING the flags control: which harness backend reaches the search, that the world model is
@@ -88,8 +88,7 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
     return runner.invoke(
         app,
         [
-            "harness",
-            "create",
+            "optimize",
             "made",
             "--tasks",
             _tasks_file(tmp_path),
@@ -126,7 +125,7 @@ def test_create_e2b_wires_backend_flags_and_still_loads_the_world_model(
 
     result = _invoke(
         tmp_path,
-        "--harness-backend",
+        "--backend",
         "e2b",
         "--eval-concurrency",
         "4",
@@ -217,6 +216,32 @@ def test_create_default_local_loads_the_world_model(
     )
     assert expected in flat
     assert "--harness-backend" not in flat  # and the run-it hint stays plain
+
+
+def test_optimize_accepts_world_model_as_second_argument(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    loads = _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "made",
+            "wm-user",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--iterations",
+            "1",
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert loads == ["wm-user"]
 
 
 def test_create_meta_role_from_settings_drives_the_proposer(
@@ -334,7 +359,7 @@ def test_create_meta_defaults_to_the_world_model_provider(
     assert "models.meta" not in result.output
 
 
-def test_create_rejects_unknown_harness_backend(tmp_path: Path) -> None:
-    result = _invoke(tmp_path, "--harness-backend", "banana")
+def test_optimize_rejects_unknown_backend(tmp_path: Path) -> None:
+    result = _invoke(tmp_path, "--backend", "banana")
     assert result.exit_code == 2  # usage error, not a traceback
     assert "choose local or e2b" in result.output

@@ -1,6 +1,6 @@
 # HarnessDelta: the update-representation interface for `wmh harness`
 
-This is the interface `wmh harness create` mutates through and the archive records: a typed,
+This is the interface `wmh optimize` mutates through and the archive records: a typed,
 precondition-guarded, gate-audited delta object, replacing "a harness update is a file edit".
 Getting this right matters more than any implementation detail downstream: **the update
 representation IS the search space**, and everything the meta-agent can learn about *how to

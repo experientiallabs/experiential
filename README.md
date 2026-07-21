@@ -1,7 +1,8 @@
 # World Model Harness
 
-`wmh` is an open-source system for running worker agents, learning simulations of their
-deployed environments from traces, and using optimizer agents to improve the harness around them.
+`wmh` is an open-source project for running and building continuously improving agents. It
+includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
+builds task-specific harnesses for stronger performance at lower cost.
 
 ```mermaid
 flowchart TB
@@ -30,98 +31,55 @@ flowchart TB
     linkStyle 2 stroke:#f5a623,stroke-width:2px
 ```
 
-The **world model** reproduces the environment, the **worker agent** acts inside it, and the
-**optimizer agent** uses the resulting evidence to search for a better worker harness.
+## Getting started
 
-## Choose your starting point
+### Local setup
 
-Set up the repository once:
-
-```bash
-git clone https://github.com/experientiallabs/world-model-harness
-cd world-model-harness
-uv sync
-```
-
-### Run an open-source agent
-
-Start the built-in [pi](https://github.com/earendil-works/pi) worker agent on a task. Logging in
-lets the local harness use platform-managed model credentials; you can also stay logged out and
-use local provider credentials.
+Install WMH, choose the model provider for the built-in worker agent, and start a local run:
 
 ```bash
-uv run wmh login
-uv run wmh run --task "Inspect this repository and explain it"
+pip install world-model-harness
+wmh providers set
+wmh run --task "Inspect this repository and explain it"
 ```
 
-Use `--dir PATH` to choose its working directory. Use `wmh run <agent-id>` instead when you want
-to run a hosted agent and its champion harness.
-
-### Build a world model from traces
-
-Turn recorded agent behavior into a model of the environment the agent acts against:
+Build a named world model from collected traces:
 
 ```bash
-uv run wmh build
-uv run wmh play
+wmh build --file traces.jsonl --name my-environment
 ```
 
-`wmh build` opens a guided flow for OpenTelemetry, chat/tool-call logs, Braintrust, Arize Phoenix,
-Langfuse, LangSmith, PostHog, and Mastra traces. The resulting model can run in process, behind the
-local HTTP server, or as the environment for closed-loop agent evaluation. See
-[trace ingestion](./docs/reference/ingest.md) for source-specific setup.
-
-### Optimize an agent harness
-
-Given a world model and a task set, let an optimizer agent propose harness changes and evaluate
-each candidate against the simulated environment:
+Then optimize an agent harness against that model and a set of tasks:
 
 ```bash
-uv run wmh harness create my-agent \
-  --tasks tasks.jsonl \
-  --model my-environment \
-  --iterations 5
-
-uv run wmh eval tasks.jsonl \
-  --mode closed-loop \
-  --name my-environment \
-  --harness my-agent@champion
+wmh optimize my-agent my-environment --tasks tasks.jsonl
 ```
 
-The search stores immutable harness versions and moves the `champion` alias only when a candidate
-passes its evaluation gates. Use `--harness-backend e2b` to evaluate the real pi harness in pooled
-E2B sandboxes while the world model remains the environment. See the
-[closed-loop evaluation guide](./docs/reference/closed_loop.md) and
-[harness update contract](./docs/reference/harness_delta.md) for the underlying workflow.
+### Hosted platform
 
-## How the loop works
-
-1. The **worker agent** runs tasks in a real or simulated environment and produces traces,
-   trajectories, and outcomes.
-2. The **world model** learns a fast simulation of the deployed environment from those traces.
-3. The **optimizer agent** proposes changes to the worker's prompts, tools, policies, skills, or
-   runtime code, then measures the candidates in closed-loop runs against the world model.
-4. The best gated candidate becomes the new worker harness, which can be validated in the real
-   environment and produce the next round of evidence.
-
-## See the world model in action
-
-Below is a comparison running 8 SWE-bench tasks: real sandboxes on the left, a world model acting as the sandbox on the right.
-
-![world-model-harness demo](./assets/demo.gif)
-
-## Explore the world-model tools
+Create an account at [platform.experientiallabs.ai](https://platform.experientiallabs.ai), then
+authenticate the CLI:
 
 ```bash
-uv run wmh examples list          # swe-bench, tau-bench, terminal-tasks
-uv run wmh eval list              # eval suites shipped with the examples
-uv run wmh eval run tau-bench     # replay + score reconstruction fidelity
-uv run wmh scenarios build --file traces.otel.jsonl   # traces -> judgeable eval scenarios
-uv run wmh play                   # step into the environment yourself
-uv run wmh serve                  # local HTTP backend on :8000
+wmh login
 ```
 
-Example-local prebuilt models live under `examples/<task>/models/`; pass `--root examples/<task>` to `wmh list`, `wmh demo`, `wmh play`, or `wmh serve` to use one without rebuilding.
+Copy an agent ID from the platform and run its current champion harness:
+
+```bash
+wmh run <agent-id>
+```
+
+### E2B backend
+
+Hosted agents already run in platform-managed E2B sandboxes. To evaluate a local optimization in
+E2B, install the extra and provide an E2B key:
+
+```bash
+pip install "world-model-harness[e2b]"
+export E2B_API_KEY=...
+wmh optimize my-agent my-environment --tasks tasks.jsonl --backend e2b
+```
 
 ## Use a world model as an API
 
@@ -237,7 +195,7 @@ credentials ever enter a sandbox**.
 ```bash
 uv sync --extra e2b                # the e2b SDK is an optional extra
 export E2B_API_KEY=...             # sandboxes; the only credential involved
-uv run wmh harness create my-agent --tasks tasks.jsonl --harness-backend e2b \
+uv run wmh optimize my-agent my-environment --tasks tasks.jsonl --backend e2b \
   --iterations 5 --proposal-batch-size 3
 uv run wmh eval tasks.jsonl --mode closed-loop --harness pi-agent --harness-backend e2b
 ```
@@ -256,76 +214,6 @@ Each optimization iteration generates a
 sibling batch from the frozen current champion, evaluates every sibling against that same
 snapshot, and selects at most one gate-eligible winner. Proposal batch size controls search
 breadth; `k` independently controls the number of evaluation passes per scenario.
-
-## Agentic mode: knowledge base, reasoning, web grounding
-
-Beyond retrieval, a world model can act like an *agent* about its own environment (all opt-in):
-
-- **Knowledge base** — `wmh build --knowledge` extracts the environment's canonical facts
-  (business rules, state-dependent gates, entities, tool schemas) from the train traces into
-  `models/<name>/knowledge/*.md`. It's plain markdown: edit it in any editor (`wmh knowledge`
-  prints the path), read/write it over HTTP (`GET/PUT /world_models/{name}/knowledge`), and the
-  env keeps it in every prompt and appends its own cross-session notes to `learned.md`.
-- **Reasoning** — `--reasoning` switches the output contract to deliberate-then-answer: the env
-  checks the knowledge base's gates (auth, availability, preconditions) and the session history
-  before deciding success vs. error.
-- **Web grounding** — `--grounder brave` (env var `BRAVE_SEARCH_API_KEY`, free tier) lets the env
-  issue a bounded web search when an action references a real-world entity outside its traces
-  and knowledge — instead of hallucinating it; `--grounder fetch` (keyless) additionally
-  live-fetches the action's own read-only `curl` GET URLs. Results are cached into the knowledge
-  base; the default is `none`, so tests and evals never touch the network.
-- **Verify pass** — `--verify` adds a second self-check completion per step: the env re-examines
-  its draft against the gates, history, and exact computations before answering (~2× serve cost;
-  measured to pay off exactly where content prediction is hardest).
-
-## Fidelity: one knob at build, one switch at run
-
-Build effort is a **tier**, not an iteration count:
-
-```bash
-wmh build --fidelity low     # RAG only — index the traces, ship the base prompt (near-free)
-wmh build --fidelity medium  # + a light prompt-optimization (GEPA) pass        (default)
-wmh build --fidelity high    # + full GEPA + a cheap auto-config search
-wmh build --fidelity max     # deep GEPA + the full config ladder, to be certain
-```
-
-`high`/`max` additionally search the agentic configs (reason / +knowledge / +verify / +fetch)
-on the build's held-out split — candidates pruned by a zero-token corpus signature, ties going
-to the cheaper config — and record the winner in the artifact's `auto_fidelity.json`.
-
-At run time you either just run it (pure RAG, always), or ask for everything:
-
-```bash
-wmh serve --max-fidelity     # the build-measured winning config (or all extras if unmeasured)
-wmh play  --max-fidelity
-```
-
-Measure any configuration explicitly with `wmh eval run <suite> --knowledge --reasoning` (the
-eval seeds its knowledge from the train split only — never from held-out traces).
-## Providers
-
-One interface, four backends, verified on startup. Credentials are read from the environment:
-
-| Provider | Model | Env vars |
-|---|---|---|
-| Anthropic | Claude Opus | `ANTHROPIC_API_KEY` |
-| AWS Bedrock | Claude Opus | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
-| Azure OpenAI | GPT | `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT` |
-| OpenAI | GPT | `OPENAI_API_KEY` |
-
-## The monorepo
-
-This repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/):
-`wmh` is the flagship package at the root (the quickstart above), and sibling packages live under
-`packages/`, each installable on its own:
-
-| Package | What it does | Get it |
-|---|---|---|
-| **wmh** (root) | Agent traces → a faithful world model of your environment | the quickstart above |
-| [`packages/llm-waterfall/`](./packages/llm-waterfall) | Pool LLM quota across models, providers, and AWS accounts: stateless failover that spills only on capacity errors, returning cost + the full attempt trail | `pip install "llm-waterfall @ git+https://github.com/experientiallabs/world-model-harness#subdirectory=packages/llm-waterfall"` *(PyPI release pending)* |
-| [`packages/environment-capture/`](./packages/environment-capture) | Point it at any agent benchmark: integrate via a small adapter, capture every real agent-environment transition as OTel GenAI JSONL; 27k+ transitions already published on the [Hub](https://huggingface.co/experiential-labs) | `pip install environment-capture` |
-
-One clone, one `uv sync`, one gate (`just gate`); each package is built and released independently.
 
 ## Development
 

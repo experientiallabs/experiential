@@ -38,7 +38,7 @@ from rich.table import Table
 import wmh.providers as providers
 from wmh.cli.agent_session import register as register_agent_session_commands
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
-from wmh.cli.harness_app import harness_app
+from wmh.cli.harness_app import harness_app, optimize
 from wmh.cli.platform_cmds import register as register_platform_commands
 from wmh.cli.ui import (
     BuildParams,
@@ -60,11 +60,13 @@ from wmh.config import (
     ArtifactPaths,
     FidelityTier,
     HarnessConfig,
+    ModelRole,
     WorldModelStore,
     load_config,
     load_env_file,
     load_settings,
     normalize_name,
+    save_settings,
     set_telemetry_enabled,
     settings_path,
     validate_name,
@@ -118,7 +120,7 @@ from wmh.telemetry import (
 from wmh.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
 
 app = typer.Typer(
-    help="World Model Harness: a frontier LLM acts as your agent's environment.",
+    help="Run agents, build world models from traces, and optimize agent harnesses.",
     no_args_is_help=True,
 )
 
@@ -141,6 +143,7 @@ app.add_typer(config_app, name="config")
 app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
+app.command("optimize")(optimize)
 register_platform_commands(app)
 register_agent_session_commands(app)
 _console = Console()
@@ -210,6 +213,99 @@ def config_telemetry(
         raise typer.BadParameter("action must be one of: status, enable, disable")
     state = "enabled" if settings.telemetry.enabled else "disabled"
     _console.print(f"telemetry {state} ({settings_path(root)})")
+
+
+def _worker_provider_config(
+    provider: str,
+    model: str,
+    region: str | None,
+    *,
+    endpoint: str | None = None,
+    deployment: str | None = None,
+    api_version: str | None = None,
+) -> ProviderConfig:
+    """Resolve the provider settings used by the built-in worker agent."""
+    config = _provider_config(provider, model, region)
+    if endpoint is not None:
+        config = config.model_copy(update={"endpoint": endpoint})
+    if config.kind is ProviderKind.AZURE_OPENAI:
+        config = config.model_copy(
+            update={
+                "deployment": deployment or config.model_type or config.model,
+                "api_version": api_version or "2024-05-01-preview",
+            }
+        )
+    return config
+
+
+@providers_app.command("set")
+def providers_set(
+    provider: str = typer.Option(None, "--provider", help="Provider for the local worker agent."),
+    model: str = typer.Option(None, "--model", help="Canonical model type for the worker."),
+    region: str = typer.Option(None, "--region", help="AWS region for Bedrock."),
+    endpoint: str = typer.Option(None, "--endpoint", help="OpenAI-compatible API endpoint."),
+    deployment: str = typer.Option(None, "--deployment", help="Azure deployment name."),
+    api_version: str = typer.Option(None, "--api-version", help="Azure API version."),
+    root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding local settings."),
+) -> None:
+    """Choose and verify the model provider used by local worker-agent runs."""
+    existing = load_settings(root).models.worker
+    used_picker = _console.is_terminal and (provider is None or model is None)
+    if used_picker:
+        provider, model, region = select_provider_and_model(
+            _console,
+            lambda text: _console.input(text),
+            lambda text: _console.input(text, password=True),
+            default_provider=provider or (existing.provider if existing else None),
+            default_model=model or (existing.model if existing else None),
+            default_region=region or (existing.region if existing else None),
+            interactive=True,
+            check=lambda cfg: verify_all(
+                [
+                    _worker_provider_config(
+                        cfg.kind.value,
+                        cfg.model_type or cfg.model,
+                        cfg.region,
+                        endpoint=endpoint,
+                        deployment=deployment,
+                        api_version=api_version,
+                    )
+                ]
+            )[0],
+        )
+    if provider is None or model is None:
+        raise typer.BadParameter(
+            "provide --provider and --model, or run `wmh providers set` in a terminal"
+        )
+    config = _worker_provider_config(
+        provider,
+        model,
+        region,
+        endpoint=endpoint,
+        deployment=deployment,
+        api_version=api_version,
+    )
+    if not used_picker:
+        result = verify_all([config])[0]
+        if not result.ok:
+            detail = escape(result.detail or "unknown error")
+            _console.print(f"[red]provider verification failed[/red]: {detail}")
+            raise typer.Exit(1)
+
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(
+        provider=config.kind.value,
+        model=config.model_type or model,
+        region=config.region,
+        endpoint=config.endpoint,
+        deployment=config.deployment,
+        api_version=config.api_version,
+    )
+    save_settings(settings, root)
+    _console.print(
+        f"[green]set[/green] local worker provider to {config.kind.value} "
+        f"({config.model_type or model}) in {settings_path(root)}"
+    )
 
 
 @providers_app.command("verify")
@@ -316,7 +412,7 @@ def build(
     provider: str = typer.Option(
         None, "--provider", help="Provider that serves the model (default: bedrock)."
     ),
-    model: str = typer.Option("claude-opus-4-8", help="Canonical serve model type."),
+    model: str = typer.Option(None, help="Canonical serve model type."),
     judge_model: str = typer.Option(
         None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
     ),
@@ -384,6 +480,10 @@ def build(
     needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
+    configured_worker = load_settings(root).models.resolve("worker")
+    use_configured_worker = configured_worker is not None and (
+        provider is None or provider == configured_worker.provider
+    )
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
         source=source,
@@ -393,9 +493,16 @@ def build(
         api_key=api_key,
         since=since,
         limit=limit,
-        provider=provider,
-        model=model,
-        region=region,
+        provider=provider or (configured_worker.provider if configured_worker else None),
+        model=(
+            model
+            or (configured_worker.model if use_configured_worker and configured_worker else None)
+            or "claude-opus-4-8"
+        ),
+        region=(
+            region
+            or (configured_worker.region if use_configured_worker and configured_worker else None)
+        ),
         fidelity=fidelity,
         train_split=train_split,
         judge_model=judge_model,
@@ -468,6 +575,14 @@ def build(
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
         trace_adapter=params.source,
     )
+    if use_configured_worker and configured_worker is not None and model is None:
+        config.providers[0] = config.providers[0].model_copy(
+            update={
+                "endpoint": configured_worker.endpoint,
+                "deployment": configured_worker.deployment,
+                "api_version": configured_worker.api_version,
+            }
+        )
     if grounder not in GROUNDER_KINDS:
         raise typer.BadParameter(
             f"unknown grounder {grounder!r}; choose one of: {', '.join(GROUNDER_KINDS)}"

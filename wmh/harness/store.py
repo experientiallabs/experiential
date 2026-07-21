@@ -1,7 +1,7 @@
 """Harnesses on disk: immutable numbered versions plus movable aliases, per name.
 
 Like world models under `.wmh/models/<name>/`, a harness is a named artifact — but harnesses
-accumulate *versions*, because they are the thing `wmh harness create` iterates on. A version, once
+accumulate *versions*, because they are the thing `wmh optimize` iterates on. A version, once
 written, never changes; deployment state lives in movable aliases; and every eval result keys to an
 immutable version rather than to "whatever the harness currently is".
 

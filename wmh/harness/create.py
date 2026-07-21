@@ -1,4 +1,4 @@
-"""`wmh harness create`: budgeted search over harness deltas, gated by non-regression.
+"""`wmh optimize`: budgeted search over harness deltas, gated by non-regression.
 
 Each iteration freezes the current champion, clusters its failures into mechanisms, and asks the
 proposer for a sibling batch of `HarnessDelta` objects against one size-weighted,

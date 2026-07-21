@@ -13,6 +13,8 @@ from wmh.config.config import (
 )
 from wmh.config.dotenv import load_env_file, upsert_env_var
 from wmh.config.settings import (
+    ModelRole,
+    ModelsSettings,
     ProjectSettings,
     TelemetrySettings,
     ensure_telemetry_anonymous_id,
@@ -39,6 +41,8 @@ __all__ = [
     "ArtifactPaths",
     "HarnessConfig",
     "ModelInfo",
+    "ModelRole",
+    "ModelsSettings",
     "ProjectSettings",
     "TelemetrySettings",
     "WorldModelStore",

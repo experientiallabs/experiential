@@ -20,7 +20,7 @@ wmh eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_rep
   `bash`, `read_file`, `write_file`, and `submit`. Pass `--harness <name>[@ref]` to evaluate a
   stored harness version.
 - By default, the agent and world model share a provider. Configure `[models.agent]` in
-  `.wmh/settings.toml` to evaluate with a distinct agent provider. `wmh harness create` and the
+  `.wmh/settings.toml` to evaluate with a distinct agent provider. `wmh optimize` and the
   reproduction command it prints resolve the same role.
 - Every task runs **k=3 passes** (the repo's eval-reporting convention); the score is the fraction of
   passes whose transcript satisfies every gold assertion, judged by an LLM judge that never trusts

@@ -1,0 +1,63 @@
+name: python package
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/python-package.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "wmh/**"
+      - "packages/llm-waterfall/llm_waterfall/**"
+      - "packages/llm-waterfall/LICENSE"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/python-package.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "README.md"
+      - "wmh/**"
+      - "packages/llm-waterfall/llm_waterfall/**"
+      - "packages/llm-waterfall/LICENSE"
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build the WMH distribution
+        run: uv build --package world-model-harness --no-sources
+      - name: Smoke test the wheel
+        run: |
+          uv venv /tmp/wmh-wheel-smoke
+          uv pip install --python /tmp/wmh-wheel-smoke/bin/python dist/*.whl
+          /tmp/wmh-wheel-smoke/bin/python -c "import llm_waterfall, wmh"
+          /tmp/wmh-wheel-smoke/bin/wmh --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist
+      - name: Publish to PyPI with trusted publishing
+        run: uv publish --trusted-publishing always dist/*

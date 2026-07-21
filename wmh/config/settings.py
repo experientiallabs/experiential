@@ -42,7 +42,7 @@ class ModelsSettings(BaseModel):
     extraction (trace facets/digests); `meta` is the harness-search delta proposer, which
     needs a long-context, long-output model (one proposal holds every harness surface in its
     prompt and replies with a complete replacement surface); `agent` is the agent-under-test
-    whose harness `wmh harness create` searches. Set it to optimize a harness for a model
+    whose harness `wmh optimize` searches. Set it to optimize a harness for a model
     distinct from the world model's serve provider (e.g. a small self-hosted agent against a
     frontier-served world model). Unset `judge`/`summary` fall back to `worker`; each command
     documents which explicit model flags and opt-in roles it uses.
@@ -60,7 +60,7 @@ class ModelsSettings(BaseModel):
         `meta` and `agent` deliberately do NOT fall back to `worker`: each is picked for a
         need the scenario worker does not serve (the proposer's long-context/long-output
         surface; the agent-under-test's own identity), so when unset they return None and the
-        caller keeps its own default (`wmh harness create` and closed-loop eval use the world
+        caller keeps its own default (`wmh optimize` and closed-loop eval use the world
         model's provider for the opt-in roles when unset).
         """
         if role not in ("worker", "judge", "summary", "meta", "agent"):

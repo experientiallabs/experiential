@@ -1,4 +1,4 @@
-"""`HarnessDelta`: the typed update object `wmh harness create` searches through.
+"""`HarnessDelta`: the typed update object `wmh optimize` searches through.
 
 The update representation IS the search space: everything the meta-agent can learn about *how to
 improve harnesses* is bounded by what the update object can express. A raw file edit expresses

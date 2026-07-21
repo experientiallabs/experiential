@@ -20,10 +20,12 @@ import wmh.cli.hosted_session as hosted_mod
 from wmh.cli import app
 from wmh.cli.session_state import DetachedSessionState, SessionStateError, SessionStateStore
 from wmh.cli.workspace_sync import snapshot_from_archive
+from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.workspace_patch import build_workspace_patch
 from wmh.platform.client import PlatformError
 from wmh.platform.credentials import PlatformCredentials
+from wmh.providers.base import ProviderKind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -170,6 +172,39 @@ def test_build_driver_not_logged_in_runs_baseline_local(monkeypatch: pytest.Monk
     assert driver._worker_fn is None
     assert isinstance(driver._provider, _FakeProvider)
     assert driver._doc.runtime_kind() == "pi-node"
+
+
+def test_build_driver_uses_configured_local_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="openai", model="gpt-5.4-mini"))
+        ),
+        tmp_path / ".wmh",
+    )
+    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    configs = []
+
+    def get_provider(config: object) -> _FakeProvider:
+        configs.append(config)
+        return _FakeProvider()
+
+    monkeypatch.setattr(mod, "get_provider", get_provider)
+
+    driver = mod._build_driver(
+        target=None,
+        jail_root=tmp_path,
+        provider=None,
+        model=None,
+        task=None,
+    )
+
+    assert isinstance(driver, mod.LocalLiveDriver)
+    [config] = configs
+    assert config.kind is ProviderKind.OPENAI
+    assert config.model == "gpt-5.4-mini"
 
 
 def test_build_driver_logged_in_agent_uses_hosted_e2b_without_local_workspace(

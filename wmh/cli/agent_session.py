@@ -54,6 +54,7 @@ from wmh.cli.workspace_sync import (
     WorkspaceSyncError,
     snapshot_workspace,
 )
+from wmh.config import load_settings
 from wmh.engine.play import parse_action
 from wmh.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
 from wmh.harness.live_session import LiveSession, SessionEvent, ToolOutcome
@@ -788,14 +789,30 @@ class RemoteWorldModelDriver:
 
 def _local_worker_provider(provider: str | None, model: str | None) -> ToolCallingProvider:
     """Build the logged-out worker provider from local environment credentials."""
+    configured = load_settings().models.resolve("worker")
+    provider_name = provider or (
+        configured.provider if configured is not None else _DEFAULT_PROVIDER
+    )
+    model_name = model or (configured.model if configured is not None else _DEFAULT_MODEL)
     try:
-        kind = ProviderKind(provider or _DEFAULT_PROVIDER)
+        kind = ProviderKind(provider_name)
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
-        msg = f"unknown provider {provider!r}; choose one of: {kinds}"
+        msg = f"unknown provider {provider_name!r}; choose one of: {kinds}"
         raise typer.BadParameter(msg) from None
-    spec = resolve_provider_model(kind, model or _DEFAULT_MODEL)
-    built = get_provider(ProviderConfig(kind=kind, model_type=spec.model_type, model=spec.model_id))
+    spec = resolve_provider_model(kind, model_name)
+    use_configured_knobs = configured is not None and configured.provider == kind.value
+    built = get_provider(
+        ProviderConfig(
+            kind=kind,
+            model_type=spec.model_type,
+            model=spec.model_id,
+            region=configured.region if use_configured_knobs else None,
+            endpoint=configured.endpoint if use_configured_knobs else None,
+            deployment=configured.deployment if use_configured_knobs else None,
+            api_version=configured.api_version if use_configured_knobs else None,
+        )
+    )
     if not isinstance(built, ToolCallingProvider):
         msg = f"provider {kind.value}/{spec.model_id} does not support structured tool calling"
         raise typer.BadParameter(msg)

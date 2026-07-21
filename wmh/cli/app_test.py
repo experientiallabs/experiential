@@ -16,7 +16,15 @@ from typer.testing import CliRunner
 
 from wmh.cli import app
 from wmh.cli.app import _CONCURRENCY_ISOLATION_FLAGS
-from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, verify_via_ping
+from wmh.config import ModelRole, load_config, load_settings, save_settings
+from wmh.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    VerifyResult,
+    verify_via_ping,
+)
 
 # `wmh.cli`'s `app` attribute (the Typer object) shadows the `wmh.cli.app` submodule on
 # plain `import wmh.cli.app as ...`; go through importlib to monkeypatch module globals.
@@ -140,6 +148,33 @@ def _build(root, name: str, tmp_path) -> None:  # noqa: ANN001 - pytest fixture 
     assert result.exit_code == 0, result.output
 
 
+def test_build_uses_configured_worker_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="openai", model="gpt-5.4-mini")
+    save_settings(settings, root)
+
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "configured",
+            "--file",
+            _traces_file(tmp_path),
+            "--fidelity",
+            "low",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = load_config(root / "models" / "configured")
+    assert config.serve_provider is ProviderKind.OPENAI
+    assert config.serve_provider_config().model_type == "gpt-5.4-mini"
+
+
 def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001
     from wmh.config.card import load_card
 
@@ -167,7 +202,17 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
 
 def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
-    core = {"build", "list", "serve", "demo", "eval", "play", "download", "knowledge"}
+    core = {
+        "build",
+        "list",
+        "serve",
+        "demo",
+        "eval",
+        "play",
+        "download",
+        "knowledge",
+        "optimize",
+    }
     platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
 
@@ -347,6 +392,74 @@ def test_config_telemetry_command_manages_project_settings(tmp_path) -> None:  #
     enabled = runner.invoke(app, ["config", "telemetry", "enable", "--root", str(root)])
     assert enabled.exit_code == 0, enabled.output
     assert "telemetry enabled" in enabled.output
+
+
+def test_providers_set_verifies_and_saves_local_worker(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    checked: list[ProviderConfig] = []
+
+    def verify(configs: list[ProviderConfig]) -> list[VerifyResult]:
+        checked.extend(configs)
+        return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
+
+    monkeypatch.setattr(cli_app_module, "verify_all", verify)
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--endpoint",
+            "https://models.example/v1",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert checked[0].kind is ProviderKind.OPENAI
+    worker = load_settings(root).models.worker
+    assert worker is not None
+    assert worker.provider == "openai"
+    assert worker.model == "gpt-5.4-mini"
+    assert worker.endpoint == "https://models.example/v1"
+
+
+def test_providers_set_does_not_save_a_failed_provider(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    root = tmp_path / ".wmh"
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: [
+            VerifyResult(
+                ok=False,
+                kind=configs[0].kind,
+                model=configs[0].model,
+                detail="bad key",
+            )
+        ],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "bad key" in result.output
+    assert load_settings(root).models.worker is None
 
 
 def test_examples_list_shows_task_folders() -> None:

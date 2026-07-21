@@ -107,7 +107,7 @@ def test_meta_role_resolves_when_configured_and_never_falls_back_to_worker() -> 
 def test_agent_role_resolves_when_configured_and_never_falls_back_to_worker() -> None:
     """The agent-under-test role is opt-in: unset agent means the caller's default.
 
-    `wmh harness create` optimizes a harness for a specific agent model, which may differ
+    `wmh optimize` optimizes a harness for a specific agent model, which may differ
     from the world model's serve model; an unset agent must keep the world-model-provider
     default rather than silently inheriting the scenario worker.
     """

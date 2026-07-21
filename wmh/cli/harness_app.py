@@ -1,11 +1,11 @@
-"""`wmh harness` — named, versioned agent harnesses under `.wmh/harnesses/<name>/`.
+"""Agent-harness optimization and inspection under `.wmh/harnesses/<name>/`.
 
 A harness is the scaffold an agent runs with: prompt surfaces, a tool policy, loop parameters, and
 skills, stored as immutable numbered versions with movable aliases (`champion` is what runs by
-default). `init` writes the baseline as v1; `list`/`show` inspect what exists; `create` searches
-for a better harness by **inverting the world model** — delta variants are scored closed-loop
-against it and gated on non-regression, so the environment model the traces built now steers what
-the agent's scaffold should be. Run one closed-loop with
+default). `init` writes the baseline as v1; `list`/`show` inspect what exists; `wmh optimize`
+searches for a better harness by **inverting the world model**. Delta variants are scored
+closed-loop against it and gated on non-regression, so the environment model the traces built now
+steers what the agent's scaffold should be. Run one closed-loop with
 `wmh eval <tasks> --mode closed-loop --harness <name>[@ref]`.
 """
 
@@ -35,7 +35,7 @@ from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider
 
 harness_app = typer.Typer(
-    help="Named, versioned agent harnesses (.wmh/harnesses): create, init, list, show.",
+    help="Inspect and initialize named, versioned agent harnesses.",
     no_args_is_help=True,
 )
 _console = Console()
@@ -95,23 +95,21 @@ def show_harness(
         _console.print(surface.content)
 
 
-@harness_app.command("create")
-def create(
-    name: str = typer.Argument(None, help="Name for the created harness."),
+def optimize(
+    name: str = typer.Argument(None, help="Agent name for the optimized harness."),
+    model: str = typer.Argument(
+        None,
+        help="World model to optimize against (default: the only built one).",
+    ),
     tasks_file: str = typer.Option(None, "--tasks", help="JSONL task file to optimize against."),
     holdout_file: str = typer.Option(
         None,
         "--holdout",
         help="Optional JSONL held-out task file: accepted deltas must also be no worse here.",
     ),
-    model: str = typer.Option(
-        None,
-        "--model",
-        help="World model to search against (default: the only built one).",
-    ),
-    harness_backend: str = typer.Option(
+    backend: str = typer.Option(
         "local",
-        "--harness-backend",
+        "--backend",
         help="Where the harness PROCESS runs: local (in/from this process) or e2b (the real "
         "pi agent inside pooled E2B sandboxes). The environment is always the world model.",
     ),
@@ -126,13 +124,13 @@ def create(
         None,
         "--e2b-template",
         envvar=E2B_TEMPLATE_ENV,
-        help="Prebaked E2B sandbox template for --harness-backend e2b (default: "
+        help="Prebaked E2B sandbox template for --backend e2b (default: "
         "$WMH_E2B_TEMPLATE; without one, every sandbox bootstraps node + the pi runner deps).",
     ),
     seed: str = typer.Option(
         None,
         "--seed",
-        help="Harness to start from, as name[@ref] (default: the built-in baseline).",
+        help="Harness to start from, as a name or name@version (default: built-in baseline).",
     ),
     iterations: int = typer.Option(None, min=1, help="Propose-and-gate steps (the search budget)."),
     proposal_batch_size: int = typer.Option(
@@ -148,22 +146,13 @@ def create(
     ),
     yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
 ) -> None:
-    """Create a harness by inverting the world model: search harness-space against it.
+    """Optimize an agent harness by searching against a world model.
 
-    An LLM meta-agent proposes typed deltas against the harness document (surface-keyed ops with
-    preconditions), each applied child is scored closed-loop (k passes per task) and gated on
-    non-regression (regression suite, then full split, then the optional held-out split). The
-    agent-under-test resolves from `.wmh/settings.toml` `[models.agent]` when set and otherwise
-    uses the world model's provider. The proposer's model resolves from `[models.meta]` when set;
-    use a long-context, long-output model because a proposal carries whole replacement surfaces.
-    Otherwise the proposer also uses the world model's provider. The environment is ALWAYS the
-    world-model simulation; `--harness-backend` only picks where the harness PROCESS runs:
-    `local` (the default) keeps it in/from this process, `e2b` runs the real pi agent inside
-    pooled E2B sandboxes (pi-node seeds only), its tool calls still answered by the world model
-    host-side, with all (task, attempt) cells in parallel unless
-    --eval-concurrency caps them. The champion is saved as a new immutable version with the
-    `champion` alias. Interactive at a TTY: missing inputs are prompted for (the backend stays
-    flag-only).
+    The optimizer proposes harness changes, scores them against the simulated environment, and
+    saves the best gated result as the new champion. Configure distinct agent and optimizer models
+    with `models.agent` and `models.meta` in `.wmh/settings.toml`.
+
+    The backend controls where the worker process runs. The environment remains the world model.
     """
     interactive = _console.is_terminal
     if name is None:
@@ -181,10 +170,8 @@ def create(
             else 5
         )
 
-    if harness_backend not in ("local", "e2b"):
-        raise typer.BadParameter(
-            f"unknown --harness-backend {harness_backend!r}; choose local or e2b"
-        )
+    if backend not in ("local", "e2b"):
+        raise typer.BadParameter(f"unknown --backend {backend!r}; choose local or e2b")
     # Fail on a bad name NOW, not after the search has spent its eval budget on the save.
     try:
         validate_name(name)
@@ -206,7 +193,7 @@ def create(
     )
     backend_note = (
         " (pi harness in pooled E2B sandboxes; env stays the world model)"
-        if harness_backend == "e2b"
+        if backend == "e2b"
         else ""
     )
     meta_note = (
@@ -270,7 +257,7 @@ def create(
         proposal_batch_size=proposal_batch_size,
         k=k,
         holdout=holdout,
-        harness_backend="e2b" if harness_backend == "e2b" else "local",
+        harness_backend="e2b" if backend == "e2b" else "local",
         eval_concurrency=eval_concurrency,
         e2b_template=e2b_template,
         on_progress=_progress,
@@ -299,11 +286,11 @@ def create(
         "--harness",
         f"{name}@{saved.version}",
     ]
-    if harness_backend == "e2b":
+    if backend == "e2b":
         run_argv.extend(("--harness-backend", "e2b"))
     if eval_concurrency is not None:
         run_argv.extend(("--eval-concurrency", str(eval_concurrency)))
-    if harness_backend == "e2b" and e2b_template is not None:
+    if backend == "e2b" and e2b_template is not None:
         run_argv.extend(("--e2b-template", e2b_template))
     _console.print(
         f"  run it: [bold]{escape(shlex.join(run_argv))}[/bold]",
@@ -353,7 +340,7 @@ def init_harness(
         if store.exists(name):
             raise typer.BadParameter(
                 f"harness {name!r} already exists; new versions are appended by "
-                "`wmh harness create`, and aliases move with `set_alias`"
+                "`wmh optimize`, and aliases move with `set_alias`"
             )
         doc = store.save_version(HarnessDoc.baseline(name), alias=CHAMPION_ALIAS)
     except ValueError as exc:  # invalid name -> usage error, not a traceback
