@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import weakref
 from collections.abc import Sequence
@@ -89,6 +90,20 @@ def _template_controls(template_name: str) -> tuple[asyncio.Lock, asyncio.Semaph
         return lock, semaphore
 
 
+# e2b converts a non-2xx status GET into BuildException(f"{status_code}: ...") (only 429 becomes
+# RateLimitException, 401 AuthenticationException); a transient server-side 5xx is as retryable
+# as a transport error, while 4xx and terminal build states stay fatal.
+_SERVER_ERROR_BUILD_EXCEPTION = re.compile(r"^5\d\d: ")
+
+
+def _is_retryable_status_error(error: Exception) -> bool:
+    if isinstance(error, (httpx.TransportError, RateLimitException)):
+        return True
+    return isinstance(error, BuildException) and bool(
+        _SERVER_ERROR_BUILD_EXCEPTION.match(str(error))
+    )
+
+
 async def _get_template_build_status(
     build_info: BuildInfo,
     *,
@@ -98,7 +113,9 @@ async def _get_template_build_status(
     for attempt in range(len(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS) + 1):
         try:
             return await AsyncTemplate.get_build_status(build_info, logs_offset=logs_offset)
-        except (httpx.TransportError, RateLimitException):
+        except Exception as error:  # noqa: BLE001 - classified below; non-transient re-raises
+            if not _is_retryable_status_error(error):
+                raise
             if attempt == len(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS):
                 raise
             await asyncio.sleep(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS[attempt] / 1_000)
@@ -251,10 +268,11 @@ class WmhE2BEnvironment(E2BEnvironment):
             "environment_name": self.environment_name,
             "session_id": self.session_id,
         }
+        self._sandbox = None
         for attempt in range(_CREATE_ATTEMPTS):
             await acquire_e2b_create_slot_async()
             try:
-                self._sandbox = await AsyncSandbox.create(
+                sandbox = await AsyncSandbox.create(
                     template=self._template_name,
                     metadata=metadata,
                     envs=self._startup_env(),
@@ -264,24 +282,35 @@ class WmhE2BEnvironment(E2BEnvironment):
                     ),
                     network=self._sandbox_create_network_options(),
                 )
-                break
             except Exception:  # noqa: BLE001 - preserve Harbor's retry-all create contract
-                self._sandbox = None
                 if attempt + 1 == _CREATE_ATTEMPTS:
                     raise
                 await asyncio.sleep(_CREATE_RETRY_DELAY_S)
-        if self._sandbox is None:
-            raise RuntimeError("E2B sandbox create returned no sandbox")
-        try:
+                continue
             # One cheap identity check: the sandbox must really come from the qualified alias.
-            info = await self._sandbox.get_info()
+            # It lives INSIDE the create retry so one transient get_info failure retries the
+            # whole create instead of failing it; a genuine mismatch stays immediately fatal.
+            try:
+                info = await sandbox.get_info()
+            except BaseException as error:
+                await self._kill_quietly(sandbox)
+                if isinstance(error, Exception) and attempt + 1 < _CREATE_ATTEMPTS:
+                    await asyncio.sleep(_CREATE_RETRY_DELAY_S)
+                    continue
+                raise
             if info.name is not None and info.name != self._template_name:
+                await self._kill_quietly(sandbox)
                 raise RuntimeError("E2B sandbox template name mismatch")
-        except BaseException:
-            sandbox = self._sandbox
-            self._sandbox = None
+            self._sandbox = sandbox
+            return
+        raise RuntimeError("E2B sandbox create returned no sandbox")
+
+    async def _kill_quietly(self, sandbox: AsyncSandbox) -> None:
+        """Best-effort kill of a sandbox this environment is abandoning."""
+        try:
             await sandbox.kill()
-            raise
+        except Exception:  # noqa: BLE001 - the create/identity error stays authoritative
+            self.logger.warning("failed to kill an abandoned E2B sandbox", exc_info=True)
 
     @override
     async def start(self, force_build: bool) -> None:

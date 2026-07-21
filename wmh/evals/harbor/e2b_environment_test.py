@@ -75,11 +75,14 @@ def _build_status(
 
 
 class _Sandbox:
-    def __init__(self, *, name: str | None) -> None:
+    def __init__(self, *, name: str | None, info_errors: list[Exception] | None = None) -> None:
         self.info = SimpleNamespace(template_id="template-id", name=name)
+        self.info_errors = list(info_errors or [])
         self.kill_calls = 0
 
     async def get_info(self) -> SimpleNamespace:
+        if self.info_errors:
+            raise self.info_errors.pop(0)
         return self.info
 
     async def kill(self) -> None:
@@ -190,7 +193,12 @@ def test_template_build_submits_once_and_retries_only_the_status_get(
     build_info = _build_info(environment)
     submissions: list[dict[str, object]] = []
     polls: list[int] = []
-    status_failures = [httpx.ConnectError("stream reset"), httpx.ReadTimeout("slow")]
+    # Transport errors AND server-side 5xx (e2b wraps non-2xx as BuildException("5xx: ...")) are
+    # transient; both must retry the GET without ever re-submitting the build.
+    status_failures: list[Exception] = [
+        httpx.ConnectError("stream reset"),
+        BuildException("503: upstream hiccup"),
+    ]
 
     async def build_in_background(**kwargs: object) -> BuildInfo:
         submissions.append(kwargs)
@@ -202,9 +210,9 @@ def test_template_build_submits_once_and_retries_only_the_status_get(
     async def get_build_status(info: BuildInfo, logs_offset: int = 0) -> object:
         assert info is build_info
         polls.append(logs_offset)
-        if status_failures and len(polls) == 2:
-            raise status_failures.pop(0)  # ConnectError is a TransportError: retry the GET
-        if len(polls) < 4:
+        if status_failures and len(polls) >= 2:
+            raise status_failures.pop(0)
+        if len(polls) < 5:
             return building
         return _build_status(build_info, TemplateBuildStatus.READY)
 
@@ -221,8 +229,8 @@ def test_template_build_submits_once_and_retries_only_the_status_get(
     assert submissions[0]["name"] == environment.template_name
     assert submissions[0]["cpu_count"] == 2
     assert submissions[0]["memory_mb"] == 2048
-    # The failed GET was retried at the SAME offset; offsets advance only past received logs.
-    assert polls == [0, 1, 1, 2]
+    # Failed GETs were retried at the SAME offset; offsets advance only past received logs.
+    assert polls == [0, 1, 1, 1, 2]
 
 
 @pytest.mark.parametrize("terminal", ["error", "unknown"])
@@ -281,6 +289,60 @@ def test_ambiguous_submission_propagates_without_polling(
     with pytest.raises(httpx.ConnectError, match="submission lost"):
         asyncio.run(environment._create_template())
     assert polls == []
+
+
+def test_client_error_status_get_is_fatal_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    polls: list[int] = []
+
+    async def build_in_background(**_kwargs: object) -> BuildInfo:
+        return build_info
+
+    async def get_build_status(_info: BuildInfo, logs_offset: int = 0) -> object:
+        polls.append(logs_offset)
+        raise BuildException("404: template build not found")
+
+    monkeypatch.setattr(AsyncTemplate, "build_in_background", staticmethod(build_in_background))
+    monkeypatch.setattr(AsyncTemplate, "get_build_status", staticmethod(get_build_status))
+
+    with pytest.raises(BuildException, match="404"):
+        asyncio.run(environment._create_template())
+    assert polls == [0]  # a 4xx is a real answer, never retried
+
+
+def test_transient_get_info_failure_retries_the_create_instead_of_failing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    first = _Sandbox(
+        name=environment.template_name,
+        info_errors=[httpx.ConnectError("info fetch reset")],
+    )
+    second = _Sandbox(name=environment.template_name)
+    sandboxes = [first, second]
+
+    async def admit() -> None:
+        return None
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        return sandboxes.pop(0)
+
+    async def sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(e2b_environment_module, "acquire_e2b_create_slot_async", admit)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    asyncio.run(environment._create_sandbox())
+
+    assert first.kill_calls == 1  # the unverifiable sandbox never leaks
+    assert environment._sandbox is second
 
 
 def test_per_alias_single_flight_prevents_a_double_submission(
