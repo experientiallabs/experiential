@@ -1375,14 +1375,22 @@ def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
     assert emitted == [("stdout", "inspected\n"), ("stderr", "warning\n")]
     agent_call, cleanup_call = commands.calls
     assert agent_call == {
-        "user": project._shell_user,  # noqa: SLF001 - assert per-project isolation identity
+        "user": "root",
         "cwd": "/home/user/project/.scratch",
         "timeout": 60.0,
     }
     assert cleanup_call == {"user": "root", "timeout": 10.0}
     command, cleanup_command = commands.runs
     assert command.startswith("env -i ")
-    assert "setpriv --no-new-privs" in command
+    assert f"setpriv --reuid=$(id -u {project._shell_user})" in command  # noqa: SLF001
+    assert f"--regid=$(id -g {project._shell_user})" in command  # noqa: SLF001
+    assert "--init-groups" in command
+    assert "--init-groups --no-new-privs" in command
+    assert "--inh-caps=-all" in command
+    assert "--ambient-caps=-all" in command
+    assert "--bounding-set=-all" in command
+    assert command.index("setpriv --reuid=") < command.index("bash --noprofile --norc -c")
+    assert "umask 077" in command
     assert "timeout --kill-after=3s 50s" in command
     assert "pwd && rg TODO ../candidates" in command
     assert "wmh-project-shell-quiescence" in cleanup_command
@@ -1610,12 +1618,37 @@ def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
     shell_setup = next(
         command for command in sandbox.commands.runs if "useradd --system" in command
     )
+    assert "groupadd --system wmh-project-shell" in shell_setup
     assert "useradd --system --user-group --no-create-home" in shell_setup
     assert project._shell_user != PROJECT_SHELL_USER  # noqa: SLF001
     assert f"id -u {project._shell_user}" in shell_setup  # noqa: SLF001
-    assert shell_setup.count(project._shell_user) == 3  # noqa: SLF001
+    assert (  # noqa: SLF001
+        f"usermod --append --groups wmh-project-shell {project._shell_user}" in shell_setup
+    )
+    assert shell_setup.count(project._shell_user) == 4  # noqa: SLF001
+    assert "chgrp wmh-project-shell /home/user" in shell_setup
+    assert "chmod g=x /home/user" in shell_setup
     assert "mkdir -p /home/user/project/.scratch" in shell_setup
     assert "chmod 1777 /home/user/project/.scratch" in shell_setup
+
+
+def test_custom_project_workspace_does_not_repermission_its_parent() -> None:
+    sandbox = _Sandbox()
+    project = AgentProject(
+        sandbox,
+        workspace="/srv/wmh/project",
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        owns_sandbox=False,
+    )
+
+    project._prepare_shell_workspace()  # noqa: SLF001
+
+    shell_setup = next(
+        command for command in sandbox.commands.runs if "useradd --system" in command
+    )
+    assert "chgrp wmh-project-shell /srv/wmh" not in shell_setup
+    assert "chmod g=x /srv/wmh" not in shell_setup
+    assert "mkdir -p /srv/wmh/project/.scratch" in shell_setup
 
 
 def test_project_shell_setup_nonzero_exit_fails_closed_and_remains_retryable() -> None:

@@ -41,6 +41,7 @@ from wmh.providers.base import ToolCallingProvider
 PROJECT_WORKSPACE = "/home/user/project"
 PROJECT_SCRATCH_DIR = ".scratch"
 PROJECT_SHELL_USER = "wmh-project-shell"
+PROJECT_SHELL_GROUP = "wmh-project-shell"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
 DEFAULT_SOURCE_TREE_MAX_FILES = 1_024
 DEFAULT_SOURCE_TREE_MAX_BYTES = 8 * 1024 * 1024
@@ -703,13 +704,25 @@ class AgentProject:
         if self._shell_ready_sandbox_id == id(self._sandbox):
             return
         scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
+        workspace_access = ""
+        if self.workspace == PROJECT_WORKSPACE:
+            workspace_parent = str(PurePosixPath(PROJECT_WORKSPACE).parent)
+            workspace_access = (
+                f"chgrp {PROJECT_SHELL_GROUP} {shlex.quote(workspace_parent)}\n"
+                f"chmod g=x {shlex.quote(workspace_parent)}\n"
+            )
         command = (
             "set -eu\n"
+            f"if ! getent group {PROJECT_SHELL_GROUP} >/dev/null 2>&1; then\n"
+            f"  groupadd --system {PROJECT_SHELL_GROUP}\n"
+            "fi\n"
             f"if ! id -u {self._shell_user} >/dev/null 2>&1; then\n"
             f"  useradd --system --user-group --no-create-home "
             f"--shell /usr/sbin/nologin {self._shell_user}\n"
             "fi\n"
             f"id -u {self._shell_user} >/dev/null\n"
+            f"usermod --append --groups {PROJECT_SHELL_GROUP} {self._shell_user}\n"
+            f"{workspace_access}"
             f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
         )
         result = self._sandbox.commands.run(command, user="root", timeout=30)
@@ -897,6 +910,7 @@ class AgentProject:
         filter_command = f"node -e {shlex.quote(_BASH_FILTER_SCRIPT)}"
         script = (
             "set -o pipefail\n"
+            "umask 077\n"
             f"timeout --kill-after=3s {_BASH_PROCESS_TIMEOUT_S}s "
             f"bash --noprofile --norc -c {shlex.quote(command)} "
             f"2> >({filter_command} >&2) | {filter_command}\n"
@@ -904,11 +918,13 @@ class AgentProject:
             'exit "$status"'
         )
         scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
+        shell_user = shlex.quote(self._shell_user)
         wrapped = (
             "env -i PATH=/usr/local/bin:/usr/bin:/bin "
             f"HOME={shlex.quote(scratch)} TMPDIR={shlex.quote(scratch)} "
-            f"USER={self._shell_user} LOGNAME={self._shell_user} "
-            "setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all "
+            f"USER={shell_user} LOGNAME={shell_user} "
+            f"setpriv --reuid=$(id -u {shell_user}) --regid=$(id -g {shell_user}) "
+            "--init-groups --no-new-privs --inh-caps=-all --ambient-caps=-all "
             f"--bounding-set=-all bash --noprofile --norc -c {shlex.quote(script)}"
         )
         stdout = ""
@@ -919,7 +935,10 @@ class AgentProject:
             try:
                 result = self._sandbox.commands.run(
                     wrapped,
-                    user=self._shell_user,
+                    # E2B cannot start a command directly as a dynamically created system user.
+                    # Start the trusted wrapper as root, then drop uid, gid, groups, privileges,
+                    # and capabilities before the agent-controlled command reaches Bash.
+                    user="root",
                     cwd=scratch,
                     timeout=_BASH_TIMEOUT_S,
                 )
