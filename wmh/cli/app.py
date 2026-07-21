@@ -580,7 +580,7 @@ def build(
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
         trace_adapter=params.source,
     )
-    if use_configured_worker and configured_worker is not None and model is None:
+    if use_configured_worker and configured_worker is not None:
         config.providers[0] = config.providers[0].model_copy(
             update={
                 "endpoint": configured_worker.endpoint,

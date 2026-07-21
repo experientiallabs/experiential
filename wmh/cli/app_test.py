@@ -175,6 +175,49 @@ def test_build_uses_configured_worker_provider(patched_provider, tmp_path) -> No
     assert config.serve_provider_config().model_type == "gpt-5.4-mini"
 
 
+def test_build_explicit_model_keeps_configured_azure_connection(
+    patched_provider: None, tmp_path: Path
+) -> None:
+    root = tmp_path / ".wmh"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(
+        provider="azure",
+        model="gpt-5.5",
+        endpoint="https://azure.example/v1",
+        deployment="configured-deployment",
+        api_version="2026-01-01",
+    )
+    save_settings(settings, root)
+
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "explicit-model",
+            "--file",
+            _traces_file(tmp_path),
+            "--provider",
+            "azure",
+            "--model",
+            "gpt-5.5",
+            "--fidelity",
+            "low",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = load_config(root / "models" / "explicit-model")
+    provider = config.serve_provider_config()
+    assert provider.kind is ProviderKind.AZURE_OPENAI
+    assert provider.model_type == "gpt-5.5"
+    assert provider.endpoint == "https://azure.example/v1"
+    assert provider.deployment == "configured-deployment"
+    assert provider.api_version == "2026-01-01"
+
+
 def test_build_wizard_does_not_reuse_connection_for_changed_provider(
     patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
