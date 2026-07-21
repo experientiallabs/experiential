@@ -1356,10 +1356,12 @@ class E2BSandboxPool:
         )
 
     def _start_runner(self, sandbox: SandboxHandle) -> E2BStdioChannel:
-        # The creation factory gives bootstrap and startup the configured lease. Reset only after
-        # the hello handshake so the next episode receives the full budget; subsequent in-flight
-        # heartbeats keep extending it while the episode is active.
+        # Template-less bootstrap can consume most of the creation lease. Reset immediately before
+        # starting the runner so startup + hello get the configured budget, then reset again after
+        # hello so the next episode gets that full budget too. Subsequent in-flight heartbeats keep
+        # extending the lease while the episode is active.
         timeout = self._sandbox_timeout_s
+        sandbox.set_timeout(timeout)
         # timeout=0 = no command-connection limit (SDK-documented): the runner must outlive every
         # episode on this sandbox; the sandbox's own lifetime is the real bound.
         handle = sandbox.commands.run(START_CMD, background=True, stdin=True, timeout=0)

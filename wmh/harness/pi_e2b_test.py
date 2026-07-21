@@ -1049,7 +1049,90 @@ def test_pool_acquire_without_hello_raises_with_stderr_and_kills_the_sandbox(
     with pytest.raises(RuntimeError, match="no hello") as excinfo:
         pool.acquire()
     assert "SyntaxError: unexpected token" in str(excinfo.value)
+    assert fake.timeouts == [900]  # startup was protected; no post-hello reset was possible
     assert fake.kills == 1  # a sandbox that failed bootstrap never leaks
+
+
+def test_pool_resets_lease_before_runner_start_and_after_hello(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold-start work and the first episode each receive a fresh sandbox lease."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    handle = _ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True)
+    fake = FakeSandbox(handle)
+    events: list[str] = []
+
+    original_set_timeout = fake.set_timeout
+
+    def recording_set_timeout(timeout: int) -> None:
+        events.append("set_timeout")
+        original_set_timeout(timeout)
+
+    original_run = fake.commands.run
+
+    def recording_run(
+        cmd: str,
+        background: bool | None = None,
+        *,
+        envs: dict[str, str] | None = None,
+        stdin: bool | None = None,
+        timeout: float | None = None,
+    ) -> object:
+        if background:
+            events.append("runner_start")
+        return original_run(cmd, background, envs=envs, stdin=stdin, timeout=timeout)
+
+    monkeypatch.setattr(fake, "set_timeout", recording_set_timeout)
+    monkeypatch.setattr(fake.commands, "run", recording_run)
+    pool = E2BSandboxPool(sandbox_factory=lambda: fake)
+    original_await_hello = pool._await_hello  # noqa: SLF001 - ordering contract under test
+
+    def recording_await_hello(channel: E2BStdioChannel) -> None:
+        events.append("await_hello")
+        original_await_hello(channel)
+        events.append("hello")
+
+    monkeypatch.setattr(pool, "_await_hello", recording_await_hello)
+
+    pool.acquire()
+
+    assert events == ["set_timeout", "runner_start", "await_hello", "hello", "set_timeout"]
+    assert fake.timeouts == [900, 900]
+    pool.close()
+
+
+@pytest.mark.parametrize(
+    ("failed_reset", "runner_starts"),
+    [(1, False), (2, True)],
+)
+def test_pool_reset_failure_retires_cold_start_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_reset: int,
+    runner_starts: bool,
+) -> None:
+    """Neither the pre-start nor post-hello lease reset may leak its sandbox on failure."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    handle = _ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True)
+    fake = FakeSandbox(handle)
+    reset_attempts = 0
+
+    def failing_set_timeout(timeout: int) -> None:
+        nonlocal reset_attempts
+        assert timeout == 900
+        reset_attempts += 1
+        if reset_attempts == failed_reset:
+            raise RuntimeError("lease reset failed")
+        fake.timeouts.append(timeout)
+
+    monkeypatch.setattr(fake, "set_timeout", failing_set_timeout)
+    pool = E2BSandboxPool(sandbox_factory=lambda: fake)
+
+    with pytest.raises(RuntimeError, match="lease reset failed"):
+        pool.acquire()
+
+    assert bool(fake.commands.background_cmds) is runner_starts
+    assert reset_attempts == failed_reset
+    assert fake.kills == 1
 
 
 def test_pool_with_template_skips_installs_but_still_writes_runner_files() -> None:
@@ -1300,11 +1383,11 @@ def test_acquire_extends_the_lifetime_of_a_reused_sandbox(
     pool = E2BSandboxPool(sandbox_factory=factory)
     sandbox, channel = pool.acquire()
     [fake] = made
-    assert fake.timeouts == [900]  # reset after bootstrap and hello, just before episode use
+    assert fake.timeouts == [900, 900]  # protect startup, then refresh after hello for episode use
     pool.release(sandbox, channel, healthy=True)
     again, _ = pool.acquire()
     assert again is sandbox
-    assert fake.timeouts == [900, 900]  # the reuse extended the countdown again
+    assert fake.timeouts == [900, 900, 900]  # the reuse extended the countdown again
     pool.close()
 
 
@@ -1328,14 +1411,14 @@ def test_explicit_episode_timeout_sizes_private_pool_creation_and_reuse(
     [fake] = made
     assert factory_calls == [{"api_key": None, "template": "", "metadata": None, "timeout": 12_900}]
     assert runtime._episode_timeout_s == 12_000  # noqa: SLF001 - watchdog stays exact
-    assert fake.timeouts == [12_900]
+    assert fake.timeouts == [12_900, 12_900]
     assert channel._max_episode_lifetime_s == 12_900  # noqa: SLF001 - overrun headroom
 
     pool.release(sandbox, channel, healthy=True)
     reused, reused_channel = pool.acquire()
     assert reused is sandbox
     assert reused_channel is channel
-    assert fake.timeouts == [12_900, 12_900]
+    assert fake.timeouts == [12_900, 12_900, 12_900]
     runtime.close()
 
 
