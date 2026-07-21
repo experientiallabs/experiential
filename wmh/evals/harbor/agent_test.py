@@ -15,7 +15,11 @@ from harbor.environments.base import BaseEnvironment, ExecResult
 from harbor.models.agent.context import AgentContext
 
 from wmh.core.types import Action, ActionKind
-from wmh.evals.harbor.agent import HarborAgentEnvironment, WmhHarborAgent
+from wmh.evals.harbor.agent import (
+    MAX_OBSERVATION_CHARS,
+    HarborAgentEnvironment,
+    WmhHarborAgent,
+)
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
 from wmh.providers.base import ProviderConfig, ProviderKind
@@ -25,6 +29,7 @@ from wmh.providers.retry import RetryingProvider
 class _Environment:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, str] | None, int | None]] = []
+        self.responses: dict[str, str] = {}
 
     async def exec(
         self,
@@ -35,6 +40,8 @@ class _Environment:
         **_kwargs: object,
     ) -> ExecResult:
         self.calls.append((command, env, timeout_sec))
+        if command in self.responses:
+            return ExecResult(stdout=self.responses[command], stderr="", return_code=0)
         if command == "sleep 999":
             raise TimeoutError("command exceeded 240s")
         if command == "false":
@@ -224,6 +231,33 @@ def test_environment_exec_failures_become_error_observations_not_episode_deaths(
         [step] = [cast("dict[str, dict[str, object]]", s) for s in bridge.recorded_steps()]
         assert step["action"]["arguments"] == {"command": "sleep 999"}
         assert step["observation"]["is_error"] is True
+
+    asyncio.run(run())
+
+
+def test_oversized_command_output_is_truncated_before_it_reaches_the_channel() -> None:
+    """A real environment can emit observations no model can use (a 52 MiB rendered image via
+    read_file, observed live); unbounded, one such frame kills the worker transport
+    mid-episode. The bridge bounds every observation with an explicit head+tail marker."""
+
+    async def run() -> None:
+        environment = _Environment()
+        oversized = "x" * (MAX_OBSERVATION_CHARS + 10_000)
+        environment.responses["cat -- /app/image.ppm"] = oversized
+        bridge = HarborAgentEnvironment(
+            asyncio.get_running_loop(), cast("BaseEnvironment", environment)
+        )
+        observation = await asyncio.to_thread(
+            bridge.execute,
+            Action(
+                kind=ActionKind.TOOL_CALL, name="read_file", arguments={"path": "/app/image.ppm"}
+            ),
+        )
+        assert observation.is_error is False
+        assert len(observation.content) < MAX_OBSERVATION_CHARS + 200
+        assert "characters truncated" in observation.content
+        assert observation.content.startswith("x" * 100)
+        assert observation.content.endswith("x" * 100)
 
     asyncio.run(run())
 

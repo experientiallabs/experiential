@@ -464,10 +464,28 @@ def _invalid_arguments(tool: str, message: str) -> Observation:
     return Observation(content=f"invalid {tool} arguments: {message}", is_error=True)
 
 
+# A real task environment can emit observations no model context can use (a rendered 52 MiB
+# image via read_file, verified live): an unbounded observation travels the whole worker
+# transport as one frame and kills the runner channel mid-episode. Head+tail keeps both the
+# format signature and any trailing summary a command prints.
+MAX_OBSERVATION_CHARS = 262_144
+
+
+def _bounded_observation_text(content: str) -> str:
+    if len(content) <= MAX_OBSERVATION_CHARS:
+        return content
+    half = MAX_OBSERVATION_CHARS // 2
+    omitted = len(content) - MAX_OBSERVATION_CHARS
+    return (
+        content[:half] + f"\n... [{omitted} characters truncated; command output exceeded "
+        f"{MAX_OBSERVATION_CHARS} characters] ...\n" + content[-half:]
+    )
+
+
 def _command_observation(result: ExecResult) -> Observation:
     stdout = result.stdout or ""
     stderr = result.stderr or ""
-    content = stdout + stderr
+    content = _bounded_observation_text(stdout + stderr)
     if result.return_code != 0:
         content += f"\n[exit {result.return_code}]"
     return Observation(
