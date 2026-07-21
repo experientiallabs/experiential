@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
@@ -13,6 +17,7 @@ import typer
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import DatasetConfig, JobConfig, RetryConfig
 from harbor.models.trial.config import AgentConfig, EnvironmentConfig
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from wmh.cli import app
@@ -22,6 +27,7 @@ from wmh.cli.harness_optimize import (
     _execute_optimization,
 )
 from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
+from wmh.evals.harbor.canonical import canonical_harbor_job_config
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
 from wmh.harness.live_session import SessionEvent
@@ -217,6 +223,34 @@ def _job_config(tmp_path: Path) -> JobConfig:
     )
 
 
+def _raw_job_config_for_hash_seed(hash_seed: int) -> dict[str, object]:
+    """Harbor's JSON-mode set ordering from a genuinely distinct interpreter seed."""
+    script = """
+from harbor.models.job.config import JobConfig, RetryConfig
+
+config = JobConfig(
+    job_name="template",
+    jobs_dir="run/harbor",
+    retry=RetryConfig(
+        max_retries=0,
+        include_exceptions={"ZetaError", "AlphaError"},
+    ),
+    artifacts=["second", "first"],
+)
+print(config.model_dump_json())
+"""
+    environment = os.environ.copy()
+    environment["PYTHONHASHSEED"] = str(hash_seed)
+    output = subprocess.check_output(
+        [sys.executable, "-c", script],
+        env=environment,
+        text=True,
+    )
+    value = json.loads(output)
+    assert isinstance(value, dict)
+    return cast("dict[str, object]", value)
+
+
 def _configs() -> tuple[ProviderConfig, ProviderConfig]:
     return (
         ProviderConfig(
@@ -281,6 +315,117 @@ def _commit_ready_boundary(
     checkpoint.before_step(len(result.iterations))
     checkpoint.commit_boundary(result)
     checkpoint.finish_project_segment(usage)
+
+
+def test_harbor_job_identity_and_resume_are_stable_across_process_hash_seeds(
+    tmp_path: Path,
+) -> None:
+    """Harbor set order cannot fork an otherwise identical durable optimization."""
+    raw_templates = [_raw_job_config_for_hash_seed(seed) for seed in (0, 1, 42)]
+    raw_retry_orders = {
+        json.dumps(cast("dict[str, object]", template["retry"]), separators=(",", ":"))
+        for template in raw_templates
+    }
+    assert len(raw_retry_orders) > 1  # prove the subprocesses exercised the original defect
+
+    canonical_templates = [canonical_harbor_job_config(template) for template in raw_templates]
+    assert canonical_templates[0] == canonical_templates[1] == canonical_templates[2]
+    retry = cast("dict[str, object]", canonical_templates[0]["retry"])
+    assert retry["include_exceptions"] == ["AlphaError", "ZetaError"]
+    assert retry["exclude_exceptions"] == sorted(cast("list[str]", retry["exclude_exceptions"]))
+    assert canonical_templates[0]["artifacts"] == ["second", "first"]
+    ordered = JobConfig(
+        job_name="ordered",
+        agents=[
+            AgentConfig(import_path="agents.First"),
+            AgentConfig(import_path="agents.Second"),
+        ],
+        datasets=[DatasetConfig(path=Path("second")), DatasetConfig(path=Path("first"))],
+        artifacts=["second", "first"],
+    )
+    ordered_payload = canonical_harbor_job_config(ordered)
+    ordered_agents = cast("list[dict[str, object]]", ordered_payload["agents"])
+    ordered_datasets = cast("list[dict[str, object]]", ordered_payload["datasets"])
+    assert [agent["import_path"] for agent in ordered_agents] == [
+        "agents.First",
+        "agents.Second",
+    ]
+    assert [dataset["path"] for dataset in ordered_datasets] == ["second", "first"]
+    assert ordered_payload["artifacts"] == ["second", "first"]
+    reordered = ordered.model_copy(
+        update={
+            "agents": list(reversed(ordered.agents)),
+            "datasets": list(reversed(ordered.datasets)),
+            "artifacts": list(reversed(ordered.artifacts)),
+        },
+        deep=True,
+    )
+    assert canonical_harbor_job_config(reordered) != ordered_payload
+
+    unknown_top_level = {**raw_templates[0], "unknown_identity_input": True}
+    unknown_nested = json.loads(json.dumps(raw_templates[0]))
+    cast("dict[str, object]", unknown_nested["retry"])["unknown_retry_input"] = True
+    with pytest.raises(ValidationError):
+        canonical_harbor_job_config(unknown_top_level)
+    with pytest.raises(ValidationError):
+        canonical_harbor_job_config(unknown_nested)
+
+    run_dir = tmp_path / "run"
+    root = tmp_path / ".wmh"
+    seed = _source("seed")
+    meta_config, agent_config = _configs()
+    base_identity = _checkpoint_identity(
+        run_dir=run_dir,
+        root=root,
+        job_config=_job_config(tmp_path),
+        seed=seed,
+        request=_request(),
+        iterations=1,
+        max_score_cells=2,
+        meta_config=meta_config,
+        agent_config=agent_config,
+    )
+    # model_copy intentionally bypasses validation to reproduce a checkpoint written by the
+    # pre-fix process, whose Harbor JSON list retained that process's arbitrary set order.
+    legacy_identity = base_identity.model_copy(update={"harbor_job_template": raw_templates[0]})
+    expected_identity = PopulationCheckpointIdentity.model_validate(
+        {
+            **base_identity.model_dump(mode="json"),
+            "harbor_job_template": raw_templates[1],
+        }
+    )
+    serialized_identities = [
+        json.dumps(
+            PopulationCheckpointIdentity.model_validate(
+                {
+                    **base_identity.model_dump(mode="json"),
+                    "harbor_job_template": template,
+                }
+            ).model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        for template in raw_templates
+    ]
+    assert len(set(serialized_identities)) == 1
+    assert len({hashlib.sha256(value).hexdigest() for value in serialized_identities}) == 1
+
+    with PopulationCheckpointStore.create(
+        run_dir,
+        identity=legacy_identity,
+        seed=seed,
+    ) as checkpoint:
+        _commit_ready_boundary(
+            checkpoint,
+            _result(seed),
+            usage=SandboxUsage(count=1, seconds=1.0),
+        )
+    identity_path = run_dir / "checkpoint/identity.json"
+    raw_identity_before_resume = identity_path.read_bytes()
+    with PopulationCheckpointStore.open(run_dir) as resumed:
+        resumed.assert_identity(expected_identity)
+        assert resumed.control.committed_step == 0
+    assert identity_path.read_bytes() == raw_identity_before_resume
 
 
 def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
@@ -419,8 +564,11 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert outcome.saved.version == 1
     assert outcome.saved.doc_hash == result.best.candidate.doc_hash
     assert (root / "harnesses/selected/aliases.toml").exists()
-    assert json.loads((run_dir / "inputs.json").read_text())["iterations"] == 3
-    assert json.loads((run_dir / "inputs.json").read_text())["episode_timeout_sec"] == 12_000
+    inputs = json.loads((run_dir / "inputs.json").read_text())
+    assert inputs["iterations"] == 3
+    assert inputs["episode_timeout_sec"] == 12_000
+    retry = inputs["harbor_job_template"]["retry"]
+    assert retry["exclude_exceptions"] == sorted(retry["exclude_exceptions"])
     written = json.loads((run_dir / "outcome.json").read_text())
     assert written["best_candidate_id"] == "candidate-0000"
     assert written["project_sandbox_usage"] == {"count": 3, "seconds": 37.5}

@@ -32,6 +32,7 @@ from wmh.config import ARTIFACT_DIR
 from wmh.config.store import validate_name
 from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
+from wmh.evals.harbor.canonical import canonical_harbor_job_config
 from wmh.evals.harbor.scorer import HarborScorer
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage, resolve_e2b_template
@@ -371,7 +372,7 @@ def _execute_optimization(
             iterations=iterations,
             planned_score_cells=planned_score_cells,
             max_score_cells=max_score_cells,
-            harbor_job_template=effective_job_config.model_dump(mode="json"),
+            harbor_job_template=canonical_harbor_job_config(effective_job_config),
             meta_provider=meta_config,
             agent_provider=agent_config,
             optimizer_document_hash=optimizer.doc_hash,

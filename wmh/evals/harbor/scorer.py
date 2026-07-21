@@ -11,8 +11,6 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date, datetime, time
-from enum import Enum
 from pathlib import Path
 from typing import Literal, Protocol, Self, TypeVar
 from uuid import UUID, uuid4
@@ -33,6 +31,7 @@ from wmh.evals.harbor.agent import (
     WMH_HARBOR_AGENT_VERSION,
     WmhHarborAgent,
 )
+from wmh.evals.harbor.canonical import normalize_harbor_json
 from wmh.evals.harbor.tasks import (
     HarborTaskIdentity,
     ResolvedHarborTaskSet,
@@ -674,44 +673,12 @@ def _read_json(path: Path) -> object:
 
 def _canonical_model(model: BaseModel) -> str:
     return json.dumps(
-        _normalize_json(model.model_dump(mode="python")),
+        normalize_harbor_json(model.model_dump(mode="python")),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
         allow_nan=False,
     )
-
-
-def _normalize_json(value: object) -> object:
-    if isinstance(value, BaseModel):
-        return _normalize_json(value.model_dump(mode="python"))
-    if isinstance(value, Mapping):
-        return {
-            str(key): _normalize_json(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-        }
-    if isinstance(value, (set, frozenset)):
-        normalized = [_normalize_json(item) for item in value]
-        return sorted(
-            normalized,
-            key=lambda item: json.dumps(
-                item,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ),
-        )
-    if isinstance(value, (list, tuple)):
-        return [_normalize_json(item) for item in value]
-    if isinstance(value, Enum):
-        return _normalize_json(value.value)
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, UUID):
-        return str(value)
-    if isinstance(value, (datetime, date, time)):
-        return value.isoformat()
-    return value
 
 
 def _validate_trial_lock(lock: TrialLock, trial: TrialResult) -> None:
@@ -877,7 +844,7 @@ def _trial_summary(trial: TrialResult) -> str:
 
 def _digest_json(value: object) -> str:
     encoded = json.dumps(
-        _normalize_json(value),
+        normalize_harbor_json(value),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

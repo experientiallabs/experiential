@@ -19,6 +19,7 @@ from wmh.cli.model_roles import resolve_required_model_config
 from wmh.config import ARTIFACT_DIR
 from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
+from wmh.evals.harbor.canonical import canonical_harbor_job_config
 from wmh.evals.harbor.scorer import HarborScorer
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, resolve_e2b_template
 from wmh.harness.runtime import (
@@ -224,7 +225,7 @@ def _execute_scoring(
     inputs: JsonObject = {
         "schema_version": 2,
         "score_request": request.model_dump(mode="json"),
-        "harbor_job_template": effective_job_config.model_dump(mode="json"),
+        "harbor_job_template": canonical_harbor_job_config(effective_job_config),
         "agent_provider": agent_config.model_dump(mode="json"),
         "harness_backend": harness_backend,
         "e2b_template": e2b_template or None,

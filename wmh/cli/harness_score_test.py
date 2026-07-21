@@ -203,6 +203,8 @@ def test_execute_resolves_one_scorer_request_and_neutral_archive(
     assert inputs["schema_version"] == 2
     assert inputs["score_request"] == request.model_dump(mode="json")
     assert inputs["episode_timeout_sec"] == 12_000
+    retry = inputs["harbor_job_template"]["retry"]
+    assert retry["exclude_exceptions"] == sorted(retry["exclude_exceptions"])
     assert inputs["targets"] == [
         {
             "document_hash": target.harness.doc_hash,

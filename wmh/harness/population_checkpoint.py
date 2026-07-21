@@ -15,6 +15,7 @@ from filelock import BaseFileLock, FileLock, Timeout
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from wmh.core.types import JsonObject
+from wmh.evals.harbor.canonical import canonical_harbor_job_config
 from wmh.harness.archive_io import copy_score_artifacts, write_source_tree, write_text
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
@@ -94,6 +95,11 @@ class PopulationCheckpointIdentity(BaseModel):
     @classmethod
     def _validate_episode_timeout(cls, value: object) -> float:
         return validate_episode_timeout_s(value)
+
+    @field_validator("harbor_job_template", mode="before")
+    @classmethod
+    def _canonicalize_harbor_job_template(cls, value: object) -> JsonObject:
+        return canonical_harbor_job_config(value)
 
     @model_validator(mode="after")
     def _validate_score_cell_plan(self) -> PopulationCheckpointIdentity:
