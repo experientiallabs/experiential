@@ -304,6 +304,26 @@ class HarborScorer:
         """The frozen reward interpretation this scorer applies."""
         return self._reward_mode
 
+    @property
+    def task_pins(self) -> dict[str, str]:
+        """One stable provenance pin per resolved task, keyed by task id.
+
+        Git tasks pin their resolved commit and package tasks their name@ref, so a caller can
+        record the exact task identity a run was scored against and detect a dataset that
+        re-resolves differently on resume. Local-path tasks pin only their resolved path (the
+        weaker identity is deliberate: hashing arbitrary task dirs is not this scorer's job).
+        """
+        pins: dict[str, str] = {}
+        for task in self._tasks:
+            task_id = task.get_task_id().get_name()
+            if task.is_package_task():
+                pins[task_id] = f"package:{task.name}@{task.ref or 'latest'}"
+            elif task.is_git_task():
+                pins[task_id] = f"git:{task.git_url}@{task.git_commit_id}"
+            else:
+                pins[task_id] = f"path:{task.path}"
+        return pins
+
     def candidate_job_dir(self, doc: HarnessDoc) -> Path:
         """The deterministic job directory one candidate's trials live in (resume key)."""
         return self._job_template.jobs_dir / f"wmh-{doc.doc_hash[:12]}"

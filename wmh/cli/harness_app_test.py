@@ -456,11 +456,13 @@ def _harbor_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str
 
     def fake_scorer(
         config: _HarborRunConfig, *, run_dir: Path, provider_config: ProviderConfig
-    ) -> _FakeHarborScorer:
+    ) -> tuple[_FakeHarborScorer, dict[str, str]]:
         del run_dir
         captured["config"] = config
         captured["provider_config"] = provider_config
-        return _FakeHarborScorer(config.task_ids, config.attempts)
+        salt = str(captured.get("pin_salt", ""))
+        pins = {task_id: f"path:/tasks/{task_id}{salt}" for task_id in config.task_ids}
+        return _FakeHarborScorer(config.task_ids, config.attempts), pins
 
     def fake_proposer(
         *, run_dir: Path, meta_config: ProviderConfig, e2b_template: str | None
@@ -514,6 +516,10 @@ def test_harbor_dispatch_runs_the_population_and_publishes_the_winner(
     run_config = json.loads((tmp_path / "run" / "run-config.json").read_text(encoding="utf-8"))
     assert run_config["agent"] == "pi"
     assert run_config["iterations"] == 1
+    assert run_config["seed_version"] is None  # the built-in seed carries no store version
+    assert run_config["task_pins"] == {"t1": "path:/tasks/t1"}
+    assert run_config["worker_model"]["model"] == "gpt-5.5"
+    assert run_config["proposer_model"]["provider"] == "azure"
     state = json.loads((tmp_path / "run" / "state.json").read_text(encoding="utf-8"))
     assert [entry["candidate_id"] for entry in state["outcomes"]] == [
         "candidate-0000",
@@ -602,3 +608,185 @@ def test_world_model_path_rejects_harbor_only_flags(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "apply only to the harbor environment" in result.output
+
+
+def test_harbor_run_config_preserves_sensitive_env_values_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recorded job template is the PARSED RAW mapping, never a harbor model_dump.
+
+    Harbor's env serializers redact sensitive-named values that differ from this process's
+    environment; a round-trip through model_dump would corrupt the recorded run config and
+    every trial. MY_API_KEY is sensitive-named and deliberately absent from os.environ.
+    """
+    captured = _harbor_project(tmp_path, monkeypatch)
+    monkeypatch.delenv("MY_API_KEY", raising=False)
+    (tmp_path / "job.yaml").write_text(
+        _HARBOR_JOB_YAML + "verifier:\n  env:\n    MY_API_KEY: run-specific-secret\n",
+        encoding="utf-8",
+    )
+
+    result = _invoke_harbor(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    run_config = json.loads((tmp_path / "run" / "run-config.json").read_text(encoding="utf-8"))
+    assert run_config["harbor_job_template"]["verifier"]["env"]["MY_API_KEY"] == (
+        "run-specific-secret"
+    )
+    config = captured["config"]
+    assert isinstance(config, _HarborRunConfig)
+    verifier = config.harbor_job_template["verifier"]
+    assert isinstance(verifier, dict)
+    assert verifier["env"] == {"MY_API_KEY": "run-specific-secret"}
+
+
+def test_harbor_publication_is_idempotent_across_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _harbor_project(tmp_path, monkeypatch)
+    first = _invoke_harbor(tmp_path)
+    assert first.exit_code == 0, first.output
+    store = HarnessStore(str(tmp_path / ".wmh"))
+    assert store.versions("pi") == [1]
+
+    again = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--resume",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+
+    assert again.exit_code == 0, again.output
+    assert "already published" in again.output
+    assert store.versions("pi") == [1]  # no duplicate version, champion did not move again
+    assert store.aliases("pi")["champion"] == 1
+
+
+def test_harbor_rejects_world_model_only_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _harbor_project(tmp_path, monkeypatch)
+    result = _invoke_harbor(tmp_path, "--tasks", "tasks.jsonl", "--k", "3")
+    assert result.exit_code == 2
+    flat = " ".join(result.output.split())
+    assert "--tasks" in flat
+    assert "world-model environment" in flat
+
+
+def test_harbor_seed_ref_resolves_through_the_store_and_resume_pins_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """'pi@champion' seeds from the store, and a resume uses the RECORDED seed even after
+    this run's own publication (or anything else) moves the champion alias."""
+    _harbor_project(tmp_path, monkeypatch)
+    store = HarnessStore(str(tmp_path / ".wmh"))
+    stored_seed = HarnessDoc.baseline("pi").model_copy(update={"name": "pi"})
+    store.save_version(stored_seed, alias="champion")  # v1, champion
+
+    first = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi@champion",
+            "harbor",
+            "--harbor-config",
+            str(tmp_path / "job.yaml"),
+            "--task-ids",
+            str(tmp_path / "tasks.json"),
+            "--iterations",
+            "1",
+            "--max-iterations-this-run",
+            "1",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert first.exit_code == 0, first.output
+    assert "checkpointed" in first.output
+    run_config = json.loads((tmp_path / "run" / "run-config.json").read_text(encoding="utf-8"))
+    assert run_config["seed_version"] == 1
+    recorded = tmp_path / "run" / "candidates" / "candidate-0000" / "source" / "SYSTEM.md"
+    assert recorded.read_text(encoding="utf-8") == stored_seed.system_prompt()
+
+    # Champion moves before the resume; the run must keep its recorded seed regardless.
+    store.save_version(stored_seed.model_copy(update={"version": 0}), alias="champion")  # v2
+    resumed = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi@champion",
+            "harbor",
+            "--resume",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert resumed.exit_code == 0, resumed.output
+    assert "optimized" in resumed.output
+    assert recorded.read_text(encoding="utf-8") == stored_seed.system_prompt()
+    assert store.versions("pi") == [1, 2, 3]  # the winner published as the next version
+
+
+def test_harbor_resume_rejects_changed_model_roles_and_dataset_pins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _harbor_project(tmp_path, monkeypatch)
+    first = _invoke_harbor(tmp_path, "--max-iterations-this-run", "1")
+    assert first.exit_code == 0, first.output
+
+    # A mid-run settings.toml edit silently changing the worker model is rejected.
+    root = tmp_path / ".wmh"
+    changed = ModelRole(provider="azure", model="gpt-6", endpoint="https://x.example")
+    kept = ModelRole(provider="azure", model="gpt-5.5", endpoint="https://x.example")
+    save_settings(ProjectSettings(models=ModelsSettings(meta=kept, agent=changed)), root)
+    role_conflict = _invoke_harbor(tmp_path, "--resume")
+    assert role_conflict.exit_code == 2
+    assert "models.agent" in " ".join(role_conflict.output.split())
+
+    # A dataset that re-resolves to different task pins is rejected too.
+    save_settings(ProjectSettings(models=ModelsSettings(meta=kept, agent=kept)), root)
+    captured["pin_salt"] = "@drifted"
+    pin_conflict = _invoke_harbor(tmp_path, "--resume")
+    assert pin_conflict.exit_code == 2
+    assert "resolved differently" in " ".join(pin_conflict.output.split())
+
+
+def test_harbor_resume_accepts_a_restated_episode_timeout_for_an_e2b_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flag consistency is judged on the EFFECTIVE config: restating --episode-timeout on a
+    resumed e2b run must not trip the local-backend guard via this invocation's defaults."""
+    _harbor_project(tmp_path, monkeypatch)
+    first = _invoke_harbor(
+        tmp_path, "--backend", "e2b", "--episode-timeout", "120", "--max-iterations-this-run", "1"
+    )
+    assert first.exit_code == 0, first.output
+
+    resumed = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--resume",
+            "--episode-timeout",
+            "120",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert resumed.exit_code == 0, resumed.output
+    assert "optimized" in resumed.output

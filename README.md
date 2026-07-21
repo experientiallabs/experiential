@@ -134,10 +134,14 @@ wmh optimize pi harbor \
 `--backend` controls the task environment and worker placement (`local` = docker task containers
 with a local pi worker; `e2b` = E2B task environments with a sandboxed pi worker). The PROPOSER
 project always runs in E2B in this version, so `E2B_API_KEY` is required on either backend. All
-durable state lives in `--run-dir`: an interrupted run continues with `--resume` (flags that
-conflict with the recorded `run-config.json` are rejected), and `--max-iterations-this-run 1`
-advances one boundary at a time. The winner is saved as the seed agent's next version and becomes
-its champion.
+durable state lives in `--run-dir`: an interrupted run continues with `--resume` (flags, model
+roles, and dataset pins that conflict with the recorded `run-config.json` are rejected), and
+`--max-iterations-this-run 1` advances one boundary at a time. The winner is saved as the seed
+agent's next version and becomes its champion, exactly once per run dir.
+
+The bare seed literal `pi` ALWAYS means the built-in default agent (the fixed-seed protocol),
+even after a stored `pi` champion exists; to compound on an earlier result, seed explicitly from
+the store with `pi@champion` or `pi@vN`.
 
 ## Development
 
