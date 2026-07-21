@@ -117,6 +117,28 @@ The optimizer can change prompts, tools, policies, skills, and runtime code. Eve
 measured against the same simulated tasks, and only changes that pass the evaluation gates become
 the new versioned champion harness.
 
+### Optimize on real benchmark tasks (harbor)
+
+Passing the literal environment `harbor` scores complete-source harness candidates on real
+[harbor](https://pypi.org/project/harbor/) benchmark tasks instead of a world model
+(`pip install "world-model-harness[harbor]"`). Each iteration, a proposer model rewrites the
+whole harness source tree from the fixed seed, reading every prior candidate's source, scores,
+and raw trial transcripts; harbor's own verifiers then score the candidate on real tasks.
+
+```bash
+wmh optimize pi harbor \
+  --harbor-config job.yaml --task-ids tasks.json \
+  --backend e2b --iterations 10 --run-dir runs/harbor-01
+```
+
+`--backend` controls the task environment and worker placement (`local` = docker task containers
+with a local pi worker; `e2b` = E2B task environments with a sandboxed pi worker). The PROPOSER
+project always runs in E2B in this version, so `E2B_API_KEY` is required on either backend. All
+durable state lives in `--run-dir`: an interrupted run continues with `--resume` (flags that
+conflict with the recorded `run-config.json` are rejected), and `--max-iterations-this-run 1`
+advances one boundary at a time. The winner is saved as the seed agent's next version and becomes
+its champion.
+
 ## Development
 
 Managed with [uv](https://docs.astral.sh/uv/); linting/formatting with [ruff](https://docs.astral.sh/ruff/); type checking with [ty](https://github.com/astral-sh/ty). Conventions live in [AGENTS.md](./AGENTS.md).

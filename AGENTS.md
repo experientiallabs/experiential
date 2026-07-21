@@ -67,8 +67,10 @@ uv run pytest -q
 
 - `wmh optimize <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
   harness-creation workflow. Keep CLI wiring in `wmh/cli/harness_app.py` and search behavior in
-  `wmh/harness/create.py`; another public workflow needs a distinct user case and equivalent
-  validation, audit, and versioning guarantees.
+  `wmh/harness/create.py` (world-model delta search) or `wmh/harness/population.py` plus
+  `wmh/harness/project_proposer.py` (the `harbor` environment's complete-source population
+  search); another public workflow needs a distinct user case and equivalent validation, audit,
+  and versioning guarantees.
 - A harness is a validated `HarnessDoc`, not an editable directory. Its typed surfaces cover
   prompts, skills, tool policy, loop parameters, and executable code; rendered files are exports.
 - Change harnesses only through `HarnessDelta`. Preserve parent and child hashes, per-surface
