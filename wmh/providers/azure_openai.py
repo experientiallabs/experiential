@@ -22,6 +22,7 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    TokenUsage,
     VerifyResult,
     normalize_chat_temperature,
     verify_via_ping,
@@ -139,6 +140,33 @@ class AzureOpenAIProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        if self.config.reasoning_effort is not None:
+            # Text completion consumers (proposer, judges, the baseline loop) must use the same
+            # verified v1 Responses route as complete_chat; the api-versioned chat client would
+            # silently drop reasoning_effort. Reasoning models reject non-default sampling, so
+            # `temperature` is not forwarded (matching OpenAIResponsesProvider.complete).
+            response = self.complete_chat(
+                ChatRequest.model_validate(
+                    {
+                        "messages": [
+                            *([{"role": "system", "content": system}] if system else []),
+                            *[{"role": m.role, "content": m.content} for m in messages],
+                        ],
+                        "max_completion_tokens": max_tokens,
+                    }
+                )
+            )
+            message = response.choices[0].message if response.choices else None
+            text = (
+                message.content if message is not None and isinstance(message.content, str) else ""
+            )
+            usage = response.token_usage()
+            return Completion(
+                text=text,
+                usage=TokenUsage(
+                    input_tokens=usage.input_tokens, output_tokens=usage.output_tokens
+                ),
+            )
         return _openai_common.complete(
             self._get_client().chat.completions, self._deployment(), system, messages, max_tokens
         )

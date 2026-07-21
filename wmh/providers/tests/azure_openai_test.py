@@ -362,6 +362,37 @@ def test_reasoning_verify_pings_the_responses_route(monkeypatch: pytest.MonkeyPa
     assert responses.calls[0]["max_output_tokens"] == 2048
 
 
+def test_reasoning_complete_routes_through_the_responses_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Text completion consumers must use the same verified route as complete_chat."""
+    responses = _FakeResponses()
+    provider = AzureOpenAIProvider(_reasoning_config())
+    monkeypatch.setattr(
+        provider,
+        "_get_responses_client",
+        lambda: _FakeResponsesClient(responses),
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("reasoning complete must not use chat")),
+    )
+
+    completion = provider.complete("sys", [Message(role="user", content="hi")], max_tokens=32)
+
+    assert len(responses.calls) == 1
+    assert responses.calls[0]["input"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+    assert responses.calls[0]["max_output_tokens"] == 32
+    assert responses.calls[0]["reasoning"] == {"effort": "high"}
+    assert "temperature" not in responses.calls[0]
+    assert completion.usage.input_tokens == 11
+    assert completion.usage.output_tokens == 7
+
+
 def test_reasoning_verify_treats_an_exhausted_ping_budget_as_reachable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
