@@ -1092,15 +1092,20 @@ class _FakePool:
         metadata: dict[str, str] | None = None,
         sandbox_factory: object = None,
         hello_timeout: float = 0.0,
+        episode_timeout_s: float = 300.0,
     ) -> None:
         self.template = template
         self.metadata = metadata
+        self.episode_timeout_s = episode_timeout_s
         self.channels: list[_ScriptedPoolChannel] = []
         self.releases: list[bool] = []
         self.retire_idle_calls = 0
         self.closes = 0
         self.close_failures = 0
         _FakePool.instances.append(self)
+
+    def assert_episode_timeout(self, episode_timeout_s: float) -> None:
+        del episode_timeout_s  # the fake pool accepts any budget
 
     def usage(self) -> SandboxUsage:
         return SandboxUsage(count=len(self.channels), seconds=1.5 * len(self.channels))

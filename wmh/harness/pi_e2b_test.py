@@ -507,6 +507,7 @@ def _runtime(
     temperature: float = 0.7,
     skills: SkillLibrary | None = None,
     episode_timeout_s: float = 300.0,
+    transport_retries: int = 1,
     should_cancel: Callable[[], bool] | None = None,
 ) -> E2BPiRuntime:
     return E2BPiRuntime(
@@ -522,6 +523,7 @@ def _runtime(
         temperature=temperature,
         skills=skills,
         episode_timeout_s=episode_timeout_s,
+        transport_retries=transport_retries,
         should_cancel=should_cancel,
     )
 
@@ -536,6 +538,12 @@ def _sent_frames(fake: FakeSandbox) -> list[JsonObject]:
         else value
         for value in decoded
     ]
+
+
+@pytest.mark.parametrize("value", [True, -1, 0.5])
+def test_transport_retry_budget_must_be_a_nonnegative_integer(value: object) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        _runtime(transport_retries=cast("int", value))
 
 
 def _of_kind(fake: FakeSandbox, kind: str) -> list[JsonObject]:
@@ -637,6 +645,32 @@ def test_transport_keepalive_stops_renewing_at_the_episode_deadline(
     channel._decode_line(_line(keepalive))  # noqa: SLF001
 
     assert fake.timeouts == [300]  # the final refresh expires exactly at the hard deadline
+
+
+def test_long_episode_keepalive_preserves_cleanup_headroom(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 12000s watchdog keeps the sandbox alive through the 12900s overrun deadline."""
+    now = [100.0]
+    monkeypatch.setattr(pi_e2b_module.time, "monotonic", lambda: now[0])
+    keepalive: JsonObject = {"type": TRANSPORT_KEEPALIVE_TYPE}
+    handle = _ScriptedHandle([], hold_open=True)
+    fake = FakeSandbox(handle)
+    channel = _channel(
+        fake,
+        handle,
+        sandbox_timeout_s=12_900,
+        timeout_refresh_interval_s=300,
+        max_episode_lifetime_s=12_900,
+    )
+
+    channel.send({"type": "episode_start"})
+    assert channel._episode_renewal_deadline_at == 13_000  # noqa: SLF001 - absolute cap
+    now[0] += 300
+    channel._decode_line(_line(keepalive))  # noqa: SLF001 - exact transport path
+
+    assert fake.timeouts == [12_600]
+    assert now[0] + fake.timeouts[-1] == 13_000
 
 
 def test_transport_keepalive_refresh_failure_is_nonfatal_and_retried(
@@ -867,7 +901,9 @@ def test_pool_default_factory_tags_initial_and_replacement_sandboxes(
 
     assert replacement is made[1]
     assert len(made) == 2
-    assert factory_calls == [{"api_key": "key", "template": "tmpl", "metadata": metadata}]
+    assert factory_calls == [
+        {"api_key": "key", "template": "tmpl", "metadata": metadata, "timeout": 900}
+    ]
     pool.close()
 
 
@@ -1014,6 +1050,54 @@ def test_pool_acquire_without_hello_raises_with_stderr_and_kills_the_sandbox(
         pool.acquire()
     assert "SyntaxError: unexpected token" in str(excinfo.value)
     assert fake.kills == 1  # a sandbox that failed bootstrap never leaks
+
+
+def test_pool_resets_lease_before_runner_start_and_after_hello(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold-start work and the first episode each receive a fresh sandbox lease."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    handle = _ScriptedHandle(_stdout_events([{"type": "hello"}]), hold_open=True)
+    fake = FakeSandbox(handle)
+    events: list[str] = []
+
+    original_set_timeout = fake.set_timeout
+
+    def recording_set_timeout(timeout: int) -> None:
+        events.append("set_timeout")
+        original_set_timeout(timeout)
+
+    original_run = fake.commands.run
+
+    def recording_run(
+        cmd: str,
+        background: bool | None = None,
+        *,
+        envs: dict[str, str] | None = None,
+        stdin: bool | None = None,
+        timeout: float | None = None,
+    ) -> object:
+        if background:
+            events.append("runner_start")
+        return original_run(cmd, background, envs=envs, stdin=stdin, timeout=timeout)
+
+    monkeypatch.setattr(fake, "set_timeout", recording_set_timeout)
+    monkeypatch.setattr(fake.commands, "run", recording_run)
+    pool = E2BSandboxPool(sandbox_factory=lambda: fake)
+    original_await_hello = pool._await_hello  # noqa: SLF001 - ordering contract under test
+
+    def recording_await_hello(channel: E2BStdioChannel) -> None:
+        events.append("await_hello")
+        original_await_hello(channel)
+        events.append("hello")
+
+    monkeypatch.setattr(pool, "_await_hello", recording_await_hello)
+
+    pool.acquire()
+
+    assert events == ["set_timeout", "runner_start", "await_hello", "hello", "set_timeout"]
+    assert fake.timeouts == [900, 900]
+    pool.close()
 
 
 def test_pool_with_template_skips_installs_but_still_writes_runner_files() -> None:
@@ -1264,12 +1348,60 @@ def test_acquire_extends_the_lifetime_of_a_reused_sandbox(
     pool = E2BSandboxPool(sandbox_factory=factory)
     sandbox, channel = pool.acquire()
     [fake] = made
-    assert fake.timeouts == [900]  # reset after bootstrap, immediately before the runner starts
+    assert fake.timeouts == [900, 900]  # protect startup, then refresh after hello for episode use
     pool.release(sandbox, channel, healthy=True)
     again, _ = pool.acquire()
     assert again is sandbox
-    assert fake.timeouts == [900, 900]  # the reuse extended the countdown again
+    assert fake.timeouts == [900, 900, 900]  # the reuse extended the countdown again
     pool.close()
+
+
+def test_explicit_episode_timeout_sizes_private_pool_creation_and_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long episode budget reaches Sandbox.create, the runner lease, and warm reuse."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for([[{"type": "hello"}]])
+    factory_calls: list[dict[str, object]] = []
+
+    def recording_default_factory(**kwargs: object) -> SandboxFactory:
+        factory_calls.append(kwargs)
+        return factory
+
+    monkeypatch.setattr(pi_e2b_module, "default_sandbox_factory", recording_default_factory)
+    runtime = _runtime(episode_timeout_s=12_000)
+    pool = runtime._pool  # noqa: SLF001 - verifies the runtime-owned lease contract
+
+    sandbox, channel = pool.acquire()
+    [fake] = made
+    assert factory_calls == [{"api_key": None, "template": "", "metadata": None, "timeout": 12_900}]
+    assert runtime._episode_timeout_s == 12_000  # noqa: SLF001 - watchdog stays exact
+    assert fake.timeouts == [12_900, 12_900]
+    assert channel._max_episode_lifetime_s == 12_900  # noqa: SLF001 - overrun headroom
+
+    pool.release(sandbox, channel, healthy=True)
+    reused, reused_channel = pool.acquire()
+    assert reused is sandbox
+    assert reused_channel is channel
+    assert fake.timeouts == [12_900, 12_900, 12_900]
+    runtime.close()
+
+
+def test_shared_pool_rejects_an_episode_budget_above_its_lease_capacity() -> None:
+    """A shared default pool cannot silently undercut a 12000-second runtime promise."""
+    factory, _made = _factory_for([[{"type": "hello"}]])
+    default_pool = E2BSandboxPool(sandbox_factory=factory)
+    with pytest.raises(ValueError, match="shared E2BSandboxPool episode timeout is too small"):
+        _runtime(pool=default_pool, episode_timeout_s=12_000)
+    default_pool.close()
+
+    sized_pool = E2BSandboxPool(
+        sandbox_factory=factory,
+        episode_timeout_s=12_000,
+    )
+    runtime = _runtime(pool=sized_pool, episode_timeout_s=12_000)
+    assert runtime._pool is sized_pool  # noqa: SLF001 - accepted capacity is reused exactly
+    sized_pool.close()
 
 
 def test_acquire_replaces_a_dead_idle_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1328,6 +1460,35 @@ def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
     assert result.answer == "recovered"
     assert len(made) == 2
     assert made[0].kills == 1  # the dead attempt's sandbox was discarded, not reused
+    pool.close()
+
+
+def test_zero_transport_retry_budget_never_replays_an_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """transport_retries=0 (the real-environment policy) turns transport death into a raise."""
+    monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
+    factory, made = _factory_for(
+        [
+            [{"type": "hello"}],
+            [
+                {"type": "hello"},
+                {"type": "done", "answer": "must not run"},
+            ],
+        ]
+    )
+
+    def dying_factory() -> FakeSandbox:
+        fake = factory()
+        fake.commands._handle._hold_open = False  # noqa: SLF001
+        return fake
+
+    pool = E2BSandboxPool(sandbox_factory=dying_factory)
+    with pytest.raises(RuntimeError, match="exited mid-episode"):
+        _runtime(pool=pool, transport_retries=0).run("t1", "do it", _RecordingEnv())
+
+    assert len(made) == 1
+    assert made[0].kills == 1
     pool.close()
 
 

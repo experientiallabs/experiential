@@ -40,11 +40,13 @@ from wmh.harness.code_runtime import (
     compile_harness_code,
 )
 from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MAX_TURNS,
     DEFAULT_SYSTEM_PROMPT,
     AgentRuntime,
     Runtime,
+    validate_episode_timeout_s,
 )
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import DEFAULT_TOOLS, READ_SKILL, render_tools, resolve_tools
@@ -323,6 +325,8 @@ class HarnessDoc(BaseModel):
         backend: str = "local",
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
+        episode_timeout_s: float | None = None,
+        transport_retries: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
         """The configured agent runtime this document describes.
@@ -337,12 +341,29 @@ class HarnessDoc(BaseModel):
         npm deps) is already done; default is $WMH_E2B_TEMPLATE. Under `local`, "pi-node" uses
         the SSH shim (or the RunnerLink frame transport when PI_TRANSPORT=link); otherwise a
         `code:runtime` surface drives episodes with the harness's own in-process program; with
-        neither, the fixed baseline loop runs. All expose the same
+        neither, the fixed baseline loop runs. `episode_timeout_s` controls the E2B pi-node
+        episode wall budget; omitting it preserves the 300-second default. `transport_retries`
+        controls whole-episode replay after an E2B transport death; omitting it preserves that
+        runtime's one-retry default, and a side-effectful real environment passes 0. Other
+        execution modes reject both instead of silently ignoring them. All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
         if backend not in ("local", "e2b"):
             raise ValueError(f"unknown backend {backend!r}; choose local or e2b")
-        if self.runtime_kind() == "pi-node":
+        if transport_retries is not None and (
+            isinstance(transport_retries, bool)
+            or not isinstance(transport_retries, int)
+            or transport_retries < 0
+        ):
+            raise ValueError("transport_retries must be a nonnegative integer")
+        runtime_kind = self.runtime_kind()
+        if episode_timeout_s is not None:
+            episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
+            if backend != "e2b" or runtime_kind != "pi-node":
+                raise ValueError("episode_timeout_s applies only to e2b pi-node execution")
+        if transport_retries is not None and (backend != "e2b" or runtime_kind != "pi-node"):
+            raise ValueError("transport_retries applies only to e2b pi-node execution")
+        if runtime_kind == "pi-node":
             skills = SkillLibrary(self.skills())
             code_files = {s.path: s.content for s in self.code_files() if s.path is not None}
             tool_names = self.tools()
@@ -376,6 +397,12 @@ class HarnessDoc(BaseModel):
                     pool=e2b_pool,
                     max_turns=self.max_turns(),
                     max_output_tokens=self.max_output_tokens(),
+                    episode_timeout_s=(
+                        DEFAULT_EVAL_EPISODE_TIMEOUT_S
+                        if episode_timeout_s is None
+                        else episode_timeout_s
+                    ),
+                    transport_retries=(1 if transport_retries is None else transport_retries),
                     should_cancel=should_cancel,
                 )
             # PI_TRANSPORT=link routes pi to the RunnerLink frame transport (a persistent runner the

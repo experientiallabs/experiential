@@ -11,6 +11,7 @@ the same types the rest of the harness uses.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
@@ -47,6 +48,11 @@ DEFAULT_MAX_TURNS = 20  # small shell tasks converge well before this; raise for
 # reasoning model can exhaust one response before it emits a tool call even when many turns remain.
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
+# A score cell must finish much sooner than the E2B lease-renewal safety cap. This wall budget is
+# host-enforced by RunnerLink and may be exceeded only by one already-running provider/tool call.
+# It lives here (not pi_e2b) so timeout policy validates without importing the optional e2b path.
+DEFAULT_EVAL_EPISODE_TIMEOUT_S = 300.0
+
 # Per-observation cap in the judge-facing transcript. Generous rather than tight: gold evidence
 # routinely lives deep in long outputs (`cat` of a produced file, `ls -R`), and truncating it away
 # turns real successes into judged failures.
@@ -56,6 +62,20 @@ _NUDGE = (
     "[ERROR] that reply was not a single valid JSON tool call. Reply with EXACTLY one JSON "
     'object: {"tool": "<tool name>", "arguments": {...}}'
 )
+
+
+def validate_episode_timeout_s(value: object) -> float:
+    """Return one finite positive episode timeout, rejecting booleans and non-numbers.
+
+    The single entry-point validation for the episode wall budget: `HarnessDoc.runtime()` and
+    the runtimes call this once instead of re-validating the number at every layer.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("episode_timeout_s must be a finite positive number")
+    timeout = float(value)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("episode_timeout_s must be a finite positive number")
+    return timeout
 
 
 class HarnessSearchCancelled(RuntimeError):
