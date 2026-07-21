@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
   <title id="title">World model, worker agent, and optimizer agent</title>
-  <desc id="description">A world model above a worker agent and optimizer agent. Bidirectional arrows connect all three.</desc>
+  <desc id="description">A world model sits above a worker agent and optimizer agent. Bidirectional arrows connect all three.</desc>
 
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
