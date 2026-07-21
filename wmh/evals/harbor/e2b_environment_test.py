@@ -157,6 +157,33 @@ def test_harbor_e2b_omitted_resources_become_explicit_build_values(tmp_path: Pat
     assert environment._effective_memory_mb == 1024
 
 
+def test_harbor_e2b_task_storage_is_not_sent_to_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(
+        tmp_path,
+        task_config=EnvironmentConfig(cpus=2, memory_mb=2048, storage_mb=4096),
+    )
+    calls: list[dict[str, object]] = []
+
+    async def build(**kwargs: object) -> object:
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(e2b_environment_module.AsyncTemplate, "build", staticmethod(build))
+
+    asyncio.run(environment._create_template())
+
+    assert environment._effective_storage_mb == 4096
+    assert len(calls) == 1
+    assert calls[0]["name"] == environment.template_name
+    assert calls[0]["cpu_count"] == 2
+    assert calls[0]["memory_mb"] == 2048
+    assert calls[0]["template"] is not None
+    assert "storage_mb" not in calls[0]
+
+
 def test_harbor_e2b_resource_mismatch_kills_without_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

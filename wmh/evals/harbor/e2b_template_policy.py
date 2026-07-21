@@ -172,5 +172,6 @@ def e2b_template_readiness_policy_payload() -> dict[str, int | str | bool]:
         "build_concurrency_limit": E2B_TEMPLATE_BUILD_CONCURRENCY_LIMIT,
         "resource_qualified_alias": True,
         "force_build": False,
-        "storage_policy": "reject_requested",
+        "task_storage_policy": "provider_default_unenforced",
+        "override_storage_policy": "reject",
     }

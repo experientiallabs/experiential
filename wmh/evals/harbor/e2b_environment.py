@@ -142,8 +142,12 @@ class WmhE2BEnvironment(E2BEnvironment):
             and _PREPARATION_DIGEST_PATTERN.fullmatch(preparation_digest) is None
         ):
             raise ValueError("preparation_digest must be a sha256 digest")
-        if self._effective_storage_mb is not None:
-            raise ValueError("Harbor E2B does not enforce requested storage")
+        # Harbor's E2B backend deliberately leaves task-declared storage on the
+        # provider default: E2B exposes no storage field on template build or
+        # sandbox create. Preserve that backend contract, but reject an explicit
+        # runtime override so an operator cannot mistake it for an enforced value.
+        if self._override_storage_mb is not None:
+            raise ValueError("Harbor E2B does not enforce storage overrides")
 
         effective_cpu = (
             None if self._cpu_resource_mode is ResourceMode.IGNORE else self.task_env_config.cpus

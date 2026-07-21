@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from e2b.template.types import BuildInfo
@@ -201,7 +202,7 @@ def test_plan_mirrors_step_verifier_contexts_and_fallback(tmp_path: Path) -> Non
     assert aggregate["separate_verifier_context_count"] == 2
 
 
-def test_plan_rejects_storage_that_e2b_cannot_enforce(tmp_path: Path) -> None:
+def test_plan_accepts_task_storage_as_unenforced_provider_default(tmp_path: Path) -> None:
     tasks_root = tmp_path / "tasks"
     task_dir = _task(
         tasks_root,
@@ -210,11 +211,19 @@ def test_plan_rejects_storage_that_e2b_cannot_enforce(tmp_path: Path) -> None:
         task_toml='version = "1.0"\n[environment]\nstorage_mb = 4096\n',
     )
 
-    with pytest.raises(ValueError, match="does not enforce requested storage"):
-        readiness.E2BTemplateReadinessPlan.create(
-            job_config=_job(tmp_path),
-            task_set=_task_set(tasks_root, [task_dir]),
-        )
+    plan = readiness.E2BTemplateReadinessPlan.create(
+        job_config=_job(tmp_path),
+        task_set=_task_set(tasks_root, [task_dir]),
+    )
+
+    payload = plan.identity_payload()
+    policy_payload = cast("dict[str, int | str | bool]", payload["policy"])
+    assert policy_payload["task_storage_policy"] == "provider_default_unenforced"
+    assert policy_payload["override_storage_policy"] == "reject"
+    assert "storage" not in json.dumps(payload["templates"], sort_keys=True)
+    assert payload["context_resource_histogram"] == [
+        {"cpu_count": 2, "memory_mb": 1024, "count": 1}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -223,7 +232,7 @@ def test_plan_rejects_storage_that_e2b_cannot_enforce(tmp_path: Path) -> None:
         ({"force_build": True}, "does not allow force_build"),
         ({"kwargs": {"require_prebuilt": True}}, "reserved environment kwargs"),
         ({"kwargs": {"preparation_digest": "sha256:" + "0" * 64}}, "reserved"),
-        ({"override_storage_mb": 4096}, "does not enforce requested storage"),
+        ({"override_storage_mb": 4096}, "does not enforce storage overrides"),
     ],
 )
 def test_plan_rejects_unsafe_runtime_configuration_before_provider_access(
