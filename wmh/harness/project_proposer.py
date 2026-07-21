@@ -240,7 +240,7 @@ class ProjectCandidateProposer:
         *,
         should_cancel: Callable[[], bool] | None = None,
     ) -> CandidateProposal:
-        """Produce one new source tree without selecting or materializing a host parent."""
+        """Produce one new source tree from the fixed seed, never a selected later parent."""
         self._check_cancelled(should_cancel)
         frozen_history = tuple(history)
         if not frozen_history:
@@ -274,7 +274,7 @@ class ProjectCandidateProposer:
         candidate_id = f"candidate-{next_proposal_count:04d}"
         proposal_dir = f"proposals/{candidate_id}"
         stage = self._project.stage_source_tree(
-            HarnessSourceTree(files=()),
+            frozen_history[0].source,
             max_files=self._max_source_files,
             max_bytes=self._max_source_bytes,
         )
@@ -608,16 +608,21 @@ def _proposal_request(
 
 Read `history/manifest.json`. It indexes all {history_count} evaluated candidates, their complete
 source directories, full score reports, and raw evaluator artifacts. Earlier coding-turn traces
-remain under `proposals/`. {previous_trace} Use the full population as evidence. Do not select or
-assume a host-designated source to extend.
+remain under `proposals/`. {previous_trace} Use the full population as evidence.
 
-Your only candidate output is this initially empty directory:
+Your only candidate output is this directory:
 `{absolute_stage}`
 
-Use Bash to inspect immutable project evidence and to copy, create, edit, delete, and test files
-inside that directory. Leave one complete standalone harness source tree there. Do not modify
-`history/`, `proposals/`, or any other project path. When the candidate is complete, call submit.
-The host snapshots the directory once after this turn and will not ask for a repair.
+The host initialized it with a complete, freely editable copy of the fixed first evaluated seed at
+`history/candidate-0000/source`. Every proposal slot receives that same fixed scaffold regardless
+of later candidates or scores. Use Bash to inspect all immutable project evidence and to create,
+edit, delete, replace, and test files inside the candidate directory. Leave one complete standalone
+harness source tree there; it must not import from or otherwise depend on `history/`, `proposals/`,
+or any other project path. The final portable source tree must contain a UTF-8 `SYSTEM.md`;
+optional `config.toml`, `runtime.py`, `skills/*.md`, and code files must remain valid in the
+portable source format and parse together as one complete harness. Do not modify immutable project
+paths. When the candidate is complete, call submit. The host snapshots the directory once after
+this turn and will not ask for a repair.
 
 This turn's immutable request and trace are stored under `{proposal_dir}/`.
 """

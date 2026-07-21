@@ -148,6 +148,7 @@ def _evaluated(
     *,
     source: HarnessSourceTree | None = None,
     artifacts: dict[str, bytes] | None = None,
+    score: float = 0.5,
 ) -> EvaluatedCandidate:
     tree = source or _source()
     candidate = tree.to_doc(candidate_id)
@@ -175,7 +176,7 @@ def _evaluated(
             ScoreCell(
                 task_id="task-1",
                 attempt=1,
-                score=0.5,
+                score=score,
                 passed=False,
                 summary="raw result",
                 artifact_paths=tuple(raw),
@@ -222,15 +223,16 @@ def test_project_proposer_materializes_complete_history_and_returns_one_candidat
     project = _FakeProject([candidate_source])
     project.run_behavior = _emit_bash_activity
     proposer = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    seed = _evaluated()
 
-    result = proposer.propose((_evaluated(),))
+    result = proposer.propose((seed,))
 
     assert result.candidate_id == "candidate-0001"
     assert result.source == candidate_source
     assert result.candidate.system_prompt() == "improved"
     assert result.worker_usage == TokenUsage(input_tokens=11, output_tokens=7, calls=1)
     assert len(project.run_calls) == 1
-    assert project.staged == [HarnessSourceTree(files=())]
+    assert project.staged == [seed.source]
     assert len(project.snapshot_calls) == 1
     assert project.run_calls[0].writable_files == ()
     assert project.run_calls[0].retry_recoverable is False
@@ -256,6 +258,51 @@ def test_project_proposer_materializes_complete_history_and_returns_one_candidat
     assert project.files["proposals/candidate-0001/source/SYSTEM.md"] == "improved"
     events = json.loads(project.files["proposals/candidate-0001/events.json"])
     assert [event["kind"] for event in events] == ["tool_call", "submit"]
+
+
+def test_every_live_proposal_stages_the_fixed_seed_not_a_later_high_scorer() -> None:
+    seed_source = _source("fixed seed")
+    first_source = _source("higher-scoring candidate")
+    second_source = _source("independent second candidate")
+    project = _FakeProject([first_source, second_source])
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    seed = _evaluated("candidate-0000", source=seed_source, score=0.1)
+
+    first = proposer.propose((seed,))
+    higher_scorer = _evaluated("candidate-0001", source=first.source, score=0.9)
+    second = proposer.propose((seed, higher_scorer))
+
+    assert second.candidate_id == "candidate-0002"
+    assert project.staged == [seed_source, seed_source]
+    assert project.staged[1] != higher_scorer.source
+
+
+def test_fixed_seed_scaffold_is_freely_replaceable_and_final_source_is_standalone() -> None:
+    base = _source("fixed seed")
+    seed = HarnessSourceTree(
+        files=(*base.files, HarnessSourceFile(path="seed-only.txt", content="delete me"))
+    )
+    replacement = _source("standalone replacement")
+    project = _FakeProject([replacement])
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+
+    result = proposer.propose((_evaluated("candidate-0000", source=seed),))
+
+    assert project.staged == [seed]
+    assert result.source == replacement
+    assert "seed-only.txt" not in result.source.file_map()
+    assert result.source.to_doc(result.candidate_id).system_prompt() == "standalone replacement"
+    request = project.run_calls[0].instruction
+    assert "fixed first evaluated seed" in request
+    assert "Every proposal slot receives that same fixed scaffold" in request
+    assert "create,\nedit, delete, replace, and test files" in request
+    assert "must not import from or otherwise depend on `history/`, `proposals/`" in request
+    assert "must contain a UTF-8 `SYSTEM.md`" in request
+    assert "optional `config.toml`, `runtime.py`, `skills/*.md`, and code files" in request
+    assert "portable source format and parse together as one complete harness" in request
+    assert "initially empty" not in request
 
 
 def test_project_proposer_history_is_append_only_and_previous_trace_remains_visible() -> None:
@@ -317,10 +364,11 @@ def test_partial_history_write_cannot_be_reused_for_a_different_candidate() -> N
 
 def test_project_proposer_restores_exact_valid_and_invalid_turns_before_continuing() -> None:
     first_source = _source("first")
+    third_source = _source("third")
     invalid_source = HarnessSourceTree(
         files=(HarnessSourceFile(path="notes.txt", content="unfinished"),)
     )
-    original_project = _FakeProject([first_source, invalid_source])
+    original_project = _FakeProject([first_source, invalid_source, third_source])
     original_project.run_behavior = _emit_bash_activity
     original = ProjectCandidateProposer(original_project, optimizer_agent(), _provider())
     seed = _evaluated("candidate-0000")
@@ -331,8 +379,9 @@ def test_project_proposer_restores_exact_valid_and_invalid_turns_before_continui
     with pytest.raises(CandidateProposalError) as raised:
         original.propose((seed, scored_first))
     invalid = raised.value
+    original_project.emit_submit = True
 
-    restored_project = _FakeProject([_source("third")])
+    restored_project = _FakeProject([third_source])
     restored_project.run_behavior = _emit_bash_activity
     restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
     restored.restore((seed, scored_first), (first, invalid))
@@ -350,8 +399,12 @@ def test_project_proposer_restores_exact_valid_and_invalid_turns_before_continui
     assert restored_trace == original_trace
     assert restored_project.staged == [first.source, invalid.source]
 
+    original_third = original.propose((seed, scored_first))
     third = restored.propose((seed, scored_first))
     assert third.candidate_id == "candidate-0003"
+    assert original_project.staged == [seed.source, seed.source, seed.source]
+    assert restored_project.staged == [first.source, invalid.source, seed.source]
+    assert third.request == original_third.request
     assert "proposals/candidate-0002/events.json" in restored_project.run_calls[0].instruction
 
 
@@ -585,7 +638,7 @@ def test_invalid_candidate_consumes_turn_without_repair_or_fallback() -> None:
     assert raised.value.candidate_id == "candidate-0001"
     assert raised.value.source == invalid
     assert len(project.run_calls) == 1
-    assert project.staged == [HarnessSourceTree(files=())]
+    assert project.staged == [seed.source]
     assert project.files["proposals/candidate-0001/source/notes.txt"] == "partial"
 
     project.emit_submit = True
@@ -594,6 +647,7 @@ def test_invalid_candidate_consumes_turn_without_repair_or_fallback() -> None:
     assert result.candidate_id == "candidate-0002"
     assert result.candidate.system_prompt() == "later"
     assert len(project.run_calls) == 2
+    assert project.staged == [seed.source, seed.source]
     assert "proposals/candidate-0001/events.json" in project.run_calls[1].instruction
 
 
