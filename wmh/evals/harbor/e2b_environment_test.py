@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -23,6 +24,13 @@ from harbor.models.trial.paths import TrialPaths
 
 import wmh.evals.harbor.e2b_environment as e2b_environment_module
 from wmh.evals.harbor.e2b_environment import WmhE2BEnvironment
+
+
+@pytest.fixture(autouse=True)
+def _clear_build_registry() -> Iterator[None]:
+    e2b_environment_module._SUBMITTED_BUILDS.clear()
+    yield
+    e2b_environment_module._SUBMITTED_BUILDS.clear()
 
 
 def _environment(
@@ -345,25 +353,37 @@ def test_transient_get_info_failure_retries_the_create_instead_of_failing_it(
     assert environment._sandbox is second
 
 
-def test_per_alias_single_flight_prevents_a_double_submission(
+def test_single_flight_and_cross_loop_registry_pay_for_exactly_one_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """harbor's start() does exists -> build; two racing trials must pay for one build."""
+    """harbor's start() does exists -> build. Racing trials in ONE loop are serialized by the
+    per-loop alias lock; a SECOND loop (a concurrent/consecutive scorer) must find the first
+    loop's submitted build in the process-wide registry and poll it to READY, so the whole
+    process pays for exactly one build."""
     env_a = _environment(tmp_path)
     env_b = _environment(tmp_path)  # same content, same qualified alias
     assert env_a.template_name == env_b.template_name
-    built: set[str] = set()
-    submissions: list[str] = []
+    build_info = _build_info(env_a)
+    submissions: list[object] = []
+    polls: list[int] = []
+
+    async def build_in_background(**kwargs: object) -> BuildInfo:
+        submissions.append(kwargs["name"])
+        await asyncio.sleep(0.01)  # both racers reach the alias lock before the build ends
+        return build_info
+
+    async def get_build_status(info: BuildInfo, logs_offset: int = 0) -> object:
+        assert (info.template_id, info.build_id) == ("template-id", "build-id")
+        polls.append(logs_offset)
+        return _build_status(build_info, TemplateBuildStatus.READY)
+
+    monkeypatch.setattr(AsyncTemplate, "build_in_background", staticmethod(build_in_background))
+    monkeypatch.setattr(AsyncTemplate, "get_build_status", staticmethod(get_build_status))
 
     def wire(environment: WmhE2BEnvironment) -> None:
         async def exists() -> bool:
-            return environment.template_name in built
-
-        async def create_template() -> None:
-            submissions.append(environment.template_name)
-            await asyncio.sleep(0.01)  # both racers reach the lock before either build ends
-            built.add(environment.template_name)
+            return False  # the alias check never resolves; the registry must dedupe
 
         async def create_sandbox() -> None:
             environment._sandbox = cast("AsyncSandbox", _Sandbox(name=environment.template_name))
@@ -375,7 +395,6 @@ def test_per_alias_single_flight_prevents_a_double_submission(
             return None
 
         monkeypatch.setattr(environment, "_does_template_exist", exists)
-        monkeypatch.setattr(environment, "_create_template", create_template)
         monkeypatch.setattr(environment, "_create_sandbox", create_sandbox)
         monkeypatch.setattr(environment, "ensure_dirs", ensure_dirs)
         monkeypatch.setattr(environment, "_upload_environment_dir_after_start", upload)
@@ -387,13 +406,44 @@ def test_per_alias_single_flight_prevents_a_double_submission(
         await asyncio.gather(env_a.start(force_build=False), env_b.start(force_build=False))
 
     asyncio.run(race())
-    assert submissions == [env_a.template_name]
+    assert submissions == [env_a.template_name]  # in-loop single flight: one paid build
 
-    # Each score() runs its harbor job under a fresh asyncio.run loop. The single-flight
-    # primitives were contended above (they gained waiters, binding them to loop 1 on 3.12);
-    # a second job on a new loop must get fresh per-loop controls, not
-    # "bound to a different event loop".
-    built.clear()
-    submissions.clear()
+    polls_before = len(polls)
+    # A separate event loop racing the same alias: the registry (not the loop-bound lock)
+    # dedupes, and the followers poll the first loop's build to READY.
     asyncio.run(race())
-    assert submissions == [env_a.template_name]
+    assert submissions == [env_a.template_name]  # still exactly ONE submit process-wide
+    assert len(polls) > polls_before
+
+
+def test_terminal_build_failure_clears_the_registry_so_a_rebuild_can_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions: list[int] = []
+
+    async def build_in_background(**_kwargs: object) -> BuildInfo:
+        submissions.append(1)
+        return build_info
+
+    async def get_build_status(_info: BuildInfo, logs_offset: int = 0) -> object:
+        del logs_offset
+        if len(submissions) == 1:
+            return _build_status(
+                build_info,
+                TemplateBuildStatus.ERROR,
+                reason=BuildStatusReason(message="dockerfile failed"),
+            )
+        return _build_status(build_info, TemplateBuildStatus.READY)
+
+    monkeypatch.setattr(AsyncTemplate, "build_in_background", staticmethod(build_in_background))
+    monkeypatch.setattr(AsyncTemplate, "get_build_status", staticmethod(get_build_status))
+
+    with pytest.raises(BuildException, match="dockerfile failed"):
+        asyncio.run(environment._ensure_template_built(force_build=False))
+    assert e2b_environment_module._SUBMITTED_BUILDS == {}  # cleared: a rebuild may claim
+
+    asyncio.run(environment._ensure_template_built(force_build=False))
+    assert submissions == [1, 1]  # the second attempt legitimately resubmits

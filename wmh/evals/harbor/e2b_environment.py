@@ -11,9 +11,10 @@ everything else (mounts, network policy, uploads, verification) harbor's:
   a tenacity retry (harbor/environments/e2b.py `_create_template`), so one transport blip during
   a long build replays the submission and pays for a duplicate build. This class submits exactly
   once via `build_in_background`, then polls the idempotent `get_build_status` GET, retrying
-  ONLY transport/rate-limit errors there. A per-alias single-flight lock stops two trials of the
-  same task from both seeing "missing" and double-submitting, and a global semaphore keeps
-  concurrent builds under the account limit.
+  ONLY transport/rate-limit errors there. A per-loop per-alias single-flight lock plus a
+  process-wide submitted-build registry stop concurrent trials AND concurrent scorer loops from
+  both seeing "missing" and double-submitting (followers poll the already-paid build), and a
+  process-wide bounded semaphore keeps concurrent builds under the account limit.
 - **Create pacing.** Every sandbox create routes through the same process-wide 4/sec admission
   gate as wmh's own pi-worker sandboxes, so the two consumers cannot jointly exceed E2B's
   published account rate.
@@ -27,6 +28,7 @@ import re
 import threading
 import weakref
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, override
 
@@ -60,34 +62,81 @@ from wmh.harness.e2b_sandbox import acquire_e2b_create_slot_async
 _CREATE_ATTEMPTS = 2
 _CREATE_RETRY_DELAY_S = 1.0
 
-# Per-alias single-flight locks plus one build semaphore, keyed BY EVENT LOOP: harbor's base
-# start() does exists -> build, so without the lock two racing attempts of the same task both
-# see "missing" and double-submit one paid build. The keying matters: each HarborScorer.score()
-# runs its job under a fresh asyncio.run loop, and an asyncio primitive that gained waiters in
-# one loop binds to it (Python 3.12), so reusing it from the next job's loop raises
-# "bound to a different event loop". Concurrent trials of one job share one loop, which is the
-# only place the race exists; the registry entry dies with its loop (WeakKeyDictionary).
+
+@dataclass(frozen=True)
+class _SubmittedBuild:
+    """The provider identity of one already-submitted template build."""
+
+    template_id: str
+    build_id: str
+
+
+# Build coordination happens at two levels.
+#
+# Per-loop, per-alias asyncio locks give in-loop single-flight: harbor's base start() does
+# exists -> build, so without the lock two racing attempts of the same task both see "missing"
+# and double-submit one paid build. They are keyed BY EVENT LOOP because each
+# HarborScorer.score() runs its job under a fresh asyncio.run loop, and an asyncio primitive
+# that gained waiters binds to its loop (Python 3.12); the entry dies with the loop.
+#
+# Process-wide, thread-safe state covers CONCURRENT loops (two scorer threads, two candidates):
+# a registry of submitted build identities per alias (plain data, safe to share across loops)
+# so a second loop polls the first loop's already-paid build instead of resubmitting, and one
+# bounded semaphore capping concurrent builds account-wide regardless of how many loops exist.
+# The threading guard only ever protects fast dict operations; nothing awaits under it.
 _CONTROL_GUARD = threading.Lock()
-_LOOP_CONTROLS: weakref.WeakKeyDictionary[
+_LOOP_ALIAS_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
-    tuple[dict[str, asyncio.Lock], asyncio.Semaphore],
+    dict[str, asyncio.Lock],
 ] = weakref.WeakKeyDictionary()
+# alias -> identity of the submitted build; None marks a submission in flight (claimed).
+_SUBMITTED_BUILDS: dict[str, _SubmittedBuild | None] = {}
+_PROCESS_BUILD_SLOTS = threading.BoundedSemaphore(E2B_TEMPLATE_BUILD_CONCURRENCY)
+_BUILD_SLOT_POLL_INTERVAL_S = 0.25
+_REGISTRY_POLL_INTERVAL_S = 0.05
 
 
-def _template_controls(template_name: str) -> tuple[asyncio.Lock, asyncio.Semaphore]:
-    """The running loop's single-flight lock for `template_name` plus its build semaphore."""
+def _template_lock(template_name: str) -> asyncio.Lock:
+    """The running loop's single-flight lock for `template_name`."""
     loop = asyncio.get_running_loop()
     with _CONTROL_GUARD:
-        controls = _LOOP_CONTROLS.get(loop)
-        if controls is None:
-            controls = ({}, asyncio.Semaphore(E2B_TEMPLATE_BUILD_CONCURRENCY))
-            _LOOP_CONTROLS[loop] = controls
-        locks, semaphore = controls
+        locks = _LOOP_ALIAS_LOCKS.get(loop)
+        if locks is None:
+            locks = {}
+            _LOOP_ALIAS_LOCKS[loop] = locks
         lock = locks.get(template_name)
         if lock is None:
             lock = asyncio.Lock()
             locks[template_name] = lock
-        return lock, semaphore
+        return lock
+
+
+def _claim_build(alias: str) -> _SubmittedBuild | Literal["owner", "pending"]:
+    """Atomically claim the right to submit `alias`, or report who already did."""
+    with _CONTROL_GUARD:
+        if alias not in _SUBMITTED_BUILDS:
+            _SUBMITTED_BUILDS[alias] = None  # claimed: this caller owns the submission
+            return "owner"
+        entry = _SUBMITTED_BUILDS[alias]
+        return "pending" if entry is None else entry
+
+
+def _record_submitted_build(alias: str, submitted: _SubmittedBuild) -> None:
+    with _CONTROL_GUARD:
+        _SUBMITTED_BUILDS[alias] = submitted
+
+
+def _clear_submitted_build(alias: str, expected: _SubmittedBuild | None) -> None:
+    """Drop the registry entry (only if it still matches `expected`, when given)."""
+    with _CONTROL_GUARD:
+        if expected is None or _SUBMITTED_BUILDS.get(alias) == expected:
+            _SUBMITTED_BUILDS.pop(alias, None)
+
+
+async def _acquire_build_slot() -> None:
+    """Take one process-wide build slot without blocking the event loop or a worker thread."""
+    while not _PROCESS_BUILD_SLOTS.acquire(blocking=False):
+        await asyncio.sleep(_BUILD_SLOT_POLL_INTERVAL_S)
 
 
 # e2b converts a non-2xx status GET into BuildException(f"{status_code}: ...") (only 429 becomes
@@ -120,6 +169,23 @@ async def _get_template_build_status(
                 raise
             await asyncio.sleep(E2B_TEMPLATE_BUILD_STATUS_RETRY_DELAYS_MS[attempt] / 1_000)
     raise AssertionError("unreachable template build status retry state")
+
+
+async def _await_submitted_build(alias: str, submitted: _SubmittedBuild) -> None:
+    """Follower path: poll a build another loop already paid for; never submit."""
+    build_info = BuildInfo(
+        template_id=submitted.template_id,
+        build_id=submitted.build_id,
+        name=alias,
+        alias=alias,
+    )
+    try:
+        await _wait_for_template_build(build_info)
+    except BaseException:
+        # Clear only if the entry still names the failed build, so a fresh rebuild started by
+        # another caller is never clobbered.
+        _clear_submitted_build(alias, submitted)
+        raise
 
 
 async def _wait_for_template_build(build_info: BuildInfo) -> None:
@@ -253,14 +319,70 @@ class WmhE2BEnvironment(E2BEnvironment):
         exactly the duplicate-paid-build bug this override exists to prevent. Once E2B returns
         ``BuildInfo``, only idempotent status GETs for that identity are retried.
         """
-        build_info = await AsyncTemplate.build_in_background(
+        build_info = await self._submit_template_build()
+        await _wait_for_template_build(build_info)
+        return build_info
+
+    async def _submit_template_build(self) -> BuildInfo:
+        """Submit the build exactly once; never wrapped in any retry."""
+        return await AsyncTemplate.build_in_background(
             template=self._template_definition(),
             name=self._template_name,
             cpu_count=self._template_resources.cpu_count,
             memory_mb=self._template_resources.memory_mb,
         )
-        await _wait_for_template_build(build_info)
-        return build_info
+
+    async def _ensure_template_built(self, *, force_build: bool) -> None:
+        """Build the alias once per process, letting concurrent loops share one paid build.
+
+        The caller holds this loop's per-alias lock, so within one loop this runs once at a
+        time. Across loops, the process-wide registry decides: the first claimant submits
+        (inside a process-wide build slot) and records the build identity BEFORE polling, so
+        any other loop finds the identity and polls THAT build to READY instead of paying for
+        a second one. A terminal build failure clears the entry so a later attempt can rebuild.
+        """
+        alias = self._template_name
+        if force_build:
+            _clear_submitted_build(alias, None)
+        while True:
+            claim = _claim_build(alias)
+            if claim == "owner":
+                await self._acquire_slot_and_build(alias)
+                return
+            if isinstance(claim, _SubmittedBuild):
+                self.logger.debug(f"Awaiting template {alias} submitted by a concurrent job")
+                await _await_submitted_build(alias, claim)
+                return
+            # "pending": another thread's submission is in flight; wait for its identity to
+            # land (poll it) or for its failure to clear the claim (become the owner).
+            await asyncio.sleep(_REGISTRY_POLL_INTERVAL_S)
+
+    async def _acquire_slot_and_build(self, alias: str) -> None:
+        """Owner path: submit under a process-wide build slot and poll to READY."""
+        await _acquire_build_slot()
+        try:
+            self.logger.debug(f"Creating template {alias}")
+            try:
+                build_info = await self._submit_template_build()
+            except BaseException:
+                # Unknown submission outcome: release the claim so a later attempt may try
+                # again; the ambiguity itself propagates (never auto-resubmitted here).
+                _clear_submitted_build(alias, None)
+                raise
+            _record_submitted_build(
+                alias,
+                _SubmittedBuild(
+                    template_id=build_info.template_id,
+                    build_id=build_info.build_id,
+                ),
+            )
+            try:
+                await _wait_for_template_build(build_info)
+            except BaseException:
+                _clear_submitted_build(alias, None)  # terminal failure: allow a rebuild
+                raise
+        finally:
+            _PROCESS_BUILD_SLOTS.release()
 
     @override
     async def _create_sandbox(self) -> None:
@@ -315,12 +437,9 @@ class WmhE2BEnvironment(E2BEnvironment):
     @override
     async def start(self, force_build: bool) -> None:
         """Harbor's exists-then-build start, made race-free and concurrency-bounded."""
-        lock, build_semaphore = _template_controls(self._template_name)
-        async with lock:
+        async with _template_lock(self._template_name):
             if force_build or not await self._does_template_exist():
-                self.logger.debug(f"Creating template {self._template_name}")
-                async with build_semaphore:
-                    await self._create_template()
+                await self._ensure_template_built(force_build=force_build)
         await self._create_sandbox()
         if not self._sandbox:
             raise RuntimeError("Sandbox not found but was just created. This should never happen.")
