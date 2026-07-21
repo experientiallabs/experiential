@@ -373,7 +373,14 @@ class HarborScorer:
                 # completed trials through harbor's native trial resume.
                 "job_name": f"wmh-{doc.doc_hash[:12]}",
                 "n_attempts": self._attempts,
-                "tasks": [task.model_copy(deep=True) for task in self._tasks],
+                # source names the dataset a task came from, but candidate jobs carry no
+                # datasets: harbor's Job._refresh_metrics_for_eval indexes its metrics
+                # defaultdict by source, creating an empty entry for the unknown name that
+                # its display hook later crashes on with IndexError. Adhoc tasks (source
+                # None) use the always-present "adhoc" metrics entry.
+                "tasks": [
+                    task.model_copy(deep=True, update={"source": None}) for task in self._tasks
+                ],
                 "agents": [agent],
             },
             deep=True,

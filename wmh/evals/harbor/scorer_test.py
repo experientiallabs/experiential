@@ -349,6 +349,21 @@ def test_sensitive_env_values_survive_scorer_revalidation(
     assert config.verifier.env == {"GRADER_TOKEN": "grader-secret-6789"}
 
 
+def test_candidate_job_tasks_drop_their_dataset_source(tmp_path: Path) -> None:
+    """Candidate jobs pin tasks directly with no datasets; a surviving dataset source name
+    poisons harbor's metrics defaultdict (empty entry for the unknown dataset) and crashes
+    its per-trial display hook with IndexError."""
+    scorer = HarborScorer(
+        job_template=_job_template(tmp_path),
+        tasks=_tasks(tmp_path, ("task-a", "task-b")),
+        provider_config=_provider(),
+        agent_concurrency=1,
+        runner=_Runner([]),
+    )
+    config = scorer._candidate_job(HarnessDoc.baseline())
+    assert [task.source for task in config.tasks] == [None, None]
+
+
 def test_candidate_job_is_revalidated_after_model_copy(tmp_path: Path) -> None:
     """model_copy(update=) skips validation; the scorer must re-validate the exact config."""
     template = _job_template(tmp_path)
