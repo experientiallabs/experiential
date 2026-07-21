@@ -30,6 +30,64 @@ def test_save_assigns_incrementing_versions(tmp_path: Path) -> None:
     assert store.load("h", "2") == v2
 
 
+def test_reserved_version_is_exact_idempotent_and_skipped_by_other_saves(
+    tmp_path: Path,
+) -> None:
+    store = HarnessStore(tmp_path)
+    publication_id = "sha256:" + "a" * 64
+    assert store.reserve_version("h", publication_id=publication_id) == 1
+    assert store.reserve_version("h", publication_id=publication_id) == 1
+
+    unreserved = store.save_version(_variant("h", "other writer"))
+    assert unreserved.version == 2
+
+    reserved = store.save_reserved_version(
+        _variant("h", "winner"),
+        version=1,
+        publication_id=publication_id,
+    )
+    assert reserved.version == 1
+    assert (
+        store.save_reserved_version(
+            _variant("h", "winner"),
+            version=1,
+            publication_id=publication_id,
+        )
+        == reserved
+    )
+    with pytest.raises(ValueError, match="differs"):
+        store.save_reserved_version(
+            _variant("h", "collision"),
+            version=1,
+            publication_id=publication_id,
+        )
+    assert store.versions("h") == [1, 2]
+    store.commit_alias_from_reservation(
+        "h",
+        CHAMPION_ALIAS,
+        version=1,
+        publication_id=publication_id,
+        commit=lambda: None,
+    )
+    store.commit_alias_from_reservation(
+        "h",
+        CHAMPION_ALIAS,
+        version=1,
+        publication_id=publication_id,
+        commit=lambda: None,
+    )
+    assert store.aliases("h")[CHAMPION_ALIAS] == 1
+    store.set_alias("h", CHAMPION_ALIAS, 2)
+    with pytest.raises(ValueError, match="changed after version reservation"):
+        store.commit_alias_from_reservation(
+            "h",
+            CHAMPION_ALIAS,
+            version=1,
+            publication_id=publication_id,
+            commit=lambda: None,
+        )
+
+
 def test_default_load_prefers_champion_alias_else_latest(tmp_path: Path) -> None:
     store = HarnessStore(tmp_path)
     store.save_version(HarnessDoc.baseline("h"))
@@ -47,6 +105,27 @@ def test_alias_to_missing_version_rejected(tmp_path: Path) -> None:
     store.save_version(HarnessDoc.baseline("h"))
     with pytest.raises(ValueError, match="no version v9"):
         store.set_alias("h", CHAMPION_ALIAS, 9)
+
+
+def test_alias_update_is_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = HarnessStore(tmp_path)
+    store.save_version(HarnessDoc.baseline("h"), alias=CHAMPION_ALIAS)
+    store.save_version(_variant("h", "v2"))
+    alias_path = store.dir_for("h") / "aliases.toml"
+    original = alias_path.read_bytes()
+    replace = Path.replace
+
+    def fail_alias_replace(self: Path, target: Path) -> Path:
+        if target == alias_path:
+            raise OSError("alias publication interrupted")
+        return replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_alias_replace)
+    with pytest.raises(OSError, match="publication interrupted"):
+        store.set_alias("h", CHAMPION_ALIAS, 2)
+
+    assert alias_path.read_bytes() == original
+    assert store.aliases("h")[CHAMPION_ALIAS] == 1
 
 
 def test_unknown_ref_and_missing_harness_are_friendly(tmp_path: Path) -> None:

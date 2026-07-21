@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
+import shutil
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +38,7 @@ from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage, resolve_e2b_
 from wmh.harness.population import HarnessPopulationOptimizer, PopulationOptimizationResult
 from wmh.harness.population_archive import write_population_archive
 from wmh.harness.population_checkpoint import (
+    PopulationCheckpointError,
     PopulationCheckpointIdentity,
     PopulationCheckpointStateError,
     PopulationCheckpointStore,
@@ -435,10 +440,55 @@ def _execute_optimization(
         if result is None:
             raise PopulationCheckpointStateError("checkpoint has no completed seed boundary")
 
-        checkpoint.begin_finalization()
-        archive_manifest = write_population_archive(run_dir / "population", result)
         selected = result.best.candidate.model_copy(update={"name": name, "version": 0})
-        saved = HarnessStore(root).save_version(selected, alias=CHAMPION_ALIAS)
+        harness_store = HarnessStore(root)
+        if checkpoint.control.active_kind == "finalize":
+            intent = checkpoint.control.publication_intent
+            if intent is None:
+                raise PopulationCheckpointStateError("finalizing checkpoint has no intent")
+        else:
+            publication_id = checkpoint.publication_id
+            harness_version = harness_store.reserve_version(
+                name,
+                publication_id=publication_id,
+            )
+            reservation = harness_store.assert_version_reservation(
+                name,
+                version=harness_version,
+                publication_id=publication_id,
+            )
+            checkpoint.begin_finalization(
+                publication_id=publication_id,
+                harness_version=harness_version,
+                document_hash=selected.doc_hash,
+                prior_champion_version=reservation.alias_version(CHAMPION_ALIAS),
+                archive_manifest="population/manifest.json",
+                outcome_path="outcome.json",
+            )
+            intent = checkpoint.control.publication_intent
+            if intent is None:
+                raise PopulationCheckpointStateError(
+                    "checkpoint did not persist publication intent"
+                )
+
+        reservation = harness_store.assert_version_reservation(
+            intent.harness_name,
+            version=intent.harness_version,
+            publication_id=intent.publication_id,
+        )
+        if reservation.alias_version(CHAMPION_ALIAS) != intent.prior_champion_version:
+            raise PopulationCheckpointError(
+                "champion alias snapshot differs from checkpoint publication intent"
+            )
+        archive_manifest = _ensure_population_archive(
+            run_dir / intent.archive_manifest,
+            result,
+        )
+        saved = harness_store.save_reserved_version(
+            selected,
+            version=intent.harness_version,
+            publication_id=intent.publication_id,
+        )
         outcome: JsonObject = {
             "schema_version": 2,
             "best_candidate_id": result.best.candidate_id,
@@ -447,6 +497,7 @@ def _execute_optimization(
             "saved_harness": saved.name,
             "saved_version": saved.version,
             "archive_manifest": archive_manifest.relative_to(run_dir).as_posix(),
+            "archive_manifest_hash": _hash_file(archive_manifest),
             "planned_score_cells": planned_score_cells,
             "max_score_cells": max_score_cells,
             "known_score_cells": checkpoint.control.known_score_cells,
@@ -454,12 +505,18 @@ def _execute_optimization(
                 project_usage.model_dump(mode="json") if project_usage is not None else None
             ),
         }
-        outcome_path = run_dir / "outcome.json"
-        write_json_atomic(outcome_path, outcome)
-        checkpoint.mark_complete(
-            saved=saved,
-            archive_manifest=archive_manifest,
-            outcome_path=outcome_path,
+        outcome_path = run_dir / intent.outcome_path
+        _ensure_json(outcome_path, outcome)
+        harness_store.commit_alias_from_reservation(
+            intent.harness_name,
+            CHAMPION_ALIAS,
+            version=intent.harness_version,
+            publication_id=intent.publication_id,
+            commit=lambda: checkpoint.mark_complete(
+                saved=saved,
+                archive_manifest=archive_manifest,
+                outcome_path=outcome_path,
+            ),
         )
         return HarnessOptimizeOutcome(
             result=result,
@@ -490,6 +547,105 @@ def _incomplete_progress(
         run_dir=checkpoint.run_dir,
         project_usage=project_usage,
     )
+
+
+def _ensure_population_archive(
+    manifest_path: Path,
+    result: PopulationOptimizationResult,
+) -> Path:
+    """Atomically create or byte-verify the exact deterministic population archive."""
+    destination = manifest_path.parent
+    temporary = destination.with_name(f".{destination.name}.tmp-{uuid4().hex}")
+    temporary_manifest = write_population_archive(temporary, result)
+    _sync_tree(temporary)
+    if destination.exists():
+        if (
+            destination.is_symlink()
+            or not destination.is_dir()
+            or _directory_records(destination) != _directory_records(temporary)
+        ):
+            raise PopulationCheckpointError(
+                "existing population archive differs from checkpoint publication intent"
+            )
+        shutil.rmtree(temporary)
+        if not manifest_path.is_file():
+            raise PopulationCheckpointError("population archive manifest is missing")
+        return manifest_path
+    temporary.replace(destination)
+    _sync_directory(destination.parent)
+    published = destination / temporary_manifest.relative_to(temporary)
+    if published != manifest_path or not manifest_path.is_file():
+        raise PopulationCheckpointError("population archive manifest path differs from intent")
+    return manifest_path
+
+
+def _directory_records(directory: Path) -> tuple[tuple[str, int, str], ...]:
+    records: list[tuple[str, int, str]] = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise PopulationCheckpointError("population archive cannot contain symbolic links")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise PopulationCheckpointError("population archive contains a non-file entry")
+        content = path.read_bytes()
+        records.append(
+            (
+                path.relative_to(directory).as_posix(),
+                len(content),
+                hashlib.sha256(content).hexdigest(),
+            )
+        )
+    return tuple(records)
+
+
+def _ensure_json(path: Path, value: JsonObject) -> None:
+    expected = (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode(
+        "utf-8"
+    )
+    if path.exists():
+        if path.is_symlink() or not path.is_file():
+            raise PopulationCheckpointError(f"publication JSON is not a regular file: {path}")
+        try:
+            existing = path.read_bytes()
+        except OSError as error:
+            raise PopulationCheckpointError(
+                f"existing publication JSON is unreadable: {path}"
+            ) from error
+        if existing != expected:
+            raise PopulationCheckpointError(
+                f"existing publication JSON bytes differ from checkpoint intent: {path}"
+            )
+        return
+    write_json_atomic(path, value)
+    if path.read_bytes() != expected:
+        raise PopulationCheckpointError(f"published JSON differs after write: {path}")
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    _sync_directory(path.parent)
+
+
+def _sync_tree(directory: Path) -> None:
+    for path in sorted(directory.rglob("*")):
+        if path.is_file() and not path.is_symlink():
+            with path.open("rb") as handle:
+                os.fsync(handle.fileno())
+    directories = [path for path in directory.rglob("*") if path.is_dir()]
+    for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _sync_directory(path)
+    _sync_directory(directory)
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _hash_file(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _resolve_seed_source(root: str, seed: str | None) -> HarnessSourceTree:

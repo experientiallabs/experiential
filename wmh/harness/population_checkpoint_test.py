@@ -71,8 +71,14 @@ def _request() -> ScoreRequest:
     )
 
 
-def _evaluated(candidate_id: str, source: HarnessSourceTree, value: float) -> EvaluatedCandidate:
-    path = f"raw/{candidate_id}.json"
+def _evaluated(
+    candidate_id: str,
+    source: HarnessSourceTree,
+    value: float,
+    *,
+    artifact_path: str | None = None,
+) -> EvaluatedCandidate:
+    path = artifact_path or f"raw/{candidate_id}.json"
     content = json.dumps({"candidate_id": candidate_id}).encode()
     artifact = EvaluationArtifact.from_bytes(path=path, content=content)
     request = _request()
@@ -260,7 +266,7 @@ def test_checkpoint_lock_has_one_local_owner(tmp_path: Path) -> None:
         store.close()
 
 
-def test_in_progress_and_complete_checkpoints_refuse_resume(tmp_path: Path) -> None:
+def test_only_verified_cleanup_and_finalization_states_resume(tmp_path: Path) -> None:
     seed = _source("seed")
     in_progress_dir = tmp_path / "in-progress"
     store = PopulationCheckpointStore.create(
@@ -273,6 +279,24 @@ def test_in_progress_and_complete_checkpoints_refuse_resume(tmp_path: Path) -> N
     with pytest.raises(PopulationCheckpointStateError, match="in_progress"):
         PopulationCheckpointStore.open(in_progress_dir)
 
+    cleanup_dir = tmp_path / "cleanup"
+    store = PopulationCheckpointStore.create(
+        cleanup_dir,
+        identity=_identity(tmp_path / "root", seed),
+        seed=seed,
+    )
+    seed_result, _first, _final = _results()
+    store.begin_setup()
+    store.before_step(0)
+    store.commit_boundary(seed_result)
+    store.close()
+    with PopulationCheckpointStore.open(cleanup_dir) as recovered:
+        assert recovered.control.state == "ready"
+        assert recovered.control.committed_step == 0
+        assert recovered.control.project_sandbox_usage is None
+        assert recovered.result is not None
+        assert recovered.result.iterations == ()
+
     complete_dir = tmp_path / "complete"
     store = PopulationCheckpointStore.create(
         complete_dir,
@@ -280,7 +304,26 @@ def test_in_progress_and_complete_checkpoints_refuse_resume(tmp_path: Path) -> N
         seed=seed,
     )
     final_result = _commit_all(store)
-    store.begin_finalization()
+    publication_id = store.publication_id
+    store.begin_finalization(
+        publication_id=publication_id,
+        harness_version=1,
+        document_hash=final_result.best.candidate.doc_hash,
+        prior_champion_version=None,
+        archive_manifest="population/manifest.json",
+        outcome_path="outcome.json",
+    )
+    store.close()
+    finalization_tail = complete_dir / f"checkpoint/control.json.tmp-{'e' * 32}"
+    finalization_tail.write_text("{}", encoding="utf-8")
+    with PopulationCheckpointStore.open(complete_dir) as finalizing:
+        assert finalizing.control.state == "in_progress"
+        assert finalizing.control.active_kind == "finalize"
+        assert finalizing.control.publication_intent is not None
+        assert finalizing.control.publication_intent.publication_id == publication_id
+    assert not finalization_tail.exists()
+
+    store = PopulationCheckpointStore.open(complete_dir)
     archive_manifest = complete_dir / "population/manifest.json"
     archive_manifest.parent.mkdir()
     archive_manifest.write_text("{}\n", encoding="utf-8")
@@ -309,7 +352,7 @@ def test_checkpoint_identity_drift_rejects_without_mutation(tmp_path: Path) -> N
         assert (run_dir / "checkpoint/control.json").read_bytes() == control_before
 
 
-def test_checkpoint_tamper_and_torn_tail_fail_closed(tmp_path: Path) -> None:
+def test_checkpoint_tamper_fails_closed_and_atomic_tail_recovers(tmp_path: Path) -> None:
     seed = _source("seed")
     tampered_dir = tmp_path / "tampered"
     store = PopulationCheckpointStore.create(
@@ -337,9 +380,47 @@ def test_checkpoint_tamper_and_torn_tail_fail_closed(tmp_path: Path) -> None:
         seed=seed,
     )
     store.close()
-    (torn_dir / f"checkpoint/control.json.tmp-{'f' * 32}").write_text("{}")
-    with pytest.raises(PopulationCheckpointError, match="temporary"):
-        PopulationCheckpointStore.open(torn_dir)
+    temporary = torn_dir / f"checkpoint/control.json.tmp-{'f' * 32}"
+    temporary.write_text("{}")
+    with PopulationCheckpointStore.open(torn_dir) as recovered:
+        assert recovered.control.state == "ready"
+        assert recovered.control.committed_step == -1
+    assert not temporary.exists()
+
+
+def test_checkpoint_preserves_manifested_artifact_that_looks_like_atomic_tail(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    seed = _source("seed")
+    artifact_path = f"raw/trace.tmp-{'a' * 32}"
+    evaluated = _evaluated(
+        "candidate-0000",
+        seed,
+        0.5,
+        artifact_path=artifact_path,
+    )
+    result = PopulationOptimizationResult(
+        population=(evaluated,),
+        iterations=(),
+        best=evaluated,
+    )
+    with PopulationCheckpointStore.create(
+        run_dir,
+        identity=_identity(tmp_path / "root", seed),
+        seed=seed,
+    ) as store:
+        store.begin_setup()
+        store.before_step(0)
+        store.commit_boundary(result)
+        store.finish_project_segment(SandboxUsage())
+
+    artifact = run_dir / "checkpoint/steps/0000/artifacts" / artifact_path
+    before = artifact.read_bytes()
+    with PopulationCheckpointStore.open(run_dir) as recovered:
+        assert recovered.result is not None
+        assert recovered.result.population[0].score.report.artifacts[0].path == artifact_path
+    assert artifact.read_bytes() == before
 
 
 def test_score_cell_plan_must_fit_explicit_ceiling(tmp_path: Path) -> None:

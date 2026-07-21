@@ -20,10 +20,18 @@ no `doc.json` (a hand-authored harness) still loads: the files parse into a sing
 
 from __future__ import annotations
 
+import json
+import os
+import re
 import tomllib
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 import tomli_w
+from filelock import FileLock
 
 from wmh.config.store import validate_name
 from wmh.harness.doc import HarnessDoc
@@ -34,6 +42,22 @@ CHAMPION_ALIAS = "champion"
 
 _DOC_FILE = "doc.json"
 _ALIASES_FILE = "aliases.toml"
+_LOCK_FILE = ".store.lock"
+_RESERVATIONS_DIR = ".reservations"
+_PUBLICATION_ID_PATTERN = r"^sha256:[0-9a-f]{64}$"
+
+
+@dataclass(frozen=True)
+class HarnessVersionReservation:
+    """Exact version slot and alias snapshot owned by one retryable publication."""
+
+    version: int
+    publication_id: str
+    aliases: tuple[tuple[str, int], ...]
+
+    def alias_version(self, alias: str) -> int | None:
+        """Return the alias target captured when the version was reserved."""
+        return dict(self.aliases).get(alias)
 
 
 class HarnessStore:
@@ -82,12 +106,8 @@ class HarnessStore:
 
     def set_alias(self, name: str, alias: str, version: int) -> None:
         """Point `alias` at `version` (moving it if it exists). Rollback is re-pointing."""
-        if version not in self.versions(name):
-            raise ValueError(f"harness {name!r} has no version v{version}")
-        current = self.aliases(name)
-        current[alias] = version
-        path = self.dir_for(name) / _ALIASES_FILE
-        path.write_text(tomli_w.dumps({"aliases": current}), encoding="utf-8")
+        with self._locked(name):
+            self._set_alias_unlocked(name, alias, version)
 
     # -- load / save ---------------------------------------------------------------------------
 
@@ -128,18 +148,253 @@ class HarnessStore:
         Versions are append-only: this never touches an existing version directory.
         """
         validate_name(doc.name)
-        version = (self.versions(doc.name)[-1] + 1) if self.exists(doc.name) else 1
+        with self._locked(doc.name):
+            version = self._next_available_version_unlocked(doc.name)
+            stamped = self._write_version_unlocked(doc, version=version)
+            if alias is not None:
+                self._set_alias_unlocked(doc.name, alias, version)
+            return stamped
+
+    def reserve_version(self, name: str, *, publication_id: str) -> int:
+        """Reserve one exact future version for a retryable local publication."""
+        _validate_publication_id(publication_id)
+        with self._locked(name):
+            reservations = self._reservations_unlocked(name)
+            matches = [
+                item.version
+                for item in reservations.values()
+                if item.publication_id == publication_id
+            ]
+            if len(matches) > 1:
+                raise ValueError("publication owns multiple harness version reservations")
+            if matches:
+                return matches[0]
+            version = self._next_available_version_unlocked(name)
+            path = self._reservation_path(name, version)
+            _write_text_atomic(
+                path,
+                json.dumps(
+                    {
+                        "aliases": self.aliases(name),
+                        "publication_id": publication_id,
+                        "version": version,
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+            )
+            return version
+
+    def assert_version_reservation(
+        self,
+        name: str,
+        *,
+        version: int,
+        publication_id: str,
+    ) -> HarnessVersionReservation:
+        """Return an exact durable reservation or fail on missing or changed ownership."""
+        _validate_publication_id(publication_id)
+        with self._locked(name):
+            return self._assert_reservation_unlocked(name, version, publication_id)
+
+    def save_reserved_version(
+        self,
+        doc: HarnessDoc,
+        *,
+        version: int,
+        publication_id: str,
+    ) -> HarnessDoc:
+        """Idempotently write the exact immutable version owned by a reservation."""
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise ValueError("reserved harness version must be a positive integer")
+        _validate_publication_id(publication_id)
+        validate_name(doc.name)
+        with self._locked(doc.name):
+            self._assert_reservation_unlocked(doc.name, version, publication_id)
+            expected = doc.model_copy(update={"version": version})
+            directory = self.dir_for(doc.name) / f"v{version}"
+            if directory.exists():
+                if not _version_directory_matches(directory, expected):
+                    raise ValueError("reserved harness version differs from publication document")
+                return expected
+            return self._write_version_unlocked(doc, version=version)
+
+    def commit_alias_from_reservation(
+        self,
+        name: str,
+        alias: str,
+        *,
+        version: int,
+        publication_id: str,
+        commit: Callable[[], None],
+    ) -> None:
+        """Compare and move an alias, then commit terminal state under the same lock."""
+        _validate_publication_id(publication_id)
+        with self._locked(name):
+            reservation = self._assert_reservation_unlocked(name, version, publication_id)
+            prior = reservation.alias_version(alias)
+            current = self.aliases(name).get(alias)
+            if current not in (prior, version):
+                raise ValueError(f"harness alias {alias!r} changed after version reservation")
+            if current != version:
+                self._set_alias_unlocked(name, alias, version)
+            commit()
+
+    @contextmanager
+    def _locked(self, name: str) -> Iterator[Path]:
+        directory = self.dir_for(name)
+        directory.mkdir(parents=True, exist_ok=True)
+        _sync_directory(directory.parent)
+        with FileLock(directory / _LOCK_FILE):
+            yield directory
+
+    def _next_available_version_unlocked(self, name: str) -> int:
+        occupied = {*self.versions(name), *self._reservations_unlocked(name)}
+        return max(occupied, default=0) + 1
+
+    def _reservations_unlocked(self, name: str) -> dict[int, HarnessVersionReservation]:
+        directory = self.dir_for(name) / _RESERVATIONS_DIR
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise ValueError(f"invalid harness reservation directory: {directory}")
+        if not directory.is_dir():
+            return {}
+        reservations: dict[int, HarnessVersionReservation] = {}
+        for path in sorted(directory.glob("v*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"invalid harness version reservation: {path}")
+            suffix = path.stem.removeprefix("v")
+            if not suffix.isdigit():
+                continue
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                publication_id = raw["publication_id"]
+                version = raw["version"]
+                aliases = raw["aliases"]
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+                raise ValueError(f"invalid harness version reservation: {path}") from error
+            if (
+                not isinstance(publication_id, str)
+                or isinstance(version, bool)
+                or not isinstance(version, int)
+                or version < 1
+                or version != int(suffix)
+                or not isinstance(aliases, dict)
+            ):
+                raise ValueError(f"invalid harness version reservation: {path}")
+            alias_entries: list[tuple[str, int]] = []
+            for alias, target in aliases.items():
+                if (
+                    not isinstance(alias, str)
+                    or isinstance(target, bool)
+                    or not isinstance(target, int)
+                    or target < 1
+                ):
+                    raise ValueError(f"invalid harness version reservation: {path}")
+                alias_entries.append((alias, target))
+            _validate_publication_id(publication_id)
+            reservations[version] = HarnessVersionReservation(
+                version=version,
+                publication_id=publication_id,
+                aliases=tuple(sorted(alias_entries)),
+            )
+        return reservations
+
+    def _assert_reservation_unlocked(
+        self,
+        name: str,
+        version: int,
+        publication_id: str,
+    ) -> HarnessVersionReservation:
+        reservation = self._reservations_unlocked(name).get(version)
+        if reservation is None or reservation.publication_id != publication_id:
+            raise ValueError(f"harness {name!r} version v{version} is not reserved by publication")
+        return reservation
+
+    def _reservation_path(self, name: str, version: int) -> Path:
+        return self.dir_for(name) / _RESERVATIONS_DIR / f"v{version}.json"
+
+    def _write_version_unlocked(self, doc: HarnessDoc, *, version: int) -> HarnessDoc:
         stamped = doc.model_copy(update={"version": version})
-        directory = self.dir_for(doc.name) / f"v{version}"
-        directory.mkdir(parents=True, exist_ok=False)  # append-only: collision is a bug
-        (directory / _DOC_FILE).write_text(stamped.model_dump_json(indent=2), encoding="utf-8")
-        for rel_path, content in _render(stamped).items():
-            target = directory / rel_path
+        harness_dir = self.dir_for(doc.name)
+        directory = harness_dir / f"v{version}"
+        if directory.exists():
+            raise FileExistsError(f"harness {doc.name!r} version v{version} already exists")
+        temporary = harness_dir / f".v{version}.tmp-{uuid4().hex}"
+        temporary.mkdir(parents=True, exist_ok=False)
+        for rel_path, content in _version_files(stamped).items():
+            target = temporary / rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-        if alias is not None:
-            self.set_alias(doc.name, alias, version)
+            _write_text_durable(target, content)
+        _sync_tree(temporary)
+        temporary.replace(directory)
+        _sync_directory(harness_dir)
         return stamped
+
+    def _set_alias_unlocked(self, name: str, alias: str, version: int) -> None:
+        if version not in self.versions(name):
+            raise ValueError(f"harness {name!r} has no version v{version}")
+        current = self.aliases(name)
+        current[alias] = version
+        path = self.dir_for(name) / _ALIASES_FILE
+        _write_text_atomic(path, tomli_w.dumps({"aliases": current}))
+
+
+def _validate_publication_id(publication_id: str) -> None:
+    if not re.fullmatch(_PUBLICATION_ID_PATTERN, publication_id):
+        raise ValueError("publication_id must be a sha256 content identity")
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp-{uuid4().hex}")
+    _write_text_durable(temporary, content)
+    temporary.replace(path)
+    _sync_directory(path.parent)
+    if path.parent.parent != path.parent:
+        _sync_directory(path.parent.parent)
+
+
+def _write_text_durable(path: Path, content: str) -> None:
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _sync_tree(directory: Path) -> None:
+    directories = [path for path in directory.rglob("*") if path.is_dir()]
+    for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _sync_directory(path)
+    _sync_directory(directory)
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _version_files(doc: HarnessDoc) -> dict[str, str]:
+    return {_DOC_FILE: doc.model_dump_json(indent=2), **_render(doc)}
+
+
+def _version_directory_matches(directory: Path, expected: HarnessDoc) -> bool:
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    expected_files = _version_files(expected)
+    actual_files: dict[str, str] = {}
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            return False
+        if path.is_file():
+            relative = path.relative_to(directory).as_posix()
+            try:
+                actual_files[relative] = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return False
+    return actual_files == expected_files
 
 
 def _render(doc: HarnessDoc) -> dict[str, str]:

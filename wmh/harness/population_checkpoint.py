@@ -101,15 +101,45 @@ class PopulationCheckpointIdentity(BaseModel):
         return self
 
 
+class CheckpointPublicationIntent(BaseModel):
+    """Immutable winner publication target persisted before any visible side effect."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    publication_id: str = Field(pattern=_SHA256_PATTERN)
+    boundary_hash: str = Field(pattern=_SHA256_PATTERN)
+    harness_name: str
+    harness_version: int = Field(strict=True, ge=1)
+    document_hash: str
+    prior_champion_version: int | None = Field(default=None, strict=True, ge=1)
+    archive_manifest: str
+    outcome_path: str
+
+    @field_validator("archive_manifest", "outcome_path")
+    @classmethod
+    def _validate_relative_path(cls, value: str) -> str:
+        candidate = PurePosixPath(value)
+        if (
+            candidate.is_absolute()
+            or not candidate.parts
+            or candidate.as_posix() != value
+            or ".." in candidate.parts
+        ):
+            raise ValueError("checkpoint publication path must be canonical and relative")
+        return value
+
+
 class CheckpointPublication(BaseModel):
     """Durable local publication evidence recorded only at terminal completion."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    publication_id: str = Field(pattern=_SHA256_PATTERN)
     harness_name: str
     harness_version: int = Field(strict=True, ge=1)
     document_hash: str
     archive_manifest: str
+    archive_manifest_hash: str = Field(pattern=_SHA256_PATTERN)
     outcome_path: str
     outcome_hash: str = Field(pattern=_SHA256_PATTERN)
 
@@ -128,6 +158,7 @@ class PopulationCheckpointControl(BaseModel):
     active_step: int | None = Field(default=None, ge=0)
     known_score_cells: int = Field(strict=True, ge=0)
     project_sandbox_usage: SandboxUsage | None = None
+    publication_intent: CheckpointPublicationIntent | None = None
     publication: CheckpointPublication | None = None
 
     @model_validator(mode="after")
@@ -139,6 +170,8 @@ class PopulationCheckpointControl(BaseModel):
                 raise ValueError("ready checkpoint cannot contain an active step")
             if self.publication is not None:
                 raise ValueError("ready checkpoint cannot contain publication evidence")
+            if self.publication_intent is not None:
+                raise ValueError("ready checkpoint cannot contain publication intent")
         elif self.state == "in_progress":
             if self.active_kind is None:
                 raise ValueError("in-progress checkpoint requires an active kind")
@@ -149,11 +182,15 @@ class PopulationCheckpointControl(BaseModel):
                 raise ValueError("active checkpoint step must follow its committed prefix")
             if self.publication is not None:
                 raise ValueError("in-progress checkpoint cannot contain publication evidence")
+            if (self.active_kind == "finalize") != (self.publication_intent is not None):
+                raise ValueError("finalization state must contain exactly one publication intent")
         else:
             if self.active_kind is not None or self.active_step is not None:
                 raise ValueError("complete checkpoint cannot contain an active step")
             if self.publication is None:
                 raise ValueError("complete checkpoint requires publication evidence")
+            if self.publication_intent is not None:
+                raise ValueError("complete checkpoint cannot contain publication intent")
         return self
 
 
@@ -316,13 +353,13 @@ class PopulationCheckpointStore:
 
     @classmethod
     def open(cls, run_dir: Path) -> PopulationCheckpointStore:
-        """Lock and verify one resumable ready checkpoint."""
+        """Lock and verify one ready or safely recoverable checkpoint."""
         root = run_dir / _CHECKPOINT_DIR
         if not root.is_dir():
             raise PopulationCheckpointError(f"checkpoint does not exist: {root}")
         lock_file = _acquire_lock(root / _LOCK_FILE)
         try:
-            _reject_temporary_files(root)
+            _discard_temporary_files(root)
             identity_path = root / _IDENTITY_FILE
             identity = PopulationCheckpointIdentity.model_validate_json(
                 identity_path.read_text(encoding="utf-8")
@@ -332,7 +369,17 @@ class PopulationCheckpointStore:
             )
             if control.identity_hash != _hash_file(identity_path):
                 raise PopulationCheckpointError("checkpoint identity hash differs")
-            if control.state != "ready":
+            resumable_cleanup = (
+                control.state == "in_progress"
+                and control.active_kind == "cleanup"
+                and control.active_step is None
+            )
+            resumable_finalization = (
+                control.state == "in_progress"
+                and control.active_kind == "finalize"
+                and control.active_step is None
+            )
+            if control.state != "ready" and not resumable_cleanup and not resumable_finalization:
                 raise PopulationCheckpointStateError(
                     f"checkpoint state {control.state!r} is not resumable"
                 )
@@ -340,6 +387,19 @@ class PopulationCheckpointStore:
             store = cls(run_dir, lock_file, identity, control, seed, None)
             store._validate_layout()
             store._result = store._load_committed_result()
+            if resumable_cleanup:
+                if store._result is None or control.committed_step < 0:
+                    raise PopulationCheckpointStateError(
+                        "cleanup recovery requires one fully committed boundary"
+                    )
+                store._replace_control(
+                    state="ready",
+                    active_kind=None,
+                    active_step=None,
+                    project_sandbox_usage=None,
+                )
+            elif resumable_finalization:
+                store._validate_publication_intent()
             return store
         except BaseException:
             _release_lock(lock_file)
@@ -360,6 +420,28 @@ class PopulationCheckpointStore:
     def result(self) -> PopulationOptimizationResult | None:
         """Return the fully verified committed prefix, if the seed was scored."""
         return self._result
+
+    @property
+    def publication_id(self) -> str:
+        """Return the stable identity for publishing this exact committed winner."""
+        self._assert_locked()
+        if (
+            self._result is None
+            or self.control.committed_step != self.identity.iterations
+            or self.control.latest_boundary_hash is None
+        ):
+            raise PopulationCheckpointStateError(
+                "publication identity requires a fully committed optimization"
+            )
+        payload = {
+            "boundary_hash": self.control.latest_boundary_hash,
+            "document_hash": self._result.best.candidate.doc_hash,
+            "identity_hash": self.control.identity_hash,
+            "output_name": self.identity.output_name,
+        }
+        return _sha256_bytes(
+            json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        )
 
     def assert_identity(self, expected: PopulationCheckpointIdentity) -> None:
         """Reject any current input drift without mutating checkpoint state."""
@@ -451,15 +533,44 @@ class PopulationCheckpointStore:
             project_sandbox_usage=self._total_segment_usage(segment_usage),
         )
 
-    def begin_finalization(self) -> None:
+    def begin_finalization(
+        self,
+        *,
+        publication_id: str,
+        harness_version: int,
+        document_hash: str,
+        prior_champion_version: int | None,
+        archive_manifest: str,
+        outcome_path: str,
+    ) -> None:
         """Persist intent before archive, store, alias, or outcome publication."""
         self._require_ready()
         if self.control.committed_step != self.identity.iterations:
             raise PopulationCheckpointStateError("optimization prefix is not fully committed")
+        if self._result is None:
+            raise PopulationCheckpointStateError("optimization result is missing")
+        if publication_id != self.publication_id:
+            raise ValueError("publication_id differs from the committed optimization")
+        if document_hash != self._result.best.candidate.doc_hash:
+            raise ValueError("publication document differs from the committed winner")
+        boundary_hash = self.control.latest_boundary_hash
+        if boundary_hash is None:
+            raise PopulationCheckpointStateError("optimization boundary hash is missing")
+        intent = CheckpointPublicationIntent(
+            publication_id=publication_id,
+            boundary_hash=boundary_hash,
+            harness_name=self.identity.output_name,
+            harness_version=harness_version,
+            document_hash=document_hash,
+            prior_champion_version=prior_champion_version,
+            archive_manifest=archive_manifest,
+            outcome_path=outcome_path,
+        )
         self._replace_control(
             state="in_progress",
             active_kind="finalize",
             active_step=None,
+            publication_intent=intent,
         )
 
     def mark_complete(
@@ -473,8 +584,15 @@ class PopulationCheckpointStore:
         self._assert_locked()
         if self.control.state != "in_progress" or self.control.active_kind != "finalize":
             raise PopulationCheckpointStateError("checkpoint is not finalizing")
-        if saved.name != self.identity.output_name or saved.version < 1:
-            raise ValueError("saved harness does not match checkpoint publication identity")
+        intent = self.control.publication_intent
+        if intent is None:
+            raise PopulationCheckpointStateError("checkpoint publication intent is missing")
+        if (
+            saved.name != intent.harness_name
+            or saved.version != intent.harness_version
+            or saved.doc_hash != intent.document_hash
+        ):
+            raise ValueError("saved harness does not match checkpoint publication intent")
         if self._result is None:
             raise PopulationCheckpointError("checkpoint result is missing during publication")
         expected_saved = self._result.best.candidate.model_copy(
@@ -484,11 +602,18 @@ class PopulationCheckpointStore:
             raise ValueError("saved harness differs from the checkpoint winner")
         if not archive_manifest.is_file() or not outcome_path.is_file():
             raise ValueError("checkpoint publication artifacts are incomplete")
+        if (
+            _relative_to_run(self.run_dir, archive_manifest) != intent.archive_manifest
+            or _relative_to_run(self.run_dir, outcome_path) != intent.outcome_path
+        ):
+            raise ValueError("checkpoint publication paths differ from intent")
         publication = CheckpointPublication(
+            publication_id=intent.publication_id,
             harness_name=saved.name,
             harness_version=saved.version,
             document_hash=saved.doc_hash,
             archive_manifest=_relative_to_run(self.run_dir, archive_manifest),
+            archive_manifest_hash=_hash_file(archive_manifest),
             outcome_path=_relative_to_run(self.run_dir, outcome_path),
             outcome_hash=_hash_file(outcome_path),
         )
@@ -496,8 +621,27 @@ class PopulationCheckpointStore:
             state="complete",
             active_kind=None,
             active_step=None,
+            publication_intent=None,
             publication=publication,
         )
+
+    def _validate_publication_intent(self) -> None:
+        intent = self.control.publication_intent
+        if intent is None or self._result is None:
+            raise PopulationCheckpointStateError("finalizing checkpoint is incomplete")
+        if self.control.committed_step != self.identity.iterations:
+            raise PopulationCheckpointStateError(
+                "finalizing checkpoint does not contain the complete optimization"
+            )
+        if (
+            intent.publication_id != self.publication_id
+            or intent.boundary_hash != self.control.latest_boundary_hash
+            or intent.harness_name != self.identity.output_name
+            or intent.document_hash != self._result.best.candidate.doc_hash
+        ):
+            raise PopulationCheckpointStateError(
+                "finalizing checkpoint publication intent differs from committed result"
+            )
 
     def _validate_result_prefix(self, result: PopulationOptimizationResult) -> None:
         if self._result is None:
@@ -999,9 +1143,37 @@ def _release_lock(lock_file: BaseFileLock) -> None:
         lock_file.release()
 
 
-def _reject_temporary_files(root: Path) -> None:
-    if any(re.fullmatch(r".+\.tmp-[0-9a-f]{32}", path.name) for path in root.rglob("*")):
-        raise PopulationCheckpointError("checkpoint contains an interrupted temporary file")
+def _discard_temporary_files(root: Path) -> None:
+    changed: set[Path] = set()
+    for path in list(root.rglob("*")):
+        if not _is_atomic_metadata_tail(root, path):
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise PopulationCheckpointError("checkpoint temporary entry is not a regular file")
+        path.unlink()
+        changed.add(path.parent)
+    for directory in sorted(changed, key=lambda item: len(item.parts), reverse=True):
+        _sync_directory(directory)
+
+
+def _is_atomic_metadata_tail(root: Path, path: Path) -> bool:
+    match = re.fullmatch(r"(.+)\.tmp-[0-9a-f]{32}", path.name)
+    if match is None:
+        return False
+    canonical_name = match.group(1)
+    relative_parent = path.parent.relative_to(root)
+    if relative_parent == Path("."):
+        return canonical_name in {_IDENTITY_FILE, _CONTROL_FILE}
+    if relative_parent == Path("seed"):
+        return canonical_name == _MANIFEST_FILE
+    parts = relative_parent.parts
+    return (
+        len(parts) == 2
+        and parts[0] == "steps"
+        and len(parts[1]) == 4
+        and parts[1].isdigit()
+        and canonical_name == _MANIFEST_FILE
+    )
 
 
 def _relative_to_run(run_dir: Path, path: Path) -> str:

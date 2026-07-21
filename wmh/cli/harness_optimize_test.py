@@ -31,6 +31,7 @@ from wmh.harness.population import (
     PopulationOptimizationResult,
 )
 from wmh.harness.population_checkpoint import (
+    PopulationCheckpointError,
     PopulationCheckpointIdentity,
     PopulationCheckpointStore,
 )
@@ -50,6 +51,7 @@ from wmh.harness.scoring import (
     ScoreRequest,
 )
 from wmh.harness.source_tree import HarnessSourceFile, HarnessSourceTree
+from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 module = importlib.import_module("wmh.cli.harness_optimize")
@@ -405,7 +407,10 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     proposer = cast(ProjectCandidateProposer, optimizer_calls[-1]["proposer"])
     assert proposer._max_history_candidates == 20
     assert proposer._max_history_bytes == 1_000_000
-    assert archived == [(run_dir / "population", result)]
+    assert len(archived) == 1
+    assert archived[0][0].parent == run_dir
+    assert archived[0][0].name.startswith(".population.tmp-")
+    assert archived[0][1] == result
     assert isinstance(outcome, HarnessOptimizeOutcome)
     assert outcome.saved.name == "selected"
     assert outcome.saved.version == 1
@@ -1129,6 +1134,141 @@ def test_execute_finalizes_fully_committed_ready_prefix_without_project_or_score
     assert control["state"] == "complete"
     assert (run_dir / "population/manifest.json").is_file()
     assert (run_dir / "outcome.json").is_file()
+
+
+def test_execute_resumes_exact_publication_after_alias_before_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    root = tmp_path / ".wmh"
+    seed = _source("seed")
+    request = _request()
+    job_config = _job_config(tmp_path)
+    meta_config, agent_config = _configs()
+    identity = _checkpoint_identity(
+        run_dir=run_dir,
+        root=root,
+        job_config=job_config,
+        seed=seed,
+        request=request,
+        iterations=2,
+        max_score_cells=3,
+        meta_config=meta_config,
+        agent_config=agent_config,
+    )
+    with PopulationCheckpointStore.create(run_dir, identity=identity, seed=seed) as checkpoint:
+        _commit_ready_boundary(checkpoint, _result(seed), usage=SandboxUsage())
+        _commit_ready_boundary(
+            checkpoint,
+            _result_with_invalid_iterations(1, seed_source=seed),
+            usage=SandboxUsage(count=1, seconds=1.0),
+        )
+        _commit_ready_boundary(
+            checkpoint,
+            _result_with_invalid_iterations(2, seed_source=seed),
+            usage=SandboxUsage(count=1, seconds=2.0),
+        )
+
+    class FakeScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> FakeScorer:
+            return cls()
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            assert attempts == 1
+            return request
+
+    class UnreachedProjectFactory:
+        @classmethod
+        def create(cls, **_kwargs: object) -> _Project:
+            raise AssertionError("fully committed checkpoint must not create a project")
+
+    original_mark_complete = PopulationCheckpointStore.mark_complete
+    completion_calls = 0
+
+    def fail_once(
+        self: PopulationCheckpointStore,
+        *,
+        saved: HarnessDoc,
+        archive_manifest: Path,
+        outcome_path: Path,
+    ) -> None:
+        nonlocal completion_calls
+        completion_calls += 1
+        if completion_calls == 1:
+            raise RuntimeError("completion interrupted")
+        original_mark_complete(
+            self,
+            saved=saved,
+            archive_manifest=archive_manifest,
+            outcome_path=outcome_path,
+        )
+
+    monkeypatch.setattr(module, "HarborScorer", FakeScorer)
+    monkeypatch.setattr(module, "AgentProject", UnreachedProjectFactory)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+    monkeypatch.setattr(PopulationCheckpointStore, "mark_complete", fail_once)
+    arguments = {
+        "name": "selected",
+        "root": str(root),
+        "run_dir": run_dir,
+        "job_config": job_config,
+        "task_ids": ("task-a",),
+        "reward_key": "reward",
+        "iterations": 2,
+        "attempts": 1,
+        "max_score_cells": 3,
+        "seed": None,
+        "seed_reference": None,
+        "meta_config": meta_config,
+        "agent_config": agent_config,
+        "harness_backend": "local",
+        "e2b_template": None,
+        "environment_command_timeout_sec": 300,
+        "project_timeout_sec": 900,
+        "max_history_candidates": 20,
+        "max_history_bytes": 1_000_000,
+        "resume": True,
+        "max_new_boundaries": None,
+    }
+
+    with pytest.raises(RuntimeError, match="completion interrupted"):
+        _execute_optimization(**arguments)
+
+    store = HarnessStore(root)
+    assert store.versions("selected") == [1]
+    assert store.aliases("selected")[CHAMPION_ALIAS] == 1
+    assert (run_dir / "population/manifest.json").is_file()
+    assert (run_dir / "outcome.json").is_file()
+    interrupted = json.loads((run_dir / "checkpoint/control.json").read_text())
+    assert interrupted["state"] == "in_progress"
+    assert interrupted["active_kind"] == "finalize"
+    assert interrupted["publication_intent"]["harness_version"] == 1
+
+    manifest_path = run_dir / "population/manifest.json"
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    with pytest.raises(PopulationCheckpointError, match="archive differs"):
+        _execute_optimization(**arguments)
+    manifest_path.write_bytes(manifest_bytes)
+
+    outcome_path = run_dir / "outcome.json"
+    outcome_bytes = outcome_path.read_bytes()
+    outcome_path.write_text(
+        json.dumps(json.loads(outcome_bytes)),
+        encoding="utf-8",
+    )
+    with pytest.raises(PopulationCheckpointError, match="JSON bytes differ"):
+        _execute_optimization(**arguments)
+    outcome_path.write_bytes(outcome_bytes)
+
+    outcome = _execute_optimization(**arguments)
+
+    assert isinstance(outcome, HarnessOptimizeOutcome)
+    assert outcome.saved.version == 1
+    assert store.versions("selected") == [1]
+    assert store.aliases("selected")[CHAMPION_ALIAS] == 1
+    assert json.loads((run_dir / "checkpoint/control.json").read_text())["state"] == "complete"
 
 
 def test_project_teardown_failure_keeps_final_boundary_nonresumable(
