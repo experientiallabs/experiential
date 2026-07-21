@@ -7,16 +7,12 @@ builds task-specific harnesses for stronger performance at lower cost.
 ```mermaid
 flowchart TB
     world["World model<br/>Simulates the environment"]
-
-    subgraph agents[" "]
-        direction LR
-        worker["Worker agent<br/>Runs tasks"]
-        optimizer["Optimizer agent<br/>Improves the harness"]
-    end
+    worker["Worker agent<br/>Runs tasks"]
+    optimizer["Optimizer agent<br/>Improves the harness"]
 
     world <-->|"actions / observations"| worker
+    world <-->|"evaluation / feedback"| optimizer
     worker <-->|"traces / harness updates"| optimizer
-    optimizer <-->|"evaluation / feedback"| world
 
     classDef world fill:#ffffff,stroke:#0070f3,color:#0a0a0a,stroke-width:2px
     classDef worker fill:#ffffff,stroke:#7928ca,color:#0a0a0a,stroke-width:2px
@@ -25,10 +21,9 @@ flowchart TB
     class world world
     class worker worker
     class optimizer optimizer
-    style agents fill:transparent,stroke:transparent
     linkStyle 0 stroke:#0070f3,stroke-width:2px
-    linkStyle 1 stroke:#7928ca,stroke-width:2px
-    linkStyle 2 stroke:#f5a623,stroke-width:2px
+    linkStyle 1 stroke:#f5a623,stroke-width:2px
+    linkStyle 2 stroke:#7928ca,stroke-width:2px
 ```
 
 ## Getting started
