@@ -37,7 +37,7 @@ from harbor.models.agent.name import AgentName
 from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig, RetryConfig
 from harbor.models.job.result import JobResult
-from harbor.models.trial.config import TaskConfig
+from harbor.models.trial.config import AgentConfig, TaskConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
@@ -163,7 +163,7 @@ class HarborScorer:
                 "shares one runner dir); use harness_backend='e2b' for parallel trials"
             )
         # model_copy(update=) skips validation, so the copied config is re-validated as a whole.
-        self._job_template = JobConfig.model_validate(
+        self._job_template = _revalidated_job_config(
             job_template.model_copy(
                 update={
                     "environment": environment,
@@ -174,7 +174,7 @@ class HarborScorer:
                     "retry": RetryConfig(max_retries=harbor_retries),
                 },
                 deep=True,
-            ).model_dump(mode="python")
+            )
         )
         self._tasks = [TaskConfig.model_validate(task.model_dump(mode="python")) for task in tasks]
         self._task_ids = tuple(task_ids)
@@ -284,8 +284,10 @@ class HarborScorer:
 
     def _candidate_job(self, doc: HarnessDoc) -> JobConfig:
         template_agent = self._job_template.agents[0]
-        agent = template_agent.model_copy(
-            update={
+        # Constructor, not model_copy(update=): construction runs AgentConfig's validators.
+        agent_fields = {name: getattr(template_agent, name) for name in AgentConfig.model_fields}
+        agent_fields.update(
+            {
                 "name": None,
                 "import_path": WMH_HARBOR_AGENT_IMPORT_PATH,
                 "model_name": f"{self._provider_config.kind.value}/{self._provider_config.model}",
@@ -301,9 +303,9 @@ class HarborScorer:
                     "episode_timeout_sec": self._episode_timeout_s,
                     "episode_workers": self._episode_workers,
                 },
-            },
-            deep=True,
+            }
         )
+        agent = AgentConfig(**agent_fields)
         config = self._job_template.model_copy(
             update={
                 # Deterministic (NOT uuid-suffixed): rescoring the same candidate resumes its
@@ -316,7 +318,7 @@ class HarborScorer:
             deep=True,
         )
         # model_copy(update=) skips validation: re-validate the exact config harbor will run.
-        return JobConfig.model_validate(config.model_dump(mode="python"))
+        return _revalidated_job_config(config)
 
     def _project(self, doc: HarnessDoc, run: HarborRun) -> ScoreReport:
         result = run.result
@@ -364,6 +366,19 @@ class HarborScorer:
             reward_mode=self._reward_mode,
             cells=tuple(cells),
         )
+
+
+def _revalidated_job_config(config: JobConfig) -> JobConfig:
+    """Re-run JobConfig validation without serializing env-bearing sections.
+
+    model_copy(update=) skips validation, and a model_dump round-trip is NOT safe here:
+    harbor's EnvironmentConfig/VerifierConfig env field serializers templatize and redact
+    sensitive-named values on every dump (harbor.utils.env.templatize_sensitive_env) with no
+    disabling context, so dumping would silently corrupt a literal secret whose value differs
+    from os.environ. Reconstructing from field values re-runs every JobConfig validator while
+    nested models pass through by reference, never through their serializers.
+    """
+    return JobConfig(**{name: getattr(config, name) for name in JobConfig.model_fields})
 
 
 def _validate_job_template(job_template: JobConfig) -> None:

@@ -307,6 +307,31 @@ def test_builtin_e2b_environment_is_routed_through_the_paced_subclass(tmp_path: 
     assert config.environment.kwargs == {"keep": "me"}  # options survive the routing rewrite
 
 
+def test_sensitive_env_values_survive_scorer_revalidation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """harbor redacts sensitive-named env values on every model_dump when the literal differs
+    from os.environ; the scorer's re-validation must never route env-bearing sections through
+    that serializer."""
+    monkeypatch.delenv("TASK_API_KEY", raising=False)
+    monkeypatch.delenv("GRADER_TOKEN", raising=False)
+    template = _job_template(tmp_path)
+    template.environment.env = {"TASK_API_KEY": "literal-secret-12345"}
+    template.verifier.env = {"GRADER_TOKEN": "grader-secret-6789"}
+    scorer = HarborScorer(
+        job_template=template,
+        tasks=_tasks(tmp_path, ("task-a",)),
+        provider_config=_provider(),
+        harness_backend="e2b",
+        agent_concurrency=1,
+        runner=_Runner([]),
+    )
+    config = scorer._candidate_job(HarnessDoc.baseline())
+    assert config.environment.env == {"TASK_API_KEY": "literal-secret-12345"}
+    assert config.verifier.env == {"GRADER_TOKEN": "grader-secret-6789"}
+
+
 def test_candidate_job_is_revalidated_after_model_copy(tmp_path: Path) -> None:
     """model_copy(update=) skips validation; the scorer must re-validate the exact config."""
     template = _job_template(tmp_path)
