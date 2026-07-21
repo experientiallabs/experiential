@@ -174,6 +174,7 @@ class ProjectCandidateProposer:
         provider: ToolCallingProvider,
         *,
         directive: str = "",
+        on_event: Callable[[SessionEvent], None] | None = None,
         max_source_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
         max_source_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
         max_history_candidates: int = DEFAULT_MAX_HISTORY_CANDIDATES,
@@ -188,6 +189,7 @@ class ProjectCandidateProposer:
             if len(directive) > MAX_DIRECTIVE_CHARS:
                 raise ValueError(f"proposal directive exceeds {MAX_DIRECTIVE_CHARS} characters")
         self._directive = directive
+        self._on_event = on_event
         self._project = project
         self._agent = agent
         self._provider = provider
@@ -299,6 +301,15 @@ class ProjectCandidateProposer:
         self._proposal_count = next_proposal_count
 
         events: list[SessionEvent] = []
+
+        def sink(event: SessionEvent) -> None:
+            events.append(event)
+            if self._on_event is not None:
+                try:
+                    self._on_event(event)
+                except Exception:  # noqa: BLE001 - a sink error must never abort the proposal
+                    pass
+
         run_error: str | None = None
         run_result: AgentProjectRun | None = None
         try:
@@ -306,7 +317,7 @@ class ProjectCandidateProposer:
                 self._agent,
                 self._provider,
                 request,
-                on_event=events.append,
+                on_event=sink,
                 should_cancel=should_cancel,
                 writable_files=(),
                 retry_recoverable=False,

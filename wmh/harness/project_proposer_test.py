@@ -205,6 +205,72 @@ def _emit_bash_activity(
         on_event(SessionEvent(kind="tool_call", payload={"name": "bash"}))
 
 
+def _emit_two_events(
+    project: _FakeProject,
+    granted: tuple[str, ...],
+    on_event: Callable[[SessionEvent], None] | None,
+) -> None:
+    del project
+    assert granted == ()
+    if on_event is not None:
+        on_event(SessionEvent(kind="tool_call", payload={"name": "bash"}))
+        on_event(SessionEvent(kind="tool_output", payload={"chunk": "ok"}))
+
+
+def test_on_event_receives_every_agent_event_in_order() -> None:
+    project = _FakeProject([_source("improved")])
+    project.run_behavior = _emit_two_events
+    streamed: list[SessionEvent] = []
+    proposer = ProjectCandidateProposer(
+        project, optimizer_agent(), _provider(), on_event=streamed.append
+    )
+
+    result = proposer.propose((_evaluated(),))
+
+    assert [event.kind for event in streamed] == ["tool_call", "tool_output", "submit"]
+    assert list(streamed) == list(result.events)
+    assert [event.kind for event in result.events] == ["tool_call", "tool_output", "submit"]
+
+
+def test_on_event_failure_does_not_break_propose() -> None:
+    project = _FakeProject([_source("improved")])
+    project.run_behavior = _emit_two_events
+    seen: list[SessionEvent] = []
+
+    def raising_sink(event: SessionEvent) -> None:
+        seen.append(event)
+        raise RuntimeError("sink exploded")
+
+    proposer = ProjectCandidateProposer(
+        project, optimizer_agent(), _provider(), on_event=raising_sink
+    )
+
+    result = proposer.propose((_evaluated(),))
+
+    assert result.candidate_id == "candidate-0001"
+    assert result.candidate.system_prompt() == "improved"
+    assert [event.kind for event in seen] == ["tool_call", "tool_output", "submit"]
+    assert [event.kind for event in result.events] == ["tool_call", "tool_output", "submit"]
+
+
+def test_on_event_none_is_byte_identical_to_omitting_it() -> None:
+    baseline_project = _FakeProject([_source("improved")])
+    baseline_project.run_behavior = _emit_two_events
+    baseline = ProjectCandidateProposer(baseline_project, optimizer_agent(), _provider())
+    baseline_result = baseline.propose((_evaluated(),))
+
+    none_project = _FakeProject([_source("improved")])
+    none_project.run_behavior = _emit_two_events
+    none_proposer = ProjectCandidateProposer(
+        none_project, optimizer_agent(), _provider(), on_event=None
+    )
+    none_result = none_proposer.propose((_evaluated(),))
+
+    assert none_result == baseline_result
+    assert none_project.files == baseline_project.files
+    assert none_project.run_calls == baseline_project.run_calls
+
+
 def test_evaluated_candidate_rejects_score_identity_drift() -> None:
     evaluated = _evaluated()
     changed = _source("changed")
