@@ -352,6 +352,13 @@ def test_checkpoint_identity_drift_rejects_without_mutation(tmp_path: Path) -> N
             store.assert_identity(changed)
         assert (run_dir / "checkpoint/control.json").read_bytes() == control_before
 
+        changed_optimizer = identity.model_copy(
+            update={"optimizer_document_hash": "updated-optimizer-doc-hash"}
+        )
+        with pytest.raises(PopulationCheckpointError, match="optimizer_document_hash"):
+            store.assert_identity(changed_optimizer)
+        assert (run_dir / "checkpoint/control.json").read_bytes() == control_before
+
 
 def test_checkpoint_tamper_fails_closed_and_atomic_tail_recovers(tmp_path: Path) -> None:
     seed = _source("seed")
