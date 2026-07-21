@@ -524,6 +524,11 @@ def build(
         )
     # The wizard always resolves a provider; the flag path keeps its historical default.
     params.provider = params.provider or "bedrock"
+    # The wizard may replace the configured worker's provider. Re-evaluate the match before
+    # carrying provider-specific connection fields into the build config.
+    use_configured_worker = (
+        configured_worker is not None and params.provider == configured_worker.provider
+    )
 
     # Flag-supplied names get the same whitespace-to-dash normalization as the wizard.
     params.name = normalize_name(params.name)
