@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 
 import pytest
 
 from wmh.agents.default import default_agent
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.live_session import SessionEvent
-from wmh.harness.population import HarnessPopulationOptimizer
+from wmh.harness.population import HarnessPopulationOptimizer, PopulationOptimizationResult
 from wmh.harness.project_proposer import (
     CandidateProposal,
     CandidateProposalError,
@@ -98,6 +99,24 @@ class _Proposer:
         if isinstance(outcome, CandidateProposalError):
             raise outcome
         return outcome
+
+
+class _ResumableProposer(_Proposer):
+    def __init__(self, outcomes: Sequence[CandidateProposal | CandidateProposalError]) -> None:
+        super().__init__(outcomes)
+        self.restore_calls: list[
+            tuple[
+                tuple[EvaluatedCandidate, ...],
+                tuple[CandidateProposal | CandidateProposalError, ...],
+            ]
+        ] = []
+
+    def restore(
+        self,
+        history: Sequence[EvaluatedCandidate],
+        turns: Sequence[CandidateProposal | CandidateProposalError],
+    ) -> None:
+        self.restore_calls.append((tuple(history), tuple(turns)))
 
 
 def _request() -> ScoreRequest:
@@ -387,4 +406,194 @@ def test_optimizer_honors_cancellation_before_scoring_seed() -> None:
         )
 
     assert scorer.calls == []
+    assert proposer.histories == []
+
+
+def test_optimizer_commits_seed_and_each_consumed_slot_at_pre_spend_boundaries() -> None:
+    proposer = _Proposer(
+        [
+            _proposal("candidate-0001", "first"),
+            CandidateProposalError("candidate-0002", "invalid"),
+        ]
+    )
+    scorer = _Scorer([(0.2, False), (0.8, True)])
+    started: list[int] = []
+    committed: list[PopulationOptimizationResult] = []
+
+    result = HarnessPopulationOptimizer(proposer, scorer).optimize(
+        seed=_source("seed"),
+        request=_request(),
+        iterations=2,
+        before_step=started.append,
+        on_boundary=committed.append,
+    )
+
+    assert started == [0, 1, 2]
+    assert [len(boundary.iterations) for boundary in committed] == [0, 1, 2]
+    assert [len(boundary.population) for boundary in committed] == [1, 2, 2]
+    assert committed[-1] == result
+
+
+def test_optimizer_resumes_without_replaying_seed_or_consumed_slots() -> None:
+    first_proposer = _Proposer(
+        [
+            _proposal("candidate-0001", "first"),
+            CandidateProposalError("candidate-0002", "invalid"),
+        ]
+    )
+    partial = HarnessPopulationOptimizer(
+        first_proposer,
+        _Scorer([(0.2, False), (0.8, True)]),
+    ).optimize(
+        seed=_source("seed"),
+        request=_request(),
+        iterations=2,
+    )
+    resumed_proposer = _ResumableProposer([_proposal("candidate-0003", "third")])
+    resumed_scorer = _Scorer([(0.6, True)])
+    started: list[int] = []
+    committed: list[PopulationOptimizationResult] = []
+
+    result = HarnessPopulationOptimizer(resumed_proposer, resumed_scorer).optimize(
+        seed=_source("seed"),
+        request=_request(),
+        iterations=3,
+        resume=partial,
+        before_step=started.append,
+        on_boundary=committed.append,
+    )
+
+    [restore] = resumed_proposer.restore_calls
+    assert [candidate.candidate_id for candidate in restore[0]] == [
+        "candidate-0000",
+        "candidate-0001",
+    ]
+    assert [turn.candidate_id for turn in restore[1]] == [
+        "candidate-0001",
+        "candidate-0002",
+    ]
+    assert started == [3]
+    assert len(resumed_scorer.calls) == 1
+    assert [item.candidate_id for item in result.population] == [
+        "candidate-0000",
+        "candidate-0001",
+        "candidate-0003",
+    ]
+    assert [len(boundary.iterations) for boundary in committed] == [3]
+
+
+def test_optimizer_rejects_resume_with_changed_seed_or_request_before_spend() -> None:
+    partial = HarnessPopulationOptimizer(
+        _Proposer([_proposal("candidate-0001", "first")]),
+        _Scorer([(0.2, False), (0.8, True)]),
+    ).optimize(seed=_source("seed"), request=_request(), iterations=1)
+
+    for seed, request, match in (
+        (_source("changed"), _request(), "seed"),
+        (
+            _source("seed"),
+            _request().model_copy(
+                update={
+                    "context": _request().context.model_copy(
+                        update={"evaluator_digest": "sha256:" + "d" * 64}
+                    )
+                }
+            ),
+            "request",
+        ),
+    ):
+        proposer = _ResumableProposer([])
+        scorer = _Scorer([])
+        with pytest.raises(ValueError, match=match):
+            HarnessPopulationOptimizer(proposer, scorer).optimize(
+                seed=seed,
+                request=request,
+                iterations=2,
+                resume=partial,
+            )
+        assert proposer.restore_calls == []
+        assert scorer.calls == []
+
+
+def test_optimizer_requires_restore_capability_before_resuming() -> None:
+    partial = HarnessPopulationOptimizer(
+        _Proposer([_proposal("candidate-0001", "first")]),
+        _Scorer([(0.2, False), (0.8, True)]),
+    ).optimize(seed=_source("seed"), request=_request(), iterations=1)
+    scorer = _Scorer([])
+
+    with pytest.raises(TypeError, match="does not support resume"):
+        HarnessPopulationOptimizer(_Proposer([]), scorer).optimize(
+            seed=_source("seed"),
+            request=_request(),
+            iterations=2,
+            resume=partial,
+        )
+
+    assert scorer.calls == []
+
+
+def test_optimizer_rejects_resume_with_too_many_consumed_slots_before_spend() -> None:
+    partial = HarnessPopulationOptimizer(
+        _Proposer(
+            [
+                _proposal("candidate-0001", "first"),
+                CandidateProposalError("candidate-0002", "invalid"),
+            ]
+        ),
+        _Scorer([(0.2, False), (0.8, True)]),
+    ).optimize(seed=_source("seed"), request=_request(), iterations=2)
+    proposer = _ResumableProposer([])
+    scorer = _Scorer([])
+
+    with pytest.raises(ValueError, match="more consumed slots"):
+        HarnessPopulationOptimizer(proposer, scorer).optimize(
+            seed=_source("seed"),
+            request=_request(),
+            iterations=1,
+            resume=partial,
+        )
+
+    assert proposer.restore_calls == []
+    assert scorer.calls == []
+
+
+def test_population_result_rejects_malformed_checkpoint_structure() -> None:
+    result = HarnessPopulationOptimizer(
+        _Proposer([_proposal("candidate-0001", "first")]),
+        _Scorer([(0.2, False), (0.8, True)]),
+    ).optimize(seed=_source("seed"), request=_request(), iterations=1)
+    [iteration] = result.iterations
+    assert iteration.proposal is not None
+
+    with pytest.raises(ValueError, match="contiguous"):
+        replace(result, iterations=(replace(iteration, index=2),))
+
+    renamed = replace(
+        iteration.proposal,
+        candidate=iteration.proposal.source.to_doc("renamed"),
+    )
+    with pytest.raises(ValueError, match="document name"):
+        replace(result, iterations=(replace(iteration, proposal=renamed),))
+
+    with pytest.raises(ValueError, match="earliest candidate"):
+        replace(result, best=result.population[0])
+
+
+def test_boundary_failure_stops_before_the_next_spend_step() -> None:
+    proposer = _Proposer([_proposal("candidate-0001", "unreached")])
+    scorer = _Scorer([(0.2, False)])
+
+    def fail_boundary(_result: PopulationOptimizationResult) -> None:
+        raise OSError("checkpoint unavailable")
+
+    with pytest.raises(OSError, match="checkpoint unavailable"):
+        HarnessPopulationOptimizer(proposer, scorer).optimize(
+            seed=_source("seed"),
+            request=_request(),
+            iterations=1,
+            on_boundary=fail_boundary,
+        )
+
+    assert len(scorer.calls) == 1
     assert proposer.histories == []

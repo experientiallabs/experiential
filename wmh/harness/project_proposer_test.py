@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import pytest
@@ -313,6 +313,139 @@ def test_partial_history_write_cannot_be_reused_for_a_different_candidate() -> N
 
     assert recovered.candidate_id == "candidate-0001"
     assert len(project.run_calls) == 1
+
+
+def test_project_proposer_restores_exact_valid_and_invalid_turns_before_continuing() -> None:
+    first_source = _source("first")
+    invalid_source = HarnessSourceTree(
+        files=(HarnessSourceFile(path="notes.txt", content="unfinished"),)
+    )
+    original_project = _FakeProject([first_source, invalid_source])
+    original_project.run_behavior = _emit_bash_activity
+    original = ProjectCandidateProposer(original_project, optimizer_agent(), _provider())
+    seed = _evaluated("candidate-0000")
+
+    first = original.propose((seed,))
+    scored_first = _evaluated("candidate-0001", source=first.source)
+    original_project.emit_submit = False
+    with pytest.raises(CandidateProposalError) as raised:
+        original.propose((seed, scored_first))
+    invalid = raised.value
+
+    restored_project = _FakeProject([_source("third")])
+    restored_project.run_behavior = _emit_bash_activity
+    restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
+    restored.restore((seed, scored_first), (first, invalid))
+
+    original_trace = {
+        path: content
+        for path, content in original_project.files.items()
+        if path.startswith("proposals/")
+    }
+    restored_trace = {
+        path: content
+        for path, content in restored_project.files.items()
+        if path.startswith("proposals/")
+    }
+    assert restored_trace == original_trace
+    assert len(restored_project.staged) == 2
+
+    third = restored.propose((seed, scored_first))
+    assert third.candidate_id == "candidate-0003"
+    assert "proposals/candidate-0002/events.json" in restored_project.run_calls[0].instruction
+
+
+@pytest.mark.parametrize("field", ["request", "status_json"])
+def test_project_proposer_restore_rejects_incomplete_trace_before_writes(field: str) -> None:
+    project = _FakeProject([_source("first")])
+    project.run_behavior = _emit_bash_activity
+    original = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    seed = _evaluated("candidate-0000")
+    proposal = original.propose((seed,))
+    incomplete = replace(proposal, **{field: ""})
+    restored_project = _FakeProject([_source("unused")])
+    restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
+
+    with pytest.raises(ValueError, match=field):
+        restored.restore(
+            (seed, _evaluated("candidate-0001", source=proposal.source)),
+            (incomplete,),
+        )
+
+    assert restored_project.files == {}
+    assert restored_project.staged == []
+
+
+def test_project_proposer_restore_rejects_valid_turn_without_submit_before_writes() -> None:
+    project = _FakeProject([_source("first")])
+    original = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    seed = _evaluated("candidate-0000")
+    proposal = original.propose((seed,))
+    incomplete = replace(proposal, events=())
+    restored_project = _FakeProject([_source("unused")])
+    restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
+
+    with pytest.raises(ValueError, match="submit event"):
+        restored.restore(
+            (seed, _evaluated("candidate-0001", source=proposal.source)),
+            (incomplete,),
+        )
+
+    assert restored_project.files == {}
+    assert restored_project.staged == []
+
+
+def test_project_proposer_restore_rejects_tampered_request_without_an_agent_run() -> None:
+    project = _FakeProject([_source("first")])
+    original = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    seed = _evaluated("candidate-0000")
+    proposal = original.propose((seed,))
+    tampered = replace(proposal, request=proposal.request + "changed\n")
+    restored_project = _FakeProject([_source("unused")])
+    restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
+
+    with pytest.raises(ValueError, match="request differs"):
+        restored.restore(
+            (seed, _evaluated("candidate-0001", source=proposal.source)),
+            (tampered,),
+        )
+
+    assert restored_project.run_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("candidate_id", "candidate-9999", "candidate_id"),
+        ("valid", False, "validity"),
+        ("source_tree_hash", "sha256:" + "f" * 64, "source hash"),
+        ("candidate_doc_hash", "sha256:" + "e" * 64, "document hash"),
+    ],
+)
+def test_project_proposer_restore_rejects_tampered_status_before_writes(
+    field: str,
+    value: str | bool,
+    match: str,
+) -> None:
+    project = _FakeProject([_source("first")])
+    original = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+    seed = _evaluated("candidate-0000")
+    proposal = original.propose((seed,))
+    status = json.loads(proposal.status_json)
+    status[field] = value
+    tampered = replace(proposal, status_json=json.dumps(status, indent=2, sort_keys=True))
+    restored_project = _FakeProject([_source("unused")])
+    restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
+
+    with pytest.raises(ValueError, match=match):
+        restored.restore(
+            (seed, _evaluated("candidate-0001", source=proposal.source)),
+            (tampered,),
+        )
+
+    assert restored_project.files == {}
+    assert restored_project.staged == []
+    assert restored_project.run_calls == []
 
 
 def test_pre_turn_stage_failure_does_not_advance_proposal_identity() -> None:

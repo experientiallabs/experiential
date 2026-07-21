@@ -17,7 +17,7 @@ from wmh.harness.live_session import SessionEvent
 from wmh.harness.population import PopulationOptimizationResult
 from wmh.harness.runtime import TokenUsage
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 def write_population_archive(
@@ -73,9 +73,12 @@ def write_population_archive(
         if iteration.index != expected_index:
             raise ValueError("population archive iterations must be contiguous and one-indexed")
         iteration_dir = root / "iterations" / f"{iteration.index:04d}"
+        request_path = iteration_dir / "REQUEST.md"
         events_path = iteration_dir / "events.json"
+        status_path = iteration_dir / "status.json"
         entry: JsonObject = {}
         if iteration.error is not None:
+            turn = iteration.error
             events = iteration.error.events
             usage = iteration.error.worker_usage
             entry.update(
@@ -83,7 +86,7 @@ def write_population_archive(
                     "index": iteration.index,
                     "candidate_id": iteration.error.candidate_id,
                     "outcome": "invalid",
-                    "error": str(iteration.error),
+                    "error": iteration.error.reason,
                     "worker_usage": _usage(usage),
                     "events_path": relative_path(root, events_path),
                 }
@@ -96,6 +99,7 @@ def write_population_archive(
         else:
             assert iteration.proposal is not None
             assert iteration.evaluation is not None
+            turn = iteration.proposal
             events = iteration.proposal.events
             entry.update(
                 {
@@ -108,7 +112,13 @@ def write_population_archive(
                     "events_path": relative_path(root, events_path),
                 }
             )
+        if not turn.request or not turn.status_json:
+            raise ValueError("population archive proposal trace is incomplete")
+        write_text(request_path, turn.request)
         _write_events(events_path, events)
+        write_text(status_path, turn.status_json)
+        entry["request_path"] = relative_path(root, request_path)
+        entry["status_path"] = relative_path(root, status_path)
         iteration_entries.append(entry)
 
     manifest_path = root / "manifest.json"

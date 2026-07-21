@@ -91,6 +91,21 @@ def _evaluated(candidate_id: str, prompt: str, score: float) -> EvaluatedCandida
     )
 
 
+def _status(candidate_id: str, source: HarnessSourceTree, *, valid: bool) -> str:
+    return json.dumps(
+        {
+            "agent_error": None,
+            "candidate_doc_hash": (source.to_doc(candidate_id).doc_hash if valid else None),
+            "candidate_id": candidate_id,
+            "source_tree_hash": source.tree_hash,
+            "valid": valid,
+            "validation_error": None if valid else "did not submit",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
 def test_archive_copies_sources_reports_artifacts_and_proposal_events(tmp_path: Path) -> None:
     seed = _evaluated("candidate-0000", "seed", 0.0)
     candidate = _evaluated("candidate-0001", "candidate", 1.0)
@@ -100,6 +115,8 @@ def test_archive_copies_sources_reports_artifacts_and_proposal_events(tmp_path: 
         candidate=candidate.candidate,
         events=(SessionEvent(kind="submit", payload={"answer": "done"}),),
         worker_usage=TokenUsage(input_tokens=10, output_tokens=4, calls=1),
+        request="produce candidate-0001",
+        status_json=_status(candidate.candidate_id, candidate.source, valid=True),
     )
     result = PopulationOptimizationResult(
         population=(seed, candidate),
@@ -124,6 +141,8 @@ def test_archive_copies_sources_reports_artifacts_and_proposal_events(tmp_path: 
     events = json.loads((destination / "iterations/0001/events.json").read_text(encoding="utf-8"))
     assert events == [{"kind": "submit", "payload": {"answer": "done"}}]
     assert manifest["iterations"][0]["worker_usage"]["calls"] == 1
+    assert (destination / "iterations/0001/REQUEST.md").read_text() == ("produce candidate-0001")
+    assert json.loads((destination / "iterations/0001/status.json").read_text())["valid"]
 
 
 def test_archive_preserves_invalid_iteration_source_and_unknown_usage(tmp_path: Path) -> None:
@@ -135,6 +154,8 @@ def test_archive_preserves_invalid_iteration_source_and_unknown_usage(tmp_path: 
         source=invalid_source,
         events=(SessionEvent(kind="error", payload={"message": "stopped"}),),
         worker_usage=None,
+        request="produce candidate-0001",
+        status_json=_status("candidate-0001", invalid_source, valid=False),
     )
     result = PopulationOptimizationResult(
         population=(seed,),
@@ -149,7 +170,7 @@ def test_archive_preserves_invalid_iteration_source_and_unknown_usage(tmp_path: 
     [iteration] = manifest["iterations"]
     assert iteration["outcome"] == "invalid"
     assert iteration["worker_usage"] is None
-    assert "did not submit" in iteration["error"]
+    assert iteration["error"] == "did not submit"
     assert (destination / "iterations/0001/source/SYSTEM.md").read_text() == (
         "invalid but captured"
     )
@@ -161,6 +182,19 @@ def test_archive_materializes_an_empty_invalid_source_directory(tmp_path: Path) 
         "candidate-0001",
         "empty snapshot",
         source=HarnessSourceTree(files=()),
+        request="produce candidate-0001",
+        status_json=json.dumps(
+            {
+                "agent_error": None,
+                "candidate_doc_hash": None,
+                "candidate_id": "candidate-0001",
+                "source_tree_hash": HarnessSourceTree(files=()).tree_hash,
+                "valid": False,
+                "validation_error": "empty snapshot",
+            },
+            indent=2,
+            sort_keys=True,
+        ),
     )
     result = PopulationOptimizationResult(
         population=(seed,),

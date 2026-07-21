@@ -7,7 +7,7 @@ import hashlib
 import json
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from wmh.agents.project import (
     DEFAULT_SOURCE_TREE_MAX_BYTES,
@@ -113,6 +113,8 @@ class CandidateProposal:
     candidate: HarnessDoc
     events: tuple[SessionEvent, ...]
     worker_usage: TokenUsage
+    request: str = ""
+    status_json: str = ""
 
 
 class CandidateProposalError(RuntimeError):
@@ -126,12 +128,17 @@ class CandidateProposalError(RuntimeError):
         source: HarnessSourceTree | None = None,
         events: Sequence[SessionEvent] = (),
         worker_usage: TokenUsage | None = None,
+        request: str = "",
+        status_json: str = "",
     ) -> None:
         super().__init__(f"{candidate_id}: {reason}")
         self.candidate_id = candidate_id
+        self.reason = reason
         self.source = source
         self.events = tuple(events)
         self.worker_usage = worker_usage
+        self.request = request
+        self.status_json = status_json
 
 
 class CandidateProposer(Protocol):
@@ -143,6 +150,17 @@ class CandidateProposer(Protocol):
         *,
         should_cancel: Callable[[], bool] | None = None,
     ) -> CandidateProposal: ...
+
+
+@runtime_checkable
+class ResumableCandidateProposer(CandidateProposer, Protocol):
+    """Restore append-only proposal state before producing another candidate."""
+
+    def restore(
+        self,
+        history: Sequence[EvaluatedCandidate],
+        turns: Sequence[CandidateProposal | CandidateProposalError],
+    ) -> None: ...
 
 
 class ProjectCandidateProposer:
@@ -172,6 +190,49 @@ class ProjectCandidateProposer:
         self._max_history_bytes = max_history_bytes
         self._history_fingerprints: tuple[str, ...] = ()
         self._proposal_count = 0
+
+    def restore(
+        self,
+        history: Sequence[EvaluatedCandidate],
+        turns: Sequence[CandidateProposal | CandidateProposalError],
+    ) -> None:
+        """Restore exact committed proposal traces into a fresh project."""
+        if self._history_fingerprints or self._proposal_count:
+            raise ValueError("candidate proposer restore requires fresh proposer state")
+        frozen_history = tuple(history)
+        frozen_turns = tuple(turns)
+        fingerprints = self._validate_restored_state(frozen_history, frozen_turns)
+
+        self._materialize_history(frozen_history, fingerprints=fingerprints, start=0)
+        self._write_history_manifest(frozen_history)
+        history_count = 1
+        for index, turn in enumerate(frozen_turns, start=1):
+            candidate_id = f"candidate-{index:04d}"
+            proposal_dir = f"proposals/{candidate_id}"
+            stage = self._project.stage_source_tree(
+                HarnessSourceTree(files=()),
+                max_files=self._max_source_files,
+                max_bytes=self._max_source_bytes,
+            )
+            expected_request = _proposal_request(
+                candidate_id=candidate_id,
+                absolute_stage=f"{self._project.workspace}/{stage.path}",
+                proposal_dir=proposal_dir,
+                history_count=history_count,
+                previous_proposal_id=(f"candidate-{index - 1:04d}" if index > 1 else None),
+            )
+            if turn.request != expected_request:
+                raise ValueError(f"restored request differs for {candidate_id}")
+            self._project.write_text(f"{proposal_dir}/REQUEST.md", turn.request)
+            self._write_events(proposal_dir, turn.events)
+            if turn.source is not None:
+                self._write_source_tree(f"{proposal_dir}/source", turn.source)
+            self._project.write_text(f"{proposal_dir}/status.json", turn.status_json)
+            if isinstance(turn, CandidateProposal):
+                history_count += 1
+
+        self._history_fingerprints = fingerprints
+        self._proposal_count = len(frozen_turns)
 
     def propose(
         self,
@@ -279,7 +340,7 @@ class ProjectCandidateProposer:
                 validation_errors.append(str(error))
 
         worker_usage = run_result.worker_usage if run_result is not None else None
-        self._write_status(
+        status_json = self._write_status(
             proposal_dir,
             candidate_id=candidate_id,
             source=source,
@@ -295,6 +356,8 @@ class ProjectCandidateProposer:
                 source=source,
                 events=events,
                 worker_usage=worker_usage,
+                request=request,
+                status_json=status_json,
             )
         assert run_result is not None
         return CandidateProposal(
@@ -303,7 +366,86 @@ class ProjectCandidateProposer:
             candidate=candidate,
             events=tuple(events),
             worker_usage=run_result.worker_usage,
+            request=request,
+            status_json=status_json,
         )
+
+    def _validate_restored_state(
+        self,
+        history: tuple[EvaluatedCandidate, ...],
+        turns: tuple[CandidateProposal | CandidateProposalError, ...],
+    ) -> tuple[str, ...]:
+        if not history:
+            raise ValueError("restored history must include an evaluated seed")
+        candidate_ids = [item.candidate_id for item in history]
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("restored history contains duplicate candidate_id values")
+        if history[0].candidate_id != "candidate-0000":
+            raise ValueError("restored history seed must use candidate-0000")
+        score_request = history[0].score.report.request
+        if any(item.score.report.request != score_request for item in history[1:]):
+            raise ValueError("all restored history entries must use the same score request")
+        self._validate_history_bounds(history)
+        fingerprints = tuple(item.fingerprint for item in history)
+
+        population_index = 1
+        for index, turn in enumerate(turns, start=1):
+            expected_id = f"candidate-{index:04d}"
+            if turn.candidate_id != expected_id:
+                raise ValueError("restored proposal candidate_id values must match consumed slots")
+            self._validate_trace(turn)
+            if isinstance(turn, CandidateProposal):
+                if population_index >= len(history):
+                    raise ValueError("restored proposal is missing its evaluated history entry")
+                evaluated = history[population_index]
+                if evaluated.candidate_id != turn.candidate_id:
+                    raise ValueError("restored proposal and evaluated history identities differ")
+                if evaluated.source != turn.source:
+                    raise ValueError("restored proposal and evaluated history sources differ")
+                if evaluated.candidate.doc_hash != turn.candidate.doc_hash:
+                    raise ValueError("restored proposal and evaluated history documents differ")
+                population_index += 1
+        if population_index != len(history):
+            raise ValueError("restored history contains an evaluation without a proposal turn")
+        return fingerprints
+
+    @staticmethod
+    def _validate_trace(turn: CandidateProposal | CandidateProposalError) -> None:
+        if not turn.request:
+            raise ValueError("restored proposal request is missing")
+        validate_durable_text(turn.request, field="restored proposal request")
+        if not turn.status_json:
+            raise ValueError("restored proposal status_json is missing")
+        validate_durable_text(turn.status_json, field="restored proposal status_json")
+        try:
+            status = json.loads(turn.status_json)
+        except json.JSONDecodeError as error:
+            raise ValueError("restored proposal status_json is invalid") from error
+        if not isinstance(status, dict):
+            raise ValueError("restored proposal status_json must contain an object")
+        if status.get("candidate_id") != turn.candidate_id:
+            raise ValueError("restored proposal status candidate_id differs")
+        expected_valid = isinstance(turn, CandidateProposal)
+        if status.get("valid") is not expected_valid:
+            raise ValueError("restored proposal status validity differs")
+        expected_source_hash = turn.source.tree_hash if turn.source is not None else None
+        if status.get("source_tree_hash") != expected_source_hash:
+            raise ValueError("restored proposal status source hash differs")
+        candidate_hash: str | None = None
+        if turn.source is not None:
+            try:
+                candidate_hash = turn.source.to_doc(turn.candidate_id).doc_hash
+            except (TypeError, ValueError):
+                pass
+        if status.get("candidate_doc_hash") != candidate_hash:
+            raise ValueError("restored proposal status document hash differs")
+        if isinstance(turn, CandidateProposal):
+            if not any(event.kind == "submit" for event in turn.events):
+                raise ValueError("restored valid proposal trace has no submit event")
+            if turn.candidate.name != turn.candidate_id:
+                raise ValueError("restored proposal document name differs")
+            if candidate_hash != turn.candidate.doc_hash:
+                raise ValueError("restored proposal source and document differ")
 
     def _validate_history_bounds(self, history: Sequence[EvaluatedCandidate]) -> None:
         """Reject unbounded evaluator-controlled history before reading or writing its bytes."""
@@ -426,20 +568,19 @@ class ProjectCandidateProposer:
         candidate: HarnessDoc | None,
         agent_error: str | None,
         validation_errors: Sequence[str],
-    ) -> None:
-        self._project.write_text(
-            f"{proposal_dir}/status.json",
-            _json(
-                {
-                    "agent_error": agent_error,
-                    "candidate_doc_hash": candidate.doc_hash if candidate is not None else None,
-                    "candidate_id": candidate_id,
-                    "source_tree_hash": source.tree_hash if source is not None else None,
-                    "valid": not validation_errors and candidate is not None,
-                    "validation_error": "; ".join(validation_errors) or None,
-                }
-            ),
+    ) -> str:
+        status_json = _json(
+            {
+                "agent_error": agent_error,
+                "candidate_doc_hash": candidate.doc_hash if candidate is not None else None,
+                "candidate_id": candidate_id,
+                "source_tree_hash": source.tree_hash if source is not None else None,
+                "valid": not validation_errors and candidate is not None,
+                "validation_error": "; ".join(validation_errors) or None,
+            }
         )
+        self._project.write_text(f"{proposal_dir}/status.json", status_json)
+        return status_json
 
     @staticmethod
     def _check_cancelled(should_cancel: Callable[[], bool] | None) -> None:
