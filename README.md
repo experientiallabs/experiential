@@ -7,9 +7,9 @@ builds task-specific harnesses for stronger performance at lower cost.
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
 <p align="center">
-  🚀 <a href="https://platform.experientiallabs.ai">Platform</a> |
+  🌐 <a href="https://platform.experientiallabs.ai">Platform</a> |
   📚 <a href="https://github.com/experientiallabs/world-model-harness/tree/main/docs">Docs</a> |
-  🐛 <a href="https://github.com/experientiallabs/world-model-harness/issues">Issues</a>
+  <a href="https://discord.gg/QwjJpEyHd"><img src="https://cdn.simpleicons.org/discord/5865F2" alt="" width="16" height="16"> Discord</a>
 </p>
 
 ## Getting started
