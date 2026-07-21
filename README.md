@@ -121,99 +121,40 @@ The Notion path uses the optional `connectors` extra (`world-model-harness[conne
 
 ## Run after platform login
 
-`wmh run` is the single interactive execution command. After `wmh login`, an opaque platform id
-is resolved automatically: a world-model id opens a hosted model session, while an agent id runs
-that agent's champion pi harness in the platform's E2B sandbox. No local files are uploaded by
-default. Add `-u PATH` (or `--upload-dir PATH`) to upload that directory as the E2B workspace,
-live-sync changes, and automatically sync final regular-file changes back. Concurrent local edits
-are preserved and the full E2B result is saved under `.wmh-conflicts/` for manual recovery.
-Provider and E2B credentials remain platform-side, so no API keys are needed locally.
+After `wmh login`, the same `wmh run` command can open a hosted world model or run an agent's
+current champion harness in E2B. The platform manages model and sandbox credentials, so hosted
+runs do not need local API keys.
 
 ```bash
 wmh login
 wmh run <world-model-or-agent-id>
 wmh run <agent-id> -u . --task "fix the failing tests"
-wmh run --task "fix the failing tests"   # built-in pi harness, also platform-backed when logged in
 ```
 
-Hosted agent sessions can also run detached: start one, return to your shell, and keep working
-with it from later commands (or from the web app, where it remains an ordinary live session):
+Workspace upload is opt-in with `-u`: WMH live-syncs changes and preserves concurrent local edits.
+Long-running agents can detach, continue in the platform, and be messaged or reattached later.
 
 ```bash
-wmh run <agent-id> -d                    # start hosted, remember as the current session, return
-wmh run <agent-id> -u . --detach         # same, with workspace upload + live sync
-wmh run -s "Do this task"                # send a message, stream that turn until idle, exit
-wmh run -a                               # attach interactively; :detach leaves it running
-wmh run --end                            # end it explicitly, with the final workspace sync
-wmh run --session <session-id> --send "Do this task"   # address a specific session
+wmh run <agent-id> -u . --detach
+wmh run --send "Now run the full test suite"
+wmh run --attach
+wmh run --end
 ```
-
-An interactive `wmh run <agent-id>` can also be promoted mid-session: type `:detach` to leave
-the hosted session running as the current detached session (with `-u`, the sync checkpoint is
-carried over), then continue with `-s`/`-a`/`--end` as above.
-
-The current-session reference (and, with `-u`, a synchronization checkpoint) lives in WMH user
-state under `~/.wmh/sessions/`, not in your repository. Every send/attach/end first catches up:
-workspace changes the agent made while nothing was attached are applied locally, and local edits
-made since the checkpoint are uploaded, before the command proceeds. In a detached-started or
-attached session (`-a`), leaving never ends the run: `:detach`, Ctrl-D, and a second Ctrl-C all
-leave it alive, and only `wmh run --end` or the interactive `:end` command terminates it. A
-plain interactive `wmh run <agent-id>` keeps its original semantics: `:quit`, `:end`, Ctrl-D,
-and a double Ctrl-C end the session, while `:detach` promotes it. Lines starting with a colon
-are reserved for commands and are never sent to the agent as chat. Detached sessions still
-observe the platform's idle timeout: an idle session eventually ends on its own, and the next
-`wmh run --end` reconciles its final workspace (even when the local checkpoint or directory is
-gone, in which case the final archive is saved as a recovery file instead of synced).
-
-For a deployment-protected preview whose public discovery route is not available to a
-non-browser client, pair its browser and backend URLs explicitly:
-
-```bash
-wmh login --url https://preview.example --api-url https://preview-api.example
-```
-
-Workspace transport skips symlinks, VCS internals, virtual environments, dependency trees, and
-common caches. Uploads are capped at 50 MiB compressed and 512 MiB unpacked.
-
-The bare built-in pi path runs locally and requires Node.js 22.19 or newer plus npm on `PATH`. WMH
-installs the pinned pi npm dependencies into its user cache on the first run. Harness code and
-shell commands run with your normal user permissions: file tools are restricted to `--dir`, but
-bash is not OS-sandboxed. The CLI states this boundary before the local pi process starts. A
-logged-out bare `wmh run` remains available with local provider environment credentials.
 
 ## Worker and optimizer agents in E2B sandboxes
 
-Harness evals normally drive a plain in-process worker loop. With `--harness-backend e2b`, a
-`pi-node` harness runs the **real vendored [pi](https://github.com/earendil-works/pi) worker**
-with actual context management and actual harness code as a process inside an
-[E2B](https://e2b.dev) sandbox, one sandbox per (scenario × pass), **all rollouts in parallel**.
-The environment stays the world-model simulation on every backend: the sandbox only hosts the
-agent process, its tool calls come back over a stdin/stdout frame channel and are answered
-host-side by the world model, and the worker LLM is completed host-side too — **no provider
-credentials ever enter a sandbox**.
+WMH can run the real [pi](https://github.com/earendil-works/pi) worker inside isolated
+[E2B](https://e2b.dev) sandboxes while the world model supplies the environment. Optimization and
+evaluation rollouts run in parallel, and model credentials stay outside the sandbox.
 
 ```bash
-uv sync --extra e2b                # the e2b SDK is an optional extra
-export E2B_API_KEY=...             # sandboxes; the only credential involved
-uv run wmh optimize my-agent my-environment --tasks tasks.jsonl --backend e2b \
-  --iterations 5 --proposal-batch-size 3
-uv run wmh eval tasks.jsonl --mode closed-loop --harness pi-agent --harness-backend e2b
+wmh optimize my-agent my-environment --tasks tasks.jsonl --backend e2b
+wmh eval tasks.jsonl --mode closed-loop --harness my-agent --harness-backend e2b
 ```
 
-Sandboxes are pooled and reused across the whole search (bootstrap paid once, lifetimes
-auto-extended). Set `WMH_E2B_TEMPLATE` to a prebaked template with node ≥ 22.6 and pi's npm deps
-at `/home/user/pi-run` to skip per-sandbox installs (~13 s cold episodes); `--eval-concurrency`
-caps the fan-out (default: every cell at once). Worker-LLM tokens and sandbox-seconds are metered
-on the results (`worker_usage`, `sandbox_usage`).
-
-`wmh.agents` exposes the worker agent and a separately customizable optimizer agent, called the
-meta agent in the Python API, over the same vendored pi source and `LiveSession` runtime.
-`AgentProject` gives an agent a persistent E2B filesystem while starting a fresh session for each
-turn. `ProjectDeltaProposer` uses that ordinary agent/project pair to retain every earlier proposal.
-Each optimization iteration generates a
-sibling batch from the frozen current champion, evaluates every sibling against that same
-snapshot, and selects at most one gate-eligible winner. Proposal batch size controls search
-breadth; `k` independently controls the number of evaluation passes per scenario.
+The optimizer can change prompts, tools, policies, skills, and runtime code. Every candidate is
+measured against the same simulated tasks, and only changes that pass the evaluation gates become
+the new versioned champion harness.
 
 ## Development
 
