@@ -1374,15 +1374,19 @@ def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
     assert outcome.content == "inspected\nwarning\n"
     assert emitted == [("stdout", "inspected\n"), ("stderr", "warning\n")]
     agent_call, cleanup_call = commands.calls
+    # The launcher runs as root so the daemon can exec it, then setpriv drops to the shell user.
     assert agent_call == {
-        "user": project._shell_user,  # noqa: SLF001 - assert per-project isolation identity
+        "user": "root",
         "cwd": "/home/user/project/.scratch",
         "timeout": 60.0,
     }
     assert cleanup_call == {"user": "root", "timeout": 10.0}
     command, cleanup_command = commands.runs
     assert command.startswith("env -i ")
-    assert "setpriv --no-new-privs" in command
+    assert (
+        f"setpriv --reuid={project._shell_user} --regid={project._shell_user} "  # noqa: SLF001
+        "--init-groups --no-new-privs" in command
+    )
     assert "timeout --kill-after=3s 50s" in command
     assert "pwd && rg TODO ../candidates" in command
     assert "wmh-project-shell-quiescence" in cleanup_command
@@ -1616,8 +1620,6 @@ def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
     assert shell_setup.count(project._shell_user) == 3  # noqa: SLF001
     assert "mkdir -p /home/user/project/.scratch" in shell_setup
     assert "chmod 1777 /home/user/project/.scratch" in shell_setup
-    # The shell user must be able to exec the shells the sandbox daemon launches commands through.
-    assert "chmod a+rx /bin/sh /bin/bash" in shell_setup
 
 
 def test_project_shell_setup_nonzero_exit_fails_closed_and_remains_retryable() -> None:

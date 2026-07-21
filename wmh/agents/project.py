@@ -737,11 +737,6 @@ class AgentProject:
             f"--shell /usr/sbin/nologin {self._shell_user}\n"
             "fi\n"
             f"id -u {self._shell_user} >/dev/null\n"
-            # The sandbox daemon launches every unprivileged command through /bin/sh (and the
-            # wrapper re-execs /bin/bash). Some sandbox templates ship these without world-exec,
-            # so the shell user cannot start them ('fork/exec /bin/sh: permission denied') and no
-            # command ever runs. Grant read+exec on the shells so the contained shell can start.
-            "chmod a+rx /bin/sh /bin/bash 2>/dev/null || true\n"
             f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
         )
         result = self._sandbox.commands.run(command, user="root", timeout=30)
@@ -936,11 +931,17 @@ class AgentProject:
             'exit "$status"'
         )
         scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
+        # The launcher runs as root (the daemon can always exec a root process), then setpriv drops
+        # to the unprivileged shell user before the agent's command runs. This keeps the
+        # per-project unprivileged identity (so quiescence and stage ownership stay user-scoped)
+        # while avoiding a direct daemon exec as a freshly created system user, which fails as
+        # 'fork/exec /bin/sh: permission denied' on some sandbox templates.
         wrapped = (
             "env -i PATH=/usr/local/bin:/usr/bin:/bin "
             f"HOME={shlex.quote(scratch)} TMPDIR={shlex.quote(scratch)} "
             f"USER={self._shell_user} LOGNAME={self._shell_user} "
-            "setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all "
+            f"setpriv --reuid={self._shell_user} --regid={self._shell_user} --init-groups "
+            "--no-new-privs --inh-caps=-all --ambient-caps=-all "
             f"--bounding-set=-all bash --noprofile --norc -c {shlex.quote(script)}"
         )
         stdout = ""
@@ -951,7 +952,7 @@ class AgentProject:
             try:
                 result = self._sandbox.commands.run(
                     wrapped,
-                    user=self._shell_user,
+                    user="root",
                     cwd=scratch,
                     timeout=_BASH_TIMEOUT_S,
                 )
