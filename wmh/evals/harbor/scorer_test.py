@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -103,7 +105,13 @@ class _Runner:
         self.trials = trials
         self.configs: list[JobConfig] = []
 
-    def run(self, config: JobConfig) -> HarborRun:
+    def run(
+        self,
+        config: JobConfig,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> HarborRun:
+        del should_cancel
         self.configs.append(config)
         job_dir = config.jobs_dir / config.job_name
         for trial in self.trials:
@@ -202,6 +210,15 @@ def test_failed_trial_with_a_written_reward_is_a_scored_cell_not_an_infra_halt(
     ]
     scorer, _runner = _scorer(tmp_path, missing)
     with pytest.raises(HarborRewardMissingError, match="no verifier reward"):
+        scorer.score(HarnessDoc.baseline())
+
+    misconfigured = [
+        _trial(tmp_path, "task-a", 1, reward=1.0),
+        _trial(tmp_path, "task-b", 1, reward=1.0),
+    ]
+    scorer, _runner = _scorer(tmp_path, misconfigured)
+    scorer._reward_key = "grade"  # a clean trial + wrong key is a config error, not infra
+    with pytest.raises(HarborRewardMissingError, match=r"available reward keys: \['reward'\]"):
         scorer.score(HarnessDoc.baseline())
 
 
@@ -374,6 +391,15 @@ def test_template_ownership_and_local_concurrency_rules(tmp_path: Path) -> None:
             provider_config=_provider(),
             agent_concurrency=1,
         )
+    with pytest.raises(ValueError, match="command_timeout_sec must be an integer"):
+        HarborScorer(
+            job_template=_job_template(tmp_path),
+            tasks=tasks,
+            provider_config=_provider(),
+            harness_backend="e2b",
+            agent_concurrency=1,
+            command_timeout_sec=0,
+        )
 
 
 def test_harbor_retries_thread_into_retry_config_with_default_exclusions(
@@ -398,6 +424,92 @@ def test_harbor_retries_thread_into_retry_config_with_default_exclusions(
         "RewardFileNotFoundError",
         "VerifierOutputParseError",
     } <= config.retry.exclude_exceptions
+
+
+def test_concurrent_scores_of_one_candidate_are_rejected(tmp_path: Path) -> None:
+    """The entry prune is destructive; a second in-process score of the same doc must not be
+    able to delete the first one's in-flight trials."""
+    candidate = HarnessDoc.baseline()
+    trials = [
+        _trial(tmp_path, "task-a", 1, reward=1.0),
+        _trial(tmp_path, "task-b", 1, reward=1.0),
+    ]
+    scorer, _inner = _scorer(tmp_path, trials)
+    reentered: list[str] = []
+
+    class _ReentrantRunner(_Runner):
+        def run(
+            self,
+            config: JobConfig,
+            *,
+            should_cancel: Callable[[], bool] | None = None,
+        ) -> HarborRun:
+            with pytest.raises(RuntimeError, match="already being scored"):
+                scorer.score(candidate)
+            reentered.append(config.job_name)
+            return super().run(config)
+
+    scorer._runner = _ReentrantRunner(trials)
+    report = scorer.score(candidate)
+    assert reentered == [f"wmh-{candidate.doc_hash[:12]}"]
+    assert report.doc_hash == candidate.doc_hash
+    # The guard releases after the score; the same candidate is scoreable again.
+    scorer._runner = _Runner(trials)
+    scorer.score(candidate)
+
+
+def test_job_dir_with_a_different_recorded_config_is_never_pruned(tmp_path: Path) -> None:
+    """Harbor refuses to resume a dir whose config changed; pruning it first would only
+    destroy transcripts. Raise before touching anything."""
+    candidate = HarnessDoc.baseline()
+    scorer, runner = _scorer(
+        tmp_path,
+        [
+            _trial(tmp_path, "task-a", 1, reward=1.0),
+            _trial(tmp_path, "task-b", 1, reward=1.0),
+        ],
+    )
+    job_dir = scorer.candidate_job_dir(candidate)
+    other = scorer._candidate_job(candidate).model_copy(update={"n_attempts": 7})
+    job_dir.mkdir(parents=True)
+    (job_dir / "config.json").write_text(other.model_dump_json(), encoding="utf-8")
+    broken = job_dir / "task-a__stale00"
+    broken.mkdir()
+    (broken / "result.json").write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="different job config"):
+        scorer.score(candidate)
+    assert broken.is_dir()  # nothing was deleted
+    assert runner.configs == []  # and nothing ran
+
+
+def test_should_cancel_is_polled_during_the_running_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A multi-hour harbor boundary must be cancellable mid-job through the Scorer contract."""
+    polled = threading.Event()
+
+    class _HangingJob:
+        job_dir = tmp_path / "jobs" / "wmh-hanging"
+
+        @classmethod
+        async def create(cls, _config: JobConfig) -> _HangingJob:
+            return cls()
+
+        async def run(self) -> JobResult:
+            await asyncio.sleep(3600)
+            raise AssertionError("unreachable")
+
+    def cancel_requested() -> bool:
+        polled.set()
+        return True
+
+    monkeypatch.setattr(scorer_module, "Job", _HangingJob)
+    runner = scorer_module.HarborJobRunner(poll_interval_s=0.01)
+    with pytest.raises(scorer_module.HarnessSearchCancelled, match="mid-job"):
+        runner.run(_job_template(tmp_path), should_cancel=cancel_requested)
+    assert polled.is_set()
 
 
 def test_sync_runner_works_with_and_without_a_running_loop(

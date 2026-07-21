@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from harbor.models.job.config import DatasetConfig
 from harbor.models.trial.config import TaskConfig
+from harbor.tasks.client import BatchDownloadResult, TaskDownloadResult, TaskIdType
 
 from wmh.evals.harbor.tasks import resolve_harbor_tasks
 
@@ -55,16 +56,45 @@ def test_rejects_missing_duplicate_and_empty_ids(dataset: Path) -> None:
         asyncio.run(resolve_harbor_tasks(dataset, []))
 
 
-def test_dataset_filters_are_ignored_and_git_tasks_get_overwrite(dataset: Path) -> None:
+def test_dataset_filters_are_ignored(dataset: Path) -> None:
     # Preconfigured fnmatch filters on the dataset must not shadow exact selection.
     config = DatasetConfig(path=dataset, task_names=["task-b"])
     selected = asyncio.run(resolve_harbor_tasks(config, ["task-a"]))
     assert [task.get_task_id().get_name() for task in selected] == ["task-a"]
 
+
+class _Downloader:
+    def __init__(self, commit: str) -> None:
+        self.commit = commit
+        self.calls: list[tuple[list[TaskIdType], bool, Path | None]] = []
+
+    async def download_tasks(
+        self,
+        task_ids: list[TaskIdType],
+        overwrite: bool = False,
+        output_dir: Path | None = None,
+    ) -> BatchDownloadResult:
+        self.calls.append((list(task_ids), overwrite, output_dir))
+        return BatchDownloadResult(
+            results=[
+                TaskDownloadResult(
+                    path=Path("/cache") / task_id.get_name(),
+                    download_time_sec=0.1,
+                    cached=False,
+                    resolved_git_commit_id=self.commit,
+                )
+                for task_id in task_ids
+            ],
+            total_time_sec=0.1,
+        )
+
+
+def test_git_tasks_download_once_at_resolve_and_pin_without_overwrite(dataset: Path) -> None:
+    """The fresh clone happens HERE, once; candidate jobs get overwrite=False configs so they
+    reuse the resolved bytes instead of re-cloning (and clobbering concurrent jobs' cache)."""
     git_task = TaskConfig(
         path=Path("tasks/task-g"),
         git_url="https://example.com/tasks.git",
-        git_commit_id="a" * 40,
     )
 
     async def fake_get_task_configs(
@@ -74,12 +104,36 @@ def test_dataset_filters_are_ignored_and_git_tasks_get_overwrite(dataset: Path) 
         del self, disable_verification
         return [git_task]
 
+    downloader = _Downloader(commit="A" * 40)
     original = DatasetConfig.get_task_configs
     DatasetConfig.get_task_configs = fake_get_task_configs
     try:
-        [pinned] = asyncio.run(resolve_harbor_tasks(config, ["task-g"]))
+        [pinned] = asyncio.run(
+            resolve_harbor_tasks(DatasetConfig(path=dataset), ["task-g"], task_client=downloader)
+        )
     finally:
         DatasetConfig.get_task_configs = original
-    # harbor's git cache does not verify commit provenance; force a fresh download.
-    assert pinned.overwrite is True
+    # One download, with the git-cache refresh, at resolve time.
+    assert len(downloader.calls) == 1
+    assert downloader.calls[0][1] is True
+    # The pinned config never re-clones and carries the resolved commit.
+    assert pinned.overwrite is False
+    assert pinned.git_commit_id == "a" * 40
     assert git_task.overwrite is False  # the caller's config is never mutated
+    assert git_task.git_commit_id is None
+
+
+def test_local_tasks_never_touch_the_downloader(dataset: Path) -> None:
+    class _ExplodingDownloader:
+        async def download_tasks(
+            self,
+            task_ids: list[TaskIdType],
+            overwrite: bool = False,
+            output_dir: Path | None = None,
+        ) -> BatchDownloadResult:
+            raise AssertionError("local tasks must not be downloaded")
+
+    selected = asyncio.run(
+        resolve_harbor_tasks(dataset, ["task-a"], task_client=_ExplodingDownloader())
+    )
+    assert [task.get_task_id().get_name() for task in selected] == ["task-a"]

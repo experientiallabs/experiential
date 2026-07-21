@@ -25,6 +25,7 @@ import asyncio
 import logging
 import math
 import shutil
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -63,6 +64,11 @@ logger = logging.getLogger(__name__)
 TaskEnvironment = Literal["docker", "e2b"]
 HarnessBackend = Literal["local", "e2b"]
 
+# In-process registry of job dirs with a score() in flight: the entry prune is destructive, so
+# concurrent scores of the same candidate must be rejected, not interleaved.
+_ACTIVE_GUARD = threading.Lock()
+_ACTIVE_JOB_DIRS: set[Path] = set()
+
 
 class HarborRewardMissingError(RuntimeError):
     """Verifier evidence or the configured reward key is absent from a finished trial.
@@ -83,17 +89,50 @@ class HarborRun:
 class HarborRunner(Protocol):
     """Synchronous execution seam for one harbor job (fakes replace it in tests)."""
 
-    def run(self, config: JobConfig) -> HarborRun: ...
+    def run(
+        self,
+        config: JobConfig,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> HarborRun: ...
 
 
 class HarborJobRunner:
-    """Run harbor's async Python API from synchronous optimizer code."""
+    """Run harbor's async Python API from synchronous optimizer code.
 
-    def run(self, config: JobConfig) -> HarborRun:
+    `should_cancel` is polled every `poll_interval_s` while the job runs; observing it cancels
+    the harbor job task (harbor cancels its in-flight trials and persists what it can; the
+    scorer's entry prune makes the interrupted boundary resumable) and raises
+    `HarnessSearchCancelled`, so a multi-hour boundary stays cancellable through the Scorer
+    contract instead of only at its edges.
+    """
+
+    def __init__(self, *, poll_interval_s: float = 2.0) -> None:
+        if not poll_interval_s > 0:
+            raise ValueError("poll_interval_s must be positive")
+        self._poll_interval_s = poll_interval_s
+
+    def run(
+        self,
+        config: JobConfig,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> HarborRun:
         async def run_job() -> HarborRun:
             job = await Job.create(config)
-            result = await job.run()
-            return HarborRun(result=result, job_dir=job.job_dir)
+            job_task = asyncio.ensure_future(job.run())
+            if should_cancel is None:
+                return HarborRun(result=await job_task, job_dir=job.job_dir)
+            while True:
+                done, _pending = await asyncio.wait({job_task}, timeout=self._poll_interval_s)
+                if done:
+                    return HarborRun(result=job_task.result(), job_dir=job.job_dir)
+                if should_cancel():
+                    job_task.cancel()
+                    await asyncio.wait({job_task})
+                    if not job_task.cancelled():
+                        job_task.exception()  # consume; cancellation is the outcome
+                    raise HarnessSearchCancelled("harbor scoring cancelled mid-job")
 
         try:
             asyncio.get_running_loop()
@@ -154,6 +193,15 @@ class HarborScorer:
             or agent_concurrency < 1
         ):
             raise ValueError("agent_concurrency must be a positive integer")
+        if (
+            isinstance(command_timeout_sec, bool)
+            or not isinstance(command_timeout_sec, int)
+            or not 1 <= command_timeout_sec <= MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
+        ):
+            raise ValueError(
+                "command_timeout_sec must be an integer in "
+                f"[1, {MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC}]"
+            )
         _validate_job_template(job_template)
         environment = _route_task_environment(job_template, task_environment)
         effective_concurrency = agent_concurrency or job_template.n_concurrent_trials
@@ -270,16 +318,29 @@ class HarborScorer:
         if should_cancel is not None and should_cancel():
             raise HarnessSearchCancelled("harbor scoring cancelled before job start")
         config = self._candidate_job(doc)
-        pruned = _prune_invalid_trial_dirs(
-            config.jobs_dir / config.job_name, reward_key=self._reward_key
-        )
-        if pruned:
-            logger.info(
-                "pruned %d invalid trial dir(s) under %s; harbor resume re-runs only those",
-                pruned,
-                config.jobs_dir / config.job_name,
-            )
-        run = self._runner.run(config)
+        job_dir = (config.jobs_dir / config.job_name).resolve()
+        # The entry prune is destructive; two concurrent scores of one candidate in this
+        # process would delete each other's in-flight trials through the shared job dir.
+        with _ACTIVE_GUARD:
+            if job_dir in _ACTIVE_JOB_DIRS:
+                raise RuntimeError(
+                    f"candidate {doc.doc_hash[:12]} is already being scored (job dir {job_dir}); "
+                    "wait for the in-flight score to finish"
+                )
+            _ACTIVE_JOB_DIRS.add(job_dir)
+        try:
+            _assert_job_dir_resumable(job_dir, config)
+            pruned = _prune_invalid_trial_dirs(job_dir, reward_key=self._reward_key)
+            if pruned:
+                logger.info(
+                    "pruned %d invalid trial dir(s) under %s; harbor resume re-runs only those",
+                    pruned,
+                    job_dir,
+                )
+            run = self._runner.run(config, should_cancel=should_cancel)
+        finally:
+            with _ACTIVE_GUARD:
+                _ACTIVE_JOB_DIRS.discard(job_dir)
         return self._project(doc, run)
 
     def _candidate_job(self, doc: HarnessDoc) -> JobConfig:
@@ -452,6 +513,30 @@ def _route_task_environment(job_template: JobConfig, task_environment: TaskEnvir
     )
 
 
+def _assert_job_dir_resumable(job_dir: Path, config: JobConfig) -> None:
+    """Refuse to touch a job dir whose recorded config differs from the one about to run.
+
+    Harbor itself refuses to resume such a dir (FileExistsError), so pruning it first would
+    only destroy transcripts of a run that can never be resumed by this config anyway.
+    JobConfig equality ignores job_name/debug, matching harbor's own resume check.
+    """
+    config_path = job_dir / "config.json"
+    if not config_path.exists():
+        return
+    try:
+        existing = JobConfig.model_validate_json(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            f"candidate job dir {job_dir} has an unreadable config.json; refusing to prune or "
+            "resume it. Move or delete the directory to rerun this candidate"
+        ) from error
+    if existing != config:
+        raise ValueError(
+            f"candidate job dir {job_dir} was produced by a different job config; harbor would "
+            "refuse to resume it. Move or delete the directory to rerun this candidate"
+        )
+
+
 def _prune_invalid_trial_dirs(job_dir: Path, *, reward_key: str) -> int:
     """Delete trial dirs harbor's resume would either crash on or wrongly keep.
 
@@ -503,9 +588,11 @@ def _official_reward(trial: TrialResult, *, reward_key: str) -> float:
     verifier = trial.verifier_result
     rewards = None if verifier is None else verifier.rewards
     if rewards is None or reward_key not in rewards:
+        available = sorted(rewards or {})
         raise HarborRewardMissingError(
-            f"harbor trial {trial.trial_name!r} has no verifier reward {reward_key!r}; "
-            "the verifier never produced evidence, so this cell cannot be scored"
+            f"harbor trial {trial.trial_name!r} has no verifier reward {reward_key!r} "
+            f"(available reward keys: {available or 'none'}); either the verifier never "
+            "produced evidence or reward_key is misconfigured for this task set"
         )
     value = rewards[reward_key]
     if isinstance(value, bool) or not isinstance(value, (int, float)):
