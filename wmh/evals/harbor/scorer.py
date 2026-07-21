@@ -38,6 +38,7 @@ from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import JobConfig, RetryConfig
 from harbor.models.job.result import JobResult
 from harbor.models.trial.config import TaskConfig
+from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
 from wmh.evals.harbor.agent import (
@@ -458,7 +459,7 @@ def _prune_invalid_trial_dirs(job_dir: Path, *, reward_key: str) -> int:
 
 
 def _trial_dir_is_scoreable(trial_dir: Path, *, reward_key: str) -> bool:
-    result_path = trial_dir / "result.json"
+    result_path = TrialPaths(trial_dir).result_path
     try:
         trial = TrialResult.model_validate_json(result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

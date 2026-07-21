@@ -294,14 +294,17 @@ class WmhHarborAgent(BaseAgent):
                 await _wait_for_quiescence(run_task)
             raise
         finally:
-            close = getattr(runtime, "close", None)
-            if callable(close):
-                await _run_uncancellable(close, executor)
-            bridge.close()
-            # The trace write lives inside this finally: a harbor-timeout cancellation (the most
-            # informative failure class) must still leave the partial transcript for the
-            # proposer. Synchronous small-file I/O, so re-cancellation cannot interrupt it.
-            self._write_trace(task_id, run_task, bridge, cancelled=cancel_requested.is_set())
+            try:
+                close = getattr(runtime, "close", None)
+                if callable(close):
+                    await _run_uncancellable(close, executor)
+            finally:
+                bridge.close()
+                # The trace write lives inside this inner finally: a harbor-timeout cancellation
+                # (the most informative failure class) must still leave the partial transcript
+                # for the proposer, even when cleanup itself was re-cancelled above. Synchronous
+                # small-file I/O, so cancellation cannot interrupt the write itself.
+                self._write_trace(task_id, run_task, bridge, cancelled=cancel_requested.is_set())
         _populate_context(context, result)
 
     def _write_trace(
