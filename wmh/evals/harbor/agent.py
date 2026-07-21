@@ -107,8 +107,21 @@ class HarborAgentEnvironment:
         self._recorded_steps: list[JsonObject] = []
 
     def execute(self, action: Action) -> Observation:
-        """Execute one supported WMH tool in Harbor's owned task environment."""
-        observation = self._execute(action)
+        """Execute one supported WMH tool in Harbor's owned task environment.
+
+        A command that times out or dies on a transport error is a CANDIDATE outcome, not an
+        infrastructure failure: it becomes an error observation the agent can react to. Letting
+        it escape as an exception would kill the episode before verification, turn the whole
+        candidate into an unscoreable HarborRewardMissingError, and (because the pruner deletes
+        reward-less failed trials) make the deterministic job dir re-run it forever.
+        """
+        try:
+            observation = self._execute(action)
+        except Exception as exc:  # noqa: BLE001 - env failures are episode feedback, never fatal
+            observation = Observation(
+                content=f"environment command failed: {type(exc).__name__}: {exc}",
+                is_error=True,
+            )
         self._recorded_steps.append(
             {
                 "action": action.model_dump(mode="json"),
@@ -289,7 +302,7 @@ class WmhHarborAgent(BaseAgent):
             abort = getattr(runtime, "abort", None)
             try:
                 if callable(abort):
-                    await _run_uncancellable(abort, executor)
+                    await self._cleanup_uncancellable(abort, executor, what="abort")
             finally:
                 await _wait_for_quiescence(run_task)
             raise
@@ -297,7 +310,7 @@ class WmhHarborAgent(BaseAgent):
             try:
                 close = getattr(runtime, "close", None)
                 if callable(close):
-                    await _run_uncancellable(close, executor)
+                    await self._cleanup_uncancellable(close, executor, what="close")
             finally:
                 bridge.close()
                 # The trace write lives inside this inner finally: a harbor-timeout cancellation
@@ -306,6 +319,26 @@ class WmhHarborAgent(BaseAgent):
                 # small-file I/O, so cancellation cannot interrupt the write itself.
                 self._write_trace(task_id, run_task, bridge, cancelled=cancel_requested.is_set())
         _populate_context(context, result)
+
+    async def _cleanup_uncancellable(
+        self,
+        call: Callable[[], object],
+        executor: ThreadPoolExecutor,
+        *,
+        what: str,
+    ) -> None:
+        """Run one cleanup step to completion; its failures never replace the episode outcome.
+
+        A pool-close/abort error (e.g. SandboxCleanupError) after a finished episode would
+        otherwise abort the trial pre-verification and discard a real result. Cancellation
+        semantics are preserved: a re-cancellation observed during cleanup still re-raises.
+        """
+        try:
+            await _run_uncancellable(call, executor)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - cleanup is best-effort; the run outcome wins
+            self.logger.warning("harbor agent %s cleanup failed; continuing", what, exc_info=True)
 
     def _write_trace(
         self,
@@ -375,10 +408,13 @@ async def _run_uncancellable[T](
     loop = asyncio.get_running_loop()
     cleanup_task = asyncio.ensure_future(loop.run_in_executor(executor, call))
     cancelled = await _wait_until_done(cleanup_task)
-    result = cleanup_task.result()
     if cancelled:
+        # Re-deliver the cancellation; a cleanup failure is secondary (consume it so the
+        # event loop never logs a never-retrieved exception).
+        if not cleanup_task.cancelled():
+            cleanup_task.exception()
         raise asyncio.CancelledError
-    return result
+    return cleanup_task.result()
 
 
 async def _wait_until_done[T](task: asyncio.Future[T]) -> bool:

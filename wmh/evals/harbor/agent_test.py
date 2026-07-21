@@ -35,6 +35,8 @@ class _Environment:
         **_kwargs: object,
     ) -> ExecResult:
         self.calls.append((command, env, timeout_sec))
+        if command == "sleep 999":
+            raise TimeoutError("command exceeded 240s")
         if command == "false":
             return ExecResult(stdout="", stderr="failed\n", return_code=7)
         if command.startswith("cat --"):
@@ -200,6 +202,61 @@ def test_agent_runs_the_exact_candidate_on_the_dedicated_executor_and_persists_i
     trace = json.loads((tmp_path / "wmh-run.json").read_text())
     assert trace["answer"] == "done"
     assert trace["stop_reason"] == "submitted"
+
+
+def test_environment_exec_failures_become_error_observations_not_episode_deaths() -> None:
+    """A timed-out or transport-dead task command is a candidate outcome the agent sees as an
+    error observation; escaping as an exception would skip verification and make the whole
+    candidate unscoreable (and, with the pruner, re-run forever)."""
+
+    async def run() -> None:
+        environment = _Environment()
+        bridge = HarborAgentEnvironment(
+            asyncio.get_running_loop(), cast("BaseEnvironment", environment)
+        )
+        observation = await asyncio.to_thread(
+            bridge.execute,
+            Action(kind=ActionKind.TOOL_CALL, name="bash", arguments={"command": "sleep 999"}),
+        )
+        assert observation.is_error is True
+        assert "environment command failed: TimeoutError" in observation.content
+        # The failed step still reaches the transcript the proposer reads.
+        [step] = [cast("dict[str, dict[str, object]]", s) for s in bridge.recorded_steps()]
+        assert step["action"]["arguments"] == {"command": "sleep 999"}
+        assert step["observation"]["is_error"] is True
+
+    asyncio.run(run())
+
+
+def test_cleanup_failure_never_masks_the_episode_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SandboxCleanupError-class failure from close() must not abort a verified-able trial."""
+
+    class _Runtime:
+        def run(
+            self,
+            task_id: str,
+            _instruction: str,
+            _environment: HarborAgentEnvironment,
+        ) -> RunResult:
+            return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="done")
+
+        def close(self) -> None:
+            raise RuntimeError("failed to prove cleanup for 1 sandbox")
+
+    monkeypatch.setattr("wmh.evals.harbor.agent.get_provider", lambda _config: _FakeProvider())
+    monkeypatch.setattr(HarnessDoc, "runtime", lambda *_args, **_kwargs: _Runtime())
+    agent = _agent(tmp_path)
+    context = AgentContext()
+
+    asyncio.run(agent.run("solve it", cast("BaseEnvironment", _Environment()), context))
+
+    assert context.metadata is not None
+    assert context.metadata["stop_reason"] == "submitted"
+    trace = json.loads((tmp_path / "wmh-run.json").read_text())
+    assert trace["answer"] == "done"  # the full result survived the failed cleanup
 
 
 def test_harbor_timeout_cancellation_still_persists_the_partial_transcript(
