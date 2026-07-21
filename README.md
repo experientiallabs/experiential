@@ -129,6 +129,21 @@ uv run ty check          # type check
 uv run pytest -q         # tests
 ```
 
+## Roadmap
+
+- [x] Configure local model providers by role.
+- [x] Run the built-in Pi runtime agent locally.
+- [x] Build world models from OTel GenAI and supported vendor traces.
+- [x] Step, score, and inspect world models through Python and HTTP APIs.
+- [x] Optimize harnesses with staged evaluation gates and versioned champions.
+- [x] Run hosted world models and champion agents by platform ID.
+- [x] Detach, message, reattach, and safely synchronize hosted workspaces.
+- [x] Run Pi harness evaluation cells in parallel E2B sandboxes.
+- [ ] Publish `world-model-harness` to PyPI with a complete installation guide.
+- [ ] Make `wmh run` and `wmh optimize` use the same default Pi harness.
+- [ ] Generate optimizer-ready task sets directly from traces and scenarios.
+- [ ] Add the root license, contribution guide, and security policy.
+
 ## Usage telemetry
 
 `wmh` uses anonymous usage telemetry to track the volume of usage.
