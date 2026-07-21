@@ -26,6 +26,7 @@ from wmh.providers.base import ToolCallingProvider
 DEFAULT_MAX_HISTORY_CANDIDATES = 1_024
 DEFAULT_MAX_HISTORY_BYTES = 512 * 1024 * 1024
 MAX_HISTORY_ARTIFACT_PATH_BYTES = 1_024
+MAX_DIRECTIVE_CHARS = 20_000
 
 
 class CandidateProject(Protocol):
@@ -172,6 +173,7 @@ class ProjectCandidateProposer:
         agent: HarnessDoc,
         provider: ToolCallingProvider,
         *,
+        directive: str = "",
         max_source_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
         max_source_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
         max_history_candidates: int = DEFAULT_MAX_HISTORY_CANDIDATES,
@@ -181,6 +183,11 @@ class ProjectCandidateProposer:
         _require_positive_int(max_source_bytes, field="max_source_bytes")
         _require_positive_int(max_history_candidates, field="max_history_candidates")
         _require_positive_int(max_history_bytes, field="max_history_bytes")
+        if directive:
+            validate_durable_text(directive, field="proposal directive")
+            if len(directive) > MAX_DIRECTIVE_CHARS:
+                raise ValueError(f"proposal directive exceeds {MAX_DIRECTIVE_CHARS} characters")
+        self._directive = directive
         self._project = project
         self._agent = agent
         self._provider = provider
@@ -220,6 +227,7 @@ class ProjectCandidateProposer:
                 proposal_dir=proposal_dir,
                 history_count=history_count,
                 previous_proposal_id=(f"candidate-{index - 1:04d}" if index > 1 else None),
+                directive=self._directive,
             )
             if turn.request != expected_request:
                 raise ValueError(f"restored request differs for {candidate_id}")
@@ -285,6 +293,7 @@ class ProjectCandidateProposer:
             proposal_dir=proposal_dir,
             history_count=len(frozen_history),
             previous_proposal_id=previous_proposal_id,
+            directive=self._directive,
         )
         self._project.write_text(f"{proposal_dir}/REQUEST.md", request)
         self._proposal_count = next_proposal_count
@@ -596,6 +605,7 @@ def _proposal_request(
     proposal_dir: str,
     history_count: int,
     previous_proposal_id: str | None,
+    directive: str = "",
 ) -> str:
     previous_trace = (
         f"The immediately preceding coding-turn trace is "
@@ -604,13 +614,19 @@ def _proposal_request(
         if previous_proposal_id is not None
         else "There is no earlier coding turn in this project."
     )
+    directive_block = (
+        "\nThe user directing this optimization gave the following feedback. Treat it as the"
+        f" primary objective of this candidate:\n\n{directive}\n"
+        if directive
+        else ""
+    )
     return f"""Produce exactly one complete harness candidate: {candidate_id}.
 
 Read `history/manifest.json`. It indexes all {history_count} evaluated candidates, their complete
 source directories, full score reports, and raw evaluator artifacts. Earlier coding-turn traces
 remain under `proposals/`. {previous_trace} Use the full population as evidence. Do not select or
 assume a host-designated source to extend.
-
+{directive_block}
 Your only candidate output is this initially empty directory:
 `{absolute_stage}`
 

@@ -413,6 +413,65 @@ def test_project_proposer_restore_rejects_tampered_request_without_an_agent_run(
     assert restored_project.run_calls == []
 
 
+def test_project_proposer_threads_directive_into_request_and_restore() -> None:
+    directive = "User feedback: the agent must gain read access to my GitHub issues."
+    project = _FakeProject([_source("improved")])
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(
+        project, optimizer_agent(), _provider(), directive=directive
+    )
+    seed = _evaluated("candidate-0000")
+
+    proposal = proposer.propose((seed,))
+
+    assert directive in proposal.request
+    assert directive in project.run_calls[0].instruction
+    assert directive in project.files["proposals/candidate-0001/REQUEST.md"]
+
+    restored_project = _FakeProject([_source("unused")])
+    restored = ProjectCandidateProposer(
+        restored_project, optimizer_agent(), _provider(), directive=directive
+    )
+    restored.restore(
+        (seed, _evaluated("candidate-0001", source=proposal.source)),
+        (proposal,),
+    )
+    assert restored_project.files["proposals/candidate-0001/REQUEST.md"] == proposal.request
+
+
+def test_project_proposer_restore_rejects_a_different_directive() -> None:
+    project = _FakeProject([_source("improved")])
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(
+        project, optimizer_agent(), _provider(), directive="original directive"
+    )
+    seed = _evaluated("candidate-0000")
+    proposal = proposer.propose((seed,))
+
+    restored_project = _FakeProject([_source("unused")])
+    restored = ProjectCandidateProposer(restored_project, optimizer_agent(), _provider())
+
+    with pytest.raises(ValueError, match="request differs"):
+        restored.restore(
+            (seed, _evaluated("candidate-0001", source=proposal.source)),
+            (proposal,),
+        )
+
+    assert restored_project.run_calls == []
+
+
+def test_project_proposer_rejects_invalid_directive() -> None:
+    with pytest.raises(ValueError, match="directive"):
+        ProjectCandidateProposer(
+            _FakeProject([]), optimizer_agent(), _provider(), directive="bad\x00directive"
+        )
+
+    with pytest.raises(ValueError, match="directive"):
+        ProjectCandidateProposer(
+            _FakeProject([]), optimizer_agent(), _provider(), directive="x" * 20_001
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [

@@ -174,6 +174,21 @@ sibling batch from the frozen current champion, evaluates every sibling against 
 snapshot, and selects at most one gate-eligible winner. Proposal batch size controls search
 breadth; `k` independently controls the number of evaluation passes per scenario.
 
+### Improve a harness from feedback
+
+One piece of feedback ("you should have access to my GitHub") can drive a single, gated
+improvement step: the feedback becomes the proposer's directive AND is synthesized into
+must-pass verification tasks (tasks the current champion already passes are dropped first).
+
+```bash
+uv run wmh harness improve my-agent --feedback "you should have access to my GitHub" \
+  --tasks tasks.jsonl --model my-world-model
+```
+
+The candidate is promoted (saved as a new champion version) only when it clears both gates: the
+standard suite score stays within a 10 percent margin of the seed (`--margin`), and every
+synthesized feedback verification task passes a strict majority of its attempts.
+
 ## Agentic mode: knowledge base, reasoning, web grounding
 
 Beyond retrieval, a world model can act like an *agent* about its own environment (all opt-in):
