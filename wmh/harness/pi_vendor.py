@@ -19,17 +19,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmh.harness.doc import Surface, SurfaceKind
+# code_surface_id lives with the Surface grammar in doc.py; imported (and re-exported) here for
+# the existing pi-vendor call sites.
+from wmh.harness.doc import Surface, SurfaceKind, code_surface_id
 
 # The committed, byte-exact vendored copy (see VENDOR.md for the upstream pin).
 PI_AGENT_ROOT = Path(__file__).parent / "vendor" / "pi-agent"
 # pi's runnable TypeScript source — the harness the meta-agent searches over.
 _SOURCE_GLOB = "src/**/*.ts"
-
-
-def code_surface_id(relpath: str) -> str:
-    """A stable surface id from a path (`src/agent-loop.ts` -> `code:src-agent-loop-ts`)."""
-    return "code:" + relpath.replace("/", "-").replace(".", "-")
 
 
 def pi_agent_source_paths() -> list[Path]:

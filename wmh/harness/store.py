@@ -16,6 +16,9 @@ immutable version rather than to "whatever the harness currently is".
 
 `doc.json` is authoritative; the rendered files are an export. A directory with rendered files but
 no `doc.json` (a hand-authored harness) still loads: the files parse into a single-prompt document.
+Rendered-only loads are strict: unknown config.toml tables or fields, non-.md files under skills/,
+and a skill filename that does not match its frontmatter name are errors with actionable messages,
+not silently ignored. Dotfiles (.DS_Store and friends) are skipped.
 """
 
 from __future__ import annotations
@@ -157,7 +160,13 @@ def _parse_rendered(name: str, directory: Path) -> HarnessDoc:
     for path in sorted(directory.rglob("*")):
         if not path.is_file():
             continue
-        rel = path.relative_to(directory).as_posix()
+        rel_path = path.relative_to(directory)
+        if any(part.startswith(".") for part in rel_path.parts):
+            # Finder and editors drop metadata like .DS_Store (often with NUL bytes) into
+            # hand-authored dirs. A dotfile can never be a harness surface (its code_surface_id
+            # is not a valid slug), so skip it instead of failing the load on its content.
+            continue
+        rel = rel_path.as_posix()
         if rel in {_DOC_FILE, _ALIASES_FILE}:
             continue
         files.append(HarnessSourceFile(path=rel, content=path.read_text(encoding="utf-8")))

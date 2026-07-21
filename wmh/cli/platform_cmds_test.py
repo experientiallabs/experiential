@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import typer
 from typer.testing import CliRunner
 
 from wmh.cli.app import app
-from wmh.cli.platform_cmds import _resolve_kind
-from wmh.platform.client import PlatformError, WhoAmI
+from wmh.cli.platform_cmds import _pull_harness, _resolve_kind
+from wmh.harness.doc import HarnessDoc, Surface, SurfaceKind
+from wmh.harness.store import HarnessStore
+from wmh.platform.client import HarnessVersionDoc, PlatformError, WhoAmI
 from wmh.platform.credentials import ENV_HOME, PlatformCredentials, save_credentials
+
+if TYPE_CHECKING:
+    from wmh.platform.client import PlatformClient
 
 runner = CliRunner()
 
@@ -98,6 +104,62 @@ def test_pull_rejects_unknown_kind() -> None:
     result = runner.invoke(app, ["pull", "anything", "--kind", "typo"])
     assert result.exit_code != 0
     assert "must be 'model' or 'harness'" in result.output
+
+
+def _pathful_doc() -> HarnessDoc:
+    return HarnessDoc(
+        name="pi",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
+            Surface(
+                id="code:src-agent-ts",
+                kind=SurfaceKind.CODE,
+                path="src/agent.ts",
+                content="// a",
+            ),
+        ],
+    )
+
+
+class _HarnessVersionClient(_StubClient):
+    """Serves one canned harness version payload with a configurable hash."""
+
+    payload_doc_hash = ""
+
+    def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
+        del org_id, name
+        return HarnessVersionDoc(
+            version=version,
+            doc=_pathful_doc().model_dump(mode="json"),
+            doc_hash=type(self).payload_doc_hash,
+        )
+
+
+def test_pull_harness_accepts_the_legacy_doc_hash(tmp_path: Path) -> None:
+    """Pathful versions the platform recorded pre-path-hash must stay pullable."""
+    doc = _pathful_doc()
+    root = str(tmp_path / ".wmh")
+
+    class _LegacyClient(_HarnessVersionClient):
+        payload_doc_hash = doc.legacy_doc_hash
+
+    _pull_harness(cast("PlatformClient", _LegacyClient()), "org-1", "pi", root, version=3)
+
+    assert HarnessStore(root).load("pi").doc_hash == doc.doc_hash
+
+
+def test_pull_harness_still_rejects_a_corrupt_doc_hash(tmp_path: Path) -> None:
+    class _CorruptClient(_HarnessVersionClient):
+        payload_doc_hash = "0" * 32
+
+    with pytest.raises(typer.Exit):
+        _pull_harness(
+            cast("PlatformClient", _CorruptClient()),
+            "org-1",
+            "pi",
+            str(tmp_path / ".wmh"),
+            version=3,
+        )
 
 
 def test_login_with_token_drops_stale_default_org(

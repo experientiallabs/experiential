@@ -335,7 +335,9 @@ def _pull_harness(
         version = harness.latest_version
     payload = client.get_harness_version(org_id, name, version)
     doc = HarnessDoc.model_validate(payload.doc)
-    if doc.doc_hash != payload.doc_hash:
+    # Versions the platform recorded before doc_hash covered materialized paths carry the legacy
+    # hash; accept either so pre-change pathful (pi-node) records stay pullable.
+    if payload.doc_hash not in (doc.doc_hash, doc.legacy_doc_hash):
         _console.print("[red]Pulled doc failed its integrity check; not saving.[/red]")
         raise typer.Exit(code=1)
     saved = HarnessStore(root).save_version(

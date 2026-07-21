@@ -557,7 +557,9 @@ def test_doc_runtime_dispatches_runner_link_under_pi_transport_link() -> None:
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
             Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content="7"),
             Surface(id=MAX_OUTPUT_TOKENS_ID, kind=SurfaceKind.PARAM, content="16384"),
-            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+            Surface(
+                id="code:src-agent-ts", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"
+            ),
         ],
     )
     provider = cast(Provider, _P())

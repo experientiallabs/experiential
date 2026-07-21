@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import tomllib
 from pathlib import PurePosixPath
 
@@ -12,12 +11,15 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from wmh.core.text import validate_durable_text
 
-# _SLUG_RE is doc's surface-id grammar; reusing it keeps `to_doc`'s path checks and Surface
-# validation from ever drifting apart.
+# _SAFE_PATH_RE and _SLUG_RE are doc's path and surface-id grammars; sharing them keeps this
+# module's file checks and Surface validation from ever drifting apart.
 from wmh.harness.doc import (
+    _SAFE_PATH_RE,
     _SLUG_RE,
+    _STORE_METADATA_FILES,
     CODE_RUNTIME_ID,
     MAX_OUTPUT_TOKENS_ID,
+    MAX_SURFACE_PATH_BYTES,
     MAX_TURNS_ID,
     RUNTIME_KIND_ID,
     TEMPERATURE_ID,
@@ -25,8 +27,8 @@ from wmh.harness.doc import (
     HarnessDoc,
     Surface,
     SurfaceKind,
+    code_surface_id,
 )
-from wmh.harness.pi_vendor import code_surface_id
 from wmh.harness.skills import Skill
 
 SYSTEM_FILE = "SYSTEM.md"
@@ -34,11 +36,9 @@ CONFIG_FILE = "config.toml"
 RUNTIME_FILE = "runtime.py"
 SKILLS_DIR = "skills"
 
-_STORE_METADATA_FILES = frozenset({"doc.json", "aliases.toml"})
 _RESERVED_RENDER_FILES = frozenset({SYSTEM_FILE, CONFIG_FILE, RUNTIME_FILE})
-_SOURCE_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 _TREE_HASH_BYTES = 16
-MAX_SOURCE_PATH_BYTES = 1_024
+MAX_SOURCE_PATH_BYTES = MAX_SURFACE_PATH_BYTES
 
 
 class HarnessSourceFile(BaseModel):
@@ -57,7 +57,7 @@ class HarnessSourceFile(BaseModel):
             or not candidate.parts
             or candidate.as_posix() != self.path
             or ".." in candidate.parts
-            or not _SOURCE_PATH_RE.fullmatch(self.path)
+            or not _SAFE_PATH_RE.fullmatch(self.path)
             or len(self.path.encode("utf-8")) > MAX_SOURCE_PATH_BYTES
         ):
             raise ValueError(f"source path {self.path!r} must be a canonical relative POSIX path")
@@ -89,6 +89,28 @@ class HarnessSourceTree(BaseModel):
         metadata = sorted(path for path in paths if path in _STORE_METADATA_FILES)
         if metadata:
             raise ValueError(f"source tree cannot contain store metadata file(s): {metadata}")
+        # Renders land on real filesystems, so structural conflicts must fail here, at
+        # validation time, not later inside a store write.
+        by_fold: dict[str, str] = {}
+        for path in sorted(paths):
+            claimed = by_fold.setdefault(path.casefold(), path)
+            if claimed != path:
+                raise ValueError(
+                    f"source paths {claimed!r} and {path!r} differ only by letter case and "
+                    "would collide on a case-insensitive filesystem; rename one"
+                )
+        directory_prefixes: dict[str, str] = {}
+        for path in paths:
+            parts = path.split("/")
+            for index in range(1, len(parts)):
+                directory_prefixes.setdefault("/".join(parts[:index]), path)
+        for path in sorted(paths):
+            child = directory_prefixes.get(path)
+            if child is not None:
+                raise ValueError(
+                    f"source path {path!r} is a file but is also the directory holding "
+                    f"{child!r}; rename one so no file path is a directory prefix of another"
+                )
         return tuple(sorted(files, key=lambda item: item.path))
 
     @classmethod
@@ -223,6 +245,12 @@ class HarnessSourceTree(BaseModel):
             if item.path in _RESERVED_RENDER_FILES or item.path.startswith(f"{SKILLS_DIR}/"):
                 continue
             surface_id = _code_surface_id(item.path)
+            if surface_id == CODE_RUNTIME_ID:
+                raise ValueError(
+                    f"code file path {item.path!r} would alias the reserved in-process runtime "
+                    f"surface {CODE_RUNTIME_ID!r} (which renders as {RUNTIME_FILE}); rename "
+                    "the file"
+                )
             claimed = code_paths_by_id.get(surface_id)
             if claimed is not None:
                 raise ValueError(

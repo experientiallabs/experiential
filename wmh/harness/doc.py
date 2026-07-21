@@ -28,6 +28,7 @@ import os
 import re
 from collections.abc import Callable
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -67,7 +68,17 @@ CODE_RUNTIME_ID = "code:runtime"
 
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 
+# Store metadata filenames a pathful code surface may never materialize to: on render they
+# would shadow the harness store's own authority files.
+_STORE_METADATA_FILES = frozenset({"doc.json", "aliases.toml"})
+MAX_SURFACE_PATH_BYTES = 1_024
+
 DEFAULT_TEMPERATURE = 0.7
+
+
+def code_surface_id(relpath: str) -> str:
+    """A stable surface id from a path (`src/agent-loop.ts` -> `code:src-agent-loop-ts`)."""
+    return "code:" + relpath.replace("/", "-").replace(".", "-")
 
 
 class SurfaceKind(StrEnum):
@@ -103,8 +114,41 @@ class Surface(BaseModel):
         if self.path is not None:
             if self.kind is not SurfaceKind.CODE:
                 raise ValueError(f"surface {self.id!r}: only code surfaces may carry a path")
-            if not _SAFE_PATH_RE.match(self.path) or ".." in self.path.split("/"):
-                raise ValueError(f"surface {self.id!r}: unsafe path {self.path!r}")
+            candidate = PurePosixPath(self.path)
+            if (
+                not _SAFE_PATH_RE.match(self.path)
+                or not candidate.parts
+                or candidate.as_posix() != self.path
+                or ".." in candidate.parts
+                or len(self.path.encode("utf-8")) > MAX_SURFACE_PATH_BYTES
+            ):
+                raise ValueError(
+                    f"surface {self.id!r}: unsafe path {self.path!r}; a code surface path must "
+                    f"be a canonical relative POSIX path of at most {MAX_SURFACE_PATH_BYTES} "
+                    "UTF-8 bytes with no '.' or '..' segments"
+                )
+            if self.path in _STORE_METADATA_FILES:
+                raise ValueError(
+                    f"surface {self.id!r}: path {self.path!r} would shadow a harness store "
+                    "metadata file; rename the file"
+                )
+            if self.id == CODE_RUNTIME_ID:
+                raise ValueError(
+                    f"surface {CODE_RUNTIME_ID!r} is the in-process runtime module and must not "
+                    f"carry a path (got {self.path!r}); rename the file so it maps to its own id"
+                )
+            expected_id = code_surface_id(self.path)
+            if not _SLUG_RE.match(expected_id.partition(":")[2]):
+                raise ValueError(
+                    f"code surface path {self.path!r} maps to surface id {expected_id!r}, which "
+                    "is not a valid 'code:<kebab-slug>' id; use lowercase [a-z0-9] runs separated "
+                    "by single '/', '.', or '-' characters (for example src/agent-loop.ts)"
+                )
+            if self.id != expected_id:
+                raise ValueError(
+                    f"surface {self.id!r} does not match its path {self.path!r}: a pathful code "
+                    f"surface must use id {expected_id!r} (code_surface_id of its path)"
+                )
         if self.budget is not None and len(self.content) > self.budget:
             raise ValueError(
                 f"surface {self.id!r} content is {len(self.content)} chars, "
@@ -192,6 +236,17 @@ class HarnessDoc(BaseModel):
             + (f"\x00path={surface.path}" if surface.path is not None else "")
             for surface in self.surfaces
         )
+        return _digest(joined)
+
+    @property
+    def legacy_doc_hash(self) -> str:
+        """The pre-path-inclusion document identity (surface id + content hash only).
+
+        Exists ONLY so `wmh pull` can integrity-check harness versions the platform recorded
+        before `doc_hash` covered materialized paths. Never use it anywhere else: not for new
+        records, dedupe, or caching.
+        """
+        joined = "\n".join(f"{s.id}\x00{s.content_hash}" for s in self.surfaces)
         return _digest(joined)
 
     # -- derived, validated views ------------------------------------------------------------

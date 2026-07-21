@@ -199,9 +199,27 @@ def test_code_surface_path_colliding_with_a_reserved_file_is_rejected(tmp_path: 
         name="x",
         surfaces=[
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
-            Surface(id="code:sys", kind=SurfaceKind.CODE, path="SYSTEM.md", content="// nope"),
+            Surface(
+                id="code:config-toml", kind=SurfaceKind.CODE, path="config.toml", content="# nope"
+            ),
         ],
     )
     store = HarnessStore(tmp_path)
     with pytest.raises(ValueError, match="reserved file"):
         store.save_version(doc)
+
+
+def test_hand_authored_dir_load_skips_dotfiles(tmp_path: Path) -> None:
+    """Finder metadata (.DS_Store, binary) must not break a rendered-only load."""
+    store = HarnessStore(tmp_path)
+    directory = store.dir_for("hand") / "v1"
+    directory.mkdir(parents=True)
+    (directory / "SYSTEM.md").write_text("You are careful.", encoding="utf-8")
+    (directory / ".DS_Store").write_bytes(b"\x00\x01Bud1\x00")
+    (directory / ".hidden").mkdir()
+    (directory / ".hidden" / "note.txt").write_text("ignored", encoding="utf-8")
+
+    doc = store.load("hand")
+
+    assert doc.system_prompt() == "You are careful."
+    assert doc.code_files() == []

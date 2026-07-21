@@ -101,6 +101,46 @@ def test_source_tree_rejects_duplicate_paths() -> None:
         )
 
 
+def test_source_tree_rejects_case_insensitive_path_collisions() -> None:
+    """{SYSTEM.md, system.md} silently corrupts renders on case-insensitive filesystems."""
+    with pytest.raises(
+        ValueError, match=r"'SYSTEM\.md' and 'system\.md' differ only by letter case"
+    ):
+        HarnessSourceTree(
+            files=(
+                HarnessSourceFile(path="SYSTEM.md", content="one"),
+                HarnessSourceFile(path="system.md", content="two"),
+            )
+        )
+
+
+def test_source_tree_rejects_file_and_directory_prefix_conflicts() -> None:
+    """{src, src/a.ts} would crash a store write halfway instead of failing validation."""
+    with pytest.raises(
+        ValueError, match=r"'src' is a file but is also the directory holding 'src/a\.ts'"
+    ):
+        HarnessSourceTree(
+            files=(
+                HarnessSourceFile(path="SYSTEM.md", content="p"),
+                HarnessSourceFile(path="src", content="conflict"),
+                HarnessSourceFile(path="src/a.ts", content="x"),
+            )
+        )
+
+
+def test_source_tree_rejects_a_file_that_aliases_the_runtime_surface() -> None:
+    """A file named exactly `runtime` must not hijack the in-process code:runtime surface."""
+    tree = HarnessSourceTree(
+        files=(
+            HarnessSourceFile(path="SYSTEM.md", content="p"),
+            HarnessSourceFile(path="runtime", content="x"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="would alias the reserved in-process runtime"):
+        tree.to_doc("invalid")
+
+
 def test_source_tree_rejects_unparsed_skill_namespace_files() -> None:
     tree = HarnessSourceTree(
         files=(

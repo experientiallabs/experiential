@@ -1037,7 +1037,9 @@ def _pi_seed() -> HarnessDoc:
             Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p"),
             Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
             Surface(id=RUNTIME_KIND_ID, kind=SurfaceKind.PARAM, content="pi-node"),
-            Surface(id="code:a", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"),
+            Surface(
+                id="code:src-agent-ts", kind=SurfaceKind.CODE, path="src/agent.ts", content="// a"
+            ),
         ],
     )
 

@@ -418,7 +418,7 @@ def test_project_parent_manifest_splits_large_surfaces_below_read_cap() -> None:
                 content="submit",
             ),
             Surface(
-                id="code:large",
+                id="code:src-large-ts",
                 kind=SurfaceKind.CODE,
                 content=content,
                 path="src/large.ts",
@@ -433,7 +433,7 @@ def test_project_parent_manifest_splits_large_surfaces_below_read_cap() -> None:
 
     manifest_text = project.files["context/iteration-0001/parent.json"]
     surfaces = _parent_surface_manifests(project, "context/iteration-0001/parent.json")
-    code_surface = next(surface for surface in surfaces if surface["id"] == "code:large")
+    code_surface = next(surface for surface in surfaces if surface["id"] == "code:src-large-ts")
     relative_files = [
         path.removeprefix(f"{project.workspace}/")
         for path in cast("list[str]", code_surface["content_files"])
