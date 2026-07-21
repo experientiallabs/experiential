@@ -71,6 +71,18 @@ class _SubmittedBuild:
     build_id: str
 
 
+@dataclass(frozen=True)
+class _AmbiguousSubmission:
+    """A submission whose outcome is unknown: it failed before the client got a build id.
+
+    E2B may have accepted the request (a paid build may be running) even though the client saw
+    an exception, so the alias must stay claimed; the next attempt reconciles with the control
+    plane before any resubmission.
+    """
+
+    error: str
+
+
 # Build coordination happens at two levels.
 #
 # Per-loop, per-alias asyncio locks give in-loop single-flight: harbor's base start() does
@@ -89,8 +101,9 @@ _LOOP_ALIAS_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop,
     dict[str, asyncio.Lock],
 ] = weakref.WeakKeyDictionary()
-# alias -> identity of the submitted build; None marks a submission in flight (claimed).
-_SUBMITTED_BUILDS: dict[str, _SubmittedBuild | None] = {}
+# alias -> identity of the submitted build; None marks a submission in flight (claimed);
+# _AmbiguousSubmission marks a failed submission with an unknown provider-side outcome.
+_SUBMITTED_BUILDS: dict[str, _SubmittedBuild | _AmbiguousSubmission | None] = {}
 _PROCESS_BUILD_SLOTS = threading.BoundedSemaphore(E2B_TEMPLATE_BUILD_CONCURRENCY)
 _BUILD_SLOT_POLL_INTERVAL_S = 0.25
 _REGISTRY_POLL_INTERVAL_S = 0.05
@@ -111,19 +124,28 @@ def _template_lock(template_name: str) -> asyncio.Lock:
         return lock
 
 
-def _claim_build(alias: str) -> _SubmittedBuild | Literal["owner", "pending"]:
-    """Atomically claim the right to submit `alias`, or report who already did."""
+def _claim_build(
+    alias: str,
+) -> _SubmittedBuild | _AmbiguousSubmission | Literal["owner", "pending"]:
+    """Atomically claim the right to submit `alias`, or report what already happened to it.
+
+    An ambiguous entry is converted back into a live claim on return, so exactly one caller
+    owns its reconciliation while everyone else sees "pending".
+    """
     with _CONTROL_GUARD:
         if alias not in _SUBMITTED_BUILDS:
             _SUBMITTED_BUILDS[alias] = None  # claimed: this caller owns the submission
             return "owner"
         entry = _SUBMITTED_BUILDS[alias]
+        if isinstance(entry, _AmbiguousSubmission):
+            _SUBMITTED_BUILDS[alias] = None  # claimed: this caller owns the reconciliation
+            return entry
         return "pending" if entry is None else entry
 
 
-def _record_submitted_build(alias: str, submitted: _SubmittedBuild) -> None:
+def _record_submitted_build(alias: str, entry: _SubmittedBuild | _AmbiguousSubmission) -> None:
     with _CONTROL_GUARD:
-        _SUBMITTED_BUILDS[alias] = submitted
+        _SUBMITTED_BUILDS[alias] = entry
 
 
 def _clear_submitted_build(alias: str, expected: _SubmittedBuild | None) -> None:
@@ -339,7 +361,9 @@ class WmhE2BEnvironment(E2BEnvironment):
         time. Across loops, the process-wide registry decides: the first claimant submits
         (inside a process-wide build slot) and records the build identity BEFORE polling, so
         any other loop finds the identity and polls THAT build to READY instead of paying for
-        a second one. A terminal build failure clears the entry so a later attempt can rebuild.
+        a second one. A terminal build failure clears the entry so a later attempt can
+        rebuild; a submission whose outcome is unknown stays claimed as ambiguous and must be
+        reconciled with the control plane before anyone may resubmit.
         """
         alias = self._template_name
         if force_build:
@@ -353,8 +377,11 @@ class WmhE2BEnvironment(E2BEnvironment):
                 self.logger.debug(f"Awaiting template {alias} submitted by a concurrent job")
                 await _await_submitted_build(alias, claim)
                 return
-            # "pending": another thread's submission is in flight; wait for its identity to
-            # land (poll it) or for its failure to clear the claim (become the owner).
+            if isinstance(claim, _AmbiguousSubmission):
+                await self._reconcile_ambiguous_submission(alias, claim)
+                return
+            # "pending": another caller's submission or reconciliation is in flight; wait for
+            # its identity to land (poll it) or for its failure to release the claim.
             await asyncio.sleep(_REGISTRY_POLL_INTERVAL_S)
 
     async def _acquire_slot_and_build(self, alias: str) -> None:
@@ -364,10 +391,15 @@ class WmhE2BEnvironment(E2BEnvironment):
             self.logger.debug(f"Creating template {alias}")
             try:
                 build_info = await self._submit_template_build()
-            except BaseException:
-                # Unknown submission outcome: release the claim so a later attempt may try
-                # again; the ambiguity itself propagates (never auto-resubmitted here).
-                _clear_submitted_build(alias, None)
+            except BaseException as error:
+                # E2B may have accepted the request before the failure, so a paid build may be
+                # running without us holding its id. Keep the alias CLAIMED as ambiguous: no
+                # waiter may submit a second paid build until a later attempt reconciles with
+                # the control plane. The failure itself propagates (never auto-resubmitted).
+                _record_submitted_build(
+                    alias,
+                    _AmbiguousSubmission(error=f"{type(error).__name__}: {error}"),
+                )
                 raise
             _record_submitted_build(
                 alias,
@@ -383,6 +415,33 @@ class WmhE2BEnvironment(E2BEnvironment):
                 raise
         finally:
             _PROCESS_BUILD_SLOTS.release()
+
+    async def _reconcile_ambiguous_submission(
+        self,
+        alias: str,
+        ambiguous: _AmbiguousSubmission,
+    ) -> None:
+        """Resolve an earlier submission of unknown outcome before allowing any resubmission.
+
+        `_claim_build` converted the ambiguous entry into a live claim, so this caller is the
+        single reconciler. The control plane is the authority: if the alias now resolves (the
+        same check start() trusts), the earlier submission went through and completed, so the
+        claim is released with nothing to build. Only when the control plane shows no such
+        template may this claimant submit fresh. An ambiguous submission never yielded a build
+        id, so there is no exact build to poll; alias resolution is the completion evidence.
+        """
+        self.logger.debug(
+            f"Reconciling an ambiguous earlier submission of template {alias} ({ambiguous.error})"
+        )
+        try:
+            exists = await self._does_template_exist()
+        except BaseException:
+            _record_submitted_build(alias, ambiguous)  # still unknown: restore the marker
+            raise
+        if exists:
+            _clear_submitted_build(alias, None)
+            return
+        await self._acquire_slot_and_build(alias)
 
     @override
     async def _create_sandbox(self) -> None:

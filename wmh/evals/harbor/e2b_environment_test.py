@@ -353,6 +353,76 @@ def test_transient_get_info_failure_retries_the_create_instead_of_failing_it(
     assert environment._sandbox is second
 
 
+def test_ambiguous_submission_stays_claimed_and_reconciles_without_resubmitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A submission that fails before the client gets a build id may still be running as a
+    paid build. The alias must stay claimed (ambiguous), and the next attempt reconciles with
+    the control plane: alias resolves -> the earlier build went through, nothing is re-paid."""
+    environment = _environment(tmp_path)
+    submissions: list[int] = []
+
+    async def build_in_background(**_kwargs: object) -> BuildInfo:
+        submissions.append(1)  # E2B accepted the request...
+        raise httpx.ConnectError("response lost after acceptance")  # ...but the reply died
+
+    monkeypatch.setattr(AsyncTemplate, "build_in_background", staticmethod(build_in_background))
+
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(environment._ensure_template_built(force_build=False))
+    entry = e2b_environment_module._SUBMITTED_BUILDS[environment.template_name]
+    assert isinstance(entry, e2b_environment_module._AmbiguousSubmission)
+    assert "ConnectError" in entry.error
+
+    async def exists() -> bool:
+        return True  # the control plane shows the earlier submission completed
+
+    monkeypatch.setattr(environment, "_does_template_exist", exists)
+    asyncio.run(environment._ensure_template_built(force_build=False))
+    assert submissions == [1]  # never re-submitted: one paid build
+    assert e2b_environment_module._SUBMITTED_BUILDS == {}  # reconciled and released
+
+
+def test_ambiguous_submission_rebuilds_only_when_the_control_plane_shows_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _environment(tmp_path)
+    build_info = _build_info(environment)
+    submissions: list[int] = []
+
+    async def build_in_background(**_kwargs: object) -> BuildInfo:
+        submissions.append(1)
+        if len(submissions) == 1:
+            raise httpx.ConnectError("submission lost")
+        return build_info
+
+    async def get_build_status(_info: BuildInfo, logs_offset: int = 0) -> object:
+        del logs_offset
+        return _build_status(build_info, TemplateBuildStatus.READY)
+
+    async def exists() -> bool:
+        return False  # the control plane shows no such template: safe to submit fresh
+
+    monkeypatch.setattr(AsyncTemplate, "build_in_background", staticmethod(build_in_background))
+    monkeypatch.setattr(AsyncTemplate, "get_build_status", staticmethod(get_build_status))
+    monkeypatch.setattr(environment, "_does_template_exist", exists)
+
+    with pytest.raises(httpx.ConnectError):
+        asyncio.run(environment._ensure_template_built(force_build=False))
+    assert isinstance(
+        e2b_environment_module._SUBMITTED_BUILDS[environment.template_name],
+        e2b_environment_module._AmbiguousSubmission,
+    )
+
+    asyncio.run(environment._ensure_template_built(force_build=False))
+    assert submissions == [1, 1]  # the reconciler legitimately resubmitted
+    assert e2b_environment_module._SUBMITTED_BUILDS[environment.template_name] == (
+        e2b_environment_module._SubmittedBuild(template_id="template-id", build_id="build-id")
+    )
+
+
 def test_single_flight_and_cross_loop_registry_pay_for_exactly_one_build(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
