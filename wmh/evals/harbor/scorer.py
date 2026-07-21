@@ -573,6 +573,10 @@ def _trial_dir_is_scoreable(trial_dir: Path, *, reward_key: str) -> bool:
         return False
     if trial.exception_info is None:
         return True
+    if trial.exception_info.exception_type in _VERIFIER_OUTCOME_EXCEPTIONS:
+        # Scored 0 by _official_reward; re-running a deterministic verifier failure would
+        # loop forever without changing the outcome.
+        return True
     return _trial_reward(trial, reward_key=reward_key) is not None
 
 
@@ -590,11 +594,29 @@ def _trial_reward(trial: TrialResult, *, reward_key: str) -> float | None:
     return reward
 
 
+# Verifier failures harbor itself classifies as outcome-shaped (its default retry exclude
+# list): the verifier ran against the candidate's artifacts and terminally failed to produce
+# a reward. Scoring these 0 matches the benchmark's own semantics (an absent reward file is a
+# failed task) and keeps a deterministic verifier timeout from wedging the boundary in a
+# raise -> prune -> identical re-run loop.
+_VERIFIER_OUTCOME_EXCEPTIONS = frozenset(
+    {
+        "VerifierTimeoutError",
+        "RewardFileNotFoundError",
+        "RewardFileEmptyError",
+        "VerifierOutputParseError",
+    }
+)
+
+
 def _official_reward(trial: TrialResult, *, reward_key: str) -> float:
-    """The verifier's written reward; absence is the one unscoreable (infra) condition."""
+    """The verifier's written reward; absence without an outcome-shaped cause is infra."""
     verifier = trial.verifier_result
     rewards = None if verifier is None else verifier.rewards
     if rewards is None or reward_key not in rewards:
+        exception = trial.exception_info
+        if exception is not None and exception.exception_type in _VERIFIER_OUTCOME_EXCEPTIONS:
+            return 0.0
         available = sorted(rewards or {})
         raise HarborRewardMissingError(
             f"harbor trial {trial.trial_name!r} has no verifier reward {reward_key!r} "

@@ -205,12 +205,30 @@ def test_failed_trial_with_a_written_reward_is_a_scored_cell_not_an_infra_halt(
     assert cell.note == "completed with AgentTimeoutError"
 
     missing = [
-        _trial(tmp_path, "task-a", 1, reward=None, exception="VerifierTimeoutError"),
+        _trial(tmp_path, "task-a", 1, reward=None, exception="RuntimeError"),
         _trial(tmp_path, "task-b", 1, reward=1.0),
     ]
     scorer, _runner = _scorer(tmp_path, missing)
     with pytest.raises(HarborRewardMissingError, match="no verifier reward"):
         scorer.score(HarnessDoc.baseline())
+
+
+def test_outcome_shaped_verifier_failures_score_zero_instead_of_halting(tmp_path: Path) -> None:
+    """harbor classifies these as outcome-shaped (its retry exclude list): the verifier ran
+    against the candidate's artifacts and terminally produced no reward. Scoring 0 matches the
+    benchmark's absent-reward-file semantics and keeps a deterministic verifier timeout from
+    wedging the boundary in a raise/prune/re-run loop."""
+    trials = [
+        _trial(tmp_path, "task-a", 1, reward=None, exception="VerifierTimeoutError"),
+        _trial(tmp_path, "task-b", 1, reward=1.0),
+    ]
+    scorer, _runner = _scorer(tmp_path, trials, reward_mode="positive-binary")
+    report = scorer.score(HarnessDoc.baseline())
+    cell = report.by_task()["task-a"][0]
+    assert cell.reward == 0.0
+    assert cell.passed is False
+    assert cell.note == "completed with VerifierTimeoutError"
+    assert report.score == 0.5
 
     misconfigured = [
         _trial(tmp_path, "task-a", 1, reward=1.0),
@@ -265,6 +283,11 @@ def test_entry_prunes_only_unscoreable_trial_dirs(tmp_path: Path) -> None:
     (job_dir / crashed.trial_name / "result.json").write_text(
         crashed.model_dump_json(), encoding="utf-8"
     )
+    verifier_timeout = _trial(tmp_path, "task-b", 4, reward=None, exception="VerifierTimeoutError")
+    (job_dir / verifier_timeout.trial_name).mkdir()
+    (job_dir / verifier_timeout.trial_name / "result.json").write_text(
+        verifier_timeout.model_dump_json(), encoding="utf-8"
+    )
 
     scorer.score(candidate)
 
@@ -272,6 +295,8 @@ def test_entry_prunes_only_unscoreable_trial_dirs(tmp_path: Path) -> None:
     assert not unparseable.exists()
     assert not missing_result.exists()
     assert not (job_dir / crashed.trial_name).exists()
+    # Outcome-shaped verifier failure: scored 0, so re-running it would loop forever.
+    assert (job_dir / verifier_timeout.trial_name).is_dir()
     assert runner.configs  # the job still ran after pruning
 
 
