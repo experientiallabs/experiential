@@ -33,7 +33,7 @@ from wmh.harness.scoring import RewardMode
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 _JOB_ID = UUID("00000000-0000-4000-8000-000000000001")
-_SUFFIXES = ("a7Hm2Ks", "m4Vx8Pa", "z9Tc3Wb")
+_SUFFIXES = ("a7Hm2Ks", "m4Vx8Pa", "z9Tc3Wb", "q6Rn5Jd")
 
 
 def _provider() -> ProviderConfig:
