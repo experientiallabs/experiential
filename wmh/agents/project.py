@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import shlex
 import time
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
 from uuid import uuid4
+
+from pydantic import BaseModel
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
@@ -31,6 +34,7 @@ from wmh.harness.live_session import (
 from wmh.harness.pi_e2b import start_live_runner
 from wmh.harness.runner_link import Channel, TokenUsage
 from wmh.harness.runtime import HarnessSearchCancelled
+from wmh.harness.source_tree import MAX_SOURCE_PATH_BYTES, HarnessSourceFile, HarnessSourceTree
 from wmh.harness.tools import resolve_tools
 from wmh.providers.base import ToolCallingProvider
 
@@ -38,6 +42,8 @@ PROJECT_WORKSPACE = "/home/user/project"
 PROJECT_SCRATCH_DIR = ".scratch"
 PROJECT_SHELL_USER = "wmh-project-shell"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
+DEFAULT_SOURCE_TREE_MAX_FILES = 1_024
+DEFAULT_SOURCE_TREE_MAX_BYTES = 8 * 1024 * 1024
 _BASH_TIMEOUT_S = 60.0
 _BASH_PROCESS_TIMEOUT_S = 50
 _SHELL_QUIESCENCE_TIMEOUT_S = 10.0
@@ -95,6 +101,89 @@ process.stdin.on("end", () => {{
 }});
 """
 
+_SNAPSHOT_SOURCE_TREE_SCRIPT = r"""
+import base64
+import json
+import os
+import stat
+import sys
+
+
+def fail(message):
+    sys.stderr.write(message + "\n")
+    raise SystemExit(2)
+
+
+root = sys.argv[1]
+max_files = int(sys.argv[2])
+max_bytes = int(sys.argv[3])
+max_path_bytes = int(sys.argv[4])
+try:
+    root_stat = os.lstat(root)
+except FileNotFoundError:
+    fail("source stage does not exist")
+if not stat.S_ISDIR(root_stat.st_mode):
+    fail("source stage is not a directory")
+
+files = []
+total_bytes = 0
+entries = 0
+max_entries = max_files * 4
+for current, directories, names in os.walk(root, topdown=True, followlinks=False):
+    directories.sort()
+    names.sort()
+    for name in directories:
+        entries += 1
+        if entries > max_entries:
+            fail("source stage exceeds entry-count bound")
+        path = os.path.join(current, name)
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            fail("non-regular entry in source stage: " + os.path.relpath(path, root))
+    for name in names:
+        entries += 1
+        if entries > max_entries:
+            fail("source stage exceeds entry-count bound")
+        path = os.path.join(current, name)
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if len(relative.encode("utf-8")) > max_path_bytes:
+            fail("source entry exceeds path-length bound")
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            fail("non-regular entry in source stage: " + relative)
+        if len(files) >= max_files:
+            fail("source stage exceeds file-count bound")
+        if before.st_size > max_bytes - total_bytes:
+            fail("source stage exceeds byte bound")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as source:
+            opened = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+            ):
+                fail("source entry changed while opening: " + relative)
+            content = source.read(max_bytes - total_bytes + 1)
+        if len(content) > max_bytes - total_bytes:
+            fail("source stage exceeds byte bound")
+        try:
+            content.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("source entry is not UTF-8: " + relative)
+        total_bytes += len(content)
+        files.append(
+            {
+                "path": relative,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+
+json.dump({"files": files}, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+"""
+
 
 class ChannelFactory(Protocol):
     """Start one fresh runner channel in a project's sandbox."""
@@ -109,6 +198,27 @@ class AgentProjectRun:
     answer: str
     events: tuple[SessionEvent, ...]
     worker_usage: TokenUsage
+
+
+@dataclass(frozen=True)
+class ProjectSourceStage:
+    """One writable source-tree stage bound to a specific project sandbox generation."""
+
+    path: str
+    sandbox_generation: int
+
+
+class _EncodedSourceFile(BaseModel):
+    """One regular snapshot file encoded for bounded JSON transport."""
+
+    path: str
+    content_base64: str
+
+
+class _EncodedSourceSnapshot(BaseModel):
+    """The trusted sandbox script's fixed-expansion wire representation."""
+
+    files: tuple[_EncodedSourceFile, ...]
 
 
 class _ProjectAgentTurnError(RuntimeError):
@@ -144,6 +254,10 @@ class AgentProject:
         self._active_sandbox_started_at = time.monotonic()
         self._retired_sandbox_seconds = 0.0
         self._sandbox_count = 1
+        self._sandbox_generation = 1
+        self._next_source_stage = 1
+        self._source_stages: dict[str, ProjectSourceStage] = {}
+        self._snapshotted_source_stages: set[str] = set()
         # A lease remains live until E2B confirms its kill. Replacement failures retain both
         # handles here so usage keeps accruing and close() can retry every unproven teardown.
         self._live_sandboxes: dict[int, tuple[SandboxHandle, float]] = {
@@ -235,6 +349,106 @@ class AgentProject:
                 "publish agent output through write_file"
             )
         return self._file_contents[relative]
+
+    def stage_source_tree(
+        self,
+        tree: HarnessSourceTree,
+        *,
+        max_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
+        max_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
+    ) -> ProjectSourceStage:
+        """Materialize one editable tree in a fresh, sandbox-generation-bound scratch path."""
+        if self._closing:
+            raise RuntimeError("cannot stage a source tree in a closed project")
+        self._ensure_project_shell_healthy()
+        if self._active_event_sink is not None:
+            raise RuntimeError("cannot stage a source tree while a project agent turn is running")
+        tree.validate_bounds(max_files=max_files, max_bytes=max_bytes)
+        self._prepare_shell_workspace()
+        stage_name = f"stage-{self._next_source_stage:06d}"
+        self._next_source_stage += 1
+        relative = f"{PROJECT_SCRATCH_DIR}/source-stages/{stage_name}"
+        absolute = self._absolute_path(relative)
+        self._sandbox.commands.run(f"mkdir -p {shlex.quote(absolute)}", timeout=30)
+        for item in tree.files:
+            self._write_sandbox_file(
+                self._sandbox,
+                f"{absolute}/{item.path}",
+                item.content,
+            )
+        self._sandbox.commands.run(
+            f"chown -R {PROJECT_SHELL_USER}:{PROJECT_SHELL_USER} {shlex.quote(absolute)} "
+            f"&& find {shlex.quote(absolute)} -type d -exec chmod 700 {{}} + "
+            f"&& find {shlex.quote(absolute)} -type f -exec chmod 600 {{}} +",
+            user="root",
+            timeout=30,
+        )
+        stage = ProjectSourceStage(
+            path=relative,
+            sandbox_generation=self._sandbox_generation,
+        )
+        self._source_stages[stage.path] = stage
+        return stage
+
+    def snapshot_source_tree(
+        self,
+        stage: ProjectSourceStage,
+        *,
+        max_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
+        max_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
+    ) -> HarnessSourceTree:
+        """Revoke proposer processes and capture one stage as bounded immutable host data."""
+        if self._closing:
+            raise RuntimeError("cannot snapshot a source tree in a closed project")
+        self._ensure_project_shell_healthy()
+        if self._active_event_sink is not None:
+            raise RuntimeError(
+                "cannot snapshot a source tree while a project agent turn is running"
+            )
+        known = self._source_stages.get(stage.path)
+        if known is not stage:
+            raise ValueError("source stage does not belong to this project")
+        if stage.path in self._snapshotted_source_stages:
+            raise RuntimeError(f"source stage {stage.path!r} has already been snapshotted")
+        if stage.sandbox_generation != self._sandbox_generation:
+            raise RuntimeError(
+                f"source stage {stage.path!r} was lost when the project sandbox was replaced"
+            )
+        _validate_source_tree_bounds(max_files=max_files, max_bytes=max_bytes)
+
+        # No more model or tool frames may arrive once capture starts. Any shell process that
+        # escaped an individual Bash command still runs as the dedicated unprivileged user. Stop
+        # that entire user, kill it, and prove it absent before the trusted regular-file walk.
+        self._snapshotted_source_stages.add(stage.path)
+        self._close_agent_session()
+        absolute = self._absolute_path(stage.path)
+        command = _source_tree_snapshot_command(
+            absolute,
+            shell_user=self._shell_user,
+            max_files=max_files,
+            max_bytes=max_bytes,
+        )
+        try:
+            result = self._sandbox.commands.run(command, user="root", timeout=60.0)
+        except Exception as error:  # noqa: BLE001 - E2B raises command failures
+            detail = str(getattr(error, "stderr", "") or error)
+            raise RuntimeError(
+                f"project source snapshot failed: {_capped(detail).content}"
+            ) from error
+        exit_code = int(getattr(result, "exit_code", 0) or 0)
+        if exit_code != 0:
+            stderr = str(getattr(result, "stderr", "") or "snapshot command failed")
+            raise RuntimeError(f"project source snapshot failed: {_capped(stderr).content}")
+        try:
+            tree = _decode_source_tree_snapshot(str(getattr(result, "stdout", "")))
+        except ValueError as error:
+            raise RuntimeError("project source snapshot returned an invalid source tree") from error
+        tree.validate_bounds(max_files=max_files, max_bytes=max_bytes)
+        if stage.sandbox_generation != self._sandbox_generation:
+            raise RuntimeError(
+                f"source stage {stage.path!r} was lost when the project sandbox was replaced"
+            )
+        return tree
 
     def run(
         self,
@@ -644,6 +858,7 @@ class AgentProject:
         self._close_agent_session()
         self._active_sandbox_started_at = replacement_started_at
         self._sandbox = replacement
+        self._sandbox_generation += 1
         self._network_locked_sandbox_id = None
         self._shell_ready_sandbox_id = None
         if self._owns_sandbox:
@@ -665,8 +880,8 @@ class AgentProject:
         The project tree is owned by the ordinary sandbox user and is readable but not writable
         by the dedicated project-shell user. Shell commands start in a sticky scratch directory
         and receive an empty environment, no network, no privilege escalation, and bounded process
-        and output streams. Durable outputs must cross the separate exact-file ``write_file``
-        grant.
+        and output streams. Durable outputs cross a trusted source snapshot or the separate
+        exact-file ``write_file`` grant.
         """
         filter_command = f"node -e {shlex.quote(_BASH_FILTER_SCRIPT)}"
         script = (
@@ -778,7 +993,7 @@ class AgentProject:
             raise RuntimeError(stderr)
 
     def _ensure_project_shell_healthy(self) -> None:
-        """Reject further agent work after unproven shell cleanup."""
+        """Reject further agent or source-stage work after unproven shell cleanup."""
         if self._shell_quiescence_error is not None:
             raise RuntimeError(
                 "project shell is tainted after cleanup failure; close it and create a new "
@@ -813,6 +1028,28 @@ class AgentProject:
         return frozenset(self._relative_path(self._absolute_path(path)) for path in writable_files)
 
 
+def _validate_source_tree_bounds(*, max_files: int, max_bytes: int) -> None:
+    """Validate source snapshot limits before interpolating them into the trusted command."""
+    if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files < 1:
+        raise ValueError("max_files must be a positive integer")
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+        raise ValueError("max_bytes must be a positive integer")
+
+
+def _decode_source_tree_snapshot(payload: str) -> HarnessSourceTree:
+    """Decode bounded base64 JSON from the trusted snapshot script."""
+    encoded = _EncodedSourceSnapshot.model_validate_json(payload)
+    files: list[HarnessSourceFile] = []
+    for item in encoded.files:
+        try:
+            content_bytes = base64.b64decode(item.content_base64, validate=True)
+            content = content_bytes.decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError(f"invalid encoded snapshot content for {item.path!r}") from error
+        files.append(HarnessSourceFile(path=item.path, content=content))
+    return HarnessSourceTree(files=tuple(files))
+
+
 def _project_shell_quiescence_command(shell_user: str) -> str:
     """Build the root-only stop, kill, and absence-proof command."""
     return (
@@ -831,6 +1068,21 @@ def _project_shell_quiescence_command(shell_user: str) -> str:
         "  echo 'could not prove project shell quiescence' >&2\n"
         "  exit 70\n"
         "fi\n"
+    )
+
+
+def _source_tree_snapshot_command(
+    absolute: str,
+    *,
+    shell_user: str,
+    max_files: int,
+    max_bytes: int,
+) -> str:
+    """Build the root-only quiescence and regular-file capture command."""
+    return (
+        _project_shell_quiescence_command(shell_user) + "# wmh-project-source-snapshot\n"
+        f"python3 -c {shlex.quote(_SNAPSHOT_SOURCE_TREE_SCRIPT)} "
+        f"{shlex.quote(absolute)} {max_files} {max_bytes} {MAX_SOURCE_PATH_BYTES}\n"
     )
 
 

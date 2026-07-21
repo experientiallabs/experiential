@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import base64
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from llm_waterfall import ChatResponse
 
@@ -14,6 +20,7 @@ from wmh.harness.doc import TOOL_POLICY_ID, HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxCleanupError, SandboxUsage
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.runtime import HarnessSearchCancelled
+from wmh.harness.source_tree import HarnessSourceFile, HarnessSourceTree
 from wmh.providers.base import ProviderConfig, ProviderKind
 
 
@@ -59,6 +66,41 @@ class _Commands:
     def send_stdin(self, pid: int, data: str, request_timeout: float | None = None) -> object:
         del pid, data, request_timeout
         return None
+
+
+class _SourceTreeCommands(_Commands):
+    """Script the trusted snapshot response while recording its E2B command contract."""
+
+    def __init__(self, files: _Files) -> None:
+        super().__init__(files)
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.snapshot_payload = _snapshot_payload(
+            HarnessSourceTree(files=(HarnessSourceFile(path="SYSTEM.md", content="candidate"),))
+        )
+
+    def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+        del background
+        self.runs.append(cmd)
+        self.calls.append((cmd, dict(kwargs)))
+        if "wmh-project-source-snapshot" in cmd:
+            return _Output(stdout=self.snapshot_payload)
+        return _Output()
+
+
+def _snapshot_payload(tree: HarnessSourceTree) -> str:
+    return json.dumps(
+        {
+            "files": [
+                {
+                    "path": item.path,
+                    "content_base64": base64.b64encode(item.content.encode("utf-8")).decode(
+                        "ascii"
+                    ),
+                }
+                for item in tree.files
+            ]
+        }
+    )
 
 
 class _Sandbox:
@@ -1434,6 +1476,8 @@ def test_project_bash_cleanup_failure_taints_the_project() -> None:
     assert "project shell is tainted" in blocked.content
     with pytest.raises(RuntimeError, match="project shell is tainted"):
         project.run(meta_agent(), _Provider(), "continue", timeout=1)
+    with pytest.raises(RuntimeError, match="project shell is tainted"):
+        project.stage_source_tree(HarnessSourceTree(files=()))
 
 
 def test_project_bash_cleanup_failure_stops_before_another_provider_call() -> None:
@@ -1617,3 +1661,221 @@ def test_project_rejects_agents_with_uncontained_tools() -> None:
 
     with pytest.raises(ValueError, match="uncontained tools: read_skill"):
         project.run(uncontained, _Provider(), "escape", timeout=1)
+
+
+def test_project_stages_and_snapshots_a_complete_source_tree_once() -> None:
+    """The host captures current stage bytes only after revoking proposer processes."""
+    sandbox = _Sandbox()
+    commands = _SourceTreeCommands(sandbox.files)
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    seed = HarnessSourceTree.from_doc(HarnessDoc.baseline("seed"))
+    candidate = HarnessSourceTree(
+        files=(
+            HarnessSourceFile(path="SYSTEM.md", content="candidate"),
+            HarnessSourceFile(
+                path="config.toml",
+                content='[harness]\ntools = ["submit"]\nmax_turns = 8\n',
+            ),
+            HarnessSourceFile(path="src/new.ts", content="export const value = 1;\n"),
+        )
+    )
+    commands.snapshot_payload = _snapshot_payload(candidate)
+
+    stage = project.stage_source_tree(seed)
+    captured = project.snapshot_source_tree(stage)
+
+    assert stage.path == ".scratch/source-stages/stage-000001"
+    assert captured == candidate
+    assert captured.to_doc("candidate").system_prompt() == "candidate"
+    assert (
+        sandbox.files.values["/home/user/project/.scratch/source-stages/stage-000001/SYSTEM.md"]
+        == seed.file_map()["SYSTEM.md"]
+    )
+    snapshot_command, snapshot_options = next(
+        call for call in commands.calls if "wmh-project-source-snapshot" in call[0]
+    )
+    assert snapshot_options == {"user": "root", "timeout": 60.0}
+    assert f"pkill -STOP -u {PROJECT_SHELL_USER}" in snapshot_command
+    assert f"pkill -KILL -u {PROJECT_SHELL_USER}" in snapshot_command
+    assert f"pgrep -u {PROJECT_SHELL_USER}" in snapshot_command
+    with pytest.raises(RuntimeError, match="already been snapshotted"):
+        project.snapshot_source_tree(stage)
+
+
+def test_project_snapshot_preserves_candidate_deletions() -> None:
+    sandbox = _Sandbox()
+    commands = _SourceTreeCommands(sandbox.files)
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    seed = HarnessSourceTree(
+        files=(
+            HarnessSourceFile(path="SYSTEM.md", content="seed"),
+            HarnessSourceFile(path="src/removed.ts", content="remove me"),
+        )
+    )
+    commands.snapshot_payload = _snapshot_payload(
+        HarnessSourceTree(files=(HarnessSourceFile(path="SYSTEM.md", content="candidate"),))
+    )
+
+    captured = project.snapshot_source_tree(project.stage_source_tree(seed))
+
+    assert captured.file_map() == {"SYSTEM.md": "candidate"}
+
+
+def test_project_snapshot_cannot_salvage_a_stage_lost_on_sandbox_replacement() -> None:
+    original = _Sandbox()
+    replacement = _Sandbox()
+    original.commands = _SourceTreeCommands(original.files)
+    replacement.commands = _SourceTreeCommands(replacement.files)
+    project = AgentProject(
+        original,
+        channel_factory=lambda sandbox, workspace: _Channel(),
+        sandbox_factory=lambda: replacement,
+    )
+    stage = project.stage_source_tree(HarnessSourceTree.from_doc(HarnessDoc.baseline("seed")))
+    project.write_text("submissions/ready.txt", "ready")
+
+    project._replace_sandbox()  # noqa: SLF001 - exercise the recovery boundary directly
+
+    assert project.read_text("submissions/ready.txt") == "ready"
+    with pytest.raises(RuntimeError, match="lost when the project sandbox was replaced"):
+        project.snapshot_source_tree(stage)
+
+
+def test_project_rejects_an_equal_looking_stage_handle_from_another_project() -> None:
+    first_sandbox = _Sandbox()
+    first_sandbox.commands = _SourceTreeCommands(first_sandbox.files)
+    second_sandbox = _Sandbox()
+    second_sandbox.commands = _SourceTreeCommands(second_sandbox.files)
+    first = AgentProject(first_sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    second = AgentProject(second_sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    empty = HarnessSourceTree(files=())
+
+    first_stage = first.stage_source_tree(empty)
+    second_stage = second.stage_source_tree(empty)
+
+    assert first_stage == second_stage
+    with pytest.raises(ValueError, match="does not belong to this project"):
+        second.snapshot_source_tree(first_stage)
+
+
+def test_project_source_stage_does_not_require_a_host_selected_starting_tree() -> None:
+    sandbox = _Sandbox()
+    sandbox.commands = _SourceTreeCommands(sandbox.files)
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    stage = project.stage_source_tree(HarnessSourceTree(files=()))
+
+    assert stage.path == ".scratch/source-stages/stage-000001"
+
+
+def test_project_snapshot_failure_consumes_the_stage() -> None:
+    class _FailingSnapshotCommands(_SourceTreeCommands):
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            if "wmh-project-source-snapshot" in cmd:
+                raise RuntimeError("capture failed")
+            return super().run(cmd, background, **kwargs)
+
+    sandbox = _Sandbox()
+    sandbox.commands = _FailingSnapshotCommands(sandbox.files)
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    stage = project.stage_source_tree(HarnessSourceTree(files=()))
+
+    with pytest.raises(RuntimeError, match="capture failed"):
+        project.snapshot_source_tree(stage)
+    with pytest.raises(RuntimeError, match="already been snapshotted"):
+        project.snapshot_source_tree(stage)
+
+
+def test_project_snapshot_rechecks_file_and_byte_bounds_host_side() -> None:
+    sandbox = _Sandbox()
+    commands = _SourceTreeCommands(sandbox.files)
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    stage = project.stage_source_tree(HarnessSourceTree.from_doc(HarnessDoc.baseline("seed")))
+    commands.snapshot_payload = _snapshot_payload(
+        HarnessSourceTree(
+            files=(
+                HarnessSourceFile(path="SYSTEM.md", content="candidate"),
+                HarnessSourceFile(path="src/a.ts", content="a"),
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="more than 1 files"):
+        project.snapshot_source_tree(stage, max_files=1)
+
+    second_stage = project.stage_source_tree(
+        HarnessSourceTree.from_doc(HarnessDoc.baseline("second"))
+    )
+    with pytest.raises(ValueError, match="more than 4 bytes"):
+        project.snapshot_source_tree(second_stage, max_bytes=4)
+
+
+def _run_snapshot_script(
+    root: Path,
+    *,
+    max_files: int = 20,
+    max_bytes: int = 10_000,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            project_module._SNAPSHOT_SOURCE_TREE_SCRIPT,  # noqa: SLF001
+            str(root),
+            str(max_files),
+            str(max_bytes),
+            str(project_module.MAX_SOURCE_PATH_BYTES),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_snapshot_script_captures_only_regular_utf8_files(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "SYSTEM.md").write_text("candidate", encoding="utf-8")
+    (tmp_path / "src" / "agent.ts").write_text("export {};\n", encoding="utf-8")
+
+    result = _run_snapshot_script(tmp_path)
+
+    assert result.returncode == 0
+    tree = project_module._decode_source_tree_snapshot(result.stdout)  # noqa: SLF001
+    assert tree.file_map() == {
+        "SYSTEM.md": "candidate",
+        "src/agent.ts": "export {};\n",
+    }
+
+
+def test_snapshot_script_rejects_symlinks(tmp_path: Path) -> None:
+    (tmp_path / "SYSTEM.md").write_text("candidate", encoding="utf-8")
+    (tmp_path / "link").symlink_to(tmp_path / "SYSTEM.md")
+
+    result = _run_snapshot_script(tmp_path)
+
+    assert result.returncode != 0
+    assert "non-regular entry" in result.stderr
+
+
+def test_snapshot_script_rejects_non_utf8_files(tmp_path: Path) -> None:
+    (tmp_path / "SYSTEM.md").write_bytes(b"\xff")
+
+    result = _run_snapshot_script(tmp_path)
+
+    assert result.returncode != 0
+    assert "not UTF-8" in result.stderr
+
+
+def test_snapshot_script_bounds_empty_directory_walks(tmp_path: Path) -> None:
+    current = tmp_path
+    for index in range(81):
+        current = current / f"d{index}"
+        current.mkdir()
+
+    result = _run_snapshot_script(tmp_path, max_files=20)
+
+    assert result.returncode != 0
+    assert "entry-count bound" in result.stderr
