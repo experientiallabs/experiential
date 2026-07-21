@@ -841,3 +841,78 @@ def test_history_artifact_content_is_verified_before_agent_exposure() -> None:
         proposer.propose((corrupt,))
 
     assert project.run_calls == []
+
+
+def test_stage_from_seed_prepopulates_output_with_the_seed_source() -> None:
+    seed_source = _source("seed prompt")
+    project = _FakeProject([_source("edited in place")])
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(
+        project, optimizer_agent(), _provider(), stage_from_seed=True
+    )
+    seed = _evaluated("candidate-0000", source=seed_source)
+
+    result = proposer.propose((seed,))
+
+    assert result.candidate_id == "candidate-0001"
+    # The output stage is pre-populated with the seed's complete tree, not an empty directory.
+    assert project.staged == [seed_source]
+    instruction = project.run_calls[0].instruction
+    assert "ALREADY POPULATED" in instruction
+    assert "Do not delete SYSTEM.md or config.toml" in instruction
+    assert "initially empty directory" not in instruction
+
+
+def test_stage_from_seed_default_false_stages_empty_with_original_wording() -> None:
+    project = _FakeProject([_source("improved")])
+    project.run_behavior = _emit_bash_activity
+    proposer = ProjectCandidateProposer(project, optimizer_agent(), _provider())
+
+    proposer.propose((_evaluated("candidate-0000"),))
+
+    assert project.staged == [HarnessSourceTree(files=())]
+    instruction = project.run_calls[0].instruction
+    assert "initially empty directory" in instruction
+    assert "ALREADY POPULATED" not in instruction
+
+
+def test_stage_from_seed_restore_round_trip_reproduces_identical_proposals() -> None:
+    seed_source = _source("seed prompt")
+    first_source = _source("first edit")
+    invalid_source = HarnessSourceTree(
+        files=(HarnessSourceFile(path="notes.txt", content="unfinished"),)
+    )
+    original_project = _FakeProject([first_source, invalid_source])
+    original_project.run_behavior = _emit_bash_activity
+    original = ProjectCandidateProposer(
+        original_project, optimizer_agent(), _provider(), stage_from_seed=True
+    )
+    seed = _evaluated("candidate-0000", source=seed_source)
+
+    first = original.propose((seed,))
+    scored_first = _evaluated("candidate-0001", source=first.source)
+    original_project.emit_submit = False
+    with pytest.raises(CandidateProposalError) as raised:
+        original.propose((seed, scored_first))
+    invalid = raised.value
+
+    restored_project = _FakeProject([_source("unused")])
+    restored_project.run_behavior = _emit_bash_activity
+    restored = ProjectCandidateProposer(
+        restored_project, optimizer_agent(), _provider(), stage_from_seed=True
+    )
+    restored.restore((seed, scored_first), (first, invalid))
+
+    original_trace = {
+        path: content
+        for path, content in original_project.files.items()
+        if path.startswith("proposals/")
+    }
+    restored_trace = {
+        path: content
+        for path, content in restored_project.files.items()
+        if path.startswith("proposals/")
+    }
+    assert restored_trace == original_trace
+    # Every restored turn re-stages the seed source, never the captured turn source.
+    assert restored_project.staged == [seed_source, seed_source]

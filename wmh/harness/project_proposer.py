@@ -179,6 +179,7 @@ class ProjectCandidateProposer:
         max_source_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
         max_history_candidates: int = DEFAULT_MAX_HISTORY_CANDIDATES,
         max_history_bytes: int = DEFAULT_MAX_HISTORY_BYTES,
+        stage_from_seed: bool = False,
     ) -> None:
         _require_positive_int(max_source_files, field="max_source_files")
         _require_positive_int(max_source_bytes, field="max_source_bytes")
@@ -197,6 +198,10 @@ class ProjectCandidateProposer:
         self._max_source_bytes = max_source_bytes
         self._max_history_candidates = max_history_candidates
         self._max_history_bytes = max_history_bytes
+        # When set, every proposal turn stages the seed (candidate-0000) source tree instead of an
+        # empty directory, so the agent edits a valid, complete harness in place rather than
+        # assembling one from scratch. Off by default so the population lane stays byte-identical.
+        self._stage_from_seed = stage_from_seed
         self._history_fingerprints: tuple[str, ...] = ()
         self._proposal_count = 0
 
@@ -215,11 +220,17 @@ class ProjectCandidateProposer:
         self._materialize_history(frozen_history, fingerprints=fingerprints, start=0)
         self._write_history_manifest(frozen_history)
         history_count = 1
+        # When staging from the seed, every turn's pre-populated base is the seed source
+        # (candidate-0000), never the captured turn source, so restored staging matches propose().
+        seed_base = frozen_history[0].source
         for index, turn in enumerate(frozen_turns, start=1):
             candidate_id = f"candidate-{index:04d}"
             proposal_dir = f"proposals/{candidate_id}"
+            staged_base = (
+                seed_base if self._stage_from_seed else (turn.source or HarnessSourceTree(files=()))
+            )
             stage = self._project.stage_source_tree(
-                turn.source or HarnessSourceTree(files=()),
+                staged_base,
                 max_files=self._max_source_files,
                 max_bytes=self._max_source_bytes,
             )
@@ -230,6 +241,7 @@ class ProjectCandidateProposer:
                 history_count=history_count,
                 previous_proposal_id=(f"candidate-{index - 1:04d}" if index > 1 else None),
                 directive=self._directive,
+                stage_from_seed=self._stage_from_seed,
             )
             if turn.request != expected_request:
                 raise ValueError(f"restored request differs for {candidate_id}")
@@ -283,8 +295,11 @@ class ProjectCandidateProposer:
         next_proposal_count = self._proposal_count + 1
         candidate_id = f"candidate-{next_proposal_count:04d}"
         proposal_dir = f"proposals/{candidate_id}"
+        staged_base = (
+            frozen_history[0].source if self._stage_from_seed else HarnessSourceTree(files=())
+        )
         stage = self._project.stage_source_tree(
-            HarnessSourceTree(files=()),
+            staged_base,
             max_files=self._max_source_files,
             max_bytes=self._max_source_bytes,
         )
@@ -296,6 +311,7 @@ class ProjectCandidateProposer:
             history_count=len(frozen_history),
             previous_proposal_id=previous_proposal_id,
             directive=self._directive,
+            stage_from_seed=self._stage_from_seed,
         )
         self._project.write_text(f"{proposal_dir}/REQUEST.md", request)
         self._proposal_count = next_proposal_count
@@ -617,6 +633,7 @@ def _proposal_request(
     history_count: int,
     previous_proposal_id: str | None,
     directive: str = "",
+    stage_from_seed: bool = False,
 ) -> str:
     previous_trace = (
         f"The immediately preceding coding-turn trace is "
@@ -631,6 +648,18 @@ def _proposal_request(
         if directive
         else ""
     )
+    output_block = (
+        "Your candidate output directory is ALREADY POPULATED with the current harness's\n"
+        f"complete source tree:\n`{absolute_stage}`\n\n"
+        "Edit it in place to satisfy the objective. Do not delete SYSTEM.md or config.toml,\n"
+        "and the final directory must remain a complete standalone harness source tree."
+        if stage_from_seed
+        else (
+            "Your only candidate output is this initially empty directory:\n"
+            f"`{absolute_stage}`\n\n"
+            "Leave one complete standalone harness source tree there."
+        )
+    )
     return f"""Produce exactly one complete harness candidate: {candidate_id}.
 
 Read `history/manifest.json`. It indexes all {history_count} evaluated candidates, their complete
@@ -638,13 +667,12 @@ source directories, full score reports, and raw evaluator artifacts. Earlier cod
 remain under `proposals/`. {previous_trace} Use the full population as evidence. Do not select or
 assume a host-designated source to extend.
 {directive_block}
-Your only candidate output is this initially empty directory:
-`{absolute_stage}`
+{output_block}
 
 Use Bash to inspect immutable project evidence and to copy, create, edit, delete, and test files
-inside that directory. Leave one complete standalone harness source tree there. Do not modify
-`history/`, `proposals/`, or any other project path. When the candidate is complete, call submit.
-The host snapshots the directory once after this turn and will not ask for a repair.
+inside that directory. Do not modify `history/`, `proposals/`, or any other project path. When the
+candidate is complete, call submit. The host snapshots the directory once after this turn and will
+not ask for a repair.
 
 This turn's immutable request and trace are stored under `{proposal_dir}/`.
 """
