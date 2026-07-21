@@ -268,6 +268,9 @@ class WmhHarborAgent(BaseAgent):
         """Run the candidate in a dedicated worker thread and always persist its WMH trace."""
         context.metadata = {"candidate_doc_hash": self._harness.doc_hash}
         cancel_requested = threading.Event()
+        # Cancellation is cooperative and best-effort on the local backend: the local SSH
+        # pi-node runtime has no should_cancel hook, so a cancelled local episode runs to its
+        # own node/SSH bound before the shield below releases. The e2b backend honors it.
         runtime = self._harness.runtime(
             self._provider,
             backend=self._harness_backend,

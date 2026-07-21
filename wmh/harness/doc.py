@@ -345,7 +345,10 @@ class HarnessDoc(BaseModel):
         episode wall budget; omitting it preserves the 300-second default. `transport_retries`
         controls whole-episode replay after an E2B transport death; omitting it preserves that
         runtime's one-retry default, and a side-effectful real environment passes 0. Other
-        execution modes reject both instead of silently ignoring them. All expose the same
+        execution modes reject both instead of silently ignoring them. `should_cancel` is
+        honored cooperatively by the e2b and link pi-node runtimes; the local SSH pi-node
+        runtime has no cancellation hook, so there it is accepted but best-effort only (an
+        in-flight episode runs to its own node/SSH bound). All expose the same
         `run(task_id, instruction, environment) -> RunResult` shape closed-loop eval drives.
         """
         if backend not in ("local", "e2b"):
