@@ -35,7 +35,12 @@ from wmh.evals.harbor.agent import MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
 from wmh.evals.harbor.canonical import canonical_harbor_job_config
 from wmh.evals.harbor.scorer import HarborScorer
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, SandboxUsage, resolve_e2b_template
+from wmh.harness.e2b_sandbox import (
+    E2B_TEMPLATE_ENV,
+    SandboxUsage,
+    e2b_create_rate_policy_payload,
+    resolve_e2b_template,
+)
 from wmh.harness.population import HarnessPopulationOptimizer, PopulationOptimizationResult
 from wmh.harness.population_archive import write_population_archive
 from wmh.harness.population_checkpoint import (
@@ -378,6 +383,7 @@ def _execute_optimization(
             optimizer_document_hash=optimizer.doc_hash,
             harness_backend=harness_backend,
             e2b_template=e2b_template or None,
+            project_e2b_create_rate_policy=e2b_create_rate_policy_payload(),
             environment_command_timeout_sec=environment_command_timeout_sec,
             episode_timeout_sec=episode_timeout_sec,
             project_timeout_sec=project_timeout_sec,

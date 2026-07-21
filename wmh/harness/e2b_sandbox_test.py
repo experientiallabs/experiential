@@ -7,24 +7,129 @@ locally-defined `RateLimitException` stands in for e2b's, and a plain fake satis
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from types import ModuleType
 
 import pytest
 
+import wmh.harness.e2b_sandbox as e2b_sandbox_module
 from wmh.harness.e2b_sandbox import (
+    E2B_CREATE_RATE_POLICY,
+    E2BCreateRateGate,
+    E2BCreateRateLimitError,
+    E2BCreateRatePolicy,
     SandboxCleanupError,
     SandboxHandle,
     create_sandbox,
     default_sandbox_factory,
+    e2b_create_rate_policy_payload,
     kill_sandbox,
     resolve_e2b_template,
 )
 
+_ACQUIRE_E2B_CREATE_SLOT = e2b_sandbox_module.acquire_e2b_create_slot
+
 
 class RateLimitException(Exception):
     """Name-matches e2b's 429 exception; classification never imports the SDK."""
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self.now_ns = 0
+        self.sleeps: list[float] = []
+
+    def monotonic_ns(self) -> int:
+        with self._lock:
+            return self.now_ns
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            self.sleeps.append(seconds)
+            self.now_ns += round(seconds * 1_000_000_000)
+
+
+@pytest.fixture(autouse=True)
+def _disable_process_rate_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(e2b_sandbox_module, "acquire_e2b_create_slot", lambda: None)
+
+
+def test_e2b_create_rate_policy_is_frozen_and_canonical() -> None:
+    assert E2B_CREATE_RATE_POLICY == E2BCreateRatePolicy()
+    assert e2b_create_rate_policy_payload() == {
+        "schema_version": 1,
+        "provider": "e2b",
+        "operation": "sandbox_create",
+        "maximum_dispatches": 4,
+        "period_milliseconds": 1000,
+        "maximum_wait_seconds": 60.0,
+    }
+
+
+def test_e2b_create_gate_paces_ninety_shared_concurrent_admissions() -> None:
+    clock = _FakeClock()
+    gate = E2BCreateRateGate(
+        policy=E2B_CREATE_RATE_POLICY,
+        monotonic_ns=clock.monotonic_ns,
+        sleep=clock.sleep,
+    )
+
+    with ThreadPoolExecutor(max_workers=45) as executor:
+        list(executor.map(lambda _index: gate.acquire(), range(90)))
+
+    assert clock.now_ns == 89 * 250_000_000
+    assert len(clock.sleeps) == 89
+    assert all(delay == pytest.approx(0.25) for delay in clock.sleeps)
+
+
+def test_sync_and_async_e2b_create_paths_contend_on_one_process_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    gate = E2BCreateRateGate(
+        policy=E2B_CREATE_RATE_POLICY,
+        monotonic_ns=clock.monotonic_ns,
+        sleep=clock.sleep,
+    )
+    monkeypatch.setattr(e2b_sandbox_module, "_E2B_CREATE_RATE_GATE", gate)
+    monkeypatch.setattr(
+        e2b_sandbox_module,
+        "acquire_e2b_create_slot",
+        _ACQUIRE_E2B_CREATE_SLOT,
+    )
+
+    async def contend() -> None:
+        sync_calls = [
+            asyncio.to_thread(e2b_sandbox_module.acquire_e2b_create_slot) for _index in range(8)
+        ]
+        async_calls = [e2b_sandbox_module.acquire_e2b_create_slot_async() for _index in range(8)]
+        await asyncio.gather(*sync_calls, *async_calls)
+
+    asyncio.run(contend())
+
+    assert clock.now_ns == 15 * 250_000_000
+    assert len(clock.sleeps) == 15
+    assert all(delay == pytest.approx(0.25) for delay in clock.sleeps)
+
+
+def test_e2b_create_gate_rejects_an_admission_beyond_its_wait_bound() -> None:
+    clock = _FakeClock()
+    gate = E2BCreateRateGate(
+        policy=E2BCreateRatePolicy(maximum_wait_seconds=0.1),
+        monotonic_ns=clock.monotonic_ns,
+        sleep=clock.sleep,
+    )
+    gate.acquire()
+
+    with pytest.raises(E2BCreateRateLimitError, match="0.100 seconds"):
+        gate.acquire()
+
+    assert clock.sleeps == []
 
 
 class _Result:
@@ -281,6 +386,62 @@ def test_default_factory_passes_metadata_to_the_lazy_e2b_sdk(
             "metadata": metadata,
         }
     ]
+
+
+def test_default_factory_reacquires_rate_gate_before_every_create_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeSandbox()
+    creates: list[int] = []
+    admissions: list[int] = []
+
+    class _SandboxSdk:
+        @staticmethod
+        def create(**_kwargs: object) -> FakeSandbox:
+            creates.append(1)
+            if len(creates) < 4:
+                raise RateLimitException("slow down")
+            return fake
+
+    e2b = ModuleType("e2b")
+    e2b.__dict__["Sandbox"] = _SandboxSdk
+    monkeypatch.setitem(sys.modules, "e2b", e2b)
+    monkeypatch.setattr(
+        e2b_sandbox_module,
+        "acquire_e2b_create_slot",
+        lambda: admissions.append(1),
+    )
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    assert create_sandbox(default_sandbox_factory(api_key="key")) is fake
+    assert len(creates) == 4
+    assert len(admissions) == 4
+
+
+def test_default_factory_rate_gate_precedes_nonretryable_create_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class _SandboxSdk:
+        @staticmethod
+        def create(**_kwargs: object) -> FakeSandbox:
+            events.append("create")
+            raise ValueError("bad template")
+
+    e2b = ModuleType("e2b")
+    e2b.__dict__["Sandbox"] = _SandboxSdk
+    monkeypatch.setitem(sys.modules, "e2b", e2b)
+    monkeypatch.setattr(
+        e2b_sandbox_module,
+        "acquire_e2b_create_slot",
+        lambda: events.append("admit"),
+    )
+
+    with pytest.raises(ValueError, match="bad template"):
+        create_sandbox(default_sandbox_factory(api_key="key"))
+
+    assert events == ["admit", "create"]
 
 
 def test_default_factory_snapshots_template_environment(

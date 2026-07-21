@@ -11,12 +11,17 @@ optional extra (`uv sync --extra e2b`).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections.abc import Callable, Iterator, Sequence
-from typing import Protocol, cast, runtime_checkable
+from dataclasses import dataclass
+from threading import Lock
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
+
+from wmh.core.types import JsonObject
 
 
 class SandboxUsage(BaseModel):
@@ -45,6 +50,108 @@ _CREATE_DELAYS = (1.0, 3.0, 9.0)
 # be proved.
 _KILL_DELAYS = (0.1, 0.5)
 _KILL_REQUEST_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class E2BCreateRatePolicy:
+    """Process-wide admission policy for calls that create E2B sandboxes."""
+
+    schema_version: Literal[1] = 1
+    provider: Literal["e2b"] = "e2b"
+    operation: Literal["sandbox_create"] = "sandbox_create"
+    maximum_dispatches: int = 4
+    period_milliseconds: int = 1_000
+    maximum_wait_seconds: float = 60.0
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.maximum_dispatches, bool)
+            or self.maximum_dispatches < 1
+            or isinstance(self.period_milliseconds, bool)
+            or self.period_milliseconds < 1
+            or isinstance(self.maximum_wait_seconds, bool)
+            or self.maximum_wait_seconds <= 0
+        ):
+            raise ValueError("E2B create-rate policy values must be positive")
+
+    @property
+    def interval_ns(self) -> int:
+        """Minimum nanoseconds between admitted sandbox-create calls."""
+        return round(self.period_milliseconds * 1_000_000 / self.maximum_dispatches)
+
+
+E2B_CREATE_RATE_POLICY = E2BCreateRatePolicy()
+
+
+def e2b_create_rate_policy_payload() -> JsonObject:
+    """Return the canonical execution-identity payload for E2B create admission."""
+    policy = E2B_CREATE_RATE_POLICY
+    return {
+        "schema_version": policy.schema_version,
+        "provider": policy.provider,
+        "operation": policy.operation,
+        "maximum_dispatches": policy.maximum_dispatches,
+        "period_milliseconds": policy.period_milliseconds,
+        "maximum_wait_seconds": policy.maximum_wait_seconds,
+    }
+
+
+class E2BCreateRateLimitError(RuntimeError):
+    """A sandbox create could not be admitted within the bounded queue wait."""
+
+
+class E2BCreateRateGate:
+    """Serialize one process's E2B creates at a fixed monotonic rate."""
+
+    def __init__(
+        self,
+        *,
+        policy: E2BCreateRatePolicy = E2B_CREATE_RATE_POLICY,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._policy = policy
+        self._monotonic_ns = monotonic_ns
+        self._sleep = sleep
+        self._lock = Lock()
+        self._next_admission_ns: int | None = None
+
+    def acquire(self) -> None:
+        """Wait for one create slot or fail before the policy's queue horizon."""
+        started_ns = self._monotonic_ns()
+        with self._lock:
+            now_ns = self._monotonic_ns()
+            target_ns = max(now_ns, self._next_admission_ns or now_ns)
+            total_wait_ns = target_ns - started_ns
+            maximum_wait_ns = round(self._policy.maximum_wait_seconds * 1_000_000_000)
+            if total_wait_ns > maximum_wait_ns:
+                raise E2BCreateRateLimitError(
+                    "E2B sandbox create could not be admitted within "
+                    f"{self._policy.maximum_wait_seconds:.3f} seconds"
+                )
+            while now_ns < target_ns:
+                self._sleep((target_ns - now_ns) / 1_000_000_000)
+                advanced_ns = self._monotonic_ns()
+                if advanced_ns <= now_ns:
+                    raise E2BCreateRateLimitError(
+                        "E2B sandbox create admission clock did not advance while waiting"
+                    )
+                now_ns = advanced_ns
+            admitted_ns = max(now_ns, target_ns)
+            self._next_admission_ns = admitted_ns + self._policy.interval_ns
+
+
+_E2B_CREATE_RATE_GATE = E2BCreateRateGate()
+
+
+def acquire_e2b_create_slot() -> None:
+    """Acquire one slot from the process-wide E2B sandbox-create gate."""
+    _E2B_CREATE_RATE_GATE.acquire()
+
+
+async def acquire_e2b_create_slot_async() -> None:
+    """Acquire the same process-wide slot without blocking the event loop."""
+    await asyncio.to_thread(acquire_e2b_create_slot)
 
 
 def resolve_e2b_template(template: str | None) -> str | None:
@@ -200,6 +307,7 @@ def default_sandbox_factory(
         key = api_key or os.environ.get(E2B_API_KEY_ENV)
         if not key:
             raise RuntimeError(f"set ${E2B_API_KEY_ENV} to run the harness in E2B sandboxes")
+        acquire_e2b_create_slot()
         if metadata:
             sandbox = Sandbox.create(
                 template=chosen_template,

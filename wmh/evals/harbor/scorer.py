@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import harbor
 from harbor import Job
 from harbor.models.agent.name import AgentName
+from harbor.models.environment_type import EnvironmentType
 from harbor.models.job.config import DatasetConfig, JobConfig, RetryConfig
 from harbor.models.job.lock import JobLock, TrialLock
 from harbor.models.job.result import JobResult
@@ -38,7 +39,10 @@ from wmh.evals.harbor.tasks import (
     resolve_harbor_task_set,
 )
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_sandbox import resolve_e2b_template
+from wmh.harness.e2b_sandbox import (
+    e2b_create_rate_policy_payload,
+    resolve_e2b_template,
+)
 from wmh.harness.pi_runtime import PI_RUNNER_DIR, PI_RUNNER_HOST
 from wmh.harness.runtime import (
     DEFAULT_EVAL_EPISODE_TIMEOUT_S,
@@ -58,7 +62,8 @@ from wmh.providers.base import ProviderConfig
 _INDEX_PATH = "raw/index.json"
 _REQUIRED_JOB_FILES = frozenset({"config.json", "lock.json", "result.json", "job.log"})
 _REQUIRED_TRIAL_FILES = frozenset({"config.json", "lock.json", "result.json", "trial.log"})
-_HARBOR_SCORER_VERSION = "3"
+_HARBOR_SCORER_VERSION = "4"
+WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH = "wmh.evals.harbor.e2b_environment:WmhE2BEnvironment"
 _CHECKSUM_PATTERN = r"^[0-9a-f]{64}$"
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -102,6 +107,30 @@ def _validate_episode_timeout_sec(value: object) -> float:
         raise ValueError("episode_timeout_sec must be a finite positive number") from error
 
 
+def _pace_builtin_e2b_environment(job_config: JobConfig) -> tuple[JobConfig, bool]:
+    """Route Harbor's built-in E2B backend through WMH's paced subclass."""
+    environment = job_config.environment
+    if environment.type is EnvironmentType.E2B:
+        if environment.import_path is not None:
+            raise ValueError("Harbor E2B environment cannot set both type and import_path")
+        paced_environment = environment.model_copy(
+            update={
+                "type": None,
+                "import_path": WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH,
+            },
+            deep=True,
+        )
+        paced_job = job_config.model_copy(
+            update={"environment": paced_environment},
+            deep=True,
+        )
+        return JobConfig.model_validate(paced_job.model_dump(mode="python")), True
+    return (
+        job_config,
+        environment.import_path == WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH,
+    )
+
+
 class HarborScorer:
     """Evaluate exact harness candidates through Harbor's official verifier lifecycle."""
 
@@ -118,6 +147,7 @@ class HarborScorer:
         e2b_template: str | None = None,
         runner: HarborRunner | None = None,
     ) -> None:
+        job_config, task_environment_uses_paced_e2b = _pace_builtin_e2b_environment(job_config)
         if len(job_config.datasets) != 1 or job_config.tasks:
             raise ValueError("HarborScorer requires exactly one dataset and no direct tasks")
         if len(job_config.agents) != 1:
@@ -196,6 +226,7 @@ class HarborScorer:
         self._environment_command_timeout_sec = environment_command_timeout_sec
         self._episode_timeout_sec = episode_timeout_sec
         self._harness_backend = harness_backend
+        self._task_environment_uses_paced_e2b = task_environment_uses_paced_e2b
         if harness_backend == "local":
             self._local_runner_identity = {
                 "transport": "ssh",
@@ -308,12 +339,26 @@ class HarborScorer:
             "local_runner": self._local_runner_identity,
             "environment_command_timeout_sec": self._environment_command_timeout_sec,
             "episode_timeout_sec": self._episode_timeout_sec,
+            "e2b_create_rate": self._e2b_create_rate_identity(),
         }
         return ScoreContext(
             task_set_digest=_digest_json(task_payload),
             evaluator_digest=_digest_json(evaluator_payload),
             execution_config_digest=_digest_json(execution_payload),
         )
+
+    def _e2b_create_rate_identity(self) -> dict[str, object] | None:
+        consumers = []
+        if self._task_environment_uses_paced_e2b:
+            consumers.append("task_environment")
+        if self._harness_backend == "e2b":
+            consumers.append("worker_sandbox")
+        if not consumers:
+            return None
+        return {
+            "policy": e2b_create_rate_policy_payload(),
+            "consumers": consumers,
+        }
 
     def score(self, candidate: HarnessDoc, *, request: ScoreRequest) -> HarnessScore:
         """Run and project one candidate, raising unless every requested cell is scoreable."""

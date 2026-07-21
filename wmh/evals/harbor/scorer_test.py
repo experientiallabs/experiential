@@ -35,6 +35,7 @@ from harbor.models.trial.result import (
 from harbor.models.verifier.result import VerifierResult
 from harbor.tasks.client import TaskDownloadResult
 
+import wmh.evals.harbor.scorer as scorer_module
 from wmh.evals.harbor.agent import (
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     WMH_HARBOR_AGENT_IMPORT_PATH,
@@ -42,6 +43,7 @@ from wmh.evals.harbor.agent import (
     WmhHarborAgent,
 )
 from wmh.evals.harbor.scorer import (
+    WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH,
     HarborJobRunner,
     HarborRun,
     HarborScorer,
@@ -89,6 +91,7 @@ class _Runner:
             if task_id in task_configs:
                 trial.config.task = task_configs[task_id].model_copy(deep=True)
                 trial.task_id = trial.config.task.get_task_id()
+            trial.config.environment = config.environment.model_copy(deep=True)
             trial.task_checksum = identity.trial_checksum
             trial.config.trials_dir = destination
             trial.trial_uri = destination.joinpath(trial.trial_name).resolve().as_uri()
@@ -408,7 +411,8 @@ def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
     assert scored.report.candidate_doc_hash == candidate.doc_hash
     config = runner.configs[0]
     assert config.n_attempts == 2
-    assert config.environment.type is EnvironmentType.E2B
+    assert config.environment.type is None
+    assert config.environment.import_path == WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
     assert config.datasets == []
     assert [task.get_task_id().get_name() for task in config.tasks] == [
         "task-a",
@@ -420,6 +424,84 @@ def test_scorer_projects_shuffled_opaque_replicates_and_injects_candidate(
     assert config.agents[0].kwargs["harness_backend"] == "local"
     assert config.agents[0].kwargs["command_timeout_sec"] == MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC
     assert "secret" not in json.dumps(config.agents[0].kwargs).lower()
+
+
+def test_scorer_rewrites_builtin_e2b_environment_without_losing_options(
+    tmp_path: Path,
+) -> None:
+    environment = EnvironmentConfig(
+        type=EnvironmentType.E2B,
+        force_build=True,
+        override_cpus=2,
+        override_memory_mb=2048,
+        env={"VISIBLE": "value"},
+        kwargs={"option": "value"},
+    )
+    config = _job_config(tmp_path, backend=EnvironmentType.E2B).model_copy(
+        update={"environment": environment}
+    )
+    scorer, _ = _scorer(tmp_path, _run(tmp_path, []), job_config=config)
+
+    rewritten = scorer._job_config.environment
+    assert rewritten.type is None
+    assert rewritten.import_path == WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
+    assert rewritten.model_dump(exclude={"type", "import_path"}) == environment.model_dump(
+        exclude={"type", "import_path"}
+    )
+
+
+def test_scorer_rejects_ambiguous_builtin_and_custom_e2b_environment(
+    tmp_path: Path,
+) -> None:
+    config = _job_config(tmp_path, backend=EnvironmentType.E2B).model_copy(
+        update={
+            "environment": EnvironmentConfig(
+                type=EnvironmentType.E2B,
+                import_path="package.module:CustomE2BEnvironment",
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="E2B environment.*import_path"):
+        _scorer(tmp_path, _run(tmp_path, []), job_config=config)
+
+
+def test_e2b_create_policy_is_bound_only_when_an_e2b_path_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local, _ = _scorer(tmp_path / "local", _run(tmp_path / "local", []))
+    task_e2b, _ = _scorer(
+        tmp_path / "task-e2b",
+        _run(tmp_path / "task-e2b", []),
+        job_config=_job_config(tmp_path / "task-e2b", backend=EnvironmentType.E2B),
+    )
+    worker_e2b, _ = _scorer(
+        tmp_path / "worker-e2b",
+        _run(tmp_path / "worker-e2b", []),
+        harness_backend="e2b",
+        e2b_template="runner-template",
+    )
+    local_digest = local.context().execution_config_digest
+    task_digest = task_e2b.context().execution_config_digest
+    worker_digest = worker_e2b.context().execution_config_digest
+
+    monkeypatch.setattr(
+        scorer_module,
+        "e2b_create_rate_policy_payload",
+        lambda: {
+            "schema_version": 1,
+            "provider": "e2b",
+            "operation": "sandbox_create",
+            "maximum_dispatches": 3,
+            "period_milliseconds": 1000,
+            "maximum_wait_seconds": 60.0,
+        },
+    )
+
+    assert local.context().execution_config_digest == local_digest
+    assert task_e2b.context().execution_config_digest != task_digest
+    assert worker_e2b.context().execution_config_digest != worker_digest
 
 
 @pytest.mark.parametrize("case", ["missing", "extra", "duplicate", "unfinished"])

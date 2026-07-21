@@ -29,7 +29,7 @@ from wmh.cli.harness_optimize import (
 from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.evals.harbor.canonical import canonical_harbor_job_config
 from wmh.harness.doc import HarnessDoc
-from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.e2b_sandbox import SandboxUsage, e2b_create_rate_policy_payload
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.population import (
     HarnessPopulationOptimizer,
@@ -295,6 +295,7 @@ def _checkpoint_identity(
         optimizer_document_hash=module.optimizer_agent().doc_hash,
         harness_backend="local",
         e2b_template=None,
+        project_e2b_create_rate_policy=e2b_create_rate_policy_payload(),
         environment_command_timeout_sec=300,
         episode_timeout_sec=300,
         project_timeout_sec=900,
@@ -764,6 +765,7 @@ def test_execute_resumes_ready_seed_at_next_slot_without_rescoring(
         optimizer_document_hash=module.optimizer_agent().doc_hash,
         harness_backend="local",
         e2b_template=None,
+        project_e2b_create_rate_policy=e2b_create_rate_policy_payload(),
         environment_command_timeout_sec=300,
         episode_timeout_sec=300,
         project_timeout_sec=900,

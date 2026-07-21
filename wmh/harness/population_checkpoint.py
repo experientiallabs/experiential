@@ -35,7 +35,7 @@ from wmh.harness.scoring import HarnessScore, HarnessScoreReport, ScoreRequest
 from wmh.harness.source_tree import HarnessSourceFile, HarnessSourceTree
 from wmh.providers.base import ProviderConfig
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _CHECKPOINT_DIR = "checkpoint"
 _IDENTITY_FILE = "identity.json"
@@ -61,7 +61,7 @@ class PopulationCheckpointIdentity(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = _SCHEMA_VERSION
+    schema_version: Literal[3] = _SCHEMA_VERSION
     output_name: str = Field(min_length=1, max_length=512)
     artifact_root: str = Field(min_length=1)
     seed_reference: str | None = None
@@ -76,6 +76,7 @@ class PopulationCheckpointIdentity(BaseModel):
     optimizer_document_hash: str = Field(min_length=1)
     harness_backend: Literal["local", "e2b"]
     e2b_template: str | None = None
+    project_e2b_create_rate_policy: JsonObject
     environment_command_timeout_sec: int = Field(strict=True, ge=1)
     episode_timeout_sec: float = Field(gt=0)
     project_timeout_sec: float = Field(gt=0)
@@ -161,7 +162,7 @@ class PopulationCheckpointControl(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = _SCHEMA_VERSION
+    schema_version: Literal[3] = _SCHEMA_VERSION
     identity_hash: str = Field(pattern=_SHA256_PATTERN)
     state: Literal["ready", "in_progress", "complete"]
     committed_step: int = Field(strict=True, ge=-1)
@@ -230,7 +231,7 @@ class _FileRecord(BaseModel):
 class _SeedManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = _SCHEMA_VERSION
+    schema_version: Literal[3] = _SCHEMA_VERSION
     source_tree_hash: str
     files: tuple[_FileRecord, ...]
 
@@ -238,7 +239,7 @@ class _SeedManifest(BaseModel):
 class _BoundaryManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[2] = _SCHEMA_VERSION
+    schema_version: Literal[3] = _SCHEMA_VERSION
     index: int = Field(strict=True, ge=0)
     previous_manifest_hash: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     outcome: Literal["seed", "scored", "invalid"]

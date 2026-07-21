@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from wmh.harness.e2b_sandbox import SandboxUsage
+from wmh.harness.e2b_sandbox import SandboxUsage, e2b_create_rate_policy_payload
 from wmh.harness.live_session import SessionEvent
 from wmh.harness.population import PopulationIteration, PopulationOptimizationResult
 from wmh.harness.population_checkpoint import (
@@ -197,6 +197,7 @@ def _identity(root: Path, seed: HarnessSourceTree) -> PopulationCheckpointIdenti
         optimizer_document_hash="optimizer-doc-hash",
         harness_backend="e2b",
         e2b_template="template",
+        project_e2b_create_rate_policy=e2b_create_rate_policy_payload(),
         environment_command_timeout_sec=300,
         episode_timeout_sec=300,
         project_timeout_sec=900,
@@ -357,6 +358,21 @@ def test_checkpoint_identity_drift_rejects_without_mutation(tmp_path: Path) -> N
         )
         with pytest.raises(PopulationCheckpointError, match="optimizer_document_hash"):
             store.assert_identity(changed_optimizer)
+        assert (run_dir / "checkpoint/control.json").read_bytes() == control_before
+
+        changed_project_rate = identity.model_copy(
+            update={
+                "project_e2b_create_rate_policy": {
+                    **e2b_create_rate_policy_payload(),
+                    "maximum_dispatches": 3,
+                }
+            }
+        )
+        with pytest.raises(
+            PopulationCheckpointError,
+            match="project_e2b_create_rate_policy",
+        ):
+            store.assert_identity(changed_project_rate)
         assert (run_dir / "checkpoint/control.json").read_bytes() == control_before
 
 
