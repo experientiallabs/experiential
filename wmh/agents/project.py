@@ -242,6 +242,7 @@ class AgentProject:
         on_event: Callable[[SessionEvent], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         writable_files: Collection[str] | None = None,
+        retry_recoverable: bool = True,
     ) -> AgentProjectRun:
         """Run one turn of an ordinary agent against this persistent project.
 
@@ -252,7 +253,9 @@ class AgentProject:
         agent's ``write_file`` tool access to exact project-relative files for
         this logical run. Omitting it preserves unrestricted project writes;
         an empty collection denies every agent write. Host ``write_text`` calls
-        are not constrained by an agent turn's grant.
+        are not constrained by an agent turn's grant. Set
+        ``retry_recoverable=False`` when one logical run must represent exactly
+        one agent attempt even if its runner transport fails after partial work.
         """
         if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
@@ -267,8 +270,9 @@ class AgentProject:
         write_grant = self._normalize_writable_files(writable_files)
         usage_before = self._total_worker_usage()
         self._active_writable_files = write_grant
+        max_attempts = 2 if retry_recoverable else 1
         try:
-            for attempt in range(2):
+            for attempt in range(max_attempts):
                 try:
                     result = self._run_turn(
                         agent,
@@ -287,7 +291,13 @@ class AgentProject:
                 except HarnessSearchCancelled:
                     raise
                 except Exception as error:
-                    if attempt > 0 or not _is_recoverable_session_error(error):
+                    recoverable = _is_recoverable_session_error(error)
+                    if not recoverable:
+                        raise
+                    if attempt + 1 >= max_attempts:
+                        # A transport-poisoned session is never reused by a later logical run,
+                        # even when this caller deliberately owns recovery at a higher level.
+                        self._close_agent_session()
                         raise
                     if self._sandbox_factory is None:
                         self._close_agent_session()

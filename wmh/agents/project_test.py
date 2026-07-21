@@ -851,6 +851,73 @@ def test_project_restarts_one_live_session_after_transport_disconnect() -> None:
     assert [frame["type"] for frame in recovered.sent].count("user_message") == 1
 
 
+def test_project_can_disable_retry_after_partial_work_and_provider_call() -> None:
+    """One optimizer iteration never replays a partially written coding turn."""
+
+    class _DisconnectedAfterPartialWork(_Channel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.inbound = [
+                {"type": "state", "status": "idle"},
+                {"type": "state", "status": "running"},
+                {
+                    "type": "tool_request",
+                    "req_id": 1,
+                    "name": "write_file",
+                    "arguments": {
+                        "path": "/home/user/project/stages/candidate/SYSTEM.md",
+                        "content": "partial candidate",
+                    },
+                },
+                {"type": "llm_request", "req_id": 2, "openai_body": {"messages": []}},
+            ]
+
+        def recv(self, timeout: float | None = None) -> JsonObject | None:
+            if self.inbound:
+                return super().recv(timeout)
+            raise RuntimeError("Server disconnected")
+
+    class _CountingProvider(_MeteredProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete_chat(self, request: object) -> ChatResponse:
+            self.calls += 1
+            return super().complete_chat(request)
+
+    channel = _DisconnectedAfterPartialWork()
+    channel_starts = 0
+
+    def channel_factory(sandbox: object, workspace: str) -> _Channel:
+        nonlocal channel_starts
+        del sandbox, workspace
+        channel_starts += 1
+        return channel
+
+    provider = _CountingProvider()
+    project = AgentProject(
+        _Sandbox(),
+        channel_factory=channel_factory,
+        owns_sandbox=False,
+    )
+
+    with pytest.raises(RuntimeError, match="Server disconnected"):
+        project.run(
+            meta_agent(),
+            provider,
+            "produce one candidate",
+            timeout=1,
+            writable_files=["stages/candidate/SYSTEM.md"],
+            retry_recoverable=False,
+        )
+
+    assert provider.calls == 1
+    assert channel_starts == 1
+    assert [frame["type"] for frame in channel.sent].count("user_message") == 1
+    assert project.read_text("stages/candidate/SYSTEM.md") == "partial candidate"
+    assert channel.closed is True
+
+
 def test_project_retries_a_transient_channel_send_failure() -> None:
     """E2B stdin timeouts are transport failures even after LiveSession stringifies them."""
 
