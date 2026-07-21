@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import weakref
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal, override
@@ -58,22 +59,34 @@ from wmh.harness.e2b_sandbox import acquire_e2b_create_slot_async
 _CREATE_ATTEMPTS = 2
 _CREATE_RETRY_DELAY_S = 1.0
 
-# Per-alias single-flight locks plus one global build semaphore, process-wide: harbor's base
+# Per-alias single-flight locks plus one build semaphore, keyed BY EVENT LOOP: harbor's base
 # start() does exists -> build, so without the lock two racing attempts of the same task both
-# see "missing" and double-submit one paid build. The registry itself is guarded by a threading
-# lock; the asyncio primitives are only ever awaited from the (single) running job loop.
+# see "missing" and double-submit one paid build. The keying matters: each HarborScorer.score()
+# runs its job under a fresh asyncio.run loop, and an asyncio primitive that gained waiters in
+# one loop binds to it (Python 3.12), so reusing it from the next job's loop raises
+# "bound to a different event loop". Concurrent trials of one job share one loop, which is the
+# only place the race exists; the registry entry dies with its loop (WeakKeyDictionary).
 _CONTROL_GUARD = threading.Lock()
-_TEMPLATE_LOCKS: dict[str, asyncio.Lock] = {}
-_BUILD_SEMAPHORE = asyncio.Semaphore(E2B_TEMPLATE_BUILD_CONCURRENCY)
+_LOOP_CONTROLS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    tuple[dict[str, asyncio.Lock], asyncio.Semaphore],
+] = weakref.WeakKeyDictionary()
 
 
-def _template_lock(template_name: str) -> asyncio.Lock:
+def _template_controls(template_name: str) -> tuple[asyncio.Lock, asyncio.Semaphore]:
+    """The running loop's single-flight lock for `template_name` plus its build semaphore."""
+    loop = asyncio.get_running_loop()
     with _CONTROL_GUARD:
-        lock = _TEMPLATE_LOCKS.get(template_name)
+        controls = _LOOP_CONTROLS.get(loop)
+        if controls is None:
+            controls = ({}, asyncio.Semaphore(E2B_TEMPLATE_BUILD_CONCURRENCY))
+            _LOOP_CONTROLS[loop] = controls
+        locks, semaphore = controls
+        lock = locks.get(template_name)
         if lock is None:
             lock = asyncio.Lock()
-            _TEMPLATE_LOCKS[template_name] = lock
-        return lock
+            locks[template_name] = lock
+        return lock, semaphore
 
 
 async def _get_template_build_status(
@@ -273,10 +286,11 @@ class WmhE2BEnvironment(E2BEnvironment):
     @override
     async def start(self, force_build: bool) -> None:
         """Harbor's exists-then-build start, made race-free and concurrency-bounded."""
-        async with _template_lock(self._template_name):
+        lock, build_semaphore = _template_controls(self._template_name)
+        async with lock:
             if force_build or not await self._does_template_exist():
                 self.logger.debug(f"Creating template {self._template_name}")
-                async with _BUILD_SEMAPHORE:
+                async with build_semaphore:
                     await self._create_template()
         await self._create_sandbox()
         if not self._sandbox:

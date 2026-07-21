@@ -325,5 +325,13 @@ def test_per_alias_single_flight_prevents_a_double_submission(
         await asyncio.gather(env_a.start(force_build=False), env_b.start(force_build=False))
 
     asyncio.run(race())
+    assert submissions == [env_a.template_name]
 
+    # Each score() runs its harbor job under a fresh asyncio.run loop. The single-flight
+    # primitives were contended above (they gained waiters, binding them to loop 1 on 3.12);
+    # a second job on a new loop must get fresh per-loop controls, not
+    # "bound to a different event loop".
+    built.clear()
+    submissions.clear()
+    asyncio.run(race())
     assert submissions == [env_a.template_name]
