@@ -42,6 +42,20 @@ def test_surface_id_must_match_kind() -> None:
         Surface(id="prompt:Not Kebab", kind=SurfaceKind.PROMPT, content="x")
 
 
+def test_trailing_newline_never_slips_past_id_or_path_validation() -> None:
+    # `$` in re.match also matches before a final newline; the validators must use fullmatch
+    # or a newline-carrying surface passes here and fails only at render/reparse time.
+    with pytest.raises(ValidationError, match="matching its kind"):
+        Surface(id="prompt:core\n", kind=SurfaceKind.PROMPT, content="x")
+    with pytest.raises(ValidationError, match="unsafe path"):
+        Surface(
+            id=code_surface_id("src/agent.ts"),
+            kind=SurfaceKind.CODE,
+            content="x",
+            path="src/agent.ts\n",
+        )
+
+
 def test_budget_is_enforced_at_construction() -> None:
     Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="ok", budget=10)
     with pytest.raises(ValidationError, match="over its budget"):

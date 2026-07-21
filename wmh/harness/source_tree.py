@@ -310,7 +310,7 @@ class HarnessSourceTree(BaseModel):
 def _code_surface_id(path: str) -> str:
     """Derive a code file's surface id, failing with the path and the allowed grammar."""
     surface_id = code_surface_id(path)
-    if not _SLUG_RE.match(surface_id.partition(":")[2]):
+    if not _SLUG_RE.fullmatch(surface_id.partition(":")[2]):
         raise ValueError(
             f"code file path {path!r} maps to surface id {surface_id!r}, which is not a valid "
             "'code:<kebab-slug>' id; use lowercase [a-z0-9] runs separated by single '/', '.', "

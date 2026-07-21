@@ -107,7 +107,7 @@ class Surface(BaseModel):
     def _validate(self) -> Surface:
         validate_durable_text(self.content, field=f"surface {self.id!r} content")
         prefix, sep, slug = self.id.partition(":")
-        if not sep or prefix != self.kind.value or not _SLUG_RE.match(slug):
+        if not sep or prefix != self.kind.value or not _SLUG_RE.fullmatch(slug):
             raise ValueError(
                 f"surface id {self.id!r} must be '{self.kind.value}:<kebab-slug>' matching its kind"
             )
@@ -116,7 +116,7 @@ class Surface(BaseModel):
                 raise ValueError(f"surface {self.id!r}: only code surfaces may carry a path")
             candidate = PurePosixPath(self.path)
             if (
-                not _SAFE_PATH_RE.match(self.path)
+                not _SAFE_PATH_RE.fullmatch(self.path)
                 or not candidate.parts
                 or candidate.as_posix() != self.path
                 or ".." in candidate.parts
@@ -138,7 +138,7 @@ class Surface(BaseModel):
                     f"carry a path (got {self.path!r}); rename the file so it maps to its own id"
                 )
             expected_id = code_surface_id(self.path)
-            if not _SLUG_RE.match(expected_id.partition(":")[2]):
+            if not _SLUG_RE.fullmatch(expected_id.partition(":")[2]):
                 raise ValueError(
                     f"code surface path {self.path!r} maps to surface id {expected_id!r}, which "
                     "is not a valid 'code:<kebab-slug>' id; use lowercase [a-z0-9] runs separated "
