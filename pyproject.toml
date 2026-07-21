@@ -3,16 +3,20 @@ name = "world-model-harness"
 version = "0.1.0"
 description = "Run agents, build world models from traces, and optimize agent harnesses."
 readme = "README.md"
-requires-python = ">=3.11"
+# harbor 0.20.0 requires Python >=3.12; the harbor evaluator is a first-class optimize
+# environment, so the whole package moves to 3.12 (deliberate 3.11 drop, noted in the PR body).
+requires-python = ">=3.12"
 dependencies = [
-    "typer>=0.12",
+    # typer/rich/fastapi/uvicorn floors match harbor 0.20.0's requirements so the harbor
+    # extra resolves against the core install without downgrades.
+    "typer>=0.16",
     "click>=8.2",  # pins no_args_is_help semantics: help + usage-error exit 2 (<8.2 exited 0)
-    "fastapi>=0.110",
-    "uvicorn>=0.29",
+    "fastapi>=0.128",
+    "uvicorn>=0.38",
     "pydantic>=2.6",
     "numpy>=1.26",
     "httpx>=0.27",
-    "rich>=13.7",
+    "rich>=14.1",
     # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
     # read core behind `wmh download` (stdlib-only; pushing needs the member's fetch extra).
     # RELEASE ORDER: environment-capture must be published to PyPI before any wmh release —
@@ -37,8 +41,16 @@ viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
 # pooled E2B microVMs while the environment stays the world model. Only those runs need it —
 # local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b).
-e2b = ["e2b>=2.0"]
+# (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b). Exact pin: the harbor E2B environment
+# (wmh.evals.harbor.e2b_environment) depends on version-sensitive template-build API behavior
+# and embeds the e2b version in template alias derivation.
+e2b = ["e2b==2.31.0"]
+# The harbor evaluator (`wmh.evals.harbor`): scores harness candidates on real
+# Terminal-Bench-2-style tasks through the harbor runner. Imported lazily, same contract as
+# the e2b extra. Exact pin: our E2B template alias derivation embeds harbor's version and
+# tracks its build behavior. Running harbor task environments ON E2B additionally needs
+# `wmh[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
+harbor = ["harbor==0.20.0"]
 # Context connectors (`wmh.connect`): the MCP client SDK backs the Notion connector's
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
 # lazily (wmh.connect.notion), same contract as the e2b extra above.
@@ -49,7 +61,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,e2b,connectors]",
+    "world-model-harness[otel,viz,e2b,connectors,harbor]",
 ]
 
 [dependency-groups]
@@ -106,7 +118,7 @@ norecursedirs = ["tau2-bench"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 # `examples/` holds isolated, self-contained task launch/capture helpers that can depend on their
 # own benchmark environments. They are not part of the reusable `wmh` package.
 extend-exclude = ["examples/", ".agents/",
@@ -123,10 +135,12 @@ select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
 # The environment-capture member's benchmark capture/smoke/fetch scripts are operator-run CLIs
 # that report progress on stdout/stderr — that is their product output, same class as the
 # legacy dirs excluded above. The never-print rule (AGENTS.md § Python) binds `wmh/` in full.
-"packages/environment-capture/**" = ["T20"]
+# UP040: the member still publishes for Python >=3.11, where the `type` alias keyword (3.12+)
+# is unavailable; drop this ignore when the member's own floor moves to 3.12.
+"packages/environment-capture/**" = ["T20", "UP040"]
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.12"
 
 [tool.ty.src]
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
