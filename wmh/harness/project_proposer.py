@@ -671,19 +671,36 @@ def _proposal_request(
             "Leave one complete standalone harness source tree there."
         )
     )
+    intro_block = (
+        "The output directory below already contains the current harness's complete source tree.\n"
+        "Work only inside it; do not read `history/` or `proposals/` (they are not needed here)."
+        if stage_from_seed
+        else (
+            f"Read `history/manifest.json`. It indexes all {history_count} evaluated candidates,\n"
+            "their complete source directories, full score reports, and raw evaluator artifacts.\n"
+            f"Earlier coding-turn traces remain under `proposals/`. {previous_trace} Use the full\n"
+            "population as evidence. Do not select or assume a host-designated source to extend."
+        )
+    )
+    bash_block = (
+        "Use Bash to edit and test files inside that directory (address it by the absolute path\n"
+        "above). Do not modify any other project path. When the candidate is complete, call submit.\n"
+        "The host snapshots the directory once after this turn and will not ask for a repair."
+        if stage_from_seed
+        else (
+            "Use Bash to inspect immutable project evidence and to copy, create, edit, delete, and\n"
+            "test files inside that directory. Do not modify `history/`, `proposals/`, or any other\n"
+            "project path. When the candidate is complete, call submit. The host snapshots the\n"
+            "directory once after this turn and will not ask for a repair."
+        )
+    )
     return f"""Produce exactly one complete harness candidate: {candidate_id}.
 
-Read `history/manifest.json`. It indexes all {history_count} evaluated candidates, their complete
-source directories, full score reports, and raw evaluator artifacts. Earlier coding-turn traces
-remain under `proposals/`. {previous_trace} Use the full population as evidence. Do not select or
-assume a host-designated source to extend.
+{intro_block}
 {directive_block}
 {output_block}
 
-Use Bash to inspect immutable project evidence and to copy, create, edit, delete, and test files
-inside that directory. Do not modify `history/`, `proposals/`, or any other project path. When the
-candidate is complete, call submit. The host snapshots the directory once after this turn and will
-not ask for a repair.
+{bash_block}
 
 This turn's immutable request and trace are stored under `{proposal_dir}/`.
 """

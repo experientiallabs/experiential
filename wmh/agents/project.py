@@ -737,6 +737,11 @@ class AgentProject:
             f"--shell /usr/sbin/nologin {self._shell_user}\n"
             "fi\n"
             f"id -u {self._shell_user} >/dev/null\n"
+            # Let the unprivileged shell user traverse the project root to reach its scratch stage
+            # by absolute path. Some templates create the workspace mode 700 (owner only), which
+            # denies the shell user every absolute path under it; o+x grants traversal (not listing
+            # or reading the tree) so a staged, shell-user-owned source directory is reachable.
+            f"chmod o+x {shlex.quote(self.workspace)}\n"
             f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
         )
         result = self._sandbox.commands.run(command, user="root", timeout=30)

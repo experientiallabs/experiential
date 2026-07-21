@@ -870,6 +870,9 @@ def test_stage_from_seed_prepopulates_output_with_the_seed_source() -> None:
     assert "Do not delete SYSTEM.md or config.toml" in instruction
     assert "then call submit" in instruction
     assert "initially empty directory" not in instruction
+    # A pre-staged edit must not be sent to the (unreadable) history/proposals dirs.
+    assert "do not read `history/`" in instruction
+    assert "Read `history/manifest.json`" not in instruction
 
 
 def test_stage_from_seed_default_false_stages_empty_with_original_wording() -> None:
