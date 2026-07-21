@@ -63,6 +63,15 @@ class HarnessOptimizeOutcome:
     project_usage: SandboxUsage | None
 
 
+@dataclass(frozen=True)
+class HarnessOptimizeProgress:
+    """Ready incomplete run that can continue without publishing a winner."""
+
+    result: PopulationOptimizationResult
+    run_dir: Path
+    project_usage: SandboxUsage | None
+
+
 def register(app: typer.Typer) -> None:
     """Register scorer-driven optimization under ``wmh harness``."""
     app.command("optimize")(optimize_harness)
@@ -144,6 +153,15 @@ def optimize_harness(
         "--resume",
         help="Continue one exact ready checkpoint at --result-out without replaying work.",
     ),
+    max_new_boundaries: int | None = typer.Option(
+        None,
+        "--max-new-boundaries",
+        min=1,
+        help=(
+            "Stop this invocation after at most this many new durable boundaries "
+            "(seed or proposal), leaving the fixed total plan unchanged."
+        ),
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project artifact root and harness store."),
     yes: bool = typer.Option(False, "--yes", help="Acknowledge the displayed execution matrix."),
 ) -> None:
@@ -219,7 +237,17 @@ def optimize_harness(
         max_history_candidates=max_history_candidates,
         max_history_bytes=max_history_bytes,
         resume=resume,
+        max_new_boundaries=max_new_boundaries,
     )
+    if isinstance(outcome, HarnessOptimizeProgress):
+        completed = len(outcome.result.iterations) + 1
+        _console.print(
+            f"[yellow]checkpointed[/yellow] [bold]{name}[/bold] "
+            f"boundaries={completed}/{iterations + 1}; no winner published; "
+            "rerun the same command with "
+            f"--resume --result-out {outcome.run_dir}"
+        )
+        return
     _console.print(
         f"[green]optimized[/green] [bold]{name}[/bold] v{outcome.saved.version} "
         f"score={outcome.result.best_score:.6f}; evidence -> {outcome.run_dir}"
@@ -248,8 +276,15 @@ def _execute_optimization(
     max_history_candidates: int,
     max_history_bytes: int,
     resume: bool,
-) -> HarnessOptimizeOutcome:
+    max_new_boundaries: int | None = None,
+) -> HarnessOptimizeOutcome | HarnessOptimizeProgress:
     """Resolve one immutable scorer request, execute it, and publish evidence before winner."""
+    if max_new_boundaries is not None and (
+        isinstance(max_new_boundaries, bool)
+        or not isinstance(max_new_boundaries, int)
+        or max_new_boundaries < 1
+    ):
+        raise ValueError("max_new_boundaries must be a positive integer")
     planned_from_inputs = (iterations + 1) * len(task_ids) * attempts
     if planned_from_inputs > max_score_cells:
         raise typer.BadParameter(
@@ -335,6 +370,7 @@ def _execute_optimization(
 
         result = checkpoint.result
         project_usage = checkpoint.control.project_sandbox_usage
+        new_boundaries = 0
         if result is None:
             checkpoint.begin_setup()
             result = HarnessPopulationOptimizer(
@@ -351,6 +387,13 @@ def _execute_optimization(
             )
             checkpoint.finish_project_segment(SandboxUsage())
             project_usage = checkpoint.control.project_sandbox_usage
+            new_boundaries += 1
+            if max_new_boundaries is not None and new_boundaries >= max_new_boundaries:
+                return _incomplete_progress(
+                    checkpoint,
+                    result,
+                    project_usage=project_usage,
+                )
 
         while checkpoint.control.committed_step < iterations:
             checkpoint.begin_setup()
@@ -378,6 +421,17 @@ def _execute_optimization(
             project_usage = project.usage()
             checkpoint.finish_project_segment(project_usage)
             project_usage = checkpoint.control.project_sandbox_usage
+            new_boundaries += 1
+            if (
+                checkpoint.control.committed_step < iterations
+                and max_new_boundaries is not None
+                and new_boundaries >= max_new_boundaries
+            ):
+                return _incomplete_progress(
+                    checkpoint,
+                    result,
+                    project_usage=project_usage,
+                )
         if result is None:
             raise PopulationCheckpointStateError("checkpoint has no completed seed boundary")
 
@@ -414,6 +468,28 @@ def _execute_optimization(
             archive_manifest=archive_manifest,
             project_usage=project_usage,
         )
+
+
+def _incomplete_progress(
+    checkpoint: PopulationCheckpointStore,
+    result: PopulationOptimizationResult,
+    *,
+    project_usage: SandboxUsage | None,
+) -> HarnessOptimizeProgress:
+    """Return progress only from a locked, ready, incomplete checkpoint boundary."""
+    if checkpoint.control.state != "ready":
+        raise PopulationCheckpointStateError("incomplete optimization checkpoint is not ready")
+    if checkpoint.control.committed_step >= checkpoint.identity.iterations:
+        raise PopulationCheckpointStateError(
+            "completed optimization cannot return partial progress"
+        )
+    if checkpoint.result != result:
+        raise PopulationCheckpointStateError("checkpoint result differs from partial progress")
+    return HarnessOptimizeProgress(
+        result=result,
+        run_dir=checkpoint.run_dir,
+        project_usage=project_usage,
+    )
 
 
 def _resolve_seed_source(root: str, seed: str | None) -> HarnessSourceTree:

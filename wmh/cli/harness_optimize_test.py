@@ -16,7 +16,11 @@ from harbor.models.trial.config import AgentConfig, EnvironmentConfig
 from typer.testing import CliRunner
 
 from wmh.cli import app
-from wmh.cli.harness_optimize import HarnessOptimizeOutcome, _execute_optimization
+from wmh.cli.harness_optimize import (
+    HarnessOptimizeOutcome,
+    HarnessOptimizeProgress,
+    _execute_optimization,
+)
 from wmh.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import SandboxUsage
@@ -402,6 +406,7 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert proposer._max_history_candidates == 20
     assert proposer._max_history_bytes == 1_000_000
     assert archived == [(run_dir / "population", result)]
+    assert isinstance(outcome, HarnessOptimizeOutcome)
     assert outcome.saved.name == "selected"
     assert outcome.saved.version == 1
     assert outcome.saved.doc_hash == result.best.candidate.doc_hash
@@ -412,6 +417,120 @@ def test_execute_composes_exact_scorer_project_optimizer_archive_and_store(
     assert written["project_sandbox_usage"] == {"count": 3, "seconds": 37.5}
     assert written["known_score_cells"] == 1
     assert written["max_score_cells"] == 4
+
+
+def test_execute_stops_ready_then_resumes_without_publishing_partial_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _request()
+    seed = _source("seed")
+    first_proposal = _result_with_invalid_iterations(1, seed_source=seed)
+    completed = _result_with_invalid_iterations(2, seed_source=seed)
+    optimizer_resumes: list[PopulationOptimizationResult | None] = []
+    projects: list[_Project] = []
+
+    class FakeScorer:
+        @classmethod
+        async def create(cls, **_kwargs: object) -> FakeScorer:
+            return cls()
+
+        def request(self, *, attempts: int) -> ScoreRequest:
+            assert attempts == 1
+            return request
+
+    class FakeProjectFactory:
+        @classmethod
+        def create(cls, **_kwargs: object) -> _Project:
+            project = _Project()
+            projects.append(project)
+            return project
+
+    class FakeOptimizer:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def optimize(self, **kwargs: object) -> PopulationOptimizationResult:
+            before_step = cast(Callable[[int], None], kwargs["before_step"])
+            on_boundary = cast(
+                Callable[[PopulationOptimizationResult], None], kwargs["on_boundary"]
+            )
+            resumed = cast(PopulationOptimizationResult | None, kwargs["resume"])
+            optimizer_resumes.append(resumed)
+            if resumed is None:
+                boundary = _result(seed)
+                before_step(0)
+                on_boundary(boundary)
+                return boundary
+            index = len(resumed.iterations) + 1
+            boundary = first_proposal if index == 1 else completed
+            before_step(index)
+            on_boundary(boundary)
+            return boundary
+
+    def fake_archive(path: Path, _result: PopulationOptimizationResult) -> Path:
+        path.mkdir(parents=True)
+        manifest = path / "manifest.json"
+        manifest.write_text("{}\n", encoding="utf-8")
+        return manifest
+
+    meta_config, agent_config = _configs()
+    monkeypatch.setattr(module, "HarborScorer", FakeScorer)
+    monkeypatch.setattr(module, "AgentProject", FakeProjectFactory)
+    monkeypatch.setattr(module, "HarnessPopulationOptimizer", FakeOptimizer)
+    monkeypatch.setattr(module, "get_provider", lambda config: _ToolProvider(config))
+    monkeypatch.setattr(module, "write_population_archive", fake_archive)
+    root = tmp_path / ".wmh"
+    run_dir = tmp_path / "run"
+    arguments = {
+        "name": "selected",
+        "root": str(root),
+        "run_dir": run_dir,
+        "job_config": _job_config(tmp_path),
+        "task_ids": ("task-a",),
+        "reward_key": "reward",
+        "iterations": 2,
+        "attempts": 1,
+        "max_score_cells": 3,
+        "seed_reference": None,
+        "meta_config": meta_config,
+        "agent_config": agent_config,
+        "harness_backend": "local",
+        "e2b_template": None,
+        "environment_command_timeout_sec": 300,
+        "project_timeout_sec": 900,
+        "max_history_candidates": 20,
+        "max_history_bytes": 1_000_000,
+        "max_new_boundaries": 2,
+    }
+
+    progress = _execute_optimization(**arguments, seed=seed, resume=False)
+
+    assert isinstance(progress, HarnessOptimizeProgress)
+    assert len(progress.result.iterations) == 1
+    assert len(projects) == 1
+    assert projects[0].closed
+    assert json.loads((run_dir / "checkpoint/control.json").read_text())["state"] == "ready"
+    assert "max_new_boundaries" not in json.loads((run_dir / "inputs.json").read_text())
+    assert not (run_dir / "population").exists()
+    assert not (run_dir / "outcome.json").exists()
+    assert not (root / "harnesses/selected").exists()
+
+    arguments["max_new_boundaries"] = 1
+    outcome = _execute_optimization(**arguments, seed=None, resume=True)
+
+    assert isinstance(outcome, HarnessOptimizeOutcome)
+    assert len(projects) == 2
+    assert all(project.closed for project in projects)
+    assert optimizer_resumes[0] is None
+    assert optimizer_resumes[1] is not None
+    assert optimizer_resumes[1].iterations == ()
+    assert optimizer_resumes[2] is not None
+    assert len(optimizer_resumes[2].iterations) == 1
+    assert len(outcome.result.iterations) == 2
+    assert json.loads((run_dir / "checkpoint/control.json").read_text())["state"] == "complete"
+    assert (run_dir / "population/manifest.json").is_file()
+    assert (run_dir / "outcome.json").is_file()
+    assert (root / "harnesses/selected/aliases.toml").is_file()
 
 
 def test_execute_rejects_score_cell_plan_before_scorer_or_run_mutation(
@@ -1285,10 +1404,16 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
     calls: list[dict[str, object]] = []
     fake_result = _result()
 
-    def fake_execute(**kwargs: object) -> HarnessOptimizeOutcome:
+    def fake_execute(**kwargs: object) -> HarnessOptimizeOutcome | HarnessOptimizeProgress:
         calls.append(kwargs)
-        saved = fake_result.best.candidate.model_copy(update={"name": "selected", "version": 1})
         run_dir = cast(Path, kwargs["run_dir"])
+        if kwargs["max_new_boundaries"] is not None:
+            return HarnessOptimizeProgress(
+                result=fake_result,
+                run_dir=run_dir,
+                project_usage=None,
+            )
+        saved = fake_result.best.candidate.model_copy(update={"name": "selected", "version": 1})
         return HarnessOptimizeOutcome(
             result=fake_result,
             saved=saved,
@@ -1328,6 +1453,7 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
     )
 
     assert invoked.exit_code == 0, invoked.output
+    assert "optimized" in invoked.output
     [call] = calls
     assert call["harness_backend"] == "local"
     assert call["iterations"] == 2
@@ -1339,6 +1465,42 @@ def test_cli_uses_required_roles_complete_default_pi_seed_and_local_backend(
     assert isinstance(seed, HarnessSourceTree)
     assert seed.to_doc("seed").runtime_kind() == "pi-node"
     assert len(seed.to_doc("seed").code_files()) > 1
+
+    partial_out = tmp_path / "partial-run"
+    partial = runner.invoke(
+        app,
+        [
+            "harness",
+            "optimize",
+            "selected",
+            "--harbor-config",
+            str(config_path),
+            "--task-ids",
+            str(task_ids_path),
+            "--reward-key",
+            "reward",
+            "--iterations",
+            "2",
+            "--attempts",
+            "1",
+            "--max-score-cells",
+            "3",
+            "--max-new-boundaries",
+            "1",
+            "--result-out",
+            str(partial_out),
+            "--root",
+            str(root),
+            "--yes",
+        ],
+    )
+
+    assert partial.exit_code == 0, partial.output
+    assert calls[-1]["max_new_boundaries"] == 1
+    assert "checkpointed" in partial.output
+    assert "no winner published" in partial.output
+    assert "--resume --result-out" in partial.output
+    assert "partial-run" in partial.output
 
 
 def test_cli_requires_explicit_confirmation_in_noninteractive_mode(tmp_path: Path) -> None:
