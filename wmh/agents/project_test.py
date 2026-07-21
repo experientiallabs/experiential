@@ -1333,7 +1333,7 @@ def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
     assert emitted == [("stdout", "inspected\n"), ("stderr", "warning\n")]
     agent_call, cleanup_call = commands.calls
     assert agent_call == {
-        "user": PROJECT_SHELL_USER,
+        "user": project._shell_user,  # noqa: SLF001 - assert per-project isolation identity
         "cwd": "/home/user/project/.scratch",
         "timeout": 60.0,
     }
@@ -1344,8 +1344,22 @@ def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
     assert "timeout --kill-after=3s 50s" in command
     assert "pwd && rg TODO ../candidates" in command
     assert "wmh-project-shell-quiescence" in cleanup_command
-    assert f"pkill -STOP -u {PROJECT_SHELL_USER}" in cleanup_command
-    assert f"pkill -KILL -u {PROJECT_SHELL_USER}" in cleanup_command
+    assert f"pkill -STOP -u {project._shell_user}" in cleanup_command  # noqa: SLF001
+    assert f"pkill -KILL -u {project._shell_user}" in cleanup_command  # noqa: SLF001
+
+
+def test_projects_sharing_a_sandbox_use_isolated_shell_cleanup_identities() -> None:
+    """Quiescing one project cannot target another project's shell processes."""
+    sandbox = _Sandbox()
+    first = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    second = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    assert first._shell_user != second._shell_user  # noqa: SLF001
+    first_cleanup = project_module._project_shell_quiescence_command(  # noqa: SLF001
+        first._shell_user  # noqa: SLF001
+    )
+    assert first._shell_user in first_cleanup  # noqa: SLF001
+    assert second._shell_user not in first_cleanup  # noqa: SLF001
 
 
 def test_project_bash_bounds_streams_before_live_session_publication() -> None:

@@ -9,6 +9,7 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
+from uuid import uuid4
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
@@ -159,6 +160,9 @@ class AgentProject:
         self._session_provider: ToolCallingProvider | None = None
         self._network_locked_sandbox_id: int | None = None
         self._shell_ready_sandbox_id: int | None = None
+        # Shell cleanup is user-scoped. Give every project its own unprivileged identity so
+        # quiescing one project cannot stop commands owned by another project in a shared sandbox.
+        self._shell_user = f"{PROJECT_SHELL_USER}-{uuid4().hex[:12]}"
         self._shell_quiescence_error: str | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
         # ``None`` preserves the historical unrestricted project-tool behavior. A concrete set is
@@ -476,11 +480,11 @@ class AgentProject:
         scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
         command = (
             "set -eu\n"
-            f"if ! id -u {PROJECT_SHELL_USER} >/dev/null 2>&1; then\n"
+            f"if ! id -u {self._shell_user} >/dev/null 2>&1; then\n"
             f"  useradd --system --user-group --no-create-home "
-            f"--shell /usr/sbin/nologin {PROJECT_SHELL_USER}\n"
+            f"--shell /usr/sbin/nologin {self._shell_user}\n"
             "fi\n"
-            f"id -u {PROJECT_SHELL_USER} >/dev/null\n"
+            f"id -u {self._shell_user} >/dev/null\n"
             f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
         )
         self._sandbox.commands.run(command, user="root", timeout=30)
@@ -666,7 +670,7 @@ class AgentProject:
         wrapped = (
             "env -i PATH=/usr/local/bin:/usr/bin:/bin "
             f"HOME={shlex.quote(scratch)} TMPDIR={shlex.quote(scratch)} "
-            f"USER={PROJECT_SHELL_USER} LOGNAME={PROJECT_SHELL_USER} "
+            f"USER={self._shell_user} LOGNAME={self._shell_user} "
             "setpriv --no-new-privs --inh-caps=-all --ambient-caps=-all "
             f"--bounding-set=-all bash --noprofile --norc -c {shlex.quote(script)}"
         )
@@ -678,7 +682,7 @@ class AgentProject:
             try:
                 result = self._sandbox.commands.run(
                     wrapped,
-                    user=PROJECT_SHELL_USER,
+                    user=self._shell_user,
                     cwd=scratch,
                     timeout=_BASH_TIMEOUT_S,
                 )
@@ -753,7 +757,7 @@ class AgentProject:
     def _quiesce_project_shell(self) -> None:
         """Kill every dedicated shell-user process and fail if any process remains."""
         result = self._sandbox.commands.run(
-            _project_shell_quiescence_command(),
+            _project_shell_quiescence_command(self._shell_user),
             user="root",
             timeout=_SHELL_QUIESCENCE_TIMEOUT_S,
         )
@@ -798,21 +802,21 @@ class AgentProject:
         return frozenset(self._relative_path(self._absolute_path(path)) for path in writable_files)
 
 
-def _project_shell_quiescence_command() -> str:
+def _project_shell_quiescence_command(shell_user: str) -> str:
     """Build the root-only stop, kill, and absence-proof command."""
     return (
         "set -eu\n"
         "# wmh-project-shell-quiescence\n"
         "for attempt in 1 2 3; do\n"
-        f"  if ! pgrep -u {PROJECT_SHELL_USER} >/dev/null; then break; fi\n"
-        f"  pkill -STOP -u {PROJECT_SHELL_USER} || true\n"
+        f"  if ! pgrep -u {shell_user} >/dev/null; then break; fi\n"
+        f"  pkill -STOP -u {shell_user} || true\n"
         "done\n"
-        f"pkill -KILL -u {PROJECT_SHELL_USER} || true\n"
+        f"pkill -KILL -u {shell_user} || true\n"
         "for attempt in 1 2 3; do\n"
-        f"  if ! pgrep -u {PROJECT_SHELL_USER} >/dev/null; then break; fi\n"
+        f"  if ! pgrep -u {shell_user} >/dev/null; then break; fi\n"
         "  sleep 0.05\n"
         "done\n"
-        f"if pgrep -u {PROJECT_SHELL_USER} >/dev/null; then\n"
+        f"if pgrep -u {shell_user} >/dev/null; then\n"
         "  echo 'could not prove project shell quiescence' >&2\n"
         "  exit 70\n"
         "fi\n"
