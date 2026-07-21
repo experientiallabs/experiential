@@ -1,8 +1,8 @@
 # Agent guide — world-model-harness
 
-A frontier LLM acts as the *environment* an agent steps against, reconstructed from the user's
-OpenTelemetry traces. The reusable harness lives under `wmh/`; task-specific examples live under
-`examples/`.
+WMH couples three first-class capabilities: a worker-agent runtime, world models learned from
+agent traces, and an optimizer that improves the worker's harness against those models. Reusable
+code lives under `wmh/`; task-specific examples live under `examples/`.
 
 ## Toolchain
 
@@ -14,6 +14,73 @@ uv run ruff check . && uv run ruff format .
 uv run ty check
 uv run pytest -q
 ```
+
+## World models and trace lifecycle
+
+- `wmh build --file <traces> --name <model>` is the canonical trace-to-model path. Route every
+  corpus through the registered `TraceAdapter` seam rather than adding parallel ingest or build
+  flows.
+- New trace sources belong in `wmh/ingest/`, normalize into the `Trace` and `Step` contracts in
+  `wmh/core/types.py`, support file ingestion, and register from `wmh/ingest/__init__.py`.
+- Preserve the build's data boundary: deterministic train, validation, and test splits; a
+  full-corpus serving index; train-only prompt optimization and knowledge extraction; untouched
+  test data for final evaluation.
+- `--fidelity low|medium|high|max` controls measured search effort. Persist searched runtime
+  winners in `auto_fidelity.json` and activate them only through runtime `--max-fidelity`.
+- Keep evaluation protocols distinct. Open-loop eval is teacher-forced observation
+  reconstruction; closed-loop eval is agent task success against the simulation. Eval retrieval
+  uses `DemoRetriever`, and closed-loop runs stay frozen or use `enrich=False` so predictions
+  cannot become later demonstrations.
+- Knowledge is editable markdown seeded from training traces only. Automated serving writes may
+  touch only `learned.md` and `grounded.md`; seeded rules, entities, schemas, and human edits stay
+  intact.
+- `wmh scenarios build` must retain representative clustering, source back-agreement, normalized
+  weights, provenance, and coverage. `wmh serve`, the Python API, and CLI execution must share the
+  same stateful `WorldModel` session, step, score, usage, and knowledge code paths.
+
+## Worker-agent execution
+
+- Keep `wmh run` as the single execution surface. Bare runs use the built-in local pi harness;
+  platform ids resolve to hosted world-model or agent sessions.
+- `wmh providers set` owns the project-local worker model in `.wmh/settings.toml`. Local runs and
+  builds use that role unless explicit flags override it; credentials remain in the environment
+  or gitignored `.env`, never in settings.
+- Only bare runs execute harness code and bash on the user's machine. Preserve the explicit local
+  execution consent boundary and the `--dir` file-tool jail.
+- Hosted agent ids run their champion harness in platform-managed E2B. Do not require local model
+  or E2B credentials for this path, and keep worker LLM calls, provider secrets, and world-model
+  state host-side.
+- Workspace upload is explicit through `-u` or `--upload-dir`. Preserve bounded regular-file
+  snapshots, incremental bidirectional patches, final three-way reconciliation, concurrent local
+  edits, and the complete remote recovery archive on conflict.
+- Detached sessions must survive without a local process. Persist the transcript cursor and sync
+  checkpoint under WMH user state, then catch up before send, attach, or end.
+- For optimizer and eval E2B runs, sandbox the real pi process while the environment remains the
+  world-model simulation. Reuse warm sandboxes within score waves, isolate concurrent cells,
+  meter sandbox lifetime, retry uncertain transport only in a fresh sandbox, and fail closed when
+  cleanup cannot be proved.
+
+## Harness optimization
+
+- `wmh optimize <agent> <world-model> --tasks <tasks.jsonl>` is the only public harness-creation
+  path. Keep CLI wiring in `wmh/cli/harness_app.py` and search behavior in
+  `wmh/harness/create.py`.
+- A harness is a validated `HarnessDoc`, not an editable directory. Its typed surfaces cover
+  prompts, skills, tool policy, loop parameters, and executable code; rendered files are exports.
+- Change harnesses only through `HarnessDelta`. Preserve parent and child hashes, per-surface
+  preconditions, operation rationales, expected effects, and atomic whole-document validation.
+- Score candidates with closed-loop evaluation against the world model. Worker location (`local`
+  or `e2b`) never changes which environment is under test.
+- Promotion must pass the trigger screen plus regression-suite, full-split, and optional holdout
+  gates. Binary success is primary, assertion credit breaks ties, and newly passing tasks join the
+  regression suite.
+- Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
+  deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
+  promotion or rollback.
+- `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize --tasks` currently
+  requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
+- Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,
+  `proposer_test.py`, and the scenario builder or verification tests as applicable.
 
 ## Python
 
@@ -93,9 +160,10 @@ uv run pytest -q
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
 - `packages/` — every workspace member lives here, one dir per package:
-     `packages/llm-waterfall/` (stateless LLM failover) and `packages/environment-capture/`
-     (benchmark adapters + real-run trace capture emitting OTel GenAI JSONL). Each is its own
-     PyPI package. Per-benchmark data dirs (`packages/environment-capture/<benchmark>/`) follow
+     `packages/llm-waterfall/` (stateless LLM failover, bundled into the flagship WMH wheel) and
+     `packages/environment-capture/` (benchmark adapters + real-run trace capture emitting OTel
+     GenAI JSONL, consumed from PyPI). Per-benchmark data dirs
+     (`packages/environment-capture/<benchmark>/`) follow
      the examples/ discipline: Hub-hosted data bundles (trace corpus + task data/gold dirs as
      public datasets under the experiential-labs org; gitignored here, fetched via
      `environment_capture.hub`) + provenance/license README + thin
@@ -176,18 +244,20 @@ uv run pytest -q
 
 This repo is a **uv workspace** monorepo. The root `pyproject.toml` is the `wmh` flagship
 package (its quickstart is unchanged: clone → `uv sync` → `uv run wmh ...`), and each member lives
-under `packages/<name>/` with its own `pyproject.toml`, its own version, and its own PyPI
-release.
+under `packages/<name>/` with its own `pyproject.toml` and version. The release policy is explicit
+per member rather than inferred from workspace membership.
 Rules of the road:
 
 - **Membership**: `[tool.uv.workspace].members = ["packages/*"]` in the root pyproject — a new dir under `packages/` with a pyproject IS a member; anything inside the
   workspace that depends on a member resolves it from source via `[tool.uv.sources]`
   (`{ workspace = true }`), never from PyPI.
-- **Dependency arrows**: members never import `wmh`, and `wmh` depends on members only through
-  their public, published APIs. Members must be installable and usable standalone. Consuming a
-  member takes BOTH halves: declare it in `[project.dependencies]` (so installs outside the
-  workspace resolve it) AND rely on `[tool.uv.sources]` for in-workspace source resolution —
-  the sources entry alone wires nothing. Carve-out: the no-wmh-import rule binds the member's
+- **Dependency arrows**: members never import `wmh`, and members remain installable and usable
+  standalone. Published dependencies such as `environment-capture` need BOTH halves: declare them
+  in `[project.dependencies]` and use `[tool.uv.sources]` for in-workspace source resolution. The
+  intentional `llm-waterfall` exception is bundled into the flagship wheel, so it remains a
+  workspace development dependency but is not a `Requires-Dist` dependency of WMH. Do not add a
+  second runtime copy or a separate release requirement without revisiting the one-distribution
+  decision. Carve-out: the no-wmh-import rule binds the member's
   PUBLISHED source tree (what `[tool.hatch.build]`/`include` ships in the wheel). Local research
   and capture scripts inside per-benchmark data dirs (e.g.
   `packages/environment-capture/tau-bench/rl/`) may import `wmh`: they are workspace tooling
@@ -198,8 +268,10 @@ Rules of the road:
   `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in
   its own `[tool.ruff]`/`[tool.ty]` tables (ruff resolves the closest config). `web/` keeps its
   own separate JS gate (rule 5).
-- **Publishing**: each member releases to PyPI independently (`uv build`/`uv publish` from the
-  member dir); version bumps are per-member commits.
+- **Publishing**: `.github/workflows/python-package.yml` builds and publishes only the flagship
+  `world-model-harness` distribution. Its wheel includes `wmh` plus `llm_waterfall`; the publish
+  job runs only for a GitHub release and uses the `pypi` trusted-publisher environment. Do not add
+  member publishing workflows unless the release policy changes explicitly.
 - **One way to do each thing** (rule 13) applies across the workspace: if a capability exists in
   a member, `wmh` consumes it rather than growing a parallel copy.
 
