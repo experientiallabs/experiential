@@ -1616,6 +1616,8 @@ def test_project_accepts_bash_as_a_contained_agent_tool() -> None:
     assert shell_setup.count(project._shell_user) == 3  # noqa: SLF001
     assert "mkdir -p /home/user/project/.scratch" in shell_setup
     assert "chmod 1777 /home/user/project/.scratch" in shell_setup
+    # The shell user must be able to exec the shells the sandbox daemon launches commands through.
+    assert "chmod a+rx /bin/sh /bin/bash" in shell_setup
 
 
 def test_project_shell_setup_nonzero_exit_fails_closed_and_remains_retryable() -> None:

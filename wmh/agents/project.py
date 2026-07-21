@@ -737,6 +737,11 @@ class AgentProject:
             f"--shell /usr/sbin/nologin {self._shell_user}\n"
             "fi\n"
             f"id -u {self._shell_user} >/dev/null\n"
+            # The sandbox daemon launches every unprivileged command through /bin/sh (and the
+            # wrapper re-execs /bin/bash). Some sandbox templates ship these without world-exec,
+            # so the shell user cannot start them ('fork/exec /bin/sh: permission denied') and no
+            # command ever runs. Grant read+exec on the shells so the contained shell can start.
+            "chmod a+rx /bin/sh /bin/bash 2>/dev/null || true\n"
             f"mkdir -p {shlex.quote(scratch)} && chmod 1777 {shlex.quote(scratch)}"
         )
         result = self._sandbox.commands.run(command, user="root", timeout=30)
