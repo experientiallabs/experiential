@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" role="img" aria-labelledby="title description">
-  <title id="title">World model, worker agent, and optimizer</title>
-  <desc id="description">A world model sits above a worker agent and optimizer. Bidirectional arrows connect all three.</desc>
+  <title id="title">World model, runtime agent, and optimizer</title>
+  <desc id="description">A world model sits above a runtime agent and optimizer. Bidirectional arrows connect all three.</desc>
 
   <defs>
     <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -27,7 +27,7 @@
   <text class="box-copy" x="480" y="117">Simulates the environment</text>
 
   <rect class="box" x="70" y="360" width="300" height="108" rx="12" stroke="#7928ca"/>
-  <text class="box-title" x="220" y="406">Worker agent</text>
+  <text class="box-title" x="220" y="406">Runtime agent</text>
   <text class="box-copy" x="220" y="437">Runs tasks</text>
 
   <rect class="box" x="590" y="360" width="300" height="108" rx="12" stroke="#f5a623"/>

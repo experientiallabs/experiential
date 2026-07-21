@@ -4,13 +4,13 @@
 includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
 builds task-specific harnesses for stronger performance at lower cost.
 
-![World model, worker agent, and optimizer connected in a continuous improvement loop](assets/agent-loop.svg)
+![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/agent-loop.svg)
 
 ## Getting started
 
 ### Local setup
 
-Install WMH, choose the model provider for the built-in worker agent, and start a local run:
+Install WMH, choose the model provider for the built-in runtime agent, and start a local run:
 
 ```bash
 pip install world-model-harness
@@ -96,7 +96,7 @@ wmh run --attach
 wmh run --end
 ```
 
-## Worker agents and optimizers in E2B sandboxes
+## Runtime agents and optimizers in E2B sandboxes
 
 WMH can run the real [pi](https://github.com/earendil-works/pi) worker inside isolated
 [E2B](https://e2b.dev) sandboxes while the world model supplies the environment. Optimization and
