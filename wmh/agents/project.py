@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import shlex
 import time
@@ -9,6 +10,8 @@ from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Protocol
+
+from pydantic import BaseModel
 
 from wmh.core.types import JsonObject
 from wmh.harness.doc import HarnessDoc
@@ -30,13 +33,19 @@ from wmh.harness.live_session import (
 from wmh.harness.pi_e2b import start_live_runner
 from wmh.harness.runner_link import Channel, TokenUsage
 from wmh.harness.runtime import HarnessSearchCancelled
+from wmh.harness.source_tree import MAX_SOURCE_PATH_BYTES, HarnessSourceFile, HarnessSourceTree
 from wmh.harness.tools import resolve_tools
 from wmh.providers.base import ToolCallingProvider
 
 PROJECT_WORKSPACE = "/home/user/project"
 DEFAULT_PROJECT_TIMEOUT_S = 21_600
+DEFAULT_SOURCE_TREE_MAX_FILES = 1_024
+DEFAULT_SOURCE_TREE_MAX_BYTES = 8 * 1024 * 1024
 _OUTPUT_CAP = 16_000
-_PROJECT_TOOLS = frozenset({"read_file", "write_file", "submit"})
+# Combined stdout+stderr budget for one bash command (head+tail truncated per stream).
+_BASH_OUTPUT_CAP = 32 * 1024
+_BASH_TIMEOUT_S = 60.0
+_PROJECT_TOOLS = frozenset({"bash", "read_file", "write_file", "submit"})
 _RECOVERABLE_SESSION_MARKERS = (
     "server disconnected",
     "connection reset",
@@ -53,6 +62,80 @@ _RECOVERABLE_SESSION_MARKERS = (
     "live session runner did not become ready",
     "channel send failed",
 )
+
+# One trusted in-sandbox walk turning a project directory into bounded {path: base64} JSON.
+# Regular files only (symlinks, sockets, and pipes are skipped); path and byte bounds are
+# enforced in-sandbox so the host never downloads more than the declared budget.
+_SNAPSHOT_SOURCE_TREE_SCRIPT = r"""
+import base64
+import json
+import os
+import stat
+import sys
+
+
+def fail(message):
+    sys.stderr.write(message + "\n")
+    raise SystemExit(2)
+
+
+root = sys.argv[1]
+max_files = int(sys.argv[2])
+max_bytes = int(sys.argv[3])
+max_path_bytes = int(sys.argv[4])
+if not os.path.isdir(root):
+    fail("source directory does not exist: " + root)
+
+files = []
+total_bytes = 0
+for current, directories, names in os.walk(root, topdown=True, followlinks=False):
+    directories.sort()
+    names.sort()
+    for name in names:
+        path = os.path.join(current, name)
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            continue
+        relative = os.path.relpath(path, root).replace(os.sep, "/")
+        if len(relative.encode("utf-8")) > max_path_bytes:
+            fail("file path exceeds " + str(max_path_bytes) + " bytes: " + relative)
+        if len(files) >= max_files:
+            fail("directory exceeds the " + str(max_files) + " file bound")
+        with open(path, "rb") as source:
+            content = source.read(max_bytes - total_bytes + 1)
+        total_bytes += len(content)
+        if total_bytes > max_bytes:
+            fail("directory exceeds the " + str(max_bytes) + " byte bound")
+        files.append(
+            {
+                "path": relative,
+                "content_base64": base64.b64encode(content).decode("ascii"),
+            }
+        )
+
+json.dump({"files": files}, sys.stdout, separators=(",", ":"))
+"""
+
+
+@dataclass(frozen=True)
+class ProjectBashResult:
+    """One finished project bash command: bounded streams plus its exit code."""
+
+    stdout: str
+    stderr: str
+    exit_code: int
+
+
+class _EncodedSourceFile(BaseModel):
+    """One regular snapshot file encoded for bounded JSON transport."""
+
+    path: str
+    content_base64: str
+
+
+class _EncodedSourceSnapshot(BaseModel):
+    """The trusted sandbox script's wire representation."""
+
+    files: tuple[_EncodedSourceFile, ...]
 
 
 class ChannelFactory(Protocol):
@@ -190,6 +273,93 @@ class AgentProject:
         self._file_contents[relative] = content
         return content
 
+    def run_bash(self, command: str, *, timeout_s: float = _BASH_TIMEOUT_S) -> ProjectBashResult:
+        """Run one bounded shell command in the workspace as the default sandbox user.
+
+        The command runs under ``timeout --kill-after`` inside a profile-free bash with the
+        project workspace as its working directory. A nonzero exit is a RESULT, not an
+        exception: E2B raises on nonzero exits with the streams attached to the exception, so
+        that shape is unwrapped here. Only a transport failure (no exit code) propagates.
+        Streams are head+tail truncated to a fixed combined budget.
+        """
+        if self._closing:
+            raise RuntimeError("cannot run bash in a closed project")
+        budget_s = max(1, int(timeout_s))
+        script = (
+            f"cd {shlex.quote(self.workspace)} && "
+            f"timeout --kill-after=10s {budget_s}s "
+            f"bash --noprofile --norc -c {shlex.quote(command)}"
+        )
+        result: object
+        try:
+            result = self._sandbox.commands.run(script, timeout=budget_s + 30)
+        except Exception as error:  # noqa: BLE001 - E2B raises finished nonzero exits
+            exit_code = getattr(error, "exit_code", None)
+            if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+                raise  # a transport failure, not a finished command
+            result = error
+        return ProjectBashResult(
+            stdout=_head_tail(str(getattr(result, "stdout", "") or ""), _BASH_OUTPUT_CAP // 2),
+            stderr=_head_tail(str(getattr(result, "stderr", "") or ""), _BASH_OUTPUT_CAP // 2),
+            exit_code=int(getattr(result, "exit_code", 0) or 0),
+        )
+
+    def stage_source_tree(
+        self,
+        tree: HarnessSourceTree,
+        dest: str,
+        *,
+        max_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
+        max_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
+    ) -> None:
+        """Write one bounded, validated source tree under a project-relative directory."""
+        tree.validate_bounds(max_files=max_files, max_bytes=max_bytes)
+        self._absolute_path(dest)  # containment: reject absolute or traversing destinations
+        for item in tree.files:
+            self.write_text(f"{dest}/{item.path}", item.content)
+
+    def snapshot_source_tree(
+        self,
+        directory: str,
+        *,
+        max_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
+        max_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
+    ) -> HarnessSourceTree:
+        """Capture one project directory as a bounded, validated host-side source tree.
+
+        A single in-sandbox python walk emits every regular file as base64 JSON on stdout;
+        the host decodes and validates it into a :class:`HarnessSourceTree`. Bound breaches,
+        non-UTF-8 content, and invalid paths raise with the offending path in the message.
+        """
+        if self._closing:
+            raise RuntimeError("cannot snapshot a source tree in a closed project")
+        if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files < 1:
+            raise ValueError("max_files must be a positive integer")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        absolute = self._absolute_path(directory)
+        command = (
+            f"python3 -c {shlex.quote(_SNAPSHOT_SOURCE_TREE_SCRIPT)} {shlex.quote(absolute)} "
+            f"{max_files} {max_bytes} {MAX_SOURCE_PATH_BYTES}"
+        )
+        try:
+            result = self._sandbox.commands.run(command, timeout=120)
+        except Exception as error:  # noqa: BLE001 - E2B raises command failures
+            detail = str(getattr(error, "stderr", "") or error)
+            raise RuntimeError(
+                f"project source snapshot failed: {_head_tail(detail, 4_096)}"
+            ) from error
+        exit_code = int(getattr(result, "exit_code", 0) or 0)
+        if exit_code != 0:
+            stderr = str(getattr(result, "stderr", "") or "snapshot command failed")
+            raise RuntimeError(f"project source snapshot failed: {_head_tail(stderr, 4_096)}")
+        try:
+            tree = _decode_source_tree_snapshot(str(getattr(result, "stdout", "")))
+        except ValueError as error:
+            raise RuntimeError(f"project source snapshot is invalid: {error}") from error
+        tree.validate_bounds(max_files=max_files, max_bytes=max_bytes)
+        return tree
+
     def run(
         self,
         agent: HarnessDoc,
@@ -200,6 +370,7 @@ class AgentProject:
         on_event: Callable[[SessionEvent], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         writable_files: Collection[str] | None = None,
+        retry_recoverable: bool = True,
     ) -> AgentProjectRun:
         """Run one turn of an ordinary agent against this persistent project.
 
@@ -210,7 +381,9 @@ class AgentProject:
         agent's ``write_file`` tool access to exact project-relative files for
         this logical run. Omitting it preserves unrestricted project writes;
         an empty collection denies every agent write. Host ``write_text`` calls
-        are not constrained by an agent turn's grant.
+        are not constrained by an agent turn's grant. ``retry_recoverable=False``
+        makes the run exactly one agent attempt: a transport failure closes the
+        session and propagates instead of transparently replaying paid work.
         """
         if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
@@ -224,8 +397,9 @@ class AgentProject:
         write_grant = self._normalize_writable_files(writable_files)
         usage_before = self._total_worker_usage()
         self._active_writable_files = write_grant
+        max_attempts = 2 if retry_recoverable else 1
         try:
-            for attempt in range(2):
+            for attempt in range(max_attempts):
                 try:
                     result = self._run_turn(
                         agent,
@@ -244,7 +418,12 @@ class AgentProject:
                 except HarnessSearchCancelled:
                     raise
                 except Exception as error:
-                    if attempt > 0 or not _is_recoverable_session_error(error):
+                    if not _is_recoverable_session_error(error):
+                        raise
+                    if attempt + 1 >= max_attempts:
+                        # A transport-poisoned session is never reused by a later logical run,
+                        # even when the caller deliberately owns recovery at a higher level.
+                        self._close_agent_session()
                         raise
                     if self._sandbox_factory is None:
                         self._close_agent_session()
@@ -573,8 +752,21 @@ class AgentProject:
         arguments: JsonObject,
         emit: Callable[[str, str], None],
     ) -> ToolOutcome:
-        del emit  # Project file tools return one bounded observation; they do not stream output.
+        del emit  # Project tools return one bounded observation; they do not stream output.
         try:
+            if name == "bash":
+                # Agent bash writes bypass the host-side file mirror, so a sandbox replacement
+                # would silently lose them. That is sound only because bash-driven proposal
+                # turns run with retry_recoverable=False: a dead transport ends the turn
+                # instead of replaying it onto a replacement sandbox.
+                result = self.run_bash(str(arguments.get("command", "")))
+                body = result.stdout
+                if result.stderr:
+                    body = f"{body}\n[stderr]\n{result.stderr}" if body else result.stderr
+                if result.exit_code != 0:
+                    marker = f"[exit {result.exit_code}]"
+                    body = f"{body}\n{marker}" if body else marker
+                return ToolOutcome(content=body, is_error=result.exit_code != 0)
             if name == "read_file":
                 path = self._tool_path(str(arguments.get("path", "")))
                 relative = self._relative_path(path)
@@ -683,3 +875,25 @@ def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:
         is_error=is_error,
         truncated=True,
     )
+
+
+def _head_tail(content: str, cap: int) -> str:
+    """Keep both ends of one stream within `cap` characters, with an omission marker."""
+    if len(content) <= cap:
+        return content
+    half = cap // 2
+    omitted = len(content) - cap
+    return f"{content[:half]}\n... {omitted} characters truncated ...\n{content[-half:]}"
+
+
+def _decode_source_tree_snapshot(payload: str) -> HarnessSourceTree:
+    """Decode bounded base64 JSON from the trusted snapshot script."""
+    encoded = _EncodedSourceSnapshot.model_validate_json(payload)
+    files: list[HarnessSourceFile] = []
+    for item in encoded.files:
+        try:
+            content = base64.b64decode(item.content_base64, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError(f"file {item.path!r} is not valid UTF-8 text") from error
+        files.append(HarnessSourceFile(path=item.path, content=content))
+    return HarnessSourceTree(files=tuple(files))
