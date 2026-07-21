@@ -58,6 +58,7 @@ class _FakeProject:
         self.files: dict[str, str] = {}
         self.snapshots = snapshots
         self.staged: list[HarnessSourceTree] = []
+        self.staged_copy_from: list[str | None] = []
         self.snapshot_calls: list[ProjectSourceStage] = []
         self.run_calls: list[_RunCall] = []
         self.emit_submit = True
@@ -80,9 +81,11 @@ class _FakeProject:
         *,
         max_files: int,
         max_bytes: int,
+        copy_from: str | None = None,
     ) -> ProjectSourceStage:
         del max_files, max_bytes
         self.staged.append(tree)
+        self.staged_copy_from.append(copy_from)
         return ProjectSourceStage(
             path=f".scratch/source-stages/stage-{len(self.staged):06d}",
             sandbox_generation=1,
@@ -585,6 +588,7 @@ def test_pre_turn_stage_failure_does_not_advance_proposal_identity() -> None:
             *,
             max_files: int,
             max_bytes: int,
+            copy_from: str | None = None,
         ) -> ProjectSourceStage:
             self.stage_attempts += 1
             if self.stage_attempts == 1:
@@ -593,6 +597,7 @@ def test_pre_turn_stage_failure_does_not_advance_proposal_identity() -> None:
                 tree,
                 max_files=max_files,
                 max_bytes=max_bytes,
+                copy_from=copy_from,
             )
 
     project = _StageFailsOnceProject()
@@ -857,6 +862,9 @@ def test_stage_from_seed_prepopulates_output_with_the_seed_source() -> None:
     assert result.candidate_id == "candidate-0001"
     # The output stage is pre-populated with the seed's complete tree, not an empty directory.
     assert project.staged == [seed_source]
+    # It is populated by an in-sandbox copy of the already-materialized seed source, never by a
+    # per-file host re-upload (which can disconnect the sandbox).
+    assert project.staged_copy_from == ["history/candidate-0000/source"]
     instruction = project.run_calls[0].instruction
     assert "ALREADY POPULATED" in instruction
     assert "Do not delete SYSTEM.md or config.toml" in instruction
@@ -871,6 +879,7 @@ def test_stage_from_seed_default_false_stages_empty_with_original_wording() -> N
     proposer.propose((_evaluated("candidate-0000"),))
 
     assert project.staged == [HarnessSourceTree(files=())]
+    assert project.staged_copy_from == [None]
     instruction = project.run_calls[0].instruction
     assert "initially empty directory" in instruction
     assert "ALREADY POPULATED" not in instruction

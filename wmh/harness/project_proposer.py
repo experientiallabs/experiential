@@ -27,6 +27,9 @@ DEFAULT_MAX_HISTORY_CANDIDATES = 1_024
 DEFAULT_MAX_HISTORY_BYTES = 512 * 1024 * 1024
 MAX_HISTORY_ARTIFACT_PATH_BYTES = 1_024
 MAX_DIRECTIVE_CHARS = 20_000
+# The seed's complete source tree is materialized here before staging, so ``stage_from_seed``
+# copies it in-sandbox from this path rather than re-uploading it file by file from the host.
+SEED_SOURCE_DIR = "history/candidate-0000/source"
 
 
 class CandidateProject(Protocol):
@@ -44,6 +47,7 @@ class CandidateProject(Protocol):
         *,
         max_files: int,
         max_bytes: int,
+        copy_from: str | None = None,
     ) -> ProjectSourceStage: ...
 
     def snapshot_source_tree(
@@ -233,6 +237,7 @@ class ProjectCandidateProposer:
                 staged_base,
                 max_files=self._max_source_files,
                 max_bytes=self._max_source_bytes,
+                copy_from=SEED_SOURCE_DIR if self._stage_from_seed else None,
             )
             expected_request = _proposal_request(
                 candidate_id=candidate_id,
@@ -302,6 +307,7 @@ class ProjectCandidateProposer:
             staged_base,
             max_files=self._max_source_files,
             max_bytes=self._max_source_bytes,
+            copy_from=SEED_SOURCE_DIR if self._stage_from_seed else None,
         )
         absolute_stage = f"{self._project.workspace}/{stage.path}"
         request = _proposal_request(

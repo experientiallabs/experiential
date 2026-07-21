@@ -356,8 +356,16 @@ class AgentProject:
         *,
         max_files: int = DEFAULT_SOURCE_TREE_MAX_FILES,
         max_bytes: int = DEFAULT_SOURCE_TREE_MAX_BYTES,
+        copy_from: str | None = None,
     ) -> ProjectSourceStage:
-        """Materialize one editable tree in a fresh, sandbox-generation-bound scratch path."""
+        """Materialize one editable tree in a fresh, sandbox-generation-bound scratch path.
+
+        When ``copy_from`` names an existing project-relative directory whose contents already
+        equal ``tree`` (e.g. a candidate's materialized ``history/.../source``), the stage is
+        populated with a single in-sandbox copy instead of re-uploading every file from the host.
+        That avoids a large per-file write burst that can disconnect the sandbox, and ``tree`` is
+        still used only to enforce the file-count and byte bounds.
+        """
         if self._closing:
             raise RuntimeError("cannot stage a source tree in a closed project")
         self._ensure_project_shell_healthy()
@@ -370,12 +378,31 @@ class AgentProject:
         relative = f"{PROJECT_SCRATCH_DIR}/source-stages/{stage_name}"
         absolute = self._absolute_path(relative)
         self._sandbox.commands.run(f"mkdir -p {shlex.quote(absolute)}", timeout=30)
-        for item in tree.files:
-            self._write_sandbox_file(
-                self._sandbox,
-                f"{absolute}/{item.path}",
-                item.content,
+        if copy_from is not None:
+            source_absolute = self._absolute_path(copy_from)
+            copy_result = self._sandbox.commands.run(
+                f"cp -a {shlex.quote(source_absolute)}/. {shlex.quote(absolute)}/",
+                user="root",
+                timeout=60,
             )
+            copy_exit = int(getattr(copy_result, "exit_code", 0) or 0)
+            if copy_exit != 0:
+                detail = str(
+                    getattr(copy_result, "stderr", "")
+                    or getattr(copy_result, "stdout", "")
+                    or "stage copy command returned no output"
+                )
+                raise RuntimeError(
+                    f"project source stage copy failed with exit {copy_exit}: "
+                    f"{_capped(detail).content}"
+                )
+        else:
+            for item in tree.files:
+                self._write_sandbox_file(
+                    self._sandbox,
+                    f"{absolute}/{item.path}",
+                    item.content,
+                )
         permission_result = self._sandbox.commands.run(
             f"chown -R {self._shell_user}:{self._shell_user} {shlex.quote(absolute)} "
             f"&& find {shlex.quote(absolute)} -type d -exec chmod 700 {{}} + "

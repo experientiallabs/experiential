@@ -1711,6 +1711,35 @@ def test_project_stages_and_snapshots_a_complete_source_tree_once() -> None:
         project.snapshot_source_tree(stage)
 
 
+def test_project_source_stage_copies_in_sandbox_without_host_writes() -> None:
+    """``copy_from`` populates the stage with one in-sandbox copy, not a per-file re-upload."""
+    sandbox = _Sandbox()
+    commands = _SourceTreeCommands(sandbox.files)
+    sandbox.commands = commands
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+    seed = HarnessSourceTree.from_doc(HarnessDoc.baseline("seed"))
+
+    files_before = dict(sandbox.files.values)
+    stage = project.stage_source_tree(seed, copy_from="history/candidate-0000/source")
+
+    # No stage file was written from the host; the stage is filled by a single cp as root.
+    stage_prefix = f"/home/user/project/{stage.path}/"
+    assert not [path for path in sandbox.files.values if path.startswith(stage_prefix)]
+    assert sandbox.files.values == files_before
+    copy_command, copy_options = next(
+        call for call in commands.calls if call[0].startswith("cp -a ")
+    )
+    assert copy_options == {"user": "root", "timeout": 60}
+    assert (
+        f"cp -a /home/user/project/history/candidate-0000/source/. /home/user/project/{stage.path}/"
+    ) in copy_command
+    # Ownership is still handed to the shell user exactly as in the host-write path.
+    assert any(
+        call[0].startswith(f"chown -R {project._shell_user}:{project._shell_user} ")  # noqa: SLF001
+        for call in commands.calls
+    )
+
+
 def test_project_source_stage_permission_nonzero_exit_fails_closed() -> None:
     class _PermissionFails(_SourceTreeCommands):
         def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
