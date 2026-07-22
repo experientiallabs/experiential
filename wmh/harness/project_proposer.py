@@ -67,6 +67,7 @@ class CandidateProject(Protocol):
         on_event: Callable[[SessionEvent], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         writable_files: Collection[str] | None = None,
+        shell_cwd: str | None = None,
         retry_recoverable: bool = True,
     ) -> AgentProjectRun: ...
 
@@ -342,6 +343,9 @@ class ProjectCandidateProposer:
                 on_event=sink,
                 should_cancel=should_cancel,
                 writable_files=(),
+                # Start the agent's shell inside its pre-populated, shell-user-owned stage so it
+                # edits the harness with plain relative paths instead of traversing the tree.
+                shell_cwd=stage.path if self._stage_from_seed else None,
                 retry_recoverable=False,
             )
         except HarnessSearchCancelled:
@@ -655,8 +659,11 @@ def _proposal_request(
         else ""
     )
     output_block = (
-        "Your candidate output directory is ALREADY POPULATED with the current harness's\n"
-        f"complete source tree:\n`{absolute_stage}`\n\n"
+        "Your Bash shell already starts INSIDE your candidate output directory, which is\n"
+        "ALREADY POPULATED with the current harness's complete source tree:\n"
+        f"`{absolute_stage}`\n\n"
+        "Use relative paths from your working directory (for example `cat config.toml`,\n"
+        "`sed -i ... SYSTEM.md`, `ls skills/`); you do not need to cd or use absolute paths.\n"
         "Edit it in place to satisfy the objective. Do not delete SYSTEM.md or config.toml,\n"
         "and the final directory must remain a complete standalone harness source tree.\n\n"
         "Work efficiently and finish: the tree is already complete, so do NOT re-read every\n"
@@ -683,15 +690,15 @@ def _proposal_request(
         )
     )
     bash_block = (
-        "Use Bash to edit and test files inside that directory (address it by the absolute path\n"
-        "above). Do not modify any other project path. When the candidate is complete, call submit.\n"
-        "The host snapshots the directory once after this turn and will not ask for a repair."
+        "Use Bash to edit and test files in your working directory with relative paths. Do not\n"
+        "modify any other project path. When the candidate is complete, call submit. The host\n"
+        "snapshots the directory once after this turn and will not ask for a repair."
         if stage_from_seed
         else (
-            "Use Bash to inspect immutable project evidence and to copy, create, edit, delete, and\n"
-            "test files inside that directory. Do not modify `history/`, `proposals/`, or any other\n"
-            "project path. When the candidate is complete, call submit. The host snapshots the\n"
-            "directory once after this turn and will not ask for a repair."
+            "Use Bash to inspect immutable project evidence and to copy, create, edit, delete,\n"
+            "and test files inside that directory. Do not modify `history/`, `proposals/`, or any\n"
+            "other project path. When the candidate is complete, call submit. The host snapshots\n"
+            "the directory once after this turn and will not ask for a repair."
         )
     )
     return f"""Produce exactly one complete harness candidate: {candidate_id}.

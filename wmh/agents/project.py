@@ -279,6 +279,9 @@ class AgentProject:
         self._shell_user = f"{PROJECT_SHELL_USER}-{uuid4().hex[:12]}"
         self._shell_quiescence_error: str | None = None
         self._active_event_sink: Callable[[SessionEvent], None] | None = None
+        # Absolute directory the current turn's bash starts in (default: the scratch home). A
+        # staged, shell-user-owned dir lets the agent edit with relative paths; cleared per turn.
+        self._active_shell_cwd: str | None = None
         # ``None`` preserves the historical unrestricted project-tool behavior. A concrete set is
         # one logical run's exact, project-relative write grant; it is cleared even when the turn
         # fails so a reused live session cannot inherit the preceding turn's authority.
@@ -383,10 +386,11 @@ class AgentProject:
         # down to the stage's parent must be traversable by the unprivileged shell user or it
         # cannot reach the stage by absolute path (templates create these with a restrictive
         # umask). The stage itself is then chowned to the shell user with tight file modes below.
+        scratch_absolute = self._absolute_path(PROJECT_SCRATCH_DIR)
         self._sandbox.commands.run(
             f"mkdir -p {shlex.quote(absolute)} "
             f"&& chmod o+x {shlex.quote(self.workspace)} "
-            f"{shlex.quote(self._absolute_path(PROJECT_SCRATCH_DIR))} {shlex.quote(stages_absolute)}",
+            f"{shlex.quote(scratch_absolute)} {shlex.quote(stages_absolute)}",
             user="root",
             timeout=30,
         )
@@ -510,6 +514,7 @@ class AgentProject:
         on_event: Callable[[SessionEvent], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         writable_files: Collection[str] | None = None,
+        shell_cwd: str | None = None,
         retry_recoverable: bool = True,
     ) -> AgentProjectRun:
         """Run one turn of an ordinary agent against this persistent project.
@@ -524,6 +529,10 @@ class AgentProject:
         are not constrained by an agent turn's grant. Set
         ``retry_recoverable=False`` when one logical run must represent exactly
         one agent attempt even if its runner transport fails after partial work.
+        ``shell_cwd`` optionally starts the agent's bash in a specific
+        project-relative directory (default: the scratch home); point it at a
+        staged source directory the shell user owns so the agent can edit it
+        with plain relative paths instead of traversing the restricted tree.
         """
         if self._closing:
             raise RuntimeError("cannot run an agent in a closed project")
@@ -538,6 +547,7 @@ class AgentProject:
         write_grant = self._normalize_writable_files(writable_files)
         usage_before = self._total_worker_usage()
         self._active_writable_files = write_grant
+        self._active_shell_cwd = self._absolute_path(shell_cwd) if shell_cwd is not None else None
         max_attempts = 2 if retry_recoverable else 1
         try:
             for attempt in range(max_attempts):
@@ -579,6 +589,7 @@ class AgentProject:
             raise AssertionError("unreachable")
         finally:
             self._active_writable_files = None
+            self._active_shell_cwd = None
 
     def _run_turn(
         self,
@@ -948,6 +959,10 @@ class AgentProject:
             'exit "$status"'
         )
         scratch = f"{self.workspace}/{PROJECT_SCRATCH_DIR}"
+        # HOME/TMPDIR stay in the sticky scratch home, but the command's working directory can be
+        # a staged, shell-user-owned dir so the agent edits it with plain relative paths instead
+        # of traversing the restricted project tree (which it can traverse but not list).
+        bash_cwd = self._active_shell_cwd or scratch
         # The launcher runs as root (the daemon can always exec a root process), then setpriv drops
         # to the unprivileged shell user before the agent's command runs. This keeps the
         # per-project unprivileged identity (so quiescence and stage ownership stay user-scoped)
@@ -970,7 +985,7 @@ class AgentProject:
                 result = self._sandbox.commands.run(
                     wrapped,
                     user="root",
-                    cwd=scratch,
+                    cwd=bash_cwd,
                     timeout=_BASH_TIMEOUT_S,
                 )
                 stdout = _bounded_bash_stream(str(getattr(result, "stdout", "") or ""))

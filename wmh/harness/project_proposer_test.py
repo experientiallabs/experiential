@@ -49,6 +49,7 @@ class _RunCall:
     instruction: str
     writable_files: tuple[str, ...]
     retry_recoverable: bool
+    shell_cwd: str | None = None
 
 
 class _FakeProject:
@@ -111,6 +112,7 @@ class _FakeProject:
         on_event: Callable[[SessionEvent], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         writable_files: Collection[str] | None = None,
+        shell_cwd: str | None = None,
         retry_recoverable: bool = True,
     ) -> AgentProjectRun:
         del agent, provider, should_cancel
@@ -120,6 +122,7 @@ class _FakeProject:
                 instruction=instruction,
                 writable_files=granted,
                 retry_recoverable=retry_recoverable,
+                shell_cwd=shell_cwd,
             )
         )
         if self.run_behavior is not None:
@@ -865,8 +868,11 @@ def test_stage_from_seed_prepopulates_output_with_the_seed_source() -> None:
     # It is populated by an in-sandbox copy of the already-materialized seed source, never by a
     # per-file host re-upload (which can disconnect the sandbox).
     assert project.staged_copy_from == ["history/candidate-0000/source"]
+    # The agent's shell starts inside the staged output dir so it edits with relative paths.
+    assert project.run_calls[0].shell_cwd == ".scratch/source-stages/stage-000001"
     instruction = project.run_calls[0].instruction
     assert "ALREADY POPULATED" in instruction
+    assert "starts INSIDE your candidate output directory" in instruction
     assert "Do not delete SYSTEM.md or config.toml" in instruction
     assert "then call submit" in instruction
     assert "initially empty directory" not in instruction
@@ -884,6 +890,7 @@ def test_stage_from_seed_default_false_stages_empty_with_original_wording() -> N
 
     assert project.staged == [HarnessSourceTree(files=())]
     assert project.staged_copy_from == [None]
+    assert project.run_calls[0].shell_cwd is None
     instruction = project.run_calls[0].instruction
     assert "initially empty directory" in instruction
     assert "ALREADY POPULATED" not in instruction

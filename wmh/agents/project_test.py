@@ -1394,6 +1394,34 @@ def test_project_bash_runs_as_an_unprivileged_bounded_scratch_process() -> None:
     assert f"pkill -KILL -u {project._shell_user}" in cleanup_command  # noqa: SLF001
 
 
+def test_project_bash_starts_in_the_active_shell_cwd_when_set() -> None:
+    """A turn's shell_cwd (e.g. a staged source dir) becomes the agent's bash working directory."""
+    sandbox = _Sandbox()
+    project = AgentProject(sandbox, channel_factory=lambda sandbox, workspace: _Channel())
+
+    class _BashCommands(_Commands):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[dict[str, object]] = []
+
+        def run(self, cmd: str, background: bool | None = None, **kwargs: object) -> _Output:
+            del background
+            self.runs.append(cmd)
+            self.calls.append(dict(kwargs))
+            return _Output(stdout="ok\n")
+
+    commands = _BashCommands()
+    sandbox.commands = commands
+    stage = "/home/user/project/.scratch/source-stages/stage-000001"
+    project._active_shell_cwd = stage  # noqa: SLF001 - simulate an active run's staged cwd
+
+    project._execute_tool("bash", {"command": "ls"}, lambda stream, data: None)  # noqa: SLF001
+
+    agent_call = commands.calls[0]
+    assert agent_call["cwd"] == stage
+    assert agent_call["user"] == "root"
+
+
 def test_projects_sharing_a_sandbox_use_isolated_shell_cleanup_identities() -> None:
     """Quiescing one project cannot target another project's shell processes."""
     sandbox = _Sandbox()
