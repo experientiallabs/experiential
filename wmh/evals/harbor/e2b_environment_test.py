@@ -353,15 +353,18 @@ def test_transient_get_info_failure_retries_the_create_instead_of_failing_it(
     assert environment._sandbox is second
 
 
-def test_ambiguous_submission_stays_claimed_and_reconciles_without_resubmitting(
+def test_ambiguous_submission_waits_out_eventual_consistency_before_concluding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A submission that fails before the client gets a build id may still be running as a
-    paid build. The alias must stay claimed (ambiguous), and the next attempt reconciles with
-    the control plane: alias resolves -> the earlier build went through, nothing is re-paid."""
+    paid build. The alias must stay claimed (ambiguous), and reconciliation must not read a
+    single False (E2B alias visibility is eventually consistent) as "rejected": once the alias
+    becomes visible on a later poll, the earlier build went through and nothing is re-paid."""
+    monkeypatch.setattr(e2b_environment_module, "_AMBIGUOUS_VISIBILITY_DELAY_S", 0.0)
     environment = _environment(tmp_path)
     submissions: list[int] = []
+    exist_checks = 0
 
     async def build_in_background(**_kwargs: object) -> BuildInfo:
         submissions.append(1)  # E2B accepted the request...
@@ -376,21 +379,27 @@ def test_ambiguous_submission_stays_claimed_and_reconciles_without_resubmitting(
     assert "ConnectError" in entry.error
 
     async def exists() -> bool:
-        return True  # the control plane shows the earlier submission completed
+        nonlocal exist_checks
+        exist_checks += 1
+        return exist_checks >= 3  # invisible on the first two polls, then propagates
 
     monkeypatch.setattr(environment, "_does_template_exist", exists)
     asyncio.run(environment._ensure_template_built(force_build=False))
+
     assert submissions == [1]  # never re-submitted: one paid build
+    assert exist_checks == 3  # polled past the transient False windows before concluding
     assert e2b_environment_module._SUBMITTED_BUILDS == {}  # reconciled and released
 
 
-def test_ambiguous_submission_rebuilds_only_when_the_control_plane_shows_nothing(
+def test_ambiguous_submission_rebuilds_only_after_the_full_window_shows_nothing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(e2b_environment_module, "_AMBIGUOUS_VISIBILITY_DELAY_S", 0.0)
     environment = _environment(tmp_path)
     build_info = _build_info(environment)
     submissions: list[int] = []
+    exist_checks = 0
 
     async def build_in_background(**_kwargs: object) -> BuildInfo:
         submissions.append(1)
@@ -403,7 +412,9 @@ def test_ambiguous_submission_rebuilds_only_when_the_control_plane_shows_nothing
         return _build_status(build_info, TemplateBuildStatus.READY)
 
     async def exists() -> bool:
-        return False  # the control plane shows no such template: safe to submit fresh
+        nonlocal exist_checks
+        exist_checks += 1
+        return False  # absent across the entire window: the submission was truly rejected
 
     monkeypatch.setattr(AsyncTemplate, "build_in_background", staticmethod(build_in_background))
     monkeypatch.setattr(AsyncTemplate, "get_build_status", staticmethod(get_build_status))
@@ -417,7 +428,9 @@ def test_ambiguous_submission_rebuilds_only_when_the_control_plane_shows_nothing
     )
 
     asyncio.run(environment._ensure_template_built(force_build=False))
-    assert submissions == [1, 1]  # the reconciler legitimately resubmitted
+    # The full eventual-consistency window is exhausted before exactly one resubmit.
+    assert exist_checks == e2b_environment_module._AMBIGUOUS_VISIBILITY_CHECKS
+    assert submissions == [1, 1]  # the reconciler legitimately resubmitted, exactly once
     assert e2b_environment_module._SUBMITTED_BUILDS[environment.template_name] == (
         e2b_environment_module._SubmittedBuild(template_id="template-id", build_id="build-id")
     )

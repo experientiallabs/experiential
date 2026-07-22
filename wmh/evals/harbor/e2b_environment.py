@@ -107,6 +107,12 @@ _SUBMITTED_BUILDS: dict[str, _SubmittedBuild | _AmbiguousSubmission | None] = {}
 _PROCESS_BUILD_SLOTS = threading.BoundedSemaphore(E2B_TEMPLATE_BUILD_CONCURRENCY)
 _BUILD_SLOT_POLL_INTERVAL_S = 0.25
 _REGISTRY_POLL_INTERVAL_S = 0.05
+# Reconciling an ambiguous submission checks alias visibility over a bounded window because E2B
+# alias visibility is eventually consistent: a build that E2B accepted can be invisible for a
+# few seconds, so one False must not be read as "rejected" and trigger a duplicate paid build.
+# ~6 checks x 5s covers the observed propagation lag with margin.
+_AMBIGUOUS_VISIBILITY_CHECKS = 6
+_AMBIGUOUS_VISIBILITY_DELAY_S = 5.0
 
 
 def _template_lock(template_name: str) -> asyncio.Lock:
@@ -424,23 +430,32 @@ class WmhE2BEnvironment(E2BEnvironment):
         """Resolve an earlier submission of unknown outcome before allowing any resubmission.
 
         `_claim_build` converted the ambiguous entry into a live claim, so this caller is the
-        single reconciler. The control plane is the authority: if the alias now resolves (the
-        same check start() trusts), the earlier submission went through and completed, so the
-        claim is released with nothing to build. Only when the control plane shows no such
-        template may this claimant submit fresh. An ambiguous submission never yielded a build
-        id, so there is no exact build to poll; alias resolution is the completion evidence.
+        single reconciler and holds the claim for the whole window (no other loop can resubmit
+        meanwhile). The control plane is the authority, but E2B alias visibility is eventually
+        consistent: an accepted build can be invisible for a few seconds, so a single False
+        must NOT be read as "rejected". Poll alias visibility over a bounded window; if the
+        alias appears at any check, the earlier submission went through, so release the claim
+        with nothing re-paid. Only if it stays absent across the ENTIRE window may this
+        claimant clear the marker and submit fresh. An ambiguous submission never yielded a
+        build id, so alias resolution is the completion evidence; there is no exact build to
+        poll.
         """
         self.logger.debug(
             f"Reconciling an ambiguous earlier submission of template {alias} ({ambiguous.error})"
         )
-        try:
-            exists = await self._does_template_exist()
-        except BaseException:
-            _record_submitted_build(alias, ambiguous)  # still unknown: restore the marker
-            raise
-        if exists:
-            _clear_submitted_build(alias, None)
-            return
+        for check in range(_AMBIGUOUS_VISIBILITY_CHECKS):
+            try:
+                exists = await self._does_template_exist()
+            except BaseException:
+                _record_submitted_build(alias, ambiguous)  # still unknown: restore the marker
+                raise
+            if exists:
+                _clear_submitted_build(alias, None)
+                return
+            if check + 1 < _AMBIGUOUS_VISIBILITY_CHECKS:
+                await asyncio.sleep(_AMBIGUOUS_VISIBILITY_DELAY_S)
+        # Absent across the whole eventual-consistency window: the original submission was
+        # truly rejected. Safe to submit a fresh build.
         await self._acquire_slot_and_build(alias)
 
     @override
