@@ -111,6 +111,21 @@ def test_seed_and_proposals_scored_with_earliest_tie_selection(tmp_path: Path) -
     assert result.best_score == 1.0
 
 
+def test_zero_iterations_scores_only_the_seed(tmp_path: Path) -> None:
+    # Score-only mode: a fixed harness (baseline or frozen champion) is scored on a task set
+    # with no proposal. This is how heldout scoring runs.
+    scorer = _FakeScorer({"seed": (1.0, 0.0)})
+    proposer = _ScriptedProposer([])
+
+    result = optimize(_tree("seed"), scorer, proposer, 0, run_dir=tmp_path)
+
+    assert result.completed is True
+    assert [o.candidate_id for o in result.outcomes] == ["candidate-0000"]
+    assert proposer.slots == []  # the proposer is never consulted
+    assert scorer.scored == ["seed"]
+    assert result.best.candidate_id == "candidate-0000"
+
+
 def test_invalid_proposal_consumes_slot_and_records_evidence(tmp_path: Path) -> None:
     scorer = _FakeScorer({"seed": (1.0, 0.0), "fix": (0.0, 1.0)})
     proposer = _ScriptedProposer(["invalid", _tree("fix")])

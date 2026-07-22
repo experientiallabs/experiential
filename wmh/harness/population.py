@@ -325,12 +325,14 @@ def optimize(
 ) -> PopulationResult:
     """Score the seed and `iterations` sequential proposal slots with durable resume.
 
+    `iterations == 0` is score-only: the seed is scored and committed and no proposal runs,
+    which is how a fixed harness (a baseline or a frozen champion) is scored on a task set.
     `max_new_boundaries` stops this invocation after that many NEW boundaries (already
     committed slots do not count), leaving the fixed total plan resumable. The result's
     `completed` flag says whether every slot has been consumed.
     """
-    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
-        raise ValueError("iterations must be a positive integer")
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 0:
+        raise ValueError("iterations must be a non-negative integer")
     if max_new_boundaries is not None and (
         isinstance(max_new_boundaries, bool)
         or not isinstance(max_new_boundaries, int)

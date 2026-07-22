@@ -173,7 +173,12 @@ def optimize(
         "--seed",
         help="Harness to start from, as a name or name@version (default: built-in baseline).",
     ),
-    iterations: int = typer.Option(None, min=1, help="Propose-and-gate steps (the search budget)."),
+    iterations: int = typer.Option(
+        None,
+        min=0,
+        help="Propose-and-gate steps (the search budget). 0 scores the seed only (harbor env), "
+        "the way a baseline or a frozen champion is scored on a task set.",
+    ),
     proposal_batch_size: int = typer.Option(
         1,
         "--proposal-batch-size",
@@ -311,6 +316,11 @@ def optimize(
         raise typer.BadParameter(
             f"{', '.join(harbor_only)} apply only to the harbor environment; "
             "use `wmh optimize <agent> harbor ...`"
+        )
+    if iterations == 0:
+        raise typer.BadParameter(
+            "--iterations 0 (score-only) applies only to the harbor environment; "
+            "world-model optimization needs at least one search iteration"
         )
     interactive = _console.is_terminal
     if name is None:
