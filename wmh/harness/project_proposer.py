@@ -49,8 +49,13 @@ PROPOSALS_DIR = "proposals"
 DEFAULT_CANDIDATE_HISTORY_BYTES = 256 * 1024 * 1024
 # Per-file cap before head/tail truncation (transcripts keep both ends plus a marker).
 DEFAULT_HISTORY_FILE_BYTES = 2 * 1024 * 1024
-_WMH_RUN_FILENAME = "wmh-run.json"
-_TRIAL_AGENT_DIR = "agent"
+# The harbor trial layout the proposer and the scorer both read: the WMH transcript lives at
+# `<trial>/<TRIAL_AGENT_DIR>/<WMH_RUN_FILENAME>`. Shared (not duplicated) so telemetry extraction
+# in the scorer and evidence materialization here can never drift onto divergent literals.
+TRIAL_AGENT_DIR = "agent"
+WMH_RUN_FILENAME = "wmh-run.json"
+_WMH_RUN_FILENAME = WMH_RUN_FILENAME
+_TRIAL_AGENT_DIR = TRIAL_AGENT_DIR
 _TRIAL_VERIFIER_DIR = "verifier"
 
 
