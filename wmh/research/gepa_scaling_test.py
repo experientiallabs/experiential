@@ -334,3 +334,32 @@ def test_run_ablation_end_to_end_with_fakes(monkeypatch) -> None:  # noqa: ANN00
     assert [c.condition.label for c in report.conditions] == ["t16_b0", "t16_b4"]
     by_label = {c.condition.label: c.mean for c in report.conditions}
     assert by_label["t16_b4"] > by_label["t16_b0"]
+
+
+def test_results_dir_persists_winning_prompt_and_report(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    """Per-step reports + the winning prompt are what paired analyses need; without them a
+    run's evidence is one aggregate mean per seed (the GEPA-VPD round-1 rigor gap)."""
+    from wmh.engine.replay import ReplayReport
+
+    monkeypatch.setattr(
+        gs, "optimize_prompt", lambda *a, **k: type("R", (), {"prompt": "EVOLVED"})()
+    )
+
+    def fake_score(prompt, held_out, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        on_report = kwargs.get("on_report")
+        if on_report is not None:
+            on_report(ReplayReport(mean_score=0.7, n_steps=1))
+        return 0.7
+
+    monkeypatch.setattr(gs, "score_prompt", fake_score)
+    ab = GepaScalingAblation(
+        _corpus(200),
+        "BASE",
+        make_backends=_fake_backends,
+        grid=[(16, 4)],
+        results_dir=tmp_path,
+    )
+    run_ablation(ab, seeds=[0])
+    assert (tmp_path / "t16_b4_s0.prompt.txt").read_text(encoding="utf-8") == "EVOLVED"
+    saved = (tmp_path / "t16_b4_s0.report.json").read_text(encoding="utf-8")
+    assert '"mean_score": 0.7' in saved

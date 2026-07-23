@@ -197,6 +197,7 @@ def _run(args: argparse.Namespace, tracker: RunTracker) -> AblationReport:
         test_cap=args.test_cap,
         concurrency=args.concurrency,
         reflection_provider=reflection_provider,
+        results_dir=Path(args.results_dir) if args.results_dir else None,
     )
     split = ablation.split
     scored = len(ablation.scored_test)
@@ -322,6 +323,12 @@ def main() -> None:
         "capture junk; same filter as `wmh build --drop-degenerate`).",
     )
     parser.add_argument("--out", default=None, help="Path to write the AblationReport JSON.")
+    parser.add_argument(
+        "--results-dir",
+        default=None,
+        help="Persist each (condition, seed)'s winning prompt + per-step ReplayReport here "
+        "(paired per-step analyses need them; the aggregate mean alone cannot support one).",
+    )
     args = parser.parse_args()
 
     tracker = RunTracker(run_id="gepa-scaling", kind="research")

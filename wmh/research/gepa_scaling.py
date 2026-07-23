@@ -31,6 +31,7 @@ workspace runner; the reproduce pins in `docs/research/world_model_findings.md` 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 from wmh.core.types import Step, Trace
 from wmh.engine.replay import replay
@@ -78,6 +79,7 @@ class GepaScalingAblation:
         test_cap: int | None = None,
         concurrency: int = 1,
         reflection_provider: Provider | None = None,
+        results_dir: Path | None = None,
     ) -> None:
         self._base_prompt = base_prompt
         self._make_backends = make_backends
@@ -88,6 +90,13 @@ class GepaScalingAblation:
         self._concurrency = concurrency
         # Optional separate reflection LM (strong reflector, cheap executor); None self-reflects.
         self._reflection_provider = reflection_provider
+        # When set, each (condition, seed) persists its winning prompt and full per-step
+        # ReplayReport here. Per-step scores are what paired analyses need (bootstrap CIs over
+        # steps, where-did-the-lift-come-from diffs); the aggregate mean alone cannot support
+        # either, which is why the GEPA-VPD round-1 headline rested on seed-separation only.
+        self._results_dir = results_dir
+        if results_dir is not None:
+            results_dir.mkdir(parents=True, exist_ok=True)
         self._split: CorpusSplit = partition_corpus(
             corpus, test_frac=test_frac, valid_frac=valid_frac
         )
@@ -181,6 +190,16 @@ class GepaScalingAblation:
             )
             prompt = result.prompt
 
+        on_report = None
+        if self._results_dir is not None:
+            stem = self._results_dir / f"{condition.label}_s{seed}"
+            stem.with_suffix(".prompt.txt").write_text(prompt, encoding="utf-8")
+
+            def on_report(report) -> None:  # noqa: ANN001 - ReplayReport
+                stem.with_suffix(".report.json").write_text(
+                    report.model_dump_json(indent=2), encoding="utf-8"
+                )
+
         return score_prompt(
             prompt,
             self._test,
@@ -192,6 +211,7 @@ class GepaScalingAblation:
             sample_turns=self._sample_turns,
             seed=seed,
             concurrency=self._concurrency,
+            on_report=on_report,
         )
 
     def _hard_step_filter(

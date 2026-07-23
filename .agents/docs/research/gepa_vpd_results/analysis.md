@@ -91,6 +91,66 @@ mb=8/val=90-inclusive into build or ship search-only tiers.
 **R2.4: don't buy b=16.** +0.001 over b=8 for ~2x the cost. #163's budget-50 tau model is
 now best explained by its era/config, not by budget scaling.
 
+## Round 3 / N1: salvaged per-step CIs + the real mechanism (2026-07-23)
+
+Round-1 winning prompts were recovered from the gepa library log lines (all 4 seeds; T3
+seed-1 rescored 0.722 vs recorded 0.759, flagged - judge noise or a merge-program
+extraction miss; direction intact) and rescored beside base with per-step persistence
+(`steps/`, $16.57). Paired per-step bootstrap (5000 resamples, seeds pooled):
+
+- **T2 Haiku x tau: +0.0277, 95% CI [+0.017, +0.039] - EXCLUDES 0.** The parity-cell lift
+  is now rigorous, not seed-separation.
+- **T3 Mini x terminal: +0.0379, 95% CI [+0.001, +0.075] - excludes 0, barely** (terminal
+  is genuinely high-variance at n=198 steps).
+
+**N1.1: the mechanism hypothesis was WRONG.** 96-97% of GEPA's gain comes from FIXING
+failing steps (base score < 0.8), only 3-4% from polishing passing steps. The
+graded-polish explanation for probe v1's failure is dead. The correct diagnosis of the
+probe: its failure-counting frame was right and its CLASSIFIER is what's broken - it
+labels failures "unknowable" that GEPA demonstrably fixes. What looks unknowable to a
+judge staring at one step in isolation is often inferable from corpus-wide conventions.
+Probe v2 therefore needs corpus context in the classification call (retrieve similar
+steps, ask "is the answer inferable from these examples?") - and must probe the TEST-like
+distribution, not the RAG-saturated valid band (probe v1's tau cell saw 3 failures where
+the test band had plenty). GEPA also buys its gains with real regressions (about -0.24 per
+step of gain across both cells): net-positive but not free.
+
+## Round 3 / N2-N4: task type, model size, substitution (2026-07-23)
+
+Same harness; all GEPA arms winning-config; per-step reports persisted natively
+(`results_dir`). Round-3 spend ~$272 (N4's swe arms ran $60-65 each - swe steps are huge;
+over the ~$160 estimate). Paired CIs are per-step bootstraps, seeds pooled.
+
+| cell | rag anchor | +GEPA | paired lift | verdict |
+|---|---|---|---|---|
+| N2 Haiku x bird-sql | 0.767 | 0.795 | **+0.028 [+0.011,+0.047]** | real; derivability does NOT amplify |
+| N3 Sonnet 4.6 x tau | 0.823 | **0.898** | **+0.075 [+0.056,+0.094]** | biggest lift in the program |
+| N4 Haiku x swe (gepa+rag vs rag) | 0.499 | 0.513 | +0.014 [-0.017,+0.045] | n.s.; nothing works on swe |
+
+N4 full ladder: base 0.522, rag 0.499 (RAG HURTS, -0.023), gepa-norag 0.526 (+0.004 vs
+base, ~0), gepa+rag 0.513. **The grid's swe "GEPA substitutes for RAG" story does NOT
+replicate at rubric-v2/winning-config for Haiku**: GEPA-alone is flat; GEPA+RAG only
+partially repairs RAG's damage; best arm = base. (Grid's +0.147 swe cell was also a
+byte-identical-prompt artifact cell; the +0.075 GPT-5.5 cell remains untested at v2.)
+
+**N3.1: the ceiling-convergence law (tau).** Three executors, three anchors, one
+destination: Sonnet 0.823 -> 0.898, Haiku 0.864 -> 0.893, Opus 4.8 0.875 -> 0.892. On tau,
+GEPA lift is not a property of model size or task type; it is **ceiling(corpus) -
+anchor(executor)**. Model-size curves are non-monotone because ANCHORS are non-monotone
+(Sonnet's tau anchor sits below Haiku's).
+**N3.2: the ceiling is NOT executor-independent everywhere.** Terminal: Mini reached 0.760
+but Haiku stopped at 0.726 from a similar anchor; swe: no executor moves at all. So
+corpus-common ceilings hold on structured-API corpora (tau), executor-specific limits
+dominate on content-heavy ones.
+**Predictor (the practical yield):** anchor + one GEPA run on ANY executor per corpus gives
+the ceiling; expected lift for a new executor = max(0, ceiling - anchor) on
+tau/bird-sql-like corpora, ~0 on swe-like. The $3-8 anchor run IS the per-executor half of
+the probe; the per-corpus ceiling is a one-time ~$40 measurement.
+
+Housekeeping: N4's arms collided in `steps/` (rag/no-rag share a condition label; later
+arms overwrote earlier per-step reports - base/gepa-norag pairs lost, aggregates intact).
+Fix before reuse: include the retrieval flag in the label or use per-arm results dirs.
+
 ## Round 2 / E4: headroom probe v1 FAILS validation (2026-07-20)
 
 All 5 cells probed ($3.64 total, `probe_*.json`). The probe does NOT rank-order the measured
