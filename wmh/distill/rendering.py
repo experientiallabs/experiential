@@ -38,7 +38,7 @@ MISSING_DISTILL_EXTRA = (
 
 
 class RendererTokenizer(Protocol):
-    """The tokenizer slice cookbook renderers rely on.
+    """The tokenizer slice cookbook renderers (and this seam's decodes) rely on.
 
     HuggingFace `PreTrainedTokenizer` (what `tinker.SamplingClient.get_tokenizer`
     returns) satisfies this structurally; tests supply small deterministic fakes.
@@ -48,8 +48,8 @@ class RendererTokenizer(Protocol):
         """Encode text to token ids."""
         ...
 
-    def decode(self, token_ids: list[int]) -> str:
-        """Decode token ids back to text."""
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = ...) -> str:
+        """Decode token ids back to text (HF's `skip_special_tokens` contract)."""
         ...
 
 
@@ -101,6 +101,10 @@ class ChatRendering(Protocol):
 
     def decode(self, token_ids: list[int]) -> str:
         """Decode token ids back to text."""
+        ...
+
+    def decode_with_specials(self, token_ids: list[int]) -> str:
+        """Decode token ids to text KEEPING special tokens (the template framing)."""
         ...
 
     def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
@@ -377,6 +381,18 @@ class CookbookChatRendering:
     def decode(self, token_ids: list[int]) -> str:
         """Decode token ids back to text with the renderer's tokenizer."""
         return str(self._renderer.tokenizer.decode(token_ids))
+
+    def decode_with_specials(self, token_ids: list[int]) -> str:
+        """Raw decode preserving special tokens, for human-readable episode logs.
+
+        `decode` stays the parsing/serving path and rides the tokenizer's
+        default cleanup, which may strip or normalize special tokens
+        depending on the tokenizer's configuration; this variant pins
+        `skip_special_tokens=False` so the chat template's framing
+        (`<|im_start|>`, think blocks, tool-call markers) survives verbatim
+        into the text.
+        """
+        return str(self._renderer.tokenizer.decode(token_ids, skip_special_tokens=False))
 
     def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
         """Parse sampled token ids into text plus OpenAI-format tool calls.

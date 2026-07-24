@@ -111,6 +111,11 @@ class _MiniRendering:
     def decode(self, token_ids: list[int]) -> str:
         return self._tok.decode(token_ids)
 
+    def decode_with_specials(self, token_ids: list[int]) -> str:
+        # The char-level fake has no special tokens to strip, so the raw
+        # decode IS the specials-preserving decode.
+        return self._tok.decode(token_ids)
+
     def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
         return ParsedAssistantMessage(
             text=self._tok.decode(sampled_ids), tool_calls=[], stopped=False
