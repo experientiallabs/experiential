@@ -151,3 +151,19 @@ alongside the scalar.
 - RouterBench licenses: code MIT (LICENSE carries a stray LangChain copyright line, likely a
   template slip); the HF dataset carries NO license tag. We consume it for internal
   validation and cite it; do not redistribute the data in any public artifact.
+
+## Embedder comparison (2026-07-24): hashing ties text-embedding-3-large on RouterBench
+
+Identical 12k-prompt subsample (seed 7), identical split, knob=0: best-single gpt-4 0.7937 @
+$0.00318; hashing-1024 0.7935 @ $0.00240; azure text-embedding-3-large (3072d) 0.7930 @
+$0.00262. The semantic embedder bought nothing, and its fit leg took 33 minutes against the
+rate-limited deployment vs ~12s for hashing.
+
+WHY (cluster audit of the fitted policy): hashing's 64 clusters align cleanly with dataset
+identity (24 hellaswag clusters, per-subject mmlu clusters, ...) because RouterBench prompts
+carry strong lexical format signatures, and dataset identity IS most of this benchmark's
+routable signal (gpt-4 ranks first in 54/64 clusters; the routing win lives in the 10 clusters
+led by Yi-34B/claude-v2/mixtral). LIMIT: this does not transfer to wm-scenario corpora, where
+all scenarios share one format and the routable structure (if any) is semantic. Decision:
+hashing stays the default for stage A/B; the comparison RERUNS per corpus in stage C before
+any product-default call. Follow-up noted: compare full knob-swept frontiers, not just knob=0.
