@@ -67,6 +67,19 @@ def run_corpus(name: str, bundle: str, telecom: bool | None) -> None:
     if out_path.exists():
         logger.info("%s: matrix exists, skipping", name)
         return
+    OUT.mkdir(parents=True, exist_ok=True)
+    rows_path = OUT / f"{name}_rows.jsonl"
+    done: set[tuple[str, str, int]] = set()
+    prior = []
+    if rows_path.exists():
+        for line in rows_path.read_text().splitlines():
+            o = json.loads(line)
+            done.add((o["scenario_id"], o["model"], o["episode"]))
+            prior.append(o)
+        logger.info("%s: resuming, %d rows already captured", name, len(done))
+    import threading
+    write_lock = threading.Lock()
+    rows_handle = rows_path.open("a", encoding="utf-8")
     started = time.monotonic()
     model_dir = BUNDLES / bundle / "models" / name
     traces = get_adapter("otel-genai").from_file(str(BUNDLES / bundle / "traces.otel.jsonl"))
@@ -94,16 +107,32 @@ def run_corpus(name: str, bundle: str, telecom: bool | None) -> None:
             str(model_dir), get_provider(serve_config), reward_provider=judge_provider
         )
         single = ModelPool(models=[pool.entry(entry_name)])
+        from wmh.env.closed_loop import scenario_id as sid_of
+
+        todo = [
+            s
+            for s in scenarios
+            if any((sid_of(s), entry_name, ep) not in done for ep in range(EPISODES))
+        ]
+
+        def persist(outcome) -> None:  # noqa: ANN001
+            with write_lock:
+                rows_handle.write(outcome.model_dump_json() + "\n")
+                rows_handle.flush()
+
         return evaluate_pool(
             lambda: WorldModelEnv(wm, score_on_close=True),
             single,
-            scenarios,
+            todo,
             episodes_per_scenario=EPISODES,
             max_steps=MAX_STEPS,
             tools_hint=hint or None,
+            on_outcome=persist,
         )
 
-    outcomes = []
+    from wmh.optimize.outcomes import ScenarioOutcome
+
+    outcomes = [ScenarioOutcome.model_validate(o) for o in prior]
     with ThreadPoolExecutor(max_workers=len(pool.models)) as executor:
         futures = {
             executor.submit(run_candidate, entry.name): entry.name for entry in pool.models
@@ -115,8 +144,17 @@ def run_corpus(name: str, bundle: str, telecom: bool | None) -> None:
             except Exception as exc:  # noqa: BLE001 - one candidate must not kill the corpus
                 logger.error("%s: %s FAILED: %s", name, entry_name, str(exc)[:200])
 
-    matrix = OutcomeMatrix(pool=pool.models, outcomes=outcomes)
-    OUT.mkdir(parents=True, exist_ok=True)
+    # Dedupe (scenario, model, episode): a resumed scenario reruns all its episodes, so a
+    # previously-persisted episode can appear twice; first occurrence wins.
+    seen: set[tuple[str, str, int]] = set()
+    unique = []
+    for outcome in outcomes:
+        key = (outcome.scenario_id, outcome.model, outcome.episode)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(outcome)
+    matrix = OutcomeMatrix(pool=pool.models, outcomes=unique)
     matrix.save(out_path)
     scored = [o for o in matrix.outcomes if o.reward is not None]
     candidate_cost = sum(o.cost_usd for o in matrix.outcomes)
