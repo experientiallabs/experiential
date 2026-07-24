@@ -320,6 +320,14 @@ def main() -> None:
         ".wmh/evals/dashboard.html"
     )
     runs = [json.loads(line) for line in RUNS.read_text(encoding="utf-8").splitlines()]
+    # Merge the specialist chats' run files (shared data root; see the routing transfer
+    # prompts). Same RunRecord shape; variant names are namespaced per chat.
+    shared = Path.home() / "Desktop/Projects/wmh-routing-data/runs"
+    if shared.is_dir():
+        for extra in sorted(shared.glob("*.jsonl")):
+            if extra.name == "master.jsonl":
+                continue
+            runs += [json.loads(line) for line in extra.read_text().splitlines() if line]
     # Default view = OUR models only (the 9-model pool on certified prompts + the wm corpora).
     # The fitter-validation matrices (RouterBench 2023 models, LLMRouterBench flagships) are
     # research plumbing; include them explicitly with --all.
