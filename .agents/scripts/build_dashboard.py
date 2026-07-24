@@ -102,7 +102,7 @@ const VARIANT_INFO = {
  'rank': 'Embed each task, cluster them, keep a per-cluster scoreboard of which model wins there; a new request goes to its nearest cluster\u2019s champion. (Avengers, arXiv 2505.19797)',
  'rank-tilt': 'Same as rank, but trust big clusters more than tiny ones - a weird one-off request should not be routed by a 3-scenario cluster\u2019s noisy scoreboard. (ProxRouter-inspired, arXiv 2510.09852)',
  'irt': 'No clusters: learn a small report card per model (what it\u2019s good at) and a difficulty score per question, then predict who passes - like matching students to exam questions. Needs much less data. (IrtNet, arXiv 2510.00844)',
- 'jisi': 'Find the most similar past tasks, see which model actually did well on those exact ones, and sanity-check that the strong models behave consistently around there. (JiSi proxy mode, arXiv 2601.01330)',
+ 'jisi': 'Find the most similar past tasks, throw out false matches (neighbors where models answered very differently from the rest - looked alike, wasn\u2019t alike), then route to whoever did best on what remains. (JiSi proxy mode, arXiv 2601.01330)',
  'static': 'A fixed hand-picked model for everything.',
 };
 const VC = {"best-single":"var(--c0)","rank":"var(--c1)","rank-tilt":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)"};
