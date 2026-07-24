@@ -44,7 +44,7 @@ from wmh.harness.runtime import (
     RunResult,
     validate_episode_timeout_s,
 )
-from wmh.providers.base import ProviderConfig
+from wmh.providers.base import Provider, ProviderConfig
 from wmh.providers.registry import get_provider
 from wmh.providers.retry import wrap_provider_with_retries
 
@@ -240,13 +240,31 @@ class WmhHarborAgent(BaseAgent):
             raise ValueError(
                 f"Harbor model identity must be {expected_model_name!r}, got {model_name!r}"
             )
-        # Retry-wrap the worker provider: Bedrock disables botocore's own retries, so one
-        # unwrapped ThrottlingException would otherwise kill a whole trial.
-        self._provider = wrap_provider_with_retries(get_provider(self._provider_config))
+        self._provider = self._build_provider(self._provider_config)
         self._command_timeout_sec = _validate_command_timeout_sec(command_timeout_sec)
         self._harness_backend = harness_backend
         self._e2b_template = e2b_template
         self._episode_workers = episode_workers
+
+    def _build_provider(self, config: ProviderConfig) -> Provider:
+        """Construct the worker provider; the one seam subclasses may override.
+
+        Called exactly once, from ``__init__``, after ``BaseAgent`` has set
+        ``self.logs_dir`` and the validated provider config and model identity are in
+        place, so an override can key per-trial state (e.g. a token sink named after
+        the harbor trial) off the logs directory.
+
+        Args:
+            config: The validated worker provider config.
+
+        Returns:
+            The provider the episode runtime will drive. Overrides must keep the
+            retry contract by wrapping their provider with
+            ``wrap_provider_with_retries``.
+        """
+        # Retry-wrap the worker provider: Bedrock disables botocore's own retries, so one
+        # unwrapped ThrottlingException would otherwise kill a whole trial.
+        return wrap_provider_with_retries(get_provider(config))
 
     @staticmethod
     def name() -> str:

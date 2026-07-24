@@ -22,7 +22,7 @@ from wmh.evals.harbor.agent import (
 )
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 from wmh.providers.retry import RetryingProvider
 
 
@@ -389,6 +389,53 @@ def test_agent_exception_persists_a_partial_transcript_with_the_error(
     assert trace["partial"] is True
     assert trace["stop_reason"] == "agent-exception:RuntimeError"
     assert trace["error"] == "RuntimeError: sandbox died"
+
+
+def test_build_provider_hook_runs_with_logs_dir_set_and_feeds_the_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider-construction seam: an override sees the validated config after
+    BaseAgent has set logs_dir, and its provider is the exact one the runtime drives
+    (the distill agent keys its per-trial token sink off both)."""
+    observed: dict[str, object] = {}
+    hook_provider = _FakeProvider()
+
+    class _HookAgent(WmhHarborAgent):
+        def _build_provider(self, config: ProviderConfig) -> Provider:
+            observed["logs_dir"] = self.logs_dir
+            observed["config"] = config
+            return cast("Provider", hook_provider)
+
+    class _Runtime:
+        def run(
+            self,
+            task_id: str,
+            _instruction: str,
+            _environment: HarborAgentEnvironment,
+        ) -> RunResult:
+            return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="done")
+
+        def close(self) -> None:
+            return None
+
+    def runtime(_self: HarnessDoc, provider: object, **_kwargs: object) -> _Runtime:
+        observed["runtime_provider"] = provider
+        return _Runtime()
+
+    monkeypatch.setattr(HarnessDoc, "runtime", runtime)
+    agent = _HookAgent(
+        logs_dir=tmp_path,
+        model_name="bedrock/worker-model",
+        harness=HarnessDoc.baseline().model_dump(mode="json"),
+        provider_config=_provider_config().model_dump(mode="json"),
+    )
+
+    assert observed["logs_dir"] == tmp_path
+    assert observed["config"] == _provider_config()
+
+    asyncio.run(agent.run("solve it", cast("BaseEnvironment", _Environment()), AgentContext()))
+    assert observed["runtime_provider"] is hook_provider
 
 
 def test_agent_rejects_invalid_construction(tmp_path: Path) -> None:
