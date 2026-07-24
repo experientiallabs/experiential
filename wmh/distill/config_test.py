@@ -141,9 +141,12 @@ require_no_regression = false
 
 [pricing]
 student_prefill = 0.1
+student_cached_prefill = 0.03
 student_sample = 0.4
 student_train = 0.6
 teacher_prefill = 1.2
+teacher_cached_prefill = 0.3
+teacher_sample = 3.0
 
 [budget]
 max_usd = 50.0
@@ -170,6 +173,10 @@ tags = ["smoke", "tb2"]
     assert cfg.eval.every == 0
     assert cfg.gate.min_teacher_fraction == 1.0
     assert cfg.pricing.is_complete()
+    # Explicit cached rates win over the 20%-of-prefill derivation.
+    assert cfg.pricing.effective_student_cached_prefill == pytest.approx(0.03)
+    assert cfg.pricing.effective_teacher_cached_prefill == pytest.approx(0.3)
+    assert cfg.pricing.teacher_sample == pytest.approx(3.0)
     assert cfg.budget.max_usd == pytest.approx(50.0)
     assert cfg.wandb.enabled is True
     assert cfg.wandb.project == "my-distill"
@@ -220,6 +227,9 @@ def test_warmup_keep_rejects_unknown_value(tmp_path: Path) -> None:
         "[gate]\nmin_teacher_fraction = 0.0",
         "[gate]\nmin_teacher_fraction = 1.5",
         "[pricing]\nstudent_prefill = -0.1",
+        "[pricing]\nstudent_cached_prefill = -0.1",
+        "[pricing]\nteacher_cached_prefill = -0.1",
+        "[pricing]\nteacher_sample = -0.1",
         "[budget]\nmax_usd = 0.0",
     ],
 )
@@ -342,10 +352,58 @@ def test_pricing_is_complete() -> None:
     assert not PricingConfig().is_complete()
     partial = PricingConfig(student_prefill=0.1, student_sample=0.2)
     assert not partial.is_complete()
-    full = PricingConfig(
+    # The four full prices alone are not complete: teacher-in-harness episodes
+    # bill teacher_sample, so it must be priced too.
+    no_teacher_sample = PricingConfig(
         student_prefill=0.1, student_sample=0.2, student_train=0.3, teacher_prefill=0.4
     )
+    assert not no_teacher_sample.is_complete()
+    # The cached rates never block completeness: their 20% defaults derive
+    # from the full prefill prices.
+    full = PricingConfig(
+        student_prefill=0.1,
+        student_sample=0.2,
+        student_train=0.3,
+        teacher_prefill=0.4,
+        teacher_sample=1.0,
+    )
     assert full.is_complete()
+
+
+def test_pricing_cached_defaults_derive_20_percent_of_prefill() -> None:
+    derived = PricingConfig(student_prefill=1.0, teacher_prefill=10.0)
+    assert derived.effective_student_cached_prefill == pytest.approx(0.2)
+    assert derived.effective_teacher_cached_prefill == pytest.approx(2.0)
+    # No full prefill price means no derivation: the cached meter is unpriced.
+    assert PricingConfig().effective_student_cached_prefill is None
+    assert PricingConfig().effective_teacher_cached_prefill is None
+    # An explicit cached price stands alone, even without the full price.
+    explicit = PricingConfig(student_cached_prefill=0.07, teacher_cached_prefill=0.9)
+    assert explicit.effective_student_cached_prefill == pytest.approx(0.07)
+    assert explicit.effective_teacher_cached_prefill == pytest.approx(0.9)
+
+
+def test_snapshot_round_trips_the_pricing_section(tmp_path: Path) -> None:
+    cfg = _minimal_config().model_copy(
+        update={
+            "pricing": PricingConfig(
+                student_prefill=0.3,
+                student_sample=0.7,
+                student_train=0.6,
+                teacher_prefill=2.49,
+                teacher_cached_prefill=0.498,
+                teacher_sample=6.225,
+            )
+        },
+        deep=True,
+    )
+    snap_path = tmp_path / "snapshot.toml"
+    snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+    parsed = load_distill_config(snap_path)
+    assert parsed == cfg
+    # The unset student cached rate stays unset (derived at charge time).
+    assert parsed.pricing.student_cached_prefill is None
+    assert parsed.pricing.effective_student_cached_prefill == pytest.approx(0.06)
 
 
 def test_direct_model_validation_rejects_extra() -> None:
