@@ -181,23 +181,77 @@ class GateConfig(BaseModel):
     require_no_regression: bool = True
 
 
+CACHED_PREFILL_FRACTION = 0.2
+"""Default cached-prefill price as a fraction of the full prefill price.
+
+Tinker bills a request's verbatim repeated prompt prefix at 20% of the full
+prefill price (the ratio its console lists, e.g. Ultra 0.498 vs 2.49
+USD/Mtok). An explicit `*_cached_prefill` field overrides this derivation.
+"""
+
+
 class PricingConfig(BaseModel):
-    """Per-model per-meter prices, USD per million tokens (all optional)."""
+    """Per-model per-meter prices, USD per million tokens (all optional).
+
+    Tinker bills prefill PER REQUEST over each call's full prompt: every
+    agent turn re-bills its whole context, with the verbatim repeated prefix
+    billed at a discounted cached rate. The `*_cached_prefill` fields carry
+    that cached rate; when left unset they default to
+    `CACHED_PREFILL_FRACTION` (20%) of the corresponding full prefill price
+    whenever that price is set, and stay unpriced otherwise. `teacher_sample`
+    prices the tokens teacher-in-harness episodes (warmup collection and the
+    gate's teacher baseline) SAMPLE, which bill at the sampling rate
+    (~2.5x prefill on the live price list), not the prefill rate.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     student_prefill: Annotated[float, Field(ge=0)] | None = None
+    student_cached_prefill: Annotated[float, Field(ge=0)] | None = None
+    """Student cached-prefill rate; None means 20% of student_prefill when set."""
+
     student_sample: Annotated[float, Field(ge=0)] | None = None
     student_train: Annotated[float, Field(ge=0)] | None = None
     teacher_prefill: Annotated[float, Field(ge=0)] | None = None
+    teacher_cached_prefill: Annotated[float, Field(ge=0)] | None = None
+    """Teacher cached-prefill rate; None means 20% of teacher_prefill when set."""
+
+    teacher_sample: Annotated[float, Field(ge=0)] | None = None
+    """Sampling rate for teacher-in-harness episodes (warmup, gate baseline)."""
+
+    @property
+    def effective_student_cached_prefill(self) -> float | None:
+        """The student cached-prefill price actually charged (see class docstring)."""
+        if self.student_cached_prefill is not None:
+            return self.student_cached_prefill
+        if self.student_prefill is not None:
+            return self.student_prefill * CACHED_PREFILL_FRACTION
+        return None
+
+    @property
+    def effective_teacher_cached_prefill(self) -> float | None:
+        """The teacher cached-prefill price actually charged (see class docstring)."""
+        if self.teacher_cached_prefill is not None:
+            return self.teacher_cached_prefill
+        if self.teacher_prefill is not None:
+            return self.teacher_prefill * CACHED_PREFILL_FRACTION
+        return None
 
     def is_complete(self) -> bool:
-        """Whether every meter has a price, so run cost can be fully accounted."""
+        """Whether every meter has a price, so run cost can be fully accounted.
+
+        The cached-prefill meters count as priced through their derived 20%
+        defaults, so completeness needs exactly the four full prices plus
+        `teacher_sample`.
+        """
         return (
             self.student_prefill is not None
+            and self.effective_student_cached_prefill is not None
             and self.student_sample is not None
             and self.student_train is not None
             and self.teacher_prefill is not None
+            and self.effective_teacher_cached_prefill is not None
+            and self.teacher_sample is not None
         )
 
 
