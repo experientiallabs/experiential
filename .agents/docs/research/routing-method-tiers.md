@@ -167,3 +167,37 @@ led by Yi-34B/claude-v2/mixtral). LIMIT: this does not transfer to wm-scenario c
 all scenarios share one format and the routable structure (if any) is semantic. Decision:
 hashing stays the default for stage A/B; the comparison RERUNS per corpus in stage C before
 any product-default call. Follow-up noted: compare full knob-swept frontiers, not just knob=0.
+
+## Stage B (2026-07-24): OUR 9-model pool on certified RouterBench MCQ, exact-match
+
+Setup: gold recovered from the matrix by consensus (23,354/26,821 certified, 87.1%, zero
+parse conflicts); 1,199 stratified prompts x 9 models = 10,791 calls, $17.77, judge-free
+grading; ~0.5% error rows (Azure content filters), recorded unscored. 843 fit / 356 test.
+
+Single models on test (cost/call, accuracy): gpt-5.4-mini $0.00015/0.827; haiku-4-5
+$0.00023/0.888; deepseek-v4-pro $0.00033/0.836; sonnet-5 $0.00084/0.941; opus-4-8
+$0.00131/0.949; glm-5.2 $0.00242/0.812; kimi-k2.6 $0.00248/0.805; fable-5 $0.0035/0.904;
+gpt-5.5 $0.00351/0.955. Oracle 0.9916 @ $0.00019.
+
+HONEST HEADLINE: on these saturated 2023-era MCQ benchmarks, routing does NOT beat
+price-mixing with our pool. AIQ ours 0.8726-0.8802 (k swept 4-64) vs Zero-Router 0.9014;
+sonnet-5 alone (0.941 @ $0.00084) anchors a singles hull the fitted frontier stays under.
+Best routed point (k=32, knob=0): 0.9607 @ $0.00236 - above best-single gpt-5.5 (+0.6pt,
+within the ~1.7pt noise floor of 356 scenarios) at 33% lower cost and faster (routed p50
+0.8-1.9s vs gpt-5.5 p50 1.87s / mean 2.33s), but single points do not beat the hull.
+
+WHY, and why this does not kill routing: 2026 models are near-ceiling and almost TOTALLY
+ORDERED on 2023 MCQ (every model 0.81-0.955); per-cluster specialization barely exists, and
+843 scenarios / 64 clusters = ~13 per cluster fits rankings on noise (the no-support-threshold
+characteristic + DARS 2606.06924's warning, live). Contrast stage A: the 2023 pool had REAL
+specialization (Yi-34B led whole clusters over gpt-4) and routing beat both best-single and
+the floor. Routing pays where models specialize; it cannot pay where quality is totally
+ordered and the data is saturated.
+
+Consequences: (1) the fitter is validated (stage A) and the honest-benchmark machinery does
+its job - on saturated corpora the improvement report should recommend a STATIC policy
+(sonnet-5 at 4x under gpt-5.5's cost, or haiku at 15x under with -6.7pts) and say so;
+(2) the decisive test for the product is stage C, wm scenarios from customer traces, where
+specialization demonstrably exists (the bird-sql smoke: haiku 1.0 vs gpt-5.4-mini 0.0 on
+identical scenarios); (3) fitter iteration queue: per-cluster support thresholds, k selection
+on validation, DARS-style multi-sample labels.
