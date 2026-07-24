@@ -51,8 +51,24 @@ def _matrices() -> dict[str, OutcomeMatrix]:
     ours = Path(".wmh/evals/routerbench/ours_matrix.json")
     if ours.exists():
         out["routerbench-ours9"] = OutcomeMatrix.load(ours)
+    wm_matrices = []
     for wm in sorted(Path(".wmh/evals/wm").glob("*_matrix.json")):
-        out[f"wm-{wm.stem.removesuffix('_matrix')}"] = OutcomeMatrix.load(wm)
+        corpus = wm.stem.removesuffix("_matrix")
+        matrix = OutcomeMatrix.load(wm)
+        out[f"wm-{corpus}"] = matrix
+        wm_matrices.append((corpus, matrix))
+    if len(wm_matrices) >= 2:
+        # The pooled cross-corpus aggregate: per-corpus test sides are tiny, so THIS is where
+        # the statistically real wm signal lives. Scenario ids get a corpus prefix, which also
+        # makes the stratified split per-corpus (each corpus contributes to fit AND test).
+        combined = []
+        for corpus, matrix in wm_matrices:
+            for outcome in matrix.outcomes:
+                clone = outcome.model_copy(
+                    update={"scenario_id": f"{corpus}:{outcome.scenario_id}"}
+                )
+                combined.append(clone)
+        out["wm-all"] = OutcomeMatrix(pool=wm_matrices[0][1].pool, outcomes=combined)
     return out
 
 
