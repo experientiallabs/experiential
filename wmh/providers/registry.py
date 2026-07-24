@@ -22,13 +22,20 @@ _BACKENDS = {
 }
 
 
-def get_provider(config: ProviderConfig) -> Provider:
-    """Construct the provider for `config.kind`. The one place backends are wired in."""
+def get_provider(config: ProviderConfig, *, api_key: str | None = None) -> Provider:
+    """Construct the provider for `config.kind`. The one place backends are wired in.
+
+    `api_key` is the trusted explicit-credential channel: only operator-owned call sites (the
+    model pool, tests) can pass it, so untrusted bundle config can never choose a credential.
+    When set, the backend authenticates with exactly this key instead of its default env vars.
+    """
     try:
         backend = _BACKENDS[config.kind]
     except KeyError:  # pragma: no cover - exhaustive over the enum
         raise ValueError(f"unknown provider kind: {config.kind}") from None
-    return backend(config)
+    if api_key is None:
+        return backend(config)
+    return backend(config, api_key=api_key)
 
 
 def verify_all(configs: list[ProviderConfig]) -> list[VerifyResult]:

@@ -31,8 +31,12 @@ if TYPE_CHECKING:
 class OpenAIProvider:
     """GPT 5.5 via the OpenAI API."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
         self.config = config
+        # Trusted explicit credential from get_provider (pool entries with api_key_env). When
+        # set, it authenticates even against a config endpoint: the pool file is operator
+        # config, so its endpoint+key pairing is trusted, unlike a model bundle's config.toml.
+        self._api_key = api_key
         self._client: OpenAI | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
 
@@ -52,10 +56,19 @@ class OpenAIProvider:
             # target, a grid's OpenAI/self-hosted target is a SINGLE provider with no chain behind
             # it, so removing this retry would turn any transient 429/5xx into a permanent 0.0 step
             # and bias the comparison against exactly those models. Key + OPENAI_BASE_URL from env.
-            if self.config.endpoint:
+            if self._api_key is not None:
+                # Trusted explicit credential (see __init__): the operator paired this key with
+                # this endpoint, so it is sent as-is (base_url=None keeps the SDK default).
+                self._client = OpenAI(
+                    base_url=self.config.endpoint,
+                    api_key=self._api_key,
+                    timeout=240.0,
+                    max_retries=1,
+                )
+            elif self.config.endpoint:
                 # OpenAI-compatible server. Auth comes from WMH_ENDPOINT_API_KEY; NEVER send
                 # the real OPENAI_API_KEY to an arbitrary base_url. Most self-hosted servers
-                # ignore auth, but the SDK insists on *a* key — hence the placeholder.
+                # ignore auth, but the SDK insists on *a* key, hence the placeholder.
                 self._client = OpenAI(
                     base_url=self.config.endpoint,
                     api_key=os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed",

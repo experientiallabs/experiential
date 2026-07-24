@@ -79,7 +79,14 @@ def _is_nova(model_id: str) -> bool:
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
+        if api_key is not None:
+            # Keeps the backend union uniformly constructible from get_provider while failing
+            # loudly: Bedrock has no API-key auth to send the credential to.
+            raise ValueError(
+                "Bedrock authenticates with AWS credentials (profile/role), not an API key; "
+                "drop api_key/api_key_env for this provider"
+            )
         self.config = config
         self._client: BaseClient | None = None
         # Model capability lives in WMH's canonical catalog. Subclasses may

@@ -22,8 +22,11 @@ if TYPE_CHECKING:
 class AnthropicProvider:
     """Primary backend: Opus 4.8 for env simulation, GEPA reflection, and the judge."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
         self.config = config
+        # Trusted explicit credential from get_provider (pool entries with api_key_env);
+        # None means the SDK reads ANTHROPIC_API_KEY from the environment.
+        self._api_key = api_key
         self._client: Anthropic | None = None
 
     def _get_client(self) -> Anthropic:
@@ -32,7 +35,10 @@ class AnthropicProvider:
         if self._client is None:
             from anthropic import Anthropic
 
-            self._client = Anthropic()  # picks up ANTHROPIC_API_KEY from the environment
+            if self._api_key is not None:
+                self._client = Anthropic(api_key=self._api_key)
+            else:
+                self._client = Anthropic()  # picks up ANTHROPIC_API_KEY from the environment
         return self._client
 
     def complete(

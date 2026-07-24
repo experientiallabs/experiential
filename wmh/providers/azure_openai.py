@@ -46,8 +46,13 @@ _REASONING_PING = ChatRequest.model_validate(
 class AzureOpenAIProvider:
     """GPT 5.5 via an Azure OpenAI deployment."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
         self.config = config
+        # Trusted explicit credential from get_provider (pool entries with api_key_env). When
+        # set, it authenticates the config endpoint directly: the pool file is operator config,
+        # so its endpoint+key pairing is trusted and the untrusted-endpoint downgrade below
+        # does not apply. Multi-account pools (several Azure resources, one key each) need this.
+        self._api_key = api_key
         self._client: AzureOpenAI | None = None
         self._responses_client: OpenAI | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
@@ -82,7 +87,15 @@ class AzureOpenAIProvider:
 
             from openai import AzureOpenAI
 
-            if is_config_endpoint:
+            if self._api_key is not None:
+                # Trusted explicit credential (see __init__): authenticate this endpoint with
+                # exactly the operator-paired key, bypassing the untrusted-endpoint downgrade.
+                self._client = AzureOpenAI(
+                    api_version=self.config.api_version,
+                    azure_endpoint=endpoint,
+                    api_key=self._api_key,
+                )
+            elif is_config_endpoint:
                 # A config-controlled endpoint (config.toml can come from an untrusted model
                 # bundle) is an untrusted host. NEVER let the SDK fall back to the real
                 # AZURE_OPENAI_API_KEY for it: auth comes from WMH_ENDPOINT_API_KEY, mirroring
@@ -105,7 +118,10 @@ class AzureOpenAIProvider:
         """Create the Azure v1 client used by configured structured reasoning calls."""
         if self._responses_client is None:
             endpoint, is_config_endpoint = self._resolved_endpoint()
-            if is_config_endpoint:
+            if self._api_key is not None:
+                # Same trusted explicit credential as _get_client.
+                api_key: str | None = self._api_key
+            elif is_config_endpoint:
                 api_key = os.environ.get("WMH_ENDPOINT_API_KEY") or "not-needed"
             else:
                 api_key = os.environ.get("AZURE_OPENAI_API_KEY")

@@ -26,8 +26,11 @@ if TYPE_CHECKING:
 class OpenAIResponsesProvider:
     """GPT 5.x via OpenAI's Responses API."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
         self.config = config
+        # Trusted explicit credential from get_provider (pool entries with api_key_env);
+        # None means the SDK reads OPENAI_API_KEY from the environment.
+        self._api_key = api_key
         self._client: OpenAI | None = None
 
     def _get_client(self) -> OpenAI:
@@ -36,7 +39,10 @@ class OpenAIResponsesProvider:
         if self._client is None:
             from openai import OpenAI
 
-            self._client = OpenAI()  # picks up OPENAI_API_KEY from the environment
+            if self._api_key is not None:
+                self._client = OpenAI(api_key=self._api_key)
+            else:
+                self._client = OpenAI()  # picks up OPENAI_API_KEY from the environment
         return self._client
 
     def complete(
