@@ -1,0 +1,6 @@
+[
+ "build-cython-ext",
+ "build-pov-ray",
+ "constraints-scheduling",
+ "overfull-hbox"
+]

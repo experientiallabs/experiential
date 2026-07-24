@@ -5,8 +5,9 @@ or needs to resume lives under it:
 
     <run_dir>/
       config.toml         # exact snapshot of the DistillConfig the run started with
-      metrics.jsonl       # one JSON row per training step, appended as steps finish
+      metrics.jsonl       # one JSON row per warmup/training step, appended as steps finish
       spend.json          # cumulative priced USD across every session, updated per charge
+      warmup.json         # the WarmupRecord marker; its existence means warmup is done
       evals/<name>.json   # interim and final eval payloads, keyed by eval name
       checkpoints.json    # manifest of saved tinker:// state + sampler paths
       gate.json           # the DistillGateRecord verdict
@@ -14,6 +15,7 @@ or needs to resume lives under it:
       handoff.toml        # the [models.agent] serving snippet for the user
       harbor/step-NNNN/   # per-step harbor jobs dirs (written by the rollout collector)
       tokens/step-NNNN/   # per-step token sinks (written by the rollout collector)
+      warmup-rollouts/    # the warmup phase's isolated rollout root (teacher trials)
 
 `AdapterStore` mirrors `wmh/harness/store.py`'s `HarnessStore` idiom for the
 trained adapters themselves: `.wmh/adapters/<name>/` accumulates immutable
@@ -56,6 +58,7 @@ _CARD_FILE = "model_card.json"
 _CONFIG_FILE = "config.toml"
 _METRICS_FILE = "metrics.jsonl"
 _SPEND_FILE = "spend.json"
+_WARMUP_FILE = "warmup.json"
 _CHECKPOINTS_FILE = "checkpoints.json"
 _GATE_FILE = "gate.json"
 _MODEL_CARD_FILE = "model_card.json"
@@ -73,6 +76,40 @@ class SpendLedger(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     total_usd: float = Field(ge=0.0)
+
+
+class WarmupRecord(BaseModel):
+    """The warmup.json shape: proof one session finished (or skipped) warmup.
+
+    The record exists exactly when the warmup phase reached its terminal
+    outcome, so a resumed run never re-runs it. It is NOT a checkpoint
+    manifest entry: checkpoint steps drive the resume step count, and warmup
+    precedes step 0. `state_path` lets a resume that has no step checkpoint
+    yet restore the warmed weights instead of starting cold.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    steps: int = Field(ge=0)
+    """Warmup optimizer steps actually applied (0 when the phase was skipped)."""
+
+    trials: int = Field(ge=0)
+    """Teacher trials collected on the train split."""
+
+    kept_trials: int = Field(ge=0)
+    """Trials that survived the `warmup.keep` filter."""
+
+    datums: int = Field(ge=0)
+    """SFT datums the kept trials merged into."""
+
+    state_path: str | None = None
+    """The post-warmup tinker:// training-state path; None when skipped."""
+
+    sampler_path: str | None = None
+    """The post-warmup tinker:// sampler-weights path; None when skipped."""
+
+    skipped_reason: str | None = None
+    """Why the phase trained nothing (e.g. zero passing trials); None when it ran."""
 
 
 class CheckpointRecord(BaseModel):
@@ -142,6 +179,10 @@ class DistillRunStore:
     @property
     def spend_path(self) -> Path:
         return self.run_dir / _SPEND_FILE
+
+    @property
+    def warmup_path(self) -> Path:
+        return self.run_dir / _WARMUP_FILE
 
     @property
     def checkpoints_path(self) -> Path:
@@ -311,6 +352,45 @@ class DistillRunStore:
                 f"corrupt spend ledger at {self.spend_path}: {exc}; delete the file to "
                 "fall back to summing metrics rows (which may miss eval spend, so "
                 "consider lowering budget.max_usd accordingly) and resume"
+            ) from exc
+
+    # -- warmup ----------------------------------------------------------------------------------
+
+    def write_warmup(self, record: WarmupRecord) -> Path:
+        """Persist the warmup phase's terminal record to `warmup.json`.
+
+        Written exactly once per run, when the phase finished training or
+        decided to skip; a resumed session that finds the file never re-runs
+        warmup.
+
+        Args:
+            record: The phase's outcome.
+
+        Returns:
+            The written path.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.warmup_path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        return self.warmup_path
+
+    def read_warmup(self) -> WarmupRecord | None:
+        """The recorded warmup outcome, or None when the phase never finished.
+
+        Raises:
+            ValueError: If the file exists but does not parse; the message
+                says how to recover.
+        """
+        try:
+            text = self.warmup_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        try:
+            return WarmupRecord.model_validate_json(text)
+        except ValidationError as exc:
+            raise ValueError(
+                f"corrupt warmup record at {self.warmup_path}: {exc}; delete the file "
+                "so the resumed run re-runs the warmup phase (already-collected teacher "
+                "trials under warmup-rollouts/ resume trial-level through harbor)"
             ) from exc
 
     # -- evals -----------------------------------------------------------------------------------

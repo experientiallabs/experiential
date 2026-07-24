@@ -21,6 +21,7 @@ from wmh.distill.data import (
     attach_advantages,
     build_datums,
     to_tinker_datums,
+    to_tinker_sft_datums,
 )
 from wmh.distill.fake_tinker import FakeDatum, FakeServiceClient, FakeTrainingClient
 from wmh.distill.tokens import TrialRecord
@@ -464,6 +465,72 @@ def test_to_tinker_datums_tito_round_trip_through_the_fake_training_client() -> 
     )
     with pytest.raises(AssertionError, match="TITO violation"):
         training.forward_backward([corrupted], "importance_sampling")
+
+
+# --- to_tinker_sft_datums (the warmup cross_entropy converter) --------------------------------
+
+
+def test_to_tinker_sft_datums_keyset_and_shift_layout() -> None:
+    """The cross_entropy wire contract: exactly {target_tokens, weights}, shifted.
+
+    The keyset is pinned against the installed SDK (tinker 0.23.3): its own
+    custom-loss path (tinker/lib/public_interfaces/training_client.py) rejects
+    any cross_entropy loss_fn_inputs key outside {'target_tokens', 'weights'},
+    and the cookbook's supervised datum builder emits exactly this pair. The
+    live service already rejected an unexpected "mask" key once
+    (importance_sampling, observed 2026-07-23), so the keyset is asserted, not
+    trusted.
+    """
+    pytest.importorskip("tinker")
+    datum = _one_datum()  # no advantages attached: SFT must not need them
+    (td,) = to_tinker_sft_datums([datum])
+
+    tokens = datum.model_input_tokens
+    assert td.model_input.to_ints() == tokens[:-1]
+    assert set(td.loss_fn_inputs) == {"target_tokens", "weights"}
+    assert [int(t) for t in td.loss_fn_inputs["target_tokens"].data] == tokens[1:]
+    assert td.loss_fn_inputs["target_tokens"].dtype == "int64"
+    # weights = the shifted loss mask, so context tokens carry no loss.
+    assert [float(w) for w in td.loss_fn_inputs["weights"].data] == datum.loss_mask[1:]
+    assert td.loss_fn_inputs["weights"].dtype == "float32"
+
+
+def test_to_tinker_sft_datums_rejects_short_datum() -> None:
+    pytest.importorskip("tinker")
+    short = TrainDatum(
+        trial_name="task-a__x1",
+        fragment_index=0,
+        model_input_tokens=[7],
+        loss_mask=[1.0],
+        sampled_logprobs=[-0.5],
+    )
+    with pytest.raises(ValueError, match="at least 2"):
+        to_tinker_sft_datums([short])
+
+
+def test_to_tinker_sft_datums_import_error_names_the_extra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "tinker", None)
+    with pytest.raises(ImportError, match="uv sync --extra distill"):
+        to_tinker_sft_datums([])
+
+
+def test_to_tinker_sft_datums_tito_round_trip_through_the_fake_training_client() -> None:
+    """Warmup CE datums built from sampled spans satisfy the fake's TITO check."""
+    pytest.importorskip("tinker")
+    training, spans = _sampled_episode()
+
+    datums, stats = build_datums([_record(spans)], _cfg())
+    assert stats.datums == 1
+    (td,) = to_tinker_sft_datums(datums)
+    fake = FakeDatum(
+        model_input_tokens=td.model_input.to_ints(),
+        target_tokens=[int(t) for t in td.loss_fn_inputs["target_tokens"].data],
+        weights=[float(w) for w in td.loss_fn_inputs["weights"].data],
+    )
+    training.forward_backward([fake], "cross_entropy")
+    assert training.forward_backward_calls[-1][1] == "cross_entropy"
 
 
 # --- Real-data fixture: live smoke-dev step-0 token sink (ids only) --------------------------

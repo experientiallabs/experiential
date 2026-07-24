@@ -16,7 +16,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, cast
 
 import pytest
 from llm_waterfall.types import ChatMessage, ChatTool
@@ -38,6 +38,7 @@ from wmh.distill.config import (
     StudentConfig,
     TeacherConfig,
     TrainConfig,
+    WarmupConfig,
 )
 from wmh.distill.data import TrainDatum
 from wmh.distill.deadlines import TinkerDeadlineError
@@ -49,6 +50,8 @@ from wmh.distill.fake_tinker import (
     FakeTrainingClient,
 )
 from wmh.distill.loop import (
+    STUDENT_BEFORE_EVAL,
+    WARMUP_ROLLOUTS_DIR,
     DistillBudgetError,
     DistillProgress,
     DistillResult,
@@ -57,6 +60,7 @@ from wmh.distill.loop import (
     SdkTrainingClient,
     StepMetrics,
     TaskSampler,
+    WarmupMetrics,
     pin_rollout_params,
     resume_command,
     run_distillation,
@@ -198,6 +202,11 @@ class _FakeRollouts:
         self.service = service
         self.calls: list[_RolloutCall] = []
         self.fabricate_spans = False
+        self.teacher_fail_all = False
+        """When True, every trial of the teacher provider fails (warmup skip path)."""
+
+        self.fail_on_train_step: int | None = None
+        """Raise on the TRAIN batch of this step (a crash between phases)."""
 
     def __call__(
         self,
@@ -211,11 +220,18 @@ class _FakeRollouts:
         should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[list[TrialRecord], RolloutStats]:
         del should_cancel
+        is_train_batch = (
+            run_dir.parent.name != "eval-rollouts" and run_dir.name != WARMUP_ROLLOUTS_DIR
+        )
+        if is_train_batch and step_index == self.fail_on_train_step:
+            raise RuntimeError("injected rollout crash")
         client = self.service.create_sampling_client(provider_config.model)
         records: list[TrialRecord] = []
         for task_index, task_id in enumerate(task_ids):
             for attempt in range(1, cfg.train.group_size + 1):
                 passed = task_index % 2 == 0
+                if self.teacher_fail_all and provider_config.model == _TEACHER:
+                    passed = False
                 trial_name = f"{task_id}__s{attempt}"
                 records.append(
                     TrialRecord(
@@ -352,6 +368,39 @@ def _train_priced_cfg(budget_max: float) -> DistillConfig:
     )
 
 
+def _warmup_cfg(
+    *,
+    warmup_steps: int = 2,
+    rollouts_per_task: int = 2,
+    keep: Literal["passed", "all"] = "passed",
+    warmup_lr: float | None = 5e-5,
+    budget_max: float | None = None,
+    pricing: PricingConfig | None = None,
+) -> DistillConfig:
+    """The 3-step config with the supervised warmup phase enabled."""
+    return _cfg(budget_max=budget_max, pricing=pricing).model_copy(
+        update={
+            "warmup": WarmupConfig(
+                steps=warmup_steps,
+                rollouts_per_task=rollouts_per_task,
+                keep=keep,
+                learning_rate=warmup_lr,
+            )
+        }
+    )
+
+
+def _warmup_calls(env: _Env) -> list[_RolloutCall]:
+    warmup_dir = env.run_dir / WARMUP_ROLLOUTS_DIR
+    return [call for call in env.rollouts.calls if call.run_dir == warmup_dir]
+
+
+def _loss_fns(env: _Env) -> list[str]:
+    training = env.service.training
+    assert training is not None
+    return [loss for _, loss in training.inner.forward_backward_calls]
+
+
 def _run(
     env: _Env,
     cfg: DistillConfig,
@@ -392,12 +441,16 @@ class _RecordingTracker:
 
     def __init__(self) -> None:
         self.steps: list[tuple[int, StepMetrics]] = []
+        self.warmup_steps: list[tuple[int, WarmupMetrics]] = []
         self.evals: list[tuple[str, float, int | None]] = []
         self.summaries: list[_TrackedSummary] = []
         self.finish_calls = 0
 
     def log_step(self, step: int, metrics: StepMetrics) -> None:
         self.steps.append((step, metrics))
+
+    def log_warmup_step(self, warmup_step: int, metrics: WarmupMetrics) -> None:
+        self.warmup_steps.append((warmup_step, metrics))
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
         self.evals.append((name, solve_rate, step))
@@ -749,6 +802,224 @@ def test_resume_with_an_empty_run_dir_is_rejected(
     env = _setup(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="nothing to resume"):
         _run(env, _cfg(), resume=True)
+
+
+# -- the supervised warmup phase ---------------------------------------------------------------
+
+
+def test_warmup_trains_on_passing_teacher_trials_then_opd_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    tracker = _RecordingTracker()
+
+    result = _run(env, _warmup_cfg(), tracker=tracker)
+
+    assert result.steps_completed == 3
+    assert result.gate.accepted
+
+    # The warmup collection ran the TEACHER on the full train split under the
+    # isolated warmup-rollouts root, rollouts_per_task attempts per task.
+    (warmup_call,) = _warmup_calls(env)
+    assert warmup_call.provider_model == _TEACHER
+    assert warmup_call.task_ids == _TRAIN_IDS
+    assert warmup_call.attempts == 2
+    assert warmup_call.step_index == 0
+
+    # Two cross_entropy passes over the passed-filter datums (tasks at even
+    # positions pass: 2 tasks x 2 attempts = 4 kept trials, one datum each),
+    # then the three importance_sampling OPD steps; every cross_entropy batch
+    # cleared the fake's TITO check on TEACHER-issued spans. The warmup LR
+    # applies to the warmup passes only.
+    training = env.service.training
+    assert training is not None
+    assert _loss_fns(env) == ["cross_entropy"] * 2 + ["importance_sampling"] * 3
+    ce_batches = [
+        batch for batch, loss in training.inner.forward_backward_calls if loss == "cross_entropy"
+    ]
+    assert all(len(batch) == 4 for batch in ce_batches)
+    assert training.inner.optim_step_lrs == [5e-5, 5e-5, 1e-4, 1e-4, 1e-4]
+
+    # OPD step 0 sampled the WARMED student: the post-warmup forced refresh
+    # produced a fresh sampler path, distinct from the pre-warmup weights the
+    # student-before baseline sampled.
+    train_calls = [call for call in env.rollouts.calls if call.run_dir == env.run_dir]
+    before_call = next(
+        call for call in env.rollouts.calls if call.run_dir.name == STUDENT_BEFORE_EVAL
+    )
+    assert "warmup" in train_calls[0].provider_model
+    assert train_calls[0].provider_model != before_call.provider_model
+
+    # Metrics: one phase-tagged warmup row per warmup step, then the OPD rows
+    # (their step indices restart at 0, so the phase key is the discriminator).
+    store = DistillRunStore(env.run_dir)
+    rows = store.read_metrics()
+    warmup_rows = [row for row in rows if row.get("phase") == "warmup"]
+    step_rows = [row for row in rows if "phase" not in row]
+    assert [row["step"] for row in warmup_rows] == [0, 1]
+    assert [row["step"] for row in step_rows] == [0, 1, 2]
+    for row in warmup_rows:
+        assert row["trials"] == 8
+        assert row["kept_trials"] == 4
+        assert row["solve_rate"] == 0.5
+        assert row["datums"] == 4
+        assert _number(row, "learning_rate") == pytest.approx(5e-5)
+        assert _number(row, "student_train_tokens") > 0
+        assert _number(row, "usd") > 0
+    # The teacher collection's charge folds into warmup row 0 only.
+    assert _number(warmup_rows[0], "teacher_prefill_tokens") > 0
+    assert _number(warmup_rows[1], "teacher_prefill_tokens") == 0
+
+    # The tracker saw the same warmup rows the store persisted.
+    assert [step for step, _ in tracker.warmup_steps] == [0, 1]
+    for (step, metrics), row in zip(tracker.warmup_steps, warmup_rows, strict=True):
+        assert row == {"step": step, **metrics.model_dump(mode="json")}
+
+    # The completion marker records the phase, and warmup never lands in the
+    # checkpoint manifest (checkpoint steps drive the resume step count).
+    record = store.read_warmup()
+    assert record is not None
+    assert record.steps == 2
+    assert record.trials == 8
+    assert record.kept_trials == 4
+    assert record.datums == 4
+    assert record.skipped_reason is None
+    assert record.state_path is not None
+    assert record.sampler_path == train_calls[0].provider_model
+    assert [checkpoint.step for checkpoint in store.checkpoints()] == [1, 2]
+
+    assert "warmup" in {event.phase for event in env.progress}
+
+
+def test_warmup_zero_passing_trials_skips_to_pure_opd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Zero passing teacher trials degrade the run to pure OPD, never abort it."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.teacher_fail_all = True
+
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.loop"):
+        result = _run(env, _warmup_cfg())
+
+    assert "pure on-policy distillation" in caplog.text
+    assert result.steps_completed == 3
+    assert _loss_fns(env) == ["importance_sampling"] * 3  # nothing to warm up on
+    assert len(_warmup_calls(env)) == 1  # the collection itself did run
+
+    store = DistillRunStore(env.run_dir)
+    warmup_rows = [row for row in store.read_metrics() if row.get("phase") == "warmup"]
+    assert len(warmup_rows) == 1
+    assert warmup_rows[0]["trials"] == 8
+    assert warmup_rows[0]["kept_trials"] == 0
+    assert warmup_rows[0]["datums"] == 0
+    record = store.read_warmup()
+    assert record is not None
+    assert record.steps == 0
+    assert record.skipped_reason is not None
+    assert "keep='passed'" in record.skipped_reason
+    assert record.state_path is None and record.sampler_path is None
+
+
+def test_warmup_keep_all_trains_on_failing_trials_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.teacher_fail_all = True  # nothing passes; keep="all" still trains
+
+    result = _run(env, _warmup_cfg(warmup_steps=1, keep="all"))
+
+    assert result.steps_completed == 3
+    assert _loss_fns(env) == ["cross_entropy"] + ["importance_sampling"] * 3
+    training = env.service.training
+    assert training is not None
+    (ce_batch, _) = training.inner.forward_backward_calls[0]
+    assert len(ce_batch) == 8  # every trial kept: 4 tasks x 2 attempts
+    record = DistillRunStore(env.run_dir).read_warmup()
+    assert record is not None
+    assert record.kept_trials == 8
+    assert record.datums == 8
+
+
+def test_resume_never_reruns_a_completed_warmup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    cfg = _warmup_cfg()
+    _run(env, cfg)
+    assert len(_warmup_calls(env)) == 1
+    assert _loss_fns(env).count("cross_entropy") == 2
+
+    result = _run(env, cfg, resume=True)
+
+    assert result.steps_completed == 3
+    # Neither the teacher collection nor the SFT passes ran again.
+    assert len(_warmup_calls(env)) == 1
+    assert _loss_fns(env).count("cross_entropy") == 2
+
+
+def test_budget_abort_mid_warmup_reruns_warmup_whole_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted warmup holds no completion marker, so it re-runs whole."""
+    env = _setup(tmp_path, monkeypatch)
+    capped = _warmup_cfg(
+        budget_max=1.0,
+        # Only student_train is priced, so the run survives the baselines and
+        # the teacher collection, then the first warmup pass blows the cap.
+        pricing=PricingConfig(
+            student_prefill=0.0, student_sample=0.0, student_train=1e9, teacher_prefill=0.0
+        ),
+    )
+
+    with pytest.raises(DistillBudgetError):
+        _run(env, capped)
+
+    store = DistillRunStore(env.run_dir)
+    assert store.read_warmup() is None  # no marker: the phase never finished
+    assert len(_warmup_calls(env)) == 1
+    assert _loss_fns(env).count("cross_entropy") == 1  # the aborted first pass
+
+    result = _run(env, _warmup_cfg(), resume=True)  # cap lifted: the documented recovery
+
+    assert result.steps_completed == 3
+    # The resumed session re-collected and re-trained the whole warmup phase.
+    assert len(_warmup_calls(env)) == 2
+    assert _loss_fns(env).count("cross_entropy") == 1 + 2
+    record = store.read_warmup()
+    assert record is not None
+    assert record.steps == 2
+
+
+def test_resume_restores_post_warmup_state_when_no_step_checkpoint_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between warmup and the first step checkpoint keeps the warmup.
+
+    Without the warmup record's state_path restore, this resume would start
+    OPD from the COLD student and silently lose the warmup it already paid
+    for (no step checkpoint exists yet for load_state to use).
+    """
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.fail_on_train_step = 0
+    cfg = _warmup_cfg()
+
+    with pytest.raises(RuntimeError, match="injected rollout crash"):
+        _run(env, cfg)
+
+    store = DistillRunStore(env.run_dir)
+    record = store.read_warmup()
+    assert record is not None
+    assert record.state_path is not None
+    assert store.latest_checkpoint() is None  # nothing step-level to restore
+
+    env.rollouts.fail_on_train_step = None
+    result = _run(env, cfg, resume=True)
+
+    assert result.steps_completed == 3
+    training = env.service.training
+    assert training is not None
+    assert training.load_state_calls == [record.state_path]
+    assert len(_warmup_calls(env)) == 1  # warmup itself was not re-run
 
 
 # -- preflight failure paths -----------------------------------------------------------------
