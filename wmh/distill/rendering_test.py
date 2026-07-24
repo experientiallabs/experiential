@@ -49,10 +49,22 @@ class _CharTokenizer:
                 ids.extend(ord(ch) for ch in piece)
         return ids
 
-    def decode(self, token_ids: list[int]) -> str:
-        """Decode ids back to text, restoring special strings."""
+    def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+        """Decode ids back to text, restoring (or, on request, dropping) specials.
+
+        Mirrors the HF `skip_special_tokens` contract the seam's
+        `decode_with_specials` relies on (False keeps them, HF's default).
+        """
         reverse = {v: k for k, v in self._SPECIALS.items()}
-        return "".join(reverse.get(t) or chr(t) for t in token_ids)
+        fragments: list[str] = []
+        for token in token_ids:
+            special = reverse.get(token)
+            if special is not None:
+                if not skip_special_tokens:
+                    fragments.append(special)
+            else:
+                fragments.append(chr(token))
+        return "".join(fragments)
 
 
 def _tool(name: str) -> ChatTool:
@@ -202,6 +214,29 @@ def test_build_renderer_qwen3_tools_prompt_and_tool_call_parse() -> None:
 
     truncated = rendering.parse_response(tokenizer.encode("ran out of bud"))
     assert truncated.stopped is False
+
+
+def test_decode_with_specials_keeps_the_chat_template_framing() -> None:
+    # decode() rides the tokenizer's default cleanup; decode_with_specials must
+    # pin skip_special_tokens=False so the template framing survives verbatim.
+    pytest.importorskip("tinker_cookbook")
+
+    class _RecordingTokenizer(_CharTokenizer):
+        def __init__(self) -> None:
+            self.decode_flags: list[bool] = []
+
+        def decode(self, token_ids: list[int], skip_special_tokens: bool = False) -> str:
+            self.decode_flags.append(skip_special_tokens)
+            return super().decode(token_ids, skip_special_tokens)
+
+    tokenizer = _RecordingTokenizer()
+    rendering = build_renderer("Qwen/Qwen3-8B", tokenizer)
+    prompt_ids = rendering.build_generation_prompt([ChatMessage(role="user", content="hi")])
+    text = rendering.decode_with_specials(prompt_ids)
+    assert "<|im_start|>user" in text
+    assert "<|im_end|>" in text
+    assert text.endswith("<|im_start|>assistant\n")
+    assert tokenizer.decode_flags[-1] is False
 
 
 def _echoed_conversation() -> tuple[list[ChatMessage], list[ChatMessage]]:
