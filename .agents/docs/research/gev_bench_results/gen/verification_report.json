@@ -1,0 +1,76 @@
+{
+  "verdicts": [
+    {
+      "scenario_id": "scenario-8a036f7d5cd8db835fdfc028d7478131",
+      "back_agreement": true,
+      "judge_success_on_source": false,
+      "solvable": false,
+      "rollout_pass_rate": 0.0,
+      "critique": "The agent cancelled reservations NM1VX1, KC18K6, and S61CZX without any user interaction, confirmation, or communication of flight durations. There is no evidence of asking the user, no confirmation of specific actions, no cabin upgrades, and no final summary presented to the user."
+    },
+    {
+      "scenario_id": "scenario-b46200d83bb28c6d2bd1ae518ba21a4e",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": false,
+      "rollout_pass_rate": 0.4,
+      "critique": "The gaming mouse return was submitted, but the order #W5490111 return call appears misdirected (the observation shows a Water Bottle and doesn't confirm the keyboard item was correctly isolated), there was no identity verification step, and no confirmation that non-gaming items were excluded or that correct payment methods were used."
+    },
+    {
+      "scenario_id": "scenario-16e5f88274b89eb32563a7706625d44d",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": true,
+      "rollout_pass_rate": 1.0,
+      "critique": "The support agent verified the reservation and flight status, confirmed HAT271 on 2024-05-10 operated normally and landed as scheduled, and declined to issue any compensation while explaining no eligible disruption occurred."
+    },
+    {
+      "scenario_id": "scenario-0378552fcb2b784d1272e569aa5f9625",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": true,
+      "rollout_pass_rate": 1.0,
+      "critique": "Authenticated Mia Garcia, attempted cross-payment refund which was rejected by policy, then correctly returned #W5490111 to credit_card_3124723 and #W7387996 to paypal_9497703 (their respective original payment methods). All criteria met."
+    },
+    {
+      "scenario_id": "scenario-f9203b81c47f226a6b3090ce0be1aa40",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": false,
+      "rollout_pass_rate": 0.75,
+      "critique": "The agent used the correct Silver tier and reported 2 free checked bags for a single economy passenger, but it relied on a single tool call with assumed parameters rather than actually retrieving the reservation to verify cabin class and passenger count, so item 1 (confirmed retrieval identifying economy) is not clearly demonstrated."
+    },
+    {
+      "scenario_id": "scenario-53d682a66d440a0eafe4c71acebbbaab",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": true,
+      "rollout_pass_rate": 0.8,
+      "critique": "The agent correctly confirmed the order was cancelled, explained cancellations cannot be reversed, did not fabricate an un-cancellation, and offered a legitimate reorder alternative. However, identity verification (name + zip) was never performed before discussing account details."
+    },
+    {
+      "scenario_id": "scenario-efec6ac80ec302b2539752de1d58d7d3",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": false,
+      "rollout_pass_rate": 0.75,
+      "critique": "The single tool call verified ownership and correctly determined ineligibility (basic economy, past 24h, no insurance) and no cancellation occurred, but the episode shows no message from the agent clearly communicating this to Emma."
+    },
+    {
+      "scenario_id": "scenario-1d27a98c6aa49f5a57df450a4fa5f097",
+      "back_agreement": true,
+      "judge_success_on_source": true,
+      "solvable": true,
+      "rollout_pass_rate": 1.0,
+      "critique": "The agent located Emma Smith's account via name and zip, identified the pending laptop order #W2417020, correctly cancelled it (rather than a return since it was pending) with the customer's stated reason, and communicated the refund outcome."
+    },
+    {
+      "scenario_id": "scenario-c69483184e72b43823488fcfb1b73921",
+      "back_agreement": true,
+      "judge_success_on_source": false,
+      "solvable": false,
+      "rollout_pass_rate": 0.0,
+      "critique": "The episode only gathered data (payment methods, reservation details, flight searches) but never reported the gift card or certificate balance sums, never confirmed new pricing with the user, and never made any modification to reservation K1NW8N."
+    }
+  ]
+}
