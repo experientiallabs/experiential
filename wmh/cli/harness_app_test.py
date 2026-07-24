@@ -972,3 +972,28 @@ def test_hosted_optimization_requires_a_configured_worker_model(
 
     with pytest.raises(typer.BadParameter, match="wmh providers set"):
         harness_app_module._resolve_environment("postgres", str(tmp_path), local_only=False)
+
+
+def test_declining_the_prompt_still_releases_the_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Answering No before the search starts must not leak a hosted platform connection."""
+    closed: list[bool] = []
+    monkeypatch.setattr(
+        harness_app_module,
+        "_resolve_environment",
+        lambda name, root, *, local_only: harness_app_module._OptimizeEnvironment(
+            source=_FakeSource(), provider=_Provider(), hosted=True, client=_FakeClient()
+        ),
+    )
+    monkeypatch.setattr(
+        harness_app_module._OptimizeEnvironment, "close", lambda self: closed.append(True)
+    )
+    monkeypatch.setattr(harness_app_module.Confirm, "ask", lambda *a, **kw: False)
+    # The confirmation only appears on a terminal, which the CLI runner is not.
+    monkeypatch.setattr(type(harness_app_module._console), "is_terminal", True)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert closed == [True]

@@ -12,6 +12,7 @@ steers what the agent's scaffold should be. Run one closed-loop with
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import shlex
 from dataclasses import dataclass
@@ -371,74 +372,76 @@ def optimize(
     holdout = _load_task_file(holdout_file) if holdout_file else None
     store = HarnessStore(root)
     seed_doc = _resolve_seed(store, seed)
-    # The world model IS the environment on every backend, so it is always required.
+    # The world model IS the environment on every backend, so it is always required. Everything
+    # after resolution runs inside `closing`: a declined confirmation or a bad model role must
+    # still release a hosted environment's platform connection.
     environment = _resolve_environment(model, root, local_only=local)
-    provider = environment.provider
-    model_name = environment.source.label
-    meta_provider, meta_model = resolve_opt_in_model_provider(root, "meta", provider)
-    agent_provider, agent_model = resolve_opt_in_model_provider(root, "agent", provider)
+    with contextlib.closing(environment):
+        provider = environment.provider
+        model_name = environment.source.label
+        meta_provider, meta_model = resolve_opt_in_model_provider(root, "meta", provider)
+        agent_provider, agent_model = resolve_opt_in_model_provider(root, "agent", provider)
 
-    candidate_count = iterations * proposal_batch_size
-    rollouts = (candidate_count + 1) * k * len(tasks)
-    holdout_note = (
-        f" (+ up to {(candidate_count + 1) * k * len(holdout)} held-out)" if holdout else ""
-    )
-    backend_note = (
-        " (pi harness in pooled E2B sandboxes; env stays the world model)"
-        if backend == "e2b"
-        else ""
-    )
-    meta_note = (
-        f" (proposer: {meta_model} from settings models.meta)" if meta_model is not None else ""
-    )
-    agent_note = (
-        f" (agent-under-test: {agent_model} from settings models.agent)"
-        if agent_model is not None
-        else ""
-    )
-    _console.print(
-        f"searching from [bold]{seed_doc.name}[/bold] against "
-        f"{'platform' if environment.hosted else 'local'} world model "
-        f"[bold]{model_name}[/bold]: {iterations} iteration(s), "
-        f"{proposal_batch_size} proposal(s)/iteration, k={k}, {len(tasks)} task(s) "
-        f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
-        f"{meta_note}{agent_note}{backend_note}"
-    )
-    if interactive and not yes and not Confirm.ask("Proceed?", default=True):
-        raise typer.Exit(0)
-
-    def _progress(iteration: int, variant: str, score: float, changed: bool) -> None:
-        tag = "seed" if iteration == 0 else f"iter {iteration}"
-        state = (
-            "seed"
-            if iteration == 0
-            else "[green]selected[/green]"
-            if changed
-            else "[yellow]unchanged[/yellow]"
+        candidate_count = iterations * proposal_batch_size
+        rollouts = (candidate_count + 1) * k * len(tasks)
+        holdout_note = (
+            f" (+ up to {(candidate_count + 1) * k * len(holdout)} held-out)" if holdout else ""
         )
-        _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {state}")
-
-    def _note(message: str) -> None:
-        # Dead proposals narrate here; scored proposals use the structured callback below.
-        _console.print(f"  [dim]{message}[/dim]")
-
-    def _proposal(record: ProposalRecord) -> None:
-        if record.outcome != "scored":
-            return
-        assert record.candidate is not None and record.score is not None
-        state = (
-            "[green]selected[/green]"
-            if record.selected
-            else "[cyan]eligible, not selected[/cyan]"
-            if record.gate_eligible
-            else "[yellow]rejected by gate[/yellow]"
+        backend_note = (
+            " (pi harness in pooled E2B sandboxes; env stays the world model)"
+            if backend == "e2b"
+            else ""
+        )
+        meta_note = (
+            f" (proposer: {meta_model} from settings models.meta)" if meta_model is not None else ""
+        )
+        agent_note = (
+            f" (agent-under-test: {agent_model} from settings models.agent)"
+            if agent_model is not None
+            else ""
         )
         _console.print(
-            f"  [iteration {record.iteration} proposal {record.proposal_index}] "
-            f"{record.candidate}: success_rate={record.score:.3f} {state}"
+            f"searching from [bold]{seed_doc.name}[/bold] against "
+            f"{'platform' if environment.hosted else 'local'} world model "
+            f"[bold]{model_name}[/bold]: {iterations} iteration(s), "
+            f"{proposal_batch_size} proposal(s)/iteration, k={k}, {len(tasks)} task(s) "
+            f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
+            f"{meta_note}{agent_note}{backend_note}"
         )
+        if interactive and not yes and not Confirm.ask("Proceed?", default=True):
+            raise typer.Exit(0)
 
-    try:
+        def _progress(iteration: int, variant: str, score: float, changed: bool) -> None:
+            tag = "seed" if iteration == 0 else f"iter {iteration}"
+            state = (
+                "seed"
+                if iteration == 0
+                else "[green]selected[/green]"
+                if changed
+                else "[yellow]unchanged[/yellow]"
+            )
+            _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {state}")
+
+        def _note(message: str) -> None:
+            # Dead proposals narrate here; scored proposals use the structured callback below.
+            _console.print(f"  [dim]{message}[/dim]")
+
+        def _proposal(record: ProposalRecord) -> None:
+            if record.outcome != "scored":
+                return
+            assert record.candidate is not None and record.score is not None
+            state = (
+                "[green]selected[/green]"
+                if record.selected
+                else "[cyan]eligible, not selected[/cyan]"
+                if record.gate_eligible
+                else "[yellow]rejected by gate[/yellow]"
+            )
+            _console.print(
+                f"  [iteration {record.iteration} proposal {record.proposal_index}] "
+                f"{record.candidate}: success_rate={record.score:.3f} {state}"
+            )
+
         result = create_harness(
             name,
             seed_doc,
@@ -458,52 +461,50 @@ def optimize(
             on_note=_note,
             on_proposal=_proposal,
         )
-    finally:
-        environment.close()
-    saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
-    selected = len(result.archive.accepted())
-    _console.print(
-        f"[green]created[/green] [bold]{name}[/bold] v{saved.version} (champion) "
-        f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
-        f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
-    )
-    if environment.hosted:
-        # `wmh eval --mode closed-loop` scores against a LOCAL model, so pointing at the hosted
-        # name would not resolve; publishing the champion is the useful next step instead.
+        saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
+        selected = len(result.archive.accepted())
         _console.print(
-            f"  publish it: [bold]{escape(shlex.join(['wmh', 'push', name, '--root', root]))}"
-            "[/bold]",
-            soft_wrap=True,
+            f"[green]created[/green] [bold]{name}[/bold] v{saved.version} (champion) "
+            f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
+            f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
         )
-    else:
-        run_argv = [
-            "wmh",
-            "eval",
-            tasks_file,
-            "--mode",
-            "closed-loop",
-            "--name",
-            model_name,
-            "--root",
-            root,
-            "--k",
-            str(k),
-            "--harness",
-            f"{name}@{saved.version}",
-        ]
-        if backend == "e2b":
-            run_argv.extend(("--harness-backend", "e2b"))
-        if eval_concurrency is not None:
-            run_argv.extend(("--eval-concurrency", str(eval_concurrency)))
-        if backend == "e2b" and e2b_template is not None:
-            run_argv.extend(("--e2b-template", e2b_template))
-        _console.print(
-            f"  run it: [bold]{escape(shlex.join(run_argv))}[/bold]",
-            soft_wrap=True,
-        )
-    if archive_out:
-        Path(archive_out).write_text(result.archive.model_dump_json(indent=2), encoding="utf-8")
-        _console.print(f"  wrote archive -> {archive_out}")
+        if environment.hosted:
+            # `wmh eval --mode closed-loop` scores against a LOCAL model, so pointing at the hosted
+            # name would not resolve; publishing the champion is the useful next step instead.
+            _console.print(
+                f"  publish it: [bold]{escape(shlex.join(['wmh', 'push', name, '--root', root]))}"
+                "[/bold]",
+                soft_wrap=True,
+            )
+        else:
+            run_argv = [
+                "wmh",
+                "eval",
+                tasks_file,
+                "--mode",
+                "closed-loop",
+                "--name",
+                model_name,
+                "--root",
+                root,
+                "--k",
+                str(k),
+                "--harness",
+                f"{name}@{saved.version}",
+            ]
+            if backend == "e2b":
+                run_argv.extend(("--harness-backend", "e2b"))
+            if eval_concurrency is not None:
+                run_argv.extend(("--eval-concurrency", str(eval_concurrency)))
+            if backend == "e2b" and e2b_template is not None:
+                run_argv.extend(("--e2b-template", e2b_template))
+            _console.print(
+                f"  run it: [bold]{escape(shlex.join(run_argv))}[/bold]",
+                soft_wrap=True,
+            )
+        if archive_out:
+            Path(archive_out).write_text(result.archive.model_dump_json(indent=2), encoding="utf-8")
+            _console.print(f"  wrote archive -> {archive_out}")
 
 
 def _load_task_file(path: str) -> list[TaskSpec]:
