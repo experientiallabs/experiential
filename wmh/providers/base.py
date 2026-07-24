@@ -16,6 +16,7 @@ class ProviderKind(StrEnum):
     AZURE_OPENAI = "azure"  # GPT 5.5 via the Azure OpenAI service
     OPENAI = "openai"  # GPT 5.5 direct
     OPENAI_RESPONSES = "openai_responses"  # GPT 5.x direct via the Responses API
+    TINKER = "tinker"  # Tinker LoRA sampling for distillation rollouts (lazy distill extra)
 
 
 class EmbedderKind(StrEnum):

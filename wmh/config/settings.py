@@ -26,6 +26,9 @@ class ModelRole(BaseModel):
 
     provider: str  # a ProviderKind value ("bedrock", "azure", "openai", ...)
     model: str
+    # Canonical model identity when `model` is a runtime id that does not carry it, e.g. a
+    # tinker:// weights path whose base model determines the renderer and tokenizer.
+    model_type: str | None = None
     region: str | None = None  # AWS Bedrock region
     endpoint: str | None = None  # Azure OpenAI / custom base URL
     deployment: str | None = None  # Azure OpenAI deployment name

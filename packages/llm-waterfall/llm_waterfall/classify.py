@@ -56,8 +56,9 @@ _SDK_CAPACITY_TYPE_NAMES = frozenset(
 )
 
 # Top-level modules whose exceptions we trust for name/status-code classification. An exception
-# named `RateLimitError` from arbitrary application code proves nothing.
-_TRUSTED_SDK_MODULES = frozenset({"openai", "anthropic", "httpx", "httpcore"})
+# named `RateLimitError` from arbitrary application code proves nothing. tinker's exceptions
+# mirror openai's shape (same capacity type names; `status_code` on its APIStatusError family).
+_TRUSTED_SDK_MODULES = frozenset({"openai", "anthropic", "httpx", "httpcore", "tinker"})
 
 # HTTP statuses on a trusted SDK error that mean capacity/transient failure. 529 is Anthropic's
 # "overloaded". Everything else (400/401/403/404/422/...) is a client error.

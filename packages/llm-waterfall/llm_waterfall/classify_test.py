@@ -81,6 +81,20 @@ def test_sdk_capacity_types_are_capacity(name: str, module: str) -> None:
     assert is_capacity_error(_sdk_exception(name, module))
 
 
+@pytest.mark.parametrize("name", ["RateLimitError", "APITimeoutError", "APIConnectionError"])
+def test_tinker_capacity_types_are_capacity(name: str) -> None:
+    # The tinker SDK defines openai-shaped exceptions in the `tinker` module; without the
+    # module gate trusting it, a transient tinker 429/timeout would classify as client_error
+    # and kill a whole trial instead of being retried.
+    assert is_capacity_error(_sdk_exception(name, "tinker._exceptions"))
+
+
+def test_tinker_status_and_bad_request_classify_like_openai() -> None:
+    assert is_capacity_error(_sdk_exception("APIStatusError", "tinker", status_code=503))
+    exc = _sdk_exception("BadRequestError", "tinker", status_code=400)
+    assert outcome_for(exc) == "client_error"
+
+
 def test_sdk_type_name_from_foreign_module_is_client_error() -> None:
     # Same class name, wrong module: the gate must reject lookalikes from arbitrary code.
     assert outcome_for(_sdk_exception("RateLimitError", "myapp.errors")) == "client_error"
