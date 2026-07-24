@@ -402,3 +402,20 @@ def test_meter_lines_mirror_the_estimate_shape() -> None:
     assert lines["student_train"].usd == pytest.approx(1.0)
     assert lines["teacher_prefill"].tokens == 0
     assert lines["teacher_prefill"].usd is None
+
+
+def test_estimate_topk_ce_multiplies_train_tokens_by_k() -> None:
+    """The topk_ce loss trains k full-sequence replicas per datum, so the
+    student_train projection scales by train.topk (and nothing else moves)."""
+    base = _config()
+    topk = base.model_copy(
+        update={"train": base.train.model_copy(update={"loss": "topk_ce", "topk": 4})}
+    )
+
+    default_tokens = _tokens(estimate_run_cost(base, n_train_tasks=5, n_holdout_tasks=3))
+    topk_tokens = _tokens(estimate_run_cost(topk, n_train_tasks=5, n_holdout_tasks=3))
+
+    assert topk_tokens["student_train"] == 4 * default_tokens["student_train"]
+    for meter, tokens in default_tokens.items():
+        if meter != "student_train":
+            assert topk_tokens[meter] == tokens

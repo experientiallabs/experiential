@@ -18,11 +18,15 @@ from wmh.distill.config import (
 )
 from wmh.distill.data import (
     CONTEXT_OVERFLOW_STOP_REASON,
+    TopkCandidates,
+    TopkCeStats,
     TrainDatum,
     attach_advantages,
     build_datums,
+    build_topk_ce_datums,
     to_tinker_datums,
     to_tinker_sft_datums,
+    to_tinker_topk_ce_datums,
 )
 from wmh.distill.fake_tinker import FakeDatum, FakeServiceClient, FakeTrainingClient
 from wmh.distill.tokens import TrialRecord
@@ -1391,3 +1395,239 @@ def test_live_sink_pair_merges_with_incremental_prompts() -> None:
     assert len(datums) == 1
     assert stats.fragments == 0
     assert stats.fragmentation_rate == 0.0
+
+
+# --- topk-CE: rank-aligned replication ----------------------------------------
+
+
+def _topk_row_for(datum: TrainDatum, k: int) -> list[TopkCandidates | None]:
+    """A well-formed top-k row: k candidates at every loss position, best first."""
+    row: list[TopkCandidates | None] = [None] * len(datum.model_input_tokens)
+    for position, mask in enumerate(datum.loss_mask):
+        if mask != 1.0 or position == 0:
+            continue
+        row[position] = [(500 + position * 10 + rank, -0.5 - float(rank)) for rank in range(k)]
+    return row
+
+
+def test_build_topk_ce_datums_rank_aligned_replication_math() -> None:
+    """k replicas per source, weights per loss position summing to 1 across
+    replicas, rank-j targets everywhere, and untouched context positions.
+
+    The rank-aligned form computes the same per-position weighted-CE
+    objective as per-position replication because cross_entropy has no
+    cross-position coupling: summing the k replicas' losses reproduces
+    `sum_j w_j(p) * CE(candidate_j(p))` at every position p.
+    """
+    datum = _one_datum()
+    k = 3
+    row = _topk_row_for(datum, k)
+
+    replicas, stats = build_topk_ce_datums([datum], [row], k)
+
+    assert stats == TopkCeStats(
+        source_datums=1, datums=k, mismatch_drops=0, loss_tokens=datum.loss_token_count
+    )
+    assert len(replicas) == k
+    n = len(datum.model_input_tokens)
+    for rank, replica in enumerate(replicas):
+        assert replica.is_topk_replica
+        # The model input, mask, and sampled logprobs are the source's exactly.
+        assert replica.model_input_tokens == datum.model_input_tokens
+        assert replica.loss_mask == datum.loss_mask
+        assert replica.sampled_logprobs == datum.sampled_logprobs
+        assert replica.advantages == []
+        for position in range(n):
+            if datum.loss_mask[position] == 1.0 and position > 0:
+                candidates = row[position]
+                assert candidates is not None
+                assert replica.target_tokens[position] == candidates[rank][0]
+            else:
+                # Context targets are the realized tokens at weight 0.
+                assert replica.target_tokens[position] == datum.model_input_tokens[position]
+                assert replica.target_weights[position] == 0.0
+    # Renormalization: at every loss position the replica weights are the
+    # softmax of the candidate logprobs and sum to 1 across the k replicas.
+    for position in range(n):
+        if datum.loss_mask[position] != 1.0 or position == 0:
+            continue
+        candidates = row[position]
+        assert candidates is not None
+        exps = [math.exp(lp) for _, lp in candidates]
+        expected = [value / sum(exps) for value in exps]
+        got = [replica.target_weights[position] for replica in replicas]
+        assert got == pytest.approx(expected)
+        assert sum(got) == pytest.approx(1.0)
+        assert got[0] > got[1] > got[2]  # rank 0 is the teacher's top choice
+
+
+def test_build_topk_ce_datums_sorts_candidates_defensively() -> None:
+    """Backend ordering is not trusted: rank 0 is always the best candidate."""
+    datum = TrainDatum(
+        trial_name="t",
+        fragment_index=0,
+        model_input_tokens=[1, 7],
+        loss_mask=[0.0, 1.0],
+        sampled_logprobs=[0.0, -0.5],
+    )
+    shuffled: list[TopkCandidates | None] = [None, [(30, -2.0), (10, -0.1), (20, -1.0)]]
+
+    replicas, _ = build_topk_ce_datums([datum], [shuffled], 3)
+
+    assert [replica.target_tokens[1] for replica in replicas] == [10, 20, 30]
+    weights = [replica.target_weights[1] for replica in replicas]
+    assert weights[0] > weights[1] > weights[2]
+    assert sum(weights) == pytest.approx(1.0)
+
+
+def test_build_topk_ce_datums_pads_missing_ranks_with_zero_weight() -> None:
+    """Fewer than k candidates renormalize over the available ones; padded
+    ranks carry the realized token at weight 0 (no loss, unit total kept)."""
+    datum = _one_datum()
+    k = 4
+    row = _topk_row_for(datum, 2)  # only 2 candidates everywhere
+
+    replicas, stats = build_topk_ce_datums([datum], [row], k)
+
+    assert stats.datums == 4
+    for position, mask in enumerate(datum.loss_mask):
+        if mask != 1.0 or position == 0:
+            continue
+        weights = [replica.target_weights[position] for replica in replicas]
+        assert sum(weights) == pytest.approx(1.0)
+        assert weights[2] == 0.0 and weights[3] == 0.0
+        for padded in replicas[2:]:
+            assert padded.target_tokens[position] == datum.model_input_tokens[position]
+
+
+def test_build_topk_ce_datums_drops_misaligned_and_unscoreable_rows(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    good = _one_datum()
+    short_row = _topk_row_for(good, 2)[:-1]
+    no_candidates = _topk_row_for(good, 2)
+    no_candidates[2] = None  # a loss position without candidates
+
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.data"):
+        replicas, stats = build_topk_ce_datums(
+            [good, good, good],
+            [short_row, no_candidates, _topk_row_for(good, 2)],
+            2,
+        )
+
+    assert stats.mismatch_drops == 2
+    assert stats.source_datums == 1
+    assert len(replicas) == 2  # only the aligned source, k replicas
+    assert "one entry per position" in caplog.text
+    assert "no candidates at loss position 2" in caplog.text
+
+
+def test_build_topk_ce_datums_drops_position_zero_loss_token() -> None:
+    """A loss token at position 0 has no context, so the teacher row keeps it
+    None and the whole datum drops loudly, mirroring attach_advantages."""
+    datum = TrainDatum(
+        trial_name="t",
+        fragment_index=0,
+        model_input_tokens=[100, 101],
+        loss_mask=[1.0, 1.0],
+        sampled_logprobs=[-0.5, -0.6],
+    )
+    row = _topk_row_for(datum, 2)  # position 0 stays None
+
+    replicas, stats = build_topk_ce_datums([datum], [row], 2)
+
+    assert replicas == []
+    assert stats.mismatch_drops == 1
+
+
+def test_build_topk_ce_datums_rejects_caller_bugs() -> None:
+    datum = _one_datum()
+    with pytest.raises(ValueError, match="k must be >= 1"):
+        build_topk_ce_datums([datum], [_topk_row_for(datum, 1)], 0)
+    with pytest.raises(ValueError, match="one per-position row per datum"):
+        build_topk_ce_datums([datum], [], 2)
+    with pytest.raises(ValueError, match="more than k = 1"):
+        build_topk_ce_datums([datum], [_topk_row_for(datum, 3)], 1)
+
+
+def test_train_datum_validates_topk_replica_fields() -> None:
+    with pytest.raises(ValueError, match="set together"):
+        TrainDatum(
+            trial_name="t",
+            fragment_index=0,
+            model_input_tokens=[1, 2],
+            loss_mask=[0.0, 1.0],
+            sampled_logprobs=[0.0, -0.5],
+            target_tokens=[1, 9],
+        )
+    with pytest.raises(ValueError, match="target_tokens length"):
+        TrainDatum(
+            trial_name="t",
+            fragment_index=0,
+            model_input_tokens=[1, 2],
+            loss_mask=[0.0, 1.0],
+            sampled_logprobs=[0.0, -0.5],
+            target_tokens=[9],
+            target_weights=[1.0],
+        )
+    with pytest.raises(ValueError, match="only at loss positions"):
+        TrainDatum(
+            trial_name="t",
+            fragment_index=0,
+            model_input_tokens=[1, 2],
+            loss_mask=[0.0, 1.0],
+            sampled_logprobs=[0.0, -0.5],
+            target_tokens=[1, 9],
+            target_weights=[0.5, 0.5],
+        )
+
+
+def test_to_tinker_topk_ce_datums_keyset_and_shift_layout() -> None:
+    """Topk replicas ride the pinned cross_entropy wire format: exactly
+    {target_tokens, weights}, shifted, sharing the source's model input."""
+    pytest.importorskip("tinker")
+    datum = _one_datum()
+    k = 2
+    row = _topk_row_for(datum, k)
+
+    wire = to_tinker_topk_ce_datums([datum], [row], k)
+
+    replicas, _ = build_topk_ce_datums([datum], [row], k)
+    tokens = datum.model_input_tokens
+    assert len(wire) == k
+    for td, replica in zip(wire, replicas, strict=True):
+        assert td.model_input.to_ints() == tokens[:-1]  # shared model input
+        assert set(td.loss_fn_inputs) == {"target_tokens", "weights"}
+        assert [int(t) for t in td.loss_fn_inputs["target_tokens"].data] == (
+            replica.target_tokens[1:]
+        )
+        assert td.loss_fn_inputs["target_tokens"].dtype == "int64"
+        assert [float(w) for w in td.loss_fn_inputs["weights"].data] == pytest.approx(
+            replica.target_weights[1:]
+        )
+        assert td.loss_fn_inputs["weights"].dtype == "float32"
+
+
+def test_to_tinker_topk_ce_datums_tito_round_trip_through_the_fake() -> None:
+    """Wire replicas built from sampled spans pass the fake's input-side TITO
+    check even though their targets are teacher candidates nobody issued."""
+    pytest.importorskip("tinker")
+    training, spans = _sampled_episode()
+
+    datums, stats = build_datums([_record(spans)], _cfg())
+    assert stats.datums == 1
+    k = 2
+    row = _topk_row_for(datums[0], k)
+    wire = to_tinker_topk_ce_datums(datums, [row], k)
+
+    fakes = [
+        FakeDatum(
+            model_input_tokens=td.model_input.to_ints(),
+            target_tokens=[int(t) for t in td.loss_fn_inputs["target_tokens"].data],
+            weights=[float(w) for w in td.loss_fn_inputs["weights"].data],
+            topk=True,
+        )
+        for td in wire
+    ]
+    training.forward_backward(fakes, "cross_entropy")
+    assert training.forward_backward_calls[-1][1] == "cross_entropy"
