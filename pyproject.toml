@@ -55,13 +55,19 @@ harbor = ["harbor==0.20.0"]
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
 # lazily (wmh.connect.notion), same contract as the e2b extra above.
 connectors = ["mcp>=1.27"]
+# On-policy distillation (`wmh.distill` + the tinker provider): trains a LoRA student on
+# Tinker from harbor rollouts. Imported lazily, same contract as the e2b extra. The cookbook
+# pin tracks the 0.4.x renderer surface this integration was verified against; Tinker's model
+# lineup churns, so base-model names live in run configs, never in code.
+# wandb is optional run tracking (lazy import, activated only via [wandb] enabled in the run config).
+distill = ["tinker>=0.23", "tinker-cookbook>=0.4.3,<0.5", "wandb>=0.17"]
 # dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
 # project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,e2b,connectors,harbor]",
+    "world-model-harness[otel,viz,e2b,connectors,harbor,distill]",
 ]
 
 [dependency-groups]

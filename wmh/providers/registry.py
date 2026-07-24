@@ -12,6 +12,7 @@ from wmh.providers.base import Provider, ProviderConfig, ProviderKind, VerifyRes
 from wmh.providers.bedrock import BedrockProvider
 from wmh.providers.openai import OpenAIProvider
 from wmh.providers.openai_responses import OpenAIResponsesProvider
+from wmh.providers.tinker import TinkerChatProvider
 
 _BACKENDS = {
     ProviderKind.ANTHROPIC: AnthropicProvider,
@@ -19,6 +20,7 @@ _BACKENDS = {
     ProviderKind.AZURE_OPENAI: AzureOpenAIProvider,
     ProviderKind.OPENAI: OpenAIProvider,
     ProviderKind.OPENAI_RESPONSES: OpenAIResponsesProvider,
+    ProviderKind.TINKER: TinkerChatProvider,
 }
 
 
