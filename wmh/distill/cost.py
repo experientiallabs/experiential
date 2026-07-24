@@ -8,11 +8,12 @@ cap by raising `BudgetExhausted` (the loop saves state and prints the resume
 command on that error).
 
 The projection is a deliberately simple, documented heuristic: episode counts
-come exactly from the config (steps x tasks x group size, plus interim evals
-and the gate/baseline episodes), and per-episode tokens come from a turns x
-tokens-per-turn model capped by the rollout context budget. Meters mirror the
-four `[pricing]` fields; a meter without a price surfaces as a None-usd line
-so the CLI can warn instead of silently under-reporting.
+come exactly from the config (steps x tasks x group size, plus warmup teacher
+episodes, interim evals, and the gate/baseline episodes), and per-episode
+tokens come from a turns x tokens-per-turn model capped by the rollout context
+budget. Meters mirror the four `[pricing]` fields; a meter without a price
+surfaces as a None-usd line so the CLI can warn instead of silently
+under-reporting.
 """
 
 from __future__ import annotations
@@ -90,6 +91,9 @@ class CostEstimate(BaseModel):
     baseline_episodes: int = Field(ge=0)
     """Gate/baseline episodes: student before + student after + teacher-in-harness."""
 
+    warmup_episodes: int = Field(ge=0)
+    """Warmup teacher episodes: train tasks x warmup.rollouts_per_task (0 when off)."""
+
     @property
     def priced_usd(self) -> float:
         """Total USD over the priced lines only."""
@@ -127,6 +131,8 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     Episode counts (exact, from the config):
 
     - train: `steps x min(tasks_per_batch, n_train_tasks) x group_size`
+    - warmup: `n_train_tasks x warmup.rollouts_per_task` teacher episodes when
+      `warmup.steps > 0`, else 0
     - interim evals: `steps // eval.every` evals (0 when eval.every is 0) of
       `min(eval.tasks, n_train_tasks) x eval.k` student episodes each
     - gate/baseline: student-before and student-after at
@@ -146,10 +152,14 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     and `sampled` to student_sample; every train episode additionally charges
     `episode_tokens` to student_train (forward_backward over the full datum)
     and `episode_tokens` to teacher_prefill (the teacher scores each episode's
-    full sequence once, append-only single datum). Teacher-in-harness baseline
-    episodes charge their full `episode_tokens` to teacher_prefill as an
-    approximation: the config carries no teacher sampling meter, so their
-    sampled tokens are priced at the teacher's prefill rate.
+    full sequence once, append-only single datum). Teacher-in-harness episodes
+    (the gate baseline and the warmup collection) charge their full
+    `episode_tokens` to teacher_prefill as an approximation: the config
+    carries no teacher sampling meter, so their sampled tokens are priced at
+    the teacher's prefill rate. Warmup SFT training tokens are NOT projected:
+    they depend on how many teacher trials pass (unknowable up front) and are
+    bounded by warmup.steps full-batch passes over at most the warmup
+    episodes' tokens.
 
     Args:
         cfg: The validated run config.
@@ -182,6 +192,7 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
 
     tasks_per_step = min(cfg.train.tasks_per_batch, n_train_tasks)
     train_episodes = cfg.train.steps * tasks_per_step * cfg.train.group_size
+    warmup_episodes = n_train_tasks * cfg.warmup.rollouts_per_task if cfg.warmup.steps > 0 else 0
     interim_evals = cfg.train.steps // cfg.eval.every if cfg.eval.every > 0 else 0
     eval_episodes = interim_evals * min(cfg.eval.tasks, n_train_tasks) * cfg.eval.k
     gate_attempts = n_holdout_tasks * cfg.gate.k
@@ -189,21 +200,24 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     teacher_baseline_episodes = gate_attempts
 
     student_episodes = train_episodes + eval_episodes + student_baseline_episodes
+    teacher_episodes = train_episodes + teacher_baseline_episodes + warmup_episodes
     projections: dict[MeterName, int] = {
         "student_prefill": student_episodes * prefill_tokens,
         "student_sample": student_episodes * sampled_tokens,
         "student_train": train_episodes * episode_tokens,
-        "teacher_prefill": (train_episodes + teacher_baseline_episodes) * episode_tokens,
+        "teacher_prefill": teacher_episodes * episode_tokens,
     }
     estimate = CostEstimate(
         lines=[_line(cfg.pricing, meter, projections[meter]) for meter in METER_NAMES],
         train_episodes=train_episodes,
         eval_episodes=eval_episodes,
         baseline_episodes=student_baseline_episodes + teacher_baseline_episodes,
+        warmup_episodes=warmup_episodes,
     )
     logger.debug(
-        "cost estimate: %d train + %d eval + %d baseline episode(s), priced $%.2f%s",
+        "cost estimate: %d train + %d warmup + %d eval + %d baseline episode(s), priced $%.2f%s",
         estimate.train_episodes,
+        estimate.warmup_episodes,
         estimate.eval_episodes,
         estimate.baseline_episodes,
         estimate.priced_usd,

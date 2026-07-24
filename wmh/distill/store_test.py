@@ -22,6 +22,7 @@ from wmh.distill.store import (
     AdapterStore,
     DistillModelCard,
     DistillRunStore,
+    WarmupRecord,
     build_handoff_toml,
 )
 
@@ -136,6 +137,41 @@ def test_corrupt_spend_ledger_is_actionable(tmp_path: Path) -> None:
     store.spend_path.write_text("{not json", encoding="utf-8")
     with pytest.raises(ValueError, match="corrupt spend ledger"):
         store.read_spend()
+
+
+def test_warmup_record_round_trips(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    assert store.read_warmup() is None  # fresh dir: warmup never finished
+    record = WarmupRecord(
+        steps=2,
+        trials=16,
+        kept_trials=4,
+        datums=4,
+        state_path="tinker://fake/state/1",
+        sampler_path="tinker://fake/sampler/warmup/0",
+    )
+    path = store.write_warmup(record)
+    assert path == store.warmup_path
+    assert store.read_warmup() == record
+
+
+def test_warmup_record_skip_shape(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    store.write_warmup(
+        WarmupRecord(steps=0, trials=8, kept_trials=0, datums=0, skipped_reason="0 passing")
+    )
+    read = store.read_warmup()
+    assert read is not None
+    assert read.skipped_reason == "0 passing"
+    assert read.state_path is None and read.sampler_path is None
+
+
+def test_corrupt_warmup_record_is_actionable(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    store.write_warmup(WarmupRecord(steps=1, trials=1, kept_trials=1, datums=1))
+    store.warmup_path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="corrupt warmup record"):
+        store.read_warmup()
 
 
 def test_write_eval_places_payload_under_evals(tmp_path: Path) -> None:

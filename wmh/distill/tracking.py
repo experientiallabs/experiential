@@ -25,7 +25,7 @@ from wmh.core.types import JsonObject, JsonValue
 from wmh.distill.config import DistillConfig
 
 if TYPE_CHECKING:
-    from wmh.distill.loop import StepMetrics
+    from wmh.distill.loop import StepMetrics, WarmupMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -41,13 +41,17 @@ _MISSING_WANDB_EXTRA = (
 class DistillTracker(Protocol):
     """The tracking slice the distillation loop emits to.
 
-    Implementations must never raise from `log_step`, `log_eval`,
-    `log_summary`, or `finish` once constructed: the loop calls them inline
-    with paid training work.
+    Implementations must never raise from `log_step`, `log_warmup_step`,
+    `log_eval`, `log_summary`, or `finish` once constructed: the loop calls
+    them inline with paid training work.
     """
 
     def log_step(self, step: int, metrics: StepMetrics) -> None:
         """Record one training step's metrics row."""
+        ...
+
+    def log_warmup_step(self, warmup_step: int, metrics: WarmupMetrics) -> None:
+        """Record one warmup step's metrics row (keys under `warmup/`)."""
         ...
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
@@ -77,6 +81,9 @@ class NullTracker:
     """The disabled tracker: every call is a no-op."""
 
     def log_step(self, step: int, metrics: StepMetrics) -> None:
+        """No-op."""
+
+    def log_warmup_step(self, warmup_step: int, metrics: WarmupMetrics) -> None:
         """No-op."""
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
@@ -273,6 +280,21 @@ class WandbTracker:
         """Log one training step's flattened metrics row."""
         payload = _flatten_step_metrics(metrics)
         self._guarded(lambda: self._wandb.log(cast("Mapping[str, JsonValue]", payload), step=step))
+
+    def log_warmup_step(self, warmup_step: int, metrics: WarmupMetrics) -> None:
+        """Log one warmup step's numeric fields under `warmup/` keys.
+
+        Warmup precedes training step 0 and wandb steps must never decrease,
+        so every warmup row logs at wandb step 0 with the warmup index carried
+        as `warmup/step` (later warmup rows overwrite same-step keys on the
+        dashboard; the run dir's metrics.jsonl keeps every row).
+        """
+        payload: dict[str, float | int] = {"warmup/step": warmup_step}
+        for key, value in metrics.model_dump(mode="json").items():
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                continue
+            payload[f"warmup/{key}"] = value
+        self._guarded(lambda: self._wandb.log(cast("Mapping[str, JsonValue]", payload), step=0))
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
         """Log one eval batch's solve rate under `eval/<name>`."""

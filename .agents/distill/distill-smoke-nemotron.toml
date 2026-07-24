@@ -31,7 +31,7 @@ center_advantages = true
 max_datum_tokens = 65536
 sampler_refresh_every = 1
 save_state_every = 2
-trial_concurrency = 1
+trial_concurrency = 4
 
 # temperature 1.0 keeps issued sampler logprobs comparable to the untempered
 # teacher logprobs (unbiased reverse-KL advantages).
@@ -39,8 +39,14 @@ trial_concurrency = 1
 temperature = 1.0
 max_tokens = 8192
 
+# SFT warmup on the teacher's own passing pi trajectories: the first smoke's
+# student solved 0% before AND after OPD (it sampled only failures, so the
+# reverse KL stayed flat). The teacher solves ~25%, so 8 train tasks x 2
+# attempts yields ~4 passing trajectories for the warmup SFT set.
 [warmup]
-steps = 0
+steps = 2
+rollouts_per_task = 2
+keep = "passed"
 
 [eval]
 every = 3
