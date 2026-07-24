@@ -41,6 +41,20 @@ from wmh.distill.gate import DistillGateRecord
 
 logger = logging.getLogger(__name__)
 
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write `text` to `path` via a same-directory tmp file plus atomic replace.
+
+    Every durable manifest in the run dir goes through this: a torn write to
+    checkpoints.json (or the config snapshot, warmup record, gate verdict)
+    would otherwise corrupt the resume path exactly when a crash made resume
+    necessary.
+    """
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
 ADAPTERS_DIR = "adapters"
 CHAMPION_ALIAS = "champion"
 
@@ -209,7 +223,7 @@ class DistillRunStore:
     def snapshot_config(self, cfg: DistillConfig) -> Path:
         """Write the exact config the run started with to `config.toml`."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+        _write_text_atomic(self.config_path, snapshot_toml(cfg))
         return self.config_path
 
     def load_config(self) -> DistillConfig:
@@ -307,8 +321,8 @@ class DistillRunStore:
     def write_spend(self, total_usd: float) -> None:
         """Persist the run's cumulative priced spend to `spend.json` (atomically).
 
-        The loop calls this on EVERY budget charge, so the ledger — not the
-        metrics rows, which only land when a training step completes — is the
+        The loop calls this on EVERY budget charge, so the ledger (not the
+        metrics rows, which only land when a training step completes) is the
         resume path's source of truth for prior spend. Without it, everything
         charged since the last metrics row (holdout baselines before step 0,
         an interim eval after its step's row, the finalize student-after eval)
@@ -325,11 +339,9 @@ class DistillRunStore:
             raise ValueError(f"cumulative spend must be >= 0, got {total_usd}")
         self.run_dir.mkdir(parents=True, exist_ok=True)
         payload = SpendLedger(total_usd=total_usd).model_dump_json(indent=2)
-        # Atomic replace: the ledger is rewritten on every charge, and a torn
-        # write would block the next resume with a corrupt-ledger error.
-        tmp_path = self.spend_path.with_name(self.spend_path.name + ".tmp")
-        tmp_path.write_text(payload, encoding="utf-8")
-        tmp_path.replace(self.spend_path)
+        # The ledger is rewritten on every charge, and a torn write would
+        # block the next resume with a corrupt-ledger error.
+        _write_text_atomic(self.spend_path, payload)
 
     def read_spend(self) -> float | None:
         """The ledger's cumulative spend, or None when no ledger exists yet.
@@ -370,7 +382,7 @@ class DistillRunStore:
             The written path.
         """
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.warmup_path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        _write_text_atomic(self.warmup_path, record.model_dump_json(indent=2))
         return self.warmup_path
 
     def read_warmup(self) -> WarmupRecord | None:
@@ -408,7 +420,7 @@ class DistillRunStore:
         """
         self.evals_dir.mkdir(parents=True, exist_ok=True)
         path = self.evals_dir / f"{validate_name(name)}.json"
-        path.write_text(payload.model_dump_json(indent=2), encoding="utf-8")
+        _write_text_atomic(path, payload.model_dump_json(indent=2))
         return path
 
     # -- checkpoints -----------------------------------------------------------------------------
@@ -432,7 +444,7 @@ class DistillRunStore:
         manifest.checkpoints = [c for c in manifest.checkpoints if c.step != step]
         manifest.checkpoints.append(record)
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoints_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+        _write_text_atomic(self.checkpoints_path, manifest.model_dump_json(indent=2))
         return record
 
     def checkpoints(self) -> list[CheckpointRecord]:
@@ -463,13 +475,13 @@ class DistillRunStore:
     def write_gate(self, record: DistillGateRecord) -> Path:
         """Persist the promotion verdict to `gate.json`."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.gate_path.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        _write_text_atomic(self.gate_path, record.model_dump_json(indent=2))
         return self.gate_path
 
     def write_model_card(self, card: DistillModelCard) -> Path:
         """Persist the run's model card to `model_card.json`."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.model_card_path.write_text(card.model_dump_json(indent=2), encoding="utf-8")
+        _write_text_atomic(self.model_card_path, card.model_dump_json(indent=2))
         return self.model_card_path
 
     def write_handoff(self, toml_text: str) -> Path:
@@ -493,7 +505,7 @@ class DistillRunStore:
                 "build_handoff_toml so it pastes cleanly into a settings file"
             ) from exc
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.handoff_path.write_text(toml_text, encoding="utf-8")
+        _write_text_atomic(self.handoff_path, toml_text)
         return self.handoff_path
 
 
@@ -553,7 +565,7 @@ class AdapterStore:
         current = self.aliases(name)
         current[alias] = version
         path = self.dir_for(name) / _ALIASES_FILE
-        path.write_text(tomli_w.dumps({"aliases": current}), encoding="utf-8")
+        _write_text_atomic(path, tomli_w.dumps({"aliases": current}))
 
     # -- load / save -----------------------------------------------------------------------------
 
@@ -624,13 +636,13 @@ class AdapterStore:
         stamped = card.model_copy(update={"name": name, "version": version})
         directory = self.dir_for(name) / f"v{version}"
         directory.mkdir(parents=True, exist_ok=False)  # append-only: collision is a bug
-        (directory / _CARD_FILE).write_text(stamped.model_dump_json(indent=2), encoding="utf-8")
+        _write_text_atomic(directory / _CARD_FILE, stamped.model_dump_json(indent=2))
         if alias is not None:
             self.set_alias(name, alias, version)
         return version
 
 
-def build_handoff_toml(sampler_path: str, *, endpoint: str | None = None) -> str:
+def build_handoff_toml(sampler_path: str, *, base_model: str, endpoint: str | None = None) -> str:
     """Build the `[models.agent]` snippet pointing an agent at the distilled student.
 
     The snippet targets wmh's openai provider with a custom endpoint, which is
@@ -640,6 +652,9 @@ def build_handoff_toml(sampler_path: str, *, endpoint: str | None = None) -> str
 
     Args:
         sampler_path: The final tinker:// sampler-weights path to serve.
+        base_model: The student's base model name, written as `model_type` so
+            capability resolution keys on the model family, not the raw
+            weights path (the same shape the CLI's `--promote` writes).
         endpoint: The OpenAI-compatible base URL; defaults to
             `DEFAULT_TINKER_OPENAI_ENDPOINT`.
 
@@ -658,7 +673,12 @@ def build_handoff_toml(sampler_path: str, *, endpoint: str | None = None) -> str
             "checkpoints.json and model card)"
         )
     resolved_endpoint = endpoint if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
-    for label, value in (("sampler path", sampler_path), ("endpoint", resolved_endpoint)):
+    values = (
+        ("sampler path", sampler_path),
+        ("base model", base_model),
+        ("endpoint", resolved_endpoint),
+    )
+    for label, value in values:
         if any(ch in value for ch in ('"', "\\", "\n")):
             raise ValueError(
                 f"{label} {value!r} contains a quote, backslash, or newline and cannot be "
@@ -673,5 +693,6 @@ def build_handoff_toml(sampler_path: str, *, endpoint: str | None = None) -> str
         "[models.agent]\n"
         'provider = "openai"\n'
         f'model = "{sampler_path}"\n'
+        f'model_type = "{base_model}"\n'
         f'endpoint = "{resolved_endpoint}"\n'
     )
