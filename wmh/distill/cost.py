@@ -7,34 +7,57 @@ the run spends, and `check()` enforces the optional `[budget] max_usd` hard
 cap by raising `BudgetExhausted` (the loop saves state and prints the resume
 command on that error).
 
+Metering follows Tinker's PER-REQUEST billing, not unique context tokens:
+every sampling request bills its whole prompt, so each agent turn re-bills the
+episode's full context, with the verbatim repeated prefix billed at the
+discounted cached rate (`episode_billing` documents the exact split). Rollout
+episodes therefore charge three meters each (full prefill, cached prefill,
+sample), and teacher-in-harness episodes bill their sampled tokens at the
+teacher's SAMPLING rate. Ignoring the per-request term once under-reported a
+console-reconciled run by ~6x (306M billed tokens vs ~50M unique).
+
 The projection is a deliberately simple, documented heuristic: episode counts
 come exactly from the config (steps x tasks x group size, plus warmup teacher
 episodes, interim evals, and the gate/baseline episodes), and per-episode
 tokens come from a turns x tokens-per-turn model capped by the rollout context
-budget. Meters mirror the four `[pricing]` fields; a meter without a price
-surfaces as a None-usd line so the CLI can warn instead of silently
-under-reporting.
+budget. Meters mirror the `[pricing]` fields (cached rates fall back to the
+documented 20% derivation); a meter without a price surfaces as a None-usd
+line so the CLI can warn instead of silently under-reporting.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from wmh.distill.config import DistillConfig, PricingConfig
+from wmh.distill.tokens import TrialRecord
+from wmh.providers.tinker import TokenSpan
 
 logger = logging.getLogger(__name__)
 
-MeterName = Literal["student_prefill", "student_sample", "student_train", "teacher_prefill"]
-
-METER_NAMES: tuple[MeterName, ...] = (
+MeterName = Literal[
     "student_prefill",
+    "student_cached_prefill",
     "student_sample",
     "student_train",
     "teacher_prefill",
+    "teacher_cached_prefill",
+    "teacher_sample",
+]
+
+METER_NAMES: tuple[MeterName, ...] = (
+    "student_prefill",
+    "student_cached_prefill",
+    "student_sample",
+    "student_train",
+    "teacher_prefill",
+    "teacher_cached_prefill",
+    "teacher_sample",
 )
 
 _TOKENS_PER_USD_UNIT = 1_000_000
@@ -112,17 +135,116 @@ class CostEstimate(BaseModel):
 def _meter_price(pricing: PricingConfig, meter: MeterName) -> float | None:
     if meter == "student_prefill":
         return pricing.student_prefill
+    if meter == "student_cached_prefill":
+        return pricing.effective_student_cached_prefill
     if meter == "student_sample":
         return pricing.student_sample
     if meter == "student_train":
         return pricing.student_train
-    return pricing.teacher_prefill
+    if meter == "teacher_prefill":
+        return pricing.teacher_prefill
+    if meter == "teacher_cached_prefill":
+        return pricing.effective_teacher_cached_prefill
+    return pricing.teacher_sample
 
 
 def _line(pricing: PricingConfig, meter: MeterName, tokens: int) -> CostLine:
     price = _meter_price(pricing, meter)
     usd = tokens / _TOKENS_PER_USD_UNIT * price if price is not None else None
     return CostLine(meter=meter, tokens=tokens, price_per_mtok=price, usd=usd)
+
+
+class SpanBilling(BaseModel):
+    """Per-request billing volumes measured from recorded rollout spans.
+
+    The three volumes map onto three meters: `unique_tokens` at the full
+    prefill rate, `cached_tokens` at the cached-prefill rate, and
+    `sampled_tokens` at the sampling rate.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    unique_tokens: int = Field(ge=0)
+    """Distinct episode tokens, billed once at the full prefill rate."""
+
+    cached_tokens: int = Field(ge=0)
+    """Repeated per-request prompt volume, billed at the cached-prefill rate."""
+
+    sampled_tokens: int = Field(ge=0)
+    """Sampled completion tokens, billed at the sampling rate."""
+
+    def __add__(self, other: SpanBilling) -> SpanBilling:
+        return SpanBilling(
+            unique_tokens=self.unique_tokens + other.unique_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            sampled_tokens=self.sampled_tokens + other.sampled_tokens,
+        )
+
+
+def episode_billing(spans: Sequence[TokenSpan]) -> SpanBilling:
+    """Per-request billing volumes for ONE episode's recorded spans.
+
+    Tinker bills prefill PER REQUEST over each call's full prompt: every
+    agent turn re-bills the episode's whole context, with the verbatim
+    repeated prefix billed at the cached rate. The model here:
+
+    - per-request volume = sum over spans of `len(prompt_token_ids)`.
+    - unique = tokens the episode put through the model for the first time.
+      For a prefix-clean episode (every prompt extends the previous prompt
+      plus its sampled tokens verbatim, the same test `build_datums` merges
+      on) this is exactly the final span's prompt plus sampled length. A
+      prefix break restarts the accumulation, so a fragmented episode's
+      unique volume is the sum over fragments: re-prefilled context counts
+      as unique again, matching what the service re-bills at the full rate.
+    - cached = the per-request volume beyond unique, clamped at zero (a
+      single-call episode repeats nothing). Under the prefix property every
+      repeat is verbatim, so the cached rate applies to all of it.
+
+    Args:
+        spans: One episode's recorded spans, in any order (sorted by
+            call_index here).
+
+    Returns:
+        The episode's billing volumes.
+    """
+    unique = 0
+    per_request = 0
+    sampled = 0
+    accumulated: list[int] = []
+    for span in sorted(spans, key=lambda item: item.call_index):
+        prompt = span.prompt_token_ids
+        per_request += len(prompt)
+        if accumulated and prompt[: len(accumulated)] == accumulated:
+            unique += len(prompt) - len(accumulated)
+        else:
+            unique += len(prompt)
+        unique += len(span.sampled_token_ids)
+        sampled += len(span.sampled_token_ids)
+        accumulated = list(prompt) + list(span.sampled_token_ids)
+    return SpanBilling(
+        unique_tokens=unique,
+        cached_tokens=max(per_request - unique, 0),
+        sampled_tokens=sampled,
+    )
+
+
+def batch_billing(records: Sequence[TrialRecord]) -> SpanBilling:
+    """Summed `episode_billing` over one rollout batch's trial records.
+
+    Summed per episode (not over a flattened span list) so each episode's
+    cached volume clamps independently and one trial's prefix break never
+    bleeds into another's accounting.
+
+    Args:
+        records: The batch's trial records (span-less trials contribute 0).
+
+    Returns:
+        The batch's total billing volumes.
+    """
+    total = SpanBilling(unique_tokens=0, cached_tokens=0, sampled_tokens=0)
+    for record in records:
+        total = total + episode_billing(record.spans)
+    return total
 
 
 def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: int) -> CostEstimate:
@@ -145,21 +267,29 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     - `sampled = avg_turns x min(sampling.max_tokens, 512)`
     - `episode_tokens = min(rollout.context_budget_tokens,
       2048 + avg_turns x (1024 + sampled_per_turn))`: the episode's final
-      unique sequence length under the prefix property
-    - `prefill = episode_tokens - sampled`
+      unique sequence length under the prefix property (the estimate assumes
+      prefix-clean episodes, so this is also the unique billing volume)
+    - per-request prefill: turn k's prompt is
+      `min(2048 + k x 1024 + (k - 1) x sampled_per_turn,
+      context_budget_tokens)` and every turn re-bills it whole, so the
+      per-request volume is the sum over turns; the part beyond
+      `episode_tokens` is the verbatim repeat billed at the cached rate
+      (see `episode_billing` for the same split on actual spans)
 
-    Meter mapping: every student episode charges `prefill` to student_prefill
-    and `sampled` to student_sample; every train episode additionally charges
-    `episode_tokens` to student_train (forward_backward over the full datum)
-    and `episode_tokens` to teacher_prefill (the teacher scores each episode's
-    full sequence once, append-only single datum). Teacher-in-harness episodes
-    (the gate baseline and the warmup collection) charge their full
-    `episode_tokens` to teacher_prefill as an approximation: the config
-    carries no teacher sampling meter, so their sampled tokens are priced at
-    the teacher's prefill rate. Warmup SFT training tokens are NOT projected:
-    they depend on how many teacher trials pass (unknowable up front) and are
-    bounded by warmup.steps full-batch passes over at most the warmup
-    episodes' tokens.
+    Meter mapping: every student episode charges `episode_tokens` (its unique
+    volume) to student_prefill, the repeated per-request volume to
+    student_cached_prefill, and `sampled` to student_sample; every train
+    episode additionally charges `episode_tokens` to student_train
+    (forward_backward over the full datum) and `episode_tokens` to
+    teacher_prefill (the teacher scores each episode's full sequence once,
+    one full-price request with no repeats to cache). Teacher-in-harness
+    episodes (the gate baseline and the warmup collection) charge `sampled`
+    to teacher_sample (they bill the teacher's SAMPLING rate on what they
+    generate) plus per-request prefill exactly like a student episode, onto
+    teacher_prefill and teacher_cached_prefill. Warmup SFT training tokens
+    are NOT projected: they depend on how many teacher trials pass
+    (unknowable up front) and are bounded by warmup.steps full-batch passes
+    over at most the warmup episodes' tokens.
 
     Args:
         cfg: The validated run config.
@@ -183,12 +313,25 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
 
     avg_turns = max(1, math.ceil(cfg.rollout.max_turns * _AVG_TURN_FRACTION))
     sampled_per_turn = min(cfg.sampling.max_tokens, _SAMPLED_TOKENS_PER_TURN)
+    context_budget = cfg.rollout.context_budget_tokens
     episode_tokens = min(
-        cfg.rollout.context_budget_tokens,
+        context_budget,
         _BASE_PROMPT_TOKENS + avg_turns * (_OBSERVATION_TOKENS_PER_TURN + sampled_per_turn),
     )
     sampled_tokens = min(avg_turns * sampled_per_turn, episode_tokens)
-    prefill_tokens = episode_tokens - sampled_tokens
+    # Per-request accounting: every turn re-bills its whole prompt, so the
+    # per-request volume sums the per-turn prompts; the episode's distinct
+    # tokens bill once at the full rate and the rest is the cached repeat.
+    per_request_tokens = sum(
+        min(
+            _BASE_PROMPT_TOKENS
+            + turn * _OBSERVATION_TOKENS_PER_TURN
+            + (turn - 1) * sampled_per_turn,
+            context_budget,
+        )
+        for turn in range(1, avg_turns + 1)
+    )
+    cached_tokens = max(per_request_tokens - episode_tokens, 0)
 
     tasks_per_step = min(cfg.train.tasks_per_batch, n_train_tasks)
     train_episodes = cfg.train.steps * tasks_per_step * cfg.train.group_size
@@ -200,12 +343,17 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     teacher_baseline_episodes = gate_attempts
 
     student_episodes = train_episodes + eval_episodes + student_baseline_episodes
-    teacher_episodes = train_episodes + teacher_baseline_episodes + warmup_episodes
+    teacher_harness_episodes = teacher_baseline_episodes + warmup_episodes
     projections: dict[MeterName, int] = {
-        "student_prefill": student_episodes * prefill_tokens,
+        "student_prefill": student_episodes * episode_tokens,
+        "student_cached_prefill": student_episodes * cached_tokens,
         "student_sample": student_episodes * sampled_tokens,
         "student_train": train_episodes * episode_tokens,
-        "teacher_prefill": teacher_episodes * episode_tokens,
+        "teacher_prefill": (
+            train_episodes * episode_tokens + teacher_harness_episodes * episode_tokens
+        ),
+        "teacher_cached_prefill": teacher_harness_episodes * cached_tokens,
+        "teacher_sample": teacher_harness_episodes * sampled_tokens,
     }
     estimate = CostEstimate(
         lines=[_line(cfg.pricing, meter, projections[meter]) for meter in METER_NAMES],
