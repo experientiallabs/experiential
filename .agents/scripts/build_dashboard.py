@@ -40,6 +40,10 @@ padding:5px 12px;border-radius:6px;cursor:pointer;font:inherit}
 .swatch{width:10px;height:10px;border-radius:3px;display:inline-block}
 svg text{font:11px -apple-system,sans-serif;fill:var(--muted)}
 svg .tick line{stroke:var(--grid)}
+.pop{position:fixed;pointer-events:none;background:var(--surface);border:1px solid var(--grid);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.10);padding:16px 18px;max-width:400px;z-index:10;opacity:0;transition:opacity .1s;font-size:12.5px;line-height:1.55}
+.pop h4{margin:0 0 8px;font-size:13px}
+.pop table{margin:0;width:100%}.pop td,.pop th{padding:2px 8px 2px 0;border:none;text-align:right;font-size:12px}
+.pop td:first-child,.pop th:first-child{text-align:left}
 .tip{position:fixed;pointer-events:none;background:var(--ink);color:#fff;padding:8px 10px;
 border-radius:6px;font-size:12px;line-height:1.5;opacity:0;transition:opacity .08s;max-width:340px;z-index:9}
 table{border-collapse:collapse;width:100%;margin-top:8px}
@@ -72,6 +76,7 @@ shifts toward cheaper models, because cheaper models are usually also faster - v
 per-model p50 in each tooltip and the token breakdown. Accuracy deltas smaller than the noise
 floor (~1/sqrt(n) on the test count) are ties.</div>
 <div class="tip" id="tip"></div>
+<div class="pop" id="pop"></div>
 <script>
 const DATA = __DATA__;
 const MATRIX_INFO = {
@@ -94,6 +99,18 @@ const COL_INFO = {
 };
 const VC = {"best-single":"var(--c0)","rank":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)"};
 const tip = document.getElementById('tip');
+const pop = document.getElementById('pop');
+function showPop(e, html){pop.innerHTML=html;pop.style.opacity=1;
+ const w=Math.min(400,innerWidth-40);
+ pop.style.left=Math.min(e.clientX+16,innerWidth-w-20)+'px';
+ pop.style.top=Math.min(e.clientY+14,innerHeight-pop.offsetHeight-20)+'px';}
+function hidePop(){pop.style.opacity=0;}
+// One global color per model (fixed by overall token volume), shared by every section.
+const MODEL_COLORS={};
+{const vol={};
+ DATA.forEach(r=>Object.entries(r.result.tokens_by_model||{}).forEach(([m,b])=>vol[m]=(vol[m]||0)+b.input+b.output));
+ const GR=['#5c5c5c','#7d7d7d','#9a9a9a','#b3b3b3','#c9c9c9','#dedede','#6e6e6e','#8b8b8b'];
+ Object.keys(vol).sort((a,b)=>vol[b]-vol[a]).forEach((m,i)=>MODEL_COLORS[m]=i<5?`var(--c${i})`:GR[(i-5)%GR.length]);}
 function showTip(e, html){tip.innerHTML=html;tip.style.opacity=1;
  tip.style.left=Math.min(e.clientX+14,innerWidth-360)+'px';tip.style.top=(e.clientY+12)+'px';}
 function hideTip(){tip.style.opacity=0;}
@@ -218,16 +235,29 @@ function headlines(){
    <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
    <div style="color:var(--muted)"><b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
    (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>`;
-  const tokens=Object.entries(r.tokens_by_model||{}).sort((a,b)=>(b[1].input+b[1].output)-(a[1].input+a[1].output))
-    .map(([mo,bk])=>`${mo}: ${bk.input.toLocaleString()} in / ${bk.output.toLocaleString()} out`).join('<br>');
-  const detail=`<b>${best.variant}</b> ${JSON.stringify(best.params)} vs best-single ${bs.params.model}`+
-   `<br>routed: ${fmtP(r.accuracy)} @ ${fmt$(r.cost_per_call)}${r.latency_p50_s?` · p50 ${r.latency_p50_s.toFixed(2)}s / p95 ${r.latency_p95_s.toFixed(2)}s`:''}`+
-   `<br>baseline: ${fmtP(b.accuracy)} @ ${fmt$(b.cost_per_call)}${b.latency_p50_s?` · p50 ${b.latency_p50_s.toFixed(2)}s`:''}`+
-   `<br>n = ${r.scenarios} held-out scenarios${r.scenarios<60?' · <b>small n - wide noise floor</b>':''} · unscored ${r.unscored}`+
-   `<br>split seed ${best.split_seed} · fit ${best.fit_scenarios}`+
-   (tokens?`<br><br><u>token blend by model</u><br>${tokens}`:'');
-  div.addEventListener('mousemove',e=>showTip(e,detail));
-  div.addEventListener('mouseleave',hideTip);
+  // Per-model economics for this run: routed calls, total cost, token share.
+  const counts={}; Object.entries(r.model_mix).forEach(([mo,s])=>counts[mo]=Math.round(s*r.scenarios));
+  const totCost={}; Object.entries(r.per_model_cost_per_call||{}).forEach(([mo,c])=>totCost[mo]=c*(counts[mo]||0));
+  const costSum=Object.values(totCost).reduce((a,v)=>a+v,0)||1;
+  const tokSum=Object.values(r.tokens_by_model||{}).reduce((a,b)=>a+b.input+b.output,0)||1;
+  const models=Object.keys(r.model_mix).sort((a,b)=>(totCost[b]||0)-(totCost[a]||0));
+  let seg='', x=0; const W=360;
+  models.forEach(mo=>{const w=(totCost[mo]||0)/costSum*W;
+   if(w>0.5) seg+=`<rect x="${x}" y="2" width="${Math.max(w-2,1)}" height="12" rx="3" fill="${MODEL_COLORS[mo]||'var(--other)'}"/>`; x+=w;});
+  const rows2=models.map(mo=>{const bk=(r.tokens_by_model||{})[mo]||{input:0,output:0};
+   return `<tr><td><i class="swatch" style="background:${MODEL_COLORS[mo]||'var(--other)'}"></i> ${mo}</td>`+
+    `<td>${fmtP(r.model_mix[mo])}</td><td>${fmtP((bk.input+bk.output)/tokSum)}</td>`+
+    `<td>${fmt$(totCost[mo]||0)}</td><td>${fmtP((totCost[mo]||0)/costSum)}</td></tr>`}).join('');
+  const detail=`<h4>${best.variant} ${JSON.stringify(best.params)} <span style="color:var(--muted);font-weight:400">vs best-single ${bs.params.model}</span></h4>`+
+   `<table><tr><th></th><th>acc</th><th>cost/call</th><th>p50</th></tr>`+
+   `<tr><td>routed</td><td><b>${fmtP(r.accuracy)}</b></td><td><b>${fmt$(r.cost_per_call)}</b></td><td><b>${r.latency_p50_s?r.latency_p50_s.toFixed(2)+'s':'-'}</b></td></tr>`+
+   `<tr><td>baseline</td><td>${fmtP(b.accuracy)}</td><td>${fmt$(b.cost_per_call)}</td><td>${b.latency_p50_s?b.latency_p50_s.toFixed(2)+'s':'-'}</td></tr></table>`+
+   `<div style="color:var(--muted);margin:8px 0 10px">n = ${r.scenarios} held-out${r.scenarios<60?' · <b>small n - wide noise floor</b>':''} · unscored ${r.unscored} · split seed ${best.split_seed} · fit ${best.fit_scenarios}</div>`+
+   `<div style="font-weight:600;margin-bottom:4px">Cost by model</div>`+
+   `<svg viewBox="0 0 ${W} 16" style="width:100%;display:block">${seg}</svg>`+
+   `<table style="margin-top:6px"><tr><th>model</th><th>calls</th><th>tok %</th><th>cost</th><th>cost %</th></tr>${rows2}</table>`;
+  div.addEventListener('mousemove',e=>showPop(e,detail));
+  div.addEventListener('mouseleave',hidePop);
   cont.appendChild(div);
  }
 }
