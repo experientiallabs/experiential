@@ -297,3 +297,12 @@ and look-at-the-outputs discipline (all binding via routing-common.md). The mast
 (optimization) owns interfaces, benchmark sanity, cross-chat comparison, and promotion into
 wmh/optimize; next master tasks = drawing-board survey beyond these three families and an
 empirical audit of the benchmarks themselves.
+
+## Benchmark-health audit (2026-07-24, master): step-cap truncation
+
+Judge sanity passes on read samples (grounded, specific critiques). But max_steps=8 truncates
+real work: crmarena 55% truncated episodes averaging r=0.05 (one sampled sonnet-5 episode had
+found the correct answer per the judge's own critique and scored 0.0 for not submitting in
+time); dabstep 49%. Clean wm corpora = terminal-tasks (3%) and bird-sql (12%). Full table +
+consequences in ~/Desktop/Projects/wmh-routing-data/findings/master.md; scaled round re-runs
+exploration corpora at max_steps 16, and stop_reason mix becomes a standard health metric.
