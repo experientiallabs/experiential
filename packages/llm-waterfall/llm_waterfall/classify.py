@@ -105,6 +105,22 @@ def _is_botocore_transport_error(exc: Exception) -> bool:
     return False
 
 
+# tinker's sidecar family (the SDK's local transport subprocess dying, failing to start, or
+# losing IPC mid-request), matched anywhere in the MRO by (module, name) like the botocore
+# transport bases above: these carry no status_code, no openai-shaped capacity name, and no
+# reliable message phrasing, but a fresh attempt (which respawns the sidecar) can succeed.
+_TINKER_TRANSPORT_BASES = frozenset({"SidecarError"})
+
+
+def _is_tinker_transport_error(exc: Exception) -> bool:
+    """Whether `exc` is any member of tinker's SidecarError family."""
+    for klass in type(exc).__mro__:
+        module = getattr(klass, "__module__", "") or ""
+        if module.split(".")[0] == "tinker" and klass.__name__ in _TINKER_TRANSPORT_BASES:
+            return True
+    return False
+
+
 def outcome_for(exc: Exception) -> Outcome:
     """Classify an exception raised by a backend attempt.
 
@@ -115,10 +131,13 @@ def outcome_for(exc: Exception) -> Outcome:
          message substring can never overrule it.
       3. Botocore's ConnectionError/HTTPClientError family, matched by MRO (module, name) —
          transport failures whose subclasses carry no code and keep inventing new phrasings.
-      4. SDK exception type name, gated on the defining module.
-      5. HTTP status, from a `status_code` attribute on the exception or on its `.response`
+      4. Tinker's non-HTTP failure families, same MRO matching: the SidecarError family is
+         transport-shaped (retry can respawn the sidecar), and RequestFailedError classifies
+         by its `category` field (a "user" request is wrong; "server"/"unknown" are transient).
+      5. SDK exception type name, gated on the defining module.
+      6. HTTP status, from a `status_code` attribute on the exception or on its `.response`
          (httpx.HTTPStatusError carries it there), same module gate.
-      6. Conservative transport-phrase substrings for structureless errors.
+      7. Conservative transport-phrase substrings for structureless errors.
     """
     if isinstance(exc, WaterfallExhausted):
         return "capacity_error"
@@ -135,9 +154,18 @@ def outcome_for(exc: Exception) -> Outcome:
     if _is_botocore_transport_error(exc):
         return "capacity_error"
 
+    if _is_tinker_transport_error(exc):
+        return "capacity_error"
+
     if _from_trusted_sdk(exc):
         if type(exc).__name__ in _SDK_CAPACITY_TYPE_NAMES:
             return "capacity_error"
+        if type(exc).__name__ == "RequestFailedError":
+            # tinker's async-request failure carries a StrEnum `category` instead of a
+            # status code: "user" means this request is wrong (propagate); "server" and
+            # "unknown" mean the service failed it and a fresh attempt can succeed.
+            category = str(getattr(exc, "category", "")).lower()
+            return "client_error" if category == "user" else "capacity_error"
         status = getattr(exc, "status_code", None)
         if not isinstance(status, int):
             # httpx.HTTPStatusError keeps the status on the response object instead.
