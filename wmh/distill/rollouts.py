@@ -135,6 +135,31 @@ class RolloutStats(BaseModel):
     # agent-process boundary, so it is not trivially wireable today.
 
 
+def rollout_stats(records: Sequence[TrialRecord]) -> RolloutStats:
+    """The batch health stats over a set of assembled trial records.
+
+    A pure function of the records, so a batch loaded back from persisted
+    trial records (the warmup-trials manifest) reports the same stats its
+    original collection did.
+
+    Args:
+        records: The batch's trial records.
+
+    Returns:
+        The aggregate stats; an empty batch reports zero trials and a 0.0
+        solve rate.
+    """
+    with_spans = sum(1 for record in records if record.spans)
+    return RolloutStats(
+        trials=len(records),
+        trials_with_spans=with_spans,
+        solve_rate=(
+            sum(1 for record in records if record.passed) / len(records) if records else 0.0
+        ),
+        empty_span_trials=len(records) - with_spans,
+    )
+
+
 def collect_rollouts(
     step_index: int,
     task_ids: Sequence[str],
@@ -246,15 +271,7 @@ def collect_rollouts(
     )
     report = scorer.score(harness, should_cancel=should_cancel)
     records = assemble_trial_records(report.cells, token_sink_dir)
-    with_spans = sum(1 for record in records if record.spans)
-    stats = RolloutStats(
-        trials=len(records),
-        trials_with_spans=with_spans,
-        solve_rate=(
-            sum(1 for record in records if record.passed) / len(records) if records else 0.0
-        ),
-        empty_span_trials=len(records) - with_spans,
-    )
+    stats = rollout_stats(records)
     if stats.empty_span_trials:
         logger.warning(
             "%d/%d trial(s) in %s produced no token spans (the agent died before its "

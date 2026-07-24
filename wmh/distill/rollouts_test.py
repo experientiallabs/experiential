@@ -20,7 +20,8 @@ from wmh.distill.config import (
     TeacherConfig,
     TrainConfig,
 )
-from wmh.distill.rollouts import collect_rollouts
+from wmh.distill.rollouts import collect_rollouts, rollout_stats
+from wmh.distill.tokens import TrialRecord
 from wmh.evals.harbor.scorer import HarborScorer
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.scoring import ScoreCell, ScoreReport, ScoreRequest
@@ -405,6 +406,39 @@ def test_missing_harbor_extra_names_the_extra(
         collect_rollouts(
             0, _TASK_IDS, cfg, HarnessDoc.baseline(), _provider_config(), tmp_path / "run"
         )
+
+
+def _trial(task_id: str, *, passed: bool, spans: bool) -> TrialRecord:
+    return TrialRecord(
+        task_id=task_id,
+        attempt=1,
+        trial_name=f"{task_id}__s1",
+        reward=1.0 if passed else 0.0,
+        passed=passed,
+        spans=[_span(0)] if spans else [],
+        artifact_dir=f"/trials/{task_id}",
+    )
+
+
+def test_rollout_stats_is_a_pure_function_of_the_records() -> None:
+    """Stats recomputed from persisted records match a live batch's shape."""
+    stats = rollout_stats(
+        [
+            _trial("task-a", passed=True, spans=True),
+            _trial("task-b", passed=False, spans=True),
+            _trial("task-c", passed=False, spans=False),
+            _trial("task-d", passed=True, spans=True),
+        ]
+    )
+    assert stats.trials == 4
+    assert stats.trials_with_spans == 3
+    assert stats.solve_rate == 0.5
+    assert stats.empty_span_trials == 1
+
+    empty = rollout_stats([])
+    assert empty.trials == 0
+    assert empty.solve_rate == 0.0
+    assert empty.empty_span_trials == 0
 
 
 def test_module_scope_never_imports_the_harbor_extra() -> None:
