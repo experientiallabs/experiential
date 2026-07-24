@@ -2,9 +2,12 @@
 
 One run couples every distill layer end to end: preflight checks before any
 spend, teacher-in-harness and student-before baselines on the holdout split,
-then the training loop (harbor rollouts from the current student sampler,
-prefix-merge datums, teacher scoring, reverse-KL advantages, one
-`importance_sampling` optimizer step per training step), and finally the
+the optional supervised warmup (teacher rollouts on the train split filtered
+to `warmup.keep`, then `warmup.steps` cross_entropy passes so a student that
+would sample only failures starts OPD from the teacher's successful
+trajectories), then the training loop (harbor rollouts from the current
+student sampler, prefix-merge datums, teacher scoring, reverse-KL advantages,
+one `importance_sampling` optimizer step per training step), and finally the
 holdout gate that decides whether the adapter is promoted into the
 `AdapterStore`.
 
@@ -13,7 +16,8 @@ collector writes its per-step `harbor/step-NNNN/` and `tokens/step-NNNN/`
 dirs under the run dir for training batches; eval batches (baselines, interim
 evals, student-after) get their own isolated roots under
 `eval-rollouts/<eval-name>/` so their harbor job dirs never collide with a
-training step's.
+training step's, and the warmup phase's teacher trials likewise land under
+`warmup-rollouts/`.
 
 The Tinker SDK stays an optional extra: the real service client is built
 lazily only when no `service_client` is injected, and the thin `Sdk*`
@@ -30,10 +34,15 @@ Resume: cadenced `save_state` checkpoints land in the run store's manifest;
 `resume=True` restores the latest checkpoint via `load_state`, continues the
 step count from the checkpoint, restores the prior sessions' USD spend from
 the run store's spend ledger (written on every charge, so eval spend between
-metrics rows survives), and reuses recorded baseline evals. Steps and student
-evals whose harbor job dirs were left by a prior session re-run whole (the
-rollout collector wipes stale-policy job dirs). A budget abort
-(`DistillBudgetError`) always carries the exact resume command.
+metrics rows survives), and reuses recorded baseline evals. A finished warmup
+phase is recorded as the run store's `warmup.json` marker and never re-runs
+(when no step checkpoint exists yet, its recorded post-warmup state is what
+`load_state` restores); an UNfinished warmup re-runs whole, with the teacher
+trials themselves resuming trial-level through harbor (the teacher's identity
+is stable across sessions). Steps and student evals whose harbor job dirs
+were left by a prior session re-run whole (the rollout collector wipes
+stale-policy job dirs). A budget abort (`DistillBudgetError`) always carries
+the exact resume command.
 """
 
 from __future__ import annotations
@@ -53,12 +62,24 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from wmh.config.store import validate_name
 from wmh.distill.config import DistillConfig, PricingConfig
 from wmh.distill.cost import METER_NAMES, BudgetExhausted, BudgetMeter, CostLine, MeterName
-from wmh.distill.data import TrainDatum, attach_advantages, build_datums, to_tinker_datums
+from wmh.distill.data import (
+    TrainDatum,
+    attach_advantages,
+    build_datums,
+    to_tinker_datums,
+    to_tinker_sft_datums,
+)
 from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmh.distill.gate import DistillGateRecord, gate_distillation
 from wmh.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
 from wmh.distill.rollouts import collect_rollouts
-from wmh.distill.store import AdapterStore, DistillModelCard, DistillRunStore, build_handoff_toml
+from wmh.distill.store import (
+    AdapterStore,
+    DistillModelCard,
+    DistillRunStore,
+    WarmupRecord,
+    build_handoff_toml,
+)
 from wmh.distill.teacher import (
     EncodingTokenizer,
     SdkLogprobScorer,
@@ -86,6 +107,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 IMPORTANCE_SAMPLING_LOSS = "importance_sampling"
+CROSS_ENTROPY_LOSS = "cross_entropy"
+"""The warmup phase's supervised loss (see `to_tinker_sft_datums` for the keyset)."""
 
 DEFAULT_TITO_MEAN_TOLERANCE = 0.25
 """Max mean |issued - recomputed| logprob gap the preflight recompute accepts.
@@ -108,6 +131,9 @@ _PREFLIGHT_SAMPLE_TOKENS = 16
 EVAL_ROLLOUTS_DIR = "eval-rollouts"
 """Run-dir subdirectory holding each eval batch's isolated rollout root."""
 
+WARMUP_ROLLOUTS_DIR = "warmup-rollouts"
+"""Run-dir subdirectory holding the warmup phase's teacher rollout root."""
+
 TEACHER_BASELINE_EVAL = "baseline-teacher"
 STUDENT_BEFORE_EVAL = "baseline-student-before"
 STUDENT_AFTER_EVAL = "student-after"
@@ -118,7 +144,9 @@ _MISSING_TINKER_EXTRA = (
     "wmh.distill.fake_tinker)"
 )
 
-DistillPhase = Literal["preflight", "baseline", "rollouts", "training", "eval", "finalize", "gate"]
+DistillPhase = Literal[
+    "preflight", "baseline", "warmup", "rollouts", "training", "eval", "finalize", "gate"
+]
 
 
 class DistillProgress(BaseModel):
@@ -214,7 +242,46 @@ class StepMetrics(BaseModel):
     student_train_tokens: int = Field(ge=0)
     teacher_prefill_tokens: int = Field(ge=0)
     usd: float = Field(ge=0.0)
-    """Priced spend since the previous metrics row (baselines fold into step 0)."""
+    """Priced spend since the previous metrics row (spend before the first row,
+    the baselines and any warmup collection, folds into that first row)."""
+
+
+class WarmupMetrics(BaseModel):
+    """One warmup step's metrics row (the store adds the `step` key).
+
+    Warmup rows share `metrics.jsonl` with training rows and their step
+    indices restart at 0 for OPD, so the constant `phase` field is what
+    distinguishes them (training rows carry no `phase` key). A run whose
+    warmup was skipped (zero kept trials) writes exactly one row with
+    `datums = 0` so the degradation to pure OPD is visible in the metrics.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: Literal["warmup"] = "warmup"
+    tasks: int = Field(ge=0)
+    trials: int = Field(ge=0)
+    """Teacher trials collected on the train split (task x rollouts_per_task)."""
+
+    kept_trials: int = Field(ge=0)
+    """Trials that survived the `warmup.keep` filter."""
+
+    solve_rate: float = Field(ge=0.0, le=1.0)
+    """The teacher's solve rate over the collected warmup trials."""
+
+    datums: int = Field(ge=0)
+    loss_tokens: int = Field(ge=0)
+    context_tokens: int = Field(ge=0)
+    learning_rate: float = Field(gt=0)
+    """The effective warmup LR (warmup.learning_rate or train.learning_rate)."""
+
+    student_prefill_tokens: int = Field(ge=0)
+    student_sample_tokens: int = Field(ge=0)
+    student_train_tokens: int = Field(ge=0)
+    teacher_prefill_tokens: int = Field(ge=0)
+    usd: float = Field(ge=0.0)
+    """Priced spend since the previous metrics row (the teacher collection and
+    any earlier baseline spend fold into warmup step 0's row)."""
 
 
 class SpendSummary(BaseModel):
@@ -399,13 +466,21 @@ class SdkTrainingClient:
     def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
         """Convert to real tinker datums and run one bounded forward/backward.
 
+        The loss decides the wire conversion: cross_entropy datums (the
+        warmup phase) carry {target_tokens, weights}, importance_sampling
+        datums carry {target_tokens, logprobs, advantages}; each loss rejects
+        any other keyset server-side.
+
         Never retried on a deadline expiry: gradients may already have been
         accumulated server-side, so a re-submit could count the batch twice.
         The typed error aborts the step; resume restores the last checkpoint.
         """
-        future = self._client.forward_backward(
-            to_tinker_datums(datums), cast("tinker_types.LossFnType", loss_fn)
+        converted = (
+            to_tinker_sft_datums(datums)
+            if loss_fn == CROSS_ENTROPY_LOSS
+            else to_tinker_datums(datums)
         )
+        future = self._client.forward_backward(converted, cast("tinker_types.LossFnType", loss_fn))
         wait_with_deadline("forward_backward", future)
 
     def optim_step(self, learning_rate: float) -> None:
@@ -614,25 +689,32 @@ class StudentSampler:
         self._client: DistillSamplingClient | None = None
         self._last_step: int | None = None
 
-    def refresh(self, step: int) -> str:
+    def refresh(self, step: int, *, tag: str | None = None) -> str:
         """Save current weights for sampling and swap in a fresh client.
 
         Args:
             step: The 0-based training step the weights are current FOR (the
                 step about to sample from them); stamps the save name.
+            tag: Optional label forcing a save even when `step` was already
+                refreshed. The post-warmup refresh needs it: step 0 was
+                refreshed before preflight, but warmup then CHANGED the
+                weights, so the dedup must not short-circuit. The tag also
+                stamps the save name so the two step-0 artifacts cannot
+                collide.
 
         Returns:
-            The new (or, when `step` was already refreshed, current)
-            tinker:// sampler path.
+            The new (or, when `step` was already refreshed and no tag forces
+            a save, current) tinker:// sampler path.
 
         Raises:
             ValueError: If `step` is negative.
         """
         if step < 0:
             raise ValueError(f"refresh step must be >= 0, got {step}")
-        if self._path is not None and self._last_step == step:
+        if tag is None and self._path is not None and self._last_step == step:
             return self._path
-        path = self._training.save_weights_for_sampler(f"{self._run_name}-step-{step:04d}")
+        label = f"step-{step:04d}" if tag is None else f"{tag}-step-{step:04d}"
+        path = self._training.save_weights_for_sampler(f"{self._run_name}-{label}")
         self._client = self._service.create_sampling_client(path)
         self._path = path
         self._last_step = step
@@ -1212,6 +1294,188 @@ class _DistillRun:
             completed_step=None,
         )
 
+    # -- warmup ----------------------------------------------------------------------------------
+
+    def _append_warmup_row(self, warmup_step: int, row: WarmupMetrics) -> None:
+        """Persist and track one warmup row, advancing the per-row delta cursors."""
+        self._store.append_metrics(warmup_step, row)
+        self._tracker.log_warmup_step(warmup_step, row)
+        self._prev_tokens = {meter: self._budget.tokens(meter) for meter in METER_NAMES}
+        self._prev_usd = self._budget.session_usd
+
+    def _warmup_row(
+        self,
+        *,
+        trials: int,
+        kept_trials: int,
+        solve_rate: float,
+        datums: int,
+        loss_tokens: int,
+        context_tokens: int,
+        learning_rate: float,
+    ) -> WarmupMetrics:
+        """One warmup metrics row carrying the meter deltas since the last row."""
+        tokens_now = {meter: self._budget.tokens(meter) for meter in METER_NAMES}
+        return WarmupMetrics(
+            tasks=len(self._train_ids),
+            trials=trials,
+            kept_trials=kept_trials,
+            solve_rate=solve_rate,
+            datums=datums,
+            loss_tokens=loss_tokens,
+            context_tokens=context_tokens,
+            learning_rate=learning_rate,
+            student_prefill_tokens=tokens_now["student_prefill"]
+            - self._prev_tokens["student_prefill"],
+            student_sample_tokens=tokens_now["student_sample"]
+            - self._prev_tokens["student_sample"],
+            student_train_tokens=tokens_now["student_train"] - self._prev_tokens["student_train"],
+            teacher_prefill_tokens=tokens_now["teacher_prefill"]
+            - self._prev_tokens["teacher_prefill"],
+            usd=max(self._budget.session_usd - self._prev_usd, 0.0),
+        )
+
+    def _warmup(self) -> None:
+        """The supervised warmup phase: teacher rollouts, keep-filter, SFT passes.
+
+        The teacher runs the pi harness on every TRAIN task
+        (`warmup.rollouts_per_task` attempts each, rollouts isolated under
+        `warmup-rollouts/`), the kept trials merge into cross_entropy datums
+        through the same prefix merge OPD uses (the teacher SAMPLED these
+        tokens, so they are exact sampled ids and need no advantages), and
+        the student trains `warmup.steps` passes. Each pass is one
+        forward_backward over the FULL warmup datum list plus one optim_step:
+        the set is small (train tasks x rollouts_per_task, filtered), so
+        full-batch epochs keep the schedule deterministic and resumable
+        without a datum-level cursor. Zero kept datums degrade the run to
+        pure OPD (warning + one metrics row + the skip recorded), never an
+        abort. Afterwards the state is saved and the sampler force-refreshed
+        so OPD step 0 samples the warmed student, and `warmup.json` marks the
+        phase done for resumes.
+        """
+        cfg = self._cfg
+        warmup = cfg.warmup
+        learning_rate = (
+            warmup.learning_rate if warmup.learning_rate is not None else cfg.train.learning_rate
+        )
+        self._emit(
+            "warmup",
+            f"collecting teacher trajectories: {len(self._train_ids)} train task(s) x "
+            f"{warmup.rollouts_per_task} attempt(s) of {self._teacher_identity}",
+        )
+        # The collector reads attempts from train.group_size, the same override
+        # trick _run_eval uses for its k.
+        warmup_cfg = cfg.model_copy(
+            update={"train": cfg.train.model_copy(update={"group_size": warmup.rollouts_per_task})}
+        )
+        records, roll_stats = collect_rollouts(
+            0,
+            self._train_ids,
+            warmup_cfg,
+            self._harness,
+            self._teacher_provider(),
+            self._run_dir / WARMUP_ROLLOUTS_DIR,
+        )
+        prefill, sampled = _span_token_counts(records)
+        # Teacher sampling is metered like the teacher-in-harness baseline:
+        # every token at the teacher_prefill price (the config carries no
+        # teacher sampling meter; estimate_run_cost documents the approximation).
+        self._budget.charge("teacher_prefill", prefill + sampled)
+        try:
+            self._budget.check()
+        except BudgetExhausted as exc:
+            self._abort_for_budget(exc, completed_step=None)
+
+        kept = [record for record in records if warmup.keep == "all" or record.passed]
+        datums, datum_stats = build_datums(kept, cfg)
+        if not datums:
+            reason = (
+                f"warmup collected {roll_stats.trials} teacher trial(s) but kept "
+                f"{len(kept)} under keep={warmup.keep!r} and built 0 datums"
+            )
+            logger.warning(
+                "%s (teacher solve rate %.2f, %d trial(s) without spans, %d overflow "
+                "drop(s), %d overlong drop(s)); skipping warmup, the run degrades to "
+                "pure on-policy distillation",
+                reason,
+                roll_stats.solve_rate,
+                roll_stats.empty_span_trials,
+                datum_stats.overflow_drops,
+                datum_stats.overlong_drops,
+            )
+            self._append_warmup_row(
+                0,
+                self._warmup_row(
+                    trials=roll_stats.trials,
+                    kept_trials=len(kept),
+                    solve_rate=roll_stats.solve_rate,
+                    datums=0,
+                    loss_tokens=0,
+                    context_tokens=0,
+                    learning_rate=learning_rate,
+                ),
+            )
+            self._store.write_warmup(
+                WarmupRecord(
+                    steps=0,
+                    trials=roll_stats.trials,
+                    kept_trials=len(kept),
+                    datums=0,
+                    skipped_reason=reason,
+                )
+            )
+            self._emit("warmup", f"warmup skipped: {reason}")
+            return
+
+        train_tokens = sum(len(datum.model_input_tokens) for datum in datums)
+        self._emit(
+            "warmup",
+            f"training {warmup.steps} cross_entropy pass(es) over {len(datums)} "
+            f"datum(s) from {len(kept)}/{roll_stats.trials} kept teacher trial(s) "
+            f"(lr {learning_rate:g})",
+        )
+        for warmup_step in range(warmup.steps):
+            self._training.forward_backward(datums, loss_fn=CROSS_ENTROPY_LOSS)
+            self._training.optim_step(learning_rate)
+            self._budget.charge("student_train", train_tokens)
+            self._append_warmup_row(
+                warmup_step,
+                self._warmup_row(
+                    trials=roll_stats.trials,
+                    kept_trials=len(kept),
+                    solve_rate=roll_stats.solve_rate,
+                    datums=len(datums),
+                    loss_tokens=datum_stats.loss_tokens,
+                    context_tokens=datum_stats.context_tokens,
+                    learning_rate=learning_rate,
+                ),
+            )
+            try:
+                self._budget.check()
+            except BudgetExhausted as exc:
+                # No warmup.json yet: an interrupted warmup re-runs whole on
+                # resume (the teacher trials resume trial-level via harbor).
+                self._abort_for_budget(exc, completed_step=None)
+        state_path = self._training.save_state()
+        # The tag forces the save: step 0 was refreshed before preflight, and
+        # warmup changed the weights, so OPD step 0 must sample fresh ones.
+        sampler_path = self._sampler.refresh(0, tag="warmup")
+        self._store.write_warmup(
+            WarmupRecord(
+                steps=warmup.steps,
+                trials=roll_stats.trials,
+                kept_trials=len(kept),
+                datums=len(datums),
+                state_path=state_path,
+                sampler_path=sampler_path,
+            )
+        )
+        self._emit(
+            "warmup",
+            f"warmup complete: {warmup.steps} pass(es) over {len(datums)} datum(s); "
+            f"OPD starts from {sampler_path}",
+        )
+
     # -- the step loop ---------------------------------------------------------------------------
 
     def _train_step(self, step: int) -> None:
@@ -1336,6 +1600,7 @@ class _DistillRun:
                 )
             latest = store.latest_checkpoint()
             start_step = latest.step + 1 if latest is not None else 0
+            warmup_record = store.read_warmup()
             # The spend ledger is written on every charge, so it carries spend
             # the metrics rows never see (baselines, interim and finalize
             # evals); summing metrics rows is only the pre-ledger fallback.
@@ -1349,6 +1614,7 @@ class _DistillRun:
                 )
             latest = None
             start_step = 0
+            warmup_record = None
             prior_usd = 0.0
         # The snapshot is refreshed on resume too: the caller's config wins (the
         # documented budget-abort recovery is editing budget.max_usd and resuming).
@@ -1365,6 +1631,16 @@ class _DistillRun:
                 latest.state_path,
             )
             self._training.load_state(latest.state_path)
+        elif warmup_record is not None and warmup_record.state_path is not None:
+            # Warmup finished but no OPD step was checkpointed yet: without
+            # this restore, a resumed session would start OPD from the COLD
+            # student and silently lose the warmup it already paid for.
+            logger.info(
+                "resuming %s from the post-warmup state (%s)",
+                self._name,
+                warmup_record.state_path,
+            )
+            self._training.load_state(warmup_record.state_path)
         self._teacher_client = self._service.create_sampling_client(self._teacher_identity)
         self._teacher = TinkerTeacher(cfg.teacher, sampling_client=self._teacher_client)
         self._sampler = StudentSampler(self._service, self._training, self._name)
@@ -1400,6 +1676,23 @@ class _DistillRun:
             teacher_metered=False,
             reuse=resume,
         )
+
+        if cfg.warmup.steps > 0:
+            if warmup_record is not None:
+                logger.info(
+                    "warmup already recorded in %s; skipping (%s)",
+                    store.warmup_path,
+                    warmup_record.skipped_reason
+                    or f"{warmup_record.steps} step(s) over {warmup_record.datums} datum(s)",
+                )
+            elif start_step > 0:
+                logger.info(
+                    "resumed past step checkpoints (start step %d) with no warmup "
+                    "record; skipping warmup, the student already trained OPD steps",
+                    start_step,
+                )
+            else:
+                self._warmup()
 
         if start_step >= cfg.train.steps:
             logger.info(
@@ -1502,13 +1795,18 @@ def run_distillation(
     The flow: preflight (renderer resolution, tokenizer fingerprint, one-token
     student and teacher pings, the sample-then-recompute TITO proof, and the
     optional live-trial hook), holdout baselines (teacher-in-harness and
-    student-before), the training step loop (harbor rollouts, prefix-merge
-    datums, teacher scoring, reverse-KL advantages, importance_sampling
-    forward/backward and one optimizer step, metrics row, budget enforcement,
-    then the sampler-refresh / save-state / interim-eval cadences), and
-    finally the student-after holdout eval feeding `gate_distillation`. An
-    accepted gate saves the adapter version (champion alias) and writes the
-    serving handoff into the run dir.
+    student-before), the optional supervised warmup when `warmup.steps > 0`
+    (teacher rollouts on the train split, `warmup.keep`-filtered trials merged
+    into cross_entropy datums, `warmup.steps` full-batch passes, then a state
+    save and a forced sampler refresh so OPD starts from the warmed student;
+    zero kept trials skip the phase with a warning instead of aborting), the
+    training step loop (harbor rollouts, prefix-merge datums, teacher scoring,
+    reverse-KL advantages, importance_sampling forward/backward and one
+    optimizer step, metrics row, budget enforcement, then the sampler-refresh
+    / save-state / interim-eval cadences), and finally the student-after
+    holdout eval feeding `gate_distillation`. An accepted gate saves the
+    adapter version (champion alias) and writes the serving handoff into the
+    run dir.
 
     Args:
         name: The adapter/run name (a safe single path segment).
@@ -1521,9 +1819,11 @@ def run_distillation(
             the rollout collector's per-step dirs and per-eval
             `eval-rollouts/<name>/` roots).
         resume: Continue an aborted run in `run_dir`: restores the latest
-            checkpoint via `load_state`, continues the step count, restores
-            prior USD spend from the run store's spend ledger, and reuses
-            recorded baseline evals. The passed `cfg` wins over the old
+            checkpoint via `load_state` (or the recorded post-warmup state
+            when no step checkpoint exists yet), continues the step count,
+            restores prior USD spend from the run store's spend ledger,
+            reuses recorded baseline evals, and never re-runs a warmup whose
+            `warmup.json` record exists. The passed `cfg` wins over the old
             snapshot (the budget-abort recovery is editing `budget.max_usd`
             and resuming).
         on_progress: Optional callback receiving typed `DistillProgress`

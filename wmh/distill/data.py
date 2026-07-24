@@ -17,9 +17,11 @@ a run trace marked with the overflow stop reason) and for merged lengths over
 
 `attach_advantages` fills the reverse-KL advantages from teacher logprobs,
 and `to_tinker_datums` converts to real `tinker.Datum`s in the shifted
-next-token layout the cookbook uses. The tinker SDK is an optional extra and
-is imported lazily inside that converter only, mirroring the provider's
-contract; everything else here runs without it.
+next-token layout the cookbook uses; `to_tinker_sft_datums` is the
+cross_entropy sibling for the supervised warmup phase (teacher-sampled
+trajectories need no advantages, only the loss-mask weights). The tinker SDK
+is an optional extra and is imported lazily inside those converters only,
+mirroring the provider's contract; everything else here runs without it.
 """
 
 from __future__ import annotations
@@ -493,6 +495,67 @@ def to_tinker_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
                     # 0.0, and a zero-advantage position contributes zero loss.
                     "advantages": tinker.TensorData(
                         data=datum.advantages[1:], dtype="float32", shape=[length]
+                    ),
+                },
+            )
+        )
+    return out
+
+
+def to_tinker_sft_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
+    """Convert datums to real `tinker.Datum`s for the cross_entropy warmup loss.
+
+    Same shifted next-token layout as `to_tinker_datums`, but for supervised
+    warmup on teacher-sampled trajectories: no advantages are needed (or
+    read), and the loss mask rides as the `weights` input so context tokens
+    carry no loss (the backend CE loss is `sum(-logprobs * weights)`).
+
+    The loss_fn_inputs keyset is exactly {"target_tokens", "weights"}: the
+    cross_entropy backend of the pinned SDK (tinker 0.23.3) accepts only those
+    two keys (its own custom-loss path in
+    `tinker/lib/public_interfaces/training_client.py` rejects any other key,
+    and the cookbook's supervised datum builder emits exactly this pair).
+    Verified against the installed SDK the same way importance_sampling's
+    keyset was: the live service already rejected an unexpected "mask" key
+    once, so the keyset is pinned by `data_test.py` rather than trusted.
+
+    Args:
+        train_datums: Datums from `build_datums` (advantages may be empty).
+
+    Returns:
+        One `tinker.Datum` per input datum, in order, with loss_fn_inputs
+        exactly target_tokens (int64) and weights (float32, the shifted
+        loss mask).
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (distill extra).
+        ValueError: If a datum is too short for the input/target shift
+            (fewer than 2 tokens).
+    """
+    try:
+        import tinker
+    except ImportError as exc:
+        raise ImportError(MISSING_TINKER_EXTRA) from exc
+
+    out: list[tinker.Datum] = []
+    for datum in train_datums:
+        tokens = datum.model_input_tokens
+        if len(tokens) < 2:
+            raise ValueError(
+                f"datum (trial {datum.trial_name}, fragment {datum.fragment_index}) has "
+                f"{len(tokens)} token(s); at least 2 are needed for the next-token "
+                "input/target shift"
+            )
+        length = len(tokens) - 1
+        out.append(
+            tinker.Datum(
+                model_input=tinker.ModelInput.from_ints(tokens[:-1]),
+                loss_fn_inputs={
+                    "target_tokens": tinker.TensorData(
+                        data=tokens[1:], dtype="int64", shape=[length]
+                    ),
+                    "weights": tinker.TensorData(
+                        data=datum.loss_mask[1:], dtype="float32", shape=[length]
                     ),
                 },
             )

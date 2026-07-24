@@ -25,7 +25,7 @@ from wmh.distill.config import (
     TeacherConfig,
     WandbConfig,
 )
-from wmh.distill.loop import StepMetrics
+from wmh.distill.loop import StepMetrics, WarmupMetrics
 from wmh.distill.tracking import (
     WANDB_API_KEY_ENV,
     NullTracker,
@@ -131,6 +131,24 @@ def _metrics(*, reverse_kl: float | None = -0.25) -> StepMetrics:
     )
 
 
+def _warmup_metrics() -> WarmupMetrics:
+    return WarmupMetrics(
+        tasks=4,
+        trials=8,
+        kept_trials=3,
+        solve_rate=0.375,
+        datums=3,
+        loss_tokens=30,
+        context_tokens=90,
+        learning_rate=1e-4,
+        student_prefill_tokens=0,
+        student_sample_tokens=0,
+        student_train_tokens=120,
+        teacher_prefill_tokens=400,
+        usd=0.5,
+    )
+
+
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _FakeWandb:
     """A recording wandb module with credentials present, in a clean HOME."""
@@ -154,6 +172,7 @@ def test_build_tracker_disabled_is_a_null_tracker(tmp_path: Path) -> None:
     assert isinstance(tracker, NullTracker)
     # Every NullTracker call is a harmless no-op.
     tracker.log_step(0, _metrics())
+    tracker.log_warmup_step(0, _warmup_metrics())
     tracker.log_eval("baseline-teacher", 0.5, None)
     tracker.log_summary(
         gate_accepted=True,
@@ -305,6 +324,40 @@ def test_log_step_drops_an_unscored_reverse_kl(fake_wandb: _FakeWandb, tmp_path:
     tracker.log_step(0, _metrics(reverse_kl=None))
     (payload, _) = fake_wandb.log_calls[-1]
     assert "train/reverse_kl_per_token" not in payload
+
+
+def test_log_warmup_step_uses_warmup_keys_at_wandb_step_zero(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    """Warmup rows chart under warmup/* and always at wandb step 0.
+
+    Warmup precedes training step 0 and wandb steps must never decrease, so
+    logging warmup rows at their own indices would make wandb drop the later
+    train/ rows; the warmup index rides inside the payload instead.
+    """
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_warmup_step(0, _warmup_metrics())
+    tracker.log_warmup_step(1, _warmup_metrics())
+    assert [step for _, step in fake_wandb.log_calls] == [0, 0]
+    (payload, _) = fake_wandb.log_calls[-1]
+    assert payload == {
+        "warmup/step": 1,
+        "warmup/tasks": 4,
+        "warmup/trials": 8,
+        "warmup/kept_trials": 3,
+        "warmup/solve_rate": 0.375,
+        "warmup/datums": 3,
+        "warmup/loss_tokens": 30,
+        "warmup/context_tokens": 90,
+        "warmup/learning_rate": 1e-4,
+        "warmup/student_prefill_tokens": 0,
+        "warmup/student_sample_tokens": 0,
+        "warmup/student_train_tokens": 120,
+        "warmup/teacher_prefill_tokens": 400,
+        "warmup/usd": 0.5,
+    }
+    # The constant phase discriminator (a string) never lands in the payload.
+    assert not any("phase" in key for key in payload)
 
 
 def test_log_eval_uses_the_eval_namespace_and_step(fake_wandb: _FakeWandb, tmp_path: Path) -> None:

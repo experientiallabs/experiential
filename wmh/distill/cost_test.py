@@ -13,6 +13,7 @@ from wmh.distill.config import (
     StudentConfig,
     TeacherConfig,
     TrainConfig,
+    WarmupConfig,
 )
 from wmh.distill.cost import (
     METER_NAMES,
@@ -58,17 +59,45 @@ def test_estimate_hand_computed_tokens() -> None:
     # Episodes: train = 2 steps x min(3, 5) tasks x 2 group = 12;
     # evals = (2 // 1) x min(2, 5) x 1 = 4; gate attempts = 3 holdout x k=2 = 6;
     # student baselines (before + after) = 12; teacher baseline = 6.
-    # Student episodes = 12 + 4 + 12 = 28.
+    # Student episodes = 12 + 4 + 12 = 28. Warmup off by default: 0 episodes.
     estimate = estimate_run_cost(_config(), n_train_tasks=5, n_holdout_tasks=3)
     assert estimate.train_episodes == 12
     assert estimate.eval_episodes == 4
     assert estimate.baseline_episodes == 18
+    assert estimate.warmup_episodes == 0
     assert _tokens(estimate) == {
         "student_prefill": 28 * 4096,
         "student_sample": 28 * 256,
         "student_train": 12 * 4352,
         "teacher_prefill": (12 + 6) * 4352,
     }
+
+
+def test_estimate_includes_warmup_teacher_episodes() -> None:
+    # Warmup on: teacher episodes = 5 train tasks x 3 rollouts_per_task = 15,
+    # all charged to teacher_prefill at full episode tokens (the same
+    # teacher-in-harness approximation as the gate baseline). Student meters
+    # are untouched: warmup samples the TEACHER, and its SFT train tokens are
+    # not projected (they depend on the unknown pass rate).
+    cfg = _config().model_copy(update={"warmup": WarmupConfig(steps=2, rollouts_per_task=3)})
+    estimate = estimate_run_cost(cfg, n_train_tasks=5, n_holdout_tasks=3)
+    baseline = estimate_run_cost(_config(), n_train_tasks=5, n_holdout_tasks=3)
+    assert estimate.warmup_episodes == 15
+    tokens = _tokens(estimate)
+    base_tokens = _tokens(baseline)
+    assert tokens["teacher_prefill"] == base_tokens["teacher_prefill"] + 15 * 4352
+    for meter in ("student_prefill", "student_sample", "student_train"):
+        assert tokens[meter] == base_tokens[meter]
+
+
+def test_estimate_warmup_steps_zero_means_no_warmup_episodes() -> None:
+    # rollouts_per_task alone must not add episodes: steps = 0 disables warmup.
+    cfg = _config().model_copy(update={"warmup": WarmupConfig(steps=0, rollouts_per_task=3)})
+    estimate = estimate_run_cost(cfg, n_train_tasks=5, n_holdout_tasks=3)
+    assert estimate.warmup_episodes == 0
+    assert _tokens(estimate) == _tokens(
+        estimate_run_cost(_config(), n_train_tasks=5, n_holdout_tasks=3)
+    )
 
 
 def test_estimate_hand_computed_usd() -> None:
