@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 
+import wmh.providers.tinker as providers_tinker
 from wmh.distill.config import TeacherConfig
 from wmh.distill.data import TrainDatum
 from wmh.distill.deadlines import TinkerDeadlineError
@@ -299,6 +300,26 @@ def test_injected_scorer_is_never_dropped_on_deadline(monkeypatch: pytest.Monkey
         with pytest.raises(TinkerDeadlineError):
             teacher.score([_datum([1, 2], [3])])
     assert scorer.calls == 2
+
+
+def test_drop_wedged_scorer_evicts_the_shared_sampling_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The lazily built scorer wraps a client from the process-wide shared
+    # cache; dropping it must evict the cache entry too, or every future user
+    # of the teacher's model string would inherit the wedged session.
+    class _Client:
+        """Identity stand-in for the cached tinker.SamplingClient."""
+
+    wedged = cast("tinker.SamplingClient", _Client())
+    spec = _spec()
+    monkeypatch.setattr(providers_tinker, "_shared_samplers", {spec.model: wedged})
+    teacher = TinkerTeacher(spec)
+    monkeypatch.setattr(teacher, "_scorer", SdkLogprobScorer(wedged))
+
+    teacher._drop_wedged_scorer()
+
+    assert spec.model not in providers_tinker._shared_samplers
 
 
 class _NeverResolvingFuture:

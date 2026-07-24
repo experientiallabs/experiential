@@ -15,8 +15,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
@@ -275,12 +276,19 @@ def _install_stub_tinker(
     monkeypatch.setitem(
         sys.modules,
         "tinker",
-        SimpleNamespace(
-            ModelInput=_StubModelInput,
-            SamplingParams=_StubSamplingParams,
-            ServiceClient=service_factory,
+        cast(
+            "ModuleType",
+            SimpleNamespace(
+                ModelInput=_StubModelInput,
+                SamplingParams=_StubSamplingParams,
+                ServiceClient=service_factory,
+            ),
         ),
     )
+    # Give the test its own empty process-wide cache (restored afterwards); without
+    # this a stub client would leak into every later test through the shared cache.
+    monkeypatch.setattr(tinker_module, "_shared_service", None)
+    monkeypatch.setattr(tinker_module, "_shared_samplers", {})
 
 
 def _config() -> ProviderConfig:
@@ -927,8 +935,9 @@ def test_sampling_client_creation_is_bounded_by_the_connect_deadline(
 def test_expired_sample_drops_the_owned_client_so_the_next_attempt_rebuilds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A wedged client keeps expiring; caching it would turn one expiry into an endless
-    # run of them, so the retry wrapper's next attempt must get a fresh session.
+    # A wedged client keeps expiring; leaving it in the process-wide cache would turn
+    # one expiry into an endless run of them for every user, so the retry wrapper's
+    # next attempt must get a freshly built sampling client.
     monkeypatch.setenv(env_var_for("sample"), "0.05")
     services: list[_StubService] = []
 
@@ -942,16 +951,18 @@ def test_expired_sample_drops_the_owned_client_so_the_next_attempt_rebuilds(
     for _ in range(2):
         with pytest.raises(TinkerDeadlineError, match="tinker sample timed out"):
             provider.complete_chat(_request())
-    assert [service.created for service in services] == [
-        ["tinker://run/weights/0"],
-        ["tinker://run/weights/0"],
-    ]
+    # Exactly one ServiceClient across both attempts (the session-leak rule), but two
+    # sampling clients: the wedged one was evicted from the shared cache, not reissued.
+    assert len(services) == 1
+    assert services[0].created == ["tinker://run/weights/0"] * 2
     # Each wedged client was used exactly once and then dropped, never reused.
-    assert [client.samples for service in services for client in service.clients] == [1, 1]
+    assert [client.samples for client in services[0].clients] == [1, 1]
+    assert _config().model not in tinker_module._shared_samplers
 
 
 def test_expired_ping_drops_the_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    # `verify()` runs the same render+sample path, so it must heal the same way.
+    # `verify()` runs the same render+sample path, so it must heal the same way: the
+    # wedged client is evicted from the shared cache and the next ping rebuilds one.
     monkeypatch.setenv(env_var_for("sample"), "0.05")
     services: list[_StubService] = []
 
@@ -966,7 +977,8 @@ def test_expired_ping_drops_the_owned_client(monkeypatch: pytest.MonkeyPatch) ->
         result = provider.verify()
         assert result.ok is False
         assert "timed out" in (result.detail or "")
-    assert len(services) == 2
+    assert len(services) == 1
+    assert services[0].created == ["tinker://run/weights/0"] * 2
 
 
 def _module_scope_import_roots(path: Path) -> set[str]:
@@ -1076,3 +1088,220 @@ def test_sdk_sampler_bounds_the_sample_future(monkeypatch: pytest.MonkeyPatch) -
     sampler = SdkSampler(cast("tinker.SamplingClient", _WedgedClient()))
     with pytest.raises(TinkerDeadlineError, match="tinker sample timed out"):
         sampler.sample([1, 2, 3], max_tokens=4, temperature=1.0)
+
+
+# --- process-wide client sharing: the session-leak regression -----------------------------------
+
+
+@dataclass
+class _FakeSdkState:
+    """Counters the fake tinker SDK module tracks for the sharing tests.
+
+    `live_sessions` is deliberately never decremented: the real SDK's
+    heartbeat task strongly references each constructed client's holder, so
+    every construction pins a live server-side session for the rest of the
+    process. `session_cap` models the service refusing new session creation
+    with a capacity-shaped error once too many are live.
+    """
+
+    session_cap: int
+    live_sessions: int = 0
+    service_clients: int = 0
+    sampling_clients: int = 0
+    wedge_first_sampler: bool = False
+    wedge_sampler_construction: bool = False
+
+
+@dataclass(frozen=True)
+class _FakeSdkSequence:
+    tokens: list[int]
+    logprobs: list[float]
+
+
+@dataclass(frozen=True)
+class _FakeSdkSampleResult:
+    sequences: list[_FakeSdkSequence]
+
+
+class _ReadySdkFuture:
+    """A fake SDK future whose result is immediately available."""
+
+    def __init__(self, value: _FakeSdkSampleResult) -> None:
+        self._value = value
+
+    def result(self, timeout: float | None = None) -> _FakeSdkSampleResult:
+        del timeout
+        return self._value
+
+
+class _TimedOutSdkFuture:
+    """A wedged session's future: reports the timeout immediately (fast tests)."""
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        raise TimeoutError(f"fake future gave up after {timeout}s")
+
+
+class _FakeSdkSamplingClient:
+    """Just enough of `tinker.SamplingClient` for `SdkSampler` to drive."""
+
+    def __init__(self, wedged: bool) -> None:
+        self._wedged = wedged
+
+    def sample(
+        self, prompt: object, num_samples: int, sampling_params: object
+    ) -> _ReadySdkFuture | _TimedOutSdkFuture:
+        del prompt, num_samples, sampling_params
+        if self._wedged:
+            return _TimedOutSdkFuture()
+        return _ReadySdkFuture(
+            _FakeSdkSampleResult(
+                sequences=[_FakeSdkSequence(tokens=[65, 66], logprobs=[-0.1, -0.2])]
+            )
+        )
+
+    def get_tokenizer(self) -> FakeTokenizer:
+        return FakeTokenizer()
+
+
+class _FakeModelInput:
+    """Stands in for tinker.ModelInput (the provider only calls from_ints)."""
+
+    @classmethod
+    def from_ints(cls, token_ids: list[int]) -> list[int]:
+        return list(token_ids)
+
+
+class _FakeSamplingParams:
+    """Stands in for tinker.SamplingParams (constructed, never read)."""
+
+    def __init__(
+        self,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.stop = stop
+
+
+class _FakeTinkerModule:
+    """A sys.modules-injectable stand-in for the tinker SDK module."""
+
+    ServiceClient: type
+    ModelInput: type[_FakeModelInput]
+    SamplingParams: type[_FakeSamplingParams]
+
+    def __init__(self, service_client: type) -> None:
+        self.ServiceClient = service_client
+        self.ModelInput = _FakeModelInput
+        self.SamplingParams = _FakeSamplingParams
+
+
+def _install_fake_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    session_cap: int,
+    wedge_first_sampler: bool = False,
+    wedge_sampler_construction: bool = False,
+) -> _FakeSdkState:
+    """Install a fake tinker module that meters sessions like the live outage."""
+    state = _FakeSdkState(
+        session_cap=session_cap,
+        wedge_first_sampler=wedge_first_sampler,
+        wedge_sampler_construction=wedge_sampler_construction,
+    )
+
+    class _FakeServiceClient:
+        def __init__(self) -> None:
+            state.service_clients += 1
+            state.live_sessions += 1
+
+        def create_sampling_client(
+            self, model_path: str | None = None, base_model: str | None = None
+        ) -> _FakeSdkSamplingClient:
+            assert (model_path is None) != (base_model is None)
+            if state.wedge_sampler_construction:
+                threading.Event().wait()  # a fully blocking construction, never returns
+            state.live_sessions += 1
+            if state.live_sessions > state.session_cap:
+                raise RuntimeError(
+                    "429 too many requests: session capacity exceeded "
+                    f"({state.live_sessions} live sessions, cap {state.session_cap})"
+                )
+            state.sampling_clients += 1
+            wedged = state.wedge_first_sampler and state.sampling_clients == 1
+            return _FakeSdkSamplingClient(wedged)
+
+    fake = _FakeTinkerModule(_FakeServiceClient)
+    monkeypatch.setitem(sys.modules, "tinker", cast("ModuleType", fake))
+    monkeypatch.setenv("TINKER_API_KEY", "test-key")
+    # Give the test its own empty process-wide cache (restored afterwards).
+    monkeypatch.setattr(tinker_module, "_shared_service", None)
+    monkeypatch.setattr(tinker_module, "_shared_samplers", {})
+    monkeypatch.setattr(tinker_module, "build_renderer", _stub_build_renderer)
+    return state
+
+
+def _stub_build_renderer(base_model: str, tokenizer: object) -> _MiniRendering:
+    """The cookbook renderer stub for the fake base models."""
+    del base_model, tokenizer
+    return _MiniRendering()
+
+
+def test_session_cap_regression_shares_one_service_client_across_trials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The outage: a fresh ServiceClient + sampling client per trial pinned a
+    # live session each until the service refused new session creation with
+    # capacity errors (~240 cumulative). M >> N per-trial providers must all
+    # succeed because the SDK clients are shared process-wide.
+    state = _install_fake_sdk(monkeypatch, session_cap=5)
+    weights_config = _config()
+    base_config = ProviderConfig(kind=ProviderKind.TINKER, model="Qwen/Qwen3-8B")
+
+    for trial in range(40):
+        provider = get_provider(weights_config if trial % 2 == 0 else base_config)
+        assert isinstance(provider, TinkerChatProvider)
+        response = provider.complete_chat(_request())
+        assert response.choices[0].message.role == "assistant"
+
+    assert state.service_clients == 1
+    # Live sessions are bounded by distinct model strings, not by trial count:
+    # the one service client plus one sampling client per model.
+    assert state.sampling_clients == 2
+    assert state.live_sessions == 1 + 2
+
+
+def test_deadline_evicts_the_shared_cache_so_every_user_heals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_sdk(monkeypatch, session_cap=100, wedge_first_sampler=True)
+
+    first = TinkerChatProvider(_config())
+    with pytest.raises(TinkerDeadlineError, match="timed out"):
+        first.complete_chat(_request())
+    # The wedged client was EVICTED from the shared cache (not merely dropped
+    # from this provider), so a different provider builds a fresh session
+    # instead of inheriting the wedged one.
+    assert _config().model not in tinker_module._shared_samplers
+    second = TinkerChatProvider(_config())
+    assert second.complete_chat(_request()).choices[0].message.role == "assistant"
+    assert state.sampling_clients == 2
+    # The first provider's next attempt heals through the same fresh client.
+    assert first.complete_chat(_request()).choices[0].message.role == "assistant"
+    assert state.sampling_clients == 2  # reused from the cache, not rebuilt again
+    assert state.service_clients == 1
+
+
+def test_shared_sampling_client_construction_is_deadline_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sdk(monkeypatch, session_cap=100, wedge_sampler_construction=True)
+    monkeypatch.setenv("WMH_TINKER_DEADLINE_CONNECT", "0.05")
+
+    with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
+        tinker_module.shared_sampling_client("tinker://run/weights/0")
+    # Nothing was cached, so a later attempt rebuilds instead of returning a
+    # half-constructed entry.
+    assert "tinker://run/weights/0" not in tinker_module._shared_samplers

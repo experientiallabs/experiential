@@ -27,6 +27,17 @@ Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged
 session raises a retryable `TinkerDeadlineError` instead of hanging, and the
 provider drops its lazily built sampling client on expiry so the retry
 wrapper's next attempt heals through a fresh session.
+
+SDK clients are shared process-wide (`shared_service_client` and
+`shared_sampling_client`): the SDK's service client starts a heartbeat task
+that strongly references its internal holder, so every constructed client
+lives for the rest of the process and keeps one server-side session alive.
+Building a fresh client per trial therefore leaks sessions until the service
+rejects new session creation with capacity errors (observed live at ~240
+cumulative sessions). One `tinker.ServiceClient` plus one `SamplingClient`
+per exact model string serve every consumer instead; the SDK documents
+`SamplingClient` as thread-safe, and all per-episode state (`TokenRecorder`,
+incremental prompt state, renderer) stays on each provider instance.
 """
 
 from __future__ import annotations
@@ -34,6 +45,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
@@ -74,6 +86,113 @@ _MISSING_TINKER_EXTRA = (
 # The tinker SamplingParams default; used when a structured request carries no
 # temperature (pi normally stamps one on every request).
 _DEFAULT_CHAT_TEMPERATURE = 1.0
+
+_shared_lock = threading.Lock()
+"""Guards the process-wide service client and sampling-client cache below."""
+
+_shared_service: tinker.ServiceClient | None = None
+_shared_samplers: dict[str, tinker.SamplingClient] = {}
+"""Process-wide `SamplingClient` cache, keyed by the exact model string."""
+
+
+def shared_service_client() -> tinker.ServiceClient:
+    """The process-wide `tinker.ServiceClient`, constructed at most once.
+
+    The SDK's service client starts a heartbeat task that strongly references
+    its internal holder, so every constructed client lives (and pins one live
+    server-side session) for the rest of the process. Constructing one per
+    trial therefore leaks sessions until the service rejects new session
+    creation with capacity errors; every wmh consumer (the rollout provider,
+    the teacher scorer, the distill loop) shares this single client instead.
+
+    The API key is checked on every call, before the cache, so a missing key
+    stays an actionable error rather than an SDK-internal auth failure.
+
+    Returns:
+        The shared service client.
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (the distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+        TinkerDeadlineError: If construction exceeds the connect deadline
+            (nothing is cached, so the next call rebuilds).
+    """
+    try:
+        import tinker
+    except ImportError as exc:
+        raise ImportError(_MISSING_TINKER_EXTRA) from exc
+    if not os.environ.get(TINKER_API_KEY_ENV):
+        raise RuntimeError(
+            f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
+            "your Tinker API key to use the tinker provider"
+        )
+    global _shared_service
+    with _shared_lock:
+        if _shared_service is None:
+            _shared_service = call_with_deadline("connect", tinker.ServiceClient)
+        return _shared_service
+
+
+def shared_sampling_client(model: str) -> tinker.SamplingClient:
+    """The process-wide sampling client for one model, from the shared cache.
+
+    Keyed by the exact model string: a `tinker://` sampler-weights path or a
+    base model name. The SDK documents `SamplingClient` as thread-safe, so a
+    single client per model serves every concurrent trial; per-episode state
+    (`TokenRecorder`, incremental prompt state, renderer) stays on each
+    provider instance. Entries live for the rest of the process (the SDK pins
+    every constructed client regardless); a wedged entry is replaced through
+    `evict_shared_sampling_client`.
+
+    Args:
+        model: The exact model string to sample from.
+
+    Returns:
+        The cached (or newly built and cached) sampling client.
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (the distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+        TinkerDeadlineError: If client construction exceeds the connect
+            deadline (nothing is cached, so the next call rebuilds).
+    """
+    service = shared_service_client()
+    with _shared_lock:
+        cached = _shared_samplers.get(model)
+        if cached is not None:
+            return cached
+
+        def build() -> tinker.SamplingClient:
+            if model.startswith("tinker://"):
+                return service.create_sampling_client(model_path=model)
+            return service.create_sampling_client(base_model=model)
+
+        client = call_with_deadline("connect", build)
+        _shared_samplers[model] = client
+        return client
+
+
+def evict_shared_sampling_client(model: str, client: tinker.SamplingClient) -> None:
+    """Drop one model's cached sampling client if it is still `client`.
+
+    The wedged-session heal path: a client that blew a deadline is wedged for
+    EVERY user sharing it, so callers evict the cache entry (not merely their
+    own reference) and the next `shared_sampling_client(model)` builds a
+    fresh session. The identity check keeps a late eviction from discarding a
+    replacement another caller already rebuilt.
+
+    Args:
+        model: The cache key the wedged client was built under.
+        client: The wedged client itself, identity-compared to the entry.
+    """
+    with _shared_lock:
+        if _shared_samplers.get(model) is client:
+            del _shared_samplers[model]
+            logger.info(
+                "evicted the shared tinker sampling client for %s; the next "
+                "user builds a fresh session",
+                model,
+            )
 
 
 class TokenSpan(BaseModel):
@@ -195,6 +314,11 @@ class SdkSampler:
     def __init__(self, client: tinker.SamplingClient) -> None:
         self._client = client
 
+    @property
+    def sdk_client(self) -> tinker.SamplingClient:
+        """The wrapped SDK client (shared-cache eviction compares its identity)."""
+        return self._client
+
     def sample(
         self,
         prompt_token_ids: list[int],
@@ -308,10 +432,14 @@ class TinkerChatProvider:
             name for an untrained student).
         sampling_client: Optional injected sampler (tests use the fakes in
             `wmh.distill.fake_tinker`; wrap a real `tinker.SamplingClient` in
-            `SdkSampler`). When None, a real client is built lazily from
-            `config.model` on first use and dropped after a
-            `TinkerDeadlineError` so the next attempt rebuilds a fresh
-            session; an injected client is never dropped.
+            `SdkSampler`). When None, a real client is fetched lazily from
+            the process-wide shared cache (`shared_sampling_client`, keyed by
+            `config.model`; one client per model string serves every
+            concurrent trial, and the SDK documents `SamplingClient` as
+            thread-safe) and EVICTED from that cache after a
+            `TinkerDeadlineError` so every future user rebuilds through a
+            fresh session; an injected client bypasses the cache entirely and
+            is never dropped.
         renderer: Optional injected rendering. When None, it is built lazily
             from the base model name and the sampling client's tokenizer.
         recorder: Optional per-episode span recorder; when present, every
@@ -377,38 +505,30 @@ class TinkerChatProvider:
         return self._sampler
 
     def _build_sdk_sampler(self) -> TinkerSampler:
-        # Lazy: don't import the SDK or read the key env var until first use.
-        try:
-            import tinker
-        except ImportError as exc:
-            raise ImportError(_MISSING_TINKER_EXTRA) from exc
-        if not os.environ.get(TINKER_API_KEY_ENV):
-            raise RuntimeError(
-                f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
-                "your Tinker API key to use the tinker provider"
-            )
-
-        def build() -> tinker.SamplingClient:
-            service = tinker.ServiceClient()
-            if self.config.model.startswith("tinker://"):
-                return service.create_sampling_client(model_path=self.config.model)
-            return service.create_sampling_client(base_model=self.config.model)
-
-        return SdkSampler(call_with_deadline("connect", build))
+        # Lazy: the SDK import and the API-key check happen inside the shared
+        # cache path (`shared_sampling_client`), so nothing touches tinker
+        # before the first completion. Sharing keeps session creation bounded
+        # by distinct model strings instead of by trial count.
+        return SdkSampler(shared_sampling_client(self.config.model))
 
     def _drop_wedged_sampler(self) -> None:
-        """Forget a lazily built sampling client after a deadline expiry.
+        """Forget (and evict from the shared cache) a wedged sampling client.
 
         A wedged session keeps timing out while a freshly built one heals
         (observed live), so dropping here makes the retry wrapper's next
-        attempt rebuild through `_get_sampler`. An injected client is never
-        dropped: the provider cannot rebuild what it did not build.
+        attempt rebuild through `_get_sampler`. The shared cache entry is
+        evicted too, not just this provider's reference: the client is shared
+        process-wide, so leaving it cached would hand the same wedged session
+        to every future trial. An injected client is never dropped: the
+        provider cannot rebuild what it did not build.
         """
         if self._owns_sampler and self._sampler is not None:
             logger.warning(
                 "dropping the tinker sampling client after a deadline expiry; "
                 "the next attempt builds a fresh session"
             )
+            if isinstance(self._sampler, SdkSampler):
+                evict_shared_sampling_client(self.config.model, self._sampler.sdk_client)
             self._sampler = None
 
     def _get_rendering(self) -> ChatRendering:
