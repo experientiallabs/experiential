@@ -32,7 +32,7 @@ center_advantages = true
 max_datum_tokens = 65536
 sampler_refresh_every = 1
 save_state_every = 4
-trial_concurrency = 8
+trial_concurrency = 32
 
 # temperature 1.0 keeps issued sampler logprobs comparable to the untempered
 # teacher logprobs (unbiased reverse-KL advantages).
@@ -56,10 +56,17 @@ min_teacher_fraction = 0.7
 require_no_regression = true
 
 [pricing]
-# Ultra 64K (verified live 2026-07-23): prefill 2.49, cached prefill 0.498,
-# sample 6.225, train 5.478 USD/Mtok. Nano prices still unlisted; the priced
-# teacher meter dominates observed spend.
+# Ultra 64K (verified live 2026-07-23): prefill 2.49, sample 6.225, train
+# 5.478 USD/Mtok. Cached prefill 0.498 is exactly the 20%-of-prefill default,
+# so both cached rates are left implied.
 teacher_prefill = 2.49
+teacher_sample = 6.225
+# Nano prices are unlisted on the console; these are implied from reconciling
+# the console's billed totals (306M tokens / $78) against the run's metered
+# per-request volumes.
+student_prefill = 0.30
+student_sample = 0.70
+student_train = 0.60
 
 [budget]
 max_usd = 600.0

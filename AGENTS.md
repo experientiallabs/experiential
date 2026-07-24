@@ -83,6 +83,18 @@ uv run pytest -q
 - Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
   deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
   promotion or rollback.
+- `wmh optimize <agent> harbor --mode distill` is the third optimization surface: instead of
+  editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
+  student from pi-agent rollouts on harbor tasks (the harness stays pinned for the run). The
+  loss is per-token reverse KL against the teacher's logprobs on the student's own sampled
+  tokens (Tinker's `importance_sampling`, with an optional supervised warmup on the teacher's
+  passing trajectories), and promotion is gated on holdout solve rates: student-after must
+  reach `gate.min_teacher_fraction` of the teacher and not regress against student-before;
+  only then does the adapter version land in `AdapterStore` with the champion alias. Run
+  configuration is a per-run TOML passed via `--distill-config` (student, teacher, harbor,
+  rollout, train, sampling, warmup, eval, gate, pricing, budget, wandb sections), snapshotted
+  into the run dir; the CLI face lives in `wmh/cli/harness_distill.py` and the loop in
+  `wmh/distill/`. See `docs/reference/distill.md` for the user-facing how-to.
 - `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize --tasks` currently
   requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
 - Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,

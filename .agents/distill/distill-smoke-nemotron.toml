@@ -59,9 +59,17 @@ min_teacher_fraction = 0.7
 require_no_regression = true
 
 [pricing]
-# Ultra 64K (2026-07-23): prefill 2.49, cached prefill 0.498, sample 6.225, train 5.478 USD/Mtok.
-# Nano: fill from the live models page at run time.
+# Ultra 64K (2026-07-23): prefill 2.49, sample 6.225, train 5.478 USD/Mtok.
+# Cached prefill 0.498 is exactly the 20%-of-prefill default, so both cached
+# rates are left implied.
 teacher_prefill = 2.49
+teacher_sample = 6.225
+# Nano prices are unlisted on the console; implied from reconciling the
+# console's billed totals (306M tokens / $78) against metered per-request
+# volumes.
+student_prefill = 0.30
+student_sample = 0.70
+student_train = 0.60
 
 [budget]
 max_usd = 75.0
