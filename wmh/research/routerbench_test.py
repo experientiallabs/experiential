@@ -10,11 +10,14 @@ import pytest
 
 from wmh.optimize.outcomes import OutcomeMatrix
 from wmh.research.routerbench import (
+    aiq,
     best_single_model,
     load_routerbench,
     oracle,
     random_baseline,
+    single_model_points,
     split_scenario_ids,
+    upper_hull,
 )
 
 _MODELS = ["model-a", "model-b"]
@@ -100,3 +103,30 @@ def _loaded() -> OutcomeMatrix:
         path = Path(tmp) / "rb.pkl"
         _frame().to_pickle(path)
         return load_routerbench(path, models=_MODELS)
+
+
+def test_upper_hull_and_aiq() -> None:
+    # Points: a dominated point (0.5, 0.3) sits under the chord (0.1,0.4)-(1.0,0.9).
+    points = [(0.1, 0.4), (0.5, 0.3), (1.0, 0.9)]
+    hull = upper_hull(points)
+    assert hull == [(0.1, 0.4), (1.0, 0.9)]
+    # AIQ over shared max x 1.0: area under segment 0.4->0.9 over [0.1, 1.0] plus the
+    # flat 0.4 head over [0, 0.1]? No head: their curve starts at the cheapest point.
+    value = aiq(points, max_cost=1.0)
+    assert value == pytest.approx((0.9 + 0.4) / 2 * 0.9 / 1.0)
+
+
+def test_aiq_extends_flat_to_shared_max_cost() -> None:
+    points = [(0.1, 0.8), (0.2, 0.8)]
+    # Extended flat to max_cost 1.0: area = 0.8 * (1.0 - 0.1), normalized by 1.0.
+    assert aiq(points, max_cost=1.0) == pytest.approx(0.8 * 0.9)
+
+
+def test_zero_router_points_are_single_models() -> None:
+    matrix = _loaded()
+    ids = matrix.scenario_ids()
+    points = single_model_points(matrix, ids)
+    assert points == {
+        "model-a": (0.02, 0.625),
+        "model-b": (0.001, 0.625),
+    }

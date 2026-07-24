@@ -20,6 +20,7 @@ from __future__ import annotations
 import random
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import pandas as pd
 
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -205,3 +206,59 @@ def random_baseline(matrix: OutcomeMatrix, ids: list[str]) -> tuple[float, float
     rewards = [reward for reward, _cost in stats.values()]
     costs = [cost for _reward, cost in stats.values()]
     return sum(rewards) / len(rewards), sum(costs) / len(costs)
+
+
+def upper_hull(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Non-decreasing upper concave envelope of (cost, quality) points.
+
+    The curve AIQ integrates (RouterBench evaluation/AIQ.py): sort by cost, keep the upper
+    convex chain, and drop any point whose quality dips below its predecessor (a rational
+    operator never pays more for less).
+    """
+    if not points:
+        raise ValueError("no points to hull")
+    ordered = sorted(points)
+    chain: list[tuple[float, float]] = []
+    for point in ordered:
+        while len(chain) >= 2:
+            (x1, y1), (x2, y2) = chain[-2], chain[-1]
+            # Pop the middle point when it sits on or under the chord to the new point.
+            if (y2 - y1) * (point[0] - x1) <= (point[1] - y1) * (x2 - x1):
+                chain.pop()
+            else:
+                break
+        chain.append(point)
+    monotone: list[tuple[float, float]] = []
+    for point in chain:
+        if monotone and point[1] < monotone[-1][1]:
+            continue
+        monotone.append(point)
+    return monotone
+
+
+def aiq(points: list[tuple[float, float]], *, max_cost: float) -> float:
+    """Area under the hull, extended flat to `max_cost`, normalized by `max_cost`.
+
+    Matches RouterBench's calc_AIQ. NOTE: the normalization couples AIQ to the comparison
+    set's most expensive point, so absolute AIQs are only comparable when computed against
+    the same `max_cost`; always report the hull points alongside.
+    """
+    hull = upper_hull(points)
+    if hull[-1][0] < max_cost:
+        hull = [*hull, (max_cost, hull[-1][1])]
+    xs = [x for x, _y in hull]
+    ys = [y for _x, y in hull]
+    area = float(np.trapezoid(ys, xs))
+    return area / max_cost
+
+
+def single_model_points(matrix: OutcomeMatrix, ids: list[str]) -> dict[str, tuple[float, float]]:
+    """Each model's (mean cost, mean reward) on `ids`: the Zero-Router's constituent points.
+
+    RouterBench's non-predictive floor is the hull of these (random mixing between two models
+    traces the segment joining them, so the hull IS the best label-free strategy).
+    """
+    stats = _mean_by_model(matrix, set(ids))
+    if not stats:
+        raise ValueError("no scored outcomes in ids")
+    return {model: (cost, reward) for model, (reward, cost) in sorted(stats.items())}
