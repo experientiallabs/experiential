@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -27,17 +28,23 @@ from rich.table import Table
 from wmh.agents.default import default_agent
 from wmh.agents.optimizer import optimizer_agent
 from wmh.agents.project import AgentProject
-from wmh.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
+from wmh.cli.model_roles import (
+    resolve_base_provider,
+    resolve_opt_in_model_provider,
+    resolve_required_model_config,
+)
+from wmh.cli.platform_cmds import default_org
 from wmh.config import ARTIFACT_DIR, WorldModelStore
 from wmh.config.store import validate_name
 from wmh.core.types import JsonObject
 from wmh.engine import load_world_model
-from wmh.engine.world_model import WorldModel
+from wmh.evals.closed_loop import WorldModelSource
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec, load_tasks
 from wmh.harness.create import ProposalRecord, create_harness
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.e2b_sandbox import E2B_TEMPLATE_ENV, resolve_e2b_template
+from wmh.harness.environment import EnvironmentSource
 from wmh.harness.population import (
     CandidateProposer,
     PopulationResult,
@@ -54,6 +61,9 @@ from wmh.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
 from wmh.harness.scoring import RewardMode, Scorer, ScoreRequest
 from wmh.harness.source_tree import HarnessSourceTree
 from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
+from wmh.platform.client import PlatformClient, PlatformError, RemoteWorldModel
+from wmh.platform.credentials import load_credentials
+from wmh.platform.hosted_world_model import HostedWorldModelSource
 from wmh.providers.base import Provider, ProviderConfig, ToolCallingProvider
 from wmh.providers.registry import get_provider
 
@@ -139,8 +149,14 @@ def optimize(
     ),
     model: str = typer.Argument(
         None,
-        help="World model to optimize against (default: the only built one), or the literal "
-        "'harbor' to optimize on real harbor benchmark tasks.",
+        help="World model to optimize against: a platform world model (name or id) when logged "
+        "in, otherwise a locally built one (default: the only built one). The literal 'harbor' "
+        "optimizes on real harbor benchmark tasks instead.",
+    ),
+    local: bool = typer.Option(
+        False,
+        "--local",
+        help="Optimize against the LOCAL world model of that name even while logged in.",
     ),
     tasks_file: str = typer.Option(None, "--tasks", help="JSONL task file to optimize against."),
     holdout_file: str = typer.Option(
@@ -251,6 +267,11 @@ def optimize(
     best result as the new champion. Configure distinct agent and optimizer models with
     `models.agent` and `models.meta` in `.wmh/settings.toml`.
 
+    After `wmh login` the world-model ENVIRONMENT is resolved on the platform first, so a hosted
+    world model can be optimized against without building or pulling it locally: rollouts step
+    hosted sessions while the agent, proposer, and judge keep running from this machine. Pass
+    `--local` (or stay logged out) to use a locally built model.
+
     With a world-model ENVIRONMENT, the backend controls where the worker process runs and the
     environment remains the world model. With the literal `harbor` ENVIRONMENT, complete-source
     candidates are scored on real benchmark tasks: --backend controls the task environment and
@@ -268,6 +289,7 @@ def optimize(
                 ("eval_concurrency", "--eval-concurrency"),
                 ("proposal_batch_size", "--proposal-batch-size"),
                 ("archive_out", "--archive"),
+                ("local", "--local"),
             )
             if _explicit(ctx, param)
         ]
@@ -350,7 +372,9 @@ def optimize(
     store = HarnessStore(root)
     seed_doc = _resolve_seed(store, seed)
     # The world model IS the environment on every backend, so it is always required.
-    world_model, provider, model_name = _load_world_model(model, root)
+    environment = _resolve_environment(model, root, local_only=local)
+    provider = environment.provider
+    model_name = environment.source.label
     meta_provider, meta_model = resolve_opt_in_model_provider(root, "meta", provider)
     agent_provider, agent_model = resolve_opt_in_model_provider(root, "agent", provider)
 
@@ -373,7 +397,8 @@ def optimize(
         else ""
     )
     _console.print(
-        f"searching from [bold]{seed_doc.name}[/bold] against world model "
+        f"searching from [bold]{seed_doc.name}[/bold] against "
+        f"{'platform' if environment.hosted else 'local'} world model "
         f"[bold]{model_name}[/bold]: {iterations} iteration(s), "
         f"{proposal_batch_size} proposal(s)/iteration, k={k}, {len(tasks)} task(s) "
         f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
@@ -413,25 +438,28 @@ def optimize(
             f"{record.candidate}: success_rate={record.score:.3f} {state}"
         )
 
-    result = create_harness(
-        name,
-        seed_doc,
-        tasks,
-        world_model,
-        agent_provider,
-        ProviderDeltaProposer(meta_provider),
-        GoldJudge(provider),
-        iterations=iterations,
-        proposal_batch_size=proposal_batch_size,
-        k=k,
-        holdout=holdout,
-        harness_backend="e2b" if backend == "e2b" else "local",
-        eval_concurrency=eval_concurrency,
-        e2b_template=e2b_template,
-        on_progress=_progress,
-        on_note=_note,
-        on_proposal=_proposal,
-    )
+    try:
+        result = create_harness(
+            name,
+            seed_doc,
+            tasks,
+            environment.source,
+            agent_provider,
+            ProviderDeltaProposer(meta_provider),
+            GoldJudge(provider),
+            iterations=iterations,
+            proposal_batch_size=proposal_batch_size,
+            k=k,
+            holdout=holdout,
+            harness_backend="e2b" if backend == "e2b" else "local",
+            eval_concurrency=eval_concurrency,
+            e2b_template=e2b_template,
+            on_progress=_progress,
+            on_note=_note,
+            on_proposal=_proposal,
+        )
+    finally:
+        environment.close()
     saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
     selected = len(result.archive.accepted())
     _console.print(
@@ -439,31 +467,40 @@ def optimize(
         f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
         f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
     )
-    run_argv = [
-        "wmh",
-        "eval",
-        tasks_file,
-        "--mode",
-        "closed-loop",
-        "--name",
-        model_name,
-        "--root",
-        root,
-        "--k",
-        str(k),
-        "--harness",
-        f"{name}@{saved.version}",
-    ]
-    if backend == "e2b":
-        run_argv.extend(("--harness-backend", "e2b"))
-    if eval_concurrency is not None:
-        run_argv.extend(("--eval-concurrency", str(eval_concurrency)))
-    if backend == "e2b" and e2b_template is not None:
-        run_argv.extend(("--e2b-template", e2b_template))
-    _console.print(
-        f"  run it: [bold]{escape(shlex.join(run_argv))}[/bold]",
-        soft_wrap=True,
-    )
+    if environment.hosted:
+        # `wmh eval --mode closed-loop` scores against a LOCAL model, so pointing at the hosted
+        # name would not resolve; publishing the champion is the useful next step instead.
+        _console.print(
+            f"  publish it: [bold]{escape(shlex.join(['wmh', 'push', name, '--root', root]))}"
+            "[/bold]",
+            soft_wrap=True,
+        )
+    else:
+        run_argv = [
+            "wmh",
+            "eval",
+            tasks_file,
+            "--mode",
+            "closed-loop",
+            "--name",
+            model_name,
+            "--root",
+            root,
+            "--k",
+            str(k),
+            "--harness",
+            f"{name}@{saved.version}",
+        ]
+        if backend == "e2b":
+            run_argv.extend(("--harness-backend", "e2b"))
+        if eval_concurrency is not None:
+            run_argv.extend(("--eval-concurrency", str(eval_concurrency)))
+        if backend == "e2b" and e2b_template is not None:
+            run_argv.extend(("--e2b-template", e2b_template))
+        _console.print(
+            f"  run it: [bold]{escape(shlex.join(run_argv))}[/bold]",
+            soft_wrap=True,
+        )
     if archive_out:
         Path(archive_out).write_text(result.archive.model_dump_json(indent=2), encoding="utf-8")
         _console.print(f"  wrote archive -> {archive_out}")
@@ -486,7 +523,69 @@ def _resolve_seed(store: HarnessStore, seed: str | None) -> HarnessDoc:
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider, str]:
+@dataclass(frozen=True)
+class _OptimizeEnvironment:
+    """The resolved environment under search plus the providers its rollouts need.
+
+    ``provider`` is the base provider: it judges rollouts and stands in for any unset opt-in
+    role. A local world model supplies its own serving provider; a hosted one leaves prediction
+    on the platform, so the base comes from the project's ``worker`` model instead.
+    """
+
+    source: EnvironmentSource
+    provider: Provider
+    hosted: bool
+    client: PlatformClient | None = None
+
+    def close(self) -> None:
+        """Release the hosted connection, if this environment opened one."""
+        if self.client is not None:
+            self.client.close()
+
+
+def _resolve_environment(name: str | None, root: str, *, local_only: bool) -> _OptimizeEnvironment:
+    """Resolve the ENVIRONMENT argument, preferring the platform once the user is logged in.
+
+    A login means the org's world models are the ones being iterated on, so a logged-in run
+    optimizes against the hosted model of that name (or id) without building or pulling it
+    locally. Names the platform does not know still fall back to a local artifact, and
+    ``--local`` skips the platform entirely.
+    """
+    credentials = load_credentials()
+    if local_only or not credentials.is_complete():
+        return _local_environment(name, root)
+    client = PlatformClient(str(credentials.api_url), str(credentials.token))
+    try:
+        remote = _remote_world_model(client, name, credentials.default_org)
+    except PlatformError as error:
+        client.close()
+        raise typer.BadParameter(str(error)) from error
+    except BaseException:
+        client.close()
+        raise
+    if remote is None:
+        client.close()
+        return _local_environment(name, root)
+    if remote.status != "ready":
+        client.close()
+        raise typer.BadParameter(
+            f"platform world model {remote.name!r} is {remote.status}, not ready; "
+            "wait for its build to finish (see the world model's page)"
+        )
+    provider, model = resolve_base_provider(root)
+    _console.print(
+        f"[dim]using the platform world model [bold]{remote.name}[/bold] ({remote.id}); "
+        f"agent and judge run here on {model}[/dim]"
+    )
+    return _OptimizeEnvironment(
+        source=HostedWorldModelSource(client, remote.id, label=remote.name),
+        provider=provider,
+        hosted=True,
+        client=client,
+    )
+
+
+def _local_environment(name: str | None, root: str) -> _OptimizeEnvironment:
     """Resolve a world model by name (or the sole built one) and load it with its provider."""
     store = WorldModelStore(root)
     try:
@@ -494,7 +593,36 @@ def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     world_model, provider = load_world_model(model_dir)
-    return world_model, provider, model_dir.name
+    return _OptimizeEnvironment(
+        source=WorldModelSource(world_model, label=model_dir.name),
+        provider=provider,
+        hosted=False,
+    )
+
+
+def _remote_world_model(
+    client: PlatformClient, name: str | None, org_id: str | None
+) -> RemoteWorldModel | None:
+    """Find the world model `name` identifies, by platform id then by org name; None if neither.
+
+    Ids resolve without knowing the organization, which is why they are tried first: only a
+    name lookup has to pick an org, and only then does an ambiguous login become an error.
+    """
+    if name is None:
+        return None
+    try:
+        return client.get_world_model(name)
+    except PlatformError as error:
+        if error.status_code not in (404, 422):
+            raise
+    return next(
+        (
+            candidate
+            for candidate in client.list_world_models(default_org(client, org_id))
+            if candidate.name == name
+        ),
+        None,
+    )
 
 
 # -- the harbor environment: complete-source population optimization on real tasks ------------
