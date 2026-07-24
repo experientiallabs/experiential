@@ -235,8 +235,7 @@ function headlines(){
   div.innerHTML=`<div style="color:var(--muted);font-size:12px">${m}</div>
    <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
    <div style="color:var(--muted)"><b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
-   (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>
-   <div style="margin-top:7px;font-size:12px;color:var(--muted)">vs best single <b style="color:var(--ink)">${bs.params.model}</b> · <b style="color:${nWarn?'var(--c1)':'var(--ink)'}">n=${r.scenarios}</b>${nWarn?' <span style="color:var(--c1)">(small)</span>':''}</div>`;
+   (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>`;
   // Per-model economics for this run: routed calls, total cost, token share.
   const counts={}; Object.entries(r.model_mix).forEach(([mo,s])=>counts[mo]=Math.round(s*r.scenarios));
   const totCost={}; Object.entries(r.per_model_cost_per_call||{}).forEach(([mo,c])=>totCost[mo]=c*(counts[mo]||0));
@@ -253,8 +252,8 @@ function headlines(){
   const detail=`<h4>${best.variant} ${JSON.stringify(best.params)} <span style="color:var(--muted);font-weight:400">vs best-single ${bs.params.model}</span></h4>`+
    `<table><tr><th></th><th>acc</th><th>cost/call</th><th>p50</th></tr>`+
    `<tr><td>routed</td><td><b>${fmtP(r.accuracy)}</b></td><td><b>${fmt$(r.cost_per_call)}</b></td><td><b>${r.latency_p50_s?r.latency_p50_s.toFixed(2)+'s':'-'}</b></td></tr>`+
-   `<tr><td>baseline</td><td>${fmtP(b.accuracy)}</td><td>${fmt$(b.cost_per_call)}</td><td>${b.latency_p50_s?b.latency_p50_s.toFixed(2)+'s':'-'}</td></tr></table>`+
-   `<div style="color:var(--muted);margin:8px 0 10px">n = ${r.scenarios} held-out${r.scenarios<60?' · <b>small n - wide noise floor</b>':''} · unscored ${r.unscored} · split seed ${best.split_seed} · fit ${best.fit_scenarios}</div>`+
+   `<tr><td>baseline · <b>${bs.params.model}</b></td><td>${fmtP(b.accuracy)}</td><td>${fmt$(b.cost_per_call)}</td><td>${b.latency_p50_s?b.latency_p50_s.toFixed(2)+'s':'-'}</td></tr></table>`+
+   `<div style="margin:8px 0 10px;padding:6px 10px;border:1px solid var(--grid);border-radius:6px"><b style="font-size:14px;color:${nWarn?'var(--c1)':'var(--ink)'}">n = ${r.scenarios}</b> held-out scenarios${nWarn?' · <b style="color:var(--c1)">small n - wide noise floor</b>':''}<span style="color:var(--muted)"> · unscored ${r.unscored} · split seed ${best.split_seed} · fit ${best.fit_scenarios}</span></div>`+
    `<div style="font-weight:600;margin-bottom:4px">Cost by model</div>`+
    `<svg viewBox="0 0 ${W} 16" style="width:100%;display:block">${seg}</svg>`+
    `<table style="margin-top:6px"><tr><th>model</th><th>calls</th><th>tok %</th><th>cost</th><th>cost %</th></tr>${rows2}</table>`;
