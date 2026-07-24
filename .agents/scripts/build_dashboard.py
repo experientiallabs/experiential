@@ -51,8 +51,9 @@ th{color:var(--muted);font-weight:500;cursor:pointer}
 .info{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--muted);border-radius:50%;color:var(--muted);font-size:10px;margin-left:5px;cursor:help;vertical-align:1px}
 </style></head><body>
 <h1>Routing ablations</h1>
-<p class="sub">Cost, quality, and speed per router variant. Every dot is one run on the held-out
-split; hover anything for the full record. Generated from runs.jsonl.</p>
+<p class="sub">Cost, quality, and speed per router variant, on OUR model pool. Every dot is one
+run on the held-out split; hover anything for the full record. Rebuild with --all to also see
+the fitter-validation matrices (other papers' model pools).</p>
 <div class="filters" id="matrixFilter"></div>
 <div class="legend" id="variantLegend"></div>
 <h2>Cost vs quality (Pareto), per matrix</h2>
@@ -222,6 +223,12 @@ def main() -> None:
         ".wmh/evals/dashboard.html"
     )
     runs = [json.loads(line) for line in RUNS.read_text(encoding="utf-8").splitlines()]
+    # Default view = OUR models only (the 9-model pool on certified prompts + the wm corpora).
+    # The fitter-validation matrices (RouterBench 2023 models, LLMRouterBench flagships) are
+    # research plumbing; include them explicitly with --all.
+    if "--all" not in sys.argv:
+        ours = {"routerbench-ours9"}
+        runs = [r for r in runs if r["matrix"] in ours or r["matrix"].startswith("wm-")]
     out.parent.mkdir(parents=True, exist_ok=True)
     html = TEMPLATE.replace("__DATA__", json.dumps(runs))
     # Syntax gate: a single bad quote blanks the whole page silently; check before shipping.
