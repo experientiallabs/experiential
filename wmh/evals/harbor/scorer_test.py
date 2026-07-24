@@ -442,6 +442,81 @@ def test_template_ownership_and_local_concurrency_rules(tmp_path: Path) -> None:
         )
 
 
+def test_custom_agent_import_path_and_extra_kwargs_thread_into_the_job(tmp_path: Path) -> None:
+    """The distill collector's route: a custom bridge plus its extra kwargs, with every
+    scorer-owned kwarg intact next to them."""
+    scorer = HarborScorer(
+        job_template=_job_template(tmp_path),
+        tasks=_tasks(tmp_path, ("task-a",)),
+        provider_config=_provider(),
+        harness_backend="e2b",
+        e2b_template="pi-template",
+        agent_concurrency=1,
+        agent_import_path="wmh.distill.agents:WmhDistillHarborAgent",
+        extra_agent_kwargs={"token_sink_dir": "/runs/tokens/step-0000"},
+        runner=_Runner([]),
+    )
+    candidate = HarnessDoc.baseline()
+    config = scorer._candidate_job(candidate)
+    [agent] = config.agents
+    assert agent.import_path == "wmh.distill.agents:WmhDistillHarborAgent"
+    assert agent.kwargs["token_sink_dir"] == "/runs/tokens/step-0000"
+    assert agent.kwargs["harness"] == candidate.model_dump(mode="json")
+    assert agent.kwargs["harness_backend"] == "e2b"
+    assert agent.kwargs["e2b_template"] == "pi-template"
+
+
+def test_extra_agent_kwargs_and_import_path_are_validated(tmp_path: Path) -> None:
+    """Extras may extend the agent kwargs but never shadow the scorer-owned ones."""
+    with pytest.raises(ValueError, match=r"scorer-owned agent kwargs \['harness'\]"):
+        HarborScorer(
+            job_template=_job_template(tmp_path),
+            tasks=_tasks(tmp_path, ("task-a",)),
+            provider_config=_provider(),
+            harness_backend="e2b",
+            agent_concurrency=1,
+            extra_agent_kwargs={"harness": {}, "token_sink_dir": "/tmp/x"},
+        )
+    with pytest.raises(ValueError, match="module:Class"):
+        HarborScorer(
+            job_template=_job_template(tmp_path),
+            tasks=_tasks(tmp_path, ("task-a",)),
+            provider_config=_provider(),
+            harness_backend="e2b",
+            agent_concurrency=1,
+            agent_import_path="not-an-import-path",
+        )
+
+
+def test_create_threads_agent_import_path_and_extra_kwargs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_resolve(
+        _dataset: DatasetConfig,
+        task_ids: list[str],
+    ) -> list[TaskConfig]:
+        return _tasks(tmp_path, tuple(task_ids))
+
+    monkeypatch.setattr(scorer_module, "resolve_harbor_tasks", fake_resolve)
+    scorer = asyncio.run(
+        HarborScorer.create(
+            _job_template(tmp_path),
+            ["task-a"],
+            provider_config=_provider(),
+            harness_backend="e2b",
+            e2b_template="pi-template",
+            agent_concurrency=1,
+            agent_import_path="wmh.distill.agents:WmhDistillHarborAgent",
+            extra_agent_kwargs={"token_sink_dir": "/runs/tokens/step-0001"},
+        )
+    )
+    config = scorer._candidate_job(HarnessDoc.baseline())
+    [agent] = config.agents
+    assert agent.import_path == "wmh.distill.agents:WmhDistillHarborAgent"
+    assert agent.kwargs["token_sink_dir"] == "/runs/tokens/step-0001"
+
+
 def test_harbor_retries_thread_into_retry_config_with_default_exclusions(
     tmp_path: Path,
 ) -> None:

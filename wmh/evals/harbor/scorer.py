@@ -42,6 +42,7 @@ from harbor.models.trial.config import AgentConfig, TaskConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
+from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import (
     DEFAULT_EPISODE_WORKERS,
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
@@ -68,6 +69,21 @@ HarnessBackend = Literal["local", "e2b"]
 # concurrent scores of the same candidate must be rejected, not interleaved.
 _ACTIVE_GUARD = threading.Lock()
 _ACTIVE_JOB_DIRS: set[Path] = set()
+
+# Agent kwargs the scorer computes and owns; `extra_agent_kwargs` may extend the kwargs dict but
+# never silently override these, or a custom agent would run a different candidate/provider than
+# the one this scorer reports on.
+_SCORER_OWNED_AGENT_KWARGS = frozenset(
+    {
+        "harness",
+        "provider_config",
+        "harness_backend",
+        "e2b_template",
+        "command_timeout_sec",
+        "episode_timeout_sec",
+        "episode_workers",
+    }
+)
 
 
 class HarborRewardMissingError(RuntimeError):
@@ -163,6 +179,8 @@ class HarborScorer:
         command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         agent_concurrency: int | None = None,
         harbor_retries: int = 0,
+        agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
+        extra_agent_kwargs: JsonObject | None = None,
         runner: HarborRunner | None = None,
     ) -> None:
         if not tasks:
@@ -187,6 +205,18 @@ class HarborScorer:
             raise ValueError("harbor_retries must be a nonnegative integer")
         if harbor_retries < 0:
             raise ValueError("harbor_retries must be a nonnegative integer")
+        if not agent_import_path or ":" not in agent_import_path:
+            raise ValueError(
+                f"agent_import_path must be a 'module:Class' import path, got "
+                f"{agent_import_path!r}; use the exported constant of the agent bridge "
+                "(e.g. WMH_HARBOR_AGENT_IMPORT_PATH)"
+            )
+        overridden = _SCORER_OWNED_AGENT_KWARGS & set(extra_agent_kwargs or {})
+        if overridden:
+            raise ValueError(
+                f"extra_agent_kwargs may not override the scorer-owned agent kwargs "
+                f"{sorted(overridden)}; configure those through the scorer's own parameters"
+            )
         if agent_concurrency is not None and (
             isinstance(agent_concurrency, bool)
             or not isinstance(agent_concurrency, int)
@@ -232,6 +262,8 @@ class HarborScorer:
         self._reward_key = reward_key
         self._reward_mode: RewardMode = reward_mode
         self._attempts = attempts
+        self._agent_import_path = agent_import_path
+        self._extra_agent_kwargs: JsonObject = dict(extra_agent_kwargs or {})
         self._harness_backend: HarnessBackend = harness_backend
         self._episode_timeout_s = episode_timeout_s
         self._command_timeout_sec = command_timeout_sec
@@ -266,6 +298,8 @@ class HarborScorer:
         command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         agent_concurrency: int | None = None,
         harbor_retries: int = 0,
+        agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
+        extra_agent_kwargs: JsonObject | None = None,
         runner: HarborRunner | None = None,
     ) -> Self:
         """Resolve the exact tasks and construct a scorer that can incur spend.
@@ -273,6 +307,9 @@ class HarborScorer:
         `job_template` supplies the run directory (`jobs_dir`), the task environment config,
         and harbor tuning (timeouts, concurrency); it must carry exactly one dataset, no direct
         tasks, and an untouched default agent + retry config (the scorer owns those).
+        `agent_import_path` plus `extra_agent_kwargs` route trials through a custom agent
+        bridge (e.g. the distill collector's token-recording subclass); the defaults preserve
+        the standard WMH agent, and extra kwargs may never shadow the scorer-owned ones.
         """
         if len(job_template.datasets) != 1 or job_template.tasks:
             raise ValueError("HarborScorer requires exactly one dataset and no direct tasks")
@@ -291,6 +328,8 @@ class HarborScorer:
             command_timeout_sec=command_timeout_sec,
             agent_concurrency=agent_concurrency,
             harbor_retries=harbor_retries,
+            agent_import_path=agent_import_path,
+            extra_agent_kwargs=extra_agent_kwargs,
             runner=runner,
         )
 
@@ -370,7 +409,7 @@ class HarborScorer:
         agent_fields.update(
             {
                 "name": None,
-                "import_path": WMH_HARBOR_AGENT_IMPORT_PATH,
+                "import_path": self._agent_import_path,
                 "model_name": f"{self._provider_config.kind.value}/{self._provider_config.model}",
                 "skills": [],
                 "env": {},
@@ -383,6 +422,9 @@ class HarborScorer:
                     "command_timeout_sec": self._command_timeout_sec,
                     "episode_timeout_sec": self._episode_timeout_s,
                     "episode_workers": self._episode_workers,
+                    # Custom-bridge kwargs; collisions with the scorer-owned keys above
+                    # were rejected at construction, so this merge cannot shadow them.
+                    **self._extra_agent_kwargs,
                 },
             }
         )
