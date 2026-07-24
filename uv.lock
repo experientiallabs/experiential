@@ -3828,7 +3828,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "seaborn", marker = "extra == 'viz'", specifier = ">=0.13" },
-    { name = "tinker", marker = "extra == 'distill'", specifier = ">=0.23" },
+    { name = "tinker", marker = "extra == 'distill'", specifier = ">=0.23,<0.24" },
     { name = "tinker-cookbook", marker = "extra == 'distill'", specifier = ">=0.4.3,<0.5" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },

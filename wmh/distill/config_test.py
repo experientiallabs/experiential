@@ -12,6 +12,7 @@ from wmh.distill.config import (
     PricingConfig,
     StudentConfig,
     TeacherConfig,
+    TrainConfig,
     WandbConfig,
     WarmupConfig,
     load_distill_config,
@@ -409,6 +410,14 @@ def test_snapshot_round_trips_the_pricing_section(tmp_path: Path) -> None:
 def test_direct_model_validation_rejects_extra() -> None:
     with pytest.raises(ValidationError):
         StudentConfig.model_validate({"base_model": "m", "surprise": 1})
+
+
+@pytest.mark.parametrize("value", [0, -65536])
+def test_train_max_datum_tokens_must_be_positive(value: int) -> None:
+    # A zero or negative cap (a dropped minus sign survives TOML) would silently
+    # reject every episode from training after the rollout budget was already spent.
+    with pytest.raises(ValidationError):
+        TrainConfig.model_validate({"max_datum_tokens": value})
 
 
 def test_checked_in_run_configs_resolve_cookbook_renderers() -> None:

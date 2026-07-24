@@ -107,7 +107,7 @@ class TrainConfig(BaseModel):
     learning_rate: float = Field(default=1e-4, gt=0)
     advantage_clip: float = Field(default=4.0, gt=0)
     center_advantages: bool = True
-    max_datum_tokens: int = 65536
+    max_datum_tokens: int = Field(default=65536, ge=1)
     sampler_refresh_every: int = Field(default=1, ge=1)
     save_state_every: int = Field(default=8, ge=1)
     trial_concurrency: int = Field(default=8, ge=1)
@@ -190,6 +190,15 @@ USD/Mtok). An explicit `*_cached_prefill` field overrides this derivation.
 """
 
 
+def _effective_cached(explicit: float | None, full_prefill: float | None) -> float | None:
+    """The cached-prefill rate charged: the explicit override, else 20% of the full rate."""
+    if explicit is not None:
+        return explicit
+    if full_prefill is not None:
+        return full_prefill * CACHED_PREFILL_FRACTION
+    return None
+
+
 class PricingConfig(BaseModel):
     """Per-model per-meter prices, USD per million tokens (all optional).
 
@@ -222,35 +231,26 @@ class PricingConfig(BaseModel):
     @property
     def effective_student_cached_prefill(self) -> float | None:
         """The student cached-prefill price actually charged (see class docstring)."""
-        if self.student_cached_prefill is not None:
-            return self.student_cached_prefill
-        if self.student_prefill is not None:
-            return self.student_prefill * CACHED_PREFILL_FRACTION
-        return None
+        return _effective_cached(self.student_cached_prefill, self.student_prefill)
 
     @property
     def effective_teacher_cached_prefill(self) -> float | None:
         """The teacher cached-prefill price actually charged (see class docstring)."""
-        if self.teacher_cached_prefill is not None:
-            return self.teacher_cached_prefill
-        if self.teacher_prefill is not None:
-            return self.teacher_prefill * CACHED_PREFILL_FRACTION
-        return None
+        return _effective_cached(self.teacher_cached_prefill, self.teacher_prefill)
 
     def is_complete(self) -> bool:
         """Whether every meter has a price, so run cost can be fully accounted.
 
         The cached-prefill meters count as priced through their derived 20%
-        defaults, so completeness needs exactly the four full prices plus
-        `teacher_sample`.
+        defaults whenever the corresponding full prefill price is set (which
+        this requires), so completeness needs exactly the four full prices
+        plus `teacher_sample`.
         """
         return (
             self.student_prefill is not None
-            and self.effective_student_cached_prefill is not None
             and self.student_sample is not None
             and self.student_train is not None
             and self.teacher_prefill is not None
-            and self.effective_teacher_cached_prefill is not None
             and self.teacher_sample is not None
         )
 

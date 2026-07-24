@@ -369,7 +369,20 @@ def test_missing_api_key_is_actionable(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_tinker_path_without_model_type_is_actionable() -> None:
     config = ProviderConfig(kind=ProviderKind.TINKER, model="tinker://run/weights/0")
     provider = TinkerChatProvider(config, sampling_client=FakeSamplingClient(seed="s"))
-    with pytest.raises(ValueError, match="model_type"):
+    with pytest.raises(ValueError, match="model_type is unset"):
+        provider.complete_chat(_request())
+
+
+def test_tinker_path_in_model_type_names_the_swapped_field() -> None:
+    # The swapped-fields mistake (weights path in model_type) must not claim that
+    # model_type is unset; the message points at the field that actually holds the path.
+    config = ProviderConfig(
+        kind=ProviderKind.TINKER,
+        model="Qwen/Qwen3-8B",
+        model_type="tinker://run/weights/0",
+    )
+    provider = TinkerChatProvider(config, sampling_client=FakeSamplingClient(seed="s"))
+    with pytest.raises(ValueError, match="weights paths belong in config.model"):
         provider.complete_chat(_request())
 
 

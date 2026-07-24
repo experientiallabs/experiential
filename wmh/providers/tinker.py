@@ -237,6 +237,12 @@ class TinkerChatProvider:
     def _base_model_name(self) -> str:
         base = self.config.model_type or self.config.model
         if base.startswith("tinker://"):
+            if self.config.model_type:
+                raise ValueError(
+                    "config.model_type is a tinker:// weights path; set model_type to "
+                    "the base model name (e.g. 'Qwen/Qwen3-8B') so the renderer and "
+                    "tokenizer can be resolved (weights paths belong in config.model)"
+                )
             raise ValueError(
                 "config.model is a tinker:// weights path and config.model_type is "
                 "unset; set model_type to the base model name (e.g. 'Qwen/Qwen3-8B') "
