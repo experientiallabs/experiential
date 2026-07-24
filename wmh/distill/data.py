@@ -19,7 +19,11 @@ a run trace marked with the overflow stop reason) and for merged lengths over
 and `to_tinker_datums` converts to real `tinker.Datum`s in the shifted
 next-token layout the cookbook uses; `to_tinker_sft_datums` is the
 cross_entropy sibling for the supervised warmup phase (teacher-sampled
-trajectories need no advantages, only the loss-mask weights). The tinker SDK
+trajectories need no advantages, only the loss-mask weights). For the
+`topk_ce` loss, `build_topk_ce_datums` turns teacher top-k candidate rows
+into rank-aligned replica datums (see its docstring for why replication is
+per RANK, not per position) and `to_tinker_topk_ce_datums` is its one-call
+wire conversion through the same pinned cross_entropy keyset. The tinker SDK
 is an optional extra and is imported lazily inside those converters only,
 mirroring the provider's contract; everything else here runs without it.
 """
@@ -46,6 +50,9 @@ MISSING_TINKER_EXTRA = (
     "the tinker SDK is not installed; run `uv sync --extra distill` to convert "
     "training datums for a real Tinker training client"
 )
+
+TopkCandidates = list[tuple[int, float]]
+"""One position's teacher top-k: (token_id, logprob) pairs, best first."""
 
 CONTEXT_OVERFLOW_STOP_REASON = "context_overflow"
 """A run-trace stop reason marking an episode that outgrew the context budget.
@@ -89,6 +96,19 @@ class TrainDatum(BaseModel):
     advantages: list[float] = Field(default_factory=list)
     """Per-token advantages; empty until `attach_advantages` fills them."""
 
+    target_tokens: list[int] = Field(default_factory=list)
+    """Per-position training targets when they differ from the sequence's own
+    tokens; empty for ordinary datums (targets are the next tokens of
+    `model_input_tokens`). Set only on topk-CE replicas, where each loss
+    position's target is a teacher candidate rather than the realized token
+    (`build_topk_ce_datums`); non-loss positions keep the realized token."""
+
+    target_weights: list[float] = Field(default_factory=list)
+    """Per-position cross_entropy weights replacing the loss mask on the wire;
+    empty for ordinary datums (the loss mask is the weight). Set only on
+    topk-CE replicas: the renormalized teacher probability of this replica's
+    candidate at each loss position, 0.0 everywhere else."""
+
     @model_validator(mode="after")
     def _check_alignment(self) -> TrainDatum:
         """Reject any misalignment between the token sequence and its per-token lists."""
@@ -106,7 +126,32 @@ class TrainDatum(BaseModel):
                 f"advantages length {len(self.advantages)} must match "
                 f"model_input_tokens length {n} (or be empty before attach_advantages)"
             )
+        if bool(self.target_tokens) != bool(self.target_weights):
+            raise ValueError(
+                "target_tokens and target_weights must be set together (a topk-CE "
+                "replica carries both) or both left empty"
+            )
+        if self.target_tokens and (len(self.target_tokens) != n or len(self.target_weights) != n):
+            raise ValueError(
+                f"target_tokens length {len(self.target_tokens)} and target_weights "
+                f"length {len(self.target_weights)} must both match "
+                f"model_input_tokens length {n}"
+            )
+        if self.target_weights and any(
+            weight != 0.0 and mask != 1.0
+            for weight, mask in zip(self.target_weights, self.loss_mask, strict=True)
+        ):
+            raise ValueError(
+                "target_weights may be nonzero only at loss positions (mask 1.0); a "
+                "weighted context position would train on tokens the student never "
+                "sampled"
+            )
         return self
+
+    @property
+    def is_topk_replica(self) -> bool:
+        """Whether this datum is a topk-CE replica (candidate targets attached)."""
+        return bool(self.target_tokens)
 
     @property
     def loss_token_count(self) -> int:
@@ -474,6 +519,188 @@ def attach_advantages(
     return attached, stats
 
 
+class TopkCeStats(BaseModel):
+    """Accounting for one `build_topk_ce_datums` call.
+
+    Token counters cover only the KEPT source datums: a source dropped for a
+    misaligned or unscoreable top-k row is never trained on.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source_datums: int = Field(ge=0)
+    """Source datums that survived and were replicated."""
+
+    datums: int = Field(ge=0)
+    """Replica datums emitted (`source_datums x k`)."""
+
+    mismatch_drops: int = Field(ge=0)
+    """Source datums dropped because their top-k row did not align (wrong
+    length, or no candidates at a loss position)."""
+
+    loss_tokens: int = Field(ge=0)
+    """Loss positions across the kept source datums (per copy, not x k)."""
+
+
+def _renormalized_probs(candidates: TopkCandidates) -> list[float]:
+    """Softmax the candidates' logprobs over just the top-k support.
+
+    The teacher's top-k logprobs are from the FULL vocabulary distribution,
+    so they sum to less than 1; renormalizing over the k candidates makes the
+    per-position replica weights a proper distribution (they sum to 1 across
+    the k copies), keeping the weighted-CE objective's per-position scale
+    independent of how much mass the tail held.
+    """
+    peak = max(logprob for _, logprob in candidates)
+    exps = [math.exp(logprob - peak) for _, logprob in candidates]
+    total = sum(exps)
+    return [value / total for value in exps]
+
+
+def build_topk_ce_datums(
+    datums: Sequence[TrainDatum],
+    topk_rows: Sequence[Sequence[TopkCandidates | None]],
+    k: int,
+) -> tuple[list[TrainDatum], TopkCeStats]:
+    """Build rank-aligned topk-CE replica datums from teacher top-k rows.
+
+    The weighted-CE objective is per POSITION: at each loss position p the
+    loss is `sum_j w_j(p) * CE(target=candidate_j(p))` with `w_j(p)` the
+    renormalized teacher probability of candidate j at p. Emitting one
+    single-target datum per (position, candidate) would compute exactly that
+    but explode the datum count (loss_tokens x k datums, each re-prefilling
+    the whole sequence). Instead each source datum becomes k RANK-ALIGNED
+    replicas sharing the model input: replica j uses, at EVERY loss position,
+    the j-th ranked candidate as target with its renormalized probability as
+    weight (replica 0 is the teacher's top choice everywhere, and so on).
+    Because cross_entropy is a per-position sum of `weight * -logprob(target)`
+    with no cross-position coupling, summing the k replicas reproduces the
+    identical per-position weighted-CE objective with k forward passes
+    instead of k per position; the weights at each loss position sum to 1
+    across the replicas.
+
+    Positions where the teacher returned fewer than k candidates pad the
+    missing ranks with the realized token at weight 0.0 (no loss, and the
+    remaining ranks' weights still renormalize over the AVAILABLE candidates,
+    so the position keeps unit total weight). Non-loss positions carry the
+    realized next token at weight 0.0 in every replica. Candidates are
+    sorted best-first defensively (logprob descending, token id ascending on
+    ties) so rank is well defined regardless of backend ordering.
+
+    Alignment failures drop the SOURCE datum loudly and are counted, exactly
+    like `attach_advantages`: a wrong-length row, a None at a loss position
+    (including an unscoreable loss token at position 0), or an empty
+    candidate list at a loss position.
+
+    Args:
+        datums: Datums from `build_datums` (advantages not needed).
+        topk_rows: One per-position row per datum, aligned one to one with
+            `datums`; entry p is the teacher's top-k candidates for token p
+            when p is a scoreable loss position and None everywhere else
+            (`TeacherClient.score_topk`).
+        k: The replica count (`train.topk`); rows may carry at most k
+            candidates per position.
+
+    Returns:
+        The replica datums (source order, then rank order) and the stats.
+
+    Raises:
+        ValueError: If `k < 1`, `topk_rows` does not have one entry per
+            datum, or a position carries more than k candidates; those are
+            caller bugs, not per-datum evidence, so nothing is dropped.
+    """
+    if k < 1:
+        raise ValueError(f"k must be >= 1, got {k}")
+    if len(topk_rows) != len(datums):
+        raise ValueError(
+            f"got {len(topk_rows)} top-k row(s) for {len(datums)} datum(s); pass "
+            "exactly one per-position row per datum, in datum order"
+        )
+    replicas: list[TrainDatum] = []
+    mismatch_drops = 0
+    kept_sources = 0
+    loss_tokens = 0
+    for datum, row in zip(datums, topk_rows, strict=True):
+        n = len(datum.model_input_tokens)
+        if len(row) != n:
+            mismatch_drops += 1
+            logger.warning(
+                "dropping datum (trial %s, fragment %d) from training: teacher "
+                "returned %d top-k entrie(s) for %d token(s); the teacher must "
+                "score the datum's exact token sequence with one entry per position",
+                datum.trial_name,
+                datum.fragment_index,
+                len(row),
+                n,
+            )
+            continue
+        bad_position = next(
+            (
+                position
+                for position in range(n)
+                if datum.loss_mask[position] == 1.0 and not row[position]
+            ),
+            None,
+        )
+        if bad_position is not None:
+            mismatch_drops += 1
+            logger.warning(
+                "dropping datum (trial %s, fragment %d) from training: the teacher "
+                "top-k row has no candidates at loss position %d (position 0 can "
+                "never be scored; elsewhere the teacher must return candidates for "
+                "every sampled position)",
+                datum.trial_name,
+                datum.fragment_index,
+                bad_position,
+            )
+            continue
+        oversized = next((position for position in range(n) if len(row[position] or []) > k), None)
+        if oversized is not None:
+            raise ValueError(
+                f"top-k row for datum (trial {datum.trial_name}, fragment "
+                f"{datum.fragment_index}) carries {len(row[oversized] or [])} "
+                f"candidates at position {oversized}, more than k = {k}; score with "
+                "the same k the replication uses"
+            )
+        per_position: list[tuple[list[int], list[float]]] = []
+        for position in range(n):
+            candidates = row[position]
+            if datum.loss_mask[position] != 1.0 or not candidates:
+                per_position.append(([datum.model_input_tokens[position]] * k, [0.0] * k))
+                continue
+            ranked = sorted(candidates, key=lambda entry: (-entry[1], entry[0]))
+            weights = _renormalized_probs(ranked)
+            tokens = [token for token, _ in ranked]
+            pad = k - len(ranked)
+            per_position.append(
+                (
+                    tokens + [datum.model_input_tokens[position]] * pad,
+                    weights + [0.0] * pad,
+                )
+            )
+        kept_sources += 1
+        loss_tokens += datum.loss_token_count
+        for rank in range(k):
+            replicas.append(
+                TrainDatum(
+                    trial_name=datum.trial_name,
+                    fragment_index=datum.fragment_index,
+                    model_input_tokens=datum.model_input_tokens,
+                    loss_mask=datum.loss_mask,
+                    sampled_logprobs=datum.sampled_logprobs,
+                    target_tokens=[tokens[rank] for tokens, _ in per_position],
+                    target_weights=[weights[rank] for _, weights in per_position],
+                )
+            )
+    stats = TopkCeStats(
+        source_datums=kept_sources,
+        datums=len(replicas),
+        mismatch_drops=mismatch_drops,
+        loss_tokens=loss_tokens,
+    )
+    return replicas, stats
+
+
 def to_tinker_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
     """Convert attached datums to real `tinker.Datum`s for importance_sampling.
 
@@ -541,12 +768,16 @@ def to_tinker_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
 
 
 def to_tinker_sft_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
-    """Convert datums to real `tinker.Datum`s for the cross_entropy warmup loss.
+    """Convert datums to real `tinker.Datum`s for the cross_entropy loss.
 
-    Same shifted next-token layout as `to_tinker_datums`, but for supervised
-    warmup on teacher-sampled trajectories: no advantages are needed (or
-    read), and the loss mask rides as the `weights` input so context tokens
-    carry no loss (the backend CE loss is `sum(-logprobs * weights)`).
+    Same shifted next-token layout as `to_tinker_datums`, but for the two
+    cross_entropy consumers: supervised warmup on teacher-sampled
+    trajectories (no advantages are needed or read; the loss mask rides as
+    the `weights` input so context tokens carry no loss, the backend CE loss
+    being `sum(-logprobs * weights)`), and topk-CE replicas from
+    `build_topk_ce_datums` (their attached `target_tokens` replace the
+    next-token targets at loss positions and their `target_weights`, the
+    renormalized teacher probabilities, replace the loss mask).
 
     The loss_fn_inputs keyset is exactly {"target_tokens", "weights"}: the
     cross_entropy backend of the pinned SDK (tinker 0.23.3) accepts only those
@@ -558,12 +789,12 @@ def to_tinker_sft_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datu
     once, so the keyset is pinned by `data_test.py` rather than trusted.
 
     Args:
-        train_datums: Datums from `build_datums` (advantages may be empty).
+        train_datums: Datums from `build_datums` (advantages may be empty)
+            or replicas from `build_topk_ce_datums`.
 
     Returns:
         One `tinker.Datum` per input datum, in order, with loss_fn_inputs
-        exactly target_tokens (int64) and weights (float32, the shifted
-        loss mask).
+        exactly target_tokens (int64) and weights (float32).
 
     Raises:
         ImportError: If the tinker SDK is not installed (distill extra).
@@ -585,17 +816,50 @@ def to_tinker_sft_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datu
                 "input/target shift"
             )
         length = len(tokens) - 1
+        targets = datum.target_tokens if datum.is_topk_replica else tokens
+        weights = datum.target_weights if datum.is_topk_replica else datum.loss_mask
         out.append(
             tinker.Datum(
                 model_input=tinker.ModelInput.from_ints(tokens[:-1]),
                 loss_fn_inputs={
                     "target_tokens": tinker.TensorData(
-                        data=tokens[1:], dtype="int64", shape=[length]
+                        data=targets[1:], dtype="int64", shape=[length]
                     ),
-                    "weights": tinker.TensorData(
-                        data=datum.loss_mask[1:], dtype="float32", shape=[length]
-                    ),
+                    "weights": tinker.TensorData(data=weights[1:], dtype="float32", shape=[length]),
                 },
             )
         )
     return out
+
+
+def to_tinker_topk_ce_datums(
+    train_datums: Sequence[TrainDatum],
+    topk_scores: Sequence[Sequence[TopkCandidates | None]],
+    k: int,
+) -> list[tinker.Datum]:
+    """Convert source datums plus teacher top-k rows to cross_entropy wire datums.
+
+    The one-call conversion for the `topk_ce` loss: `build_topk_ce_datums`
+    does the rank-aligned replication and weight renormalization (see its
+    docstring for the objective-equivalence argument), then the replicas ride
+    the pinned cross_entropy wire format (`to_tinker_sft_datums`: exactly
+    {"target_tokens", "weights"}). Misaligned rows drop their source datum
+    with a warning, mirroring the loop's own two-step path.
+
+    Args:
+        train_datums: Datums from `build_datums`.
+        topk_scores: One per-position top-k row per datum
+            (`TeacherClient.score_topk`).
+        k: The replica count (`train.topk`).
+
+    Returns:
+        `k` `tinker.Datum`s per kept source datum, source order then rank
+        order, sharing each source's model input.
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (distill extra).
+        ValueError: On caller bugs (`build_topk_ce_datums`) or datums too
+            short for the shift (`to_tinker_sft_datums`).
+    """
+    replicas, _ = build_topk_ce_datums(train_datums, topk_scores, k)
+    return to_tinker_sft_datums(replicas)

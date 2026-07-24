@@ -3,15 +3,22 @@
 The teacher never generates during training; it scores the student's exact
 sampled tokens. `TinkerTeacher` sends each `TrainDatum`'s full (unshifted)
 token sequence through `tinker.SamplingClient.compute_logprobs` and keeps the
-loss positions.
+loss positions. For the `topk_ce` loss, `score_topk` instead makes one
+prefill-only `sample` call per datum (`max_tokens=1`,
+`include_prompt_logprobs=True`, `topk_prompt_logprobs=k`; verified live on the
+pinned SDK, k <= 1000) whose response carries BOTH the per-position top-k
+candidates and the realized per-position logprobs, so one request feeds the
+candidate targets and the unchanged reverse-KL metric.
 
 Indexing convention (verified against both the real SDK and the fakes):
 `compute_logprobs(tokens)` returns one entry per input position, where entry p
 is the logprob of token p given tokens < p, and entry 0 is None because the
-first token has no context. The datum's `model_input_tokens` IS that full
-sequence and its `loss_mask` names the sampled positions, so the returned rows
-align index for index with the datum; `teacher_test.py` pins the alignment
-against the fake sampler's echoed logprobs to guard any off-by-one.
+first token has no context. The prefill response's `prompt_logprobs` and
+`topk_prompt_logprobs` follow the same convention. The datum's
+`model_input_tokens` IS that full sequence and its `loss_mask` names the
+sampled positions, so the returned rows align index for index with the datum
+(`teacher_test.py` pins the alignment against the fake sampler's echoed
+logprobs to guard any off-by-one).
 
 The tinker SDK is an optional extra imported lazily (`uv sync --extra
 distill`), mirroring `wmh.providers.tinker`; injecting a sampling client
@@ -33,10 +40,12 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict
 
 from wmh.distill.config import TeacherConfig
-from wmh.distill.data import TrainDatum
+from wmh.distill.data import TopkCandidates, TrainDatum
 from wmh.distill.deadlines import TinkerDeadlineError, wait_with_deadline
 from wmh.providers.base import ProviderKind, VerifyResult
 from wmh.providers.tinker import evict_shared_sampling_client, shared_sampling_client
@@ -63,6 +72,29 @@ TOKENIZER_PROBE_TEXTS: tuple[str, ...] = (
 """Default fingerprint probe corpus: prose, unicode, code, JSON, shell."""
 
 
+class TeacherTopkScores(BaseModel):
+    """One `score_topk` batch: top-k candidate rows plus realized logprobs.
+
+    Both lists align one to one with the scored datums and, per datum, index
+    for index with its `model_input_tokens` (the compute_logprobs
+    convention). They come from the same prefill response, so the realized
+    logprobs cost no extra teacher request.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    topk: list[list[TopkCandidates | None]]
+    """Per datum, per position: the teacher's top-k (token_id, logprob)
+    candidates when the position is a scoreable loss position (mask 1.0,
+    p >= 1), None everywhere else."""
+
+    realized: list[list[float | None]]
+    """Per datum, per position: the teacher's logprob of the REALIZED token
+    at scoreable loss positions, None everywhere else; identical in meaning
+    to a `score()` row, so the reverse-KL metric stays comparable across
+    loss modes."""
+
+
 class TeacherClient(Protocol):
     """What the distillation loop needs from a teacher backend."""
 
@@ -72,6 +104,15 @@ class TeacherClient(Protocol):
         Row entry p is the teacher's logprob of `model_input_tokens[p]` when p
         is a scoreable loss position (mask 1.0, p >= 1) and None everywhere
         else (context positions, and position 0, which has no context).
+        """
+        ...
+
+    def score_topk(self, datums: Sequence[TrainDatum], k: int) -> TeacherTopkScores:
+        """Per-position top-k candidate rows plus realized logprobs.
+
+        Row entry p carries the teacher's top-k (token_id, logprob)
+        candidates for position p when p is a scoreable loss position and
+        None everywhere else, following the same convention as `score`.
         """
         ...
 
@@ -108,6 +149,23 @@ class LogprobScorer(Protocol):
         ...
 
 
+@runtime_checkable
+class TopkLogprobScorer(Protocol):
+    """The prefill-only top-k call `score_topk` additionally needs.
+
+    `FakeSamplingClient` and `SdkLogprobScorer` (and the loop's
+    `SdkSamplingClient` wrapper) all provide it; `score_topk` narrows its
+    `LogprobScorer` to this at runtime so plain injected scorers keep
+    working for `score`.
+    """
+
+    def topk_prompt_logprobs(
+        self, token_ids: list[int], k: int
+    ) -> tuple[list[float | None], list[TopkCandidates | None]]:
+        """(realized logprobs, top-k rows), one entry per position each."""
+        ...
+
+
 class SdkLogprobScorer:
     """Adapts a real `tinker.SamplingClient` to the `LogprobScorer` seam."""
 
@@ -130,6 +188,48 @@ class SdkLogprobScorer:
 
         future = self._client.compute_logprobs(tinker.ModelInput.from_ints(token_ids))
         return wait_with_deadline("compute_logprobs", future)
+
+    def topk_prompt_logprobs(
+        self, token_ids: list[int], k: int
+    ) -> tuple[list[float | None], list[TopkCandidates | None]]:
+        """One deadline-bounded prefill-only sample returning prompt logprobs.
+
+        The whole sequence rides as the PROMPT of a `max_tokens=1` sample
+        request with `include_prompt_logprobs=True` and
+        `topk_prompt_logprobs=k` (the pinned SDK's only top-k surface,
+        verified live: k <= 1000). The response's `prompt_logprobs` and
+        `topk_prompt_logprobs` both follow the compute_logprobs convention
+        (entry p scores token p given tokens < p; entry 0 is None), so one
+        request yields the candidates AND the realized logprobs. The single
+        sampled token is discarded.
+
+        Raises:
+            TinkerDeadlineError: If the deadline expires (the session is
+                likely wedged; the caller should retry with a fresh one).
+            RuntimeError: If the response omits either logprob field (SDK
+                drift; the pinned tinker 0.23.3 populates both on request).
+        """
+        import tinker
+
+        future = self._client.sample(
+            prompt=tinker.ModelInput.from_ints(token_ids),
+            num_samples=1,
+            sampling_params=tinker.SamplingParams(max_tokens=1),
+            include_prompt_logprobs=True,
+            topk_prompt_logprobs=k,
+        )
+        response = wait_with_deadline("sample", future)
+        realized = response.prompt_logprobs
+        rows = response.topk_prompt_logprobs
+        if realized is None or rows is None:
+            missing = "prompt_logprobs" if realized is None else "topk_prompt_logprobs"
+            raise RuntimeError(
+                f"the teacher's prefill sample response carries no {missing} even "
+                "though the request asked for it; check the pinned tinker SDK "
+                "version (0.23.3 populates both when include_prompt_logprobs and "
+                "topk_prompt_logprobs are set)"
+            )
+        return list(realized), [None if row is None else list(row) for row in rows]
 
 
 class TinkerTeacher:
@@ -254,6 +354,129 @@ class TinkerTeacher:
             self._usage_tokens,
         )
         return results
+
+    def score_topk(self, datums: Sequence[TrainDatum], k: int) -> TeacherTopkScores:
+        """Top-k candidates plus realized logprobs for each datum's loss positions.
+
+        One prefill-only sample request per datum (bounded concurrency, datum
+        order preserved) returns the teacher's per-position top-k candidates
+        AND the realized per-position logprobs together, so the reverse-KL
+        metric costs no second pass. Rows follow `score`'s convention: entry
+        p is populated exactly when p is a loss position (mask 1.0) with
+        context (p >= 1); a loss token at position 0 stays None in BOTH rows
+        and `build_topk_ce_datums` drops that datum loudly, mirroring
+        `attach_advantages`.
+
+        Usage accounting matches `score`: the full sequence tokens count
+        toward the teacher_prefill meter. The one discarded sampled token per
+        request is deliberately not counted (it is noise against the
+        sequence volume and has no meter of its own).
+
+        Args:
+            datums: The batch to score, in the loop's unshifted layout.
+            k: Candidates per position (`train.topk`).
+
+        Returns:
+            The batch's `TeacherTopkScores`, aligned one to one with `datums`.
+
+        Raises:
+            ValueError: If `k < 1`.
+            ImportError: If no client was injected and the tinker extra is
+                not installed.
+            RuntimeError: If the API key is missing, the scoring client has
+                no top-k surface, the teacher returns rows of the wrong
+                length, or a scoreable loss position comes back without
+                candidates or without a realized logprob.
+            TinkerDeadlineError: If a request deadline expires; the lazily
+                built client is dropped first so retrying score_topk
+                rebuilds a fresh session.
+        """
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        datum_list = list(datums)
+        if not datum_list:
+            return TeacherTopkScores(topk=[], realized=[])
+        scorer = self._get_scorer()
+        if not isinstance(scorer, TopkLogprobScorer):
+            raise RuntimeError(
+                f"the teacher's scoring client {type(scorer).__name__} has no "
+                "topk_prompt_logprobs surface, so it cannot serve the topk_ce "
+                "loss; inject a client with the prefill top-k call (the SDK "
+                "adapters and the fakes both have it) or use "
+                'train.loss = "importance_sampling"'
+            )
+        workers = min(_SCORE_CONCURRENCY, len(datum_list))
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                per_datum = list(
+                    pool.map(
+                        lambda datum: scorer.topk_prompt_logprobs(datum.model_input_tokens, k),
+                        datum_list,
+                    )
+                )
+        except TinkerDeadlineError:
+            # Same rationale as score(): the session is likely wedged, so a
+            # lazily built client is dropped for the caller's retry.
+            self._drop_wedged_scorer()
+            raise
+        finally:
+            # Counted whether or not scoring succeeded, same contract as
+            # score(): every submitted call runs (and bills) server-side
+            # before the pool join propagates an error.
+            self._usage_tokens += sum(len(datum.model_input_tokens) for datum in datum_list)
+        topk_rows: list[list[TopkCandidates | None]] = []
+        realized_rows: list[list[float | None]] = []
+        for index, (datum, (realized, candidates)) in enumerate(
+            zip(datum_list, per_datum, strict=True)
+        ):
+            realized_rows.append(self._loss_position_row(index, datum, realized))
+            topk_rows.append(self._loss_position_topk_row(index, datum, candidates))
+        logger.debug(
+            "teacher top-%d scored %d datum(s), %d tokens total so far",
+            k,
+            len(datum_list),
+            self._usage_tokens,
+        )
+        return TeacherTopkScores(topk=topk_rows, realized=realized_rows)
+
+    def _loss_position_topk_row(
+        self,
+        datum_index: int,
+        datum: TrainDatum,
+        candidates: list[TopkCandidates | None],
+    ) -> list[TopkCandidates | None]:
+        """Keep the prefill top-k entries at the datum's loss positions.
+
+        Mirrors `_loss_position_row` index for index: `candidates[p]` holds
+        the top-k for token p given tokens < p, so the result aligns with
+        `model_input_tokens`. Position 0's None survives (no context), and
+        `build_topk_ce_datums` drops that datum loudly.
+        """
+        tokens = datum.model_input_tokens
+        if len(candidates) != len(tokens):
+            raise RuntimeError(
+                f"teacher returned {len(candidates)} top-k entrie(s) for the "
+                f"{len(tokens)}-token sequence of datum {datum_index}; the prefill "
+                "top-k must return one entry per input position. Check that the "
+                "teacher model matches the student's tokenizer (run "
+                "tokenizer_fingerprint_check) and that the pinned tinker SDK "
+                "version is unchanged"
+            )
+        row: list[TopkCandidates | None] = [None] * len(tokens)
+        for position, weight in enumerate(datum.loss_mask):
+            if weight != 1.0 or position == 0:
+                continue
+            value = candidates[position]
+            if not value:
+                raise RuntimeError(
+                    f"teacher returned no top-k candidates for loss position "
+                    f"{position} of datum {datum_index}; only position 0 may be "
+                    f"empty. Re-run the step; if it persists, the teacher "
+                    f"{self._model_identity()!r} could not score the sequence, so "
+                    "check the model/checkpoint and the tokenizer fingerprint"
+                )
+            row[position] = list(value)
+        return row
 
     def _loss_position_row(
         self,

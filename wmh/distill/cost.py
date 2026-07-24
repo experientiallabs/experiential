@@ -280,9 +280,11 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     volume) to student_prefill, the repeated per-request volume to
     student_cached_prefill, and `sampled` to student_sample; every train
     episode additionally charges `episode_tokens` to student_train
-    (forward_backward over the full datum) and `episode_tokens` to
-    teacher_prefill (the teacher scores each episode's full sequence once,
-    one full-price request with no repeats to cache). Teacher-in-harness
+    (forward_backward over the full datum; x `train.topk` under the
+    `topk_ce` loss, whose k rank replicas each carry the full sequence) and
+    `episode_tokens` to teacher_prefill (the teacher scores each episode's
+    full sequence once, one full-price request with no repeats to cache;
+    the topk_ce prefill-only request bills the same volume). Teacher-in-harness
     episodes (the gate baseline and the warmup collection) charge `sampled`
     to teacher_sample (they bill the teacher's SAMPLING rate on what they
     generate) plus per-request prefill exactly like a student episode, onto
@@ -344,11 +346,15 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
 
     student_episodes = train_episodes + eval_episodes + student_baseline_episodes
     teacher_harness_episodes = teacher_baseline_episodes + warmup_episodes
+    # The topk_ce loss trains k rank-aligned cross_entropy replicas per datum,
+    # each carrying the full sequence, so its train volume is k x the default
+    # loss's (the loop meters actuals the same way; see build_topk_ce_datums).
+    train_replication = cfg.train.topk if cfg.train.loss == "topk_ce" else 1
     projections: dict[MeterName, int] = {
         "student_prefill": student_episodes * episode_tokens,
         "student_cached_prefill": student_episodes * cached_tokens,
         "student_sample": student_episodes * sampled_tokens,
-        "student_train": train_episodes * episode_tokens,
+        "student_train": train_episodes * episode_tokens * train_replication,
         "teacher_prefill": (
             train_episodes * episode_tokens + teacher_harness_episodes * episode_tokens
         ),
