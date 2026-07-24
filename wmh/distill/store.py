@@ -8,7 +8,9 @@ or needs to resume lives under it:
       metrics.jsonl       # one JSON row per warmup/training step, appended as steps finish
       spend.json          # cumulative priced USD across every session, updated per charge
       warmup.json         # the WarmupRecord marker; its existence means warmup is done
+      warmup-trials.json  # the warmup collection's TrialRecords (loadable by other runs)
       evals/<name>.json   # interim and final eval payloads, keyed by eval name
+      samples/<name>.md   # per-batch sample episode rollouts (step-NNNN, warmup, eval-<name>)
       checkpoints.json    # manifest of saved tinker:// state + sampler paths
       gate.json           # the DistillGateRecord verdict
       model_card.json     # the run's DistillModelCard
@@ -38,6 +40,7 @@ from wmh.config.store import validate_name
 from wmh.core.types import JsonObject
 from wmh.distill.config import DistillConfig, load_distill_config, snapshot_toml
 from wmh.distill.gate import DistillGateRecord
+from wmh.distill.tokens import TrialRecord
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +76,13 @@ _CONFIG_FILE = "config.toml"
 _METRICS_FILE = "metrics.jsonl"
 _SPEND_FILE = "spend.json"
 _WARMUP_FILE = "warmup.json"
+_WARMUP_TRIALS_FILE = "warmup-trials.json"
 _CHECKPOINTS_FILE = "checkpoints.json"
 _GATE_FILE = "gate.json"
 _MODEL_CARD_FILE = "model_card.json"
 _HANDOFF_FILE = "handoff.toml"
 _EVALS_DIR = "evals"
+_SAMPLES_DIR = "samples"
 
 
 def _utc_now_iso() -> str:
@@ -124,6 +129,24 @@ class WarmupRecord(BaseModel):
 
     skipped_reason: str | None = None
     """Why the phase trained nothing (e.g. zero passing trials); None when it ran."""
+
+
+class WarmupTrialsManifest(BaseModel):
+    """The warmup-trials.json shape: the warmup collection's assembled trials.
+
+    Written when the warmup phase's teacher rollouts finish assembling, BEFORE
+    the `warmup.keep` filter, so another run loading the collection through
+    `warmup.trajectories_from` may filter differently. The teacher identity is
+    recorded so a loading run can refuse trajectories another teacher sampled.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    teacher_model: str = Field(min_length=1)
+    """The teacher identity (checkpoint or model ref) that sampled the trials."""
+
+    records: list[TrialRecord]
+    """Every assembled trial record from the collection, unfiltered."""
 
 
 class CheckpointRecord(BaseModel):
@@ -199,6 +222,10 @@ class DistillRunStore:
         return self.run_dir / _WARMUP_FILE
 
     @property
+    def warmup_trials_path(self) -> Path:
+        return self.run_dir / _WARMUP_TRIALS_FILE
+
+    @property
     def checkpoints_path(self) -> Path:
         return self.run_dir / _CHECKPOINTS_FILE
 
@@ -217,6 +244,10 @@ class DistillRunStore:
     @property
     def evals_dir(self) -> Path:
         return self.run_dir / _EVALS_DIR
+
+    @property
+    def samples_dir(self) -> Path:
+        return self.run_dir / _SAMPLES_DIR
 
     # -- config snapshot -----------------------------------------------------------------------
 
@@ -405,6 +436,43 @@ class DistillRunStore:
                 "trials under warmup-rollouts/ resume trial-level through harbor)"
             ) from exc
 
+    def write_warmup_trials(self, manifest: WarmupTrialsManifest) -> Path:
+        """Persist the warmup collection's trial manifest to `warmup-trials.json`.
+
+        Written when the warmup teacher rollouts finish assembling (before the
+        keep filter), so another run can reuse the collection through
+        `warmup.trajectories_from` instead of paying for its own.
+
+        Args:
+            manifest: The collection's teacher identity and trial records.
+
+        Returns:
+            The written path.
+        """
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        _write_text_atomic(self.warmup_trials_path, manifest.model_dump_json(indent=2))
+        return self.warmup_trials_path
+
+    def read_warmup_trials(self) -> WarmupTrialsManifest | None:
+        """The recorded warmup trial manifest, or None when none was written.
+
+        Raises:
+            ValueError: If the file exists but does not parse; the message
+                says how to recover.
+        """
+        try:
+            text = self.warmup_trials_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        try:
+            return WarmupTrialsManifest.model_validate_json(text)
+        except ValidationError as exc:
+            raise ValueError(
+                f"corrupt warmup trial manifest at {self.warmup_trials_path}: {exc}; "
+                "re-run the source run's warmup collection to rewrite it, or point "
+                "warmup.trajectories_from elsewhere"
+            ) from exc
+
     # -- evals -----------------------------------------------------------------------------------
 
     def write_eval(self, name: str, payload: BaseModel) -> Path:
@@ -421,6 +489,28 @@ class DistillRunStore:
         self.evals_dir.mkdir(parents=True, exist_ok=True)
         path = self.evals_dir / f"{validate_name(name)}.json"
         _write_text_atomic(path, payload.model_dump_json(indent=2))
+        return path
+
+    # -- sample rollouts -------------------------------------------------------------------------
+
+    def write_samples(self, name: str, text: str) -> Path:
+        """Write one batch's rendered sample rollouts to `samples/<name>.md`.
+
+        One file per batch, replacing any prior one (a resumed session that
+        re-runs a step rewrites its samples): `step-NNNN` for training
+        batches, `warmup` for the warmup collection, `eval-<name>` for eval
+        batches.
+
+        Args:
+            name: The batch's file stem; must be a safe single path segment.
+            text: The assembled document (`wmh.distill.samples.samples_markdown`).
+
+        Returns:
+            The written path.
+        """
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
+        path = self.samples_dir / f"{validate_name(name)}.md"
+        _write_text_atomic(path, text)
         return path
 
     # -- checkpoints -----------------------------------------------------------------------------
