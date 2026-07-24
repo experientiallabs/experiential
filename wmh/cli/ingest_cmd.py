@@ -149,7 +149,7 @@ def ingest(
         if is_pull
         else None
     )
-    stream = ingest_events(file=file, pull=vendor_pull, source=source, out=out_path)
+    stream = ingest_events(file=file, pull=vendor_pull, source=source, out=out_path, limit=limit)
 
     if json_events:
         ok = False

@@ -221,3 +221,34 @@ def test_vendor_pull_lists_then_fetches_each_trace(monkeypatch) -> None:  # noqa
     assert len(traces) == 1
     assert traces[0].steps, "full-trace fetch must yield real steps"
     assert any(url.endswith(f"/api/public/traces/{_TRACE['id']}") for url in calls)
+
+
+def test_vendor_pull_unbounded_pagination_has_a_backstop(monkeypatch) -> None:  # noqa: ANN001
+    """A credential-only pull against a huge project must not page forever."""
+    import wmh.ingest.langfuse as lf
+
+    list_calls = {"count": 0}
+
+    def fake_get(url, auth=None, params=None, timeout=None):  # noqa: ANN001, ANN202 - test stub
+        class _Resp:
+            def __init__(self, payload) -> None:  # noqa: ANN001
+                self._payload = payload
+
+            def raise_for_status(self) -> None: ...
+
+            def json(self):  # noqa: ANN202
+                return self._payload
+
+        if url.endswith("/api/public/traces"):
+            assert isinstance(params, dict)
+            list_calls["count"] += 1
+            page = int(params["page"])
+            data = [
+                {"id": f"lf-{page}-{i}", "observations": ["o"]} for i in range(int(params["limit"]))
+            ]
+            return _Resp({"data": data})  # always a full page: pagination never ends naturally
+        return _Resp({**_TRACE, "id": url.rsplit("/", 1)[-1]})
+
+    monkeypatch.setattr(lf.httpx, "get", fake_get)
+    LangfuseAdapter().from_vendor(VendorPull(api_key="pk:sk"))
+    assert list_calls["count"] == lf._MAX_PAGES

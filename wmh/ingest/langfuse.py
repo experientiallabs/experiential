@@ -100,6 +100,10 @@ _SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
 _HOST_ENV = "LANGFUSE_HOST"
 _DEFAULT_HOST = "https://cloud.langfuse.com"
 _PAGE_SIZE = 50
+# Backstop on unbounded pulls (no --limit): every listed trace is re-fetched individually, so a
+# forever-pagination against a huge project would turn into thousands of requests. Mirrors the
+# LangSmith adapter's _MAX_RUNS backstop.
+_MAX_PAGES = 40
 
 
 class LangfuseAdapter(BaseTraceAdapter):
@@ -148,7 +152,7 @@ class LangfuseAdapter(BaseTraceAdapter):
             if pull.limit is not None and len(trace_ids) >= pull.limit:
                 trace_ids = trace_ids[: pull.limit]
                 break
-            if len(data) < _PAGE_SIZE:
+            if len(data) < _PAGE_SIZE or page >= _MAX_PAGES:
                 break
             page += 1
 

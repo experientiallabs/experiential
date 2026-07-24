@@ -159,18 +159,22 @@ def ingest_events(
     pull: VendorPull | None = None,
     source: str | None = None,
     out: Path,
+    limit: int | None = None,
 ) -> Iterator[IngestEvent]:
     """Normalize one source into OTel JSONL at `out`, yielding D-INGEST progress events.
 
     Exactly one of `file`/`pull` selects the transport. `source` pins the adapter; when omitted
-    (file transport only) the format is auto-detected. The generator never raises: every failure
-    becomes a terminal `ErrorEvent`, so a consumer can pipe events straight onto a wire.
+    (file transport only) the format is auto-detected. `limit` caps the normalized traces for any
+    transport (a pull's own `pull.limit` additionally bounds what is fetched vendor-side). The
+    generator never raises: every failure becomes a terminal `ErrorEvent`, so a consumer can pipe
+    events straight onto a wire.
     """
     try:
         fmt, spans = _collect_spans(file, pull, source)
         groups = group_spans(spans)
-        if pull is not None and pull.limit is not None:
-            groups = groups[: pull.limit]
+        cap = limit if limit is not None else (pull.limit if pull is not None else None)
+        if cap is not None:
+            groups = groups[:cap]
         if not groups:
             raise _IngestFailure(
                 ErrorCode.EMPTY,

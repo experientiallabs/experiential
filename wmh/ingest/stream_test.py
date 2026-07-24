@@ -138,3 +138,14 @@ def test_driver_failures_classify_to_credentials_and_unreachable() -> None:
         ErrorCode.BAD_CREDENTIALS
     )
     assert _classify(ConnectionError("could not connect")).code is ErrorCode.UNREACHABLE
+
+
+def test_file_ingest_honors_limit(tmp_path: Path) -> None:
+    """`limit` caps traces for FILE ingests too, not only vendor pulls (cost control)."""
+    src = _write_corpus(tmp_path)
+    events = list(ingest_events(file=str(src), out=tmp_path / "o.jsonl", limit=2))
+    assert isinstance(events[0], DetectedEvent)
+    assert events[0].traces == 2
+    done = events[-1]
+    assert isinstance(done, DoneEvent)
+    assert done.traces == 2
