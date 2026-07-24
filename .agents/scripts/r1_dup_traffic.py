@@ -106,7 +106,9 @@ def run_seed(name: str, ctx: MatrixContext, split_seed: int) -> None:
             RunRecord(
                 run_id=f"{name}-{variant}-{uuid.uuid4().hex[:8]}",
                 ts=ts,
-                matrix=name,
+                # Distinct matrix name: dup-traffic is a different protocol and must not sit
+                # on the split-protocol Pareto (the dashboard's default view filters it out).
+                matrix=f"{name}-duptraffic",
                 variant=variant,
                 params=params,
                 split_seed=split_seed,
