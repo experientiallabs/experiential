@@ -45,8 +45,12 @@ steps = 2
 rollouts_per_task = 2
 keep = "passed"
 
+# Interim evals off (the default): the holdout gate is the measurement that
+# matters, and interim train-subsample evals only burn rollout budget.
+# teacher_baseline_from / student_baseline_from can reuse a prior run's
+# holdout baselines (same split, attempts >= gate.k, same teacher/base model).
 [eval]
-every = 10
+every = 0
 tasks = 12
 k = 1
 

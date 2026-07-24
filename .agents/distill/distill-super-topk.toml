@@ -1,0 +1,80 @@
+# Super top-k run: Nemotron-3 Super distilled from Ultra with the topk_ce
+# loss (weighted CE over the teacher's top-8 candidates per position) at the
+# anchor's schedule, so anchor vs topk isolates the loss. Reuses the anchor
+# run's warmup collection (warmup.trajectories_from) and pre-training student
+# baseline (eval.student_baseline_from); run the anchor first under
+# .wmh/distill-runs/super-anchor. Model names are the tinker-cookbook catalog
+# names (pinned by test_checked_in_run_configs_resolve_cookbook_renderers).
+[student]
+base_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
+lora_rank = 32
+
+[teacher]
+backend = "tinker"
+model = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+
+[harbor]
+job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+backend = "local"
+reward_key = "reward"
+
+[rollout]
+max_turns = 20
+context_budget_tokens = 65536
+compaction = false
+
+[train]
+loss = "topk_ce"
+topk = 8
+steps = 40
+tasks_per_batch = 8
+group_size = 4
+learning_rate = 5e-5
+advantage_clip = 4.0
+center_advantages = true
+max_datum_tokens = 65536
+sampler_refresh_every = 1
+save_state_every = 4
+trial_concurrency = 16
+
+# temperature 1.0 keeps issued sampler logprobs comparable to the untempered
+# teacher logprobs (unbiased reverse-KL advantages).
+[sampling]
+temperature = 1.0
+max_tokens = 8192
+
+# Loads the anchor run's warmup collection instead of re-sampling the teacher
+# (same Ultra teacher; keep applies at load; loading charges nothing).
+[warmup]
+steps = 0
+
+[eval]
+every = 0
+tasks = 12
+k = 1
+teacher_baseline_from = ".wmh/distill-runs/headline/evals/baseline-teacher.json"
+
+[gate]
+k = 3
+min_teacher_fraction = 0.7
+require_no_regression = true
+
+[pricing]
+# Ultra 64K (verified live 2026-07-23): prefill 2.49, sample 6.225 USD/Mtok.
+# Cached prefill 0.498 is exactly the 20%-of-prefill default, so both cached
+# rates are left implied.
+teacher_prefill = 2.49
+teacher_sample = 6.225
+# Super rates from the Tinker models page: prefill 0.57, sample 1.44,
+# train 1.276 USD/Mtok.
+student_prefill = 0.57
+student_sample = 1.44
+student_train = 1.276
+
+[budget]
+max_usd = 200.0
+
+[wandb]
+enabled = true
+project = "wmh-distill"
+run_name = "distill-super-topk"
