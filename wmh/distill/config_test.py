@@ -13,6 +13,7 @@ from wmh.distill.config import (
     StudentConfig,
     TeacherConfig,
     WandbConfig,
+    WarmupConfig,
     load_distill_config,
     snapshot_toml,
 )
@@ -68,6 +69,9 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.sampling.temperature == pytest.approx(1.0)
     assert cfg.sampling.max_tokens == 8192
     assert cfg.warmup.steps == 0
+    assert cfg.warmup.rollouts_per_task == 1
+    assert cfg.warmup.keep == "passed"
+    assert cfg.warmup.learning_rate is None
     assert cfg.eval.every == 10
     assert cfg.eval.tasks == 12
     assert cfg.eval.k == 1
@@ -119,6 +123,12 @@ trial_concurrency = 4
 temperature = 0.0
 max_tokens = 128
 
+[warmup]
+steps = 2
+rollouts_per_task = 3
+keep = "all"
+learning_rate = 2e-5
+
 [eval]
 every = 0
 tasks = 2
@@ -153,6 +163,10 @@ tags = ["smoke", "tb2"]
     assert cfg.rollout.max_turns == 5
     assert cfg.train.center_advantages is False
     assert cfg.sampling.temperature == 0.0
+    assert cfg.warmup.steps == 2
+    assert cfg.warmup.rollouts_per_task == 3
+    assert cfg.warmup.keep == "all"
+    assert cfg.warmup.learning_rate == pytest.approx(2e-5)
     assert cfg.eval.every == 0
     assert cfg.gate.min_teacher_fraction == 1.0
     assert cfg.pricing.is_complete()
@@ -170,9 +184,17 @@ def test_compaction_true_rejected(tmp_path: Path) -> None:
         load_distill_config(_write(tmp_path, text))
 
 
-def test_warmup_steps_rejected(tmp_path: Path) -> None:
-    text = MINIMAL_TOML + "\n[warmup]\nsteps = 5\n"
-    with pytest.raises(ValueError, match="warmup is reserved; not implemented yet"):
+@pytest.mark.parametrize("steps", [0, 1, 5])
+def test_warmup_steps_accepted(tmp_path: Path, steps: int) -> None:
+    # Warmup was config-reserved in v1 (steps > 0 rejected); it is implemented now.
+    text = MINIMAL_TOML + f"\n[warmup]\nsteps = {steps}\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.warmup.steps == steps
+
+
+def test_warmup_keep_rejects_unknown_value(tmp_path: Path) -> None:
+    text = MINIMAL_TOML + "\n[warmup]\nkeep = 'best'\n"
+    with pytest.raises(ValueError, match="warmup.keep"):
         load_distill_config(_write(tmp_path, text))
 
 
@@ -189,6 +211,9 @@ def test_warmup_steps_rejected(tmp_path: Path) -> None:
         "[sampling]\ntemperature = 2.5",
         "[sampling]\nmax_tokens = 0",
         "[warmup]\nsteps = -1",
+        "[warmup]\nrollouts_per_task = 0",
+        "[warmup]\nlearning_rate = 0.0",
+        "[warmup]\nlearning_rate = -1e-5",
         "[eval]\nevery = -1",
         "[eval]\ntasks = 0",
         "[gate]\nk = 0",
@@ -288,6 +313,20 @@ def test_snapshot_round_trips_the_wandb_section(tmp_path: Path) -> None:
         ),
     ):
         cfg = _minimal_config().model_copy(update={"wandb": wandb}, deep=True)
+        snap_path = tmp_path / "snapshot.toml"
+        snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+        assert load_distill_config(snap_path) == cfg
+
+
+def test_snapshot_round_trips_the_warmup_section(tmp_path: Path) -> None:
+    # Both shapes must survive snapshot -> parse: the all-defaults section
+    # (learning_rate is None, so exclude_none omits it) and a fully populated
+    # one.
+    for warmup in (
+        WarmupConfig(),
+        WarmupConfig(steps=2, rollouts_per_task=2, keep="all", learning_rate=5e-5),
+    ):
+        cfg = _minimal_config().model_copy(update={"warmup": warmup}, deep=True)
         snap_path = tmp_path / "snapshot.toml"
         snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
         assert load_distill_config(snap_path) == cfg
