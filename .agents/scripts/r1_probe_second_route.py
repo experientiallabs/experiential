@@ -41,7 +41,7 @@ OUT = DATA / "findings" / "r1_debug" / "second_route_probe_seed0.jsonl"
 
 def main() -> None:
     matrix = OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json")
-    ctx = MatrixContext(matrix)
+    ctx = MatrixContext(matrix, "routerbench-ours9")
     fit_ids, test_ids = split_scenario_ids(matrix, train_fraction=0.7, seed=0)
     best_name, _, _ = best_single_model(matrix, fit_ids=fit_ids, eval_ids=test_ids)
     fit_matrix = np.stack([ctx.task_vecs[sid] for sid in fit_ids])

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import sys
 import uuid
@@ -51,28 +52,81 @@ class RetrievalParams(BaseModel):
     subset_p: float = 0.5
     needle_n: int = 3
     weighted: bool = True  # sim-weighted profile; False = uniform mean
-    guard: bool = True
-    guard_margin: float = 0.03  # doubled when the pick is pricier than baseline
+    # Guard modes. margin: fixed profile-gap margin (the master jisi guard). stat: paired
+    # per-neighbor reward differences must clear z standard errors (support-aware: the margin
+    # shrinks as neighbor evidence grows, unlike the fixed margin). none: unguarded.
+    guard: str = "margin"  # none | margin | stat
+    guard_margin: float = 0.03  # margin mode: doubled when the pick is pricier than baseline
+    z: float = 0.5  # stat mode: required standard errors (doubled when pricier)
+    min_pairs: int = 8  # stat mode: revert picks with fewer paired neighbors than this
     distance_floor: float | None = None  # abstain to baseline when max sim < floor
+
+
+def _openai_embed(texts: list[str], cache_path: Path) -> np.ndarray:
+    """Embed with text-embedding-3-large via the OpenAI API, cached to disk (order-stable)."""
+    if cache_path.exists():
+        cached = np.load(cache_path)
+        if cached.shape[0] == len(texts):
+            return cached
+        logger.warning(
+            "cache %s has %d rows, need %d; re-embedding", cache_path, cached.shape[0], len(texts)
+        )
+    import time
+    import urllib.request
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("--embed openai needs OPENAI_API_KEY in the environment")
+    vectors: list[list[float]] = []
+    total_tokens = 0
+    for start in range(0, len(texts), 128):
+        chunk = [t[:18000] if t.strip() else " " for t in texts[start : start + 128]]
+        payload = json.dumps({"model": "text-embedding-3-large", "input": chunk}).encode()
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/embeddings",
+            data=payload,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    data = json.loads(response.read())
+                break
+            except Exception as error:  # noqa: BLE001 (retry rate limits/transients, then raise)
+                if attempt == 3:
+                    raise
+                logger.warning("embed batch %d retry %d: %s", start, attempt + 1, error)
+                time.sleep(5 * (attempt + 1))
+        vectors.extend(d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"]))
+        total_tokens += data.get("usage", {}).get("total_tokens", 0)
+        if start % 1280 == 0:
+            logger.info(
+                "embedded %d/%d (tokens so far %d)", start + len(chunk), len(texts), total_tokens
+            )
+    array = np.asarray(vectors)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, array)
+    logger.info(
+        "openai embed: %d texts, %d tokens (~$%.3f) -> %s",
+        len(texts),
+        total_tokens,
+        total_tokens / 1e6 * 0.13,
+        cache_path,
+    )
+    return array
 
 
 class MatrixContext:
     """Split-independent precomputation for one matrix: embeddings, reply vectors, cells."""
 
-    def __init__(self, matrix: OutcomeMatrix) -> None:
+    def __init__(self, matrix: OutcomeMatrix, name: str, embed: str = "hashing") -> None:
         self.matrix = matrix
+        self.embed_kind = embed
         self.model_names = [entry.name for entry in matrix.pool]
         self.tasks: dict[str, str] = {}
         for outcome in matrix.outcomes:
             self.tasks.setdefault(outcome.scenario_id, outcome.task)
-        embedder = HashingEmbedder(dim=DIM)
         self.scenario_ids = list(self.tasks)
-        vecs = np.asarray(embedder.embed([self.tasks[sid] for sid in self.scenario_ids]))
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        self.task_vecs = {
-            sid: vecs[i] / (norms[i] if norms[i] > 0 else 1.0)
-            for i, sid in enumerate(self.scenario_ids)
-        }
         self.rewards_cell: dict[tuple[str, str], list[float]] = {}
         reply_texts: dict[tuple[str, str], str] = {}
         for outcome in matrix.outcomes:
@@ -82,12 +136,37 @@ class MatrixContext:
             self.rewards_cell.setdefault(key, []).append(outcome.reward)
             if outcome.replies and key not in reply_texts:
                 reply_texts[key] = outcome.replies[0]
-        keys = list(reply_texts)
-        if keys:
-            rvecs = np.asarray(embedder.embed([reply_texts[k] for k in keys]))
-            self.reply_vecs = {k: rvecs[i] for i, k in enumerate(keys)}
+        reply_keys = list(reply_texts)
+
+        if embed == "hashing":
+            embedder = HashingEmbedder(dim=DIM)
+            vecs = np.asarray(embedder.embed([self.tasks[sid] for sid in self.scenario_ids]))
+            rvecs = (
+                np.asarray(embedder.embed([reply_texts[k] for k in reply_keys]))
+                if reply_keys
+                else np.zeros((0, DIM))
+            )
+        elif embed == "openai":
+            cache = DATA / "cache"
+            vecs = _openai_embed(
+                [self.tasks[sid] for sid in self.scenario_ids],
+                cache / f"{name}-oai3l-tasks.npy",
+            )
+            rvecs = _openai_embed(
+                [reply_texts[k] for k in reply_keys],
+                cache / f"{name}-oai3l-replies.npy",
+            )
         else:
-            self.reply_vecs = {}
+            raise ValueError(f"unknown embed kind: {embed}")
+
+        def _norm(matrix_: np.ndarray) -> np.ndarray:
+            norms = np.linalg.norm(matrix_, axis=1, keepdims=True)
+            return matrix_ / np.where(norms > 0, norms, 1.0)
+
+        vecs = _norm(vecs)
+        self.task_vecs = {sid: vecs[i] for i, sid in enumerate(self.scenario_ids)}
+        rvecs = _norm(rvecs) if len(rvecs) else rvecs
+        self.reply_vecs = {k: rvecs[i] for i, k in enumerate(reply_keys)}
 
     def mean_cost(self, fit_ids: list[str]) -> dict[str, float]:
         fit_set = set(fit_ids)
@@ -107,8 +186,13 @@ def route(
     best_name: str,
     rewards_cell: dict[tuple[str, str], list[float]] | None = None,
     debug: list[dict] | None = None,
+    query_vecs: dict[str, np.ndarray] | None = None,
 ) -> dict[str, str]:
-    """Route every test scenario; returns sid -> model. Faithful jisi-proxy at defaults."""
+    """Route every test scenario; returns sid -> model. Faithful jisi-proxy at defaults.
+
+    `query_vecs` overrides the query embedding per sid (the dup-traffic experiment routes a
+    perturbed text while scoring against the original scenario's cells).
+    """
     cells = rewards_cell if rewards_cell is not None else ctx.rewards_cell
     fit_matrix = np.stack([ctx.task_vecs[sid] for sid in fit_ids])
     mean_cost = ctx.mean_cost(fit_ids)
@@ -130,7 +214,8 @@ def route(
         return scores
 
     for sid in test_ids:
-        sims = fit_matrix @ ctx.task_vecs[sid]
+        query = query_vecs[sid] if query_vecs is not None else ctx.task_vecs[sid]
+        sims = fit_matrix @ query
         info: dict = {"sid": sid, "task": ctx.tasks[sid][:200]}
         if params.distance_floor is not None and float(np.max(sims)) < params.distance_floor:
             picks[sid] = best_name
@@ -151,6 +236,7 @@ def route(
             picks[sid] = best_name
             continue
         chosen_profile = first
+        used_rows = neighbor_rows
         if params.second_route:
             needles = sorted(first, key=lambda m: -first[m])[: params.needle_n]
             refine = []
@@ -176,18 +262,36 @@ def route(
             second = profile(neighbor_rows[top_idx], refine_arr[top_idx])
             if second:
                 chosen_profile = second
+                used_rows = neighbor_rows[top_idx]
         pick = max(
             chosen_profile,
             key=lambda m: (chosen_profile[m], -ctx.model_names.index(m)),
         )
         guarded = False
-        if params.guard:
+        if params.guard == "margin":
             margin = params.guard_margin
             if mean_cost.get(pick, 0.0) > base_cost:
                 margin = 2 * params.guard_margin
             if chosen_profile.get(pick, 0.0) <= chosen_profile.get(best_name, 0.0) + margin:
                 pick = best_name
                 guarded = True
+        elif params.guard == "stat" and pick != best_name:
+            diffs = []
+            for j in used_rows:
+                cell_pick = cells.get((fit_ids[int(j)], pick))
+                cell_base = cells.get((fit_ids[int(j)], best_name))
+                if cell_pick and cell_base:
+                    diffs.append(sum(cell_pick) / len(cell_pick) - sum(cell_base) / len(cell_base))
+            z_eff = 2 * params.z if mean_cost.get(pick, 0.0) > base_cost else params.z
+            if len(diffs) < params.min_pairs:
+                pick = best_name
+                guarded = True
+            else:
+                mean_d = float(np.mean(diffs))
+                se = float(np.std(diffs, ddof=1)) / len(diffs) ** 0.5
+                if not mean_d > z_eff * se:
+                    pick = best_name
+                    guarded = True
         picks[sid] = pick
         if debug is not None:
             neighbor_ids = [fit_ids[int(j)] for j in neighbor_rows]
@@ -265,11 +369,11 @@ def _matrices() -> dict[str, OutcomeMatrix]:
     return out
 
 
-VARIANTS: list[tuple[str, RetrievalParams]] = [
+ROUND1: list[tuple[str, RetrievalParams]] = [
     ("r1-jisi-proxy", RetrievalParams()),
     ("r1-knn", RetrievalParams(second_route=False)),
-    ("r1-jisi-noguard", RetrievalParams(guard=False)),
-    ("r1-knn-noguard", RetrievalParams(second_route=False, guard=False)),
+    ("r1-jisi-noguard", RetrievalParams(guard="none")),
+    ("r1-knn-noguard", RetrievalParams(second_route=False, guard="none")),
     ("r1-knn-rag10", RetrievalParams(second_route=False, rag_num=10)),
     ("r1-knn-rag25", RetrievalParams(second_route=False, rag_num=25)),
     ("r1-knn-rag100", RetrievalParams(second_route=False, rag_num=100)),
@@ -278,9 +382,61 @@ VARIANTS: list[tuple[str, RetrievalParams]] = [
     ("r1-knn-uniform", RetrievalParams(second_route=False, weighted=False)),
 ]
 
+ROUND2: list[tuple[str, RetrievalParams]] = [
+    ("r1-knn-statz0", RetrievalParams(second_route=False, guard="stat", z=0.0)),
+    ("r1-knn-statz05", RetrievalParams(second_route=False, guard="stat", z=0.5)),
+    ("r1-knn-statz1", RetrievalParams(second_route=False, guard="stat", z=1.0)),
+    (
+        "r1-knn-fixk25",
+        RetrievalParams(
+            second_route=False, guard="stat", z=0.5, neighbor_rule="fixed_k", rag_num=25
+        ),
+    ),
+    (
+        "r1-knn-fixk50",
+        RetrievalParams(
+            second_route=False, guard="stat", z=0.5, neighbor_rule="fixed_k", rag_num=50
+        ),
+    ),
+    (
+        "r1-knn-fixk100",
+        RetrievalParams(
+            second_route=False, guard="stat", z=0.5, neighbor_rule="fixed_k", rag_num=100
+        ),
+    ),
+    (
+        "r1-knn-fixk200",
+        RetrievalParams(
+            second_route=False, guard="stat", z=0.5, neighbor_rule="fixed_k", rag_num=200
+        ),
+    ),
+    (
+        "r1-knn-statz05-floor40",
+        RetrievalParams(second_route=False, guard="stat", z=0.5, distance_floor=0.40),
+    ),
+    (
+        "r1-knn-statz05-floor50",
+        RetrievalParams(second_route=False, guard="stat", z=0.5, distance_floor=0.50),
+    ),
+]
+
+# The embedder ablation reruns the family's core variants under text-embedding-3-large.
+OAI_CORE: list[tuple[str, RetrievalParams]] = [
+    ("r1-jisi-proxy-oai", RetrievalParams()),
+    ("r1-knn-oai", RetrievalParams(second_route=False)),
+    ("r1-knn-noguard-oai", RetrievalParams(second_route=False, guard="none")),
+    ("r1-knn-statz05-oai", RetrievalParams(second_route=False, guard="stat", z=0.5)),
+]
+
 
 def run_matrix(
-    name: str, ctx: MatrixContext, split_seed: int, *, debug: bool, controls: bool
+    name: str,
+    ctx: MatrixContext,
+    split_seed: int,
+    *,
+    variants: list[tuple[str, RetrievalParams]],
+    debug: bool,
+    controls: bool,
 ) -> None:
     matrix = ctx.matrix
     fit_ids, test_ids = split_scenario_ids(matrix, train_fraction=0.7, seed=split_seed)
@@ -305,7 +461,7 @@ def run_matrix(
             baselines={"best_single": best_eval},
             notes=(
                 f"best_single={best_name}; oracle acc={oracle_acc:.4f} cost=${oracle_cost:.5f}; "
-                f"embedder=hashing-{DIM}; audit[{audit}]{notes_extra}"
+                f"embedder={ctx.embed_kind}; audit[{audit}]{notes_extra}"
             ),
         )
         append_run(rec, RUNS)
@@ -321,7 +477,7 @@ def run_matrix(
             (result.cost_per_call / best_eval.cost_per_call - 1) * 100,
         )
 
-    for variant, params in VARIANTS:
+    for variant, params in variants:
         debug_rows: list[dict] | None = [] if debug else None
         picks = route(ctx, params, fit_ids, test_ids, best_name, debug=debug_rows)
         record(
@@ -338,7 +494,8 @@ def run_matrix(
 
     if controls:
         cells = shuffled_cells(ctx, fit_ids, seed=split_seed)
-        for variant, params in [VARIANTS[0], VARIANTS[1], VARIANTS[3]]:
+        control_names = {"r1-jisi-proxy", "r1-knn", "r1-knn-noguard", "r1-knn-statz05"}
+        for variant, params in [v for v in variants if v[0] in control_names]:
             picks = route(ctx, params, fit_ids, test_ids, best_name, rewards_cell=cells)
             record(
                 f"{variant}-shuffled",
@@ -352,13 +509,24 @@ def main() -> None:
     wanted = [a for a in sys.argv[1:] if not a.startswith("--")]
     seeds = SPLIT_SEEDS if "--seeds" in sys.argv else [0]
     debug = "--debug" in sys.argv
+    if "--embed" in sys.argv and "openai" in sys.argv:
+        variants, embed = OAI_CORE, "openai"
+    elif "--round2" in sys.argv:
+        variants, embed = ROUND2, "hashing"
+    else:
+        variants, embed = ROUND1, "hashing"
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
             continue
-        ctx = MatrixContext(matrix)
+        ctx = MatrixContext(matrix, name, embed=embed)
         for seed in seeds:
             run_matrix(
-                name, ctx, seed, debug=debug and seed == 0, controls=name == "routerbench-ours9"
+                name,
+                ctx,
+                seed,
+                variants=variants,
+                debug=debug and seed == 0,
+                controls=name == "routerbench-ours9",
             )
     logger.info("runs -> %s", RUNS)
 
