@@ -48,6 +48,7 @@ th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
 th{color:var(--muted);font-weight:500;cursor:pointer}
 .grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:28px}
 .note{border:1px solid var(--grid);border-radius:8px;padding:12px 16px;color:var(--muted);margin-top:10px}
+.info{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;border:1px solid var(--muted);border-radius:50%;color:var(--muted);font-size:10px;margin-left:5px;cursor:help;vertical-align:1px}
 </style></head><body>
 <h1>Routing ablations</h1>
 <p class="sub">Cost, quality, and speed per router variant. Every dot is one run on the held-out
@@ -56,7 +57,7 @@ split; hover anything for the full record. Generated from runs.jsonl.</p>
 <div class="legend" id="variantLegend"></div>
 <h2>Cost vs quality (Pareto), per matrix</h2>
 <div class="grid2" id="pareto"></div>
-<h2>Model mix per run (top 4 + other)</h2>
+<h2>Model mix per run (all models)</h2>
 <div class="legend" id="mixLegend"></div>
 <div id="mix"></div>
 <h2>Blended tokens by model</h2>
@@ -70,6 +71,24 @@ floor (~1/sqrt(n) on the test count) are ties.</div>
 <div class="tip" id="tip"></div>
 <script>
 const DATA = __DATA__;
+const MATRIX_INFO = {
+ 'routerbench': 'RouterBench (2024): the classic public matrix. 36k prompts x 11 models from 2023 (gpt-4, claude-2 era) with measured per-call costs. Validates the fitter against published conventions; models are dated.',
+ 'llmrouterbench-flagship': 'LLMRouterBench (2026) flagship track: 13 modern flagship models (gemini-2.5, gpt-5, claude-sonnet-4, deepseek, qwen3-235b...) on hard datasets (AIME, GPQA, HLE...). Deduped by task text after a caught leak; small (809 scenarios), so noise floors are wide.',
+ 'routerbench-ours9': 'OUR 9-model pool (gpt-5.5/5.4-mini, fable/sonnet/haiku/opus, deepseek-v4-pro, kimi-k2.6, glm-5.2) run live on 1,199 gold-certified RouterBench MCQ prompts, exact-match graded (judge-free). Real latency per call.',
+};
+function matrixInfo(m){return MATRIX_INFO[m] || (m.startsWith('wm-') ?
+ 'Closed-loop world-model scenarios: our 9-model pool rolled as the agent against the '+m.slice(3)+' base world model (25 scenarios x 2 episodes, max 8 steps, judge pinned Opus 4.8, tool surface derived from the corpus traces). Small per-corpus test sides: read the cross-corpus aggregate, not one row.' : '');}
+const COL_INFO = {
+ 'matrix':'Which outcome matrix (benchmark) the run was evaluated on. Hover the benchmark filters above for descriptions.',
+ 'variant':'Router variant + its knobs. lam = the cost knob: reward points paid per average-call-cost unit (0 = pure accuracy).',
+ 'acc':'Mean reward of the routed choices on HELD-OUT scenarios (exact-match or judge-scored depending on the matrix). Deltas below ~1/sqrt(n) are ties.',
+ 'cost/call':'Mean measured cost of the routed model per call, in USD (from per-call usage x that model\'s real price; never list-price guesses).',
+ 'p50':'Median latency of the routed models\' own calls. "-" = this matrix carries no timings (frozen public benchmarks).',
+ 'p95':'95th-percentile call latency of the routed choices.',
+ 'vs best-single acc':'Accuracy delta (points) vs the strongest single model chosen on the fit split - the honest "why route at all" bar.',
+ 'vs cost':'Cost delta (%) vs that same best single model. Negative = cheaper.',
+ 'n':'Held-out test scenarios. Small n = wide noise floor (~+-1/sqrt(n)).',
+};
 const VC = {"best-single":"var(--c0)","rank":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)"};
 const tip = document.getElementById('tip');
 function showTip(e, html){tip.innerHTML=html;tip.style.opacity=1;
@@ -118,7 +137,10 @@ function paretoChart(matrix){
    stroke="var(--surface)" stroke-width="2"/>`;});
  s+=`</svg>`;
  const div=document.createElement('div');
- div.innerHTML=`<h3 style="font-size:13px;margin:0 0 4px">${matrix}</h3>`+s;
+ div.innerHTML=`<h3 style="font-size:13px;margin:0 0 4px">${matrix}<span class="info" data-t="${matrixInfo(matrix).replace(/"/g,'&quot;')}">i</span></h3>`+s;
+ const inf=div.querySelector('.info');
+ inf.addEventListener('mousemove',e=>showTip(e,inf.dataset.t));
+ inf.addEventListener('mouseleave',hideTip);
  div.querySelectorAll('circle').forEach(c=>{
   c.style.cursor='pointer';
   c.addEventListener('mousemove',e=>showTip(e,tooltip(DATA[+c.dataset.i])));
@@ -128,21 +150,22 @@ function paretoChart(matrix){
 function stacked(containerId, per, unit){ // per: run -> [ [label, value], ... ]
  const cont=document.getElementById(containerId); cont.innerHTML='';
  const rows=DATA.filter(r=>active.has(r.matrix));
- const models=[...new Set(rows.flatMap(r=>Object.entries(per(r)).sort((a,b)=>b[1]-a[1]).slice(0,4).map(e=>e[0])))];
- const MC={}; models.slice(0,5).forEach((m,i)=>MC[m]=`var(--c${i})`);
+ const share={};
+ rows.forEach(r=>Object.entries(per(r)).forEach(([m,v])=>share[m]=(share[m]||0)+v));
+ const models=Object.keys(share).sort((a,b)=>share[b]-share[a]);
+ const GRAYS=['#5c5c5c','#7d7d7d','#9a9a9a','#b3b3b3','#c9c9c9','#dedede','#6e6e6e','#8b8b8b'];
+ const MC={}; models.forEach((m,i)=>MC[m]=i<5?`var(--c${i})`:GRAYS[(i-5)%GRAYS.length]);
  const leg=document.getElementById('mixLegend');
- if(containerId==='mix'){leg.innerHTML=models.slice(0,5).map(m=>`<span><i class="swatch" style="background:${MC[m]}"></i>${m}</span>`).join('')+`<span><i class="swatch" style="background:var(--other)"></i>other</span>`;}
+ if(containerId==='mix'){leg.innerHTML=models.map(m=>`<span><i class="swatch" style="background:${MC[m]}"></i>${m}</span>`).join('');}
  for(const r of rows){
   const entries=Object.entries(per(r)); if(!entries.length) continue;
   const total=entries.reduce((a,[,v])=>a+v,0); if(!total) continue;
-  const top=entries.sort((a,b)=>b[1]-a[1]).slice(0,4);
-  const other=total-top.reduce((a,[,v])=>a+v,0);
+  const top=entries.sort((a,b)=>b[1]-a[1]);
   const W=560,H=22; let x=0, s=`<svg viewBox="0 0 ${W} ${H}" style="max-width:${W}px">`;
   const seg=(label,v,color)=>{const w=v/total*(W-2);
    s+=`<rect x="${x}" y="2" width="${Math.max(w-2,1)}" height="16" rx="3" fill="${color}"
     data-t="${label}: ${unit==='%'?fmtP(v/total):v.toLocaleString()}"/>`;x+=w;};
   top.forEach(([m,v])=>seg(m,v,MC[m]||'var(--other)'));
-  if(other>0.0001) seg('other',other,'var(--other)');
   s+='</svg>';
   const row=document.createElement('div');
   row.style.cssText='display:flex;gap:12px;align-items:center;margin:3px 0';
@@ -156,8 +179,10 @@ function stacked(containerId, per, unit){ // per: run -> [ [label, value], ... ]
 function table(){
  const t=document.getElementById('runs');
  const rows=DATA.filter(r=>active.has(r.matrix));
- t.innerHTML='<tr><th>matrix</th><th>variant · params</th><th>acc</th><th>cost/call</th>'+
-  '<th>p50</th><th>p95</th><th>vs best-single acc</th><th>vs cost</th><th>n</th></tr>'+
+ const th=(label,key)=>`<th>${label}<span class="info" data-t="${(COL_INFO[key]||'').replace(/"/g,'&quot;')}">i</span></th>`;
+ t.innerHTML='<tr>'+th('matrix','matrix')+th('variant · params','variant')+th('acc','acc')+
+  th('cost/call','cost/call')+th('p50','p50')+th('p95','p95')+
+  th('vs best-single acc','vs best-single acc')+th('vs cost','vs cost')+th('n','n')+'</tr>'+
   rows.map(r=>{const res=r.result,bs=r.baselines&&r.baselines.best_single;
    return `<tr><td>${r.matrix}</td><td>${r.variant} ${JSON.stringify(r.params)}</td>`+
    `<td>${fmtP(res.accuracy)}</td><td>${fmt$(res.cost_per_call)}</td>`+
@@ -166,6 +191,9 @@ function table(){
    `<td>${bs?((res.accuracy-bs.accuracy>=0?'+':'')+(100*(res.accuracy-bs.accuracy)).toFixed(1)+'pt'):'-'}</td>`+
    `<td>${bs?((100*(res.cost_per_call/bs.cost_per_call-1)).toFixed(0)+'%'):'-'}</td>`+
    `<td>${res.scenarios}</td></tr>`}).join('');
+ t.querySelectorAll('th .info').forEach(el=>{
+  el.addEventListener('mousemove',e=>showTip(e,el.dataset.t));
+  el.addEventListener('mouseleave',hideTip);});
 }
 function render(){
  const p=document.getElementById('pareto'); p.innerHTML='';
@@ -175,8 +203,12 @@ function render(){
  table();
 }
 const mf=document.getElementById('matrixFilter');
-matrices.forEach(m=>{const b=document.createElement('button');b.textContent=m;b.className='on';
+matrices.forEach(m=>{const b=document.createElement('button');b.className='on';
+ b.innerHTML=m+`<span class="info" data-t="${matrixInfo(m).replace(/"/g,'&quot;')}">i</span>`;
  b.onclick=()=>{b.classList.toggle('on');b.classList.contains('on')?active.add(m):active.delete(m);render();};
+ b.querySelector('.info').addEventListener('mousemove',e=>{e.stopPropagation();showTip(e,e.target.dataset.t)});
+ b.querySelector('.info').addEventListener('mouseleave',hideTip);
+ b.querySelector('.info').addEventListener('click',e=>e.stopPropagation());
  mf.appendChild(b);});
 document.getElementById('variantLegend').innerHTML=Object.entries(VC)
  .map(([v,c])=>`<span><i class="swatch" style="background:${c}"></i>${v}</span>`).join('');
