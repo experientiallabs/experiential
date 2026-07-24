@@ -129,7 +129,7 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
     started = time.monotonic()
     policy = fit_rank_policy(
         matrix, fit_ids=fit_ids, embedder=EmbedderSpec(dim=DIM), n_clusters=K, seed=42,
-        guard_model=best_name, min_support=4,
+        guard_model=best_name, min_support=4, guard_margin=0.03,
         fitted_from=f"{name} split{split_seed}",
     )
     logger.info("%s: rank fit in %.0fs", name, time.monotonic() - started)
@@ -167,8 +167,12 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
         raw = np.argmax(scores, axis=1)
         # Guard: keep the best-single baseline unless the picked model's score actually
         # exceeds the baseline's (worst case == 1x best-single, per product requirement).
+        base_cost = mean_cost.get(best_name, cost_scale)
         picks = [
-            head.models[int(index)] if scores[row, index] > scores[row, baseline_index]
+            head.models[int(index)]
+            if scores[row, index]
+            > scores[row, baseline_index]
+            + (0.06 if mean_cost.get(head.models[int(index)], 0.0) > base_cost else 0.03)
             else best_name
             for row, index in enumerate(raw)
         ]
@@ -255,7 +259,8 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
         pick = max(second, key=lambda m: (second[m] - LAMS[1] * 0
                     , -model_names.index(m))) if second else best_name
         # Guard: revert to baseline unless the pick's profile beats the baseline's.
-        if second.get(pick, 0.0) <= second.get(best_name, 0.0):
+        pick_margin = 0.06 if mean_cost.get(pick, 0.0) > mean_cost.get(best_name, 0.0) else 0.03
+        if second.get(pick, 0.0) <= second.get(best_name, 0.0) + pick_margin:
             pick = best_name
         jisi_picks[sid] = pick
     record(

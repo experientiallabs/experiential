@@ -62,6 +62,7 @@ def fit_rank_policy(
     default_model: str | None = None,
     guard_model: str | None = None,
     min_support: int = 0,
+    guard_margin: float = 0.0,
     fitted_from: str | None = None,
 ) -> RoutingPolicy:
     """Fit a rank policy on `matrix` (restricted to `fit_ids` when given).
@@ -151,7 +152,15 @@ def fit_rank_policy(
             top = ranking[0]
             support = sums[cluster].get(top, (0.0, 0.0, 0))[2]
             baseline_mean = means.get(guard_model, 0.0)
-            if top != guard_model and (support < min_support or means[top] <= baseline_mean):
+            # Margin: the cluster winner must beat the baseline's evidence by guard_margin
+            # (doubled when the winner is pricier), or the cluster reverts. Kills the
+            # confidently-wrong pricier-and-worse failure mode.
+            margin = guard_margin
+            if mean_costs.get(top, 0.0) > mean_costs.get(guard_model, float("inf")):
+                margin = 2 * guard_margin
+            if top != guard_model and (
+                support < min_support or means[top] <= baseline_mean + margin
+            ):
                 ranking = [guard_model, *[m for m in ranking if m != guard_model]]
         label = ""
         if prefix_counts[cluster]:

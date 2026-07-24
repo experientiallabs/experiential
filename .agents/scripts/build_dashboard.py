@@ -97,7 +97,8 @@ const COL_INFO = {
  'vs cost':'Cost delta (%) vs that same best single model. Negative = cheaper.',
  'n':'Held-out test scenarios. Small n = wide noise floor (~+-1/sqrt(n)).',
 };
-const VC = {"best-single":"var(--c0)","rank":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)"};
+const VC = {"best-single":"var(--c0)","rank":"var(--c1)","rank-tilt":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)"};
+const HOLLOW = new Set(["rank-tilt"]); // same hue family as rank, hollow marks = the tilt variant
 const tip = document.getElementById('tip');
 const pop = document.getElementById('pop');
 function showPop(e, html){pop.innerHTML=html;pop.style.opacity=1;
@@ -153,8 +154,9 @@ function paretoChart(matrix){
  }
  rows.forEach((r,i)=>{
   const cx=X(r.result.cost_per_call), cy=Y(r.result.accuracy);
-  s+=`<circle data-i="${DATA.indexOf(r)}" cx="${cx}" cy="${cy}" r="6" fill="${VC[r.variant]||'var(--other)'}"
-   stroke="var(--surface)" stroke-width="2"/>`;});
+  const hollow=HOLLOW.has(r.variant);
+  s+=`<circle data-i="${DATA.indexOf(r)}" cx="${cx}" cy="${cy}" r="6" fill="${hollow?'var(--surface)':(VC[r.variant]||'var(--other)')}"
+   stroke="${hollow?VC[r.variant]:'var(--surface)'}" stroke-width="2"/>`;});
  s+=`</svg>`;
  const div=document.createElement('div');
  div.innerHTML=`<h3 style="font-size:13px;margin:0 0 4px">${matrix}<span class="info" data-t="${matrixInfo(matrix).replace(/"/g,'&quot;')}">i</span></h3>`+s;
@@ -295,7 +297,7 @@ matrices.forEach(m=>{const b=document.createElement('button');b.className='on';
  b.querySelector('.info').addEventListener('click',e=>e.stopPropagation());
  mf.appendChild(b);});
 document.getElementById('variantLegend').innerHTML=Object.entries(VC)
- .map(([v,c])=>`<span><i class="swatch" style="background:${c}"></i>${v}</span>`).join('');
+ .map(([v,c])=>`<span><i class="swatch" style="${HOLLOW.has(v)?`background:var(--surface);border:2px solid ${c}`:`background:${c}`}"></i>${v}</span>`).join('');
 render();
 </script></body></html>
 """
