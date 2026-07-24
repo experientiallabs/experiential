@@ -20,6 +20,7 @@ brokers frames plus environment tool calls.
 from __future__ import annotations
 
 import json
+import logging
 import struct
 import time
 import uuid
@@ -43,8 +44,21 @@ from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import READ_SKILL, ToolSpec
 from wmh.providers.base import ToolCallingProvider
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_MAX_ENV_ACTIONS = 40
 DEFAULT_CANCEL_POLL_INTERVAL_S = 0.5
+
+_WORKER_ERROR_LOG_CHARS = 500
+"""Warning-level cap on a worker exception message (full detail at debug)."""
+
+
+def _bounded_error_text(exc: Exception) -> str:
+    """One warning-sized line for a worker failure, truncated past the cap."""
+    text = " ".join(str(exc).split())
+    if len(text) > _WORKER_ERROR_LOG_CHARS:
+        return text[:_WORKER_ERROR_LOG_CHARS] + "... (truncated)"
+    return text
 
 
 # --------------------------------------------------------------------------------------------------
@@ -460,6 +474,18 @@ class RunnerLink:
                 "completion": completion.wire_payload(),
             }
         except Exception as exc:  # noqa: BLE001 - report to the runner, never crash the host
+            # Never silent: a provider that fails every call otherwise ends the
+            # episode as a clean-looking zero-turn "submitted" (the runner owns
+            # what it does with the error frame), which buried a live outage.
+            logger.warning(
+                "worker completion failed for episode %s (req %s): %s: %s; "
+                "returning the error frame to the runner",
+                episode_id,
+                req_id,
+                type(exc).__name__,
+                _bounded_error_text(exc),
+            )
+            logger.debug("worker completion failure detail", exc_info=exc)
             response = {
                 "type": "llm_response",
                 "episode_id": episode_id,

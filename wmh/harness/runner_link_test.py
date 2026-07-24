@@ -7,6 +7,7 @@ for the world model; `worker_fn` is injected so the worker-LLM callback needs no
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, cast
 
@@ -324,6 +325,43 @@ def test_worker_fn_error_is_reported_not_crashed() -> None:
     assert len(responses) == 1
     resp = responses[0]
     assert "provider down" in resp["error"]  # surfaced to the runner, host survives
+    assert result.stop_reason is StopReason.SUBMITTED
+
+
+def test_worker_fn_error_is_logged_at_warning_with_type_and_bounded_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The live outage: a provider that failed every call was surfaced only to
+    # the runner, so the host logs showed clean zero-turn episodes. The host
+    # must warn (bounded, no traceback) before returning the error frame.
+    long_detail = "session capacity exceeded " + "x" * 2000
+
+    def boom(request: ChatRequest) -> ChatResponse:
+        del request
+        raise RuntimeError(long_detail)
+
+    script = [
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "answer": "ok"},
+    ]
+    ch = _FakeChannel(script)
+    with caplog.at_level(logging.WARNING, logger="wmh.harness.runner_link"):
+        result = RunnerLink(ch, worker_fn=boom).run("t1", "x", _Env(), tools=_tools())
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "worker completion failed" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0]
+    assert "session capacity exceeded" in warnings[0]
+    assert "(truncated)" in warnings[0]
+    assert len(warnings[0]) < 700  # bounded at warning level
+    # The error frame still flows to the runner and the episode still ends.
+    responses = _sent(ch, "llm_response")
+    assert len(responses) == 1
+    assert "session capacity exceeded" in responses[0]["error"]
     assert result.stop_reason is StopReason.SUBMITTED
 
 
