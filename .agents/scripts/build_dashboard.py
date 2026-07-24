@@ -205,7 +205,6 @@ function headlines(){
   const bs=rows.find(r=>r.variant==='best-single');
   const routed=rows.filter(r=>r.variant!=='best-single');
   if(!bs||!routed.length) continue;
-  // Best routed = highest accuracy; ties break cheaper.
   const best=routed.slice().sort((a,b)=>(b.result.accuracy-a.result.accuracy)||(a.result.cost_per_call-b.result.cost_per_call))[0];
   const r=best.result, b=bs.result;
   const dAcc=(100*(r.accuracy-b.accuracy));
@@ -213,13 +212,22 @@ function headlines(){
   const xLat=(r.latency_p50_s&&b.latency_p50_s)?(b.latency_p50_s/r.latency_p50_s):null;
   const good=v=>v>=0?'var(--c3)':'var(--c4)';
   const div=document.createElement('div');
-  div.style.cssText='border:1px solid var(--grid);border-radius:10px;padding:14px 16px';
-  div.innerHTML=`<div style="color:var(--muted);font-size:12px">${m} · ${best.variant} ${JSON.stringify(best.params)} vs ${bs.params.model} · n=${r.scenarios}</div>
-   <div style="font-size:22px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
-   <div style="color:var(--muted)">${fmt$(r.cost_per_call)}/call <b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
-   (xLat?` · p50 ${r.latency_p50_s.toFixed(2)}s <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+
-   `</div>
-   <div style="color:var(--muted);font-size:12px;margin-top:4px">baseline: ${fmtP(b.accuracy)} @ ${fmt$(b.cost_per_call)}${b.latency_p50_s?` · p50 ${b.latency_p50_s.toFixed(2)}s`:''}${r.scenarios<60?' · <b>small n - wide noise floor</b>':''}</div>`;
+  div.style.cssText='border:1px solid var(--grid);border-radius:10px;padding:14px 16px;cursor:help';
+  // Headline only; everything else lives on hover.
+  div.innerHTML=`<div style="color:var(--muted);font-size:12px">${m}</div>
+   <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
+   <div style="color:var(--muted)"><b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
+   (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>`;
+  const tokens=Object.entries(r.tokens_by_model||{}).sort((a,b)=>(b[1].input+b[1].output)-(a[1].input+a[1].output))
+    .map(([mo,bk])=>`${mo}: ${bk.input.toLocaleString()} in / ${bk.output.toLocaleString()} out`).join('<br>');
+  const detail=`<b>${best.variant}</b> ${JSON.stringify(best.params)} vs best-single ${bs.params.model}`+
+   `<br>routed: ${fmtP(r.accuracy)} @ ${fmt$(r.cost_per_call)}${r.latency_p50_s?` · p50 ${r.latency_p50_s.toFixed(2)}s / p95 ${r.latency_p95_s.toFixed(2)}s`:''}`+
+   `<br>baseline: ${fmtP(b.accuracy)} @ ${fmt$(b.cost_per_call)}${b.latency_p50_s?` · p50 ${b.latency_p50_s.toFixed(2)}s`:''}`+
+   `<br>n = ${r.scenarios} held-out scenarios${r.scenarios<60?' · <b>small n - wide noise floor</b>':''} · unscored ${r.unscored}`+
+   `<br>split seed ${best.split_seed} · fit ${best.fit_scenarios}`+
+   (tokens?`<br><br><u>token blend by model</u><br>${tokens}`:'');
+  div.addEventListener('mousemove',e=>showTip(e,detail));
+  div.addEventListener('mouseleave',hideTip);
   cont.appendChild(div);
  }
 }
