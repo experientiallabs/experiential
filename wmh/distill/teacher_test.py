@@ -15,6 +15,7 @@ from wmh.distill.teacher import (
     TOKENIZER_PROBE_TEXTS,
     LogprobScorer,
     SdkLogprobScorer,
+    TeacherTopkScores,
     TinkerTeacher,
     tokenizer_fingerprint_check,
 )
@@ -349,3 +350,248 @@ def test_sdk_logprob_scorer_bounds_the_future(monkeypatch: pytest.MonkeyPatch) -
     scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _WedgedClient()))
     with pytest.raises(TinkerDeadlineError, match="tinker compute_logprobs timed out"):
         scorer.compute_logprobs([1, 2, 3])
+
+
+# --- score_topk: the prefill top-k path ---------------------------------------
+
+
+def test_score_topk_rows_pin_the_prefill_slice_exactly() -> None:
+    """Pins score_topk's per-position alignment against the fake's echoes.
+
+    The fake's prefill top-k puts, at entry p, the top-k for token p given
+    tokens < p with top-1 = (token p, its realized logprob); realized rows
+    echo the issued logprobs exactly like compute_logprobs. If score_topk
+    sliced a neighboring index, the top-1 candidates would not be the
+    datum's own sampled tokens and this equality would fail.
+    """
+    client = FakeSamplingClient(seed="tinker://fake/sampler/teacher/0")
+    prompt = [100, 101, 102, 103]
+    sequence = client.sample(prompt, max_tokens=6, temperature=1.0)
+    datum = _datum(prompt, sequence.tokens)
+    teacher = TinkerTeacher(_spec(), sampling_client=client)
+
+    scores = teacher.score_topk([datum], k=4)
+
+    [topk_row] = scores.topk
+    [realized_row] = scores.realized
+    n = len(datum.model_input_tokens)
+    assert len(topk_row) == n and len(realized_row) == n
+    # Context positions stay None in both rows.
+    assert topk_row[: len(prompt)] == [None] * len(prompt)
+    assert realized_row[: len(prompt)] == [None] * len(prompt)
+    # Loss positions: realized rows equal score()'s rows (same metric meaning),
+    # and every top-1 candidate is the realized token with its issued logprob.
+    assert realized_row == teacher.score([datum])[0]
+    for offset, position in enumerate(range(len(prompt), n)):
+        candidates = topk_row[position]
+        assert candidates is not None
+        assert len(candidates) == 4
+        assert candidates[0] == (sequence.tokens[offset], sequence.logprobs[offset])
+        logprobs = [lp for _, lp in candidates]
+        assert logprobs == sorted(logprobs, reverse=True)
+
+
+def test_score_topk_preserves_order_counts_usage_and_handles_empty() -> None:
+    client = FakeSamplingClient(seed="s")
+    prompt_a, prompt_b = [1, 2, 3], [7, 8]
+    seq_a = client.sample(prompt_a, max_tokens=4, temperature=1.0)
+    seq_b = client.sample(prompt_b, max_tokens=3, temperature=1.0)
+    datum_a, datum_b = _datum(prompt_a, seq_a.tokens), _datum(prompt_b, seq_b.tokens)
+    teacher = TinkerTeacher(_spec(), sampling_client=client)
+    assert teacher.score_topk([], k=2) == TeacherTopkScores(topk=[], realized=[])
+    assert teacher.usage() == 0
+
+    scores = teacher.score_topk([datum_a, datum_b], k=2)
+
+    tops = [
+        [row[position] for position in range(len(prompt), len(row))]
+        for row, prompt in zip(scores.topk, (prompt_a, prompt_b), strict=True)
+    ]
+    assert [
+        [candidates[0][0] for candidates in per_datum if candidates is not None]
+        for per_datum in tops
+    ] == [list(seq_a.tokens), list(seq_b.tokens)]
+    expected_usage = len(datum_a.model_input_tokens) + len(datum_b.model_input_tokens)
+    assert teacher.usage() == expected_usage
+
+
+def test_score_topk_loss_position_zero_stays_none() -> None:
+    """A sampled token with no context cannot be scored; its None survives in
+    BOTH rows (build_topk_ce_datums drops the datum loudly downstream)."""
+    client = FakeSamplingClient(seed="s")
+    sequence = client.sample([], max_tokens=3, temperature=1.0)
+    datum = _datum([], sequence.tokens)
+    teacher = TinkerTeacher(_spec(), sampling_client=client)
+
+    scores = teacher.score_topk([datum], k=2)
+
+    assert scores.topk[0][0] is None
+    assert scores.realized[0][0] is None
+    assert all(entry is not None for entry in scores.topk[0][1:])
+
+
+def test_score_topk_rejects_bad_k() -> None:
+    teacher = TinkerTeacher(_spec(), sampling_client=FakeSamplingClient(seed="s"))
+    with pytest.raises(ValueError, match=">= 1"):
+        teacher.score_topk([_datum([1, 2], [3])], k=0)
+
+
+def test_score_topk_without_a_topk_scorer_is_actionable() -> None:
+    """A plain compute_logprobs client cannot serve topk_ce; the error says so."""
+    teacher = TinkerTeacher(_spec(), sampling_client=_NoneAtLossScorer())
+    with pytest.raises(RuntimeError, match="topk_prompt_logprobs"):
+        teacher.score_topk([_datum([1, 2], [3])], k=2)
+
+
+class _WrongLengthTopkScorer:
+    """Returns one prefill entry too few, simulating tokenizer/SDK drift."""
+
+    def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
+        return [None] + [-1.0] * (len(token_ids) - 1)
+
+    def topk_prompt_logprobs(
+        self, token_ids: list[int], k: int
+    ) -> tuple[list[float | None], list[list[tuple[int, float]] | None]]:
+        realized = self.compute_logprobs(token_ids)
+        rows: list[list[tuple[int, float]] | None] = [
+            [(token, -1.0)] * k for token in token_ids[:-1]
+        ]
+        return realized, rows
+
+
+def test_score_topk_wrong_length_row_is_actionable() -> None:
+    teacher = TinkerTeacher(_spec(), sampling_client=_WrongLengthTopkScorer())
+    with pytest.raises(RuntimeError, match="one entry per input position"):
+        teacher.score_topk([_datum([1, 2], [3, 4])], k=2)
+
+
+class _EmptyCandidatesScorer:
+    """Realized logprobs are fine but every top-k row is empty."""
+
+    def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
+        return [None] + [-1.0] * (len(token_ids) - 1)
+
+    def topk_prompt_logprobs(
+        self, token_ids: list[int], k: int
+    ) -> tuple[list[float | None], list[list[tuple[int, float]] | None]]:
+        del k
+        return self.compute_logprobs(token_ids), [None] * len(token_ids)
+
+
+def test_score_topk_empty_candidates_at_loss_position_is_actionable() -> None:
+    teacher = TinkerTeacher(_spec(), sampling_client=_EmptyCandidatesScorer())
+    with pytest.raises(RuntimeError, match="no top-k candidates for loss position"):
+        teacher.score_topk([_datum([1, 2], [3, 4])], k=2)
+
+
+class _WedgedTopkScorer:
+    """Every prefill top-k call reports a deadline expiry (a wedged session)."""
+
+    def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
+        return [None] * len(token_ids)
+
+    def topk_prompt_logprobs(self, token_ids: list[int], k: int) -> NoReturn:
+        del token_ids, k
+        raise TinkerDeadlineError("sample", elapsed_s=0.05, deadline_s=0.05)
+
+
+def test_score_topk_deadline_drops_and_rebuilds_the_lazy_scorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    teacher = TinkerTeacher(_spec())
+    builds: list[LogprobScorer] = []
+
+    def build_scorer() -> LogprobScorer:
+        scorer: LogprobScorer = _WedgedTopkScorer() if not builds else FakeSamplingClient(seed="s")
+        builds.append(scorer)
+        return scorer
+
+    monkeypatch.setattr(teacher, "_build_sdk_scorer", build_scorer)
+
+    with pytest.raises(TinkerDeadlineError, match="timed out"):
+        teacher.score_topk([_datum([1, 2], [3, 4])], k=2)
+    # The wedged batch still counts, same contract as score(): every submitted
+    # call runs (and bills) server-side before the pool join propagates the
+    # error, so dropping it from usage would leak real spend past the ledger.
+    assert teacher.usage() == 4
+    scores = teacher.score_topk([_datum([1, 2], [3, 4])], k=2)
+    assert len(scores.topk) == 1
+    assert teacher.usage() == 8
+    assert len(builds) == 2
+
+
+def test_sdk_logprob_scorer_topk_uses_the_prefill_sample_call() -> None:
+    """The SDK adapter sends the whole sequence as a max_tokens=1 prompt with
+    both prompt-logprob switches set, and returns the response pair."""
+    pytest.importorskip("tinker")
+
+    recorded: dict[str, object] = {}
+
+    class _Response:
+        prompt_logprobs = [None, -0.5, -0.25]
+        topk_prompt_logprobs = [None, [(2, -0.5), (9, -1.0)], [(3, -0.25), (9, -1.5)]]
+
+    class _ReadyFuture:
+        def result(self, timeout: float | None = None) -> _Response:
+            del timeout
+            return _Response()
+
+    class _Client:
+        def sample(
+            self,
+            prompt: object,
+            num_samples: int,
+            sampling_params: object,
+            include_prompt_logprobs: bool = False,
+            topk_prompt_logprobs: int = 0,
+        ) -> _ReadyFuture:
+            recorded["prompt"] = prompt
+            recorded["num_samples"] = num_samples
+            recorded["sampling_params"] = sampling_params
+            recorded["include_prompt_logprobs"] = include_prompt_logprobs
+            recorded["topk_prompt_logprobs"] = topk_prompt_logprobs
+            return _ReadyFuture()
+
+    scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _Client()))
+    realized, rows = scorer.topk_prompt_logprobs([1, 2, 3], 2)
+
+    import tinker
+
+    assert recorded["prompt"] == tinker.ModelInput.from_ints([1, 2, 3])
+    assert recorded["num_samples"] == 1
+    params = recorded["sampling_params"]
+    assert isinstance(params, tinker.SamplingParams) and params.max_tokens == 1
+    assert recorded["include_prompt_logprobs"] is True
+    assert recorded["topk_prompt_logprobs"] == 2
+    assert realized == [None, -0.5, -0.25]
+    assert rows == [None, [(2, -0.5), (9, -1.0)], [(3, -0.25), (9, -1.5)]]
+
+
+def test_sdk_logprob_scorer_topk_missing_fields_is_actionable() -> None:
+    pytest.importorskip("tinker")
+
+    class _Response:
+        prompt_logprobs = None
+        topk_prompt_logprobs = None
+
+    class _ReadyFuture:
+        def result(self, timeout: float | None = None) -> _Response:
+            del timeout
+            return _Response()
+
+    class _Client:
+        def sample(
+            self,
+            prompt: object,
+            num_samples: int,
+            sampling_params: object,
+            include_prompt_logprobs: bool = False,
+            topk_prompt_logprobs: int = 0,
+        ) -> _ReadyFuture:
+            del prompt, num_samples, sampling_params
+            del include_prompt_logprobs, topk_prompt_logprobs
+            return _ReadyFuture()
+
+    scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _Client()))
+    with pytest.raises(RuntimeError, match="prompt_logprobs"):
+        scorer.topk_prompt_logprobs([1, 2, 3], 2)
