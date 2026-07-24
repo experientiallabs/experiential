@@ -12,14 +12,19 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 from llm_waterfall.types import ChatMessage, ChatTool
 
 import wmh.distill.loop as loop_module
+
+if TYPE_CHECKING:
+    import tinker
 from wmh.core.types import JsonObject
 from wmh.distill.config import (
     BudgetConfig,
@@ -35,6 +40,7 @@ from wmh.distill.config import (
     TrainConfig,
 )
 from wmh.distill.data import TrainDatum
+from wmh.distill.deadlines import TinkerDeadlineError
 from wmh.distill.fake_tinker import (
     FakeDatum,
     FakeSamplingClient,
@@ -47,6 +53,8 @@ from wmh.distill.loop import (
     DistillProgress,
     DistillResult,
     DistillSamplingClient,
+    SdkServiceClient,
+    SdkTrainingClient,
     StepMetrics,
     TaskSampler,
     pin_rollout_params,
@@ -946,3 +954,187 @@ def test_task_sampler_is_seeded_unique_and_covering() -> None:
         TaskSampler(["a", "a"], seed=0)
     with pytest.raises(ValueError, match="empty"):
         TaskSampler([], seed=0)
+
+
+# -- SdkTrainingClient deadlines: retry-once vs abort per call idempotency -----------------------
+
+
+class _NeverResolvingFuture:
+    """Mimics the SDK future of a wedged session: result(timeout) honors the timeout."""
+
+    def __init__(self) -> None:
+        self._never = threading.Event()
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        self._never.wait(timeout)
+        raise TimeoutError(f"fake future gave up after {timeout}s")
+
+
+@dataclass(frozen=True)
+class _SavedArtifact:
+    path: str
+
+
+class _ReadyFuture:
+    """A fake SDK future whose result is immediately available."""
+
+    def __init__(self, value: object = None) -> None:
+        self._value = value
+
+    def result(self, timeout: float | None = None) -> object:
+        del timeout
+        return self._value
+
+
+class _WedgedOnceTrainingClient:
+    """Fake tinker.TrainingClient: the FIRST call of each method wedges, retries succeed."""
+
+    def __init__(self) -> None:
+        self.forward_backward_calls = 0
+        self.optim_step_calls = 0
+        self.save_state_names: list[str] = []
+        self.load_state_paths: list[str] = []
+        self.save_weights_names: list[str] = []
+
+    def forward_backward(
+        self, datums: object, loss_fn: object
+    ) -> _NeverResolvingFuture | _ReadyFuture:
+        del datums, loss_fn
+        self.forward_backward_calls += 1
+        return _NeverResolvingFuture()
+
+    def optim_step(self, params: object) -> _NeverResolvingFuture | _ReadyFuture:
+        del params
+        self.optim_step_calls += 1
+        return _NeverResolvingFuture()
+
+    def save_state(self, name: str) -> _NeverResolvingFuture | _ReadyFuture:
+        self.save_state_names.append(name)
+        if len(self.save_state_names) == 1:
+            return _NeverResolvingFuture()
+        return _ReadyFuture(_SavedArtifact(path=f"tinker://fake/state/{name}"))
+
+    def load_state(self, path: str) -> _NeverResolvingFuture | _ReadyFuture:
+        self.load_state_paths.append(path)
+        if len(self.load_state_paths) == 1:
+            return _NeverResolvingFuture()
+        return _ReadyFuture()
+
+    def save_weights_for_sampler(self, name: str) -> _NeverResolvingFuture | _ReadyFuture:
+        self.save_weights_names.append(name)
+        if len(self.save_weights_names) == 1:
+            return _NeverResolvingFuture()
+        return _ReadyFuture(_SavedArtifact(path=f"tinker://fake/sampler/{name}"))
+
+
+def _sdk_training_client(fake: _WedgedOnceTrainingClient) -> SdkTrainingClient:
+    return SdkTrainingClient(cast("tinker.TrainingClient", fake))
+
+
+def _short_deadlines(monkeypatch: pytest.MonkeyPatch) -> None:
+    for env_var in (
+        "WMH_TINKER_DEADLINE_FORWARD_BACKWARD",
+        "WMH_TINKER_DEADLINE_OPTIM_STEP",
+        "WMH_TINKER_DEADLINE_SAVE_STATE",
+        "WMH_TINKER_DEADLINE_LOAD_STATE",
+        "WMH_TINKER_DEADLINE_SAVE_WEIGHTS_FOR_SAMPLER",
+        "WMH_TINKER_DEADLINE_CONNECT",
+    ):
+        monkeypatch.setenv(env_var, "0.05")
+
+
+def test_save_weights_for_sampler_retries_once_under_a_fresh_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _short_deadlines(monkeypatch)
+    fake = _WedgedOnceTrainingClient()
+    client = _sdk_training_client(fake)
+
+    path = client.save_weights_for_sampler("run-step-0001")
+
+    # Retried exactly once, and the retry saved under a distinct "-r1" name so
+    # a first attempt that completed server-side after abandonment cannot collide.
+    assert len(fake.save_weights_names) == 2
+    first, second = fake.save_weights_names
+    assert first.startswith("run-step-0001-")
+    assert second == f"{first}-r1"
+    assert path == f"tinker://fake/sampler/{second}"
+
+
+def test_save_state_retries_once_with_a_fresh_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    _short_deadlines(monkeypatch)
+    fake = _WedgedOnceTrainingClient()
+    client = _sdk_training_client(fake)
+
+    path = client.save_state()
+
+    assert len(fake.save_state_names) == 2
+    first, second = fake.save_state_names
+    assert first != second  # the retry advanced the per-session counter
+    assert first.endswith("-state-0000")
+    assert second.endswith("-state-0001")
+    assert path == f"tinker://fake/state/{second}"
+
+
+def test_load_state_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    _short_deadlines(monkeypatch)
+    fake = _WedgedOnceTrainingClient()
+    client = _sdk_training_client(fake)
+
+    client.load_state("tinker://fake/state/x")
+
+    assert fake.load_state_paths == ["tinker://fake/state/x"] * 2
+
+
+def _attached_datum() -> TrainDatum:
+    return TrainDatum(
+        trial_name="task-a__x1",
+        fragment_index=0,
+        model_input_tokens=[1, 2, 3],
+        loss_mask=[0.0, 1.0, 1.0],
+        sampled_logprobs=[0.0, -0.5, -0.7],
+        advantages=[0.0, 0.1, 0.2],
+    )
+
+
+def test_forward_backward_deadline_aborts_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NOT idempotent: gradients may have accumulated server-side before the
+    # deadline fired, so a retry could count the batch twice. Exactly one call.
+    pytest.importorskip("tinker")
+    _short_deadlines(monkeypatch)
+    fake = _WedgedOnceTrainingClient()
+    client = _sdk_training_client(fake)
+
+    with pytest.raises(TinkerDeadlineError, match="tinker forward_backward timed out"):
+        client.forward_backward([_attached_datum()], loss_fn="importance_sampling")
+    assert fake.forward_backward_calls == 1
+
+
+def test_optim_step_deadline_aborts_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    # NOT idempotent: the step may have been applied server-side; a retry
+    # would double-step the optimizer. Exactly one call.
+    pytest.importorskip("tinker")
+    _short_deadlines(monkeypatch)
+    fake = _WedgedOnceTrainingClient()
+    client = _sdk_training_client(fake)
+
+    with pytest.raises(TinkerDeadlineError, match="tinker optim_step timed out"):
+        client.optim_step(1e-5)
+    assert fake.optim_step_calls == 1
+
+
+def test_client_construction_is_deadline_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    _short_deadlines(monkeypatch)
+    never = threading.Event()
+
+    class _WedgedService:
+        def create_sampling_client(self, **kwargs: str) -> NoReturn:
+            del kwargs
+            never.wait()
+            raise AssertionError("unreachable: the event is never set")
+
+    service = SdkServiceClient(cast("tinker.ServiceClient", _WedgedService()))
+    with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
+        service.create_sampling_client("tinker://fake/sampler/x")
