@@ -70,6 +70,15 @@ class ProxPolicy(BaseModel):
     knn_k: int = 100  # kNN-Prox: nonzero prior on this many nearest references
     default_model: str  # fallback for degenerate inputs; also the guard baseline's home
     cost_scale: float = 0.0  # fit-set mean cost per scored episode (the lambda unit)
+    # Empirical-Bayes shrinkage (r2 extension, NOT in the paper): each reference's per-model
+    # mean is shrunk toward the model's global fit mean by episode support,
+    # V_shrunk = (n*V + m*V_global) / (n + m). m=0 is the faithful paper behavior. With m>0 a
+    # singleton reference (n=2 noisy episodes) barely moves the estimate off the global mean,
+    # so thin-evidence picks fall below the guard margin BY CONSTRUCTION instead of by a hard
+    # support cutoff.
+    shrink_m: float = 0.0
+    global_rewards: dict[str, float] = Field(default_factory=dict)  # per-model fit-set means
+    global_costs: dict[str, float] = Field(default_factory=dict)
     fitted_from: str | None = None
 
 
@@ -206,11 +215,25 @@ class ProxScorer:
         shape = (len(policy.references), len(self.models))
         self.rewards = np.full(shape, np.nan)
         self.costs = np.full(shape, np.nan)
+        counts = np.zeros(shape)
         for row, ref in enumerate(policy.references):
             for name, value in ref.rewards.items():
                 if name in index:
                     self.rewards[row, index[name]] = value
                     self.costs[row, index[name]] = ref.costs.get(name, 0.0)
+                    counts[row, index[name]] = ref.counts.get(name, 1)
+        if policy.shrink_m > 0.0 and policy.global_rewards:
+            # Empirical-Bayes shrinkage toward the global fit means (see ProxPolicy.shrink_m).
+            # A cell with NO local evidence becomes exactly the global prior, so shrinkage
+            # also fills sparse matrices with the honest "we know nothing local" estimate.
+            m = policy.shrink_m
+            global_r = np.asarray([policy.global_rewards.get(name, np.nan) for name in self.models])
+            global_c = np.asarray([policy.global_costs.get(name, np.nan) for name in self.models])
+            local_r = np.where(np.isnan(self.rewards), 0.0, self.rewards)
+            local_c = np.where(np.isnan(self.costs), 0.0, self.costs)
+            with np.errstate(invalid="ignore"):
+                self.rewards = (counts * local_r + m * global_r[None, :]) / (counts + m)
+                self.costs = (counts * local_c + m * global_c[None, :]) / (counts + m)
         self.known = ~np.isnan(self.rewards)  # [R, M]
 
     def estimates(self, query: np.ndarray) -> tuple[dict[str, float], dict[str, float], int]:
@@ -358,17 +381,23 @@ def _finish_policy(
 ) -> ProxPolicy:
     if not references:
         raise ValueError("no scored references; cannot fit a prox policy")
-    best: dict[str, tuple[float, int]] = {}
+    sums: dict[str, tuple[float, float, int]] = {}
     total_cost, total_count = 0.0, 0
     for outcome in matrix.outcomes:
         if outcome.scenario_id not in fit_set or outcome.reward is None:
             continue
-        reward_sum, count = best.get(outcome.model, (0.0, 0))
-        best[outcome.model] = (reward_sum + outcome.reward, count + 1)
+        reward_sum, cost_sum, count = sums.get(outcome.model, (0.0, 0.0, 0))
+        sums[outcome.model] = (
+            reward_sum + outcome.reward,
+            cost_sum + outcome.cost_usd,
+            count + 1,
+        )
         total_cost += outcome.cost_usd
         total_count += 1
+    global_rewards = {m: rs / count for m, (rs, _cs, count) in sums.items()}
+    global_costs = {m: cs / count for m, (_rs, cs, count) in sums.items()}
     pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
-    default = min(best, key=lambda m: (-(best[m][0] / best[m][1]), pool_order[m]))
+    default = min(global_rewards, key=lambda m: (-global_rewards[m], pool_order[m]))
     return ProxPolicy(
         kind=kind,
         pool=matrix.pool,
@@ -378,5 +407,7 @@ def _finish_policy(
         knn_k=knn_k or 100,
         default_model=default,
         cost_scale=(total_cost / total_count) if total_count else 0.0,
+        global_rewards=global_rewards,
+        global_costs=global_costs,
         fitted_from=fitted_from,
     )

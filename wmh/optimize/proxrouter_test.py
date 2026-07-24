@@ -144,6 +144,35 @@ def test_missing_model_renormalizes_instead_of_nan() -> None:
     assert np.isfinite(rewards["alpha"])
 
 
+def test_shrinkage_pulls_thin_evidence_to_global_mean() -> None:
+    """With heavy shrinkage a singleton reference cannot outvote the global prior."""
+    matrix = _matrix()
+    policy = fit_knn_prox(matrix, embedder=EmbedderSpec(dim=256), knn_k=4, tau_inv=20.0)
+    scorer_raw = ProxScorer(policy)
+    heavy = policy.model_copy(update={"shrink_m": 1000.0})
+    scorer_shrunk = ProxScorer(heavy)
+    query = _embed(policy.embedder, "solve the integral dx calculus")
+    raw_rewards, _c, _n = scorer_raw.estimates(query)
+    shrunk_rewards, _c2, _n2 = scorer_shrunk.estimates(query)
+    # Raw: local evidence says alpha ~1.0 near math. Shrunk: both collapse to ~0.5 global.
+    assert raw_rewards["alpha"] > 0.9
+    assert abs(shrunk_rewards["alpha"] - 0.5) < 0.01
+    assert abs(shrunk_rewards["beta"] - 0.5) < 0.01
+    # So a guarded decision reverts to the baseline: the gap is below any real margin.
+    decision = scorer_shrunk.decide(query, guard_model="beta", guard_margin=0.03)
+    assert decision.model == "beta"
+
+
+def test_mild_shrinkage_keeps_strong_local_signal() -> None:
+    matrix = _matrix()  # 1 episode per (scenario, model): n=1 vs m=1 halves the gap
+    policy = fit_knn_prox(matrix, embedder=EmbedderSpec(dim=256), knn_k=4, tau_inv=20.0)
+    mild = policy.model_copy(update={"shrink_m": 1.0})
+    rewards, _c, _n = ProxScorer(mild).estimates(
+        _embed(policy.embedder, "solve the integral dx calculus")
+    )
+    assert rewards["alpha"] > rewards["beta"] + 0.2  # signal survives
+
+
 def test_cost_lambda_prefers_cheaper_at_parity() -> None:
     """With rewards tied, any positive lambda must route to the cheaper model."""
     outcomes = []
