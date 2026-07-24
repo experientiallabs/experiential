@@ -280,3 +280,20 @@ Honest reading: on this small deduped set, routing is a cost-saver (-6-8pt for -
 not an accuracy win. Dup audit on the other matrices: RouterBench classic 16/36,497 (0.04%,
 tables stand), ours9 0/1,199 (clean). Earlier pre-dedupe LLMRouterBench rows in this doc are
 SUPERSEDED by this section.
+
+## Credibility correction + hill-climb structure (2026-07-24, Silen review)
+
+Citation screen (which the earlier lit passes skipped): Avengers (Shanghai AI Lab, AAAI'26)
+and ProxRouter (CMU) are the established methods; JiSi (2601.01330) and IrtNet (2510.00844)
+are <5-citation 2026 preprints from unestablished groups. Corrected stance: jisi/irt/tilt are
+RESEARCH DIRECTIONS whose empirical results here are the evidence, not their papers.
+
+Structure going forward: three specialist chats (transfer prompts routing-common/r1/r2/r3 in
+~/Downloads/wmh-plan-transfer-prompts/) hill-climb retrieval (r1), cluster (r2, keeper of the
+credible Avengers/ProxRouter line), and learned-ability (r3) families against the shared
+interfaces: matrices + runs + findings under ~/Desktop/Projects/wmh-routing-data/,
+evaluate_choices/RunRecord as the single scorer, 5-seed spreads, margin guards, leak audits,
+and look-at-the-outputs discipline (all binding via routing-common.md). The master chat
+(optimization) owns interfaces, benchmark sanity, cross-chat comparison, and promotion into
+wmh/optimize; next master tasks = drawing-board survey beyond these three families and an
+empirical audit of the benchmarks themselves.
