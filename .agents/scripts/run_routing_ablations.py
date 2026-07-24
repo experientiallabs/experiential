@@ -33,7 +33,9 @@ REPORTS = Path(".wmh/evals/reports")
 DIM = 1024
 K = 64
 LAMS = [0.0, 0.02, 0.1]
-SPLIT_SEED = 0
+# Multiple disjoint-ish splits: every scenario reaches test across seeds, so per-matrix
+# signal comes from mean +- spread over seeds, not one cherry-pickable 70/30 draw.
+SPLIT_SEEDS = [0, 1, 2, 3, 4]
 
 
 def _matrices() -> dict[str, OutcomeMatrix]:
@@ -88,10 +90,10 @@ def _emit(record: RunRecord) -> None:
     )
 
 
-def run_matrix(name: str, matrix: OutcomeMatrix) -> None:
+def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
     from wmh.research.routerbench import best_single_model, oracle, split_scenario_ids
 
-    fit_ids, test_ids = split_scenario_ids(matrix, train_fraction=0.7, seed=SPLIT_SEED)
+    fit_ids, test_ids = split_scenario_ids(matrix, train_fraction=0.7, seed=split_seed)
     tasks = {o.scenario_id: o.task for o in matrix.outcomes}
     embedder = HashingEmbedder(dim=DIM)
     fit_vecs = np.asarray(embedder.embed([tasks[s] for s in fit_ids]))
@@ -112,7 +114,7 @@ def run_matrix(name: str, matrix: OutcomeMatrix) -> None:
                 matrix=name,
                 variant=variant,
                 params=params,
-                split_seed=SPLIT_SEED,
+                split_seed=split_seed,
                 fit_scenarios=len(fit_ids),
                 test_scenarios=len(test_ids),
                 result=result,
@@ -127,7 +129,7 @@ def run_matrix(name: str, matrix: OutcomeMatrix) -> None:
     started = time.monotonic()
     policy = fit_rank_policy(
         matrix, fit_ids=fit_ids, embedder=EmbedderSpec(dim=DIM), n_clusters=K, seed=42,
-        fitted_from=f"{name} split{SPLIT_SEED}",
+        fitted_from=f"{name} split{split_seed}",
     )
     logger.info("%s: rank fit in %.0fs", name, time.monotonic() - started)
     for lam in LAMS:
@@ -169,11 +171,13 @@ def run_matrix(name: str, matrix: OutcomeMatrix) -> None:
 
 
 def main() -> None:
-    wanted = sys.argv[1:]
+    wanted = [a for a in sys.argv[1:] if not a.startswith("--")]
+    seeds = SPLIT_SEEDS if "--seeds" in sys.argv else [0]
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
             continue
-        run_matrix(name, matrix)
+        for seed in seeds:
+            run_matrix(name, matrix, split_seed=seed)
     logger.info("runs -> %s, reports -> %s", RUNS, REPORTS)
 
 

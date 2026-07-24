@@ -233,7 +233,7 @@ function headlines(){
   // Headline only; everything else lives on hover.
   const nWarn=r.scenarios<60;
   div.innerHTML=`<div style="color:var(--muted);font-size:12px">${m}</div>
-   <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
+   <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)}<span style="font-size:12px;color:var(--muted);font-weight:400">${best.acc_sd?` ±${(100*best.acc_sd).toFixed(1)}`:''}</span> <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
    <div style="color:var(--muted)"><b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
    (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>`;
   // Per-model economics for this run: routed calls, total cost, token share.
@@ -296,6 +296,59 @@ def main() -> None:
     if "--all" not in sys.argv:
         ours = {"routerbench-ours9"}
         runs = [r for r in runs if r["matrix"] in ours or r["matrix"].startswith("wm-")]
+
+    # Aggregate across split seeds: one row per (matrix, variant, params) with mean metrics,
+    # accuracy spread, and TOTAL test n. Prevents a lucky split from headlining.
+    groups: dict[str, list[dict]] = {}
+    for run in runs:
+        key = json.dumps([run["matrix"], run["variant"], run["params"]], sort_keys=True)
+        groups.setdefault(key, []).append(run)
+
+    def _agg(rows: list[dict]) -> dict:
+        import statistics
+
+        base = json.loads(json.dumps(rows[-1]))  # deep copy, latest run as the template
+        results = [r["result"] for r in rows]
+
+        def _mean(field: str) -> float | None:
+            values = [r[field] for r in results if r.get(field) is not None]
+            return sum(values) / len(values) if values else None
+
+        agg = base["result"]
+        accs = [r["accuracy"] for r in results]
+        agg["accuracy"] = sum(accs) / len(accs)
+        agg["cost_per_call"] = _mean("cost_per_call")
+        agg["latency_p50_s"] = _mean("latency_p50_s")
+        agg["latency_p95_s"] = _mean("latency_p95_s")
+        agg["scenarios"] = sum(r["scenarios"] for r in results)
+        agg["unscored"] = sum(r["unscored"] for r in results)
+        mix: dict[str, float] = {}
+        for r in results:
+            for model, share in r["model_mix"].items():
+                mix[model] = mix.get(model, 0.0) + share / len(results)
+        agg["model_mix"] = mix
+        tokens: dict[str, dict[str, int]] = {}
+        for r in results:
+            for model, bucket in r.get("tokens_by_model", {}).items():
+                dst = tokens.setdefault(model, {"input": 0, "output": 0})
+                dst["input"] += bucket["input"]
+                dst["output"] += bucket["output"]
+        agg["tokens_by_model"] = tokens
+        base["seeds"] = len(rows)
+        base["acc_sd"] = statistics.stdev(accs) if len(accs) > 1 else 0.0
+        if base.get("baselines", {}).get("best_single") and all(
+            r.get("baselines", {}).get("best_single") for r in rows
+        ):
+            bs = base["baselines"]["best_single"]
+            bs_rows = [r["baselines"]["best_single"] for r in rows]
+            bs["accuracy"] = sum(r["accuracy"] for r in bs_rows) / len(bs_rows)
+            bs["cost_per_call"] = sum(r["cost_per_call"] for r in bs_rows) / len(bs_rows)
+            lat = [r["latency_p50_s"] for r in bs_rows if r.get("latency_p50_s") is not None]
+            bs["latency_p50_s"] = sum(lat) / len(lat) if lat else None
+            bs["scenarios"] = sum(r["scenarios"] for r in bs_rows)
+        return base
+
+    runs = [_agg(rows) for rows in groups.values()]
     out.parent.mkdir(parents=True, exist_ok=True)
     html = TEMPLATE.replace("__DATA__", json.dumps(runs))
     # Syntax gate: a single bad quote blanks the whole page silently; check before shipping.
