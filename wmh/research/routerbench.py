@@ -111,7 +111,9 @@ def load_routerbench(
 
 
 def _eval_name(scenario_id: str) -> str:
-    return scenario_id.split(":", 1)[0]
+    # Ids without a "dataset:" prefix (wm matrices use raw trace ids) share ONE stratum;
+    # otherwise every scenario is a size-1 stratum and the split sends them all to fit.
+    return scenario_id.split(":", 1)[0] if ":" in scenario_id else ""
 
 
 def split_scenario_ids(

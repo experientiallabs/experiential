@@ -130,3 +130,30 @@ def test_zero_router_points_are_single_models() -> None:
         "model-a": (0.02, 0.625),
         "model-b": (0.001, 0.625),
     }
+
+
+def test_split_handles_prefixless_scenario_ids() -> None:
+    # wm matrices key scenarios by raw trace ids (no "dataset:" prefix); they must still split.
+    frame = pd.DataFrame(
+        {
+            "sample_id": [f"t{i}" for i in range(10)],
+            "prompt": [f"task {i}" for i in range(10)],
+            "eval_name": [""] * 10,
+            "model-a": [1.0] * 10,
+            "model-b": [0.0] * 10,
+            "model-a|total_cost": [0.01] * 10,
+            "model-b|total_cost": [0.001] * 10,
+            "model-a|model_response": ["r"] * 10,
+            "model-b|model_response": ["r"] * 10,
+        }
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "m.pkl"
+        frame.to_pickle(path)
+        matrix = load_routerbench(path, models=_MODELS)
+    # Strip the ":"-prefix to simulate wm ids.
+    for outcome in matrix.outcomes:
+        outcome.scenario_id = outcome.scenario_id.split(":", 1)[1]
+    fit, test = split_scenario_ids(matrix, train_fraction=0.7, seed=0)
+    assert len(fit) == 7
+    assert len(test) == 3
