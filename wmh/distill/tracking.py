@@ -2,8 +2,9 @@
 
 `build_tracker` turns the run config's `[wandb]` section into a
 `DistillTracker`: the no-op `NullTracker` when tracking is disabled (the
-default), or a `WandbTracker` streaming step metrics, eval solve rates, and
-the final gate summary to a wandb run. The wandb SDK stays an optional extra
+default), or a `WandbTracker` streaming step metrics, eval solve rates,
+sample rollout tables, and the final gate summary to a wandb run. The wandb
+SDK stays an optional extra
 (lazy import, mirroring the tinker SDK in `wmh.providers.tinker`), and
 credentials are checked at init so a misconfigured run fails fast BEFORE any
 paid rollout. After a successful init the contract inverts: a wandb failure
@@ -27,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmh.core.types import JsonObject, JsonValue
 from wmh.distill.config import DistillConfig
+from wmh.distill.samples import SampleRollout
 
 if TYPE_CHECKING:
     from wmh.distill.loop import StepMetrics, WarmupMetrics
@@ -49,8 +51,8 @@ class DistillTracker(Protocol):
     """The tracking slice the distillation loop emits to.
 
     Implementations must never raise from `log_step`, `log_warmup_step`,
-    `log_eval`, `log_summary`, or `finish` once constructed: the loop calls
-    them inline with paid training work.
+    `log_eval`, `log_samples`, `log_summary`, or `finish` once constructed:
+    the loop calls them inline with paid training work.
     """
 
     def log_step(self, step: int, metrics: StepMetrics) -> None:
@@ -63,6 +65,10 @@ class DistillTracker(Protocol):
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
         """Record one eval batch's solve rate (None step means pre-training)."""
+        ...
+
+    def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
+        """Record one batch's rendered sample rollouts (None step means pre-training)."""
         ...
 
     def log_summary(
@@ -94,6 +100,9 @@ class NullTracker:
         """No-op."""
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
+        """No-op."""
+
+    def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
         """No-op."""
 
     def log_summary(
@@ -138,6 +147,14 @@ class WandbRunLike(Protocol):
         ...
 
 
+class WandbTableLike(Protocol):
+    """An opaque wandb Table instance: constructed, logged, never read back."""
+
+
+WandbLogValue = JsonValue | WandbTableLike
+"""What one wandb.log payload value may be: a plain scalar or a table."""
+
+
 class WandbModuleLike(Protocol):
     """The module-level wandb surface the tracker drives."""
 
@@ -158,8 +175,13 @@ class WandbModuleLike(Protocol):
         """Start (or, with an id and resume mode, continue) a wandb run."""
         ...
 
-    def log(self, data: Mapping[str, JsonValue], *, step: int) -> None:
-        """Log one row of metrics at a step."""
+    # The SDK's own class name; structurally just a callable attribute.
+    def Table(self, *, columns: list[str], data: list[list[JsonValue]]) -> WandbTableLike:
+        """Build one wandb Table (a fresh one per `log_samples` call)."""
+        ...
+
+    def log(self, data: Mapping[str, WandbLogValue], *, step: int) -> None:
+        """Log one row of metrics (or tables) at a step."""
         ...
 
     def finish(self) -> None:
@@ -380,6 +402,35 @@ class WandbTracker:
         """Log one eval batch's solve rate under `eval/<name>`."""
         at_step = step if step is not None else 0
         self._guarded(lambda: self._wandb.log({f"eval/{name}": solve_rate}, step=at_step))
+
+    def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
+        """Log one batch's rendered rollouts as a fresh wandb Table per call.
+
+        A wandb Table is immutable once logged (current SDKs reject
+        re-logging a mutated Table object, and incremental appends need
+        artifact round-trips), so the tracker keeps it simple: each call
+        builds a fresh table with columns kind/step/trial/reward/text and
+        logs it under a step-qualified key, `samples/<kind>-<step>`
+        (`samples/<kind>` when step is None), so every batch's sample set
+        stays addressable on the dashboard. Pre-training batches (step None)
+        chart at wandb step 0, matching `log_eval`.
+        """
+        if not samples:
+            return
+        at_step = step if step is not None else 0
+        key = f"samples/{kind}" if step is None else f"samples/{kind}-{step:04d}"
+
+        def _log() -> None:
+            table = self._wandb.Table(
+                columns=["kind", "step", "trial", "reward", "text"],
+                data=[
+                    [kind, step, sample.trial_name, sample.reward, sample.text]
+                    for sample in samples
+                ],
+            )
+            self._wandb.log({key: table}, step=at_step)
+
+        self._guarded(_log)
 
     def log_summary(
         self,

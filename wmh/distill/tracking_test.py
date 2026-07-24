@@ -27,6 +27,7 @@ from wmh.distill.config import (
     WandbConfig,
 )
 from wmh.distill.loop import StepMetrics, WarmupMetrics
+from wmh.distill.samples import SampleRollout
 from wmh.distill.tracking import (
     WANDB_API_KEY_ENV,
     WANDB_RUN_FILE,
@@ -56,13 +57,21 @@ class _FakeRun:
         self.summary = _FakeSummary()
 
 
+class _FakeTable:
+    """Records the columns and rows one fake `wandb.Table` was built with."""
+
+    def __init__(self, columns: list[str], data: list[list[JsonValue]]) -> None:
+        self.columns = columns
+        self.data = data
+
+
 class _FakeWandb(ModuleType):
     """A recording stand-in for the wandb module (installed in sys.modules)."""
 
     def __init__(self) -> None:
         super().__init__("wandb")
         self.init_calls: list[JsonObject] = []
-        self.log_calls: list[tuple[dict[str, JsonValue], int]] = []
+        self.log_calls: list[tuple[dict[str, JsonValue | _FakeTable], int]] = []
         self.finish_calls = 0
         self.run = _FakeRun()
         self.fail_logging = False
@@ -96,7 +105,12 @@ class _FakeWandb(ModuleType):
         self.run.id = id if id is not None else f"fake-run-{len(self.init_calls)}"
         return self.run
 
-    def log(self, data: Mapping[str, JsonValue], *, step: int) -> None:
+    def Table(self, *, columns: list[str], data: list[list[JsonValue]]) -> _FakeTable:
+        if self.fail_logging:
+            raise RuntimeError("wandb service unavailable")
+        return _FakeTable(columns, data)
+
+    def log(self, data: Mapping[str, JsonValue | _FakeTable], *, step: int) -> None:
         if self.fail_logging:
             raise RuntimeError("wandb service unavailable")
         self.log_calls.append((dict(data), step))
@@ -156,6 +170,14 @@ def _metrics(
     )
 
 
+def _sample(trial_name: str = "task-a__s1", reward: float = 1.0) -> SampleRollout:
+    return SampleRollout(
+        trial_name=trial_name,
+        reward=reward,
+        text=f"### trial {trial_name}\n<|im_start|>user\nhi<|im_end|>\n",
+    )
+
+
 def _warmup_metrics() -> WarmupMetrics:
     return WarmupMetrics(
         tasks=4,
@@ -202,6 +224,7 @@ def test_build_tracker_disabled_is_a_null_tracker(tmp_path: Path) -> None:
     tracker.log_step(0, _metrics())
     tracker.log_warmup_step(0, _warmup_metrics())
     tracker.log_eval("baseline-teacher", 0.5, None)
+    tracker.log_samples("train", 0, [_sample()])
     tracker.log_summary(
         gate_accepted=True,
         gate_reason="ok",
@@ -480,6 +503,43 @@ def test_log_eval_uses_the_eval_namespace_and_step(fake_wandb: _FakeWandb, tmp_p
     ]
 
 
+def test_log_samples_logs_a_fresh_table_under_a_step_qualified_key(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    """Each call builds its own immutable table; the key carries kind and step."""
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_samples("train", 3, [_sample("t1", 1.0), _sample("t2", 0.0)])
+    (payload, step) = fake_wandb.log_calls[-1]
+    assert step == 3
+    table = payload["samples/train-0003"]
+    assert isinstance(table, _FakeTable)
+    assert table.columns == ["kind", "step", "trial", "reward", "text"]
+    assert table.data == [
+        ["train", 3, "t1", 1.0, _sample("t1", 1.0).text],
+        ["train", 3, "t2", 0.0, _sample("t2", 0.0).text],
+    ]
+    # A later batch logs a fresh table under its own key, never an append.
+    tracker.log_samples("train", 4, [_sample("t3")])
+    (payload_next, _) = fake_wandb.log_calls[-1]
+    assert "samples/train-0004" in payload_next
+
+
+def test_log_samples_without_a_step_charts_at_zero(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_samples("eval-baseline-teacher", None, [_sample()])
+    (payload, step) = fake_wandb.log_calls[-1]
+    assert step == 0  # pre-training samples chart at step 0, like log_eval
+    table = payload["samples/eval-baseline-teacher"]
+    assert isinstance(table, _FakeTable)
+    assert table.data[0][1] is None  # the row keeps the honest None step
+
+
+def test_log_samples_with_no_samples_logs_nothing(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_samples("train", 0, [])
+    assert fake_wandb.log_calls == []
+
+
 def test_log_summary_updates_the_run_summary(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
     tracker = _tracker(fake_wandb, tmp_path / "run")
     tracker.log_summary(
@@ -519,6 +579,7 @@ def test_a_log_failure_degrades_to_noop_with_one_warning(
     with caplog.at_level(logging.WARNING, logger="wmh.distill.tracking"):
         tracker.log_step(0, _metrics())  # first failure: warns, marks dead
         tracker.log_eval("step-0000", 0.5, 0)  # dead: skipped silently
+        tracker.log_samples("train", 0, [_sample()])  # dead: skipped silently
         tracker.log_summary(
             gate_accepted=False,
             gate_reason="regressed",
