@@ -223,7 +223,20 @@ def main() -> None:
     )
     runs = [json.loads(line) for line in RUNS.read_text(encoding="utf-8").splitlines()]
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(TEMPLATE.replace("__DATA__", json.dumps(runs)), encoding="utf-8")
+    html = TEMPLATE.replace("__DATA__", json.dumps(runs))
+    # Syntax gate: a single bad quote blanks the whole page silently; check before shipping.
+    import re
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("node"):
+        script = re.search(r"<script>(.*)</script>", html, re.S)
+        assert script is not None
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as handle:
+            handle.write(script.group(1))
+        subprocess.run(["node", "--check", handle.name], check=True)
+    out.write_text(html, encoding="utf-8")
     sys.stderr.write(f"dashboard: {len(runs)} runs -> {out}\n")
 
 
