@@ -141,3 +141,13 @@ holds 0.772 accuracy where price-mixing toward gpt-4 interpolates ~0.70. Predict
 genuinely adding value beyond price interpolation. Caveat carried from their code: AIQ's
 normalization couples it to the comparison set's max cost, so we always publish hull points
 alongside the scalar.
+
+## Closing cross-check facts (2026-07-24)
+
+- Avengers: every evaluate/* harness passes the RAW prompt into `router.route(question)`
+  (grep across evaluate/*.py); no preprocessing before embedding, so the replication's
+  query path matches. Paper-era artifact names pin k=64 (ranking_centers_split_k64_m22),
+  config template pins top_n=2/top_k=2/beta=6.0.
+- RouterBench licenses: code MIT (LICENSE carries a stray LangChain copyright line, likely a
+  template slip); the HF dataset carries NO license tag. We consume it for internal
+  validation and cite it; do not redistribute the data in any public artifact.
