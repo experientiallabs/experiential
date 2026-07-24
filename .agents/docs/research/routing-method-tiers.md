@@ -86,3 +86,47 @@ headline). The fitted policy exposes lambda so eval can sweep the full frontier
 (fit-once-slide-knob, Hybrid LLM 2404.14618), and the future weighted-equation objective over
 quality/cost/latency (Silen's direction) arrives as knob positions on the same artifact, with
 latency as an SLA constraint rather than a scalar term (MixLLM's pattern).
+
+## Results (2026-07-24, first benchmark round)
+
+RouterBench 0-shot matrix (36,497 prompts x 11 models), stratified split seed 0
+(25,548 fit / 10,949 held-out), fitter = faithful Avengers replication
+(k=64, top_k=2, beta=6.0, seed 42). All numbers on the untouched held-out split:
+
+| policy | accuracy | cost/call | note |
+| --- | --- | --- | --- |
+| best-single (gpt-4-1106, fit-chosen) | 0.7856 | $0.00327 | the bar |
+| oracle (per-scenario best) | 0.9138 | $0.00024 | ceiling: +13pts AND 13x cheaper |
+| random | 0.5223 | $0.00083 | floor |
+| rank, hashing-512, lam=0 | 0.7882 | $0.00264 | beats best-single on BOTH axes |
+| rank, hashing-1024, lam=0 | 0.7886 | $0.00253 | |
+| rank, hashing-1024, lam=0.02 | 0.7723 | $0.00094 | -1.3pts for 71% cheaper |
+| rank, hashing-1024, lam=0.05 | 0.7552 | $0.00069 | |
+| rank, hashing-1024, lam=0.2 | 0.6938 | $0.00024 | oracle-cost territory |
+
+Readings: (1) the pure replication clears best-single with cost playing no part in fitting -
+the saving falls out of the ~25% of clusters where cheaper models genuinely rank first;
+(2) the cost knob (rerank_policy, fit-once-slide) traces a real frontier and answers the
+"how much cost for quality" question with data; (3) the gap to oracle (12.5pts) is the
+embedder + per-query-predictor headroom - hashing trigram is lexical, and the
+text-embedding-3-large comparison run is in flight. Artifacts: .wmh/evals/routerbench/.
+
+## Implementation comparison vs the reference (ZhangYiqun018/Avengers)
+
+Read line-by-line during implementation (core/routing/rank_router.py,
+core/generate_rank_router.py); differences, all deliberate and documented in
+wmh/optimize/routing.py's docstring:
+
+| aspect | reference | ours |
+| --- | --- | --- |
+| embed + normalize | external gte-qwen2-7b service + sklearn Normalizer | EmbedderSpec (hashing or Azure deployment) + same Normalizer |
+| clustering | sklearn KMeans k-means++/elkan/max_iter=1000/seeded | identical call |
+| per-cluster score | correct/total (binary) | mean reward (graded; identical on binary) |
+| ranking | accuracy desc, dict-order ties | reward desc, pool-order ties (deterministic) |
+| selection | top-k softmax(-beta*dist), sum p/(rank+0.1), missing=1/999 | identical math (shared serve/eval code path) |
+| artifacts | centres.npy + rankings.json + joblib normalizer | one versioned policy.json (self-describing) |
+| cost | absent | absent at lam=0; stored evidence + rerank knob on top |
+| routing output | top-N experts (generator may ensemble) | top-1 (single-model serving); top-N is the tier-3 ensembling step |
+
+No accidental deltas found; the two additive extras (cluster labels for the request log,
+cost evidence for the knob) do not alter lam=0 behavior.
