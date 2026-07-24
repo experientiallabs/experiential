@@ -130,6 +130,10 @@ class RolloutStats(BaseModel):
     empty_span_trials: int = Field(ge=0)
     """Trials that recorded no token span (died before the first completion)."""
 
+    # TODO: surface TokenRecorder.fallback_count (incremental-prompt re-renders) here;
+    # it needs the per-trial span sink format to carry the counter across the
+    # agent-process boundary, so it is not trivially wireable today.
+
 
 def collect_rollouts(
     step_index: int,
