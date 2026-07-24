@@ -18,9 +18,13 @@ training step's.
 The Tinker SDK stays an optional extra: the real service client is built
 lazily only when no `service_client` is injected, and the thin `Sdk*`
 adapters here (mirroring `SdkSampler` and `SdkLogprobScorer`) are the only
-code that touches it. Tests drive the whole loop with the deterministic fakes
-in `wmh.distill.fake_tinker`, whose `FakeTrainingClient` asserts the
-tokens-in-tokens-out invariant on every `forward_backward` batch.
+code that touches it. Every SDK call is deadline-bounded
+(`wmh.distill.deadlines`), so a wedged session raises a typed
+`TinkerDeadlineError` instead of hanging; see `SdkTrainingClient` for the
+per-call idempotency reasoning that decides what expiry does. Tests drive
+the whole loop with the deterministic fakes in `wmh.distill.fake_tinker`,
+whose `FakeTrainingClient` asserts the tokens-in-tokens-out invariant on
+every `forward_backward` batch.
 
 Resume: cadenced `save_state` checkpoints land in the run store's manifest;
 `resume=True` restores the latest checkpoint via `load_state`, continues the
@@ -50,6 +54,7 @@ from wmh.config.store import validate_name
 from wmh.distill.config import DistillConfig, PricingConfig
 from wmh.distill.cost import METER_NAMES, BudgetExhausted, BudgetMeter, CostLine, MeterName
 from wmh.distill.data import TrainDatum, attach_advantages, build_datums, to_tinker_datums
+from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmh.distill.gate import DistillGateRecord, gate_distillation
 from wmh.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
 from wmh.distill.rollouts import collect_rollouts
@@ -357,8 +362,8 @@ class SdkSamplingClient:
         return self._scorer.compute_logprobs(token_ids)
 
     def get_tokenizer(self) -> EncodingTokenizer:
-        """The HF tokenizer for the client's base model."""
-        return cast("EncodingTokenizer", self._client.get_tokenizer())
+        """The HF tokenizer for the client's base model (deadline-bounded fetch)."""
+        return cast("EncodingTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
 
 
 class SdkTrainingClient:
@@ -366,6 +371,20 @@ class SdkTrainingClient:
 
     Save names carry a per-session nonce so a resumed run re-saving the same
     step never collides with an earlier session's artifact names.
+
+    Every SDK call is deadline-bounded (`wmh.distill.deadlines`), and what a
+    deadline expiry does depends on the call's idempotency:
+
+    - `forward_backward` and `optim_step` are NOT idempotent mid-batch: the
+      request may have executed server-side before the deadline fired, so
+      re-submitting could accumulate the batch's gradients or apply the Adam
+      step twice. Expiry raises cleanly, aborting the step with state intact
+      (the loop's save_state cadence bounds what a resume loses).
+    - `save_state`, `load_state`, and `save_weights_for_sampler` ARE safe to
+      retry once: they read or restore state that does not change between
+      the attempts, and each save retry uses a fresh artifact name so a
+      first attempt that completed server-side after being abandoned can
+      never collide.
     """
 
     def __init__(self, client: tinker.TrainingClient) -> None:
@@ -374,34 +393,82 @@ class SdkTrainingClient:
         self._save_counter = 0
 
     def get_tokenizer(self) -> EncodingTokenizer:
-        """The student base model's HF tokenizer."""
-        return cast("EncodingTokenizer", self._client.get_tokenizer())
+        """The student base model's HF tokenizer (deadline-bounded fetch)."""
+        return cast("EncodingTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
 
     def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
-        """Convert to real tinker datums and run one blocking forward/backward."""
-        self._client.forward_backward(
+        """Convert to real tinker datums and run one bounded forward/backward.
+
+        Never retried on a deadline expiry: gradients may already have been
+        accumulated server-side, so a re-submit could count the batch twice.
+        The typed error aborts the step; resume restores the last checkpoint.
+        """
+        future = self._client.forward_backward(
             to_tinker_datums(datums), cast("tinker_types.LossFnType", loss_fn)
-        ).result()
+        )
+        wait_with_deadline("forward_backward", future)
 
     def optim_step(self, learning_rate: float) -> None:
-        """One blocking Adam step at the given learning rate."""
+        """One bounded Adam step at the given learning rate.
+
+        Never retried on a deadline expiry: the step may have been applied
+        server-side before the deadline fired, and re-applying would
+        double-step the optimizer. The typed error aborts the step cleanly.
+        """
         from tinker import types
 
-        self._client.optim_step(types.AdamParams(learning_rate=learning_rate)).result()
+        wait_with_deadline(
+            "optim_step", self._client.optim_step(types.AdamParams(learning_rate=learning_rate))
+        )
 
     def save_state(self) -> str:
-        """Save resumable training state under a session-unique name."""
+        """Save resumable training state under a session-unique name.
+
+        Retried once on a deadline expiry: saving snapshots state that does
+        not change between the attempts, and the retry advances the name
+        counter so a first attempt that completed server-side after being
+        abandoned can never collide.
+        """
+        try:
+            return self._save_state_once()
+        except TinkerDeadlineError as exc:
+            logger.warning("retrying save_state once with a fresh request: %s", exc)
+            return self._save_state_once()
+
+    def _save_state_once(self) -> str:
         name = f"wmh-distill-{self._session}-state-{self._save_counter:04d}"
         self._save_counter += 1
-        return self._client.save_state(name).result().path
+        return wait_with_deadline("save_state", self._client.save_state(name)).path
 
     def load_state(self, path: str) -> None:
-        """Restore training state from a tinker:// state path."""
-        self._client.load_state(path).result()
+        """Restore training state from a tinker:// state path.
+
+        Retried once on a deadline expiry: restoring the same immutable
+        snapshot is idempotent.
+        """
+        try:
+            wait_with_deadline("load_state", self._client.load_state(path))
+        except TinkerDeadlineError as exc:
+            logger.warning("retrying load_state once with a fresh request: %s", exc)
+            wait_with_deadline("load_state", self._client.load_state(path))
 
     def save_weights_for_sampler(self, name: str) -> str:
-        """Save sampler weights, returning the tinker:// sampler path."""
-        return self._client.save_weights_for_sampler(f"{name}-{self._session}").result().path
+        """Save sampler weights, returning the tinker:// sampler path.
+
+        Retried once on a deadline expiry: the weights do not change between
+        the attempts, and the retry saves under a distinct "-r1" name so a
+        first attempt that completed server-side after being abandoned can
+        never collide.
+        """
+        try:
+            return self._save_weights_once(f"{name}-{self._session}")
+        except TinkerDeadlineError as exc:
+            logger.warning("retrying save_weights_for_sampler once under a fresh name: %s", exc)
+            return self._save_weights_once(f"{name}-{self._session}-r1")
+
+    def _save_weights_once(self, full_name: str) -> str:
+        future = self._client.save_weights_for_sampler(full_name)
+        return wait_with_deadline("save_weights_for_sampler", future).path
 
 
 class SdkServiceClient:
@@ -411,18 +478,22 @@ class SdkServiceClient:
         self._service = service
 
     def create_lora_training_client(self, base_model: str, rank: int = 32) -> SdkTrainingClient:
-        """Create the real LoRA training client for the student."""
-        return SdkTrainingClient(
-            self._service.create_lora_training_client(base_model=base_model, rank=rank)
-        )
+        """Create the real LoRA training client for the student (deadline-bounded)."""
+
+        def build() -> tinker.TrainingClient:
+            return self._service.create_lora_training_client(base_model=base_model, rank=rank)
+
+        return SdkTrainingClient(call_with_deadline("connect", build))
 
     def create_sampling_client(self, model_path: str) -> SdkSamplingClient:
-        """Create a sampling client for a tinker:// path or a base model name."""
-        if model_path.startswith("tinker://"):
-            client = self._service.create_sampling_client(model_path=model_path)
-        else:
-            client = self._service.create_sampling_client(base_model=model_path)
-        return SdkSamplingClient(client)
+        """Create a sampling client for a tinker:// path or a base model name (bounded)."""
+
+        def build() -> tinker.SamplingClient:
+            if model_path.startswith("tinker://"):
+                return self._service.create_sampling_client(model_path=model_path)
+            return self._service.create_sampling_client(base_model=model_path)
+
+        return SdkSamplingClient(call_with_deadline("connect", build))
 
 
 def _build_sdk_service_client() -> SdkServiceClient:
@@ -442,7 +513,7 @@ def _build_sdk_service_client() -> SdkServiceClient:
             "Tinker API key to run distillation (tests inject service_client= "
             "instead of setting the key)"
         )
-    return SdkServiceClient(tinker.ServiceClient())
+    return SdkServiceClient(call_with_deadline("connect", tinker.ServiceClient))
 
 
 # -- samplers ------------------------------------------------------------------------------------

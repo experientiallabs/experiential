@@ -1,18 +1,26 @@
-"""Tests for teacher scoring: row alignment, error paths, fingerprints."""
+"""Tests for teacher scoring: row alignment, error paths, deadlines, fingerprints."""
 
 import sys
+import threading
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 
 from wmh.distill.config import TeacherConfig
 from wmh.distill.data import TrainDatum
+from wmh.distill.deadlines import TinkerDeadlineError
 from wmh.distill.fake_tinker import FakeSamplingClient, FakeTokenizer
 from wmh.distill.teacher import (
     TOKENIZER_PROBE_TEXTS,
+    LogprobScorer,
+    SdkLogprobScorer,
     TinkerTeacher,
     tokenizer_fingerprint_check,
 )
 from wmh.providers.base import ProviderKind
+
+if TYPE_CHECKING:
+    import tinker
 
 
 def _spec() -> TeacherConfig:
@@ -242,3 +250,77 @@ def test_fingerprint_rejects_empty_probes() -> None:
         tokenizer_fingerprint_check(
             "student", "teacher", FakeTokenizer(), FakeTokenizer(), probe_texts=[]
         )
+
+
+# --- deadlines: wedged sessions become retryable errors with fresh clients ---
+
+
+class _WedgedScorer:
+    """A scorer whose every call reports a deadline expiry (a wedged session)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def compute_logprobs(self, token_ids: list[int]) -> NoReturn:
+        del token_ids
+        self.calls += 1
+        raise TinkerDeadlineError("compute_logprobs", elapsed_s=0.05, deadline_s=0.05)
+
+
+def test_score_deadline_drops_and_rebuilds_the_lazy_scorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    teacher = TinkerTeacher(_spec())
+    builds: list[LogprobScorer] = []
+
+    def build_scorer() -> LogprobScorer:
+        scorer: LogprobScorer = _WedgedScorer() if not builds else FakeSamplingClient(seed="s")
+        builds.append(scorer)
+        return scorer
+
+    monkeypatch.setattr(teacher, "_build_sdk_scorer", build_scorer)
+
+    with pytest.raises(TinkerDeadlineError, match="timed out"):
+        teacher.score([_datum([1, 2], [3, 4])])
+    assert teacher.usage() == 0  # the wedged batch was never counted
+    # The retry (here: calling score again) rebuilds a fresh session and works.
+    [row] = teacher.score([_datum([1, 2], [3, 4])])
+    assert len(row) == 4
+    assert len(builds) == 2
+
+
+def test_injected_scorer_is_never_dropped_on_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An injected client cannot be rebuilt; poison the SDK so any accidental
+    # rebuild attempt would fail loudly instead of hitting the network.
+    monkeypatch.setitem(sys.modules, "tinker", None)
+    scorer = _WedgedScorer()
+    teacher = TinkerTeacher(_spec(), sampling_client=scorer)
+    for _ in range(2):
+        with pytest.raises(TinkerDeadlineError):
+            teacher.score([_datum([1, 2], [3])])
+    assert scorer.calls == 2
+
+
+class _NeverResolvingFuture:
+    """Mimics the SDK future of a wedged session: result(timeout) honors the timeout."""
+
+    def __init__(self) -> None:
+        self._never = threading.Event()
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        self._never.wait(timeout)
+        raise TimeoutError(f"fake future gave up after {timeout}s")
+
+
+def test_sdk_logprob_scorer_bounds_the_future(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("tinker")
+    monkeypatch.setenv("WMH_TINKER_DEADLINE_COMPUTE_LOGPROBS", "0.05")
+
+    class _WedgedClient:
+        def compute_logprobs(self, model_input: object) -> _NeverResolvingFuture:
+            del model_input
+            return _NeverResolvingFuture()
+
+    scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _WedgedClient()))
+    with pytest.raises(TinkerDeadlineError, match="tinker compute_logprobs timed out"):
+        scorer.compute_logprobs([1, 2, 3])

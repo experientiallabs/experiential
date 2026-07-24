@@ -42,10 +42,13 @@ logger = logging.getLogger(__name__)
 ADAPTERS_DIR = "adapters"
 CHAMPION_ALIAS = "champion"
 
-# Tinker's OpenAI-compatible serving endpoint: the SDK's production service
-# base URL plus the /v1 OpenAI-compat prefix. The endpoint is beta, so runs
-# may override it in config; artifacts always record the value actually used.
-DEFAULT_TINKER_OPENAI_ENDPOINT = "https://tinker.thinkingmachines.dev/services/tinker-prod/v1"
+# Tinker's OpenAI-compatible serving endpoint: the production service base URL
+# plus the /oai/api/v1 OpenAI-compat prefix (a bare /v1 returns 404; verified
+# live 2026-07-23 with a completion from a trained adapter). The endpoint is
+# beta, so runs may override it in config; artifacts record the value used.
+DEFAULT_TINKER_OPENAI_ENDPOINT = (
+    "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1"
+)
 
 _ALIASES_FILE = "aliases.toml"
 _CARD_FILE = "model_card.json"

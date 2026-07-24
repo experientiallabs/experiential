@@ -23,13 +23,10 @@ identity); `config.model` carries either a `tinker://` sampler-weights path or
 a base model name for an untrained student. The tinker SDK is an optional
 extra imported lazily (`uv sync --extra distill`), same contract as e2b.
 
-Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged Tinker
-session blocks forever inside the SDK's own retry loop, so client construction
-and tokenizer fetches run under the `connect` deadline and the sample future
-under the `sample` deadline. An expiry raises the retryable
-`TinkerDeadlineError` and drops the provider-owned sampling client, so the
-retry wrapper's next attempt builds a fresh session instead of inheriting the
-wedge.
+Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged
+session raises a retryable `TinkerDeadlineError` instead of hanging, and the
+provider drops its lazily built sampling client on expiry so the retry
+wrapper's next attempt heals through a fresh session.
 """
 
 from __future__ import annotations
@@ -209,7 +206,7 @@ class SdkSampler:
         """Run one deadline-bounded sample and return the single sampled sequence.
 
         Raises:
-            TinkerDeadlineError: If the `sample` deadline expires (the session
+            TinkerDeadlineError: If the sample deadline expires (the session
                 is likely wedged; the caller should retry with a fresh one).
         """
         import tinker
@@ -224,11 +221,7 @@ class SdkSampler:
         return wait_with_deadline("sample", future).sequences[0]
 
     def get_tokenizer(self) -> RendererTokenizer:
-        """The HF tokenizer for the client's base model (deadline-bounded fetch).
-
-        Raises:
-            TinkerDeadlineError: If the `connect` deadline expires.
-        """
+        """The HF tokenizer for the client's base model (deadline-bounded fetch)."""
         # HF stubs type decode as `str | list[str]` depending on the input
         # shape; for the list[int] calls renderers make it is always str.
         return cast("RendererTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
@@ -316,7 +309,9 @@ class TinkerChatProvider:
         sampling_client: Optional injected sampler (tests use the fakes in
             `wmh.distill.fake_tinker`; wrap a real `tinker.SamplingClient` in
             `SdkSampler`). When None, a real client is built lazily from
-            `config.model` on first use.
+            `config.model` on first use and dropped after a
+            `TinkerDeadlineError` so the next attempt rebuilds a fresh
+            session; an injected client is never dropped.
         renderer: Optional injected rendering. When None, it is built lazily
             from the base model name and the sampling client's tokenizer.
         recorder: Optional per-episode span recorder; when present, every
@@ -377,48 +372,37 @@ class TinkerChatProvider:
         return base
 
     def _get_sampler(self) -> TinkerSampler:
-        """The sampling client, built on first use and rebuilt after a wedge.
-
-        Raises:
-            ImportError: If the tinker SDK is not installed (the distill extra).
-            RuntimeError: If TINKER_API_KEY is missing from the environment.
-            TinkerDeadlineError: If service-client construction or sampling-client
-                creation exceeds the `connect` deadline. Neither is cached in that
-                case, so the next attempt starts from a fresh session.
-        """
-        # Lazy: don't import the SDK or read the key env var until first use.
         if self._sampler is None:
-            try:
-                import tinker
-            except ImportError as exc:
-                raise ImportError(_MISSING_TINKER_EXTRA) from exc
-            if not os.environ.get(TINKER_API_KEY_ENV):
-                raise RuntimeError(
-                    f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
-                    "your Tinker API key to use the tinker provider"
-                )
-            # Both SDK calls are fully blocking with no timeout parameter, so they run
-            # under the "connect" deadline on a daemon thread rather than forever.
-            service = call_with_deadline("connect", tinker.ServiceClient)
-            model = self.config.model
-
-            def build() -> tinker.SamplingClient:
-                if model.startswith("tinker://"):
-                    return service.create_sampling_client(model_path=model)
-                return service.create_sampling_client(base_model=model)
-
-            self._sampler = SdkSampler(call_with_deadline("connect", build))
+            self._sampler = self._build_sdk_sampler()
         return self._sampler
 
-    def _drop_wedged_sampler(self) -> None:
-        """Forget a sampling client that blew its deadline, so the next attempt rebuilds.
+    def _build_sdk_sampler(self) -> TinkerSampler:
+        # Lazy: don't import the SDK or read the key env var until first use.
+        try:
+            import tinker
+        except ImportError as exc:
+            raise ImportError(_MISSING_TINKER_EXTRA) from exc
+        if not os.environ.get(TINKER_API_KEY_ENV):
+            raise RuntimeError(
+                f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
+                "your Tinker API key to use the tinker provider"
+            )
 
-        A wedged session keeps timing out while a freshly built one succeeds, so
-        holding the cached client would turn one expiry into an endless run of
-        them. Dropping it makes the next `_get_sampler` construct a new
-        `ServiceClient` and a new `SamplingClient` (each construction is itself
-        `connect`-bounded). An injected client is never dropped: the provider
-        cannot rebuild what it did not build.
+        def build() -> tinker.SamplingClient:
+            service = tinker.ServiceClient()
+            if self.config.model.startswith("tinker://"):
+                return service.create_sampling_client(model_path=self.config.model)
+            return service.create_sampling_client(base_model=self.config.model)
+
+        return SdkSampler(call_with_deadline("connect", build))
+
+    def _drop_wedged_sampler(self) -> None:
+        """Forget a lazily built sampling client after a deadline expiry.
+
+        A wedged session keeps timing out while a freshly built one heals
+        (observed live), so dropping here makes the retry wrapper's next
+        attempt rebuild through `_get_sampler`. An injected client is never
+        dropped: the provider cannot rebuild what it did not build.
         """
         if self._owns_sampler and self._sampler is not None:
             logger.warning(
@@ -508,9 +492,9 @@ class TinkerChatProvider:
                 stop=rendering.stop_sequences,
             )
         except TinkerDeadlineError:
-            # The session is likely wedged; drop it so the retry wrapper's next
-            # attempt rebuilds fresh. No span was recorded (recording happens
-            # only after the whole completion succeeds, below).
+            # The session is likely wedged; drop it so the retry wrapper's
+            # next attempt rebuilds fresh. No span was recorded (recording
+            # happens only after the whole completion succeeds, below).
             self._drop_wedged_sampler()
             raise
         sampled_ids = list(sequence.tokens)

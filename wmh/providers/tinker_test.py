@@ -33,7 +33,6 @@ from pydantic import JsonValue, ValidationError
 import wmh.distill.rendering as rendering_module
 import wmh.providers.tinker as tinker_module
 from wmh.config import PROVIDER_ENV_VARS
-from wmh.distill.deadlines import TinkerDeadlineError, env_var_for
 from wmh.distill.config import (
     DistillConfig,
     HarborConfig,
@@ -43,6 +42,7 @@ from wmh.distill.config import (
     TrainConfig,
 )
 from wmh.distill.data import build_datums
+from wmh.distill.deadlines import TinkerDeadlineError, env_var_for
 from wmh.distill.fake_tinker import FakeSampledSequence, FakeSamplingClient, FakeTokenizer
 from wmh.distill.rendering import ParsedAssistantMessage
 from wmh.distill.tokens import TrialRecord
@@ -58,6 +58,7 @@ from wmh.providers.tinker import (
     TINKER_API_KEY_ENV,
     SdkSampler,
     TinkerChatProvider,
+    TinkerSampler,
     TokenRecorder,
     TokenSpan,
 )
@@ -147,25 +148,6 @@ class _FlakySampler:
         return self._inner.sample(
             prompt_token_ids, max_tokens=max_tokens, temperature=temperature, stop=stop
         )
-
-
-class _DeadlineSampler:
-    """A sampler whose every sample expires, as a wedged session's would."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def sample(
-        self,
-        prompt_token_ids: list[int],
-        *,
-        max_tokens: int,
-        temperature: float,
-        stop: list[str] | list[int] | None = None,
-    ) -> NoReturn:
-        del prompt_token_ids, max_tokens, temperature, stop
-        self.calls += 1
-        raise TinkerDeadlineError("sample", elapsed_s=0.05, deadline_s=0.05)
 
 
 class _StubModelInput:
@@ -987,19 +969,6 @@ def test_expired_ping_drops_the_owned_client(monkeypatch: pytest.MonkeyPatch) ->
     assert len(services) == 2
 
 
-def test_injected_client_is_never_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The provider cannot rebuild a client it did not build, so an expiry must leave the
-    # injected sampler in place. Poisoning the SDK proves no rebuild is attempted: a drop
-    # would surface as ImportError on the second call instead of another expiry.
-    monkeypatch.setitem(sys.modules, "tinker", None)
-    sampler = _DeadlineSampler()
-    provider = TinkerChatProvider(_config(), sampling_client=sampler, renderer=_MiniRendering())
-    for _ in range(2):
-        with pytest.raises(TinkerDeadlineError):
-            provider.complete_chat(_request())
-    assert sampler.calls == 2
-
-
 def _module_scope_import_roots(path: Path) -> set[str]:
     """Top-level import roots of a module (TYPE_CHECKING blocks excluded)."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -1019,3 +988,91 @@ def test_module_scope_never_imports_the_distill_extra() -> None:
         assert module.__file__ is not None
         roots = _module_scope_import_roots(Path(module.__file__))
         assert not roots & {"tinker", "tinker_cookbook"}, module.__name__
+
+
+# --- deadlines: wedged sessions become retryable errors with fresh clients ----------------------
+
+
+class _WedgedSampler:
+    """A sampler whose every call reports a deadline expiry (a wedged session)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> NoReturn:
+        del prompt_token_ids, max_tokens, temperature, stop
+        self.calls += 1
+        raise TinkerDeadlineError("sample", elapsed_s=0.05, deadline_s=0.05)
+
+
+def test_sampling_deadline_drops_and_rebuilds_the_lazy_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = TokenRecorder()
+    provider = TinkerChatProvider(_config(), renderer=_MiniRendering(), recorder=recorder)
+    builds: list[TinkerSampler] = []
+
+    def build_sampler() -> TinkerSampler:
+        sampler: TinkerSampler = _WedgedSampler() if not builds else FakeSamplingClient(seed="s")
+        builds.append(sampler)
+        return sampler
+
+    monkeypatch.setattr(provider, "_build_sdk_sampler", build_sampler)
+
+    with pytest.raises(TinkerDeadlineError, match="timed out"):
+        provider.complete_chat(_request())
+    # The timed-out call recorded no span, and the retry wrapper's next
+    # attempt (simulated by calling again) builds a fresh client and succeeds.
+    assert len(recorder) == 0
+    response = provider.complete_chat(_request())
+    assert response.choices[0].message.role == "assistant"
+    assert len(builds) == 2
+    assert [span.call_index for span in recorder.spans()] == [0]
+
+
+def test_injected_sampling_client_is_never_dropped_on_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An injected client cannot be rebuilt; poison the SDK so any accidental
+    # rebuild attempt would fail loudly instead of hitting the network.
+    monkeypatch.setitem(sys.modules, "tinker", None)
+    sampler = _WedgedSampler()
+    provider = TinkerChatProvider(_config(), sampling_client=sampler, renderer=_MiniRendering())
+    for _ in range(2):
+        with pytest.raises(TinkerDeadlineError):
+            provider.complete_chat(_request())
+    assert sampler.calls == 2
+
+
+class _NeverResolvingFuture:
+    """Mimics the SDK future of a wedged session: result(timeout) honors the timeout."""
+
+    def __init__(self) -> None:
+        self._never = threading.Event()
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        self._never.wait(timeout)
+        raise TimeoutError(f"fake future gave up after {timeout}s")
+
+
+def test_sdk_sampler_bounds_the_sample_future(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("tinker")
+    monkeypatch.setenv("WMH_TINKER_DEADLINE_SAMPLE", "0.05")
+
+    class _WedgedClient:
+        def sample(
+            self, prompt: object, num_samples: int, sampling_params: object
+        ) -> _NeverResolvingFuture:
+            del prompt, num_samples, sampling_params
+            return _NeverResolvingFuture()
+
+    sampler = SdkSampler(cast("tinker.SamplingClient", _WedgedClient()))
+    with pytest.raises(TinkerDeadlineError, match="tinker sample timed out"):
+        sampler.sample([1, 2, 3], max_tokens=4, temperature=1.0)

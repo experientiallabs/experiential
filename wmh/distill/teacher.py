@@ -17,6 +17,11 @@ The tinker SDK is an optional extra imported lazily (`uv sync --extra
 distill`), mirroring `wmh.providers.tinker`; injecting a sampling client
 (tests use `wmh.distill.fake_tinker.FakeSamplingClient`) avoids the SDK
 entirely.
+
+Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged
+session raises a retryable `TinkerDeadlineError` instead of hanging, and the
+teacher drops its lazily built client on expiry so the next score() call
+rebuilds a fresh session (an injected client is never dropped).
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from wmh.distill.config import TeacherConfig
 from wmh.distill.data import TrainDatum
+from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmh.providers.base import ProviderKind, VerifyResult
 from wmh.providers.tinker import TINKER_API_KEY_ENV
 
@@ -111,10 +117,16 @@ class SdkLogprobScorer:
         self._client = client
 
     def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
-        """One synchronous compute_logprobs call on the full sequence."""
+        """One deadline-bounded compute_logprobs call on the full sequence.
+
+        Raises:
+            TinkerDeadlineError: If the deadline expires (the session is
+                likely wedged; the caller should retry with a fresh one).
+        """
         import tinker
 
-        return self._client.compute_logprobs(tinker.ModelInput.from_ints(token_ids)).result()
+        future = self._client.compute_logprobs(tinker.ModelInput.from_ints(token_ids))
+        return wait_with_deadline("compute_logprobs", future)
 
 
 class TinkerTeacher:
@@ -135,31 +147,54 @@ class TinkerTeacher:
     ) -> None:
         self._spec = spec
         self._scorer = sampling_client
+        # Only a client the teacher built itself may be dropped and rebuilt
+        # after a deadline expiry; an injected one cannot be reconstructed.
+        self._owns_scorer = sampling_client is None
         self._usage_tokens = 0
 
     def _model_identity(self) -> str:
         return self._spec.checkpoint or self._spec.model
 
     def _get_scorer(self) -> LogprobScorer:
+        if self._scorer is None:
+            self._scorer = self._build_sdk_scorer()
+        return self._scorer
+
+    def _build_sdk_scorer(self) -> LogprobScorer:
         # Lazy: don't import the SDK or read the key env var until first use,
         # mirroring wmh.providers.tinker.TinkerChatProvider.
-        if self._scorer is None:
-            try:
-                import tinker
-            except ImportError as exc:
-                raise ImportError(_MISSING_TINKER_EXTRA) from exc
-            if not os.environ.get(TINKER_API_KEY_ENV):
-                raise RuntimeError(
-                    f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
-                    "your Tinker API key to score with the tinker teacher"
-                )
+        try:
+            import tinker
+        except ImportError as exc:
+            raise ImportError(_MISSING_TINKER_EXTRA) from exc
+        if not os.environ.get(TINKER_API_KEY_ENV):
+            raise RuntimeError(
+                f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
+                "your Tinker API key to score with the tinker teacher"
+            )
+
+        def build() -> tinker.SamplingClient:
             service = tinker.ServiceClient()
             if self._spec.checkpoint is not None:
-                client = service.create_sampling_client(model_path=self._spec.checkpoint)
-            else:
-                client = service.create_sampling_client(base_model=self._spec.model)
-            self._scorer = SdkLogprobScorer(client)
-        return self._scorer
+                return service.create_sampling_client(model_path=self._spec.checkpoint)
+            return service.create_sampling_client(base_model=self._spec.model)
+
+        return SdkLogprobScorer(call_with_deadline("connect", build))
+
+    def _drop_wedged_scorer(self) -> None:
+        """Forget a lazily built scoring client after a deadline expiry.
+
+        A wedged session keeps timing out while a freshly built one heals, so
+        the next score() call rebuilds through `_get_scorer`. An injected
+        client is never dropped: the teacher cannot rebuild what it did not
+        build.
+        """
+        if self._owns_scorer and self._scorer is not None:
+            logger.warning(
+                "dropping the tinker teacher client after a deadline expiry; "
+                "the next score() call builds a fresh session"
+            )
+            self._scorer = None
 
     def score(self, datums: Sequence[TrainDatum]) -> list[list[float | None]]:
         """Score each datum's full token sequence into a per-position row.
@@ -185,18 +220,29 @@ class TinkerTeacher:
             RuntimeError: If the API key is missing, the teacher returns a
                 result of the wrong length (tokenizer or SDK drift), or a
                 scoreable loss position comes back None.
+            TinkerDeadlineError: If a compute_logprobs deadline expires; the
+                lazily built client is dropped first so retrying score()
+                rebuilds a fresh session.
         """
         datum_list = list(datums)
         if not datum_list:
             return []
         scorer = self._get_scorer()
         workers = min(_SCORE_CONCURRENCY, len(datum_list))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            per_datum = list(
-                pool.map(
-                    lambda datum: scorer.compute_logprobs(datum.model_input_tokens), datum_list
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                per_datum = list(
+                    pool.map(
+                        lambda datum: scorer.compute_logprobs(datum.model_input_tokens), datum_list
+                    )
                 )
-            )
+        except TinkerDeadlineError:
+            # The teacher session is likely wedged; drop the lazily built
+            # client so the caller's retry scores through a fresh session.
+            # Every in-flight worker is itself deadline-bounded, so the
+            # pool's shutdown join above stays bounded too.
+            self._drop_wedged_scorer()
+            raise
         results: list[list[float | None]] = []
         for index, (datum, logprobs) in enumerate(zip(datum_list, per_datum, strict=True)):
             self._usage_tokens += len(datum.model_input_tokens)
@@ -259,6 +305,8 @@ class TinkerTeacher:
                     f"{len(_VERIFY_PROBE_TOKEN_IDS)} tokens"
                 )
         except Exception as exc:  # noqa: BLE001 - verify reports failure, never raises
+            if isinstance(exc, TinkerDeadlineError):
+                self._drop_wedged_scorer()
             return VerifyResult(ok=False, kind=ProviderKind.TINKER, model=model, detail=str(exc))
         return VerifyResult(ok=True, kind=ProviderKind.TINKER, model=model)
 
