@@ -80,7 +80,7 @@ def _wipe_stale_policy_dir(
 
     Sampler paths carry a per-session nonce, so a job dir left by a previous
     session (a crash mid-batch, then `--resume`) can never satisfy the
-    scorer's strict job-config resume check — and its completed trials sampled
+    scorer's strict job-config resume check, and its completed trials sampled
     a policy this session did not restore, so resuming them would mix
     policies. Deleting the dir (and the batch's token sinks with it) makes the
     batch re-run whole from the current weights: correct, at the price of
