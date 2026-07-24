@@ -5,11 +5,15 @@ spend, teacher-in-harness and student-before baselines on the holdout split,
 the optional supervised warmup (teacher rollouts on the train split filtered
 to `warmup.keep`, then `warmup.steps` cross_entropy passes so a student that
 would sample only failures starts OPD from the teacher's successful
-trajectories), then the training loop (harbor rollouts from the current
-student sampler, prefix-merge datums, teacher scoring, reverse-KL advantages,
-one `importance_sampling` optimizer step per training step), and finally the
-holdout gate that decides whether the adapter is promoted into the
-`AdapterStore`.
+trajectories; `warmup.trajectories_from` loads another run's recorded
+collection instead of collecting, charging nothing), then the training loop
+(harbor rollouts from the current student sampler, prefix-merge datums,
+teacher scoring, reverse-KL advantages, one `importance_sampling` optimizer
+step per training step; under `train.loss = "topk_ce"` the teacher instead
+top-k scores each datum in one prefill-only request and the step trains
+rank-aligned weighted cross_entropy replicas, the reverse-KL metric still
+coming from that same request's realized logprobs), and finally the holdout
+gate that decides whether the adapter is promoted into the `AdapterStore`.
 
 Layout: everything lands in the `DistillRunStore` run directory. The rollout
 collector writes its per-step `harbor/step-NNNN/` and `tokens/step-NNNN/`
@@ -17,7 +21,10 @@ dirs under the run dir for training batches; eval batches (baselines, interim
 evals, student-after) get their own isolated roots under
 `eval-rollouts/<eval-name>/` so their harbor job dirs never collide with a
 training step's, and the warmup phase's teacher trials likewise land under
-`warmup-rollouts/`.
+`warmup-rollouts/`. Every batch (training step, warmup collection, eval)
+additionally renders its first `train.log_sample_rollouts` episodes to
+human-readable text under `samples/` and the tracker's samples table
+(`wmh.distill.samples`), chat-template framing included.
 
 The Tinker SDK stays an optional extra: the real service client is built
 lazily only when no `service_client` is injected, and the thin `Sdk*`
@@ -72,21 +79,25 @@ from wmh.distill.cost import (
     batch_billing,
 )
 from wmh.distill.data import (
+    TopkCandidates,
     TrainDatum,
     attach_advantages,
     build_datums,
+    build_topk_ce_datums,
     to_tinker_datums,
     to_tinker_sft_datums,
 )
 from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmh.distill.gate import DistillGateRecord, gate_distillation
 from wmh.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
-from wmh.distill.rollouts import collect_rollouts
+from wmh.distill.rollouts import RolloutStats, collect_rollouts, rollout_stats
+from wmh.distill.samples import sample_rollouts, samples_markdown
 from wmh.distill.store import (
     AdapterStore,
     DistillModelCard,
     DistillRunStore,
     WarmupRecord,
+    WarmupTrialsManifest,
     build_handoff_toml,
 )
 from wmh.distill.teacher import (
@@ -96,6 +107,7 @@ from wmh.distill.teacher import (
     TinkerTeacher,
     tokenizer_fingerprint_check,
 )
+from wmh.distill.tokens import TrialRecord
 from wmh.distill.tracking import DistillTracker, build_tracker
 from wmh.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
@@ -246,11 +258,25 @@ class DistillEvalReport(BaseModel):
     provider_model: str = Field(min_length=1)
     """The provider `model` the trials sampled (sampler path or teacher ref)."""
 
+    base_model: str | None = None
+    """The base model behind `provider_model` (the provider's `model_type`).
+
+    This is what `eval.student_baseline_from` reuse validates against: a
+    student's `provider_model` is a per-run sampler path and never matches
+    across runs, while the base model is exactly what a shared pre-training
+    baseline must agree on. None only on reports from before this field.
+    """
+
     task_ids: list[str]
     attempts: int = Field(ge=1)
     trials: int = Field(ge=0)
     solve_rate: float = Field(ge=0.0, le=1.0)
     empty_span_trials: int = Field(ge=0)
+
+    source: str | None = None
+    """Provenance note when the report was imported from a prior run via
+    `eval.teacher_baseline_from` / `eval.student_baseline_from` instead of
+    measured here; None for reports this run's own trials produced."""
 
 
 class StepMetrics(BaseModel):
@@ -611,6 +637,23 @@ class SdkSamplingClient:
         """One synchronous compute_logprobs call on the full sequence."""
         try:
             return self._scorer.compute_logprobs(token_ids)
+        except TinkerDeadlineError:
+            self._evict_on_deadline()
+            raise
+
+    def topk_prompt_logprobs(
+        self, token_ids: list[int], k: int
+    ) -> tuple[list[float | None], list[TopkCandidates | None]]:
+        """One prefill-only sample returning realized and top-k prompt logprobs.
+
+        The teacher's topk_ce path (`TinkerTeacher.score_topk`) narrows its
+        injected scorer to `TopkLogprobScorer` at runtime; this delegation
+        makes the loop's teacher sampling client satisfy it against the real
+        SDK, with the same cache eviction on a deadline expiry as every
+        other call.
+        """
+        try:
+            return self._scorer.topk_prompt_logprobs(token_ids, k)
         except TinkerDeadlineError:
             self._evict_on_deadline()
             raise
@@ -1133,6 +1176,36 @@ def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:
     return HarnessDoc(name=harness.name, version=harness.version, surfaces=surfaces)
 
 
+def _batch_reverse_kl(
+    datums: Sequence[TrainDatum], rows: Sequence[Sequence[float | None]]
+) -> float | None:
+    """The batch's reverse KL per token from realized teacher logprobs.
+
+    `mean(sampled_lp - teacher_lp)` over every scored loss token; None when
+    nothing was scored. Both loss modes feed this the teacher's logprobs of
+    the REALIZED (student-sampled) tokens (`TeacherClient.score` rows, or
+    `TeacherTopkScores.realized`), so the metric means the same thing across
+    modes.
+
+    Args:
+        datums: The step's datums.
+        rows: One per-position realized-logprob row per datum, aligned with
+            `datums`; misaligned rows are skipped (the datum path drops and
+            counts them separately).
+    """
+    kl_sum = 0.0
+    kl_count = 0
+    for datum, row in zip(datums, rows, strict=True):
+        if len(row) != len(datum.model_input_tokens):
+            continue  # misaligned row: the datum builders drop and count it
+        for position, teacher_lp in enumerate(row):
+            if teacher_lp is None:
+                continue
+            kl_sum += datum.sampled_logprobs[position] - teacher_lp
+            kl_count += 1
+    return kl_sum / kl_count if kl_count else None
+
+
 def _teacher_rows(
     teacher: TeacherClient, datums: Sequence[TrainDatum]
 ) -> tuple[list[list[float | None]], float | None]:
@@ -1154,17 +1227,7 @@ def _teacher_rows(
         every scored loss token (None when nothing was scored).
     """
     rows = teacher.score(list(datums))
-    kl_sum = 0.0
-    kl_count = 0
-    for datum, row in zip(datums, rows, strict=True):
-        if len(row) != len(datum.model_input_tokens):
-            continue  # misaligned row: attach_advantages drops and counts it
-        for position, teacher_lp in enumerate(row):
-            if teacher_lp is None:
-                continue
-            kl_sum += datum.sampled_logprobs[position] - teacher_lp
-            kl_count += 1
-    return rows, (kl_sum / kl_count if kl_count else None)
+    return rows, _batch_reverse_kl(datums, rows)
 
 
 class _RunBudget:
@@ -1260,6 +1323,9 @@ class _DistillRun:
         self._tracker = tracker
         self._store = DistillRunStore(run_dir)
         self._teacher_identity = cfg.teacher.checkpoint or cfg.teacher.model
+        # Set by _preflight (the renderer needs the training client's tokenizer);
+        # kept for sample-rollout logging across every later batch.
+        self._rendering: ChatRendering | None = None
         # Set up by execute():
         self._training: DistillTrainingClient
         self._teacher: TinkerTeacher
@@ -1400,6 +1466,29 @@ class _DistillRun:
             model_type=self._cfg.teacher.model,
         )
 
+    def _log_sample_rollouts(
+        self, *, kind: str, name: str, step: int | None, records: Sequence[TrialRecord]
+    ) -> None:
+        """Persist and track one batch's first sample rollouts as readable text.
+
+        The first `train.log_sample_rollouts` span-bearing trials render with
+        the chat template's special tokens kept (`wmh.distill.samples`) and
+        land in `samples/<name>.md` plus the tracker's samples table under
+        `kind` ("train" for training batches, "warmup" for the warmup
+        collection, "eval-<key>" for eval batches; file stems are
+        "step-NNNN", "warmup", and "eval-<key>" respectively). 0 disables,
+        and a batch with no span-bearing trial writes nothing. Skipped
+        defensively when preflight has not built the renderer yet.
+        """
+        limit = self._cfg.train.log_sample_rollouts
+        if limit == 0 or self._rendering is None:
+            return
+        samples = sample_rollouts(records, self._rendering, limit)
+        if not samples:
+            return
+        self._store.write_samples(name, samples_markdown(samples))
+        self._tracker.log_samples(kind, step, samples)
+
     # -- preflight -------------------------------------------------------------------------------
 
     def _preflight(self) -> None:
@@ -1419,6 +1508,9 @@ class _DistillRun:
         rendering: ChatRendering = build_renderer(
             cfg.student.base_model, cast("RendererTokenizer", tokenizer)
         )
+        # Kept for sample-rollout logging: every batch renders its first few
+        # episodes to readable text via decode_with_specials.
+        self._rendering = rendering
         if isinstance(self._teacher_client, TokenizerSource):
             tokenizer_fingerprint_check(
                 cfg.student.base_model,
@@ -1518,9 +1610,13 @@ class _DistillRun:
             self._run_dir / EVAL_ROLLOUTS_DIR / validate_name(key),
         )
         self._charge_rollout_billing(batch_billing(records), teacher=teacher_metered)
+        self._log_sample_rollouts(
+            kind=f"eval-{key}", name=f"eval-{key}", step=completed_step, records=records
+        )
         report = DistillEvalReport(
             name=key,
             provider_model=provider.model,
+            base_model=provider.model_type,
             task_ids=list(task_ids),
             attempts=attempts,
             trials=stats.trials,
@@ -1547,8 +1643,16 @@ class _DistillRun:
         reuse: bool,
         pin_provider: bool = False,
         completed_step: int | None = None,
+        baseline_from: str | None = None,
+        baseline_from_field: str = "",
     ) -> DistillEvalReport:
-        """Run the eval, or return the recorded report when `reuse` allows it.
+        """One baseline eval: this run's recorded copy, a prior run's report, or trials.
+
+        Precedence: a report already recorded under this run's `evals/` wins
+        when `reuse` is set (a resume must not re-import or re-run anything,
+        and an imported baseline was copied there on the first session), then
+        a configured `baseline_from` path imports a prior run's report, and
+        only otherwise do trials actually run.
 
         A reused report must have been measured at the same `attempts` (the
         gate compares solve rates, so mixing estimators of different k would
@@ -1581,6 +1685,20 @@ class _DistillRun:
                     )
                 logger.info("reusing recorded eval %s (solve rate %.3f)", key, existing.solve_rate)
                 return existing
+        if baseline_from is not None:
+            return self._import_baseline(
+                key,
+                baseline_from,
+                baseline_from_field,
+                task_ids,
+                attempts,
+                provider,
+                phase=phase,
+                # The teacher's provider model (its stable identity) must match
+                # across runs; a student provider model is a per-run sampler
+                # path, so student reuse matches on base_model alone.
+                match_provider_model=teacher_metered,
+            )
         return self._run_eval(
             key,
             task_ids,
@@ -1590,6 +1708,114 @@ class _DistillRun:
             teacher_metered=teacher_metered,
             completed_step=completed_step,
         )
+
+    def _import_baseline(
+        self,
+        key: str,
+        source: str,
+        config_field: str,
+        task_ids: Sequence[str],
+        attempts: int,
+        provider: ProviderConfig,
+        *,
+        phase: DistillPhase,
+        match_provider_model: bool,
+    ) -> DistillEvalReport:
+        """Reuse a prior run's recorded baseline eval instead of running trials.
+
+        The report is validated against this run before it is trusted: it must
+        cover exactly this run's holdout task ids, carry at least `attempts`
+        (this run's `gate.k`) attempts per task, and be measured on the same
+        model (the provider model for the teacher, the recorded `base_model`
+        for the student, whose provider model is a per-run sampler path). A
+        valid report is copied into this run's `evals/` with a provenance
+        `source` note and logged and tracked like a freshly run eval; nothing
+        is charged to the budget.
+
+        Args:
+            key: The eval's store key (the baseline's canonical name).
+            source: The prior run's `evals/<key>.json` path from the config.
+            config_field: The config field naming `source`, for error messages.
+            task_ids: This run's holdout task ids.
+            attempts: This run's `gate.k`.
+            provider: The provider config the baseline WOULD have run with.
+            phase: The progress phase to emit under.
+            match_provider_model: Also require the report's `provider_model`
+                to equal the provider's model (the teacher baseline; a
+                teacher's identity is stable across runs).
+
+        Returns:
+            The validated report, re-stamped with this run's provenance note.
+
+        Raises:
+            ValueError: On a missing or unparsable file or any validation
+                mismatch; each message names the config field and the fix.
+        """
+        path = Path(source)
+        hint = f"or unset {config_field} to run the baseline here"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"{config_field} points at {path}, which does not exist; point it "
+                f"at a prior run's evals/{key}.json {hint}"
+            ) from exc
+        try:
+            report = DistillEvalReport.model_validate_json(text)
+        except ValidationError as exc:
+            raise ValueError(
+                f"{config_field} points at {path}, which is not a valid eval "
+                f"report: {exc}; point it at a prior run's evals/{key}.json {hint}"
+            ) from exc
+        if set(report.task_ids) != set(task_ids):
+            missing = sorted(set(task_ids) - set(report.task_ids))
+            extra = sorted(set(report.task_ids) - set(task_ids))
+            raise ValueError(
+                f"{config_field}: the report at {path} was measured on a different "
+                f"task set than this run's holdout split (missing: "
+                f"{', '.join(missing) or 'none'}; extra: {', '.join(extra) or 'none'}); "
+                f"a baseline only transfers between runs gating on the identical "
+                f"holdout split, so reuse one that matches {hint}"
+            )
+        if report.attempts < attempts:
+            raise ValueError(
+                f"{config_field}: the report at {path} recorded {report.attempts} "
+                f"attempt(s) per task but this run's gate.k is {attempts}; reuse a "
+                f"baseline measured with at least gate.k attempts {hint}"
+            )
+        if match_provider_model and report.provider_model != provider.model:
+            raise ValueError(
+                f"{config_field}: the report at {path} evaluated "
+                f"{report.provider_model!r} but this run's teacher is "
+                f"{provider.model!r}; reuse a baseline of the same teacher {hint}"
+            )
+        expected_base = provider.model_type or provider.model
+        if report.base_model is None and not match_provider_model:
+            raise ValueError(
+                f"{config_field}: the report at {path} records no base_model (it "
+                f"predates the field), so it cannot be validated against this run's "
+                f"base model {expected_base!r}; re-run that baseline on current code "
+                f"{hint}"
+            )
+        if report.base_model is not None and report.base_model != expected_base:
+            raise ValueError(
+                f"{config_field}: the report at {path} was measured on base model "
+                f"{report.base_model!r} but this run uses {expected_base!r}; a "
+                f"baseline only transfers between runs on the same base model, so "
+                f"reuse one that matches {hint}"
+            )
+        stamped = report.model_copy(
+            update={"name": key, "source": f"reused from {path} via {config_field}"}
+        )
+        self._store.write_eval(key, stamped)
+        self._tracker.log_eval(key, stamped.solve_rate, None)
+        self._emit(
+            phase,
+            f"eval {key}: reused {path} (solve rate {stamped.solve_rate:.3f}, "
+            f"{len(stamped.task_ids)} task(s) x {stamped.attempts} attempt(s)); "
+            "no trials run",
+        )
+        return stamped
 
     # -- warmup ----------------------------------------------------------------------------------
 
@@ -1632,29 +1858,57 @@ class _DistillRun:
             usd=max(self._budget.session_usd - self._prev_usd, 0.0),
         )
 
-    def _warmup(self) -> None:
-        """The supervised warmup phase: teacher rollouts, keep-filter, SFT passes.
+    def _load_warmup_trials(self, source_dir: Path) -> tuple[list[TrialRecord], RolloutStats]:
+        """Load another run's warmup collection instead of collecting rollouts.
 
-        The teacher runs the pi harness on every TRAIN task
-        (`warmup.rollouts_per_task` attempts each, rollouts isolated under
-        `warmup-rollouts/`), the kept trials merge into cross_entropy datums
-        through the same prefix merge OPD uses (the teacher SAMPLED these
-        tokens, so they are exact sampled ids and need no advantages), and
-        the student trains `warmup.steps` passes. Each pass is one
-        forward_backward over the FULL warmup datum list plus one optim_step:
-        the set is small (train tasks x rollouts_per_task, filtered), so
-        full-batch epochs keep the schedule deterministic and resumable
-        without a datum-level cursor. Zero kept datums degrade the run to
-        pure OPD (warning + one metrics row + the skip recorded), never an
-        abort. Afterwards the state is saved and the sampler force-refreshed
-        so OPD step 0 samples the warmed student, and `warmup.json` marks the
-        phase done for resumes.
+        The `warmup.trajectories_from` path: the source run's collection wrote
+        its assembled (unfiltered) trial records to `warmup-trials.json`, so
+        this run reuses them for its own CE passes. The source run paid for
+        the teacher rollouts, so loading charges no meter; the `keep` filter
+        still applies to the loaded records at the call site.
+
+        Args:
+            source_dir: The source run's directory.
+
+        Returns:
+            The manifest's trial records plus their recomputed batch stats.
+
+        Raises:
+            RuntimeError: If the source run has no warmup trial manifest (its
+                warmup collection never completed).
+            ValueError: If the manifest's teacher does not match this run's
+                teacher identity.
+        """
+        manifest = DistillRunStore(source_dir).read_warmup_trials()
+        if manifest is None:
+            raise RuntimeError(
+                f"warmup.trajectories_from points at {source_dir}, but no warmup trial "
+                f"manifest exists at {DistillRunStore(source_dir).warmup_trials_path}; the "
+                "manifest is written when a run's warmup collection finishes, so point "
+                "trajectories_from at a run dir whose warmup collected teacher rollouts, "
+                "or unset it to collect here"
+            )
+        if manifest.teacher_model != self._teacher_identity:
+            raise ValueError(
+                f"the warmup trials in {source_dir} were sampled by teacher "
+                f"{manifest.teacher_model!r}, but this run's teacher is "
+                f"{self._teacher_identity!r}; warmup must train on THIS teacher's "
+                "trajectories, so point warmup.trajectories_from at a run with a "
+                "matching teacher, or unset it to collect fresh"
+            )
+        return list(manifest.records), rollout_stats(manifest.records)
+
+    def _collect_warmup_trials(self) -> tuple[list[TrialRecord], RolloutStats]:
+        """Collect the warmup phase's teacher rollouts and persist their manifest.
+
+        Runs the teacher through the pi harness on every train task
+        (`warmup.rollouts_per_task` attempts each, isolated under
+        `warmup-rollouts/`), writes the assembled records to
+        `warmup-trials.json` (so other runs can load this collection via
+        `warmup.trajectories_from`), and charges the teacher meters.
         """
         cfg = self._cfg
         warmup = cfg.warmup
-        learning_rate = (
-            warmup.learning_rate if warmup.learning_rate is not None else cfg.train.learning_rate
-        )
         self._emit(
             "warmup",
             f"collecting teacher trajectories: {len(self._train_ids)} train task(s) x "
@@ -1673,6 +1927,12 @@ class _DistillRun:
             self._teacher_provider(),
             self._run_dir / WARMUP_ROLLOUTS_DIR,
         )
+        # The manifest lands before the keep filter (a loading run may filter
+        # differently) and before the budget check (the collection is complete
+        # evidence even when this run aborts right after paying for it).
+        self._store.write_warmup_trials(
+            WarmupTrialsManifest(teacher_model=self._teacher_identity, records=records)
+        )
         # Teacher-in-harness billing, same as the gate's teacher baseline:
         # sampled tokens at teacher_sample, per-request prefill split between
         # teacher_prefill (unique) and teacher_cached_prefill (repeats).
@@ -1681,12 +1941,53 @@ class _DistillRun:
             self._budget.check()
         except BudgetExhausted as exc:
             self._abort_for_budget(exc, completed_step=None)
+        return records, roll_stats
+
+    def _warmup(self) -> None:
+        """The supervised warmup phase: teacher trials, keep-filter, SFT passes.
+
+        The teacher trials come from `_collect_warmup_trials` (fresh rollouts,
+        charged to the teacher meters) or, when `warmup.trajectories_from` is
+        set, from `_load_warmup_trials` (another run's recorded collection,
+        charging nothing). Either way the kept trials merge into cross_entropy
+        datums through the same prefix merge OPD uses (the teacher SAMPLED
+        these tokens, so they are exact sampled ids and need no advantages),
+        and the student trains `warmup.steps` passes. Each pass is one
+        forward_backward over the FULL warmup datum list plus one optim_step:
+        the set is small (train tasks x rollouts_per_task, filtered), so
+        full-batch epochs keep the schedule deterministic and resumable
+        without a datum-level cursor. Zero kept datums degrade the run to
+        pure OPD (warning + one metrics row + the skip recorded), never an
+        abort. Afterwards the state is saved and the sampler force-refreshed
+        so OPD step 0 samples the warmed student, and `warmup.json` marks the
+        phase done for resumes.
+        """
+        cfg = self._cfg
+        warmup = cfg.warmup
+        learning_rate = (
+            warmup.learning_rate if warmup.learning_rate is not None else cfg.train.learning_rate
+        )
+        if warmup.trajectories_from is not None:
+            source_dir = Path(warmup.trajectories_from)
+            self._emit(
+                "warmup",
+                f"loading teacher trajectories from {source_dir} "
+                "(the collection was paid by the source run; nothing is charged)",
+            )
+            records, roll_stats = self._load_warmup_trials(source_dir)
+            sourced = "loaded"
+        else:
+            records, roll_stats = self._collect_warmup_trials()
+            sourced = "collected"
 
         kept = [record for record in records if warmup.keep == "all" or record.passed]
+        # Sampled from the KEPT trials: the SFT set is what warmup trains on,
+        # so those are the episodes worth reading.
+        self._log_sample_rollouts(kind="warmup", name="warmup", step=None, records=kept)
         datums, datum_stats = build_datums(kept, cfg)
         if not datums:
             reason = (
-                f"warmup collected {roll_stats.trials} teacher trial(s) but kept "
+                f"warmup {sourced} {roll_stats.trials} teacher trial(s) but kept "
                 f"{len(kept)} under keep={warmup.keep!r} and built 0 datums"
             )
             logger.warning(
@@ -1788,25 +2089,51 @@ class _DistillRun:
             step, batch, cfg, self._harness, self._student_provider(), self._run_dir
         )
         self._charge_rollout_billing(batch_billing(records), teacher=False)
+        self._log_sample_rollouts(kind="train", name=f"step-{step:04d}", step=step, records=records)
 
         datums, datum_stats = build_datums(records, cfg)
         teacher_usage_before = self._teacher.usage()
-        try:
-            rows, reverse_kl = _teacher_rows(self._teacher, datums)
-        finally:
-            # Charged even when scoring raises mid-batch: the pool joins every
-            # submitted call before propagating, so the whole batch was billed
-            # server-side whether or not a row came back.
-            self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
-        attached, adv_stats = attach_advantages(datums, rows, cfg)
+        advantage_mean: float | None = None
+        advantage_std: float | None = None
+        clipped_tokens = 0
+        adv_loss_tokens = 0
+        if cfg.train.loss == "topk_ce":
+            # One prefill-only teacher request per datum yields the top-k
+            # candidate rows AND the realized logprobs, so the reverse-KL
+            # metric below means exactly what it means in the default mode.
+            try:
+                scores = self._teacher.score_topk(datums, cfg.train.topk)
+            finally:
+                # Charged even when scoring raises mid-batch: the pool joins
+                # every submitted call before propagating, so the whole batch
+                # was billed server-side whether or not a row came back.
+                self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
+            reverse_kl = _batch_reverse_kl(datums, scores.realized)
+            trained, topk_stats = build_topk_ce_datums(datums, scores.topk, cfg.train.topk)
+            loss_fn = CROSS_ENTROPY_LOSS
+            mismatch_drops = topk_stats.mismatch_drops
+        else:
+            try:
+                rows, reverse_kl = _teacher_rows(self._teacher, datums)
+            finally:
+                # Same contract as the topk_ce branch above.
+                self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
+            trained, adv_stats = attach_advantages(datums, rows, cfg)
+            loss_fn = IMPORTANCE_SAMPLING_LOSS
+            mismatch_drops = adv_stats.mismatch_drops
+            advantage_mean = adv_stats.advantage_mean
+            advantage_std = adv_stats.advantage_std
+            clipped_tokens = adv_stats.clipped_tokens
+            adv_loss_tokens = adv_stats.loss_tokens
 
-        train_tokens = sum(len(datum.model_input_tokens) for datum in attached)
+        # In topk_ce mode this is k x the source CE volume (the k rank
+        # replicas each carry the full sequence), which is exactly what
+        # forward_backward consumes, so the student_train meter stays honest.
+        train_tokens = sum(len(datum.model_input_tokens) for datum in trained)
         pg_loss: float | None = None
         grad_norm: float | None = None
-        if attached:
-            train_output = self._training.forward_backward(
-                attached, loss_fn=IMPORTANCE_SAMPLING_LOSS
-            )
+        if trained:
+            train_output = self._training.forward_backward(trained, loss_fn=loss_fn)
             optim_output = self._training.optim_step(cfg.train.learning_rate)
             pg_loss = train_output.loss
             grad_norm = optim_output.grad_norm
@@ -1821,7 +2148,7 @@ class _DistillRun:
                 roll_stats.empty_span_trials,
                 datum_stats.overflow_drops,
                 datum_stats.overlong_drops,
-                adv_stats.mismatch_drops,
+                mismatch_drops,
             )
 
         deltas = self._meter_deltas()
@@ -1830,24 +2157,22 @@ class _DistillRun:
             trials=roll_stats.trials,
             solve_rate=roll_stats.solve_rate,
             empty_span_trials=roll_stats.empty_span_trials,
-            datums=len(attached),
+            datums=len(trained),
             fragments=datum_stats.fragments,
             fragmentation_rate=datum_stats.fragmentation_rate,
             overflow_drops=datum_stats.overflow_drops,
             overlong_drops=datum_stats.overlong_drops,
-            mismatch_drops=adv_stats.mismatch_drops,
-            clipped_tokens=adv_stats.clipped_tokens,
+            mismatch_drops=mismatch_drops,
+            clipped_tokens=clipped_tokens,
             loss_tokens=datum_stats.loss_tokens,
             context_tokens=datum_stats.context_tokens,
             reverse_kl_per_token=reverse_kl,
             reward_mean=(
                 sum(record.reward for record in records) / len(records) if records else None
             ),
-            advantage_mean=adv_stats.advantage_mean,
-            advantage_std=adv_stats.advantage_std,
-            clip_fraction=(
-                adv_stats.clipped_tokens / adv_stats.loss_tokens if adv_stats.loss_tokens else 0.0
-            ),
+            advantage_mean=advantage_mean,
+            advantage_std=advantage_std,
+            clip_fraction=(clipped_tokens / adv_loss_tokens if adv_loss_tokens else 0.0),
             pg_loss=pg_loss,
             grad_norm=grad_norm,
             sampler_path=sampler_path,
@@ -1870,7 +2195,7 @@ class _DistillRun:
             "training",
             f"step {step + 1}/{cfg.train.steps}: solve rate "
             f"{roll_stats.solve_rate:.2f}, reverse KL/token {kl_text}, "
-            f"{len(attached)} datum(s)",
+            f"{len(trained)} datum(s)",
             step=step,
         )
 
@@ -1880,7 +2205,7 @@ class _DistillRun:
             self._abort_for_budget(exc, completed_step=step)
 
         self._check_empty_batch_streak(
-            step, roll_stats.trials, roll_stats.empty_span_trials, len(attached)
+            step, roll_stats.trials, roll_stats.empty_span_trials, len(trained)
         )
 
         if (step + 1) % cfg.train.sampler_refresh_every == 0:
@@ -1996,6 +2321,8 @@ class _DistillRun:
             teacher_metered=True,
             reuse=resume,
             pin_provider=True,
+            baseline_from=cfg.eval.teacher_baseline_from,
+            baseline_from_field="eval.teacher_baseline_from",
         )
         before_report = self._eval_or_load(
             STUDENT_BEFORE_EVAL,
@@ -2005,6 +2332,8 @@ class _DistillRun:
             phase="baseline",
             teacher_metered=False,
             reuse=resume,
+            baseline_from=cfg.eval.student_baseline_from,
+            baseline_from_field="eval.student_baseline_from",
         )
 
         if cfg.warmup.steps > 0:
@@ -2132,11 +2461,15 @@ def run_distillation(
     The flow: preflight (renderer resolution, tokenizer fingerprint, one-token
     student and teacher pings, the sample-then-recompute TITO proof, and the
     optional live-trial hook), holdout baselines (teacher-in-harness and
-    student-before), the optional supervised warmup when `warmup.steps > 0`
-    (teacher rollouts on the train split, `warmup.keep`-filtered trials merged
-    into cross_entropy datums, `warmup.steps` full-batch passes, then a state
-    save and a forced sampler refresh so OPD starts from the warmed student;
-    zero kept trials skip the phase with a warning instead of aborting), the
+    student-before, each importable from a prior run's report via
+    `eval.teacher_baseline_from` / `eval.student_baseline_from` instead of
+    running trials), the optional supervised warmup when `warmup.steps > 0`
+    (teacher rollouts on the train split, or another run's recorded collection
+    when `warmup.trajectories_from` is set; the `warmup.keep`-filtered trials
+    merge into cross_entropy datums for `warmup.steps` full-batch passes, then
+    a state save and a forced sampler refresh so OPD starts from the warmed
+    student; zero kept trials skip the phase with a warning instead of
+    aborting), the
     training step loop (harbor rollouts, prefix-merge datums, teacher scoring,
     reverse-KL advantages, importance_sampling forward/backward and one
     optimizer step, metrics row, budget enforcement, then the sampler-refresh
@@ -2187,7 +2520,9 @@ def run_distillation(
 
     Raises:
         ValueError: On invalid name/splits, a fresh run pointed at a used
-            run dir, or wandb tracking enabled without credentials.
+            run dir, a `eval.*_baseline_from` report that fails validation
+            (wrong task set, too few attempts, or a different model), or
+            wandb tracking enabled without credentials.
         RuntimeError: On preflight failures (each message says what to fix),
             or resume with nothing to resume.
         ImportError: If no service client is injected and the tinker SDK is

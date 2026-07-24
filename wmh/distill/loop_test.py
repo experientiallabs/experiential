@@ -57,9 +57,11 @@ from wmh.distill.loop import (
     SDK_LOSS_METRIC_NAMES,
     STUDENT_AFTER_EVAL,
     STUDENT_BEFORE_EVAL,
+    TEACHER_BASELINE_EVAL,
     WARMUP_ROLLOUTS_DIR,
     DistillBudgetError,
     DistillEmptyBatchError,
+    DistillEvalReport,
     DistillProgress,
     DistillResult,
     DistillSamplingClient,
@@ -77,6 +79,7 @@ from wmh.distill.loop import (
     sdk_metric_value,
 )
 from wmh.distill.rollouts import RolloutStats
+from wmh.distill.samples import SampleRollout
 from wmh.distill.store import AdapterStore, DistillRunStore
 from wmh.distill.teacher import EncodingTokenizer
 from wmh.distill.tokens import TrialRecord
@@ -112,6 +115,9 @@ class _StubRendering:
     def decode(self, token_ids: list[int]) -> str:
         return "".join(chr(token) for token in token_ids)
 
+    def decode_with_specials(self, token_ids: list[int]) -> str:
+        return "".join(chr(token) for token in token_ids)
+
     def parse_response(self, sampled_ids: list[int]) -> None:
         raise NotImplementedError("the loop never parses responses during preflight")
 
@@ -129,14 +135,23 @@ def _number(row: JsonObject, key: str) -> float:
 
 
 def _fake_datum(datum: TrainDatum) -> FakeDatum:
-    """Convert a loop datum to the fake client's shifted next-token layout."""
+    """Convert a loop datum to the fake client's shifted next-token layout.
+
+    Mirrors `to_tinker_sft_datums` for topk-CE replicas: their attached
+    candidate targets and renormalized weights ride in place of the
+    next-token targets and the loss mask, and the fake datum is flagged so
+    the fake training client applies the input-side TITO check.
+    """
     tokens = datum.model_input_tokens
+    targets = datum.target_tokens if datum.is_topk_replica else tokens
+    weights = datum.target_weights if datum.is_topk_replica else datum.loss_mask
     return FakeDatum(
         model_input_tokens=tokens[:-1],
-        target_tokens=tokens[1:],
-        weights=datum.loss_mask[1:],
+        target_tokens=targets[1:],
+        weights=weights[1:],
         advantages=datum.advantages[1:],
         logprobs=datum.sampled_logprobs[1:],
+        topk=datum.is_topk_replica,
     )
 
 
@@ -417,6 +432,7 @@ def _warmup_cfg(
     warmup_lr: float | None = 5e-5,
     budget_max: float | None = None,
     pricing: PricingConfig | None = None,
+    trajectories_from: str | None = None,
 ) -> DistillConfig:
     """The 3-step config with the supervised warmup phase enabled."""
     return _cfg(budget_max=budget_max, pricing=pricing).model_copy(
@@ -426,6 +442,7 @@ def _warmup_cfg(
                 rollouts_per_task=rollouts_per_task,
                 keep=keep,
                 learning_rate=warmup_lr,
+                trajectories_from=trajectories_from,
             )
         }
     )
@@ -496,6 +513,7 @@ class _RecordingTracker:
         self.steps: list[tuple[int, StepMetrics]] = []
         self.warmup_steps: list[tuple[int, WarmupMetrics]] = []
         self.evals: list[tuple[str, float, int | None]] = []
+        self.samples: list[tuple[str, int | None, list[SampleRollout]]] = []
         self.summaries: list[_TrackedSummary] = []
         self.finish_calls = 0
 
@@ -507,6 +525,9 @@ class _RecordingTracker:
 
     def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
         self.evals.append((name, solve_rate, step))
+
+    def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
+        self.samples.append((kind, step, list(samples)))
 
     def log_summary(
         self,
@@ -701,6 +722,68 @@ def test_tracker_sees_every_step_eval_summary_and_finish(
     assert tracker.finish_calls == 1
 
 
+def test_sample_rollouts_land_in_files_and_the_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every batch kind writes samples/<name>.md and reaches log_samples."""
+    env = _setup(tmp_path, monkeypatch)
+    tracker = _RecordingTracker()
+
+    _run(env, _warmup_cfg(), tracker=tracker)
+
+    # One samples file per batch: the two holdout baselines, the warmup
+    # collection, the three training steps, the interim eval after step 1
+    # (eval.every=2), and the finalize student-after eval.
+    samples_dir = DistillRunStore(env.run_dir).samples_dir
+    assert {path.name for path in samples_dir.iterdir()} == {
+        "eval-baseline-teacher.md",
+        "eval-baseline-student-before.md",
+        "warmup.md",
+        "step-0000.md",
+        "step-0001.md",
+        "eval-step-0001.md",
+        "step-0002.md",
+        "eval-student-after.md",
+    }
+    # The default N=2 renders the first two span-bearing trials, each with
+    # its outcome header and the decoded episode body.
+    step0 = (samples_dir / "step-0000.md").read_text(encoding="utf-8")
+    assert step0.count("### trial ") == 2
+    assert "reward:" in step0
+    assert "stop reason: submitted" in step0
+    assert "episode tokens:" in step0
+
+    # The tracker saw the same batches, in run order, under their kinds.
+    assert [(kind, step) for kind, step, _ in tracker.samples] == [
+        ("eval-baseline-teacher", None),
+        ("eval-baseline-student-before", None),
+        ("warmup", None),
+        ("train", 0),
+        ("train", 1),
+        ("eval-step-0001", 1),
+        ("train", 2),
+        ("eval-student-after", 2),
+    ]
+    for _, _, samples in tracker.samples:
+        assert len(samples) == 2
+        for sample in samples:
+            assert sample.text.startswith(f"### trial {sample.trial_name}\n")
+
+
+def test_log_sample_rollouts_zero_disables_files_and_tracker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    tracker = _RecordingTracker()
+    cfg = _cfg()
+    cfg = cfg.model_copy(update={"train": cfg.train.model_copy(update={"log_sample_rollouts": 0})})
+
+    _run(env, cfg, tracker=tracker)
+
+    assert not DistillRunStore(env.run_dir).samples_dir.exists()
+    assert tracker.samples == []
+
+
 def test_tracker_finish_fires_on_the_budget_abort_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -788,6 +871,207 @@ def test_teacher_in_harness_episodes_charge_the_teacher_sample_rate(
     expected_sampled = (2 * 1 + 4 * 2) * 2 * 5
     assert lines["teacher_sample"].tokens == expected_sampled
     assert result.spend.total_usd == pytest.approx(float(expected_sampled))
+
+
+# -- baseline reuse across runs ----------------------------------------------------------------
+
+
+def _write_prior_baseline(
+    path: Path,
+    *,
+    name: str,
+    provider_model: str,
+    base_model: str | None,
+    task_ids: Sequence[str] = _HOLDOUT_IDS,
+    attempts: int = 1,
+    solve_rate: float = 0.5,
+) -> Path:
+    """Fabricate a prior run's recorded baseline eval report on disk."""
+    report = DistillEvalReport(
+        name=name,
+        provider_model=provider_model,
+        base_model=base_model,
+        task_ids=list(task_ids),
+        attempts=attempts,
+        trials=attempts * len(task_ids),
+        solve_rate=solve_rate,
+        empty_span_trials=0,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    return path
+
+
+def _reuse_cfg(
+    *, teacher_from: Path | None = None, student_from: Path | None = None
+) -> DistillConfig:
+    """The 3-step config with baseline reuse configured and interim evals off."""
+    return _cfg().model_copy(
+        update={
+            "eval": EvalConfig(
+                every=0,
+                tasks=2,
+                k=1,
+                teacher_baseline_from=None if teacher_from is None else str(teacher_from),
+                student_baseline_from=None if student_from is None else str(student_from),
+            )
+        }
+    )
+
+
+def test_baseline_reuse_skips_the_baseline_trials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both baselines load from prior reports, so no trials run for either eval."""
+    env = _setup(tmp_path, monkeypatch)
+    teacher_src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-teacher.json",
+        name=TEACHER_BASELINE_EVAL,
+        provider_model=_TEACHER,
+        base_model=_TEACHER,
+        solve_rate=0.5,
+    )
+    student_src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-student-before.json",
+        name=STUDENT_BEFORE_EVAL,
+        provider_model="tinker://fake/sampler/prior-run-step-0000",
+        base_model=_STUDENT,
+        solve_rate=0.25,
+    )
+    tracker = _RecordingTracker()
+
+    result = _run(
+        env, _reuse_cfg(teacher_from=teacher_src, student_from=student_src), tracker=tracker
+    )
+
+    # The rollout collector never ran for either baseline: the only eval batch
+    # is the finalize student-after, and the teacher never sampled at all.
+    eval_calls = [call for call in env.rollouts.calls if call.run_dir != env.run_dir]
+    assert [call.run_dir.name for call in eval_calls] == ["student-after"]
+    assert all(call.provider_model != _TEACHER for call in env.rollouts.calls)
+
+    # The gate consumed the reused solve rates (teacher 0.5, before 0.25;
+    # the stub collector's student-after solves 0.5).
+    assert result.gate.teacher_solve_rate == pytest.approx(0.5)
+    assert result.gate.student_before_solve_rate == pytest.approx(0.25)
+    assert result.gate.accepted
+
+    # Logged and tracked as usual (no step, like any pre-training baseline).
+    assert ("baseline-teacher", 0.5, None) in tracker.evals
+    assert ("baseline-student-before", 0.25, None) in tracker.evals
+
+
+def test_reused_baseline_is_copied_with_a_provenance_note(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    teacher_src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-teacher.json",
+        name=TEACHER_BASELINE_EVAL,
+        provider_model=_TEACHER,
+        base_model=_TEACHER,
+    )
+
+    _run(env, _reuse_cfg(teacher_from=teacher_src))
+
+    evals_dir = DistillRunStore(env.run_dir).evals_dir
+    copied = DistillEvalReport.model_validate_json(
+        (evals_dir / "baseline-teacher.json").read_text(encoding="utf-8")
+    )
+    assert copied.source is not None
+    assert str(teacher_src) in copied.source
+    assert "eval.teacher_baseline_from" in copied.source
+    assert copied.solve_rate == pytest.approx(0.5)
+    assert copied.task_ids == list(_HOLDOUT_IDS)
+    # The student baseline was NOT configured for reuse: it ran trials here,
+    # carries no provenance note, and records the base model a later run's
+    # student_baseline_from validation needs.
+    before = DistillEvalReport.model_validate_json(
+        (evals_dir / "baseline-student-before.json").read_text(encoding="utf-8")
+    )
+    assert before.source is None
+    assert before.base_model == _STUDENT
+
+
+def test_baseline_reuse_rejects_a_task_id_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-teacher.json",
+        name=TEACHER_BASELINE_EVAL,
+        provider_model=_TEACHER,
+        base_model=_TEACHER,
+        task_ids=("hold-a", "hold-z"),
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _run(env, _reuse_cfg(teacher_from=src))
+
+    message = str(excinfo.value)
+    assert "eval.teacher_baseline_from" in message
+    assert "hold-b" in message  # missing from the report
+    assert "hold-z" in message  # extra in the report
+    # The invalid report was never copied into this run's evals/.
+    assert not (DistillRunStore(env.run_dir).evals_dir / "baseline-teacher.json").exists()
+
+
+def test_baseline_reuse_rejects_too_few_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-teacher.json",
+        name=TEACHER_BASELINE_EVAL,
+        provider_model=_TEACHER,
+        base_model=_TEACHER,
+        attempts=1,
+    )
+    cfg = _reuse_cfg(teacher_from=src).model_copy(update={"gate": GateConfig(k=2)})
+
+    with pytest.raises(ValueError) as excinfo:
+        _run(env, cfg)
+
+    message = str(excinfo.value)
+    assert "eval.teacher_baseline_from" in message
+    assert "1 attempt(s)" in message
+    assert "gate.k is 2" in message
+
+
+def test_student_baseline_reuse_rejects_a_base_model_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-student-before.json",
+        name=STUDENT_BEFORE_EVAL,
+        provider_model="tinker://fake/sampler/prior-run-step-0000",
+        base_model="fake/other-student",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        _run(env, _reuse_cfg(student_from=src))
+
+    message = str(excinfo.value)
+    assert "eval.student_baseline_from" in message
+    assert "fake/other-student" in message
+    assert _STUDENT in message
+
+
+def test_student_baseline_reuse_requires_a_recorded_base_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A student report without base_model cannot be validated, so it is rejected."""
+    env = _setup(tmp_path, monkeypatch)
+    src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-student-before.json",
+        name=STUDENT_BEFORE_EVAL,
+        provider_model="tinker://fake/sampler/prior-run-step-0000",
+        base_model=None,
+    )
+
+    with pytest.raises(ValueError, match="records no base_model"):
+        _run(env, _reuse_cfg(student_from=src))
 
 
 # -- budget abort and resume -----------------------------------------------------------------
@@ -1281,6 +1565,163 @@ def test_resume_restores_post_warmup_state_when_no_step_checkpoint_exists(
     assert len(_warmup_calls(env)) == 1  # warmup itself was not re-run
 
 
+# -- shared warmup-collection loading (warmup.trajectories_from) ------------------------------
+
+
+def test_warmup_collection_writes_the_trials_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The collection persists every assembled trial, pre keep-filter."""
+    env = _setup(tmp_path, monkeypatch)
+
+    _run(env, _warmup_cfg())
+
+    manifest = DistillRunStore(env.run_dir).read_warmup_trials()
+    assert manifest is not None
+    assert manifest.teacher_model == _TEACHER
+    # Unfiltered: all 4 train tasks x 2 attempts, failing trials included,
+    # so a loading run may apply a different keep filter.
+    assert len(manifest.records) == 8
+    assert sum(1 for record in manifest.records if record.passed) == 4
+    assert all(record.spans for record in manifest.records)
+
+
+def test_warmup_loads_a_source_runs_collection_without_collecting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    source_dir = tmp_path / "source-run"
+    env.run_dir = source_dir
+    _run(env, _warmup_cfg())
+    ce_before = _loss_fns(env).count("cross_entropy")
+    assert ce_before == 2
+
+    env.run_dir = tmp_path / "target-run"
+    result = _run(env, _warmup_cfg(trajectories_from=str(source_dir)))
+
+    assert result.steps_completed == 3
+    # No teacher collection ran for the target: the only warmup-rollouts
+    # batch across both runs is the source run's.
+    assert _warmup_calls(env) == []
+    warmup_batches = [c for c in env.rollouts.calls if c.run_dir.name == WARMUP_ROLLOUTS_DIR]
+    assert len(warmup_batches) == 1
+    assert warmup_batches[0].run_dir == source_dir / WARMUP_ROLLOUTS_DIR
+    # The CE training passes still ran per the target run's config.
+    assert _loss_fns(env).count("cross_entropy") == ce_before + 2
+    record = DistillRunStore(env.run_dir).read_warmup()
+    assert record is not None
+    assert record.steps == 2
+    assert record.trials == 8
+    assert record.kept_trials == 4
+    assert record.datums == 4
+    # OPD step 0 sampled the warmed student, exactly like a collecting run.
+    train_calls = [call for call in env.rollouts.calls if call.run_dir == env.run_dir]
+    assert "warmup" in train_calls[0].provider_model
+
+
+def test_warmup_load_charges_no_teacher_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loading is free: the source run already paid for the collection."""
+    env = _setup(tmp_path, monkeypatch)
+    source_dir = tmp_path / "source-run"
+    env.run_dir = source_dir
+    source_result = _run(env, _warmup_cfg())
+    source_rows = [
+        row for row in DistillRunStore(source_dir).read_metrics() if row.get("phase") == "warmup"
+    ]
+
+    env.run_dir = tmp_path / "target-run"
+    result = _run(env, _warmup_cfg(trajectories_from=str(source_dir)))
+
+    target_rows = [
+        row for row in DistillRunStore(env.run_dir).read_metrics() if row.get("phase") == "warmup"
+    ]
+    # Warmup row 0 folds everything charged since run start: both runs pay
+    # identical baseline volumes (the fakes sample fixed-length sequences for
+    # the same tasks), and only the SOURCE run pays the teacher collection on
+    # top, so every teacher meter delta shrinks strictly when loading.
+    for meter in (
+        "teacher_prefill_tokens",
+        "teacher_cached_prefill_tokens",
+        "teacher_sample_tokens",
+    ):
+        assert 0 < _number(target_rows[0], meter) < _number(source_rows[0], meter)
+    assert _number(target_rows[0], "usd") < _number(source_rows[0], "usd")
+    assert result.spend.total_usd < source_result.spend.total_usd
+
+
+def test_warmup_load_with_a_mismatched_teacher_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Warmup SFT must train on THIS run's teacher, so a foreign manifest fails."""
+    env = _setup(tmp_path, monkeypatch)
+    source_dir = tmp_path / "source-run"
+    env.run_dir = source_dir
+    _run(env, _warmup_cfg())
+    ce_before = _loss_fns(env).count("cross_entropy")
+
+    env.run_dir = tmp_path / "target-run"
+    cfg = _warmup_cfg(trajectories_from=str(source_dir)).model_copy(
+        update={"teacher": TeacherConfig(model="fake/other-teacher-70b")}
+    )
+    with pytest.raises(ValueError, match="sampled by teacher .* this run's teacher"):
+        _run(env, cfg)
+
+    assert _loss_fns(env).count("cross_entropy") == ce_before  # nothing trained
+
+
+def test_warmup_load_applies_the_keep_filter_at_load_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The manifest is unfiltered, so keep= may differ from the source run's.
+
+    An all-failing source collection degrades a keep="passed" loader to pure
+    OPD (the same warning path as a fresh collection), while a keep="all"
+    loader trains on every loaded trial.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.teacher_fail_all = True
+    source_dir = tmp_path / "source-run"
+    env.run_dir = source_dir
+    _run(env, _warmup_cfg())  # degrades itself, but the manifest is written pre-filter
+    assert _loss_fns(env).count("cross_entropy") == 0
+
+    env.run_dir = tmp_path / "target-passed"
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.loop"):
+        result = _run(env, _warmup_cfg(trajectories_from=str(source_dir)))
+
+    assert result.steps_completed == 3
+    assert "pure on-policy distillation" in caplog.text
+    assert _loss_fns(env).count("cross_entropy") == 0
+    record = DistillRunStore(env.run_dir).read_warmup()
+    assert record is not None
+    assert record.steps == 0
+    assert record.kept_trials == 0
+    assert record.skipped_reason is not None
+    assert "loaded" in record.skipped_reason
+
+    env.run_dir = tmp_path / "target-all"
+    result_all = _run(
+        env, _warmup_cfg(warmup_steps=1, keep="all", trajectories_from=str(source_dir))
+    )
+
+    assert result_all.steps_completed == 3
+    assert _loss_fns(env).count("cross_entropy") == 1
+    record_all = DistillRunStore(env.run_dir).read_warmup()
+    assert record_all is not None
+    assert record_all.kept_trials == 8
+    assert record_all.datums == 8
+
+
+def test_warmup_load_without_a_manifest_is_actionable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match="no warmup trial manifest"):
+        _run(env, _warmup_cfg(trajectories_from=str(tmp_path / "not-a-run")))
+
+
 # -- preflight failure paths -----------------------------------------------------------------
 
 
@@ -1765,3 +2206,86 @@ def test_loop_sampling_adapter_deadline_evicts_the_shared_cache(
         adapter.get_tokenizer()
 
     assert path not in providers_tinker._shared_samplers
+
+
+# -- the topk_ce loss mode -----------------------------------------------------------------------
+
+
+def _topk_cfg(k: int = 3) -> DistillConfig:
+    """A 2-step config training the weighted top-k cross_entropy loss."""
+    base = _cfg()
+    return base.model_copy(
+        update={"train": base.train.model_copy(update={"steps": 2, "loss": "topk_ce", "topk": k})}
+    )
+
+
+def test_topk_ce_two_step_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The full loop in topk_ce mode: metrics, meters, KL, TITO, and the gate."""
+    env = _setup(tmp_path, monkeypatch)
+    k = 3
+
+    result = _run(env, _topk_cfg(k))
+
+    assert result.steps_completed == 2
+    assert result.gate.accepted
+    assert result.adapter_version == 1
+
+    # Every training batch trained cross_entropy over k rank replicas per
+    # source datum (2 tasks x 2 attempts, each merged to one datum = 4
+    # sources), and every replica cleared the fake's input-side TITO check
+    # (candidate targets are teacher-proposed; the input stays sampled tokens).
+    training = env.service.training
+    assert training is not None
+    batches = training.inner.forward_backward_calls
+    assert [loss for _, loss in batches] == ["cross_entropy"] * 2
+    for batch, _ in batches:
+        assert len(batch) == 4 * k
+        assert all(datum.topk for datum in batch)
+        # Rank replicas of one source share the model input, and at every
+        # loss-weighted target index their weights sum to 1 (the renormalized
+        # teacher distribution over the k candidates).
+        for start in range(0, len(batch), k):
+            replicas = batch[start : start + k]
+            assert len({tuple(replica.model_input_tokens) for replica in replicas}) == 1
+            for index in range(len(replicas[0].target_tokens)):
+                weights = [replica.weights[index] for replica in replicas]
+                if any(weight != 0.0 for weight in weights):
+                    assert sum(weights) == pytest.approx(1.0)
+    assert training.inner.optim_step_lrs == [1e-4] * 2
+
+    # Metrics rows: replica-count datums, the reverse-KL metric still present
+    # (from the same prefill request's realized logprobs), and no advantage
+    # metrics (nothing is clipped or centered in this mode).
+    store = DistillRunStore(env.run_dir)
+    rows = [row for row in store.read_metrics() if "phase" not in row]
+    assert [row["step"] for row in rows] == [0, 1]
+    for row in rows:
+        assert row["datums"] == 4 * k
+        assert row["mismatch_drops"] == 0
+        assert isinstance(row["reverse_kl_per_token"], float)
+        assert row["advantage_mean"] is None
+        assert row["advantage_std"] is None
+        assert _number(row, "clip_fraction") == 0.0
+        assert _number(row, "clipped_tokens") == 0
+        assert isinstance(row["pg_loss"], float)
+        assert isinstance(row["grad_norm"], float)
+        # Billing honesty: the student_train meter charged k x the CE volume
+        # (each replica carries the full sequence: loss + context tokens).
+        expected_train = k * (_number(row, "loss_tokens") + _number(row, "context_tokens"))
+        assert _number(row, "student_train_tokens") == expected_train
+        assert _number(row, "teacher_prefill_tokens") > 0
+        assert _number(row, "usd") > 0
+
+    # The spend ledger saw everything, as in the default mode.
+    assert store.read_spend() == pytest.approx(result.spend.total_usd)
+
+
+def test_topk_ce_mode_survives_fabricated_span_detection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fabricated INPUT spans still die in topk mode: the relaxation moved the
+    TITO check to the model input, it did not remove it."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.fabricate_spans = True
+    with pytest.raises(AssertionError, match="TITO violation in topk datum"):
+        _run(env, _topk_cfg())
