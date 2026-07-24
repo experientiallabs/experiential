@@ -807,3 +807,183 @@ def test_harbor_resume_accepts_a_restated_episode_timeout_for_an_e2b_run(
     )
     assert resumed.exit_code == 0, resumed.output
     assert "optimized" in resumed.output
+
+
+# -- the distill mode: routing out of optimize() and flag-surface conflicts --------------------
+
+
+class _DistillRecorder:
+    """Stands in for `run_distill`: records the keyword wiring optimize() passes."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(self, console: object, **kwargs: object) -> None:
+        self.calls.append({"console": console, **kwargs})
+
+
+def test_optimize_rejects_an_unknown_mode(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["optimize", "pi", "harbor", "--mode", "banana", "--root", str(tmp_path / ".wmh")],
+    )
+    assert result.exit_code == 2
+    assert "choose search or distill" in " ".join(result.output.split())
+
+
+def test_search_mode_rejects_distill_only_flags(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--distill-config",
+            "run.toml",
+            "--promote",
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert result.exit_code == 2
+    flat = " ".join(result.output.split())
+    assert "--distill-config" in flat
+    assert "--promote" in flat
+    assert "apply only to --mode distill" in flat
+
+
+def test_distill_mode_requires_the_harbor_environment(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "made",
+            "--mode",
+            "distill",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert result.exit_code == 2
+    flat = " ".join(result.output.split())
+    assert "requires the harbor environment" in flat
+    assert "follow-on" in flat  # the world-model distill backend is documented, not silent
+
+
+def test_harbor_distill_rejects_search_only_flags(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--mode",
+            "distill",
+            "--harbor-config",
+            "job.yaml",
+            "--iterations",
+            "3",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+    assert result.exit_code == 2
+    flat = " ".join(result.output.split())
+    assert "--harbor-config" in flat
+    assert "--iterations" in flat
+    assert "apply only to --mode search" in flat
+
+
+def test_harbor_distill_routes_to_run_distill_with_the_flag_wiring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _DistillRecorder()
+    monkeypatch.setattr(harness_app_module, "run_distill", recorder)
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--mode",
+            "distill",
+            "--distill-config",
+            str(tmp_path / "run.toml"),
+            "--task-ids",
+            str(tmp_path / "train.json"),
+            "--holdout-task-ids",
+            str(tmp_path / "holdout.json"),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+            "--resume",
+            "--yes",
+            "--promote",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [call] = recorder.calls
+    assert call["agent_name"] == "pi"
+    assert call["distill_config_path"] == str(tmp_path / "run.toml")
+    assert call["task_ids_path"] == str(tmp_path / "train.json")
+    assert call["holdout_task_ids_path"] == str(tmp_path / "holdout.json")
+    assert call["run_dir"] == str(tmp_path / "run")
+    assert call["backend"] is None  # --backend not explicit: the distill config decides
+    assert call["resume"] is True
+    assert call["yes"] is True
+    assert call["promote"] is True
+    assert call["root"] == str(tmp_path / ".wmh")
+
+
+def test_harbor_distill_passes_an_explicit_backend_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _DistillRecorder()
+    monkeypatch.setattr(harness_app_module, "run_distill", recorder)
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--mode",
+            "distill",
+            "--backend",
+            "e2b",
+            "--distill-config",
+            str(tmp_path / "run.toml"),
+            "--task-ids",
+            str(tmp_path / "train.json"),
+            "--holdout-task-ids",
+            str(tmp_path / "holdout.json"),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [call] = recorder.calls
+    assert call["backend"] == "e2b"
+
+
+def test_harbor_search_path_is_untouched_by_the_mode_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--mode search` stated explicitly behaves exactly like the flagless default."""
+    _harbor_project(tmp_path, monkeypatch)
+
+    result = _invoke_harbor(tmp_path, "--mode", "search")
+
+    assert result.exit_code == 0, result.output
+    assert "optimized" in result.output

@@ -1,0 +1,1527 @@
+"""The on-policy distillation orchestrator: `run_distillation` and its step loop.
+
+One run couples every distill layer end to end: preflight checks before any
+spend, teacher-in-harness and student-before baselines on the holdout split,
+then the training loop (harbor rollouts from the current student sampler,
+prefix-merge datums, teacher scoring, reverse-KL advantages, one
+`importance_sampling` optimizer step per training step), and finally the
+holdout gate that decides whether the adapter is promoted into the
+`AdapterStore`.
+
+Layout: everything lands in the `DistillRunStore` run directory. The rollout
+collector writes its per-step `harbor/step-NNNN/` and `tokens/step-NNNN/`
+dirs under the run dir for training batches; eval batches (baselines, interim
+evals, student-after) get their own isolated roots under
+`eval-rollouts/<eval-name>/` so their harbor job dirs never collide with a
+training step's.
+
+The Tinker SDK stays an optional extra: the real service client is built
+lazily only when no `service_client` is injected, and the thin `Sdk*`
+adapters here (mirroring `SdkSampler` and `SdkLogprobScorer`) are the only
+code that touches it. Tests drive the whole loop with the deterministic fakes
+in `wmh.distill.fake_tinker`, whose `FakeTrainingClient` asserts the
+tokens-in-tokens-out invariant on every `forward_backward` batch.
+
+Resume: cadenced `save_state` checkpoints land in the run store's manifest;
+`resume=True` restores the latest checkpoint via `load_state`, continues the
+step count from the checkpoint, restores the prior sessions' USD spend from
+the run store's spend ledger (written on every charge, so eval spend between
+metrics rows survives), and reuses recorded baseline evals. Steps and student
+evals whose harbor job dirs were left by a prior session re-run whole (the
+rollout collector wipes stale-policy job dirs). A budget abort
+(`DistillBudgetError`) always carries the exact resume command.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import random
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast, runtime_checkable
+from uuid import uuid4
+
+from llm_waterfall.types import ChatMessage
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from wmh.config.store import validate_name
+from wmh.distill.config import DistillConfig, PricingConfig
+from wmh.distill.cost import METER_NAMES, BudgetExhausted, BudgetMeter, CostLine, MeterName
+from wmh.distill.data import TrainDatum, attach_advantages, build_datums, to_tinker_datums
+from wmh.distill.gate import DistillGateRecord, gate_distillation
+from wmh.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
+from wmh.distill.rollouts import collect_rollouts
+from wmh.distill.store import AdapterStore, DistillModelCard, DistillRunStore, build_handoff_toml
+from wmh.distill.teacher import (
+    EncodingTokenizer,
+    SdkLogprobScorer,
+    TeacherClient,
+    TinkerTeacher,
+    tokenizer_fingerprint_check,
+)
+from wmh.distill.tokens import TrialRecord
+from wmh.distill.tracking import DistillTracker, build_tracker
+from wmh.harness.doc import (
+    MAX_OUTPUT_TOKENS_ID,
+    MAX_TURNS_ID,
+    TEMPERATURE_ID,
+    HarnessDoc,
+    Surface,
+    SurfaceKind,
+)
+from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.tinker import TINKER_API_KEY_ENV, SampledSequenceLike, SdkSampler
+
+if TYPE_CHECKING:
+    import tinker
+    from tinker import types as tinker_types
+
+logger = logging.getLogger(__name__)
+
+IMPORTANCE_SAMPLING_LOSS = "importance_sampling"
+
+DEFAULT_TITO_MEAN_TOLERANCE = 0.25
+"""Max mean |issued - recomputed| logprob gap the preflight recompute accepts.
+
+The fakes agree exactly, but the real service computes sampling and scoring on
+different execution paths (kernel and batching differences), so individual
+positions legitimately drift by a few hundredths of a nat (observed ~0.08 on
+Qwen3.5-4B at temperature 1.0). That noise is zero-mean across the probe
+sample, while the failures this check exists to catch (wrong sampler path,
+tokenizer or renderer drift, SDK change) shift logprobs systematically by
+whole nats. The mean bound separates those regimes robustly.
+"""
+
+DEFAULT_TITO_MAX_TOLERANCE = 1.0
+"""Max |issued - recomputed| gap at any single position (catastrophic bound)."""
+
+_PREFLIGHT_SAMPLE_TOKENS = 16
+"""Length of the preflight sample whose logprobs are recomputed (the TITO proof)."""
+
+EVAL_ROLLOUTS_DIR = "eval-rollouts"
+"""Run-dir subdirectory holding each eval batch's isolated rollout root."""
+
+TEACHER_BASELINE_EVAL = "baseline-teacher"
+STUDENT_BEFORE_EVAL = "baseline-student-before"
+STUDENT_AFTER_EVAL = "student-after"
+
+_MISSING_TINKER_EXTRA = (
+    "the tinker SDK is not installed; run `uv sync --extra distill` to run "
+    "distillation training, or inject service_client= (tests use the fakes in "
+    "wmh.distill.fake_tinker)"
+)
+
+DistillPhase = Literal["preflight", "baseline", "rollouts", "training", "eval", "finalize", "gate"]
+
+
+class DistillProgress(BaseModel):
+    """One typed progress event emitted to the `on_progress` callback."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: DistillPhase
+    message: str
+    total_steps: int = Field(ge=0)
+    step: int | None = None
+    """0-based training step the event belongs to; None for run-level phases."""
+
+    spent_usd: float = Field(ge=0.0)
+    """Total priced spend so far, including prior sessions of a resumed run."""
+
+
+ProgressCallback = Callable[[DistillProgress], None]
+
+LiveTrialPreflight = Callable[[ProviderConfig], None]
+"""The documented hook for the live single-trial pi preflight (Phase 6).
+
+Called with the student's rollout provider config (kind TINKER, model = the
+current sampler path) after every cheap preflight check has passed and before
+any baseline or training spend. A real implementation runs one short pi trial
+on a cheap task through the actual harbor stack and raises on failure (spans
+missing, prefix property broken, tool calls not round-tripping); it is
+deliberately NOT implemented in this module, which stays free of harbor
+calls beyond `collect_rollouts`.
+"""
+
+
+class DistillBudgetError(RuntimeError):
+    """The hard budget cap was hit; artifacts were persisted so the run can resume.
+
+    Attributes:
+        resume_command: The exact CLI command that resumes this run.
+        spent_usd: Total priced spend (including prior sessions) at abort.
+        max_usd: The configured `budget.max_usd` cap.
+    """
+
+    def __init__(
+        self, message: str, *, resume_command: str, spent_usd: float, max_usd: float
+    ) -> None:
+        super().__init__(message)
+        self.resume_command = resume_command
+        self.spent_usd = spent_usd
+        self.max_usd = max_usd
+
+
+class DistillEvalReport(BaseModel):
+    """One eval batch's persisted outcome (baselines, interim evals, student-after)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str = Field(min_length=1)
+    provider_model: str = Field(min_length=1)
+    """The provider `model` the trials sampled (sampler path or teacher ref)."""
+
+    task_ids: list[str]
+    attempts: int = Field(ge=1)
+    trials: int = Field(ge=0)
+    solve_rate: float = Field(ge=0.0, le=1.0)
+    empty_span_trials: int = Field(ge=0)
+
+
+class StepMetrics(BaseModel):
+    """One training step's metrics row (the store adds the `step` key)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tasks: int = Field(ge=0)
+    trials: int = Field(ge=0)
+    solve_rate: float = Field(ge=0.0, le=1.0)
+    empty_span_trials: int = Field(ge=0)
+    datums: int = Field(ge=0)
+    fragments: int = Field(ge=0)
+    fragmentation_rate: float = Field(ge=0.0, le=1.0)
+    overflow_drops: int = Field(ge=0)
+    overlong_drops: int = Field(ge=0)
+    mismatch_drops: int = Field(ge=0)
+    clipped_tokens: int = Field(ge=0)
+    loss_tokens: int = Field(ge=0)
+    context_tokens: int = Field(ge=0)
+    reverse_kl_per_token: float | None
+    """mean(sampled_lp - teacher_lp) over scored loss tokens; None when none."""
+
+    sampler_path: str
+    """The tinker:// sampler path the step's rollouts sampled from."""
+
+    student_prefill_tokens: int = Field(ge=0)
+    student_sample_tokens: int = Field(ge=0)
+    student_train_tokens: int = Field(ge=0)
+    teacher_prefill_tokens: int = Field(ge=0)
+    usd: float = Field(ge=0.0)
+    """Priced spend since the previous metrics row (baselines fold into step 0)."""
+
+
+class SpendSummary(BaseModel):
+    """Where the run's money went, in the cost module's line shape."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    lines: list[CostLine]
+    """This session's actual per-meter tokens and USD."""
+
+    session_usd: float = Field(ge=0.0)
+    prior_usd: float = Field(ge=0.0)
+    """USD earlier sessions of a resumed run recorded in the spend ledger."""
+
+    total_usd: float = Field(ge=0.0)
+
+
+class DistillResult(BaseModel):
+    """What `run_distillation` returns after the gate has been decided."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    run_dir: str
+    steps_completed: int = Field(ge=0)
+    final_sampler_path: str
+    final_state_path: str
+    gate: DistillGateRecord
+    adapter_version: int | None
+    """The promoted AdapterStore version; None when the gate rejected."""
+
+    spend: SpendSummary
+
+
+# -- injectable Tinker surface (fakes satisfy these directly) ------------------------------------
+
+
+class DistillSamplingClient(Protocol):
+    """The sampling-client slice the loop uses, in token-id terms.
+
+    `wmh.distill.fake_tinker.FakeSamplingClient` satisfies this directly; real
+    `tinker.SamplingClient`s are adapted via `SdkSamplingClient`.
+    """
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> SampledSequenceLike:
+        """Sample one sequence conditioned on the prompt token ids."""
+        ...
+
+    def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
+        """Per-position logprobs for the sequence; entry 0 is None."""
+        ...
+
+
+@runtime_checkable
+class TokenizerSource(Protocol):
+    """A sampling client that can also supply its model's tokenizer."""
+
+    def get_tokenizer(self) -> EncodingTokenizer:
+        """The tokenizer for the client's model."""
+        ...
+
+
+class DistillTrainingClient(Protocol):
+    """The training-client slice the loop drives, in loop currency.
+
+    `forward_backward` takes the loop's own `TrainDatum`s; each backend owns
+    the conversion to its wire datum type (`SdkTrainingClient` converts via
+    `to_tinker_datums`, test shims convert to `FakeDatum`s), which keeps the
+    orchestrator identical for real and fake runs.
+    """
+
+    def get_tokenizer(self) -> EncodingTokenizer:
+        """The student base model's tokenizer."""
+        ...
+
+    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
+        """Accumulate gradients for one batch under the named loss."""
+        ...
+
+    def optim_step(self, learning_rate: float) -> None:
+        """Apply one optimizer step."""
+        ...
+
+    def save_state(self) -> str:
+        """Save resumable training state, returning its tinker:// path."""
+        ...
+
+    def load_state(self, path: str) -> None:
+        """Restore training state from a previously saved path."""
+        ...
+
+    def save_weights_for_sampler(self, name: str) -> str:
+        """Save current weights for sampling, returning the sampler path."""
+        ...
+
+
+class DistillServiceClient(Protocol):
+    """The service-client slice the loop needs.
+
+    `wmh.distill.fake_tinker.FakeServiceClient` matches this shape (tests wrap
+    its training client to convert datums); the real SDK is adapted by
+    `SdkServiceClient`.
+    """
+
+    def create_lora_training_client(self, base_model: str, rank: int = 32) -> DistillTrainingClient:
+        """Create the LoRA training client for the student base model."""
+        ...
+
+    def create_sampling_client(self, model_path: str) -> DistillSamplingClient:
+        """Create a sampling client for a sampler path or base model name."""
+        ...
+
+
+# -- real-SDK adapters (lazy tinker imports, mirroring SdkSampler/SdkLogprobScorer) --------------
+
+
+class SdkSamplingClient:
+    """Adapts a real `tinker.SamplingClient` to `DistillSamplingClient`."""
+
+    def __init__(self, client: tinker.SamplingClient) -> None:
+        self._client = client
+        self._sampler = SdkSampler(client)
+        self._scorer = SdkLogprobScorer(client)
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+    ) -> SampledSequenceLike:
+        """One synchronous sample through the provider's SDK adapter."""
+        return self._sampler.sample(
+            prompt_token_ids, max_tokens=max_tokens, temperature=temperature
+        )
+
+    def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
+        """One synchronous compute_logprobs call on the full sequence."""
+        return self._scorer.compute_logprobs(token_ids)
+
+    def get_tokenizer(self) -> EncodingTokenizer:
+        """The HF tokenizer for the client's base model."""
+        return cast("EncodingTokenizer", self._client.get_tokenizer())
+
+
+class SdkTrainingClient:
+    """Adapts a real `tinker.TrainingClient` to `DistillTrainingClient`.
+
+    Save names carry a per-session nonce so a resumed run re-saving the same
+    step never collides with an earlier session's artifact names.
+    """
+
+    def __init__(self, client: tinker.TrainingClient) -> None:
+        self._client = client
+        self._session = uuid4().hex[:8]
+        self._save_counter = 0
+
+    def get_tokenizer(self) -> EncodingTokenizer:
+        """The student base model's HF tokenizer."""
+        return cast("EncodingTokenizer", self._client.get_tokenizer())
+
+    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
+        """Convert to real tinker datums and run one blocking forward/backward."""
+        self._client.forward_backward(
+            to_tinker_datums(datums), cast("tinker_types.LossFnType", loss_fn)
+        ).result()
+
+    def optim_step(self, learning_rate: float) -> None:
+        """One blocking Adam step at the given learning rate."""
+        from tinker import types
+
+        self._client.optim_step(types.AdamParams(learning_rate=learning_rate)).result()
+
+    def save_state(self) -> str:
+        """Save resumable training state under a session-unique name."""
+        name = f"wmh-distill-{self._session}-state-{self._save_counter:04d}"
+        self._save_counter += 1
+        return self._client.save_state(name).result().path
+
+    def load_state(self, path: str) -> None:
+        """Restore training state from a tinker:// state path."""
+        self._client.load_state(path).result()
+
+    def save_weights_for_sampler(self, name: str) -> str:
+        """Save sampler weights, returning the tinker:// sampler path."""
+        return self._client.save_weights_for_sampler(f"{name}-{self._session}").result().path
+
+
+class SdkServiceClient:
+    """Adapts a real `tinker.ServiceClient` to `DistillServiceClient`."""
+
+    def __init__(self, service: tinker.ServiceClient) -> None:
+        self._service = service
+
+    def create_lora_training_client(self, base_model: str, rank: int = 32) -> SdkTrainingClient:
+        """Create the real LoRA training client for the student."""
+        return SdkTrainingClient(
+            self._service.create_lora_training_client(base_model=base_model, rank=rank)
+        )
+
+    def create_sampling_client(self, model_path: str) -> SdkSamplingClient:
+        """Create a sampling client for a tinker:// path or a base model name."""
+        if model_path.startswith("tinker://"):
+            client = self._service.create_sampling_client(model_path=model_path)
+        else:
+            client = self._service.create_sampling_client(base_model=model_path)
+        return SdkSamplingClient(client)
+
+
+def _build_sdk_service_client() -> SdkServiceClient:
+    """Build the real service client (the `service_client=None` path).
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+    """
+    try:
+        import tinker
+    except ImportError as exc:
+        raise ImportError(_MISSING_TINKER_EXTRA) from exc
+    if not os.environ.get(TINKER_API_KEY_ENV):
+        raise RuntimeError(
+            f"{TINKER_API_KEY_ENV} is not set in the environment; set it to your "
+            "Tinker API key to run distillation (tests inject service_client= "
+            "instead of setting the key)"
+        )
+    return SdkServiceClient(tinker.ServiceClient())
+
+
+# -- samplers ------------------------------------------------------------------------------------
+
+
+def _seed_from_name(name: str) -> int:
+    """A stable cross-process seed derived from the run name (hash() is salted)."""
+    return int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big")
+
+
+class TaskSampler:
+    """A seeded shuffle-cycle over the train task ids.
+
+    Batches are unique within themselves and the cycle visits every task
+    before repeating any, so coverage stays even. The sequence is a pure
+    function of (task_ids, seed, draw count): a resumed run fast-forwards by
+    the completed step count and continues the exact same batch sequence.
+
+    Args:
+        task_ids: The train split's task ids; must be non-empty and unique.
+        seed: Seed for the shuffle order.
+
+    Raises:
+        ValueError: If `task_ids` is empty or contains duplicates.
+    """
+
+    def __init__(self, task_ids: Sequence[str], *, seed: int) -> None:
+        ids = list(task_ids)
+        if not ids:
+            raise ValueError("task_ids is empty; a distillation run needs at least one train task")
+        if len(set(ids)) != len(ids):
+            raise ValueError(
+                "task_ids contains duplicates; pass each train task id exactly once "
+                "(attempts per task come from train.group_size, not repeated ids)"
+            )
+        self._ids = ids
+        self._rng = random.Random(seed)
+        self._cycle: list[str] = []
+        self._position = 0
+        self._reshuffle()
+
+    def _reshuffle(self) -> None:
+        self._cycle = list(self._ids)
+        self._rng.shuffle(self._cycle)
+        self._position = 0
+
+    def next_batch(self, n: int) -> list[str]:
+        """The next batch of at most `n` unique task ids.
+
+        Args:
+            n: Requested batch size; clamped to the split size.
+
+        Returns:
+            `min(n, len(task_ids))` unique task ids in cycle order.
+
+        Raises:
+            ValueError: If `n` is not positive.
+        """
+        if n < 1:
+            raise ValueError(f"batch size must be >= 1, got {n}")
+        size = min(n, len(self._ids))
+        batch: list[str] = []
+        while len(batch) < size:
+            if self._position >= len(self._cycle):
+                self._reshuffle()
+            candidate = self._cycle[self._position]
+            self._position += 1
+            if candidate not in batch:
+                batch.append(candidate)
+        return batch
+
+
+class StudentSampler:
+    """Owns the student's sampler-weights refresh cadence.
+
+    `refresh(step)` saves the training client's current weights under a
+    step-stamped name and swaps in a sampling client for them; the exposed
+    `sampler_path` is the tinker:// path rollout provider configs point at.
+    Refreshing the same step twice is a no-op (the finalize path may land on
+    a step the cadence already refreshed).
+
+    Args:
+        service: The service client sampler clients are created from.
+        training: The training client whose weights are saved.
+        run_name: Stamped into every sampler-weights save name.
+    """
+
+    def __init__(
+        self,
+        service: DistillServiceClient,
+        training: DistillTrainingClient,
+        run_name: str,
+    ) -> None:
+        self._service = service
+        self._training = training
+        self._run_name = run_name
+        self._path: str | None = None
+        self._client: DistillSamplingClient | None = None
+        self._last_step: int | None = None
+
+    def refresh(self, step: int) -> str:
+        """Save current weights for sampling and swap in a fresh client.
+
+        Args:
+            step: The 0-based training step the weights are current FOR (the
+                step about to sample from them); stamps the save name.
+
+        Returns:
+            The new (or, when `step` was already refreshed, current)
+            tinker:// sampler path.
+
+        Raises:
+            ValueError: If `step` is negative.
+        """
+        if step < 0:
+            raise ValueError(f"refresh step must be >= 0, got {step}")
+        if self._path is not None and self._last_step == step:
+            return self._path
+        path = self._training.save_weights_for_sampler(f"{self._run_name}-step-{step:04d}")
+        self._client = self._service.create_sampling_client(path)
+        self._path = path
+        self._last_step = step
+        logger.debug("student sampler refreshed for step %d: %s", step, path)
+        return path
+
+    @property
+    def sampler_path(self) -> str:
+        """The current tinker:// sampler path."""
+        if self._path is None:
+            raise RuntimeError(
+                "the student sampler has no weights yet; call refresh() before reading sampler_path"
+            )
+        return self._path
+
+    @property
+    def client(self) -> DistillSamplingClient:
+        """The sampling client for the current weights."""
+        if self._client is None:
+            raise RuntimeError(
+                "the student sampler has no weights yet; call refresh() before reading client"
+            )
+        return self._client
+
+    def provider_config(self, base_model: str) -> ProviderConfig:
+        """The rollout provider config pointing at the current weights.
+
+        Args:
+            base_model: The student base model name (renderer identity).
+        """
+        return ProviderConfig(
+            kind=ProviderKind.TINKER, model=self.sampler_path, model_type=base_model
+        )
+
+
+# -- preflight -----------------------------------------------------------------------------------
+
+
+def tito_recompute_check(
+    client: DistillSamplingClient,
+    prompt_token_ids: Sequence[int],
+    *,
+    sample_tokens: int = _PREFLIGHT_SAMPLE_TOKENS,
+    temperature: float = 1.0,
+    mean_tolerance: float = DEFAULT_TITO_MEAN_TOLERANCE,
+    max_tolerance: float = DEFAULT_TITO_MAX_TOLERANCE,
+) -> None:
+    """The live tokens-in-tokens-out proof: sample, then recompute agreement.
+
+    Samples a short sequence, then asks the same client to `compute_logprobs`
+    on prompt + sampled tokens and requires the recomputed logprobs at the
+    sampled positions to agree with the issued ones. Two bounds apply: the
+    MEAN absolute gap across the sample must stay within `mean_tolerance`
+    (sampler/scorer kernel noise is zero-mean; systematic corruption is not),
+    and no single position may exceed `max_tolerance` (a wrong sampler path,
+    tokenizer drift, or SDK change shifts logprobs by whole nats). Failing
+    either means the sampling and scoring paths do not see the same tokens,
+    which would silently corrupt every training datum.
+
+    Args:
+        client: The student sampling client under test.
+        prompt_token_ids: A non-empty probe prompt.
+        sample_tokens: How many tokens to sample.
+        temperature: Sampling temperature; 1.0 keeps issued logprobs directly
+            comparable to recomputed model logprobs.
+        mean_tolerance: Max acceptable mean |issued - recomputed| over the
+            sampled positions.
+        max_tolerance: Max acceptable |issued - recomputed| at any position.
+
+    Raises:
+        RuntimeError: On empty prompt/sample, missing or misaligned logprobs,
+            or disagreement beyond either bound; the message names the
+            offending statistic and both values.
+    """
+    prompt = list(prompt_token_ids)
+    if not prompt:
+        raise RuntimeError(
+            "the TITO recompute check needs a non-empty probe prompt; the renderer "
+            "produced no tokens for the preflight message, so check the renderer "
+            "and tokenizer for the student base model"
+        )
+    sequence = client.sample(prompt, max_tokens=sample_tokens, temperature=temperature)
+    sampled = list(sequence.tokens)
+    issued = sequence.logprobs
+    if not sampled:
+        raise RuntimeError(
+            "the TITO recompute check sampled no tokens; the student sampler "
+            "returned an empty sequence for a fresh prompt, so check the sampler "
+            "weights path and the model's availability"
+        )
+    if issued is None or len(issued) != len(sampled):
+        got = "no logprobs" if issued is None else f"{len(issued)} logprobs"
+        raise RuntimeError(
+            f"the TITO recompute check got {got} for {len(sampled)} sampled tokens; "
+            "per-token logprobs are required for tokens-in-tokens-out training, so "
+            "check the tinker SDK version pin"
+        )
+    full = prompt + sampled
+    recomputed = client.compute_logprobs(full)
+    if len(recomputed) != len(full):
+        raise RuntimeError(
+            f"compute_logprobs returned {len(recomputed)} entries for the "
+            f"{len(full)}-token recompute sequence; it must return one entry per "
+            "position, so check the tinker SDK version pin"
+        )
+    gaps: list[float] = []
+    for offset, issued_lp in enumerate(issued):
+        recomputed_lp = recomputed[len(prompt) + offset]
+        if recomputed_lp is None:
+            raise RuntimeError(
+                f"TITO recompute returned no logprob at sampled position {offset} "
+                f"(sampler issued {issued_lp:.4f}). The scoring path cannot see "
+                "the student's own tokens, so training data would be corrupt; "
+                "check that the sampler path and base model match and that the "
+                "pinned tinker SDK is unchanged"
+            )
+        gap = abs(recomputed_lp - issued_lp)
+        if gap > max_tolerance:
+            raise RuntimeError(
+                f"TITO recompute disagreement at sampled position {offset}: the "
+                f"sampler issued logprob {issued_lp:.4f} but compute_logprobs "
+                f"returned {recomputed_lp:.4f} (gap {gap:.4f} > per-position "
+                f"bound {max_tolerance}). A gap this large means the sampling "
+                "and scoring paths disagree on the student's own tokens, so "
+                "training data would be corrupt; check that the sampler path "
+                "and base model match and that the pinned tinker SDK is unchanged"
+            )
+        gaps.append(gap)
+    mean_gap = sum(gaps) / len(gaps)
+    if mean_gap > mean_tolerance:
+        worst = max(range(len(gaps)), key=gaps.__getitem__)
+        raise RuntimeError(
+            f"TITO recompute disagreement: mean |issued - recomputed| logprob "
+            f"gap {mean_gap:.4f} over {len(gaps)} sampled tokens exceeds "
+            f"{mean_tolerance} (worst position {worst}: gap {gaps[worst]:.4f}). "
+            "Sampler/scorer kernel noise is zero-mean, so a systematic gap "
+            "means the paths disagree on the student's own tokens and training "
+            "data would be corrupt; check that the sampler path and base model "
+            "match and that the pinned tinker SDK is unchanged"
+        )
+    logger.info(
+        "TITO recompute check passed: mean gap %.4f, max gap %.4f over %d tokens",
+        mean_gap,
+        max(gaps),
+        len(gaps),
+    )
+
+
+# -- internal helpers ----------------------------------------------------------------------------
+
+
+def resume_command(name: str, run_dir: Path) -> str:
+    """The CLI command that resumes a distillation run.
+
+    This is the planned `wmh optimize ... --mode distill` surface; the CLI
+    layer reuses this helper so the command printed on a budget abort stays
+    the command that actually works. On resume the run's pinned config is the
+    `config.toml` snapshot inside the run dir.
+    """
+    return f"wmh optimize {name} harbor --mode distill --run-dir {run_dir} --resume"
+
+
+def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:
+    """Pin the config's rollout knobs onto the harness document the trials run.
+
+    The pi runtimes read their sampling temperature, turn cap, and per-call
+    output cap from the document's param surfaces, so `[sampling]` and
+    `[rollout] max_turns` only take effect by being written INTO the document:
+    `sampling.temperature` -> `param:temperature`, `rollout.max_turns` ->
+    `param:max-turns`, `sampling.max_tokens` -> `param:max-output-tokens`.
+    The result is a pure function of (seed document, config), so every session
+    and step of a run derives the identical document (and harbor job identity).
+
+    A temperature other than 1.0 is allowed but warned about: the sampler's
+    issued logprobs are temperature-scaled while the teacher's
+    `compute_logprobs` are not, which biases the reverse-KL advantages and the
+    importance-sampling correction.
+
+    Args:
+        harness: The seed harness document.
+        cfg: The validated run config.
+
+    Returns:
+        A new validated document with the three param surfaces replaced.
+    """
+    if cfg.sampling.temperature != 1.0:
+        logger.warning(
+            "sampling.temperature = %s: sampler-issued logprobs are temperature-scaled "
+            "but teacher logprobs are not, so reverse-KL advantages are biased; use "
+            "temperature = 1.0 for faithful importance weights",
+            cfg.sampling.temperature,
+        )
+    replacements = {
+        TEMPERATURE_ID: str(cfg.sampling.temperature),
+        MAX_TURNS_ID: str(cfg.rollout.max_turns),
+        MAX_OUTPUT_TOKENS_ID: str(cfg.sampling.max_tokens),
+    }
+    surfaces = [surface for surface in harness.surfaces if surface.id not in replacements]
+    surfaces.extend(
+        Surface(id=surface_id, kind=SurfaceKind.PARAM, content=content)
+        for surface_id, content in replacements.items()
+    )
+    # Reconstruct (not model_copy) so the document re-validates as a whole.
+    return HarnessDoc(name=harness.name, version=harness.version, surfaces=surfaces)
+
+
+def _span_token_counts(records: Sequence[TrialRecord]) -> tuple[int, int]:
+    """Actual (prefill, sampled) token counts across trials' recorded spans.
+
+    Prefill counts only NEW prompt tokens under the prefix property (a prompt
+    extending the accumulated episode tokens charges just its delta); a
+    non-prefix prompt re-prefills in full, matching how the service meters it.
+    """
+    prefill = 0
+    sampled = 0
+    for record in records:
+        accumulated: list[int] = []
+        for span in sorted(record.spans, key=lambda item: item.call_index):
+            prompt = span.prompt_token_ids
+            if accumulated and prompt[: len(accumulated)] == accumulated:
+                prefill += len(prompt) - len(accumulated)
+            else:
+                prefill += len(prompt)
+            sampled += len(span.sampled_token_ids)
+            accumulated = list(prompt) + list(span.sampled_token_ids)
+    return prefill, sampled
+
+
+def _teacher_rows(
+    teacher: TeacherClient, datums: Sequence[TrainDatum]
+) -> tuple[list[list[float | None]], float | None]:
+    """Score datums with the teacher and compute the batch's reverse KL.
+
+    The teacher consumes the loop's own datums and returns one per-position
+    row per datum in the compute_logprobs convention (loss positions carry a
+    logprob; everything else, including a position-0 loss token the teacher
+    cannot condition on, stays None and is dropped loudly downstream by
+    `attach_advantages`).
+
+    Args:
+        teacher: The teacher backend.
+        datums: The step's datums.
+
+    Returns:
+        The per-position teacher rows (aligned one to one with `datums`) and
+        the batch's reverse KL per token, `mean(sampled_lp - teacher_lp)` over
+        every scored loss token (None when nothing was scored).
+    """
+    rows = teacher.score(list(datums))
+    kl_sum = 0.0
+    kl_count = 0
+    for datum, row in zip(datums, rows, strict=True):
+        if len(row) != len(datum.model_input_tokens):
+            continue  # misaligned row: attach_advantages drops and counts it
+        for position, teacher_lp in enumerate(row):
+            if teacher_lp is None:
+                continue
+            kl_sum += datum.sampled_logprobs[position] - teacher_lp
+            kl_count += 1
+    return rows, (kl_sum / kl_count if kl_count else None)
+
+
+class _RunBudget:
+    """This session's `BudgetMeter` plus the USD prior sessions already spent.
+
+    The cap is enforced over the TOTAL (prior + session) so a resumed run
+    cannot spend the budget twice; the inner meter never enforces on its own.
+    Every charge is pushed through `on_spend` (the run store's spend ledger)
+    so the cumulative total survives a crash at ANY point — metrics rows alone
+    would lose everything charged since the last completed step.
+    """
+
+    def __init__(
+        self,
+        pricing: PricingConfig,
+        max_usd: float | None,
+        prior_usd: float,
+        *,
+        on_spend: Callable[[float], None] | None = None,
+    ) -> None:
+        self._meter = BudgetMeter(pricing, max_usd=None)
+        self._max_usd = max_usd
+        self.prior_usd = prior_usd
+        self._on_spend = on_spend
+
+    def charge(self, meter: MeterName, tokens: int) -> None:
+        """Record actual token usage against one meter and persist the total."""
+        self._meter.charge(meter, tokens)
+        if self._on_spend is not None:
+            self._on_spend(self.total_usd)
+
+    def check(self) -> None:
+        """Enforce the cap over the total spend.
+
+        Raises:
+            BudgetExhausted: When the cap is set and the total exceeds it.
+        """
+        if self._max_usd is not None and self.total_usd > self._max_usd:
+            raise BudgetExhausted(self.total_usd, self._max_usd)
+
+    @property
+    def session_usd(self) -> float:
+        """Priced USD spent by this session only."""
+        return self._meter.spent_usd
+
+    @property
+    def total_usd(self) -> float:
+        """Priced USD across prior sessions and this one."""
+        return self.prior_usd + self._meter.spent_usd
+
+    def tokens(self, meter: MeterName) -> int:
+        """This session's tokens charged to one meter."""
+        return self._meter.tokens(meter)
+
+    def lines(self) -> list[CostLine]:
+        """This session's actuals in the estimate's line shape."""
+        return self._meter.lines()
+
+
+class _DistillRun:
+    """One orchestrated distillation run; `run_distillation` drives it."""
+
+    def __init__(
+        self,
+        name: str,
+        cfg: DistillConfig,
+        harness: HarnessDoc,
+        train_task_ids: Sequence[str],
+        holdout_task_ids: Sequence[str],
+        run_dir: Path,
+        *,
+        service: DistillServiceClient,
+        adapter_store: AdapterStore,
+        on_progress: ProgressCallback | None,
+        live_trial_preflight: LiveTrialPreflight | None,
+        tracker: DistillTracker,
+    ) -> None:
+        self._name = name
+        self._cfg = cfg
+        self._harness = pin_rollout_params(harness, cfg)
+        self._train_ids = list(train_task_ids)
+        self._holdout_ids = list(holdout_task_ids)
+        self._run_dir = run_dir
+        self._service = service
+        self._adapters = adapter_store
+        self._on_progress = on_progress
+        self._live_trial_preflight = live_trial_preflight
+        self._tracker = tracker
+        self._store = DistillRunStore(run_dir)
+        self._teacher_identity = cfg.teacher.checkpoint or cfg.teacher.model
+        # Set up by execute():
+        self._training: DistillTrainingClient
+        self._teacher: TinkerTeacher
+        self._teacher_client: DistillSamplingClient
+        self._sampler: StudentSampler
+        self._tasks: TaskSampler
+        self._budget: _RunBudget
+        self._prev_tokens: dict[MeterName, int] = dict.fromkeys(METER_NAMES, 0)
+        self._prev_usd = 0.0
+
+    # -- plumbing --------------------------------------------------------------------------------
+
+    def _emit(self, phase: DistillPhase, message: str, *, step: int | None = None) -> None:
+        logger.info("[%s] %s", phase, message)
+        if self._on_progress is not None:
+            self._on_progress(
+                DistillProgress(
+                    phase=phase,
+                    message=message,
+                    total_steps=self._cfg.train.steps,
+                    step=step,
+                    spent_usd=max(self._budget.total_usd, 0.0),
+                )
+            )
+
+    def _abort_for_budget(self, exc: BudgetExhausted, *, completed_step: int | None) -> NoReturn:
+        """Persist what can be persisted, then raise the typed budget error.
+
+        Args:
+            exc: The meter's exhaustion error.
+            completed_step: The last fully completed training step of this
+                session, or None when no step completed (nothing new to
+                checkpoint; recorded artifacts are reused on resume).
+        """
+        if completed_step is not None:
+            state_path = self._training.save_state()
+            self._store.record_checkpoint(completed_step, state_path, self._sampler.sampler_path)
+            saved = f"training state was saved (checkpoint at step {completed_step})"
+        else:
+            saved = (
+                "no training step completed in this session, so the run resumes "
+                "from its recorded artifacts"
+            )
+        command = resume_command(self._name, self._run_dir)
+        raise DistillBudgetError(
+            f"budget exhausted: ${exc.spent_usd:.2f} spent against the "
+            f"${exc.max_usd:.2f} cap (budget.max_usd); {saved}. Raise budget.max_usd "
+            f"in {self._store.config_path} and resume with: {command}",
+            resume_command=command,
+            spent_usd=exc.spent_usd,
+            max_usd=exc.max_usd,
+        ) from exc
+
+    def _student_provider(self) -> ProviderConfig:
+        return self._sampler.provider_config(self._cfg.student.base_model)
+
+    def _teacher_provider(self) -> ProviderConfig:
+        return ProviderConfig(
+            kind=ProviderKind.TINKER,
+            model=self._teacher_identity,
+            model_type=self._cfg.teacher.model,
+        )
+
+    # -- preflight -------------------------------------------------------------------------------
+
+    def _preflight(self) -> None:
+        """Every check that must pass before the run spends real money.
+
+        Order is cheapest first: renderer resolution and the tokenizer
+        fingerprint cost nothing; the pings and the TITO recompute cost a few
+        tokens. The live single-trial pi preflight is the injected
+        `live_trial_preflight` hook (see `LiveTrialPreflight`).
+        """
+        cfg = self._cfg
+        self._emit("preflight", "running preflight checks before any spend")
+        tokenizer = self._training.get_tokenizer()
+        # The renderer must exist for the base model before any trial runs; the
+        # tokenizer satisfies the renderer's slice at runtime (rendering.py makes
+        # the same cast for the cookbook's loosely typed tokenizer parameter).
+        rendering: ChatRendering = build_renderer(
+            cfg.student.base_model, cast("RendererTokenizer", tokenizer)
+        )
+        if isinstance(self._teacher_client, TokenizerSource):
+            tokenizer_fingerprint_check(
+                cfg.student.base_model,
+                self._teacher_identity,
+                tokenizer,
+                self._teacher_client.get_tokenizer(),
+            )
+        else:
+            logger.info(
+                "teacher sampling client exposes no tokenizer; skipping the "
+                "fingerprint check (injected clients are assumed same-tokenizer)"
+            )
+        prompt_ids = rendering.build_generation_prompt([ChatMessage(role="user", content="ping")])
+        try:
+            sequence = self._sampler.client.sample(prompt_ids, max_tokens=1, temperature=0.0)
+        except Exception as exc:  # noqa: BLE001 - re-raised with actionable context
+            raise RuntimeError(
+                f"student preflight ping failed for {self._sampler.sampler_path!r} "
+                f"(base model {cfg.student.base_model!r}): {exc}; check that the "
+                f"base model is still in Tinker's lineup and that "
+                f"{TINKER_API_KEY_ENV} is valid"
+            ) from exc
+        if not sequence.tokens:
+            raise RuntimeError(
+                f"student preflight ping for {cfg.student.base_model!r} sampled no "
+                "tokens; the sampler returned an empty sequence, so check the model "
+                "name and the sampler weights path"
+            )
+        verify = self._teacher.verify()
+        if not verify.ok:
+            raise RuntimeError(
+                f"teacher preflight ping failed for {verify.model!r}: {verify.detail}; "
+                "check that the teacher model/checkpoint is still available on Tinker "
+                "and shares the student's tokenizer"
+            )
+        tito_recompute_check(self._sampler.client, prompt_ids)
+        if self._live_trial_preflight is not None:
+            self._live_trial_preflight(self._student_provider())
+        self._emit("preflight", "preflight checks passed")
+
+    # -- evals -----------------------------------------------------------------------------------
+
+    def _load_eval(self, key: str) -> DistillEvalReport | None:
+        path = self._store.evals_dir / f"{key}.json"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        try:
+            return DistillEvalReport.model_validate_json(text)
+        except ValidationError as exc:
+            raise ValueError(
+                f"corrupt eval report at {path}: {exc}; delete the file so the "
+                "resumed run re-runs this eval"
+            ) from exc
+
+    def _run_eval(
+        self,
+        key: str,
+        task_ids: Sequence[str],
+        attempts: int,
+        provider: ProviderConfig,
+        *,
+        phase: DistillPhase,
+        teacher_metered: bool,
+        completed_step: int | None,
+    ) -> DistillEvalReport:
+        """Run one eval batch as harbor trials and persist its report.
+
+        Args:
+            key: The eval's store key; also names its isolated rollout root.
+            task_ids: Exact task ids to evaluate on.
+            attempts: Attempts per task (the eval's k).
+            provider: The worker provider config for the trials.
+            phase: The progress phase to emit under.
+            teacher_metered: Charge all tokens to teacher_prefill (the
+                teacher-in-harness approximation `estimate_run_cost`
+                documents) instead of the student meters.
+            completed_step: Forwarded to the budget abort for checkpointing.
+        """
+        cfg = self._cfg
+        self._emit(
+            phase,
+            f"eval {key}: {len(list(task_ids))} task(s) x {attempts} attempt(s) "
+            f"of {provider.model}",
+            step=completed_step,
+        )
+        eval_cfg = cfg.model_copy(
+            update={"train": cfg.train.model_copy(update={"group_size": attempts})}
+        )
+        records, stats = collect_rollouts(
+            0,
+            task_ids,
+            eval_cfg,
+            self._harness,
+            provider,
+            self._run_dir / EVAL_ROLLOUTS_DIR / validate_name(key),
+        )
+        prefill, sampled = _span_token_counts(records)
+        if teacher_metered:
+            self._budget.charge("teacher_prefill", prefill + sampled)
+        else:
+            self._budget.charge("student_prefill", prefill)
+            self._budget.charge("student_sample", sampled)
+        report = DistillEvalReport(
+            name=key,
+            provider_model=provider.model,
+            task_ids=list(task_ids),
+            attempts=attempts,
+            trials=stats.trials,
+            solve_rate=stats.solve_rate,
+            empty_span_trials=stats.empty_span_trials,
+        )
+        self._store.write_eval(key, report)
+        self._tracker.log_eval(key, report.solve_rate, completed_step)
+        try:
+            self._budget.check()
+        except BudgetExhausted as exc:
+            self._abort_for_budget(exc, completed_step=completed_step)
+        return report
+
+    def _eval_or_load(
+        self,
+        key: str,
+        task_ids: Sequence[str],
+        attempts: int,
+        provider: ProviderConfig,
+        *,
+        phase: DistillPhase,
+        teacher_metered: bool,
+        reuse: bool,
+    ) -> DistillEvalReport:
+        if reuse:
+            existing = self._load_eval(key)
+            if existing is not None:
+                logger.info("reusing recorded eval %s (solve rate %.3f)", key, existing.solve_rate)
+                return existing
+        return self._run_eval(
+            key,
+            task_ids,
+            attempts,
+            provider,
+            phase=phase,
+            teacher_metered=teacher_metered,
+            completed_step=None,
+        )
+
+    # -- the step loop ---------------------------------------------------------------------------
+
+    def _train_step(self, step: int) -> None:
+        cfg = self._cfg
+        batch = self._tasks.next_batch(cfg.train.tasks_per_batch)
+        self._emit(
+            "rollouts",
+            f"step {step + 1}/{cfg.train.steps}: {len(batch)} task(s) x "
+            f"{cfg.train.group_size} attempt(s) from {self._sampler.sampler_path}",
+            step=step,
+        )
+        sampler_path = self._sampler.sampler_path
+        records, roll_stats = collect_rollouts(
+            step, batch, cfg, self._harness, self._student_provider(), self._run_dir
+        )
+        prefill, sampled = _span_token_counts(records)
+        self._budget.charge("student_prefill", prefill)
+        self._budget.charge("student_sample", sampled)
+
+        datums, datum_stats = build_datums(records, cfg)
+        teacher_usage_before = self._teacher.usage()
+        rows, reverse_kl = _teacher_rows(self._teacher, datums)
+        self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
+        attached, adv_stats = attach_advantages(datums, rows, cfg)
+
+        train_tokens = sum(len(datum.model_input_tokens) for datum in attached)
+        if attached:
+            self._training.forward_backward(attached, loss_fn=IMPORTANCE_SAMPLING_LOSS)
+            self._training.optim_step(cfg.train.learning_rate)
+            self._budget.charge("student_train", train_tokens)
+        else:
+            logger.warning(
+                "step %d produced no trainable datums (%d trial(s), %d without spans, "
+                "%d overflow drop(s), %d overlong drop(s), %d teacher mismatch "
+                "drop(s)); skipping the optimizer step",
+                step,
+                roll_stats.trials,
+                roll_stats.empty_span_trials,
+                datum_stats.overflow_drops,
+                datum_stats.overlong_drops,
+                adv_stats.mismatch_drops,
+            )
+
+        tokens_now = {meter: self._budget.tokens(meter) for meter in METER_NAMES}
+        metrics = StepMetrics(
+            tasks=len(batch),
+            trials=roll_stats.trials,
+            solve_rate=roll_stats.solve_rate,
+            empty_span_trials=roll_stats.empty_span_trials,
+            datums=len(attached),
+            fragments=datum_stats.fragments,
+            fragmentation_rate=datum_stats.fragmentation_rate,
+            overflow_drops=datum_stats.overflow_drops,
+            overlong_drops=datum_stats.overlong_drops,
+            mismatch_drops=adv_stats.mismatch_drops,
+            clipped_tokens=adv_stats.clipped_tokens,
+            loss_tokens=datum_stats.loss_tokens,
+            context_tokens=datum_stats.context_tokens,
+            reverse_kl_per_token=reverse_kl,
+            sampler_path=sampler_path,
+            student_prefill_tokens=tokens_now["student_prefill"]
+            - self._prev_tokens["student_prefill"],
+            student_sample_tokens=tokens_now["student_sample"]
+            - self._prev_tokens["student_sample"],
+            student_train_tokens=tokens_now["student_train"] - self._prev_tokens["student_train"],
+            teacher_prefill_tokens=tokens_now["teacher_prefill"]
+            - self._prev_tokens["teacher_prefill"],
+            usd=max(self._budget.session_usd - self._prev_usd, 0.0),
+        )
+        self._store.append_metrics(step, metrics)
+        self._tracker.log_step(step, metrics)
+        self._prev_tokens = tokens_now
+        self._prev_usd = self._budget.session_usd
+        kl_text = "n/a" if reverse_kl is None else f"{reverse_kl:.4f}"
+        self._emit(
+            "training",
+            f"step {step + 1}/{cfg.train.steps}: solve rate "
+            f"{roll_stats.solve_rate:.2f}, reverse KL/token {kl_text}, "
+            f"{len(attached)} datum(s)",
+            step=step,
+        )
+
+        try:
+            self._budget.check()
+        except BudgetExhausted as exc:
+            self._abort_for_budget(exc, completed_step=step)
+
+        if (step + 1) % cfg.train.sampler_refresh_every == 0:
+            self._sampler.refresh(step + 1)
+        if (step + 1) % cfg.train.save_state_every == 0:
+            state_path = self._training.save_state()
+            self._store.record_checkpoint(step, state_path, self._sampler.sampler_path)
+        if cfg.eval.every > 0 and (step + 1) % cfg.eval.every == 0:
+            subsample = self._interim_eval_tasks()
+            self._run_eval(
+                f"step-{step:04d}",
+                subsample,
+                cfg.eval.k,
+                self._student_provider(),
+                phase="eval",
+                teacher_metered=False,
+                completed_step=step,
+            )
+
+    def _interim_eval_tasks(self) -> list[str]:
+        """A fixed, seeded train subsample so interim evals compare across steps."""
+        count = min(self._cfg.eval.tasks, len(self._train_ids))
+        rng = random.Random(_seed_from_name(f"{self._name}/interim-eval"))
+        return rng.sample(self._train_ids, count)
+
+    # -- execution -------------------------------------------------------------------------------
+
+    def execute(self, *, resume: bool) -> DistillResult:
+        """Run (or resume) the whole distillation to a gate verdict."""
+        cfg = self._cfg
+        store = self._store
+        if resume:
+            if not store.config_path.exists():
+                raise RuntimeError(
+                    f"nothing to resume in {self._run_dir}: no config.toml snapshot "
+                    "from a prior run; start a fresh run without resume"
+                )
+            latest = store.latest_checkpoint()
+            start_step = latest.step + 1 if latest is not None else 0
+            # The spend ledger is written on every charge, so it carries spend
+            # the metrics rows never see (baselines, interim and finalize
+            # evals); summing metrics rows is only the pre-ledger fallback.
+            recorded_spend = store.read_spend()
+            prior_usd = recorded_spend if recorded_spend is not None else store.budget_spent()
+        else:
+            if store.config_path.exists() or store.last_step() is not None:
+                raise ValueError(
+                    f"run dir {self._run_dir} already holds a distillation run; pass "
+                    "resume=True to continue it, or choose a fresh run dir"
+                )
+            latest = None
+            start_step = 0
+            prior_usd = 0.0
+        # The snapshot is refreshed on resume too: the caller's config wins (the
+        # documented budget-abort recovery is editing budget.max_usd and resuming).
+        store.snapshot_config(cfg)
+
+        self._training = self._service.create_lora_training_client(
+            cfg.student.base_model, cfg.student.lora_rank
+        )
+        if latest is not None:
+            logger.info(
+                "resuming %s from checkpoint step %d (%s)",
+                self._name,
+                latest.step,
+                latest.state_path,
+            )
+            self._training.load_state(latest.state_path)
+        self._teacher_client = self._service.create_sampling_client(self._teacher_identity)
+        self._teacher = TinkerTeacher(cfg.teacher, sampling_client=self._teacher_client)
+        self._sampler = StudentSampler(self._service, self._training, self._name)
+        self._sampler.refresh(start_step)
+        self._budget = _RunBudget(
+            cfg.pricing, cfg.budget.max_usd, prior_usd, on_spend=store.write_spend
+        )
+        self._tasks = TaskSampler(self._train_ids, seed=_seed_from_name(self._name))
+        for _ in range(start_step):
+            self._tasks.next_batch(cfg.train.tasks_per_batch)
+
+        self._preflight()
+        try:
+            self._budget.check()
+        except BudgetExhausted as exc:
+            self._abort_for_budget(exc, completed_step=None)
+
+        teacher_report = self._eval_or_load(
+            TEACHER_BASELINE_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._teacher_provider(),
+            phase="baseline",
+            teacher_metered=True,
+            reuse=resume,
+        )
+        before_report = self._eval_or_load(
+            STUDENT_BEFORE_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._student_provider(),
+            phase="baseline",
+            teacher_metered=False,
+            reuse=resume,
+        )
+
+        if start_step >= cfg.train.steps:
+            logger.info(
+                "all %d training step(s) already completed; skipping to finalize",
+                cfg.train.steps,
+            )
+        for step in range(start_step, cfg.train.steps):
+            self._train_step(step)
+
+        return self._finalize(teacher_report, before_report)
+
+    def _finalize(
+        self, teacher_report: DistillEvalReport, before_report: DistillEvalReport
+    ) -> DistillResult:
+        cfg = self._cfg
+        self._emit("finalize", "saving final training state and sampler weights")
+        final_sampler = self._sampler.refresh(cfg.train.steps)
+        final_state = self._training.save_state()
+        final_step = max(cfg.train.steps - 1, 0)
+        self._store.record_checkpoint(final_step, final_state, final_sampler)
+
+        after_report = self._run_eval(
+            STUDENT_AFTER_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._student_provider(),
+            phase="eval",
+            teacher_metered=False,
+            completed_step=final_step,
+        )
+        record = gate_distillation(
+            teacher_report.solve_rate,
+            before_report.solve_rate,
+            after_report.solve_rate,
+            cfg.gate,
+        )
+        self._store.write_gate(record)
+        card = DistillModelCard(
+            base_model=cfg.student.base_model,
+            lora_rank=cfg.student.lora_rank,
+            teacher_model=self._teacher_identity,
+            sampler_path=final_sampler,
+            state_path=final_state,
+            steps_completed=cfg.train.steps,
+            gate=record,
+        )
+        self._store.write_model_card(card)
+        version: int | None = None
+        if record.accepted:
+            version = self._adapters.save_version(self._name, card)
+            self._store.write_handoff(build_handoff_toml(final_sampler))
+            logger.info("adapter %s v%d promoted: %s", self._name, version, record.reason)
+        else:
+            logger.warning("adapter %s not promoted: %s", self._name, record.reason)
+        self._emit("gate", record.reason)
+        self._tracker.log_summary(
+            gate_accepted=record.accepted,
+            gate_reason=record.reason,
+            teacher_solve_rate=record.teacher_solve_rate,
+            student_before_solve_rate=record.student_before_solve_rate,
+            student_after_solve_rate=record.student_after_solve_rate,
+            total_usd=self._budget.total_usd,
+            steps_completed=cfg.train.steps,
+        )
+        spend = SpendSummary(
+            lines=self._budget.lines(),
+            session_usd=self._budget.session_usd,
+            prior_usd=self._budget.prior_usd,
+            total_usd=self._budget.total_usd,
+        )
+        return DistillResult(
+            name=self._name,
+            run_dir=str(self._run_dir),
+            steps_completed=cfg.train.steps,
+            final_sampler_path=final_sampler,
+            final_state_path=final_state,
+            gate=record,
+            adapter_version=version,
+            spend=spend,
+        )
+
+
+def run_distillation(
+    name: str,
+    cfg: DistillConfig,
+    harness: HarnessDoc,
+    train_task_ids: Sequence[str],
+    holdout_task_ids: Sequence[str],
+    run_dir: Path,
+    *,
+    resume: bool = False,
+    on_progress: ProgressCallback | None = None,
+    service_client: DistillServiceClient | None = None,
+    adapter_store: AdapterStore | None = None,
+    live_trial_preflight: LiveTrialPreflight | None = None,
+    tracker: DistillTracker | None = None,
+) -> DistillResult:
+    """Run one on-policy distillation end to end (preflight to gate verdict).
+
+    The flow: preflight (renderer resolution, tokenizer fingerprint, one-token
+    student and teacher pings, the sample-then-recompute TITO proof, and the
+    optional live-trial hook), holdout baselines (teacher-in-harness and
+    student-before), the training step loop (harbor rollouts, prefix-merge
+    datums, teacher scoring, reverse-KL advantages, importance_sampling
+    forward/backward and one optimizer step, metrics row, budget enforcement,
+    then the sampler-refresh / save-state / interim-eval cadences), and
+    finally the student-after holdout eval feeding `gate_distillation`. An
+    accepted gate saves the adapter version (champion alias) and writes the
+    serving handoff into the run dir.
+
+    Args:
+        name: The adapter/run name (a safe single path segment).
+        cfg: The validated run config; snapshotted into the run dir.
+        harness: The pinned harness document the pi agent runs in every trial.
+        train_task_ids: The train split's task ids (unique, non-empty).
+        holdout_task_ids: The holdout split's task ids (unique, non-empty,
+            disjoint from the train split); baselines and the gate run here.
+        run_dir: The run's artifact directory (`DistillRunStore` layout plus
+            the rollout collector's per-step dirs and per-eval
+            `eval-rollouts/<name>/` roots).
+        resume: Continue an aborted run in `run_dir`: restores the latest
+            checkpoint via `load_state`, continues the step count, restores
+            prior USD spend from the run store's spend ledger, and reuses
+            recorded baseline evals. The passed `cfg` wins over the old
+            snapshot (the budget-abort recovery is editing `budget.max_usd`
+            and resuming).
+        on_progress: Optional callback receiving typed `DistillProgress`
+            events as phases advance.
+        service_client: Injectable Tinker service surface; tests pass fakes
+            built on `wmh.distill.fake_tinker`. None builds the real SDK
+            client lazily (requires the distill extra and TINKER_API_KEY).
+        adapter_store: Where accepted adapters are versioned; defaults to the
+            project-local `.wmh` store.
+        live_trial_preflight: The Phase 6 live single-trial pi preflight hook
+            (see `LiveTrialPreflight`); None skips it.
+        tracker: Injectable run tracker; None builds one from the config's
+            `[wandb]` section via `build_tracker` (the no-op `NullTracker`
+            unless `wandb.enabled` is set). `finish()` is guaranteed on both
+            the finalize and budget-abort paths.
+
+    Returns:
+        The `DistillResult`: gate record, final sampler/state paths, run dir,
+        adapter version (None when rejected), and the spend summary.
+
+    Raises:
+        ValueError: On invalid name/splits, a fresh run pointed at a used
+            run dir, or wandb tracking enabled without credentials.
+        RuntimeError: On preflight failures (each message says what to fix),
+            or resume with nothing to resume.
+        ImportError: If no service client is injected and the tinker SDK is
+            not installed, or wandb tracking is enabled without the wandb SDK.
+        DistillBudgetError: When `budget.max_usd` is exhausted; state is
+            persisted and the error carries the exact resume command.
+    """
+    validate_name(name)
+    train_ids = list(train_task_ids)
+    holdout_ids = list(holdout_task_ids)
+    if not train_ids or len(set(train_ids)) != len(train_ids):
+        raise ValueError(
+            "train_task_ids must be non-empty and unique; pass the train split's exact task ids"
+        )
+    if not holdout_ids or len(set(holdout_ids)) != len(holdout_ids):
+        raise ValueError(
+            "holdout_task_ids must be non-empty and unique; the baselines and the "
+            "promotion gate are measured on the holdout split"
+        )
+    overlap = sorted(set(train_ids) & set(holdout_ids))
+    if overlap:
+        raise ValueError(
+            f"task id(s) {', '.join(overlap)} appear in BOTH splits; the gate is "
+            "only meaningful on tasks the student never trained on, so make the "
+            "splits disjoint"
+        )
+    service = service_client if service_client is not None else _build_sdk_service_client()
+    # Built (and so credential-checked) before any spend: a misconfigured
+    # tracker must fail fast, not after paid baselines.
+    resolved_tracker = tracker if tracker is not None else build_tracker(cfg, run_dir, name)
+    run = _DistillRun(
+        name,
+        cfg,
+        harness,
+        train_ids,
+        holdout_ids,
+        run_dir,
+        service=service,
+        adapter_store=adapter_store if adapter_store is not None else AdapterStore(),
+        on_progress=on_progress,
+        live_trial_preflight=live_trial_preflight,
+        tracker=resolved_tracker,
+    )
+    try:
+        return run.execute(resume=resume)
+    finally:
+        # Both terminal paths (finalize and the budget abort) close the
+        # tracking run, so a resumed session starts a fresh wandb run.
+        resolved_tracker.finish()
