@@ -1,0 +1,70 @@
+# Headline run: Nemotron-3 Nano distilled from Ultra on the full TB2 split
+# (72 train / 17 holdout). Warmup collects 144 teacher episodes (~36 passing at
+# the observed 25% teacher solve rate) for the SFT bootstrap, then 40 OPD steps.
+# Cost projection from the product smoke: ~$50-100 total; the cap is a backstop.
+# Model names are the tinker-cookbook catalog names (pinned by
+# test_checked_in_run_configs_resolve_cookbook_renderers).
+[student]
+base_model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+lora_rank = 32
+
+[teacher]
+backend = "tinker"
+model = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
+
+[harbor]
+job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+backend = "local"
+reward_key = "reward"
+
+[rollout]
+max_turns = 20
+context_budget_tokens = 65536
+compaction = false
+
+[train]
+steps = 40
+tasks_per_batch = 8
+group_size = 4
+learning_rate = 1e-4
+advantage_clip = 4.0
+center_advantages = true
+max_datum_tokens = 65536
+sampler_refresh_every = 1
+save_state_every = 4
+trial_concurrency = 8
+
+# temperature 1.0 keeps issued sampler logprobs comparable to the untempered
+# teacher logprobs (unbiased reverse-KL advantages).
+[sampling]
+temperature = 1.0
+max_tokens = 8192
+
+[warmup]
+steps = 2
+rollouts_per_task = 2
+keep = "passed"
+
+[eval]
+every = 10
+tasks = 12
+k = 1
+
+[gate]
+k = 3
+min_teacher_fraction = 0.7
+require_no_regression = true
+
+[pricing]
+# Ultra 64K (verified live 2026-07-23): prefill 2.49, cached prefill 0.498,
+# sample 6.225, train 5.478 USD/Mtok. Nano prices still unlisted; the priced
+# teacher meter dominates observed spend.
+teacher_prefill = 2.49
+
+[budget]
+max_usd = 600.0
+
+[wandb]
+enabled = true
+project = "wmh-distill"
+run_name = "nano-from-ultra-tb2-headline"
