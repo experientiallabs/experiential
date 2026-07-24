@@ -22,6 +22,7 @@ import pytest
 from llm_waterfall.types import ChatMessage, ChatTool
 
 import wmh.distill.loop as loop_module
+import wmh.providers.tinker as providers_tinker
 
 if TYPE_CHECKING:
     import tinker
@@ -50,12 +51,15 @@ from wmh.distill.fake_tinker import (
     FakeTrainingClient,
 )
 from wmh.distill.loop import (
+    MAX_CONSECUTIVE_EMPTY_STEPS,
     STUDENT_BEFORE_EVAL,
     WARMUP_ROLLOUTS_DIR,
     DistillBudgetError,
+    DistillEmptyBatchError,
     DistillProgress,
     DistillResult,
     DistillSamplingClient,
+    SdkSamplingClient,
     SdkServiceClient,
     SdkTrainingClient,
     StepMetrics,
@@ -208,6 +212,9 @@ class _FakeRollouts:
         self.fail_on_train_step: int | None = None
         """Raise on the TRAIN batch of this step (a crash between phases)."""
 
+        self.empty_span_train_steps: set[int] = set()
+        """TRAIN steps whose every trial records zero spans (a dead provider)."""
+
     def __call__(
         self,
         step_index: int,
@@ -225,14 +232,18 @@ class _FakeRollouts:
         )
         if is_train_batch and step_index == self.fail_on_train_step:
             raise RuntimeError("injected rollout crash")
+        # A dead student provider: every trial ends span-less ("submitted"
+        # with zero turns), exactly what swallowed worker failures produce.
+        empty_batch = is_train_batch and step_index in self.empty_span_train_steps
         client = self.service.create_sampling_client(provider_config.model)
         records: list[TrialRecord] = []
         for task_index, task_id in enumerate(task_ids):
             for attempt in range(1, cfg.train.group_size + 1):
-                passed = task_index % 2 == 0
+                passed = task_index % 2 == 0 and not empty_batch
                 if self.teacher_fail_all and provider_config.model == _TEACHER:
                     passed = False
                 trial_name = f"{task_id}__s{attempt}"
+                spans = [] if empty_batch else self._spans(client, task_id, step_index, attempt)
                 records.append(
                     TrialRecord(
                         task_id=task_id,
@@ -240,18 +251,19 @@ class _FakeRollouts:
                         trial_name=trial_name,
                         reward=1.0 if passed else 0.0,
                         passed=passed,
-                        spans=self._spans(client, task_id, step_index, attempt),
+                        spans=spans,
                         stop_reason="submitted",
                         artifact_dir=str(
                             run_dir / "harbor" / f"step-{step_index:04d}" / trial_name
                         ),
                     )
                 )
+        with_spans = sum(1 for record in records if record.spans)
         stats = RolloutStats(
             trials=len(records),
-            trials_with_spans=len(records),
+            trials_with_spans=with_spans,
             solve_rate=sum(1 for record in records if record.passed) / len(records),
-            empty_span_trials=0,
+            empty_span_trials=len(records) - with_spans,
         )
         self.calls.append(
             _RolloutCall(
@@ -713,6 +725,56 @@ def test_budget_abort_persists_state_and_the_resume_command(
     training.inner.load_state(latest.state_path)
     # The run never reached the gate.
     assert not store.gate_path.exists()
+
+
+def test_two_consecutive_all_empty_steps_abort_with_the_resume_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dead-provider guard: all-empty steps must not burn the whole budget."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.empty_span_train_steps = {0, 1}
+
+    with pytest.raises(DistillEmptyBatchError) as excinfo:
+        _run(env, _cfg())
+
+    error = excinfo.value
+    assert error.consecutive_steps == MAX_CONSECUTIVE_EMPTY_STEPS
+    expected_command = resume_command(_NAME, env.run_dir)
+    assert error.resume_command == expected_command
+    assert expected_command in str(error)
+    assert "no completions" in str(error)
+    assert "runner logs" in str(error)
+    # Exactly two empty train batches ran: the abort fired at the second,
+    # before a third batch could spend more on span-less rollouts.
+    train_steps = [call.step_index for call in env.rollouts.calls if call.run_dir == env.run_dir]
+    assert train_steps == [0, 1]
+    # Artifacts persisted: both steps' metrics rows and a resumable checkpoint.
+    store = DistillRunStore(env.run_dir)
+    rows = store.read_metrics()
+    assert [row["step"] for row in rows] == [0, 1]
+    assert all(_number(row, "datums") == 0 for row in rows)
+    assert all(_number(row, "empty_span_trials") == _number(row, "trials") for row in rows)
+    latest = store.latest_checkpoint()
+    assert latest is not None
+    assert latest.step == 1
+
+
+def test_a_non_empty_step_resets_the_empty_batch_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.empty_span_train_steps = {0, 2}  # the healthy step 1 sits between
+
+    result = _run(env, _cfg())
+
+    # Two non-consecutive empty steps never abort: the run finishes all steps.
+    assert result.steps_completed == 3
+    store = DistillRunStore(env.run_dir)
+    rows = store.read_metrics()
+    assert [row["step"] for row in rows] == [0, 1, 2]
+    assert _number(rows[0], "datums") == 0
+    assert _number(rows[1], "datums") > 0
+    assert _number(rows[2], "datums") == 0
 
 
 def test_resume_continues_the_step_count_and_reuses_baselines(
@@ -1397,15 +1459,43 @@ def test_optim_step_deadline_aborts_without_retry(monkeypatch: pytest.MonkeyPatc
 
 
 def test_client_construction_is_deadline_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Sampling-client construction now goes through the process-wide shared
+    # cache (bounded there; see wmh/providers/tinker_test.py), so the loop's
+    # remaining direct construction is the training client.
     _short_deadlines(monkeypatch)
     never = threading.Event()
 
     class _WedgedService:
-        def create_sampling_client(self, **kwargs: str) -> NoReturn:
-            del kwargs
+        def create_lora_training_client(self, base_model: str, rank: int) -> NoReturn:
+            del base_model, rank
             never.wait()
             raise AssertionError("unreachable: the event is never set")
 
     service = SdkServiceClient(cast("tinker.ServiceClient", _WedgedService()))
     with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
-        service.create_sampling_client("tinker://fake/sampler/x")
+        service.create_lora_training_client(_STUDENT, rank=8)
+
+
+def test_loop_sampling_adapter_deadline_evicts_the_shared_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The loop's per-refresh sampling clients come from the process-wide
+    # shared cache; a deadline expiry must evict the entry so every future
+    # user (the harbor trial providers included) rebuilds a fresh session.
+    monkeypatch.setenv("WMH_TINKER_DEADLINE_CONNECT", "0.05")
+    never = threading.Event()
+
+    class _WedgedSamplingClient:
+        def get_tokenizer(self) -> NoReturn:
+            never.wait()
+            raise AssertionError("unreachable: the event is never set")
+
+    wedged = cast("tinker.SamplingClient", _WedgedSamplingClient())
+    path = "tinker://fake/sampler/x"
+    monkeypatch.setattr(providers_tinker, "_shared_samplers", {path: wedged})
+    adapter = SdkSamplingClient(wedged, model=path)
+
+    with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
+        adapter.get_tokenizer()
+
+    assert path not in providers_tinker._shared_samplers

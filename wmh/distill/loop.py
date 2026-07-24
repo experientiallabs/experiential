@@ -41,15 +41,16 @@ phase is recorded as the run store's `warmup.json` marker and never re-runs
 trials themselves resuming trial-level through harbor (the teacher's identity
 is stable across sessions). Steps and student evals whose harbor job dirs
 were left by a prior session re-run whole (the rollout collector wipes
-stale-policy job dirs). A budget abort (`DistillBudgetError`) always carries
-the exact resume command.
+stale-policy job dirs). A budget abort (`DistillBudgetError`) and an
+all-empty-batch abort (`DistillEmptyBatchError`, raised when consecutive
+training steps show the student provider producing no completions) both
+carry the exact resume command.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import random
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -98,7 +99,14 @@ from wmh.harness.doc import (
     SurfaceKind,
 )
 from wmh.providers.base import ProviderConfig, ProviderKind
-from wmh.providers.tinker import TINKER_API_KEY_ENV, SampledSequenceLike, SdkSampler
+from wmh.providers.tinker import (
+    TINKER_API_KEY_ENV,
+    SampledSequenceLike,
+    SdkSampler,
+    evict_shared_sampling_client,
+    shared_sampling_client,
+    shared_service_client,
+)
 
 if TYPE_CHECKING:
     import tinker
@@ -137,12 +145,6 @@ WARMUP_ROLLOUTS_DIR = "warmup-rollouts"
 TEACHER_BASELINE_EVAL = "baseline-teacher"
 STUDENT_BEFORE_EVAL = "baseline-student-before"
 STUDENT_AFTER_EVAL = "student-after"
-
-_MISSING_TINKER_EXTRA = (
-    "the tinker SDK is not installed; run `uv sync --extra distill` to run "
-    "distillation training, or inject service_client= (tests use the fakes in "
-    "wmh.distill.fake_tinker)"
-)
 
 DistillPhase = Literal[
     "preflight", "baseline", "warmup", "rollouts", "training", "eval", "finalize", "gate"
@@ -195,6 +197,37 @@ class DistillBudgetError(RuntimeError):
         self.resume_command = resume_command
         self.spent_usd = spent_usd
         self.max_usd = max_usd
+
+
+MAX_CONSECUTIVE_EMPTY_STEPS = 2
+"""Consecutive all-empty training steps tolerated before the run aborts.
+
+An all-empty step ran trials (`trials > 0`) but every trial produced zero
+token spans (`empty_span_trials == trials`) and therefore zero datums: the
+student provider is producing no completions at all, so training cannot make
+progress and further steps only burn rollout budget. One such step can be a
+transient batch-wide outage that self-heals; two in a row means the provider
+is down (the live failure mode was silently swallowed worker errors upstream)
+and the run aborts with `DistillEmptyBatchError`. The streak is tracked
+within one session and a non-empty step resets it.
+"""
+
+
+class DistillEmptyBatchError(RuntimeError):
+    """Consecutive training steps produced no completions; the run aborted.
+
+    Mirrors `DistillBudgetError` ergonomics: state was checkpointed and the
+    error carries the exact resume command.
+
+    Attributes:
+        resume_command: The exact CLI command that resumes this run.
+        consecutive_steps: How many all-empty steps ran back to back.
+    """
+
+    def __init__(self, message: str, *, resume_command: str, consecutive_steps: int) -> None:
+        super().__init__(message)
+        self.resume_command = resume_command
+        self.consecutive_steps = consecutive_steps
 
 
 class DistillEvalReport(BaseModel):
@@ -405,12 +438,28 @@ class DistillServiceClient(Protocol):
 
 
 class SdkSamplingClient:
-    """Adapts a real `tinker.SamplingClient` to `DistillSamplingClient`."""
+    """Adapts a real `tinker.SamplingClient` to `DistillSamplingClient`.
 
-    def __init__(self, client: tinker.SamplingClient) -> None:
+    Args:
+        client: The SDK sampling client, normally fetched from the
+            process-wide shared cache in `wmh.providers.tinker`.
+        model: The shared-cache key the client was fetched under. When set, a
+            `TinkerDeadlineError` from any call evicts that cache entry so
+            every future user of the model string (including the harbor trial
+            providers sharing the cache) rebuilds through a fresh session;
+            None disables eviction for a directly constructed adapter.
+    """
+
+    def __init__(self, client: tinker.SamplingClient, *, model: str | None = None) -> None:
         self._client = client
+        self._model = model
         self._sampler = SdkSampler(client)
         self._scorer = SdkLogprobScorer(client)
+
+    def _evict_on_deadline(self) -> None:
+        """Evict the wedged client from the shared cache (see class docstring)."""
+        if self._model is not None:
+            evict_shared_sampling_client(self._model, self._client)
 
     def sample(
         self,
@@ -420,17 +469,31 @@ class SdkSamplingClient:
         temperature: float,
     ) -> SampledSequenceLike:
         """One synchronous sample through the provider's SDK adapter."""
-        return self._sampler.sample(
-            prompt_token_ids, max_tokens=max_tokens, temperature=temperature
-        )
+        try:
+            return self._sampler.sample(
+                prompt_token_ids, max_tokens=max_tokens, temperature=temperature
+            )
+        except TinkerDeadlineError:
+            self._evict_on_deadline()
+            raise
 
     def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
         """One synchronous compute_logprobs call on the full sequence."""
-        return self._scorer.compute_logprobs(token_ids)
+        try:
+            return self._scorer.compute_logprobs(token_ids)
+        except TinkerDeadlineError:
+            self._evict_on_deadline()
+            raise
 
     def get_tokenizer(self) -> EncodingTokenizer:
         """The HF tokenizer for the client's base model (deadline-bounded fetch)."""
-        return cast("EncodingTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
+        try:
+            return cast(
+                "EncodingTokenizer", call_with_deadline("connect", self._client.get_tokenizer)
+            )
+        except TinkerDeadlineError:
+            self._evict_on_deadline()
+            raise
 
 
 class SdkTrainingClient:
@@ -547,7 +610,14 @@ class SdkTrainingClient:
 
 
 class SdkServiceClient:
-    """Adapts a real `tinker.ServiceClient` to `DistillServiceClient`."""
+    """Adapts a real `tinker.ServiceClient` to `DistillServiceClient`.
+
+    The wrapped service builds training clients; sampling clients come from
+    the process-wide shared cache in `wmh.providers.tinker` (one
+    `SamplingClient` per model string, shared with the rollout providers and
+    the teacher), so per-refresh construction never adds server-side sessions
+    beyond one per distinct sampler path.
+    """
 
     def __init__(self, service: tinker.ServiceClient) -> None:
         self._service = service
@@ -561,34 +631,27 @@ class SdkServiceClient:
         return SdkTrainingClient(call_with_deadline("connect", build))
 
     def create_sampling_client(self, model_path: str) -> SdkSamplingClient:
-        """Create a sampling client for a tinker:// path or a base model name (bounded)."""
+        """A sampling client for a tinker:// path or base model name (shared cache).
 
-        def build() -> tinker.SamplingClient:
-            if model_path.startswith("tinker://"):
-                return self._service.create_sampling_client(model_path=model_path)
-            return self._service.create_sampling_client(base_model=model_path)
-
-        return SdkSamplingClient(call_with_deadline("connect", build))
+        Fetched from (or built into) the process-wide cache, deadline-bounded;
+        the returned adapter evicts the cache entry on a `TinkerDeadlineError`
+        so every future user rebuilds through a fresh session.
+        """
+        return SdkSamplingClient(shared_sampling_client(model_path), model=model_path)
 
 
 def _build_sdk_service_client() -> SdkServiceClient:
-    """Build the real service client (the `service_client=None` path).
+    """Build the real service adapter (the `service_client=None` path).
+
+    The SDK's service client pins one live server-side session for the life
+    of the process, so the loop adapts `wmh.providers.tinker`'s process-wide
+    shared instance instead of constructing a second one.
 
     Raises:
         ImportError: If the tinker SDK is not installed (distill extra).
         RuntimeError: If TINKER_API_KEY is missing from the environment.
     """
-    try:
-        import tinker
-    except ImportError as exc:
-        raise ImportError(_MISSING_TINKER_EXTRA) from exc
-    if not os.environ.get(TINKER_API_KEY_ENV):
-        raise RuntimeError(
-            f"{TINKER_API_KEY_ENV} is not set in the environment; set it to your "
-            "Tinker API key to run distillation (tests inject service_client= "
-            "instead of setting the key)"
-        )
-    return SdkServiceClient(call_with_deadline("connect", tinker.ServiceClient))
+    return SdkServiceClient(shared_service_client())
 
 
 # -- samplers ------------------------------------------------------------------------------------
@@ -1074,6 +1137,7 @@ class _DistillRun:
         self._budget: _RunBudget
         self._prev_tokens: dict[MeterName, int] = dict.fromkeys(METER_NAMES, 0)
         self._prev_usd = 0.0
+        self._empty_step_streak = 0
 
     # -- plumbing --------------------------------------------------------------------------------
 
@@ -1117,6 +1181,50 @@ class _DistillRun:
             spent_usd=exc.spent_usd,
             max_usd=exc.max_usd,
         ) from exc
+
+    def _check_empty_batch_streak(self, step: int, trials: int, empty: int, datums: int) -> None:
+        """Track all-empty training steps and abort after the tolerated streak.
+
+        Args:
+            step: The 0-based training step that just completed its metrics row.
+            trials: The step's trial count.
+            empty: Trials that recorded no token span.
+            datums: Trainable datums the step produced.
+
+        Raises:
+            DistillEmptyBatchError: After `MAX_CONSECUTIVE_EMPTY_STEPS` steps
+                in a row where every trial produced zero spans and no datums;
+                the step's state is checkpointed first and the message carries
+                the exact resume command.
+        """
+        if not (trials > 0 and empty == trials and datums == 0):
+            self._empty_step_streak = 0
+            return
+        self._empty_step_streak += 1
+        logger.warning(
+            "step %d is all-empty (%d trial(s), every one without token spans); "
+            "%d/%d consecutive empty step(s) before the run aborts",
+            step,
+            trials,
+            self._empty_step_streak,
+            MAX_CONSECUTIVE_EMPTY_STEPS,
+        )
+        if self._empty_step_streak < MAX_CONSECUTIVE_EMPTY_STEPS:
+            return
+        state_path = self._training.save_state()
+        self._store.record_checkpoint(step, state_path, self._sampler.sampler_path)
+        command = resume_command(self._name, self._run_dir)
+        raise DistillEmptyBatchError(
+            f"aborting after {self._empty_step_streak} consecutive training steps in "
+            "which every trial produced zero token spans (0 trainable datums): the "
+            "student provider is producing no completions, so training cannot make "
+            "progress. The likely cause is provider or session failures upstream in "
+            "the rollout trials (see the runner logs for worker completion warnings). "
+            f"Run artifacts were persisted (checkpoint at step {step}), so once the "
+            f"provider is healthy resume with: {command}",
+            resume_command=command,
+            consecutive_steps=self._empty_step_streak,
+        )
 
     def _student_provider(self) -> ProviderConfig:
         return self._sampler.provider_config(self._cfg.student.base_model)
@@ -1563,6 +1671,10 @@ class _DistillRun:
         except BudgetExhausted as exc:
             self._abort_for_budget(exc, completed_step=step)
 
+        self._check_empty_batch_streak(
+            step, roll_stats.trials, roll_stats.empty_span_trials, len(attached)
+        )
+
         if (step + 1) % cfg.train.sampler_refresh_every == 0:
             self._sampler.refresh(step + 1)
         if (step + 1) % cfg.train.save_state_every == 0:
@@ -1853,6 +1965,10 @@ def run_distillation(
             not installed, or wandb tracking is enabled without the wandb SDK.
         DistillBudgetError: When `budget.max_usd` is exhausted; state is
             persisted and the error carries the exact resume command.
+        DistillEmptyBatchError: When `MAX_CONSECUTIVE_EMPTY_STEPS` training
+            steps in a row produce only span-less trials (the student
+            provider is producing no completions); state is persisted and
+            the error carries the exact resume command.
     """
     validate_name(name)
     train_ids = list(train_task_ids)

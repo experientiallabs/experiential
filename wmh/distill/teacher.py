@@ -16,37 +16,35 @@ against the fake sampler's echoed logprobs to guard any off-by-one.
 The tinker SDK is an optional extra imported lazily (`uv sync --extra
 distill`), mirroring `wmh.providers.tinker`; injecting a sampling client
 (tests use `wmh.distill.fake_tinker.FakeSamplingClient`) avoids the SDK
-entirely.
+entirely. The lazily built real client comes from `wmh.providers.tinker`'s
+process-wide shared cache (one `tinker.ServiceClient` and one
+`SamplingClient` per model string for the whole process), so teacher
+construction never adds server-side sessions of its own.
 
 Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged
 session raises a retryable `TinkerDeadlineError` instead of hanging, and the
-teacher drops its lazily built client on expiry so the next score() call
-rebuilds a fresh session (an injected client is never dropped).
+teacher drops its lazily built client on expiry, evicting the shared cache
+entry, so the next score() call rebuilds a fresh session (an injected client
+is never dropped).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Protocol
 
 from wmh.distill.config import TeacherConfig
 from wmh.distill.data import TrainDatum
-from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
+from wmh.distill.deadlines import TinkerDeadlineError, wait_with_deadline
 from wmh.providers.base import ProviderKind, VerifyResult
-from wmh.providers.tinker import TINKER_API_KEY_ENV
+from wmh.providers.tinker import evict_shared_sampling_client, shared_sampling_client
 
 if TYPE_CHECKING:
     import tinker
 
 logger = logging.getLogger(__name__)
-
-_MISSING_TINKER_EXTRA = (
-    "the tinker SDK is not installed; run `uv sync --extra distill` to score "
-    "with the tinker teacher"
-)
 
 _SCORE_CONCURRENCY = 8
 """Upper bound on concurrent compute_logprobs calls in one score() batch."""
@@ -116,6 +114,11 @@ class SdkLogprobScorer:
     def __init__(self, client: tinker.SamplingClient) -> None:
         self._client = client
 
+    @property
+    def sdk_client(self) -> tinker.SamplingClient:
+        """The wrapped SDK client (shared-cache eviction compares its identity)."""
+        return self._client
+
     def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
         """One deadline-bounded compute_logprobs call on the full sequence.
 
@@ -138,8 +141,10 @@ class TinkerTeacher:
             path to serve the teacher from.
         sampling_client: Optional injected scorer (tests use the fakes in
             `wmh.distill.fake_tinker`; wrap a real `tinker.SamplingClient` in
-            `SdkLogprobScorer`). When None, a real client is built lazily from
-            `spec` on first use.
+            `SdkLogprobScorer`). When None, a real client is fetched lazily
+            on first use from `wmh.providers.tinker`'s process-wide shared
+            cache, keyed by the teacher's model identity (checkpoint or base
+            model name); an injected client bypasses the cache entirely.
     """
 
     def __init__(
@@ -161,39 +166,30 @@ class TinkerTeacher:
         return self._scorer
 
     def _build_sdk_scorer(self) -> LogprobScorer:
-        # Lazy: don't import the SDK or read the key env var until first use,
-        # mirroring wmh.providers.tinker.TinkerChatProvider.
-        try:
-            import tinker
-        except ImportError as exc:
-            raise ImportError(_MISSING_TINKER_EXTRA) from exc
-        if not os.environ.get(TINKER_API_KEY_ENV):
-            raise RuntimeError(
-                f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
-                "your Tinker API key to score with the tinker teacher"
-            )
-
-        def build() -> tinker.SamplingClient:
-            service = tinker.ServiceClient()
-            if self._spec.checkpoint is not None:
-                return service.create_sampling_client(model_path=self._spec.checkpoint)
-            return service.create_sampling_client(base_model=self._spec.model)
-
-        return SdkLogprobScorer(call_with_deadline("connect", build))
+        # Lazy: the SDK import and the API-key check happen inside the shared
+        # cache path (`wmh.providers.tinker.shared_sampling_client`). One
+        # process-wide ServiceClient and one SamplingClient per model string
+        # are shared with the rollout providers, so building the teacher
+        # never adds server-side sessions of its own.
+        return SdkLogprobScorer(shared_sampling_client(self._model_identity()))
 
     def _drop_wedged_scorer(self) -> None:
-        """Forget a lazily built scoring client after a deadline expiry.
+        """Forget (and evict from the shared cache) a wedged scoring client.
 
         A wedged session keeps timing out while a freshly built one heals, so
-        the next score() call rebuilds through `_get_scorer`. An injected
-        client is never dropped: the teacher cannot rebuild what it did not
-        build.
+        the next score() call rebuilds through `_get_scorer`. The shared
+        cache entry is evicted too, not just this teacher's reference, so no
+        other user of the same model string inherits the wedged session. An
+        injected client is never dropped: the teacher cannot rebuild what it
+        did not build.
         """
         if self._owns_scorer and self._scorer is not None:
             logger.warning(
                 "dropping the tinker teacher client after a deadline expiry; "
                 "the next score() call builds a fresh session"
             )
+            if isinstance(self._scorer, SdkLogprobScorer):
+                evict_shared_sampling_client(self._model_identity(), self._scorer.sdk_client)
             self._scorer = None
 
     def score(self, datums: Sequence[TrainDatum]) -> list[list[float | None]]:
