@@ -19,12 +19,15 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    StreamChunk,
     VerifyResult,
     normalize_chat_temperature,
     verify_via_ping,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from openai import OpenAI
 
 
@@ -95,6 +98,24 @@ class OpenAIProvider:
             max_tokens,
             # Self-hosted OpenAI-compatible servers honor sampling params (a policy being
             # trained NEEDS temperature diversity); real OpenAI GPT-5.5 rejects them.
+            temperature=temperature if self.config.endpoint else None,
+        )
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Stream a completion natively (same temperature rule as complete)."""
+        return _openai_common.stream(
+            self._get_client().chat.completions,
+            self.config.model,
+            system,
+            messages,
+            max_tokens,
             temperature=temperature if self.config.endpoint else None,
         )
 

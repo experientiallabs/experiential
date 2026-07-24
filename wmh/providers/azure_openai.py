@@ -22,6 +22,7 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    StreamChunk,
     TokenUsage,
     VerifyResult,
     normalize_chat_temperature,
@@ -29,6 +30,8 @@ from wmh.providers.base import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from openai import AzureOpenAI, OpenAI
 
 
@@ -185,6 +188,31 @@ class AzureOpenAIProvider:
             )
         return _openai_common.complete(
             self._get_client().chat.completions, self._deployment(), system, messages, max_tokens
+        )
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Stream a completion natively from the deployment (temperature not forwarded)."""
+        del temperature  # mirror complete(): GPT-5.x deployments reject sampling params
+        if self.config.reasoning_effort is not None:
+            # The api-versioned chat-completions stream would silently drop reasoning_effort;
+            # honest failure until a native Responses-route stream lands with the serving PR.
+            raise NotImplementedError(
+                "streaming is not yet implemented for reasoning_effort Azure configs; "
+                "unset reasoning_effort or use complete()"
+            )
+        return _openai_common.stream(
+            self._get_client().chat.completions,
+            self._deployment(),
+            system,
+            messages,
+            max_tokens,
         )
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:

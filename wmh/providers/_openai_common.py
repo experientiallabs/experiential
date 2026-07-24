@@ -11,9 +11,11 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from openai import BadRequestError
 
-from wmh.providers.base import Completion, Message, TokenUsage
+from wmh.providers.base import Completion, Message, StreamChunk, TokenUsage
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from openai.types import CreateEmbeddingResponse
     from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
@@ -95,6 +97,47 @@ def complete(
         else TokenUsage()
     )
     return Completion(text=text, usage=token_usage)
+
+
+def stream(
+    chat_completions: object,
+    model: str,
+    system: str,
+    messages: list[Message],
+    max_tokens: int,
+    temperature: float | None = None,
+) -> Iterator[StreamChunk]:
+    """Stream one chat completion as `StreamChunk`s (deltas, then a terminal chunk with usage).
+
+    `stream_options.include_usage` makes the wire stream end with a usage-bearing chunk, so the
+    terminal `StreamChunk` carries real token counts instead of estimates. `temperature` follows
+    the same rule as `complete`: sent only when given (reasoning models reject sampling params).
+    """
+    resource = cast("Any", chat_completions)
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": to_messages(system, messages),
+        "max_completion_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    usage = TokenUsage()
+    for chunk in resource.create(**kwargs):
+        choices = getattr(chunk, "choices", None) or []
+        if choices:
+            delta = getattr(choices[0], "delta", None)
+            text = getattr(delta, "content", None) if delta is not None else None
+            if text:
+                yield StreamChunk(delta=text)
+        chunk_usage = getattr(chunk, "usage", None)
+        if chunk_usage is not None:
+            usage = TokenUsage(
+                input_tokens=chunk_usage.prompt_tokens,
+                output_tokens=chunk_usage.completion_tokens,
+            )
+    yield StreamChunk(done=True, usage=usage)
 
 
 def complete_chat(

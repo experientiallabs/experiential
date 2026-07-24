@@ -13,7 +13,7 @@ was constructed with. Callers that want exact control can pass their own `classi
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
 from wmh.optimize.judge import JUDGE_MARKER
 from wmh.providers.base import (
@@ -22,6 +22,8 @@ from wmh.providers.base import (
     Message,
     Provider,
     ProviderConfig,
+    StreamChunk,
+    StreamingProvider,
     TokenUsage,
     VerifyResult,
 )
@@ -82,6 +84,33 @@ class MeteredProvider:
         model = completion.model or self._provider.config.model
         self._tracker.record(phase, model, completion.usage)
         return completion
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Forward a native stream, recording usage from the terminal chunk.
+
+        A stream abandoned before its terminal chunk records nothing even though the provider
+        billed the partial generation; serving owns closing streams it starts.
+        """
+        if not isinstance(self._provider, StreamingProvider):
+            raise TypeError(
+                f"{type(self._provider).__name__} does not implement StreamingProvider; "
+                "stream() is only available for native backends"
+            )
+        phase = self._classify(system) if self._classify is not None else self._base_phase
+        for chunk in self._provider.stream(
+            system, messages, temperature=temperature, max_tokens=max_tokens
+        ):
+            if chunk.done and chunk.usage is not None:
+                model = chunk.model or self._provider.config.model
+                self._tracker.record(phase, model, chunk.usage)
+            yield chunk
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         # Embeddings carry no token usage from our providers; record a zero-usage event for the

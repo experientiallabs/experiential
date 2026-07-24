@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from wmh.providers import _openai_common, _responses_common
 from wmh.providers.base import (
@@ -13,11 +13,14 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    StreamChunk,
     TokenUsage,
     VerifyResult,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from openai import OpenAI
     from openai.types.responses.response_input_param import ResponseInputParam
     from openai.types.shared_params.reasoning import Reasoning
@@ -85,6 +88,44 @@ class OpenAIResponsesProvider:
                 store=False,
             )
         return Completion(text=_response_text(response), usage=_usage_from_response(response))
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Stream a completion through the Responses API (temperature not forwarded)."""
+        del temperature  # mirror complete(): Responses models keep provider-default sampling
+        response_input = cast("ResponseInputParam", _responses_input(system, messages))
+        kwargs: dict[str, object] = {
+            "model": self.config.model,
+            "input": response_input,
+            "max_output_tokens": max_tokens,
+            "store": False,
+            "stream": True,
+        }
+        if self.config.reasoning_effort:
+            kwargs["reasoning"] = cast("Reasoning", {"effort": self.config.reasoning_effort})
+        usage = TokenUsage()
+        # The evolving Responses stream-event union stays behind this one SDK-boundary cast
+        # (same pattern as _openai_common.complete_chat).
+        events = cast("Any", self._get_client().responses).create(**kwargs)
+        for event in events:
+            kind = getattr(event, "type", "")
+            if kind == "response.output_text.delta":
+                if event.delta:
+                    yield StreamChunk(delta=event.delta)
+            elif kind == "response.completed":
+                event_usage = event.response.usage
+                if event_usage is not None:
+                    usage = TokenUsage(
+                        input_tokens=event_usage.input_tokens,
+                        output_tokens=event_usage.output_tokens,
+                    )
+        yield StreamChunk(done=True, usage=usage)
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured request through the native Responses API."""

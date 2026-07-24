@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
@@ -164,6 +164,44 @@ class Provider(Protocol):
 
     def verify(self) -> VerifyResult:
         """Cheap creds/model check run on startup (`wmh providers verify`)."""
+        ...
+
+
+class StreamChunk(BaseModel):
+    """One increment of a streamed completion.
+
+    A stream is zero or more delta chunks followed by exactly one terminal chunk (`done=True`)
+    carrying the call's `TokenUsage` (and, for failover chains, the model that actually served).
+    Putting usage on the terminal chunk keeps streamed traffic meterable at the provider
+    boundary exactly like `complete()`.
+    """
+
+    delta: str = ""
+    done: bool = False
+    usage: TokenUsage | None = None
+    model: str | None = Field(default=None, min_length=1)
+
+
+@runtime_checkable
+class StreamingProvider(Protocol):
+    """Provider capability for native token streaming.
+
+    Separate from :class:`Provider` for the same reason as :class:`ToolCallingProvider`: the
+    world model, judge, and optimizers consume whole completions, while the serving endpoint
+    must forward tokens as the upstream model emits them (a synthesized stream would hold the
+    full response before the first byte, which defeats streaming). Every shipped backend
+    implements it natively.
+    """
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Yield delta chunks as the model emits them, then one terminal chunk with usage."""
         ...
 
 
