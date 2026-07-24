@@ -27,6 +27,7 @@ from wmh.evals.harbor.scorer import (
     HarborRewardMissingError,
     HarborRun,
     HarborScorer,
+    MissingRewardMode,
 )
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.scoring import RewardMode
@@ -138,6 +139,7 @@ def _scorer(
     attempts: int = 1,
     reward_mode: RewardMode = "raw",
     agent_concurrency: int | None = None,
+    missing_reward: MissingRewardMode = "raise",
 ) -> tuple[HarborScorer, _Runner]:
     runner = _Runner(trials)
     scorer = HarborScorer(
@@ -149,6 +151,7 @@ def _scorer(
         harness_backend="e2b",
         e2b_template="pi-template",
         agent_concurrency=agent_concurrency,
+        missing_reward=missing_reward,
         runner=runner,
     )
     return scorer, runner
@@ -211,6 +214,28 @@ def test_failed_trial_with_a_written_reward_is_a_scored_cell_not_an_infra_halt(
     scorer, _runner = _scorer(tmp_path, missing)
     with pytest.raises(HarborRewardMissingError, match="no verifier reward"):
         scorer.score(HarnessDoc.baseline())
+
+
+def test_missing_reward_zero_mode_scores_the_trial_failed_instead_of_halting(
+    tmp_path: Path,
+) -> None:
+    """Distillation evals: a runner that died before verification is a failed trial.
+
+    The search default stays strict (previous test); "zero" scores the cell 0.0
+    with an auditable note so a single transient sandbox death cannot abort a
+    long training run at its final eval.
+    """
+    trials = [
+        _trial(tmp_path, "task-a", 1, reward=None, exception="RuntimeError"),
+        _trial(tmp_path, "task-b", 1, reward=1.0),
+    ]
+    scorer, _runner = _scorer(tmp_path, trials, missing_reward="zero")
+    report = scorer.score(HarnessDoc.baseline())
+    cell = report.by_task()["task-a"][0]
+    assert cell.reward == 0.0
+    assert cell.passed is False
+    assert cell.note == "missing-reward: RuntimeError; scored 0"
+    assert report.by_task()["task-b"][0].reward == 1.0
 
 
 def test_outcome_shaped_verifier_failures_score_zero_instead_of_halting(tmp_path: Path) -> None:

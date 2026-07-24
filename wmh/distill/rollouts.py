@@ -227,8 +227,12 @@ def collect_rollouts(
             # The local pi runner shares one runner dir, so local concurrency is
             # pinned to 1; e2b parallelizes up to the configured trial concurrency.
             agent_concurrency=1 if backend == "local" else cfg.train.trial_concurrency,
+            harbor_retries=cfg.harbor.retries,
             agent_import_path=WMH_DISTILL_HARBOR_AGENT_IMPORT_PATH,
             extra_agent_kwargs={"token_sink_dir": str(token_sink_dir)},
+            # A trial that dies before producing verifier evidence is a failed
+            # trial for distillation purposes, never a reason to abort the run.
+            missing_reward="zero",
         )
     )
     _wipe_stale_policy_dir(scorer.candidate_job_dir(harness), provider_config, token_sink_dir)
