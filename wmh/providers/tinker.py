@@ -10,6 +10,14 @@ ids, and per-token logprobs) into an optional `TokenRecorder`. Downstream
 training consumes ONLY these recorded ids (tokens-in tokens-out); text is
 never re-encoded, and a sample without per-token logprobs fails loudly.
 
+Multi-turn prompts are built incrementally from the episode's own token
+history: agents re-serialize earlier assistant turns (reformatted tool-call
+JSON, collapsed think framing), so re-rendering the full history never
+byte-matches the tokens actually sampled and every turn would fragment into
+its own training datum. Instead the next prompt is (previous prompt + raw
+sampled ids + a rendered suffix of only the new messages); a genuine history
+edit falls back to a full re-render and is counted on the recorder.
+
 `config.model_type` carries the base model name (renderer and tokenizer
 identity); `config.model` carries either a `tinker://` sampler-weights path or
 a base model name for an untrained student. The tinker SDK is an optional
@@ -18,8 +26,10 @@ extra imported lazily (`uv sync --extra distill`), same contract as e2b.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
@@ -101,6 +111,7 @@ class TokenRecorder:
     def __init__(self, jsonl_path: Path | None = None) -> None:
         self._spans: list[TokenSpan] = []
         self._jsonl_path = jsonl_path
+        self._fallbacks = 0
 
     def __len__(self) -> int:
         return len(self._spans)
@@ -116,6 +127,15 @@ class TokenRecorder:
     def spans(self) -> list[TokenSpan]:
         """A snapshot copy of the spans recorded so far."""
         return list(self._spans)
+
+    @property
+    def fallback_count(self) -> int:
+        """How many prompts fell back to a full re-render (each one fragments)."""
+        return self._fallbacks
+
+    def record_fallback(self) -> None:
+        """Count one incremental-prompt fallback (genuine mid-episode history edit)."""
+        self._fallbacks += 1
 
 
 class SampledSequenceLike(Protocol):
@@ -204,6 +224,70 @@ class _SampledTurn(BaseModel):
     parsed: ParsedAssistantMessage
 
 
+@dataclass
+class _PromptState:
+    """The provider's last successful call, for incremental prompt extension.
+
+    Shares the recorder's single-episode ownership: one provider serves one
+    episode sequentially, so the next call's history normally extends this
+    call's message list by the assistant echo plus new tool/user messages.
+    """
+
+    messages: list[ChatMessage]
+    """Snapshot of the message list the last prompt was built from."""
+
+    tool_signature: str | None
+    """Normalized digest of the tool schemas the last prompt rendered with."""
+
+    prompt_tokens: list[int]
+    """The exact prompt ids sent on the last call (incremental or full)."""
+
+    sampled_tokens: list[int]
+    """The raw sampled ids of the last call, including any end-of-turn token."""
+
+
+def _tool_signature(tools: list[ChatTool] | None) -> str | None:
+    """A normalized digest of tool schemas; None when no tools are rendered."""
+    if not tools:
+        return None
+    return json.dumps([tool.model_dump(mode="json") for tool in tools], sort_keys=True)
+
+
+def _first_incompatible_index(
+    previous: list[ChatMessage], incoming: list[ChatMessage]
+) -> int | None:
+    """Where `incoming` stops being a tolerant extension of `previous`, or None.
+
+    The shared region must match role for role and count for count. Assistant
+    turns are compared by role only: the agent re-serializes the provider's
+    own turns (parsed and reformatted tool calls, collapsed think framing), so
+    their text never byte-matches and the provider's token history is the
+    ground truth for them. System, user, and tool messages must match exactly
+    by content and tool linkage. When `incoming` is longer, the first new
+    message must be the assistant echo of the provider's last sampled turn.
+
+    Returns:
+        None when compatible; otherwise the index of the first message that
+        breaks the extension (a genuine history edit or compaction).
+    """
+    if len(incoming) < len(previous):
+        return len(incoming)
+    for index, (prev, cur) in enumerate(zip(previous, incoming, strict=False)):
+        if prev.role != cur.role:
+            return index
+        if prev.role == "assistant":
+            continue
+        if prev.content != cur.content:
+            return index
+        if prev.tool_call_id != cur.tool_call_id:
+            return index
+        if (prev.model_extra or {}).get("name") != (cur.model_extra or {}).get("name"):
+            return index
+    if len(incoming) > len(previous) and incoming[len(previous)].role != "assistant":
+        return len(previous)
+    return None
+
+
 class TinkerChatProvider:
     """Serves completions from a Tinker-hosted LoRA student during distillation.
 
@@ -233,6 +317,7 @@ class TinkerChatProvider:
         self._sampler = sampling_client
         self._rendering = renderer
         self._recorder = recorder
+        self._prompt_state: _PromptState | None = None
 
     def _base_model_name(self) -> str:
         base = self.config.model_type or self.config.model
@@ -283,6 +368,55 @@ class TinkerChatProvider:
             self._rendering = build_renderer(base_model, sampler.get_tokenizer())
         return self._rendering
 
+    def _build_prompt_tokens(
+        self, messages: list[ChatMessage], tools: list[ChatTool] | None
+    ) -> list[int]:
+        """Build the prompt ids, extending the episode's own token history when possible.
+
+        When the previous call's message list is a tolerant prefix of the
+        incoming one (see `_first_incompatible_index`) and the tool schemas
+        are unchanged, the prompt is the previous prompt plus the raw sampled
+        ids plus a rendered suffix of only the NEW messages, so it extends
+        (previous prompt + previous sample) verbatim as a token prefix and the
+        episode merges into one training datum. An identical-length compatible
+        history (the caller discarded the last turn and re-asks) reuses the
+        previous prompt unchanged. Anything else (a genuine history edit or
+        compaction) falls back to a full re-render, which is counted on the
+        recorder because every fallback fragments the episode's datums.
+        """
+        rendering = self._get_rendering()
+        state = self._prompt_state
+        if state is None:
+            return rendering.build_generation_prompt(messages, tools)
+        signature = _tool_signature(tools)
+        mismatch = _first_incompatible_index(state.messages, messages)
+        if mismatch is None and signature == state.tool_signature:
+            if len(messages) == len(state.messages):
+                return list(state.prompt_tokens)
+            suffix = rendering.render_suffix(
+                messages,
+                len(state.messages) + 1,
+                tools,
+                previous_sampled_ids=state.sampled_tokens,
+            )
+            return state.prompt_tokens + state.sampled_tokens + suffix
+        if self._recorder is not None:
+            self._recorder.record_fallback()
+        if mismatch is not None:
+            logger.info(
+                "incremental prompt fallback: incoming message %d does not extend the "
+                "previous call's history (genuine edit or compaction); re-rendering the "
+                "full prompt, which fragments this episode's training datums",
+                mismatch,
+            )
+        else:
+            logger.info(
+                "incremental prompt fallback: the tool schemas changed since the previous "
+                "call; re-rendering the full prompt, which fragments this episode's "
+                "training datums"
+            )
+        return rendering.build_generation_prompt(messages, tools)
+
     def _sample_turn(
         self,
         messages: list[ChatMessage],
@@ -293,7 +427,7 @@ class TinkerChatProvider:
     ) -> _SampledTurn:
         """Render, sample, parse, and (on success) record exactly one span."""
         rendering = self._get_rendering()
-        prompt_ids = rendering.build_generation_prompt(messages, tools)
+        prompt_ids = self._build_prompt_tokens(messages, tools)
         sequence = self._get_sampler().sample(
             prompt_ids,
             max_tokens=max_tokens,
@@ -313,8 +447,15 @@ class TinkerChatProvider:
                 "for tokens-in-tokens-out training and are never fabricated"
             )
         parsed = rendering.parse_response(sampled_ids)
-        # Record only after the whole completion succeeded, so a failure that an
-        # outer retry wrapper re-invokes never leaves a span behind.
+        # Update the incremental state and record only after the whole completion
+        # succeeded, so a failure that an outer retry wrapper re-invokes never
+        # leaves a span (or stale prompt state) behind.
+        self._prompt_state = _PromptState(
+            messages=list(messages),
+            tool_signature=_tool_signature(tools),
+            prompt_tokens=prompt_ids,
+            sampled_tokens=sampled_ids,
+        )
         if self._recorder is not None:
             self._recorder.record(
                 TokenSpan(

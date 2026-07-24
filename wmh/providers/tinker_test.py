@@ -25,8 +25,18 @@ from pydantic import JsonValue, ValidationError
 
 import wmh.distill.rendering as rendering_module
 import wmh.providers.tinker as tinker_module
+from wmh.distill.config import (
+    DistillConfig,
+    HarborConfig,
+    RolloutConfig,
+    StudentConfig,
+    TeacherConfig,
+    TrainConfig,
+)
+from wmh.distill.data import build_datums
 from wmh.distill.fake_tinker import FakeSampledSequence, FakeSamplingClient, FakeTokenizer
 from wmh.distill.rendering import ParsedAssistantMessage
+from wmh.distill.tokens import TrialRecord
 from wmh.providers.base import (
     Message,
     Provider,
@@ -57,6 +67,22 @@ class _MiniRendering:
         if tools:
             lines.append("tools: " + ",".join(tool.function.name for tool in tools))
         for message in messages:
+            content = message.content if isinstance(message.content, str) else ""
+            lines.append(f"{message.role}: {content}")
+        lines.append("assistant:")
+        return self._tok.encode("\n".join(lines))
+
+    def render_suffix(
+        self,
+        messages: list[ChatMessage],
+        delta_start: int,
+        tools: list[ChatTool] | None = None,
+        *,
+        previous_sampled_ids: list[int],
+    ) -> list[int]:
+        del tools, previous_sampled_ids
+        lines = [""]
+        for message in messages[delta_start:]:
             content = message.content if isinstance(message.content, str) else ""
             lines.append(f"{message.role}: {content}")
         lines.append("assistant:")
@@ -288,6 +314,266 @@ def test_span_recorded_once_per_success_and_not_on_failure() -> None:
 
     provider.complete_chat(_request())
     assert [span.call_index for span in recorder.spans()] == [0, 1]
+
+
+class _FramedRendering(_MiniRendering):
+    """Scripted renderer with explicit per-message framing and suffix rendering.
+
+    Each message renders as `<role>content|calls=name:args</>`, the generation
+    header is `<assistant>`, and `</>` is the end-of-turn framing. Tool-call
+    arguments render VERBATIM, so a caller that echoes an assistant turn with
+    reformatted JSON spacing changes the re-rendered tokens, exactly the live
+    defect the incremental prompt construction exists to absorb.
+    """
+
+    def _segment(self, message: ChatMessage) -> str:
+        content = message.content if isinstance(message.content, str) else ""
+        calls = ""
+        if message.tool_calls:
+            calls = "|calls=" + ";".join(
+                f"{call.function.name}:{call.function.arguments}" for call in message.tool_calls
+            )
+        return f"<{message.role}>{content}{calls}</>"
+
+    def build_generation_prompt(
+        self, messages: list[ChatMessage], tools: list[ChatTool] | None = None
+    ) -> list[int]:
+        prefix = ""
+        if tools:
+            prefix = "<tools>" + ",".join(tool.function.name for tool in tools) + "</>"
+        body = "".join(self._segment(message) for message in messages)
+        return self._tok.encode(prefix + body + "<assistant>")
+
+    def render_suffix(
+        self,
+        messages: list[ChatMessage],
+        delta_start: int,
+        tools: list[ChatTool] | None = None,
+        *,
+        previous_sampled_ids: list[int],
+    ) -> list[int]:
+        del tools
+        end_of_turn = self._tok.encode("</>")
+        tokens: list[int] = []
+        if previous_sampled_ids[-len(end_of_turn) :] != end_of_turn:
+            tokens.extend(end_of_turn)
+        for message in messages[delta_start:]:
+            tokens.extend(self._tok.encode(self._segment(message)))
+        tokens.extend(self._tok.encode("<assistant>"))
+        return tokens
+
+    def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
+        text = self._tok.decode(sampled_ids)
+        stopped = text.endswith("</>")
+        return ParsedAssistantMessage(text=text.removesuffix("</>"), tool_calls=[], stopped=stopped)
+
+
+class _ScriptedSampler:
+    """Returns canned token sequences in order, recording every prompt."""
+
+    def __init__(self, texts: list[str]) -> None:
+        self._tok = FakeTokenizer()
+        self._outputs = [self._tok.encode(text) for text in texts]
+        self.prompts: list[list[int]] = []
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> FakeSampledSequence:
+        del max_tokens, temperature, stop
+        self.prompts.append(list(prompt_token_ids))
+        tokens = self._outputs.pop(0)
+        return FakeSampledSequence(tokens=tokens, logprobs=[-0.5] * len(tokens), stop_reason="stop")
+
+
+def _distill_cfg() -> DistillConfig:
+    return DistillConfig(
+        student=StudentConfig(base_model="Qwen/Qwen3-8B"),
+        teacher=TeacherConfig(model="Qwen/Qwen3-32B"),
+        harbor=HarborConfig(job_template="job.yaml"),
+        rollout=RolloutConfig(),
+        train=TrainConfig(),
+    )
+
+
+def _trial(recorder: TokenRecorder) -> TrialRecord:
+    return TrialRecord(
+        task_id="task-a",
+        attempt=1,
+        trial_name="task-a__x1",
+        reward=1.0,
+        passed=True,
+        spans=recorder.spans(),
+        stop_reason="submitted",
+        artifact_dir="/tmp/jobs/task-a__x1",
+    )
+
+
+def _framed_provider(texts: list[str]) -> tuple[TinkerChatProvider, TokenRecorder]:
+    recorder = TokenRecorder()
+    provider = TinkerChatProvider(
+        _config(),
+        sampling_client=_ScriptedSampler(texts),
+        renderer=_FramedRendering(),
+        recorder=recorder,
+    )
+    return provider, recorder
+
+
+def _chat(provider: TinkerChatProvider, messages: list[ChatMessage]) -> ChatMessage:
+    response = provider.complete_chat(
+        ChatRequest(messages=messages, temperature=0.0, max_tokens=64)
+    )
+    return response.choices[0].message
+
+
+_HISTORY = [
+    ChatMessage(role="system", content="be terse"),
+    ChatMessage(role="user", content="list files"),
+]
+
+
+def _echo(arguments: str) -> ChatMessage:
+    return ChatMessage(
+        role="assistant",
+        content="ok",
+        tool_calls=[
+            ChatToolCall(id="call_0", function=ChatFunctionCall(name="bash", arguments=arguments))
+        ],
+    )
+
+
+def _tool_result(content: str) -> ChatMessage:
+    return ChatMessage.model_validate(
+        {"role": "tool", "content": content, "tool_call_id": "call_0"}
+    )
+
+
+def test_multi_turn_verbatim_echo_prompts_extend_and_merge() -> None:
+    # Regression: when the caller echoes the assistant turn verbatim, prompts
+    # are prefix-extending AND identical to a full re-render, validating that
+    # the suffix composition matches full-render framing.
+    rendering = _FramedRendering()
+    provider, recorder = _framed_provider(['ok|calls=bash:{"cmd": "ls"}</>', "done</>"])
+    _chat(provider, _HISTORY)
+    extended = [*_HISTORY, _echo('{"cmd": "ls"}'), _tool_result("a.txt b.txt")]
+    _chat(provider, extended)
+
+    first, second = recorder.spans()
+    episode = first.prompt_token_ids + first.sampled_token_ids
+    assert second.prompt_token_ids[: len(episode)] == episode
+    assert second.prompt_token_ids == rendering.build_generation_prompt(extended)
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 1
+    assert stats.fragments == 0
+    assert recorder.fallback_count == 0
+
+
+def test_reformatted_assistant_echo_still_extends_and_merges() -> None:
+    # The live defect: the agent re-serializes the assistant turn (different
+    # JSON spacing in tool_calls), so a full re-render would NOT extend the
+    # sampled tokens; the incremental prompt must still extend and merge.
+    rendering = _FramedRendering()
+    provider, recorder = _framed_provider(['ok|calls=bash:{"cmd": "ls"}</>', "done</>"])
+    _chat(provider, _HISTORY)
+    extended = [*_HISTORY, _echo('{"cmd":"ls"}'), _tool_result("a.txt b.txt")]
+    _chat(provider, extended)
+
+    first, second = recorder.spans()
+    episode = first.prompt_token_ids + first.sampled_token_ids
+    # The defect is real in this scripted world: a full re-render diverges.
+    assert rendering.build_generation_prompt(extended)[: len(episode)] != episode
+    # The fix: the incrementally built prompt still extends the token history.
+    assert second.prompt_token_ids[: len(episode)] == episode
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 1
+    assert stats.fragments == 0
+    assert stats.fragmentation_rate == 0.0
+    assert recorder.fallback_count == 0
+
+
+def test_genuine_history_edit_falls_back_and_fragments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rendering = _FramedRendering()
+    provider, recorder = _framed_provider(["a</>", "b</>", "c</>"])
+    _chat(provider, _HISTORY)
+    second_messages = [*_HISTORY, _echo('{"cmd":"ls"}'), _tool_result("a.txt")]
+    _chat(provider, second_messages)
+    # A changed tool-result message mid-history is a genuine edit: fall back.
+    edited = [
+        *_HISTORY,
+        _echo('{"cmd":"ls"}'),
+        _tool_result("EDITED"),
+        ChatMessage(role="assistant", content="b"),
+        _tool_result("more"),
+    ]
+    with caplog.at_level("INFO", logger="wmh.providers.tinker"):
+        _chat(provider, edited)
+
+    assert recorder.fallback_count == 1
+    assert any("incoming message 3" in record.message for record in caplog.records)
+    spans = recorder.spans()
+    # The fallback prompt is a correct full render of the edited history.
+    assert spans[2].prompt_token_ids == rendering.build_generation_prompt(edited)
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 2
+    assert stats.fragments == 1
+
+
+def test_max_tokens_truncation_gets_end_of_turn_framing() -> None:
+    tok = FakeTokenizer()
+    provider, recorder = _framed_provider(["par", "done</>"])
+    first_response = _chat(provider, _HISTORY)
+    assert first_response.content == "par"
+    extended = [
+        *_HISTORY,
+        ChatMessage(role="assistant", content="par"),
+        ChatMessage(role="user", content="continue"),
+    ]
+    _chat(provider, extended)
+
+    first, second = recorder.spans()
+    episode = first.prompt_token_ids + first.sampled_token_ids
+    assert second.prompt_token_ids[: len(episode)] == episode
+    # The suffix supplies the missing end-of-turn framing before the new message.
+    expected_suffix = tok.encode("</>" + "<user>continue</>" + "<assistant>")
+    assert second.prompt_token_ids[len(episode) :] == expected_suffix
+    datums, stats = build_datums([_trial(recorder)], _distill_cfg())
+    assert len(datums) == 1
+    assert stats.fragments == 0
+
+
+def test_re_asked_identical_history_reuses_the_exact_prompt() -> None:
+    provider, recorder = _framed_provider(["a</>", "b</>"])
+    _chat(provider, _HISTORY)
+    _chat(provider, _HISTORY)
+    first, second = recorder.spans()
+    assert second.prompt_token_ids == first.prompt_token_ids
+    assert recorder.fallback_count == 0
+
+
+def test_tool_schema_change_mid_episode_falls_back() -> None:
+    provider, recorder = _framed_provider(["a</>", "b</>"])
+    tool = ChatTool(
+        function=ChatFunctionDefinition(
+            name="bash", description="run bash", parameters={"type": "object"}
+        )
+    )
+    request = ChatRequest(messages=list(_HISTORY), temperature=0.0, max_tokens=64)
+    request.tools = [tool]
+    provider.complete_chat(request)
+    follow_up = ChatRequest(
+        messages=[*_HISTORY, ChatMessage(role="assistant", content="a"), _tool_result("out")],
+        temperature=0.0,
+        max_tokens=64,
+    )
+    provider.complete_chat(follow_up)
+    assert recorder.fallback_count == 1
 
 
 def test_complete_plain_text_uses_same_machinery() -> None:
