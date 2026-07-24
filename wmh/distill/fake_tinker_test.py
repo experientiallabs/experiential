@@ -182,7 +182,7 @@ def test_tito_fires_on_corrupted_datum() -> None:
 def test_tito_fires_when_nothing_issued() -> None:
     training = _make_training()
     datum = FakeDatum(model_input_tokens=[1, 2], target_tokens=[3, 4])
-    with pytest.raises(AssertionError, match="no linked sampler issued any span"):
+    with pytest.raises(AssertionError, match="no eligible sampler issued any span"):
         training.forward_backward([datum], "importance_sampling")
 
 
@@ -266,12 +266,58 @@ def test_create_sampling_client_from_saved_path_is_linked() -> None:
     assert echoed[2:] == seq.logprobs
 
 
-def test_create_sampling_client_unknown_path_is_standalone() -> None:
+def test_create_sampling_client_unknown_path_is_unlinked_but_tracked() -> None:
+    """An unknown-path sampler (the teacher) is unlinked yet a TITO issuer.
+
+    This replaces the pre-warmup expectation that teacher spans fail TITO:
+    the warmup phase deliberately trains on TEACHER-sampled tokens, and the
+    real service serves teacher and student through the same account, so a
+    span a service-created client genuinely issued is legitimate training
+    data. Unlinked still means its spans never echo through the student's
+    shared ledger.
+    """
     service = FakeServiceClient()
     teacher = service.create_sampling_client("teacher-base-model")
     seq = teacher.sample([1], max_tokens=2, temperature=0.0)
     assert len(seq.tokens) == 2
-    # Standalone samplers do not feed any training client's ledger.
+    # Unlinked: the student's samplers cannot echo the teacher's issued logprobs.
+    training = service.create_lora_training_client("base")
+    student = training.save_weights_and_get_sampling_client("s0")
+    echoed = student.compute_logprobs([1] + seq.tokens)
+    assert echoed[1:] != seq.logprobs
+    # Tracked issuer: teacher-sampled spans satisfy the TITO check (warmup SFT).
+    datum = FakeDatum(
+        model_input_tokens=[1] + seq.tokens,
+        target_tokens=list(seq.tokens),
+        weights=[1.0] * len(seq.tokens),
+    )
+    training.forward_backward([datum], "cross_entropy")
+    assert training.forward_backward_calls[-1][1] == "cross_entropy"
+
+
+def test_corrupted_teacher_span_still_fails_tito() -> None:
+    """The issuer extension does not weaken the assertion: fabricated ids die."""
+    service = FakeServiceClient()
+    teacher = service.create_sampling_client("teacher-base-model")
+    seq = teacher.sample([1, 2], max_tokens=4, temperature=0.0)
+    corrupted = list(seq.tokens)
+    corrupted[1] = corrupted[1] + 1
+    training = service.create_lora_training_client("base")
+    datum = FakeDatum(
+        model_input_tokens=[1, 2] + corrupted,
+        target_tokens=corrupted,
+        weights=[1.0] * len(corrupted),
+    )
+    with pytest.raises(AssertionError, match=r"TITO violation in datum 0.*position 1"):
+        training.forward_backward([datum], "cross_entropy")
+    assert training.forward_backward_calls == []
+
+
+def test_directly_constructed_sampler_is_not_an_issuer() -> None:
+    """Only service-created clients count; a bare FakeSamplingClient does not."""
+    service = FakeServiceClient()
+    rogue = FakeSamplingClient(seed="rogue-sampler")
+    seq = rogue.sample([1], max_tokens=3, temperature=0.0)
     training = service.create_lora_training_client("base")
     datum = FakeDatum(
         model_input_tokens=[1] + seq.tokens,

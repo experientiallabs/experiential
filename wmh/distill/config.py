@@ -134,18 +134,29 @@ class SamplingConfig(BaseModel):
 
 
 class WarmupConfig(BaseModel):
-    """Reserved supervised warmup phase (only 0 steps supported in v1)."""
+    """Supervised warmup on the teacher's own pi trajectories before OPD steps.
+
+    The remedy for a student that samples only failing trajectories (on-policy
+    distillation then matches the teacher on failures): before the OPD step
+    loop, the teacher runs the pi harness on the TRAIN tasks, its kept trials
+    become cross_entropy SFT datums via the same prefix merge, and the student
+    trains `steps` full-batch passes over them. 0 steps (the default) disables
+    the phase entirely.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     steps: int = Field(default=0, ge=0)
+    """Full-batch SFT passes over the kept teacher trajectories; 0 disables."""
 
-    @field_validator("steps")
-    @classmethod
-    def _reject_warmup(cls, value: int) -> int:
-        if value > 0:
-            raise ValueError("warmup is reserved; not implemented yet (set warmup.steps = 0)")
-        return value
+    rollouts_per_task: int = Field(default=1, ge=1)
+    """Teacher attempts per train task when collecting warmup trajectories."""
+
+    keep: Literal["passed", "all"] = "passed"
+    """Which teacher trials feed the SFT set: reward-passing only, or all."""
+
+    learning_rate: Annotated[float, Field(gt=0)] | None = None
+    """Warmup optimizer LR; None uses `train.learning_rate`."""
 
 
 class EvalConfig(BaseModel):

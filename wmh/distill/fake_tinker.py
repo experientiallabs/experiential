@@ -15,8 +15,13 @@ randomness, so a run replayed with the same inputs produces identical outputs.
 
 The fakes also enforce the tokens-in-tokens-out (TITO) invariant that on-policy
 distillation depends on: every sampled span trained on must be byte-identical
-to a span some linked sampling client actually issued. FakeTrainingClient
-raises AssertionError from forward_backward when a datum violates it.
+to a span some sampling client actually issued. The issuer set is the training
+client's own linked samplers (its refreshed student weights) plus every
+sampling client its owning FakeServiceClient created (the teacher client the
+warmup phase trains on is created through the service, not linked to the
+student); fabricated or corrupted token ids were issued by nobody and still
+fail. FakeTrainingClient raises AssertionError from forward_backward when a
+datum violates it.
 """
 
 from __future__ import annotations
@@ -303,32 +308,44 @@ class FakeTrainingClient:
         """Record a training batch after asserting the TITO invariant.
 
         Every sampled span in every datum (maximal nonzero-weight run of
-        target tokens) must exactly equal the sampled ids of some span a
-        linked sampling client previously issued.
+        target tokens) must exactly equal the sampled ids of some span an
+        eligible issuer previously issued: a linked sampling client (this
+        training client's refreshed student weights) or any sampling client
+        the owning FakeServiceClient created (the teacher client the warmup
+        phase trains on). Fabricated ids fail either way.
 
         Args:
             datums: The batch to train on.
-            loss_fn: Loss function name (e.g. "importance_sampling"); recorded
-                but not interpreted.
+            loss_fn: Loss function name (e.g. "importance_sampling" or
+                "cross_entropy"); recorded but not interpreted.
 
         Raises:
-            AssertionError: If a sampled span was never issued by a linked
-                sampler; the message names the datum, the span, and the first
+            AssertionError: If a sampled span was never issued by an eligible
+                issuer; the message names the datum, the span, and the first
                 mismatching token position against the closest issued span.
         """
-        issued = {record.sampled_ids for record in self._ledger.records}
+        records = self._issuer_records()
+        issued = {record.sampled_ids for record in records}
         for datum_index, datum in enumerate(datums):
             for span in datum.sampled_spans():
                 if span in issued:
                     continue
-                raise AssertionError(self._tito_message(datum_index, span))
+                raise AssertionError(self._tito_message(datum_index, span, records))
         self.forward_backward_calls.append((list(datums), loss_fn))
 
-    def _tito_message(self, datum_index: int, span: tuple[int, ...]) -> str:
+    def _issuer_records(self) -> list[IssuedSample]:
+        """Every span an eligible issuer recorded: linked ledger + service clients."""
+        records = list(self._ledger.records)
+        records.extend(self._service.issued_records())
+        return records
+
+    def _tito_message(
+        self, datum_index: int, span: tuple[int, ...], records: list[IssuedSample]
+    ) -> str:
         """Build the TITO failure message naming the first mismatch position."""
         best: IssuedSample | None = None
         best_prefix = -1
-        for record in self._ledger.records:
+        for record in records:
             prefix = 0
             for a, b in zip(span, record.sampled_ids, strict=False):
                 if a != b:
@@ -340,7 +357,7 @@ class FakeTrainingClient:
         if best is None:
             return (
                 f"TITO violation in datum {datum_index}: sampled span of length "
-                f"{len(span)} trained on, but no linked sampler issued any span"
+                f"{len(span)} trained on, but no eligible sampler issued any span"
             )
         mismatch = best_prefix
         if mismatch < len(span) and mismatch < len(best.sampled_ids):
@@ -406,27 +423,43 @@ class FakeTrainingClient:
 
 
 class FakeServiceClient:
-    """Deterministic stand-in for tinker.ServiceClient."""
+    """Deterministic stand-in for tinker.ServiceClient.
+
+    Every sampling client it creates is remembered as a potential TITO issuer
+    (see `issued_records`): the real service serves the teacher and the
+    student through the same account, so tokens the teacher client genuinely
+    sampled are legitimate training targets for the warmup phase, while ids no
+    client ever issued remain violations.
+    """
 
     def __init__(self) -> None:
         self._sampler_paths: dict[str, FakeTrainingClient] = {}
+        self._sampling_clients: list[FakeSamplingClient] = []
 
     def create_lora_training_client(self, base_model: str, rank: int = 32) -> FakeTrainingClient:
         """Create a fake LoRA training client for the given base model."""
         return FakeTrainingClient(service=self, base_model=base_model, rank=rank)
 
     def create_sampling_client(self, model_path: str) -> FakeSamplingClient:
-        """Create a sampling client for a saved sampler path.
+        """Create (and track as a TITO issuer) a sampling client for a path.
 
         Paths produced by a linked training client's save_weights_for_sampler
         yield clients that share that training client's span ledger; any other
         path (e.g. a base model name for a standalone teacher) yields an
-        unlinked client seeded with the path.
+        unlinked client seeded with the path. Either way the client is tracked
+        so its issued spans satisfy the training clients' TITO checks.
         """
         training = self._sampler_paths.get(model_path)
         if training is not None:
-            return FakeSamplingClient(seed=model_path, ledger=training._ledger)
-        return FakeSamplingClient(seed=model_path)
+            client = FakeSamplingClient(seed=model_path, ledger=training._ledger)
+        else:
+            client = FakeSamplingClient(seed=model_path)
+        self._sampling_clients.append(client)
+        return client
+
+    def issued_records(self) -> list[IssuedSample]:
+        """Every span any sampling client created by this service issued."""
+        return [record for client in self._sampling_clients for record in client.issued]
 
     def _register_sampler_path(self, path: str, training: FakeTrainingClient) -> None:
         self._sampler_paths[path] = training
