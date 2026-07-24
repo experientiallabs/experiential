@@ -226,3 +226,38 @@ routers fail to beat Best Single on accuracy; Avengers-Pro wins the Pareto). Ora
 shows the tier-2 predictor headroom. Full comparison against their published Avengers rows =
 next (their baseline configs/seeds), but the replication is squarely in the leading-router
 band on their data.
+
+## Avengers successors (2026-07-24 lit review round 3, citation graph + deep dive)
+
+The Avengers lineage continued; per-paper deltas verified, code links checked:
+
+1. **JiSi / "Beyond Gemini-3-Pro" (2601.01330) - the Avengers authors' own successor**
+   (Yiqun Zhang + Shanghai AI Lab core team). Fixes three Avengers limits: query-only routing
+   (adds query-response MIXED routing: semantics + problem difficulty in the embedding),
+   static aggregation (support-set aggregator selection), separate route/aggregate (per-query
+   route-vs-aggregate switch). Router-only head-to-head: 69.68 vs Avengers 68.74; full system
+   72.15 avg beats Gemini-3-Pro 71.00 at 53% lower cost. Code: github.com/magent4aci/openJiSi.
+2. **IrtNet (2510.00844) - strongest direct challenger.** IRT ability x difficulty latent
+   model replaces per-cluster reciprocal-rank tables; beats Avengers-Pro head-to-head 67.4 vs
+   62.1 routing accuracy (35k queries, 112 models) and needs <4% of the training data (the
+   sample-efficiency answer to our thin-cluster noise). Code: github.com/JianhaoChen-nju/IrtNet.
+   (Related: IRT-Router 2506.01048 adds the monotonicity constraint + cold-start warm-up.
+   NOTE: "MonoRouter" from an earlier agent pass is FABRICATED - does not exist.)
+3. **ProxRouter (2510.09852, CMU)** - exponential-tilt reweighting bolted onto existing
+   k-means/kNN scores (w ~ p*exp(-phi/tau)); +2.8 to +8.1pp OUTLIER AUC with inliers
+   preserved. Best effort-to-payoff for customer traffic drift. No code found.
+4. **Federate the Router (2601.22318, same CMU group)** - federated routing from sparse
+   decentralized evals, k-means variant composes with our clustering: pool per-cluster stats
+   ACROSS customers to beat isolated thin-data tables. Our multi-tenant setting exactly.
+5. Also: MetaRouter (2606.06178; learned per-user preference replaces the static alpha, beats
+   Avengers-Pro on hypervolume/IGD), Mixture of Thoughts (2509.21164; latent top-K
+   aggregation, +2.92% OOD over Avengers, code github.com/jacobfa/mot), EvoRoute (2601.02695;
+   online experience base + Thompson sampling, per-step agentic), MoMA (2509.07571; trained
+   MoE router + TOPSIS knob), RouteJudge/ORBIT (2606.18774; eval harness with Avengers rows,
+   code github.com/LAMDA-Model-Reuse/ORBIT).
+
+Synthesis for our roadmap: tier-1.5 = ProxRouter tilt (drop-in robustness); tier-2's concrete
+form = IrtNet-style IRT ability model (sample-efficient, answers thin-cluster noise, open
+code) with IRT-Router's monotonicity for cold start; tier-3's concrete form = JiSi's
+route-vs-aggregate switch + MoT latent aggregation; multi-tenant lever = federated per-cluster
+stats. Cache-aware multi-turn cluster routing remains whitespace nobody claimed - still ours.
