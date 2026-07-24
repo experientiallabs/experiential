@@ -204,6 +204,107 @@ def test_build_renderer_qwen3_tools_prompt_and_tool_call_parse() -> None:
     assert truncated.stopped is False
 
 
+def _echoed_conversation() -> tuple[list[ChatMessage], list[ChatMessage]]:
+    """A two-message history plus its extension by an assistant echo and a tool result."""
+    history = [
+        ChatMessage(role="system", content="be brief"),
+        ChatMessage(role="user", content="list files"),
+    ]
+    extended = [
+        *history,
+        ChatMessage(role="assistant", content="ok done"),
+        ChatMessage.model_validate(
+            {"role": "tool", "content": "a.txt b.txt", "tool_call_id": "call_0"}
+        ),
+    ]
+    return history, extended
+
+
+def test_render_suffix_matches_full_render_for_verbatim_echo() -> None:
+    # For a conversation whose assistant echo is verbatim (rendered output equals
+    # the sampled ids), prompt + sampled + suffix must equal a full render: the
+    # per-message suffix composition matches the renderer's own framing.
+    pytest.importorskip("tinker_cookbook")
+    tokenizer = _CharTokenizer()
+    rendering = build_renderer("Qwen/Qwen3-8B", tokenizer)
+    history, extended = _echoed_conversation()
+    prompt = rendering.build_generation_prompt(history)
+    sampled = tokenizer.encode("ok done<|im_end|>")
+    suffix = rendering.render_suffix(extended, 3, previous_sampled_ids=sampled)
+    assert prompt + sampled + suffix == rendering.build_generation_prompt(extended)
+
+
+def test_render_suffix_with_tools_matches_full_render() -> None:
+    # No leading system message: the tool prefix folding shifts indices, and the
+    # suffix must still frame the delta exactly like a full render would.
+    pytest.importorskip("tinker_cookbook")
+    tokenizer = _CharTokenizer()
+    rendering = build_renderer("Qwen/Qwen3-8B", tokenizer)
+    tools = [_tool("ls")]
+    history = [ChatMessage(role="user", content="list files")]
+    extended = [
+        *history,
+        ChatMessage(role="assistant", content="ok"),
+        ChatMessage.model_validate({"role": "tool", "content": "a.txt", "tool_call_id": "call_0"}),
+    ]
+    prompt = rendering.build_generation_prompt(history, tools)
+    sampled = tokenizer.encode("ok<|im_end|>")
+    suffix = rendering.render_suffix(extended, 2, tools, previous_sampled_ids=sampled)
+    assert prompt + sampled + suffix == rendering.build_generation_prompt(extended, tools)
+
+
+def test_render_suffix_supplies_end_of_turn_after_truncation() -> None:
+    # A sample cut off at max_tokens carries no <|im_end|>; the suffix must add
+    # exactly the renderer-derived end-of-turn framing, and nothing when the
+    # sample terminated cleanly.
+    pytest.importorskip("tinker_cookbook")
+    tokenizer = _CharTokenizer()
+    rendering = build_renderer("Qwen/Qwen3-8B", tokenizer)
+    _, extended = _echoed_conversation()
+    truncated = tokenizer.encode("ok do")
+    clean = tokenizer.encode("ok do<|im_end|>")
+    suffix_truncated = rendering.render_suffix(extended, 3, previous_sampled_ids=truncated)
+    suffix_clean = rendering.render_suffix(extended, 3, previous_sampled_ids=clean)
+    assert suffix_truncated == tokenizer.encode("<|im_end|>") + suffix_clean
+
+
+def test_render_suffix_qwen3_5_frames_delta_like_the_live_template() -> None:
+    # Qwen3.5 is the live smoke's renderer: the generation header prefills
+    # <think>\n and the tool-response glue must match the live sink's delta.
+    pytest.importorskip("tinker_cookbook")
+    tokenizer = _CharTokenizer()
+    rendering = build_renderer("Qwen/Qwen3.5-4B", tokenizer)
+    history = [
+        ChatMessage(role="system", content="s"),
+        ChatMessage(role="user", content="task"),
+    ]
+    prompt = rendering.build_generation_prompt(history)
+    assert rendering.decode(prompt).endswith("<|im_start|>assistant\n<think>\n")
+    sampled = tokenizer.encode("plan\n</think>\n\ndoing<|im_end|>")
+    extended = [
+        *history,
+        ChatMessage(role="assistant", content="<think>plan</think>doing"),
+        ChatMessage.model_validate(
+            {"role": "tool", "content": "R not found\n", "tool_call_id": "call_0"}
+        ),
+    ]
+    suffix = rendering.render_suffix(extended, 3, previous_sampled_ids=sampled)
+    # Byte-identical to the delta observed in the live smoke's token sink.
+    assert rendering.decode(suffix) == (
+        "\n<|im_start|>user\n<tool_response>\nR not found\n\n</tool_response><|im_end|>"
+        "\n<|im_start|>assistant\n<think>\n"
+    )
+
+
+def test_render_suffix_rejects_out_of_range_delta_start() -> None:
+    pytest.importorskip("tinker_cookbook")
+    rendering = build_renderer("Qwen/Qwen3-8B", _CharTokenizer())
+    _, extended = _echoed_conversation()
+    for delta_start in (0, len(extended) + 1):
+        with pytest.raises(ValueError, match="delta_start"):
+            rendering.render_suffix(extended, delta_start, previous_sampled_ids=[1])
+
+
 def test_build_renderer_unknown_model_is_actionable() -> None:
     pytest.importorskip("tinker_cookbook")
     with pytest.raises(ValueError, match="unknown-org/mystery"):
