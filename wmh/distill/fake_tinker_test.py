@@ -212,6 +212,41 @@ def test_optim_step_counts_and_records_lr() -> None:
     assert training.optim_step_lrs == [1e-4, 5e-5]
 
 
+def test_forward_backward_reports_a_deterministic_batch_loss() -> None:
+    """The SDK-shaped output carries a stable "total_loss:sum" per batch."""
+    training = _make_training()
+    sampler = training.save_weights_and_get_sampling_client("s0")
+    seq = sampler.sample([1, 2, 3], max_tokens=4, temperature=0.7)
+    datum = FakeDatum(
+        model_input_tokens=[1, 2, 3] + seq.tokens[:-1],
+        target_tokens=[2, 3] + seq.tokens,
+        weights=[0.0, 0.0] + [1.0] * len(seq.tokens),
+    )
+    first = training.forward_backward([datum], "importance_sampling")
+    second = training.forward_backward([datum], "importance_sampling")
+    assert first.loss_fn_output_type == "FakeLossReturn"
+    assert len(first.loss_fn_outputs) == 1  # one entry per datum, like the SDK
+    loss = first.metrics["total_loss:sum"]
+    assert loss > 0.0
+    assert second.metrics == first.metrics  # pure function of (loss_fn, batch)
+    # A different loss_fn or batch reports a different (still deterministic) loss.
+    other_loss = training.forward_backward([datum], "cross_entropy")
+    assert other_loss.metrics["total_loss:sum"] != loss
+
+
+def test_optim_step_reports_a_deterministic_grad_norm() -> None:
+    """The SDK-shaped response carries a stable "grad_norm:mean" per step."""
+    a = _make_training()
+    b = _make_training()
+    first_a = a.optim_step(1e-4)
+    first_b = b.optim_step(1e-4)
+    assert first_a.metrics is not None and first_b.metrics is not None
+    assert first_a.metrics["grad_norm:mean"] > 0.0
+    assert first_a.metrics == first_b.metrics  # pure function of (step count, lr)
+    second_a = a.optim_step(1e-4)
+    assert second_a.metrics != first_a.metrics  # the step count advanced
+
+
 def test_save_and_load_state() -> None:
     training = _make_training()
     training.optim_step(1e-4)
