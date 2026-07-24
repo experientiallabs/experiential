@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from wmh.core.types import Trace
+from wmh.core.types import ActionKind, Trace
 
 
 class Scenario(BaseModel):
@@ -50,3 +50,24 @@ def _trace_task(trace: Trace) -> str | None:
         if step.task and step.task.strip():
             return step.task.strip()
     return None
+
+
+def tools_hint_from_traces(traces: list[Trace]) -> str:
+    """Summarize the corpus's observed tool surface for the rollout agent's system prompt.
+
+    One line per tool: name + the union of argument keys seen in the traces (the D28
+    tools.json derivation, inlined). Empty string for tool-less corpora. This is the
+    trace-derived stopgap for the scenario tool-surface contract: agents told what exists
+    stop being scored on their willingness to hallucinate affordances.
+    """
+    args_by_tool: dict[str, set[str]] = {}
+    for trace in traces:
+        for step in trace.steps:
+            action = step.action
+            if action.kind is not ActionKind.TOOL_CALL or not action.name:
+                continue
+            args_by_tool.setdefault(action.name, set()).update(action.arguments)
+    if not args_by_tool:
+        return ""
+    lines = [f"- {name}({', '.join(sorted(keys))})" for name, keys in sorted(args_by_tool.items())]
+    return "AVAILABLE TOOLS (observed in this environment):\n" + "\n".join(lines)

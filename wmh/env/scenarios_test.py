@@ -36,3 +36,47 @@ def test_skips_traces_without_a_task() -> None:
 
 def test_empty_input_gives_empty_output() -> None:
     assert scenarios_from_traces([]) == []
+
+
+def test_tools_hint_from_traces_summarizes_tool_surface() -> None:
+    from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+    from wmh.env.scenarios import tools_hint_from_traces
+
+    steps = [
+        Step(
+            state_before=EnvState(),
+            action=Action(kind=ActionKind.TOOL_CALL, name="run_sql", arguments={"query": "q"}),
+            observation=Observation(content="ok"),
+        ),
+        Step(
+            state_before=EnvState(),
+            action=Action(
+                kind=ActionKind.TOOL_CALL, name="run_sql", arguments={"query": "q", "db": "x"}
+            ),
+            observation=Observation(content="ok"),
+        ),
+        Step(
+            state_before=EnvState(),
+            action=Action(kind=ActionKind.MESSAGE, content="hello"),
+            observation=Observation(content="ok"),
+        ),
+    ]
+    traces = [Trace(trace_id="t1", steps=steps)]
+    hint = tools_hint_from_traces(traces)
+    assert "run_sql" in hint
+    assert "db" in hint and "query" in hint
+    assert "hello" not in hint  # messages are not tools
+
+
+def test_tools_hint_empty_for_toolless_traces() -> None:
+    from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+    from wmh.env.scenarios import tools_hint_from_traces
+
+    steps = [
+        Step(
+            state_before=EnvState(),
+            action=Action(kind=ActionKind.MESSAGE, content="hi"),
+            observation=Observation(content="ok"),
+        )
+    ]
+    assert tools_hint_from_traces([Trace(trace_id="t", steps=steps)]) == ""

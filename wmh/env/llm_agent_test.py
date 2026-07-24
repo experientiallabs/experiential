@@ -5,7 +5,7 @@ from __future__ import annotations
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step
 from wmh.env.episode import DONE_SIGNAL
 from wmh.env.llm_agent import LLMAgent
-from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind, VerifyResult
 
 
 class FakeProvider:
@@ -67,3 +67,34 @@ def test_agent_prompt_includes_task_state_and_history() -> None:
     assert "TASK: find x" in prompt
     assert "db is empty" in prompt
     assert "search" in prompt and "found it" in prompt
+
+
+def test_tools_hint_lands_in_the_system_prompt() -> None:
+    class _CaptureProvider:
+        def __init__(self) -> None:
+            self.system = ""
+            self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model="m")
+
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Completion:
+            self.system = system
+            return Completion(text='{"done": true, "summary": "x"}')
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            raise NotImplementedError
+
+        def verify(self) -> VerifyResult:
+            raise NotImplementedError
+
+    provider = _CaptureProvider()
+    agent = LLMAgent(provider, tools_hint="TOOLS: run_sql(query), list_tables()")
+    agent.act("do it", EnvState(), [])
+    assert "run_sql(query)" in provider.system
+    bare = LLMAgent(_CaptureProvider())
+    assert bare is not None  # no hint -> unchanged system (covered by existing tests)

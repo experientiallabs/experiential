@@ -41,14 +41,20 @@ class _AgentReply(BaseModel):
 class LLMAgent:
     """`Agent`-protocol adapter around a provider: history in, one JSON tool call out."""
 
-    def __init__(self, provider: Provider, *, temperature: float = 0.0) -> None:
+    def __init__(
+        self, provider: Provider, *, temperature: float = 0.0, tools_hint: str | None = None
+    ) -> None:
         self._provider = provider
         self._temperature = temperature
+        # Corpus-derived tool surface (names + argument keys observed in the traces). Without
+        # it, capable models honestly refuse to invent tools while weaker ones hallucinate
+        # them, and closed-loop rewards measure affordance-guessing instead of capability.
+        self._system = AGENT_SYSTEM if not tools_hint else f"{AGENT_SYSTEM}\n\n{tools_hint}"
 
     def act(self, task: str | None, state: EnvState, history: list[Step]) -> Action:
         prompt = _render_turn(task, state, history)
         completion = self._provider.complete(
-            AGENT_SYSTEM,
+            self._system,
             [Message(role="user", content=prompt)],
             temperature=self._temperature,
             max_tokens=1024,

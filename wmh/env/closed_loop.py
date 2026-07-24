@@ -104,6 +104,7 @@ def evaluate_pool(
     episodes_per_scenario: int = 1,
     max_steps: int = 20,
     agent_temperature: float = 0.0,
+    tools_hint: str | None = None,
     provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
     on_outcome: Callable[[ScenarioOutcome], None] | None = None,
 ) -> OutcomeMatrix:
@@ -120,7 +121,7 @@ def evaluate_pool(
             sid = scenario_id(scenario)
             for episode in range(episodes_per_scenario):
                 timed = _TimedProvider(provider_factory(entry))
-                agent = LLMAgent(timed, temperature=agent_temperature)
+                agent = LLMAgent(timed, temperature=agent_temperature, tools_hint=tools_hint)
                 env = env_factory()
                 result = run_episode(env, agent, scenario.task, max_steps=max_steps)
                 score = getattr(env, "last_score", None)
