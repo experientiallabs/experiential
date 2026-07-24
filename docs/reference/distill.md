@@ -48,6 +48,9 @@ context_budget_tokens = 65536  # episodes that outgrow this are dropped whole
 steps = 40           # optimizer steps
 tasks_per_batch = 8  # tasks sampled per step
 group_size = 4       # attempts per task (the on-policy group)
+# loss = "topk_ce"   # optional: weighted CE over the teacher's top-k candidate
+# topk = 8           # tokens per position instead of reverse-KL on realized
+#                    # tokens; trains ~topk x the token volume per step
 
 [sampling]
 temperature = 1.0    # keep 1.0: issued logprobs stay comparable to the teacher
@@ -58,7 +61,13 @@ steps = 2              # optional SFT bootstrap on the teacher's own passing
 rollouts_per_task = 2  # trajectories before OPD; steps = 0 disables it
 
 [eval]
-every = 10  # interim student eval every N steps (train-split subsample)
+every = 0  # interim evals off (the default); N > 0 evals a train subsample every N steps
+# Baseline reuse: point these at a prior run's eval reports to skip re-running
+# the holdout baselines. Validated before use: identical holdout task ids,
+# attempts >= this run's gate.k, and the same teacher (teacher baseline) or
+# student base model (student baseline, via the report's recorded base_model).
+# teacher_baseline_from = "runs/prior/evals/baseline-teacher.json"
+# student_baseline_from = "runs/prior/evals/baseline-student-before.json"
 
 [gate]
 k = 3                        # holdout attempts per task for each baseline
