@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from wmh.distill.config import (
     DistillConfig,
+    EvalConfig,
     HarborConfig,
     PricingConfig,
     StudentConfig,
@@ -73,9 +74,12 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.warmup.rollouts_per_task == 1
     assert cfg.warmup.keep == "passed"
     assert cfg.warmup.learning_rate is None
-    assert cfg.eval.every == 10
+    # Interim evals default OFF: the holdout gate is the run's measurement.
+    assert cfg.eval.every == 0
     assert cfg.eval.tasks == 12
     assert cfg.eval.k == 1
+    assert cfg.eval.teacher_baseline_from is None
+    assert cfg.eval.student_baseline_from is None
     assert cfg.gate.k == 3
     assert cfg.gate.min_teacher_fraction == pytest.approx(0.7)
     assert cfg.gate.require_no_regression is True
@@ -131,9 +135,11 @@ keep = "all"
 learning_rate = 2e-5
 
 [eval]
-every = 0
+every = 5
 tasks = 2
 k = 2
+teacher_baseline_from = "runs/prior/evals/baseline-teacher.json"
+student_baseline_from = "runs/prior/evals/baseline-student-before.json"
 
 [gate]
 k = 1
@@ -171,7 +177,9 @@ tags = ["smoke", "tb2"]
     assert cfg.warmup.rollouts_per_task == 3
     assert cfg.warmup.keep == "all"
     assert cfg.warmup.learning_rate == pytest.approx(2e-5)
-    assert cfg.eval.every == 0
+    assert cfg.eval.every == 5
+    assert cfg.eval.teacher_baseline_from == "runs/prior/evals/baseline-teacher.json"
+    assert cfg.eval.student_baseline_from == "runs/prior/evals/baseline-student-before.json"
     assert cfg.gate.min_teacher_fraction == 1.0
     assert cfg.pricing.is_complete()
     # Explicit cached rates win over the 20%-of-prefill derivation.
@@ -206,6 +214,50 @@ def test_warmup_keep_rejects_unknown_value(tmp_path: Path) -> None:
         load_distill_config(_write(tmp_path, text))
 
 
+def test_log_sample_rollouts_defaults_to_two_and_zero_disables(tmp_path: Path) -> None:
+    cfg = load_distill_config(_write(tmp_path, MINIMAL_TOML))
+    assert cfg.train.log_sample_rollouts == 2
+    disabled = load_distill_config(
+        _write(tmp_path, MINIMAL_TOML + "\n[train]\nlog_sample_rollouts = 0\n")
+    )
+    assert disabled.train.log_sample_rollouts == 0
+
+
+def test_train_loss_defaults_to_importance_sampling(tmp_path: Path) -> None:
+    cfg = load_distill_config(_write(tmp_path, MINIMAL_TOML))
+    assert cfg.train.loss == "importance_sampling"
+    assert cfg.train.topk == 8
+
+
+@pytest.mark.parametrize("loss", ["importance_sampling", "topk_ce"])
+def test_train_loss_accepts_both_modes(tmp_path: Path, loss: str) -> None:
+    text = MINIMAL_TOML + f"\n[train]\nloss = '{loss}'\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.train.loss == loss
+
+
+def test_train_loss_rejects_unknown_value(tmp_path: Path) -> None:
+    text = MINIMAL_TOML + "\n[train]\nloss = 'forward_kl'\n"
+    with pytest.raises(ValueError, match="train.loss"):
+        load_distill_config(_write(tmp_path, text))
+
+
+@pytest.mark.parametrize("topk", [1, 8, 64])
+def test_train_topk_bounds_accepted(tmp_path: Path, topk: int) -> None:
+    text = MINIMAL_TOML + f"\n[train]\nloss = 'topk_ce'\ntopk = {topk}\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.train.topk == topk
+
+
+def test_snapshot_round_trips_the_topk_ce_loss(tmp_path: Path) -> None:
+    text = MINIMAL_TOML + "\n[train]\nloss = 'topk_ce'\ntopk = 16\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    restored = load_distill_config(_write(tmp_path, snapshot_toml(cfg)))
+    assert restored == cfg
+    assert restored.train.loss == "topk_ce"
+    assert restored.train.topk == 16
+
+
 @pytest.mark.parametrize(
     "snippet",
     [
@@ -215,6 +267,9 @@ def test_warmup_keep_rejects_unknown_value(tmp_path: Path) -> None:
         "[train]\nlearning_rate = 0.0",
         "[train]\nadvantage_clip = 0.0",
         "[train]\ngroup_size = 0",
+        "[train]\ntopk = 0",
+        "[train]\ntopk = 65",
+        "[train]\nlog_sample_rollouts = -1",
         "[sampling]\ntemperature = -0.1",
         "[sampling]\ntemperature = 2.5",
         "[sampling]\nmax_tokens = 0",
@@ -335,9 +390,35 @@ def test_snapshot_round_trips_the_warmup_section(tmp_path: Path) -> None:
     # one.
     for warmup in (
         WarmupConfig(),
-        WarmupConfig(steps=2, rollouts_per_task=2, keep="all", learning_rate=5e-5),
+        WarmupConfig(
+            steps=2,
+            rollouts_per_task=2,
+            keep="all",
+            learning_rate=5e-5,
+            trajectories_from=".wmh/distill/runs/source-run",
+        ),
     ):
         cfg = _minimal_config().model_copy(update={"warmup": warmup}, deep=True)
+        snap_path = tmp_path / "snapshot.toml"
+        snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+        assert load_distill_config(snap_path) == cfg
+
+
+def test_snapshot_round_trips_the_eval_section(tmp_path: Path) -> None:
+    # Both shapes must survive snapshot -> parse: the all-defaults section
+    # (both baseline reuse paths are None, so exclude_none omits them) and a
+    # fully populated one.
+    for eval_cfg in (
+        EvalConfig(),
+        EvalConfig(
+            every=5,
+            tasks=4,
+            k=2,
+            teacher_baseline_from="runs/prior/evals/baseline-teacher.json",
+            student_baseline_from="runs/prior/evals/baseline-student-before.json",
+        ),
+    ):
+        cfg = _minimal_config().model_copy(update={"eval": eval_cfg}, deep=True)
         snap_path = tmp_path / "snapshot.toml"
         snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
         assert load_distill_config(snap_path) == cfg

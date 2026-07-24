@@ -105,12 +105,32 @@ class TrainConfig(BaseModel):
     tasks_per_batch: int = Field(default=8, ge=1)
     group_size: int = Field(default=4, ge=1)
     learning_rate: float = Field(default=1e-4, gt=0)
+    loss: Literal["importance_sampling", "topk_ce"] = "importance_sampling"
+    """The distillation loss. `importance_sampling` (the default) trains on
+    per-token reverse-KL advantages over the student's realized tokens;
+    `topk_ce` trains a weighted cross-entropy over the teacher's top-k
+    candidate tokens at every loss position (renormalized teacher probs as
+    weights), which carries dense supervision from tokens the student did
+    NOT sample at roughly k times the training-token volume."""
+
+    topk: int = Field(default=8, ge=1, le=64)
+    """How many teacher candidates per position under `loss = "topk_ce"`
+    (ignored by `importance_sampling`). Training volume scales linearly
+    with it (k replicated cross_entropy datums per source datum)."""
+
     advantage_clip: float = Field(default=4.0, gt=0)
     center_advantages: bool = True
     max_datum_tokens: int = Field(default=65536, ge=1)
     sampler_refresh_every: int = Field(default=1, ge=1)
     save_state_every: int = Field(default=8, ge=1)
     trial_concurrency: int = Field(default=8, ge=1)
+
+    log_sample_rollouts: int = Field(default=2, ge=0)
+    """How many sample episodes each batch renders to human-readable text:
+    after every training step, the warmup collection, and each eval batch,
+    the first N span-bearing trials are decoded WITH the chat template's
+    special tokens and written to the run dir's `samples/` files plus the
+    tracker's samples table (see `wmh.distill.samples`). 0 disables."""
 
 
 class SamplingConfig(BaseModel):
@@ -158,17 +178,41 @@ class WarmupConfig(BaseModel):
     learning_rate: Annotated[float, Field(gt=0)] | None = None
     """Warmup optimizer LR; None uses `train.learning_rate`."""
 
+    trajectories_from: str | None = None
+    """Path to another run dir whose warmup COLLECTION completed: the warmup
+    phase loads that run's `warmup-trials.json` manifest instead of collecting
+    teacher rollouts here. The manifest's teacher must match this run's
+    teacher, the `keep` filter applies at load time (so it may differ from the
+    source run's), and loading charges no meter (the source run paid for the
+    collection); the CE training passes still run per this run's config."""
+
 
 class EvalConfig(BaseModel):
-    """Periodic held-out evaluation schedule."""
+    """Held-out evaluation schedule plus cross-run baseline reuse."""
 
     model_config = ConfigDict(extra="forbid")
 
-    every: int = Field(default=10, ge=0)
-    """Evaluate every N train steps; 0 means final eval only."""
+    every: int = Field(default=0, ge=0)
+    """Evaluate every N train steps; 0 (the default) means final eval only."""
 
     tasks: int = Field(default=12, ge=1)
     k: int = Field(default=1, ge=1)
+
+    teacher_baseline_from: str | None = None
+    """Path to a prior run's `evals/baseline-teacher.json` to reuse instead of
+    re-running the teacher-in-harness holdout baseline (the teacher's solve
+    rate is a property of the teacher, not of the training run). The report
+    must cover exactly this run's holdout task ids, carry at least `gate.k`
+    attempts, and name the same teacher model; it is copied into this run's
+    `evals/` with a provenance `source` note."""
+
+    student_baseline_from: str | None = None
+    """Path to a prior run's `evals/baseline-student-before.json` to reuse
+    instead of re-running the pre-training student baseline (parallel runs
+    from the same base model share it). Validated like
+    `teacher_baseline_from`, except the model check is on the report's
+    recorded `base_model` field: the student's provider model is a per-run
+    sampler path and never matches across runs."""
 
 
 class GateConfig(BaseModel):
