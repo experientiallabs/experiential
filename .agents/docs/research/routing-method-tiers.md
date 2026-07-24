@@ -261,3 +261,22 @@ form = IrtNet-style IRT ability model (sample-efficient, answers thin-cluster no
 code) with IRT-Router's monotonicity for cold start; tier-3's concrete form = JiSi's
 route-vs-aggregate switch + MoT latent aggregation; multi-tenant lever = federated per-cluster
 stats. Cache-aware multi-turn cluster routing remains whitespace nobody claimed - still ours.
+
+## CORRECTION (2026-07-24): LLMRouterBench text-duplication leak, caught by the audit loop
+
+The first IRT run on LLMRouterBench flagship posted +12pt over the rank router - too good, so
+it went through the leak audit: zero id overlap, shuffled-label control collapsed (0.698,
+no reward leak), BUT 327/468 test scenarios had task text appearing VERBATIM in the fit split
+(the arenahard subsets categorize the same prompts across dataset dirs; overall 1,560 -> 809
+unique scenarios, nearly half duplicated). Trigram-hashing embeddings make text dupes
+near-exact retrieval keys, so the learned head profited most. Adapter now dedupes by task
+text (first occurrence wins, logged; regression test), tainted runs purged.
+
+CLEAN flagship numbers (809 scenarios, 566 fit / 243 test, zero residual overlap): best-single
+gemini-2.5-pro 0.8045 @ $0.05284; rank lam=0 0.7202 @ $0.01592; IRT lam=0 0.7449 @ $0.01643
+(+2.5pt over rank ~= the +-2.5pt noise floor at n=243 - directional, matching IrtNet's
+published direction, not conclusive here); at lam=0.1 both ~0.68 @ $0.0024 (95% cheaper).
+Honest reading: on this small deduped set, routing is a cost-saver (-6-8pt for -70-95% cost),
+not an accuracy win. Dup audit on the other matrices: RouterBench classic 16/36,497 (0.04%,
+tables stand), ours9 0/1,199 (clean). Earlier pre-dedupe LLMRouterBench rows in this doc are
+SUPERSEDED by this section.

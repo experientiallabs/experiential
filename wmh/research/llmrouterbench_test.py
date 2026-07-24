@@ -56,3 +56,13 @@ def test_datasets_missing_a_model_are_skipped(tmp_path: Path) -> None:
 def test_empty_root_fails_loudly(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="no dataset"):
         load_llmrouterbench(tmp_path, models=_MODELS)
+
+
+def test_duplicate_task_texts_are_dropped(tmp_path: Path) -> None:
+    # Same origin_query under two datasets: only the first survives (leakage control).
+    _write(tmp_path, "aime", "model-a", [_rec(1, 1.0, 0.02)])
+    _write(tmp_path, "aime", "model-b", [_rec(1, 0.0, 0.001)])
+    _write(tmp_path, "aime2", "model-a", [_rec(1, 1.0, 0.02)])
+    _write(tmp_path, "aime2", "model-b", [_rec(1, 0.0, 0.001)])
+    matrix = load_llmrouterbench(tmp_path, models=_MODELS)
+    assert matrix.scenario_ids() == ["aime:1"]

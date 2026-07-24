@@ -87,6 +87,12 @@ def load_llmrouterbench(
     ]
 
     outcomes: list[ScenarioOutcome] = []
+    # Task-level leakage control: several dataset dirs share query texts (the arenahard
+    # subsets categorize the same prompts), so a scenario split without text dedupe leaks
+    # fit tasks into test - live-caught inflating a learned router by ~+12pt (2026-07-24).
+    # First occurrence wins; drops are logged, never silent.
+    seen_tasks: set[str] = set()
+    duplicate_scenarios = 0
     for dataset_dir in dataset_dirs:
         per_model: dict[str, dict[int, dict]] = {}
         for name in model_names:
@@ -107,6 +113,10 @@ def load_llmrouterbench(
             )
         for index in sorted(shared):
             query = str(per_model[model_names[0]][index]["origin_query"])
+            if query in seen_tasks:
+                duplicate_scenarios += 1
+                continue
+            seen_tasks.add(query)
             sid = f"{dataset_dir.name}:{index}"
             for name in model_names:
                 rec = per_model[name][index]
@@ -125,4 +135,6 @@ def load_llmrouterbench(
                 )
     if not outcomes:
         raise ValueError(f"no datasets under {root} covered all of: {model_names}")
+    if duplicate_scenarios:
+        logger.info("dropped %d duplicate-text scenarios (leakage control)", duplicate_scenarios)
     return OutcomeMatrix(pool=pool, outcomes=outcomes)
