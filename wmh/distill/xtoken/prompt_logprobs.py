@@ -47,6 +47,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from typing import Literal
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -105,16 +106,32 @@ class _LogprobEntry(BaseModel):
     logprob: float
 
 
+class _LegacyLogprobs(BaseModel):
+    """The legacy `logprobs` object returned by the `echo` dialect.
+
+    Flat arrays, one entry per echoed prompt position plus the throwaway
+    sampled token, so `token_logprobs[p]` scores `token_ids[p]`. Verified
+    against Fireworks serving GLM-5.2: `token_ids` comes back identical to the
+    ids sent, which is what makes span alignment safe.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    token_logprobs: list[float | None] = Field(default_factory=list)
+    token_ids: list[int] = Field(default_factory=list)
+
+
 class _Choice(BaseModel):
-    """The one completion choice, which carries `prompt_logprobs` on some versions."""
+    """The one completion choice, carrying whichever logprob shape the server returns."""
 
     model_config = ConfigDict(extra="ignore")
 
     prompt_logprobs: list[dict[str, _LogprobEntry] | None] | None = None
+    logprobs: _LegacyLogprobs | None = None
 
 
 class _CompletionsResponse(BaseModel):
-    """A `/v1/completions` response, tolerant of where `prompt_logprobs` lands."""
+    """A `/v1/completions` response, tolerant of where the logprobs land."""
 
     model_config = ConfigDict(extra="ignore")
 
@@ -122,8 +139,39 @@ class _CompletionsResponse(BaseModel):
     choices: list[_Choice] = Field(default_factory=list)
 
 
+ScoringDialect = Literal["echo", "prompt_logprobs"]
+"""How the server exposes logprobs over caller-supplied prompt tokens.
+
+`echo` is the OpenAI legacy form (`echo: true` plus an INTEGER `logprobs`),
+which is what hosted providers expose; Fireworks' GLM-5.2 needs it, and it
+additionally echoes `token_ids` so the round trip can be verified.
+`prompt_logprobs` is the vLLM-native form, available when we run the server
+ourselves. The two differ in both request and response shape, so the dialect is
+explicit rather than sniffed: a silent guess would send a body the server
+accepts while returning nothing useful.
+"""
+
+
+class _EchoRequest(BaseModel):
+    """Scoring body for the `echo` dialect.
+
+    `logprobs` MUST be an integer. Sending `true` selects the newer
+    OpenAI-style `content` array, which carries no prompt positions at all, and
+    the server returns 200 either way.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    prompt: list[int]
+    max_tokens: int = 1
+    echo: bool = True
+    logprobs: int = 1
+    temperature: float = 0.0
+
+
 class _CompletionsRequest(BaseModel):
-    """The scoring request body: a token-id prompt, one throwaway sampled token."""
+    """Scoring body for the vLLM-native `prompt_logprobs` dialect."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -182,6 +230,7 @@ class PromptLogprobClient:
         model: str,
         *,
         api_key: str | None = None,
+        dialect: ScoringDialect = "echo",
         timeout_s: float = DEFAULT_TIMEOUT_S,
         transport: httpx.BaseTransport | None = None,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -196,6 +245,9 @@ class PromptLogprobClient:
                 `WMH_ENDPOINT_API_KEY`; this module never reads the environment
                 itself, so the real provider keys cannot leak to an arbitrary host.
                 None (the norm for a private vLLM host) sends no auth header.
+            dialect: Which logprob surface the server exposes (see
+                `ScoringDialect`). Defaults to `echo`, what hosted providers
+                offer; use `prompt_logprobs` against a vLLM server we run.
             timeout_s: Per-request wall-clock bound in seconds, applied to connect,
                 read, write, and pool waits. Defaults to `DEFAULT_TIMEOUT_S`
                 (1200s), sized for a 65k-token prefill queued behind other
@@ -221,6 +273,7 @@ class PromptLogprobClient:
             )
         self._url = _completions_url(endpoint)
         self._model = model
+        self._dialect: ScoringDialect = dialect
         self._timeout_s = timeout_s
         self._max_attempts = max_attempts
         self._sleep = sleep
@@ -315,10 +368,66 @@ class PromptLogprobClient:
         self.close()
 
     def _score(self, token_ids: list[int], *, count_usage: bool) -> list[float | None]:
-        body = _CompletionsRequest(model=self._model, prompt=token_ids).model_dump()
+        if self._dialect == "echo":
+            body = _EchoRequest(model=self._model, prompt=token_ids).model_dump()
+        else:
+            body = _CompletionsRequest(model=self._model, prompt=token_ids).model_dump()
         response = self._post(body, token_count=len(token_ids) if count_usage else 0)
+        if self._dialect == "echo":
+            return self._echo_row(response, token_ids)
         rows = self._prompt_logprob_rows(response, expected=len(token_ids))
         return self._realized_row(rows, token_ids)
+
+    def _echo_row(self, response: _CompletionsResponse, token_ids: list[int]) -> list[float | None]:
+        """Per-position logprobs from the legacy `echo` response shape.
+
+        The response echoes the prompt plus the one throwaway sampled token, so
+        it is one entry LONGER than the prompt and is truncated back. Two checks
+        are not optional:
+
+        - `token_ids` must equal the ids we sent. The server is free to
+          re-tokenize or prepend a BOS; if it did, every span offset the chunk
+          aligner computed would be shifted and every span sum silently wrong.
+        - position 0 is forced to None. Fireworks returns `0.0` there rather
+          than null, and a logprob of 0.0 means probability 1, so summing it
+          would inflate any span that started at position 0.
+        """
+        if not response.choices or response.choices[0].logprobs is None:
+            raise PromptLogprobError(
+                f"teacher scoring response from {self._url} carried no logprobs object; the "
+                "echo dialect needs `echo: true` with an INTEGER `logprobs` (sending `true` "
+                "returns a content array with no prompt positions). Confirm the served model "
+                f"{self._model!r} supports /v1/completions with echo"
+            )
+        legacy = response.choices[0].logprobs
+        expected = len(token_ids)
+        returned_ids = legacy.token_ids[:expected]
+        if returned_ids != token_ids:
+            first = next(
+                (
+                    index
+                    for index, (sent, got) in enumerate(zip(token_ids, returned_ids, strict=False))
+                    if sent != got
+                ),
+                min(len(token_ids), len(returned_ids)),
+            )
+            raise PromptLogprobError(
+                f"teacher scoring echoed {len(returned_ids)} token id(s) that do not match the "
+                f"{expected} sent (first difference at position {first}); the server "
+                "re-tokenized the prompt instead of scoring the exact ids, so every chunk span "
+                "offset would be wrong. Send the prompt as a token-id array (not text) and "
+                "confirm the endpoint's tokenizer matches the one the chunk plan was built with"
+            )
+        values = legacy.token_logprobs[:expected]
+        if len(values) != expected:
+            raise PromptLogprobError(
+                f"teacher scoring returned {len(values)} logprob(s) for a {expected}-token "
+                "prompt; the echo response must carry one entry per prompt position"
+            )
+        row: list[float | None] = list(values)
+        # Position 0 has no context; Fireworks reports 0.0 rather than null.
+        row[0] = None
+        return row
 
     def _post(self, body: dict[str, object], *, token_count: int) -> _CompletionsResponse:
         """POST one scoring request, retrying only transient failures."""
