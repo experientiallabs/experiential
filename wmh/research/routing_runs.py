@@ -1,0 +1,174 @@
+"""Uniform run records for routing ablations: one evaluator, every variant, full transparency.
+
+Every ablation run (static, best-single, rank, rank+knob, IRT, future variants) evaluates
+through `evaluate_choices` - a `choose(scenario_id) -> model` callable - so metrics are
+computed identically regardless of the router's internals. Each run persists as one JSONL
+record (`append_run`) carrying the EXPLAIN BLOCK alongside the headline numbers: model mix,
+per-model latency, and the blended token breakdown by model. That is what makes results like
+"cost went down AND p50 went down" verifiable instead of fishy: cheap models are usually also
+the fast ones, and the mix-weighted per-model latency table shows it directly.
+
+The dashboard and run reports read these records; serving's request log (D-METERING) is the
+live twin of the same fields.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from statistics import median
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, Field, JsonValue
+
+from wmh.optimize.outcomes import OutcomeMatrix
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class ChoiceEval(BaseModel):
+    """Metrics + explain block for one routing over a scenario set."""
+
+    accuracy: float
+    cost_per_call: float
+    latency_p50_s: float | None = None  # None when the matrix carries no timings
+    latency_p95_s: float | None = None
+    scenarios: int
+    unscored: int
+    model_mix: dict[str, float]
+    tokens_by_model: dict[str, dict[str, int]]  # {model: {input, output}}
+    per_model_latency_p50_s: dict[str, float] = Field(default_factory=dict)
+    per_model_cost_per_call: dict[str, float] = Field(default_factory=dict)
+
+
+class RunRecord(BaseModel):
+    """One ablation run, as persisted to runs.jsonl (the dashboard's data source)."""
+
+    run_id: str
+    ts: str
+    matrix: str  # which outcome matrix (routerbench, llmrouterbench, ours, wm corpus name)
+    variant: str  # static | best-single | rank | irt | ...
+    params: dict[str, JsonValue] = Field(default_factory=dict)
+    split_seed: int = 0
+    fit_scenarios: int = 0
+    test_scenarios: int = 0
+    result: ChoiceEval
+    baselines: dict[str, ChoiceEval] = Field(default_factory=dict)
+    notes: str = ""
+
+
+def evaluate_choices(
+    matrix: OutcomeMatrix, ids: list[str], choose: Callable[[str], str]
+) -> ChoiceEval:
+    """Score `choose` over `ids` with the full explain block (see module docstring)."""
+    by_cell: dict[tuple[str, str], list] = {}
+    for outcome in matrix.outcomes:
+        if outcome.reward is not None:
+            by_cell.setdefault((outcome.scenario_id, outcome.model), []).append(outcome)
+
+    rewards: list[float] = []
+    costs: list[float] = []
+    seconds: list[float] = []
+    mix: dict[str, int] = {}
+    tokens: dict[str, dict[str, int]] = {}
+    per_model_seconds: dict[str, list[float]] = {}
+    per_model_costs: dict[str, list[float]] = {}
+    unscored = 0
+    for sid in ids:
+        model = choose(sid)
+        mix[model] = mix.get(model, 0) + 1
+        cells = by_cell.get((sid, model))
+        if not cells:
+            unscored += 1
+            continue
+        rewards.append(sum(o.reward for o in cells if o.reward is not None) / len(cells))
+        cell_cost = sum(o.cost_usd for o in cells) / len(cells)
+        costs.append(cell_cost)
+        per_model_costs.setdefault(model, []).append(cell_cost)
+        bucket = tokens.setdefault(model, {"input": 0, "output": 0})
+        for outcome in cells:
+            bucket["input"] += outcome.usage.input_tokens
+            bucket["output"] += outcome.usage.output_tokens
+            for value in outcome.call_seconds:
+                seconds.append(value)
+                per_model_seconds.setdefault(model, []).append(value)
+    if not rewards:
+        raise ValueError("no scored outcomes for any routed choice")
+
+    def _p95(values: list[float]) -> float:
+        ordered = sorted(values)
+        return ordered[min(len(ordered) - 1, int(round(0.95 * (len(ordered) - 1))))]
+
+    return ChoiceEval(
+        accuracy=sum(rewards) / len(rewards),
+        cost_per_call=sum(costs) / len(costs),
+        latency_p50_s=median(seconds) if seconds else None,
+        latency_p95_s=_p95(seconds) if seconds else None,
+        scenarios=len(ids),
+        unscored=unscored,
+        model_mix={m: count / len(ids) for m, count in sorted(mix.items())},
+        tokens_by_model=tokens,
+        per_model_latency_p50_s={
+            m: median(values) for m, values in sorted(per_model_seconds.items())
+        },
+        per_model_cost_per_call={
+            m: sum(values) / len(values) for m, values in sorted(per_model_costs.items())
+        },
+    )
+
+
+def append_run(record: RunRecord, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(record.model_dump_json() + "\n")
+
+
+def run_report(record: RunRecord) -> str:
+    """Human-readable run report: headline, deltas vs baselines, and the explain block."""
+    result = record.result
+    lines = [
+        f"# Run {record.run_id}: {record.variant} on {record.matrix}",
+        f"{record.ts} | params {record.params} | split seed {record.split_seed} | "
+        f"{result.scenarios} test scenarios ({result.unscored} unscored)",
+        "",
+        f"accuracy {result.accuracy:.4f} | cost/call ${result.cost_per_call:.5f}"
+        + (
+            f" | latency p50 {result.latency_p50_s:.2f}s p95 {result.latency_p95_s:.2f}s"
+            if result.latency_p50_s is not None
+            else " | latency: not measured on this matrix"
+        ),
+    ]
+    for name, baseline in record.baselines.items():
+        cost_delta = (result.cost_per_call / baseline.cost_per_call - 1) * 100
+        lines.append(
+            f"vs {name}: accuracy {result.accuracy - baseline.accuracy:+.4f}, "
+            f"cost {cost_delta:+.1f}%"
+            + (
+                f", p50 {result.latency_p50_s - baseline.latency_p50_s:+.2f}s"
+                if result.latency_p50_s is not None and baseline.latency_p50_s is not None
+                else ""
+            )
+        )
+    lines += ["", "## Why (explain block)", "Model mix, with each model's own latency and cost:"]
+    for model, share in result.model_mix.items():
+        p50 = result.per_model_latency_p50_s.get(model)
+        cost = result.per_model_cost_per_call.get(model)
+        lines.append(
+            f"- {model}: {share:.0%} of calls"
+            + (f", p50 {p50:.2f}s" if p50 is not None else "")
+            + (f", ${cost:.5f}/call" if cost is not None else "")
+        )
+    lines.append("")
+    lines.append("Blended tokens by model (input/output):")
+    for model, bucket in result.tokens_by_model.items():
+        lines.append(f"- {model}: {bucket['input']:,} in / {bucket['output']:,} out")
+    if result.latency_p50_s is not None:
+        lines.append("")
+        lines.append(
+            "Note: cost and latency can drop TOGETHER when the mix shifts toward cheaper "
+            "models, because cheaper models are usually also faster (see per-model p50 above)."
+        )
+    lines.append("")
+    if record.notes:
+        lines.append(record.notes)
+    return "\n".join(lines)
