@@ -96,6 +96,7 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
         app,
         [
             "optimize",
+            "harness",
             "made",
             "--tasks",
             _tasks_file(tmp_path),
@@ -236,6 +237,7 @@ def test_optimize_accepts_world_model_as_second_argument(
         app,
         [
             "optimize",
+            "harness",
             "made",
             "wm-user",
             "--tasks",
@@ -482,6 +484,7 @@ def _invoke_harbor(tmp_path: Path, *extra: str) -> Result:
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--harbor-config",
@@ -553,6 +556,7 @@ def test_harbor_checkpoint_then_resume_completes_and_rejects_conflicts(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--resume",
@@ -587,6 +591,7 @@ def test_harbor_requires_a_run_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--harbor-config",
@@ -604,7 +609,15 @@ def test_harbor_requires_a_run_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 def test_world_model_path_rejects_harbor_only_flags(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["optimize", "made", "--run-dir", str(tmp_path / "run"), "--root", str(tmp_path)],
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path),
+        ],
     )
     assert result.exit_code == 2
     assert "apply only to the harbor environment" in result.output
@@ -653,6 +666,7 @@ def test_harbor_publication_is_idempotent_across_resumes(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--resume",
@@ -694,6 +708,7 @@ def test_harbor_seed_ref_resolves_through_the_store_and_resume_pins_it(
         app,
         [
             "optimize",
+            "harness",
             "pi@champion",
             "harbor",
             "--harbor-config",
@@ -723,6 +738,7 @@ def test_harbor_seed_ref_resolves_through_the_store_and_resume_pins_it(
         app,
         [
             "optimize",
+            "harness",
             "pi@champion",
             "harbor",
             "--resume",
@@ -777,6 +793,7 @@ def test_harbor_resume_accepts_a_restated_episode_timeout_for_an_e2b_run(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--resume",
