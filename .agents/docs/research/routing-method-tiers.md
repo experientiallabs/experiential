@@ -130,3 +130,14 @@ wmh/optimize/routing.py's docstring:
 
 No accidental deltas found; the two additive extras (cluster labels for the request log,
 cost evidence for the knob) do not alter lam=0 behavior.
+
+## AIQ vs the non-predictive floor (2026-07-24)
+
+RouterBench's own headline metric, computed with their normalization (hull area / shared max
+cost) on the held-out split: **rank-router AIQ 0.7447 vs Zero-Router 0.7001** (Zero-Router =
+hull of the 11 single models + their random mixes, the best label-free strategy). The fitted
+hull dominates the floor across the interior cost range, e.g. at ~$0.00094/call the router
+holds 0.772 accuracy where price-mixing toward gpt-4 interpolates ~0.70. Prediction is
+genuinely adding value beyond price interpolation. Caveat carried from their code: AIQ's
+normalization couples it to the comparison set's max cost, so we always publish hull points
+alongside the scalar.
