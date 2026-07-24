@@ -64,6 +64,10 @@ logger = logging.getLogger(__name__)
 
 TaskEnvironment = Literal["docker", "e2b"]
 HarnessBackend = Literal["local", "e2b"]
+MissingRewardMode = Literal["raise", "zero"]
+"""How a trial with no verifier reward scores: "raise" aborts (candidate search
+semantics: an unscoreable candidate is an infra failure), "zero" scores it 0.0
+with an auditable note (distillation evals: a dead runner is a failed trial)."""
 
 # In-process registry of job dirs with a score() in flight: the entry prune is destructive, so
 # concurrent scores of the same candidate must be rejected, not interleaved.
@@ -181,10 +185,13 @@ class HarborScorer:
         harbor_retries: int = 0,
         agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
         extra_agent_kwargs: JsonObject | None = None,
+        missing_reward: MissingRewardMode = "raise",
         runner: HarborRunner | None = None,
     ) -> None:
         if not tasks:
             raise ValueError("HarborScorer requires at least one resolved task")
+        if missing_reward not in ("raise", "zero"):
+            raise ValueError("missing_reward must be raise or zero")
         task_ids = [task.get_task_id().get_name() for task in tasks]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("HarborScorer requires unique task ids")
@@ -264,6 +271,7 @@ class HarborScorer:
         self._attempts = attempts
         self._agent_import_path = agent_import_path
         self._extra_agent_kwargs: JsonObject = dict(extra_agent_kwargs or {})
+        self._missing_reward: MissingRewardMode = missing_reward
         self._harness_backend: HarnessBackend = harness_backend
         self._episode_timeout_s = episode_timeout_s
         self._command_timeout_sec = command_timeout_sec
@@ -300,6 +308,7 @@ class HarborScorer:
         harbor_retries: int = 0,
         agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
         extra_agent_kwargs: JsonObject | None = None,
+        missing_reward: MissingRewardMode = "raise",
         runner: HarborRunner | None = None,
     ) -> Self:
         """Resolve the exact tasks and construct a scorer that can incur spend.
@@ -330,6 +339,7 @@ class HarborScorer:
             harbor_retries=harbor_retries,
             agent_import_path=agent_import_path,
             extra_agent_kwargs=extra_agent_kwargs,
+            missing_reward=missing_reward,
             runner=runner,
         )
 
@@ -479,7 +489,25 @@ class HarborScorer:
         for task_id in self._task_ids:
             trials = sorted(grouped[task_id], key=lambda trial: trial.trial_name)
             for attempt, trial in enumerate(trials, 1):
-                reward = _official_reward(trial, reward_key=self._reward_key)
+                note = _trial_note(trial)
+                try:
+                    reward = _official_reward(trial, reward_key=self._reward_key)
+                except HarborRewardMissingError:
+                    if self._missing_reward == "raise":
+                        raise
+                    # Evaluation-tolerant mode (distillation evals): a trial whose
+                    # runner died before the verifier could produce evidence is a
+                    # failed trial, not a reason to abort a long training run. The
+                    # note keeps the cause auditable per cell.
+                    exception = trial.exception_info
+                    cause = exception.exception_type if exception else "no exception info"
+                    reward = 0.0
+                    note = f"missing-reward: {cause}; scored 0"
+                    logger.warning(
+                        "harbor trial %s has no verifier reward (%s); scoring 0",
+                        trial.trial_name,
+                        cause,
+                    )
                 cells.append(
                     ScoreCell(
                         task_id=task_id,
@@ -487,7 +515,7 @@ class HarborScorer:
                         reward=reward,
                         passed=reward_passed(reward, self._reward_mode),
                         artifact_dir=str(run.job_dir / trial.trial_name),
-                        note=_trial_note(trial),
+                        note=note,
                     )
                 )
         return ScoreReport(
