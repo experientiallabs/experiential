@@ -155,3 +155,41 @@ def test_policy_round_trips_through_json(tmp_path: Path) -> None:
     path = tmp_path / "policy.json"
     policy.save(path)
     assert RoutingPolicy.load(path) == policy
+
+
+def test_azure_embedder_spec_requires_backend_fields() -> None:
+    with pytest.raises(ValueError, match="deployment"):
+        EmbedderSpec(kind="azure", dim=3072)
+
+
+def test_azure_embedder_spec_builds_a_batched_provider_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZ_EMBED_KEY", "sk-test")
+    spec = EmbedderSpec(
+        kind="azure",
+        dim=3072,
+        deployment="text-embedding-3-large",
+        endpoint="https://example.openai.azure.com",
+        api_key_env="AZ_EMBED_KEY",
+        batch=128,
+    )
+    embedder = spec.build()  # constructs lazily; no network until embed()
+    from wmh.retrieval.embedders import BatchedEmbedder
+
+    assert isinstance(embedder, BatchedEmbedder)
+
+
+def test_azure_embedder_spec_missing_key_env_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AZ_EMBED_KEY", raising=False)
+    spec = EmbedderSpec(
+        kind="azure",
+        dim=8,
+        deployment="d",
+        endpoint="https://example.openai.azure.com",
+        api_key_env="AZ_EMBED_KEY",
+    )
+    with pytest.raises(ValueError, match="AZ_EMBED_KEY"):
+        spec.build()

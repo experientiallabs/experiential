@@ -104,23 +104,38 @@ def fit_rank_policy(
 
     # Per-cluster, per-model reward sums over SCORED episodes only.
     cluster_of = {sid: int(label) for sid, label in zip(scenario_ids, labels, strict=True)}
-    sums: dict[int, dict[str, tuple[float, int]]] = {c: {} for c in range(k)}
+    sums: dict[int, dict[str, tuple[float, float, int]]] = {c: {} for c in range(k)}
     counts: Counter[int] = Counter(cluster_of.values())
     prefix_counts: dict[int, Counter[str]] = {c: Counter() for c in range(k)}
     for sid, cluster in cluster_of.items():
         if ":" in sid:
             prefix_counts[cluster][sid.split(":", 1)[0]] += 1
     pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
+    total_cost = 0.0
+    total_count = 0
     for outcome in matrix.outcomes:
         cluster = cluster_of.get(outcome.scenario_id)
         if cluster is None or outcome.reward is None:
             continue
-        reward_sum, count = sums[cluster].get(outcome.model, (0.0, 0))
-        sums[cluster][outcome.model] = (reward_sum + outcome.reward, count + 1)
+        reward_sum, cost_sum, count = sums[cluster].get(outcome.model, (0.0, 0.0, 0))
+        sums[cluster][outcome.model] = (
+            reward_sum + outcome.reward,
+            cost_sum + outcome.cost_usd,
+            count + 1,
+        )
+        total_cost += outcome.cost_usd
+        total_count += 1
 
     clusters: list[ClusterRanking] = []
     for cluster in range(k):
-        means = {model: reward_sum / count for model, (reward_sum, count) in sums[cluster].items()}
+        means = {
+            model: reward_sum / count
+            for model, (reward_sum, _cost_sum, count) in sums[cluster].items()
+        }
+        mean_costs = {
+            model: cost_sum / count
+            for model, (_reward_sum, cost_sum, count) in sums[cluster].items()
+        }
         if not means:
             # A cluster with no scored episodes ranks nothing; selection falls through to
             # default_rank scores. Logged, never silent.
@@ -136,6 +151,7 @@ def fit_rank_policy(
                 centroid=[float(v) for v in kmeans.cluster_centers_[cluster]],
                 ranking=ranking or [_overall_best(matrix, set(scenario_ids))],
                 scores={model: round(mean, 6) for model, mean in means.items()},
+                costs={model: round(mean, 8) for model, mean in mean_costs.items()},
                 total=counts[cluster],
             )
         )
@@ -150,6 +166,7 @@ def fit_rank_policy(
         top_k_clusters=top_k_clusters,
         beta=beta,
         default_rank=default_rank,
+        cost_scale=(total_cost / total_count) if total_count else 0.0,
         fitted_from=fitted_from,
     )
 
@@ -165,6 +182,36 @@ def _overall_best(matrix: OutcomeMatrix, ids: set[str]) -> str:
         raise ValueError("no scored outcomes; cannot pick a default model")
     pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
     return min(sums, key=lambda m: (-(sums[m][0] / sums[m][1]), pool_order[m]))
+
+
+def rerank_policy(policy: RoutingPolicy, *, cost_weight: float) -> RoutingPolicy:
+    """Re-rank a fitted policy's clusters under a cost weight, WITHOUT refitting.
+
+    The fit-once, slide-the-knob property (Hybrid LLM, arXiv 2404.14618): every cluster keeps
+    its stored reward/cost evidence, and the ranking key becomes
+    `mean_reward - cost_weight * mean_cost / cost_scale` (cost in fit-set-average-call units,
+    so cost_weight trades one reward point against one average call). `cost_weight=0` returns
+    the policy unchanged - the faithful Avengers behavior; the reference has no cost term
+    (Avengers-Pro's alpha is the published analogue).
+    """
+    if cost_weight == 0.0:
+        return policy
+    if policy.kind != "rank":
+        raise ValueError("only rank policies can be re-ranked")
+    if policy.cost_scale <= 0.0:
+        raise ValueError("policy has no cost_scale; refit with cost evidence to use the knob")
+    pool_order = {entry.name: index for index, entry in enumerate(policy.pool)}
+    clusters = []
+    for cluster in policy.clusters:
+        keyed = {
+            model: cluster.scores.get(model, 0.0)
+            - cost_weight * cluster.costs.get(model, 0.0) / policy.cost_scale
+            for model in cluster.ranking
+        }
+        ranking = sorted(keyed, key=lambda m: (-keyed[m], pool_order[m]))
+        clusters.append(cluster.model_copy(update={"ranking": ranking}))
+    provenance = f"{policy.fitted_from or 'unknown'} | cost_weight={cost_weight:g}"
+    return policy.model_copy(update={"clusters": clusters, "fitted_from": provenance})
 
 
 class PolicyEval(BaseModel):

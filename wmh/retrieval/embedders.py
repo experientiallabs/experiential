@@ -81,3 +81,25 @@ def get_embedder(config: HarnessConfig) -> Embedder:
 
     # `embed_provider_config` resolves the backing provider and stamps `embed_dim` on it.
     return get_provider(config.embed_provider_config())
+
+
+class BatchedEmbedder:
+    """Chunk large embed calls to fit a provider's per-request input limits.
+
+    Provider embedding APIs cap inputs per request (Azure/OpenAI: 2048 items and a token
+    budget). Fitting embeds tens of thousands of scenario texts at once; this wrapper splits
+    them into `batch`-sized requests and concatenates, so callers keep the one-call `Embedder`
+    protocol.
+    """
+
+    def __init__(self, embedder: Embedder, *, batch: int = 256) -> None:
+        if batch <= 0:
+            raise ValueError(f"batch must be positive, got {batch}")
+        self._embedder = embedder
+        self._batch = batch
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self._batch):
+            vectors.extend(self._embedder.embed(texts[start : start + self._batch]))
+        return vectors

@@ -23,14 +23,17 @@ forfeits warm cache reads and pays cold writes; until the fitter learns a real s
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 from pydantic import BaseModel, Field, model_validator
 
+from wmh.providers.base import Embedder, ProviderConfig, ProviderKind
 from wmh.providers.pool import PoolEntry
-from wmh.retrieval.embedders import HashingEmbedder
+from wmh.providers.registry import get_provider
+from wmh.retrieval.embedders import BatchedEmbedder, HashingEmbedder
 
 POLICY_VERSION = 2
 POLICY_FILENAME = "policy.json"
@@ -45,16 +48,48 @@ DEFAULT_RANK = 999
 class EmbedderSpec(BaseModel):
     """How to reproduce the policy's embedding function at serve time.
 
-    Hashing is deterministic, offline, and credential-free, so a policy file is fully
-    self-contained. `azure_openai` uses an Azure embedding deployment (the pool's credential
-    conventions apply); the fitter records whichever the fit actually used.
+    `hashing` is deterministic, offline, and credential-free, so a policy file is fully
+    self-contained. `azure` uses an Azure embedding deployment (per-entry credential
+    conventions matching the model pool: `api_key_env` names the env var); the fitter records
+    whichever the fit actually used, and serving reconstructs the identical function.
     """
 
-    kind: Literal["hashing"] = "hashing"
+    kind: Literal["hashing", "azure"] = "hashing"
     dim: int = 512
+    deployment: str | None = None  # azure embedding deployment name
+    endpoint: str | None = None
+    api_key_env: str | None = None
+    batch: int = 256  # provider embeds are chunked to this many texts per request
 
-    def build(self) -> HashingEmbedder:
-        return HashingEmbedder(dim=self.dim)
+    @model_validator(mode="after")
+    def _validate_backend(self) -> EmbedderSpec:
+        if self.kind == "azure" and not (self.deployment and self.endpoint):
+            raise ValueError("an azure embedder spec needs deployment and endpoint")
+        return self
+
+    def build(self) -> Embedder:
+        if self.kind == "hashing":
+            return HashingEmbedder(dim=self.dim)
+        api_key = None
+        if self.api_key_env:
+            api_key = os.environ.get(self.api_key_env)
+            if not api_key:
+                raise ValueError(
+                    f"embedder spec: environment variable {self.api_key_env} is unset or "
+                    "empty; export that account's API key"
+                )
+        provider = get_provider(
+            ProviderConfig(
+                kind=ProviderKind.AZURE_OPENAI,
+                model=self.deployment or "",
+                embed_model=self.deployment,
+                embed_dim=self.dim,
+                endpoint=self.endpoint,
+                api_version="2024-10-21",
+            ),
+            api_key=api_key,
+        )
+        return BatchedEmbedder(provider, batch=self.batch)
 
 
 class ClusterRanking(BaseModel):
@@ -65,6 +100,7 @@ class ClusterRanking(BaseModel):
     centroid: list[float]
     ranking: list[str] = Field(min_length=1)  # pool entry names, best first
     scores: dict[str, float] = Field(default_factory=dict)  # per-model mean reward (evidence)
+    costs: dict[str, float] = Field(default_factory=dict)  # per-model mean cost (evidence)
     total: int = 0  # fit scenarios that landed in this cluster
 
 
@@ -90,6 +126,9 @@ class RoutingPolicy(BaseModel):
     beta: float = Field(default=DEFAULT_BETA, gt=0.0)
     default_rank: int = Field(default=DEFAULT_RANK, ge=1)
     sticky: bool = True  # keep a conversation's incumbent model (see module docstring)
+    # Fit-set mean cost per scored episode (all models): the unit the cost knob trades against
+    # one reward point. 0 when the fit carried no usable costs.
+    cost_scale: float = 0.0
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
 
     @model_validator(mode="after")
