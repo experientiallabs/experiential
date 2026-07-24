@@ -515,5 +515,103 @@ def test_checked_in_run_configs_resolve_cookbook_renderers() -> None:
         pytest.skip("no checked-in distill run configs in this tree")
     for path in paths:
         cfg = load_distill_config(path)
-        for model in (cfg.student.base_model, cfg.teacher.model):
-            assert get_recommended_renderer_name(model), f"{path.name}: {model}"
+        # The student always samples through a cookbook renderer, whatever the
+        # teacher is.
+        assert get_recommended_renderer_name(cfg.student.base_model), (
+            f"{path.name}: {cfg.student.base_model}"
+        )
+        if cfg.teacher.backend == "tinker":
+            assert get_recommended_renderer_name(cfg.teacher.model), (
+                f"{path.name}: {cfg.teacher.model}"
+            )
+            continue
+        # An openai_compat teacher is a served model id the cookbook catalog
+        # knows nothing about (verified: zai-org/GLM-5.2 raises Unknown model).
+        # Its rendering comes from its own HuggingFace tokenizer instead, so the
+        # config must name one, plus the endpoint that serves the weights.
+        assert cfg.teacher.tokenizer, f"{path.name}: openai_compat teacher needs a tokenizer"
+        assert cfg.teacher.endpoint, f"{path.name}: openai_compat teacher needs an endpoint"
+
+
+XTOKEN_TEACHER = {
+    "backend": "openai_compat",
+    "model": "nvidia/GLM-5.2-NVFP4",
+    "tokenizer": "zai-org/GLM-5.2",
+    "alignment": "chunk",
+    "endpoint": "http://vllm-host:8000/v1",
+}
+
+
+def test_openai_compat_teacher_accepts_a_complete_config() -> None:
+    teacher = TeacherConfig.model_validate(XTOKEN_TEACHER)
+    assert teacher.backend == "openai_compat"
+    assert teacher.alignment == "chunk"
+    assert teacher.endpoint == "http://vllm-host:8000/v1"
+
+
+@pytest.mark.parametrize("missing", ["endpoint", "tokenizer"])
+def test_openai_compat_teacher_requires_endpoint_and_tokenizer(missing: str) -> None:
+    payload = {key: value for key, value in XTOKEN_TEACHER.items() if key != missing}
+    with pytest.raises(ValidationError, match=missing):
+        TeacherConfig.model_validate(payload)
+
+
+def test_openai_compat_teacher_requires_chunk_alignment() -> None:
+    # An endpoint with same_tokenizer alignment would ship the student's token
+    # ids to a foreign vocabulary and score noise without erroring.
+    payload = {**XTOKEN_TEACHER, "alignment": "same_tokenizer"}
+    with pytest.raises(ValidationError, match="requires teacher.alignment"):
+        TeacherConfig.model_validate(payload)
+
+
+def test_openai_compat_teacher_rejects_a_tinker_checkpoint() -> None:
+    payload = {**XTOKEN_TEACHER, "checkpoint": "tinker://weights/abc"}
+    with pytest.raises(ValidationError, match="checkpoint"):
+        TeacherConfig.model_validate(payload)
+
+
+def test_tinker_teacher_rejects_an_endpoint() -> None:
+    with pytest.raises(ValidationError, match="only for teacher.backend"):
+        TeacherConfig.model_validate({"model": "Qwen/Qwen3-8B", "endpoint": "http://x:8000/v1"})
+
+
+def test_tinker_teacher_rejects_chunk_alignment() -> None:
+    with pytest.raises(ValidationError, match="requires teacher.backend"):
+        TeacherConfig.model_validate({"model": "Qwen/Qwen3-8B", "alignment": "chunk"})
+
+
+def test_chunk_alignment_rejects_topk_ce_loss() -> None:
+    # topk_ce trains teacher candidate ids as student targets, which index a
+    # different embedding table across vocabularies.
+    with pytest.raises(ValidationError, match="cannot be used with teacher.alignment"):
+        DistillConfig.model_validate(
+            {
+                "student": {"base_model": "Qwen/Qwen3.6-27B"},
+                "teacher": XTOKEN_TEACHER,
+                "harbor": {"job_template": "jobs/tb2.yaml"},
+                "train": {"loss": "topk_ce"},
+            }
+        )
+
+
+def test_chunk_alignment_allows_importance_sampling() -> None:
+    cfg = DistillConfig.model_validate(
+        {
+            "student": {"base_model": "Qwen/Qwen3.6-27B"},
+            "teacher": XTOKEN_TEACHER,
+            "harbor": {"job_template": "jobs/tb2.yaml"},
+            "train": {"loss": "importance_sampling"},
+        }
+    )
+    assert cfg.teacher.alignment == "chunk"
+
+
+def test_xtoken_config_round_trips_through_snapshot() -> None:
+    cfg = DistillConfig.model_validate(
+        {
+            "student": {"base_model": "Qwen/Qwen3.6-27B"},
+            "teacher": XTOKEN_TEACHER,
+            "harbor": {"job_template": "jobs/tb2.yaml"},
+        }
+    )
+    assert DistillConfig.model_validate(tomllib.loads(snapshot_toml(cfg))) == cfg

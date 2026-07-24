@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import tomli_w
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 class StudentConfig(BaseModel):
@@ -27,14 +34,86 @@ class StudentConfig(BaseModel):
 
 
 class TeacherConfig(BaseModel):
-    """The teacher that scores student tokens via compute_logprobs."""
+    """The teacher that scores the student's sampled tokens.
+
+    Two backends, distinguished by whether the teacher shares the student's
+    vocabulary. A `tinker` teacher scores the student's exact token ids through
+    `compute_logprobs`, which is only meaningful when both tokenizers agree. An
+    `openai_compat` teacher is a self-hosted vLLM server that cannot read the
+    student's ids at all, so it scores its OWN tokenization of the same
+    conversation and the two are compared span by span
+    (`alignment = "chunk"`, see `wmh.distill.xtoken`).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    backend: Literal["tinker"] = "tinker"
+    backend: Literal["tinker", "openai_compat"] = "tinker"
     model: str
     checkpoint: str | None = None
     """Optional tinker:// checkpoint path to serve the teacher from."""
+
+    endpoint: str | None = None
+    """Base URL of the OpenAI-compatible server, e.g. `http://host:8000/v1`.
+    Required by (and exclusive to) the `openai_compat` backend."""
+
+    tokenizer: str | None = None
+    """HuggingFace repo id of the teacher's tokenizer, e.g. `zai-org/GLM-5.2`.
+    The cross-tokenizer path needs it to render and tokenize the conversation
+    on the teacher's side; the model name is a served id the cookbook does not
+    know."""
+
+    alignment: Literal["same_tokenizer", "chunk"] = "same_tokenizer"
+    """How teacher logprobs line up with student tokens. `same_tokenizer`
+    scores the student's ids position for position; `chunk` aligns byte-
+    identical message content between the two tokenizations."""
+
+    @model_validator(mode="after")
+    def _check_backend_coherence(self) -> TeacherConfig:
+        """Require each backend's fields and reject the other backend's.
+
+        A half-configured cross-tokenizer teacher is the dangerous case: an
+        endpoint with `alignment = "same_tokenizer"` would send the student's
+        token ids to a foreign vocabulary and score noise without erroring.
+        """
+        if self.backend == "openai_compat":
+            missing = [
+                name
+                for name, value in (("endpoint", self.endpoint), ("tokenizer", self.tokenizer))
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    f"teacher.backend = 'openai_compat' requires {' and '.join(missing)}; "
+                    "set endpoint to the vLLM server base URL (e.g. "
+                    "'http://host:8000/v1') and tokenizer to the teacher's HuggingFace "
+                    "repo id (e.g. 'zai-org/GLM-5.2')"
+                )
+            if self.alignment != "chunk":
+                raise ValueError(
+                    "teacher.backend = 'openai_compat' requires teacher.alignment = "
+                    "'chunk': a served teacher cannot score the student's token ids, so "
+                    "its logprobs must be chunk-aligned against its own tokenization"
+                )
+            if self.checkpoint is not None:
+                raise ValueError(
+                    "teacher.checkpoint is a tinker:// weights path and has no meaning "
+                    "for the 'openai_compat' backend; drop it and point teacher.endpoint "
+                    "at the server that already serves those weights"
+                )
+            return self
+        if self.endpoint is not None:
+            raise ValueError(
+                "teacher.endpoint is only for teacher.backend = 'openai_compat'; the "
+                "tinker backend reaches its teacher through the Tinker service, so "
+                "either drop endpoint or set backend = 'openai_compat'"
+            )
+        if self.alignment != "same_tokenizer":
+            raise ValueError(
+                "teacher.alignment = 'chunk' requires teacher.backend = "
+                "'openai_compat'; a tinker teacher shares the student's vocabulary and "
+                "is scored position for position"
+            )
+        return self
 
 
 class HarborConfig(BaseModel):
@@ -348,6 +427,25 @@ class DistillConfig(BaseModel):
     pricing: PricingConfig = Field(default_factory=PricingConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     wandb: WandbConfig = Field(default_factory=WandbConfig)
+
+    @model_validator(mode="after")
+    def _check_loss_supports_alignment(self) -> DistillConfig:
+        """Reject the loss/alignment pairs that cannot be expressed on the wire.
+
+        `topk_ce` trains a weighted cross-entropy whose targets are the
+        teacher's candidate TOKEN IDS. Under a foreign vocabulary those ids
+        index a different embedding table, so they would be trained as if they
+        were student tokens: silently meaningless targets, not an error.
+        """
+        if self.teacher.alignment == "chunk" and self.train.loss == "topk_ce":
+            raise ValueError(
+                "train.loss = 'topk_ce' cannot be used with teacher.alignment = "
+                "'chunk': topk_ce trains on the teacher's candidate token ids as "
+                "student targets, and those ids mean something different in the "
+                "student's vocabulary. Use train.loss = 'importance_sampling', which "
+                "needs only scalar logprob sums per aligned chunk"
+            )
+        return self
 
 
 def load_distill_config(path: Path) -> DistillConfig:
