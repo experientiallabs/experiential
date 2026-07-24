@@ -48,6 +48,7 @@ student_prefill = 0.5
 student_sample = 1.4
 student_train = 1.3
 teacher_prefill = 2.5
+teacher_sample = 6.25
 """
 
 _BUDGET_TOML = """\
@@ -363,6 +364,8 @@ def test_distill_unpriced_meters_with_a_budget_cap_honor_yes(
 def test_distill_fully_priced_estimate_proceeds_without_budget_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The four full prices plus teacher_sample fully price the run: the two
+    # cached-prefill meters derive their 20% defaults.
     _write_inputs(tmp_path, extra_toml=_PRICING_TOML)
     recorder = _RunRecorder()
     _patch_run(monkeypatch, recorder)
@@ -374,6 +377,34 @@ def test_distill_fully_priced_estimate_proceeds_without_budget_cap(
     flat = _flat(result)
     assert "unknown" not in flat
     assert "priced total $" in flat
+
+
+def test_distill_cost_table_lists_cached_and_teacher_sample_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cost table renders every meter, with derived cached prices shown."""
+    _write_inputs(tmp_path, extra_toml=_PRICING_TOML + _BUDGET_TOML)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+
+    result = _invoke(tmp_path, "--yes")
+
+    assert result.exit_code == 0, result.output
+    flat = _flat(result)
+    for meter in (
+        "student_prefill",
+        "student_cached_prefill",
+        "student_sample",
+        "student_train",
+        "teacher_prefill",
+        "teacher_cached_prefill",
+        "teacher_sample",
+    ):
+        assert meter in flat, meter
+    # Derived cached rates: 20% of 0.5 and 2.5; teacher_sample as configured.
+    assert "0.100" in flat
+    assert "0.500" in flat
+    assert "6.250" in flat
 
 
 # -- input validation --------------------------------------------------------------------------
