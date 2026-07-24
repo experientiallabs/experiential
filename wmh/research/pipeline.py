@@ -26,7 +26,8 @@ from wmh.core.types import Step, Trace
 from wmh.engine.grounding import Grounder, SourceResolver
 from wmh.engine.replay import ReplayReport, replay
 from wmh.engine.workspace import RepoTreeResolver
-from wmh.optimize.gepa import GEPAOptimizer, OptimizeResult
+from wmh.optimize.base import OptimizeResult
+from wmh.optimize.gepa import GEPAOptimizer
 from wmh.optimize.judge import RUBRIC_DIMENSIONS, Judge, RubricDimension
 from wmh.providers.base import Embedder, Provider
 from wmh.retrieval import EmbeddingRetriever, RetrievalKey

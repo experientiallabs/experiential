@@ -8,11 +8,10 @@ critique. We assert the optimizer runs a bounded loop and returns a valid fronti
 from __future__ import annotations
 
 from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmh.optimize.base import Optimizer, OptimizeResult
 from wmh.optimize.gepa import (
     ENV_PROMPT_COMPONENT,
     GEPAOptimizer,
-    Optimizer,
-    OptimizeResult,
     WorldModelGEPAAdapter,
     _eval_steps,
     _EvalStep,

@@ -21,15 +21,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
 
 import gepa
 from gepa.core.adapter import EvaluationBatch, GEPAAdapter
-from pydantic import BaseModel, Field
 
 from wmh.core.parsing import dumps_observation_contract, parse_observation
 from wmh.core.render import build_env_prompt, encode_state_action
 from wmh.core.types import Action, EnvState, JsonValue, Observation, Step, Trace
+from wmh.optimize.base import OptimizeMetrics, OptimizeResult
 from wmh.optimize.judge import Judge
 from wmh.providers.base import DEFAULT_MAX_TOKENS, Message, Provider
 from wmh.retrieval import Retriever
@@ -43,44 +42,6 @@ _EVAL_CONCURRENCY = 4
 
 # Called once per judged rollout: (rollouts_done, mean_score_so_far). Used to drive build progress.
 RolloutCallback = Callable[[int, float | None], None]
-
-
-class OptimizeMetrics(BaseModel):
-    """Outcome metrics from an optimization run."""
-
-    # Mean judge score on the SELECTION data, measured on the path that decided the run: GEPA's
-    # search-time valset aggregate when base won the search; the fresh paired re-check mean (over
-    # the valset, or the `recheck` set when supplied) when a non-base winner was accepted or
-    # reverted; the HARD-subset mean under `select_on_hard` when base won. Comparable across runs
-    # only at a fixed configuration - report a separate test-split score for cross-run numbers.
-    held_out_accuracy: float = 0.0
-    rollouts_used: int = 0  # search metric calls + the acceptance re-check's paired passes
-    # True when the search's winning candidate LOST the fresh base-vs-winner acceptance re-check
-    # and the base prompt was restored (see `GEPAOptimizer.optimize`). Surfaced so research runs
-    # can report how often GEPA's search wins fail to survive an independent evaluation.
-    reverted_to_base: bool = False
-    # Reserved: judge self-consistency / human-agreement proxy. Populating it needs repeated or
-    # independent judging (not yet implemented); `None` until then so it never reads as a real 0.0.
-    judge_agreement: float | None = None
-
-
-class OptimizeResult(BaseModel):
-    prompt: str  # winning specialized env prompt
-    frontier: list[str] = Field(default_factory=list)  # Pareto candidates
-    metrics: OptimizeMetrics = Field(default_factory=OptimizeMetrics)
-
-
-@runtime_checkable
-class Optimizer(Protocol):
-    def optimize(
-        self,
-        train: list[Trace],
-        test: list[Trace],
-        base_prompt: str,
-        budget: int,
-        *,
-        rag_corpus: list[Trace] | None = None,
-    ) -> OptimizeResult: ...
 
 
 # --- prediction helper (provider-only; no engine import, to avoid an engine<->optimize cycle) ----
