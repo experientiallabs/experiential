@@ -135,6 +135,12 @@ optimize_app = typer.Typer(
     no_args_is_help=True,
 )
 
+# Local import placement: route_app imports the optimize package; registering here keeps the
+# whole optimizer family visible in one place.
+from wmh.cli.route_app import route_app  # noqa: E402
+
+optimize_app.add_typer(route_app, name="route")
+
 
 @optimize_app.command("harness")
 def optimize(
