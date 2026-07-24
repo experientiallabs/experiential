@@ -198,6 +198,6 @@ def ingest_events(
             steps=sum(len(t.steps) for t in traces),
             otel_object=str(out),
         )
-    except Exception as exc:  # noqa: BLE001: the wire contract IS "never raise, emit error"
+    except Exception as exc:  # noqa: BLE001 - the wire contract IS "never raise, emit error"
         failure = _classify(exc)
         yield ErrorEvent(message=str(failure), code=failure.code)
