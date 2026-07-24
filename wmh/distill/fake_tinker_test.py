@@ -361,3 +361,117 @@ def test_directly_constructed_sampler_is_not_an_issuer() -> None:
     )
     with pytest.raises(AssertionError, match="TITO violation"):
         training.forward_backward([datum], "importance_sampling")
+
+
+# --- prefill top-k echo -------------------------------------------------------
+
+
+def test_topk_prompt_logprobs_echo_and_determinism() -> None:
+    """Top-1 is the sequence's own token with its realized logprob, ranks are
+    strictly decreasing hash-derived values, and the whole result is a pure
+    function of (seed, token_ids, k)."""
+    client = FakeSamplingClient(seed="tinker://fake/sampler/teacher/0")
+    prompt = [10, 11, 12]
+    seq = client.sample(prompt, max_tokens=4, temperature=1.0)
+    tokens = prompt + seq.tokens
+
+    realized, rows = client.topk_prompt_logprobs(tokens, 4)
+    realized_again, rows_again = client.topk_prompt_logprobs(tokens, 4)
+
+    assert (realized, rows) == (realized_again, rows_again)
+    # The realized logprobs ARE compute_logprobs: issued spans echo exactly.
+    assert realized == client.compute_logprobs(tokens)
+    assert realized[len(prompt) :] == list(seq.logprobs)
+    assert rows[0] is None
+    for position in range(1, len(tokens)):
+        row = rows[position]
+        assert row is not None
+        assert len(row) == 4
+        assert row[0] == (tokens[position], realized[position])
+        logprobs = [lp for _, lp in row]
+        assert logprobs == sorted(logprobs, reverse=True)
+        assert len(set(logprobs)) == 4  # strictly decreasing, no ties
+        assert len({token for token, _ in row}) == 4  # distinct candidate ids
+
+
+def test_topk_prompt_logprobs_k1_is_the_pure_echo() -> None:
+    client = FakeSamplingClient(seed="s")
+    tokens = [1, 2, 3, 4]
+    realized, rows = client.topk_prompt_logprobs(tokens, 1)
+    assert rows[0] is None
+    for position in range(1, len(tokens)):
+        assert rows[position] == [(tokens[position], realized[position])]
+
+
+def test_topk_prompt_logprobs_rejects_bad_k() -> None:
+    client = FakeSamplingClient(seed="s")
+    with pytest.raises(ValueError, match=">= 1"):
+        client.topk_prompt_logprobs([1, 2], 0)
+    with pytest.raises(ValueError, match="fake vocabulary"):
+        client.topk_prompt_logprobs([1, 2], 96)
+
+
+# --- topk-CE replicas: the input-side TITO variant ----------------------------
+
+
+def _topk_replica_datum(
+    prompt: list[int], sampled: list[int], candidate_targets: list[int]
+) -> FakeDatum:
+    """A shifted topk replica: candidate targets, fractional weights, flagged."""
+    tokens = prompt + sampled
+    # Candidate targets replace the sampled positions in target space; the
+    # target index scoring the first sampled token is len(prompt) - 1.
+    span_start = len(prompt) - 1
+    next_tokens = tokens[1:]
+    targets = next_tokens[:span_start] + candidate_targets[: len(next_tokens) - span_start]
+    weights = [0.0] * span_start + [0.25] * (len(next_tokens) - span_start)
+    return FakeDatum(
+        model_input_tokens=tokens[:-1],
+        target_tokens=targets,
+        weights=weights,
+        topk=True,
+    )
+
+
+def test_topk_datum_with_candidate_targets_passes_input_side_tito() -> None:
+    """Teacher-proposed targets are fine; the INPUT is genuine sampled tokens.
+
+    In topk-CE the targets are intentionally candidates no sampler issued
+    (that is the loss), so the fake checks the model input under the
+    loss-weighted positions against the ledger instead of the targets.
+    """
+    training = _make_training()
+    sampler = training.save_weights_and_get_sampling_client("s0")
+    prompt = [1, 2, 3]
+    seq = sampler.sample(prompt, max_tokens=5, temperature=0.7)
+    fabricated_candidates = [201, 202, 203, 204, 205]  # issued by nobody
+    datum = _topk_replica_datum(prompt, list(seq.tokens), fabricated_candidates)
+
+    training.forward_backward([datum], "cross_entropy")
+
+    assert len(training.forward_backward_calls) == 1
+
+
+def test_topk_datum_with_corrupted_input_fails_tito() -> None:
+    training = _make_training()
+    sampler = training.save_weights_and_get_sampling_client("s0")
+    prompt = [1, 2, 3]
+    seq = sampler.sample(prompt, max_tokens=5, temperature=0.7)
+    corrupted = list(seq.tokens)
+    corrupted[1] = corrupted[1] + 1  # the INPUT context is corrupted
+    datum = _topk_replica_datum(prompt, corrupted, [201, 202, 203, 204, 205])
+
+    with pytest.raises(AssertionError, match="TITO violation in topk datum 0"):
+        training.forward_backward([datum], "cross_entropy")
+    assert training.forward_backward_calls == []
+
+
+def test_topk_datum_under_non_ce_loss_is_rejected() -> None:
+    training = _make_training()
+    sampler = training.save_weights_and_get_sampling_client("s0")
+    prompt = [1, 2, 3]
+    seq = sampler.sample(prompt, max_tokens=4, temperature=0.7)
+    datum = _topk_replica_datum(prompt, list(seq.tokens), [201, 202, 203, 204])
+
+    with pytest.raises(AssertionError, match="cross_entropy"):
+        training.forward_backward([datum], "importance_sampling")

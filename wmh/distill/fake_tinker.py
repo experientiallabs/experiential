@@ -21,7 +21,11 @@ sampling client its owning FakeServiceClient created (the teacher client the
 warmup phase trains on is created through the service, not linked to the
 student); fabricated or corrupted token ids were issued by nobody and still
 fail. FakeTrainingClient raises AssertionError from forward_backward when a
-datum violates it.
+datum violates it. Datums flagged `topk=True` (topk-CE replicas) get the
+input-side variant of the check: their TARGETS are intentionally
+teacher-proposed candidate tokens no sampler issued, so the invariant binds
+the model INPUT under the loss-weighted positions instead, which must still
+be the student's exact sampled tokens (see FakeTrainingClient.forward_backward).
 """
 
 from __future__ import annotations
@@ -42,6 +46,16 @@ def _digest(*parts: str) -> bytes:
 
 def _ids_key(token_ids: list[int]) -> str:
     return ",".join(str(t) for t in token_ids)
+
+
+def _contains_run(haystack: tuple[int, ...], needle: tuple[int, ...]) -> bool:
+    """Whether `needle` appears as a contiguous run inside `haystack`."""
+    if not needle:
+        return True
+    span = len(needle)
+    return any(
+        haystack[start : start + span] == needle for start in range(len(haystack) - span + 1)
+    )
 
 
 def _derived_token(seed: str, prompt_ids: list[int], sample_index: int, position: int) -> int:
@@ -145,6 +159,9 @@ class FakeDatum:
             prompt/tool tokens outside the sampled spans. Defaults to all 1.0.
         advantages: Optional per-target-token advantages (importance_sampling).
         logprobs: Optional per-target-token behavior-policy logprobs.
+        topk: Marks a topk-CE replica: its targets are teacher-proposed
+            candidates (fractional weights), so the TITO check binds the
+            model INPUT under the weighted positions instead of the targets.
     """
 
     def __init__(
@@ -154,12 +171,14 @@ class FakeDatum:
         weights: list[float] | None = None,
         advantages: list[float] | None = None,
         logprobs: list[float] | None = None,
+        topk: bool = False,
     ) -> None:
         self.model_input_tokens = list(model_input_tokens)
         self.target_tokens = list(target_tokens)
         self.weights = list(weights) if weights is not None else [1.0] * len(target_tokens)
         self.advantages = list(advantages) if advantages is not None else []
         self.logprobs = list(logprobs) if logprobs is not None else []
+        self.topk = topk
         if len(self.weights) != len(self.target_tokens):
             raise ValueError(
                 f"weights length {len(self.weights)} does not match "
@@ -174,6 +193,31 @@ class FakeDatum:
             if weight != 0.0:
                 current.append(token)
             elif current:
+                spans.append(tuple(current))
+                current = []
+        if current:
+            spans.append(tuple(current))
+        return spans
+
+    def input_loss_spans(self) -> list[tuple[int, ...]]:
+        """Model-INPUT token runs under the nonzero-weight target positions.
+
+        Target index j scores unshifted position j + 1, whose token sits at
+        model_input index j + 1 when that index exists (the final target's
+        token was shifted out of the input, so a loss run reaching the
+        sequence end contributes one token fewer here). This is what the
+        TITO check inspects for topk-CE replicas: the targets are candidate
+        tokens by design, but the input context at the loss positions must
+        still be tokens a sampler actually issued.
+        """
+        spans: list[tuple[int, ...]] = []
+        current: list[int] = []
+        for index, weight in enumerate(self.weights):
+            in_input = index + 1 < len(self.model_input_tokens)
+            if weight != 0.0 and in_input:
+                current.append(self.model_input_tokens[index + 1])
+                continue
+            if current:
                 spans.append(tuple(current))
                 current = []
         if current:
@@ -309,6 +353,67 @@ class FakeSamplingClient:
                 )
         return result
 
+    def topk_prompt_logprobs(
+        self, token_ids: list[int], k: int
+    ) -> tuple[list[float | None], list[list[tuple[int, float]] | None]]:
+        """Deterministic echo of the SDK's prefill-only top-k prompt logprobs.
+
+        Mirrors `sample(prompt=token_ids, max_tokens=1,
+        include_prompt_logprobs=True, topk_prompt_logprobs=k)` on the real
+        client: the first return value is the realized per-position logprobs
+        (exactly `compute_logprobs(token_ids)`, so issued spans echo their
+        sampling-time logprobs), and the second is one top-k candidate list
+        per position (None at position 0, which has no context). At each
+        scoreable position the top-1 candidate is the sequence's own token
+        with its realized logprob; the remaining k - 1 candidates carry
+        hash-derived token ids and strictly decreasing hash-derived logprobs
+        below it, so ranks are unambiguous and the whole result is a pure
+        function of (seed, ledger echoes, token_ids, k): replaying the same
+        call always returns the identical value.
+
+        Args:
+            token_ids: The full sequence to score, prompt-style.
+            k: Candidates per position (>= 1).
+
+        Returns:
+            The (realized logprobs, top-k rows) pair, both with one entry
+            per input position.
+
+        Raises:
+            ValueError: If `k` is not positive.
+        """
+        if k < 1:
+            raise ValueError(f"k must be >= 1, got {k}")
+        if k > _SAMPLED_TOKEN_RANGE:
+            raise ValueError(
+                f"the fake vocabulary has only {_SAMPLED_TOKEN_RANGE} derivable "
+                f"candidate ids per position, got k = {k} (the config caps "
+                "train.topk at 64, well inside it)"
+            )
+        realized = self.compute_logprobs(token_ids)
+        rows: list[list[tuple[int, float]] | None] = [None] * len(token_ids)
+        for position in range(1, len(token_ids)):
+            top_logprob = realized[position]
+            assert top_logprob is not None  # compute_logprobs fills every p >= 1
+            entries: list[tuple[int, float]] = [(token_ids[position], top_logprob)]
+            seen = {token_ids[position]}
+            logprob = top_logprob
+            rank = 1
+            while len(entries) < k:
+                token = _derived_token(f"topk:{self.seed}", token_ids[:position], rank, position)
+                while token in seen:
+                    token = _SAMPLED_TOKEN_BASE + (
+                        (token - _SAMPLED_TOKEN_BASE + 1) % _SAMPLED_TOKEN_RANGE
+                    )
+                seen.add(token)
+                logprob += _derived_logprob(
+                    "topk-gap", self.seed, _ids_key(token_ids[: position + 1]), str(rank)
+                )
+                entries.append((token, logprob))
+                rank += 1
+            rows[position] = entries
+        return realized, rows
+
 
 class FakeTrainingClient:
     """Deterministic stand-in for tinker.TrainingClient.
@@ -345,10 +450,22 @@ class FakeTrainingClient:
         the owning FakeServiceClient created (the teacher client the warmup
         phase trains on). Fabricated ids fail either way.
 
+        Datums flagged `topk=True` (topk-CE replicas) are checked on the
+        model INPUT instead of the targets: their targets are intentionally
+        teacher-proposed candidate tokens that no sampler ever issued (that
+        is the whole point of the loss), while the input context must remain
+        the student's exact sampled tokens. Each input-side loss span
+        (`FakeDatum.input_loss_spans`) must appear as a contiguous run inside
+        some issued span (a contiguous run rather than the whole span, since
+        the next-token shift truncates a sequence-final span by one token and
+        rank padding can split a run). Topk replicas are additionally pinned
+        to the cross_entropy loss.
+
         Args:
             datums: The batch to train on.
             loss_fn: Loss function name (e.g. "importance_sampling" or
-                "cross_entropy"); recorded but not interpreted.
+                "cross_entropy"); recorded but not interpreted beyond the
+                topk-replica pin above.
 
         Returns:
             A deterministic SDK-shaped output: the metrics dict carries a
@@ -357,12 +474,32 @@ class FakeTrainingClient:
 
         Raises:
             AssertionError: If a sampled span was never issued by an eligible
-                issuer; the message names the datum, the span, and the first
-                mismatching token position against the closest issued span.
+                issuer (the message names the datum, the span, and the first
+                mismatching token position against the closest issued span),
+                if a topk replica's input-side loss span appears in no issued
+                span, or if a topk replica arrives under a loss other than
+                cross_entropy.
         """
         records = self._issuer_records()
         issued = {record.sampled_ids for record in records}
         for datum_index, datum in enumerate(datums):
+            if datum.topk:
+                if loss_fn != "cross_entropy":
+                    raise AssertionError(
+                        f"topk-CE replica datum {datum_index} was trained under "
+                        f"loss_fn {loss_fn!r}; candidate targets are only valid "
+                        "under cross_entropy"
+                    )
+                for span in datum.input_loss_spans():
+                    if any(_contains_run(record.sampled_ids, span) for record in records):
+                        continue
+                    raise AssertionError(
+                        f"TITO violation in topk datum {datum_index}: the model input "
+                        f"under a loss-weighted span (length {len(span)}) matches no "
+                        "issued span; topk-CE may propose candidate TARGETS, but the "
+                        "input context must stay the student's exact sampled tokens"
+                    )
+                continue
             for span in datum.sampled_spans():
                 if span in issued:
                     continue
