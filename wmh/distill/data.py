@@ -27,6 +27,7 @@ mirroring the provider's contract; everything else here runs without it.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -144,7 +145,12 @@ class DatumStats(BaseModel):
 
 
 class AdvantageStats(BaseModel):
-    """Accounting for one `attach_advantages` call."""
+    """Accounting for one `attach_advantages` call.
+
+    Token-level counters cover only the ATTACHED datums: a datum dropped for
+    a teacher mismatch is never trained on, so its tokens are not signal and
+    contribute to no counter here.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -155,7 +161,18 @@ class AdvantageStats(BaseModel):
     """Datums dropped because their teacher logprobs did not align."""
 
     clipped_tokens: int = Field(ge=0)
-    """Loss tokens whose raw advantage hit the clip bound."""
+    """Loss tokens whose raw advantage hit the clip bound (attached datums only)."""
+
+    loss_tokens: int = Field(ge=0)
+    """Loss tokens across the attached datums (the clip-fraction denominator)."""
+
+    advantage_mean: float | None
+    """Mean advantage over the attached datums' loss tokens, after clipping and
+    any centering (so ~0.0 under `train.center_advantages`); None when no loss
+    token survived."""
+
+    advantage_std: float | None
+    """Population standard deviation over the same loss tokens; None when none."""
 
 
 def _is_prefix(prefix: list[int], sequence: list[int]) -> bool:
@@ -345,7 +362,9 @@ def attach_advantages(
 
     Returns:
         New datums with advantages attached (drops removed, order preserved)
-        and the stats.
+        and the stats, including the trained advantage distribution (mean and
+        population std over the attached datums' loss tokens) and the kept
+        clip/loss token counts the loop derives `clip_fraction` from.
 
     Raises:
         ValueError: If `teacher_logprobs` does not have one entry per datum;
@@ -377,6 +396,7 @@ def attach_advantages(
             )
             continue
         advantages = [0.0] * n
+        datum_clipped = 0
         missing_position: int | None = None
         for position in range(n):
             if datum.loss_mask[position] != 1.0:
@@ -388,7 +408,7 @@ def attach_advantages(
             raw = teacher_lp - datum.sampled_logprobs[position]
             clipped = min(max(raw, -clip), clip)
             if clipped != raw:
-                clipped_tokens += 1
+                datum_clipped += 1
             advantages[position] = clipped
         if missing_position is not None:
             mismatch_drops += 1
@@ -403,6 +423,7 @@ def attach_advantages(
             continue
         kept.append(datum)
         per_datum_advantages.append(advantages)
+        clipped_tokens += datum_clipped
     if cfg.train.center_advantages:
         loss_count = sum(datum.loss_token_count for datum in kept)
         if loss_count:
@@ -428,10 +449,27 @@ def attach_advantages(
         )
         for datum, advantages in zip(kept, per_datum_advantages, strict=True)
     ]
+    # The advantage distribution actually trained on: loss tokens of the kept
+    # datums, after clipping and any centering.
+    loss_values = [
+        advantages[position]
+        for datum, advantages in zip(kept, per_datum_advantages, strict=True)
+        for position in range(len(advantages))
+        if datum.loss_mask[position] == 1.0
+    ]
+    advantage_mean: float | None = None
+    advantage_std: float | None = None
+    if loss_values:
+        advantage_mean = sum(loss_values) / len(loss_values)
+        variance = sum((value - advantage_mean) ** 2 for value in loss_values) / len(loss_values)
+        advantage_std = math.sqrt(variance)
     stats = AdvantageStats(
         datums=len(attached),
         mismatch_drops=mismatch_drops,
         clipped_tokens=clipped_tokens,
+        loss_tokens=len(loss_values),
+        advantage_mean=advantage_mean,
+        advantage_std=advantage_std,
     )
     return attached, stats
 

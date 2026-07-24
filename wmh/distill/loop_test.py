@@ -52,6 +52,8 @@ from wmh.distill.fake_tinker import (
 )
 from wmh.distill.loop import (
     MAX_CONSECUTIVE_EMPTY_STEPS,
+    SDK_GRAD_NORM_METRIC_NAMES,
+    SDK_LOSS_METRIC_NAMES,
     STUDENT_BEFORE_EVAL,
     WARMUP_ROLLOUTS_DIR,
     DistillBudgetError,
@@ -59,15 +61,18 @@ from wmh.distill.loop import (
     DistillProgress,
     DistillResult,
     DistillSamplingClient,
+    OptimStepOutput,
     SdkSamplingClient,
     SdkServiceClient,
     SdkTrainingClient,
     StepMetrics,
     TaskSampler,
+    TrainStepOutput,
     WarmupMetrics,
     pin_rollout_params,
     resume_command,
     run_distillation,
+    sdk_metric_value,
 )
 from wmh.distill.rollouts import RolloutStats
 from wmh.distill.store import AdapterStore, DistillRunStore
@@ -143,11 +148,17 @@ class _Training:
     def get_tokenizer(self) -> FakeTokenizer:
         return self.inner.get_tokenizer()
 
-    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
-        self.inner.forward_backward([_fake_datum(datum) for datum in datums], loss_fn)
+    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> TrainStepOutput:
+        # Mirror SdkTrainingClient: extract the loss from the SDK-shaped
+        # output's metrics dict through the same suffix-tolerant helper.
+        output = self.inner.forward_backward([_fake_datum(datum) for datum in datums], loss_fn)
+        return TrainStepOutput(loss=sdk_metric_value(output.metrics, SDK_LOSS_METRIC_NAMES))
 
-    def optim_step(self, learning_rate: float) -> None:
-        self.inner.optim_step(learning_rate)
+    def optim_step(self, learning_rate: float) -> OptimStepOutput:
+        response = self.inner.optim_step(learning_rate)
+        return OptimStepOutput(
+            grad_norm=sdk_metric_value(response.metrics, SDK_GRAD_NORM_METRIC_NAMES)
+        )
 
     def save_state(self) -> str:
         return self.inner.save_state()
@@ -518,14 +529,40 @@ def test_three_step_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         assert row["fragmentation_rate"] == 0.0
         assert row["datums"] == 4  # 2 tasks x 2 attempts, each merged to one datum
         assert isinstance(row["reverse_kl_per_token"], float)
+        # RL metrics: rewards are binary here, so the mean equals solve_rate;
+        # the fake backend reports a deterministic loss and grad norm.
+        assert row["reward_mean"] == 0.5
+        assert isinstance(row["advantage_mean"], float)
+        assert _number(row, "advantage_std") >= 0.0
+        assert 0.0 <= _number(row, "clip_fraction") <= 1.0
+        assert isinstance(row["pg_loss"], float) and row["pg_loss"] > 0.0
+        assert isinstance(row["grad_norm"], float) and row["grad_norm"] > 0.0
         for key in (
             "usd",
             "student_prefill_tokens",
+            "student_cached_prefill_tokens",
             "student_sample_tokens",
             "student_train_tokens",
             "teacher_prefill_tokens",
         ):
             assert _number(row, key) > 0
+    # Teacher-in-harness billing (teacher_sample plus cached teacher prefill)
+    # happens only in the pre-step teacher baseline, which folds into row 0;
+    # training steps score the teacher in one full-price request per datum.
+    assert _number(rows[0], "teacher_sample_tokens") > 0
+    assert _number(rows[0], "teacher_cached_prefill_tokens") > 0
+    for row in rows[1:]:
+        assert _number(row, "teacher_sample_tokens") == 0
+        assert _number(row, "teacher_cached_prefill_tokens") == 0
+    # Cumulative spend: the first row folds in the pre-step baseline spend
+    # exactly, every later row advances by exactly its own delta, and the
+    # finalize eval charges after the last row (so the ledger total is higher).
+    assert _number(rows[0], "cumulative_usd") == pytest.approx(_number(rows[0], "usd"))
+    for previous, row in zip(rows, rows[1:], strict=False):
+        assert _number(row, "cumulative_usd") == pytest.approx(
+            _number(previous, "cumulative_usd") + _number(row, "usd")
+        )
+    assert _number(rows[-1], "cumulative_usd") < result.spend.total_usd
 
     # TITO held through every forward_backward: the fake training client
     # asserts spans against its ledger BEFORE recording a call, so three
@@ -694,6 +731,35 @@ def test_a_tito_violation_fails_the_forward_backward(
         _run(env, _cfg())
 
 
+def test_teacher_in_harness_episodes_charge_the_teacher_sample_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The warmup collection and the teacher baseline bill sampling, not prefill.
+
+    Every other price is zero (the cached rates derive 20% of zero), so the
+    whole run's spend is exactly the teacher-in-harness sampled volume at the
+    teacher_sample rate.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    pricing = PricingConfig(
+        student_prefill=0.0,
+        student_sample=0.0,
+        student_train=0.0,
+        teacher_prefill=0.0,
+        teacher_sample=1e6,  # $1 per token, so USD equals the token count
+    )
+
+    result = _run(env, _warmup_cfg(pricing=pricing))
+
+    lines = {line.meter: line for line in result.spend.lines}
+    # Teacher-in-harness trials: the gate baseline (2 holdout tasks x gate.k=1)
+    # plus the warmup collection (4 train tasks x 2 attempts); the stub
+    # collector samples 2 calls x 5 tokens per trial.
+    expected_sampled = (2 * 1 + 4 * 2) * 2 * 5
+    assert lines["teacher_sample"].tokens == expected_sampled
+    assert result.spend.total_usd == pytest.approx(float(expected_sampled))
+
+
 # -- budget abort and resume -----------------------------------------------------------------
 
 
@@ -775,6 +841,18 @@ def test_a_non_empty_step_resets_the_empty_batch_streak(
     assert _number(rows[0], "datums") == 0
     assert _number(rows[1], "datums") > 0
     assert _number(rows[2], "datums") == 0
+    # A step that trained nothing surfaces no backend or advantage metrics
+    # (absent, never fabricated); the healthy step carries them all.
+    for row in (rows[0], rows[2]):
+        assert row["pg_loss"] is None
+        assert row["grad_norm"] is None
+        assert row["advantage_mean"] is None
+        assert row["advantage_std"] is None
+        assert _number(row, "clip_fraction") == 0.0
+        assert _number(row, "reward_mean") == 0.0  # trials ran; every one failed
+    assert isinstance(rows[1]["pg_loss"], float)
+    assert isinstance(rows[1]["grad_norm"], float)
+    assert isinstance(rows[1]["advantage_mean"], float)
 
 
 def test_resume_continues_the_step_count_and_reuses_baselines(
@@ -807,8 +885,11 @@ def test_resume_continues_the_step_count_and_reuses_baselines(
     # Training resumed at step 1: across both sessions each step ran exactly once.
     train_steps = [call.step_index for call in env.rollouts.calls if call.run_dir == env.run_dir]
     assert train_steps == [0, 1, 2]
-    # Prior-session spend was restored from the spend ledger.
+    # Prior-session spend was restored from the spend ledger, and the resumed
+    # session's rows carry cumulative totals that INCLUDE it.
     assert result.spend.prior_usd > 0.0
+    for row in store.read_metrics()[1:]:
+        assert _number(row, "cumulative_usd") > result.spend.prior_usd
 
 
 def test_resume_restores_spend_charged_between_metrics_rows(
@@ -928,9 +1009,15 @@ def test_warmup_trains_on_passing_teacher_trials_then_opd_proceeds(
         assert _number(row, "learning_rate") == pytest.approx(5e-5)
         assert _number(row, "student_train_tokens") > 0
         assert _number(row, "usd") > 0
-    # The teacher collection's charge folds into warmup row 0 only.
+    # The teacher collection's charge folds into warmup row 0 only, billed as
+    # a teacher-in-harness batch: sampled tokens at teacher_sample plus
+    # per-request prefill (unique full-rate, repeats cached).
     assert _number(warmup_rows[0], "teacher_prefill_tokens") > 0
+    assert _number(warmup_rows[0], "teacher_cached_prefill_tokens") > 0
+    assert _number(warmup_rows[0], "teacher_sample_tokens") > 0
     assert _number(warmup_rows[1], "teacher_prefill_tokens") == 0
+    assert _number(warmup_rows[1], "teacher_cached_prefill_tokens") == 0
+    assert _number(warmup_rows[1], "teacher_sample_tokens") == 0
 
     # The tracker saw the same warmup rows the store persisted.
     assert [step for step, _ in tracker.warmup_steps] == [0, 1]
@@ -1456,6 +1543,75 @@ def test_optim_step_deadline_aborts_without_retry(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(TinkerDeadlineError, match="tinker optim_step timed out"):
         client.optim_step(1e-5)
     assert fake.optim_step_calls == 1
+
+
+# -- SdkTrainingClient metric extraction (what the SDK actually exposes) --------------------------
+
+
+def test_sdk_metric_value_matches_bare_and_suffixed_names() -> None:
+    """Server metric keys carry a ':reduction' suffix; both spellings match."""
+    assert sdk_metric_value({"total_loss:sum": 2.0}, SDK_LOSS_METRIC_NAMES) == 2.0
+    assert sdk_metric_value({"total_loss": 1.5}, SDK_LOSS_METRIC_NAMES) == 1.5
+    assert sdk_metric_value({"loss:mean": 0.25}, SDK_LOSS_METRIC_NAMES) == 0.25
+    assert sdk_metric_value({"grad_norm:mean": 0.5}, SDK_GRAD_NORM_METRIC_NAMES) == 0.5
+    # Unrelated keys (e.g. the documented MoE diagnostics), an empty dict, and
+    # the OptimStepResponse's metrics=None all surface nothing.
+    assert sdk_metric_value({"e_frac_with_tokens:mean": 1.0}, SDK_LOSS_METRIC_NAMES) is None
+    assert sdk_metric_value({}, SDK_GRAD_NORM_METRIC_NAMES) is None
+    assert sdk_metric_value(None, SDK_LOSS_METRIC_NAMES) is None
+
+
+@dataclass(frozen=True)
+class _FwdBwdOutput:
+    """The ForwardBackwardOutput slice the adapter reads (no typed loss exists)."""
+
+    metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class _OptimResponse:
+    """The OptimStepResponse slice the adapter reads."""
+
+    metrics: dict[str, float] | None
+
+
+class _ReadyTrainingClient:
+    """Fake tinker.TrainingClient whose futures resolve immediately."""
+
+    def __init__(
+        self, fwdbwd_metrics: dict[str, float], optim_metrics: dict[str, float] | None
+    ) -> None:
+        self._fwdbwd_metrics = fwdbwd_metrics
+        self._optim_metrics = optim_metrics
+
+    def forward_backward(self, datums: object, loss_fn: object) -> _ReadyFuture:
+        del datums, loss_fn
+        return _ReadyFuture(_FwdBwdOutput(metrics=self._fwdbwd_metrics))
+
+    def optim_step(self, params: object) -> _ReadyFuture:
+        del params
+        return _ReadyFuture(_OptimResponse(metrics=self._optim_metrics))
+
+
+def test_sdk_training_client_extracts_reported_metrics() -> None:
+    pytest.importorskip("tinker")
+    fake = _ReadyTrainingClient(
+        fwdbwd_metrics={"total_loss:sum": 1.25}, optim_metrics={"grad_norm:mean": 3.5}
+    )
+    client = SdkTrainingClient(cast("tinker.TrainingClient", fake))
+    output = client.forward_backward([_attached_datum()], loss_fn="importance_sampling")
+    assert output.loss == 1.25
+    assert client.optim_step(1e-5).grad_norm == 3.5
+
+
+def test_sdk_training_client_surfaces_none_when_the_service_reports_nothing() -> None:
+    """No fabricated values: absent metrics stay None end to end."""
+    pytest.importorskip("tinker")
+    fake = _ReadyTrainingClient(fwdbwd_metrics={}, optim_metrics=None)
+    client = SdkTrainingClient(cast("tinker.TrainingClient", fake))
+    output = client.forward_backward([_attached_datum()], loss_fn="importance_sampling")
+    assert output.loss is None
+    assert client.optim_step(1e-5).grad_norm is None
 
 
 def test_client_construction_is_deadline_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
