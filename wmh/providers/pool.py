@@ -25,7 +25,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmh.providers.base import Provider, ProviderConfig, ProviderKind, TokenUsage
 from wmh.providers.registry import get_provider
 from wmh.tracking.pricing import ModelPrice, price_for
 
@@ -74,6 +74,17 @@ class PoolEntry(BaseModel):
         if price is None:  # unreachable after validation; keep the failure loud, not $0
             raise ValueError(f"pool model '{self.name}': no price available for '{self.model}'")
         return price
+
+    def cost_usd(self, usage: TokenUsage) -> float:
+        """USD cost of `usage` priced by THIS entry's row (overrides included).
+
+        The global `wmh.tracking.pricing.cost_usd` only knows the built-in table; pool entries
+        with explicit prices must be costed here or they would silently read $0.
+        """
+        price = self.price()
+        return (
+            usage.input_tokens * price.input_per_mtok + usage.output_tokens * price.output_per_mtok
+        ) / 1_000_000
 
     def provider_config(self) -> ProviderConfig:
         return ProviderConfig(
