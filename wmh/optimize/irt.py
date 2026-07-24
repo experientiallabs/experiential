@@ -55,7 +55,9 @@ class IrtHead(BaseModel):
 class _Params:
     """Mutable training view (numpy arrays); exported to IrtHead at the end."""
 
-    def __init__(self, rng: np.random.Generator, n_models: int, d_in: int, hidden: int, dim: int):
+    def __init__(
+        self, rng: np.random.Generator, n_models: int, d_in: int, hidden: int, dim: int
+    ) -> None:
         scale = lambda fan_in: 1.0 / np.sqrt(fan_in)  # noqa: E731 - local init helper
         self.theta = rng.normal(0, scale(dim), (n_models, dim))
         self.w1 = rng.normal(0, scale(d_in), (hidden, d_in))
