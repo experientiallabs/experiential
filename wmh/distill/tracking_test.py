@@ -8,6 +8,7 @@ resolution is tested against a temporary HOME so the developer's real
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -28,6 +29,7 @@ from wmh.distill.config import (
 from wmh.distill.loop import StepMetrics, WarmupMetrics
 from wmh.distill.tracking import (
     WANDB_API_KEY_ENV,
+    WANDB_RUN_FILE,
     NullTracker,
     WandbTracker,
     build_tracker,
@@ -50,6 +52,7 @@ class _FakeRun:
     """The object the fake `wandb.init` returns."""
 
     def __init__(self) -> None:
+        self.id = "fake-run-0"
         self.summary = _FakeSummary()
 
 
@@ -71,8 +74,10 @@ class _FakeWandb(ModuleType):
         entity: str | None,
         name: str,
         tags: list[str],
-        dir: str,  # the wandb SDK's own keyword name
+        dir: str,  # the wandb SDK's own keyword names, `id` included
         config: JsonObject,
+        id: str | None = None,
+        resume: str | None = None,
     ) -> _FakeRun:
         self.init_calls.append(
             {
@@ -82,8 +87,13 @@ class _FakeWandb(ModuleType):
                 "tags": list(tags),
                 "dir": dir,
                 "config": config,
+                "id": id,
+                "resume": resume,
             }
         )
+        # Like the real SDK under resume="allow": an explicit id becomes the
+        # run's id; otherwise a fresh id is assigned.
+        self.run.id = id if id is not None else f"fake-run-{len(self.init_calls)}"
         return self.run
 
     def log(self, data: Mapping[str, JsonValue], *, step: int) -> None:
@@ -106,7 +116,12 @@ def _cfg(wandb: WandbConfig | None = None) -> DistillConfig:
     )
 
 
-def _metrics(*, reverse_kl: float | None = -0.25) -> StepMetrics:
+def _metrics(
+    *,
+    reverse_kl: float | None = -0.25,
+    pg_loss: float | None = 1.5,
+    grad_norm: float | None = 2.25,
+) -> StepMetrics:
     return StepMetrics(
         tasks=2,
         trials=4,
@@ -122,12 +137,22 @@ def _metrics(*, reverse_kl: float | None = -0.25) -> StepMetrics:
         loss_tokens=40,
         context_tokens=200,
         reverse_kl_per_token=reverse_kl,
+        reward_mean=0.5,
+        advantage_mean=0.05,
+        advantage_std=1.2,
+        clip_fraction=0.075,
+        pg_loss=pg_loss,
+        grad_norm=grad_norm,
         sampler_path="tinker://fake/sampler/0001",
         student_prefill_tokens=120,
+        student_cached_prefill_tokens=30,
         student_sample_tokens=40,
         student_train_tokens=200,
         teacher_prefill_tokens=160,
+        teacher_cached_prefill_tokens=0,
+        teacher_sample_tokens=0,
         usd=0.75,
+        cumulative_usd=3.25,
     )
 
 
@@ -142,9 +167,12 @@ def _warmup_metrics() -> WarmupMetrics:
         context_tokens=90,
         learning_rate=1e-4,
         student_prefill_tokens=0,
+        student_cached_prefill_tokens=0,
         student_sample_tokens=0,
         student_train_tokens=120,
         teacher_prefill_tokens=400,
+        teacher_cached_prefill_tokens=90,
+        teacher_sample_tokens=80,
         usd=0.5,
     )
 
@@ -228,6 +256,52 @@ def test_default_run_name_derives_from_agent_and_run_dir(
     assert call["name"] == "pi-smoke-02"
 
 
+# -- resume across restarts --------------------------------------------------------------------
+
+
+def test_first_init_starts_fresh_and_persists_the_run_id(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    _tracker(fake_wandb, run_dir)
+    (call,) = fake_wandb.init_calls
+    assert call["id"] is None
+    assert call["resume"] is None
+    record = json.loads((run_dir / WANDB_RUN_FILE).read_text(encoding="utf-8"))
+    assert record == {"run_id": fake_wandb.run.id}
+
+
+def test_restart_resumes_the_persisted_run_id(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    """A restarted run CONTINUES the same dashboard run (task #11)."""
+    run_dir = tmp_path / "run"
+    _tracker(fake_wandb, run_dir)
+    first_id = fake_wandb.run.id
+    _tracker(fake_wandb, run_dir)  # the restarted session
+    second = fake_wandb.init_calls[1]
+    assert second["id"] == first_id
+    assert second["resume"] == "allow"
+    # The record still names the same run after the resume.
+    record = json.loads((run_dir / WANDB_RUN_FILE).read_text(encoding="utf-8"))
+    assert record == {"run_id": first_id}
+
+
+def test_corrupt_run_record_falls_back_to_a_fresh_run_and_rewrites(
+    fake_wandb: _FakeWandb, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / WANDB_RUN_FILE).write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.tracking"):
+        _tracker(fake_wandb, run_dir)
+    assert "corrupt wandb run record" in caplog.text
+    (call,) = fake_wandb.init_calls
+    assert call["id"] is None
+    assert call["resume"] is None
+    # The broken file was replaced with the fresh run's id.
+    record = json.loads((run_dir / WANDB_RUN_FILE).read_text(encoding="utf-8"))
+    assert record == {"run_id": fake_wandb.run.id}
+
+
 def test_missing_sdk_error_names_the_extra(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # None in sys.modules makes `import wandb` raise ImportError (the halted-import
     # convention), simulating an environment without the distill extra.
@@ -309,14 +383,33 @@ def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Pat
         "train/loss_tokens": 40,
         "train/context_tokens": 200,
         "train/reverse_kl_per_token": -0.25,
+        "train/reward_mean": 0.5,
+        "train/advantage_mean": 0.05,
+        "train/advantage_std": 1.2,
+        "train/clip_fraction": 0.075,
+        "train/pg_loss": 1.5,
+        "train/grad_norm": 2.25,
         "tokens/student_prefill": 120,
+        "tokens/student_cached_prefill": 30,
         "tokens/student_sample": 40,
         "tokens/student_train": 200,
         "tokens/teacher_prefill": 160,
+        "tokens/teacher_cached_prefill": 0,
+        "tokens/teacher_sample": 0,
         "cost/usd": 0.75,
+        "cost/usd_cum": 3.25,
     }
     # The sampler path (a string) never lands in a chartable payload.
     assert not any("sampler" in key for key in payload)
+
+
+def test_log_step_carries_both_cost_keys(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    """The per-row delta AND the all-session cumulative total chart together."""
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_step(0, _metrics())
+    (payload, _) = fake_wandb.log_calls[-1]
+    assert payload["cost/usd"] == 0.75
+    assert payload["cost/usd_cum"] == 3.25
 
 
 def test_log_step_drops_an_unscored_reverse_kl(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
@@ -324,6 +417,20 @@ def test_log_step_drops_an_unscored_reverse_kl(fake_wandb: _FakeWandb, tmp_path:
     tracker.log_step(0, _metrics(reverse_kl=None))
     (payload, _) = fake_wandb.log_calls[-1]
     assert "train/reverse_kl_per_token" not in payload
+
+
+def test_log_step_omits_backend_metrics_the_sdk_never_reported(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    """None-valued pg_loss/grad_norm simply do not chart (never fabricated)."""
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_step(0, _metrics(pg_loss=None, grad_norm=None))
+    (payload, _) = fake_wandb.log_calls[-1]
+    assert "train/pg_loss" not in payload
+    assert "train/grad_norm" not in payload
+    # The computable metrics still chart.
+    assert payload["train/clip_fraction"] == 0.075
+    assert payload["cost/usd_cum"] == 3.25
 
 
 def test_log_warmup_step_uses_warmup_keys_at_wandb_step_zero(
@@ -351,9 +458,12 @@ def test_log_warmup_step_uses_warmup_keys_at_wandb_step_zero(
         "warmup/context_tokens": 90,
         "warmup/learning_rate": 1e-4,
         "warmup/student_prefill_tokens": 0,
+        "warmup/student_cached_prefill_tokens": 0,
         "warmup/student_sample_tokens": 0,
         "warmup/student_train_tokens": 120,
         "warmup/teacher_prefill_tokens": 400,
+        "warmup/teacher_cached_prefill_tokens": 90,
+        "warmup/teacher_sample_tokens": 80,
         "warmup/usd": 0.5,
     }
     # The constant phase discriminator (a string) never lands in the payload.

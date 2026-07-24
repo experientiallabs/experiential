@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 
 import pytest
@@ -310,12 +311,20 @@ def test_attach_advantages_clips_both_directions() -> None:
     assert attached[0].advantages == [0.0, 0.0, 2.0, -0.5, -2.0]
     # The input datum is untouched; attachment returns new datums.
     assert datum.advantages == []
+    # Hand-computed distribution over the trained values [2.0, -0.5, -2.0]:
+    # mean -1/6, population std sqrt(mean of squared deviations).
+    assert stats.loss_tokens == 3
+    assert stats.advantage_mean == pytest.approx(-1 / 6)
+    expected_std = math.sqrt(((2.0 + 1 / 6) ** 2 + (-0.5 + 1 / 6) ** 2 + (-2.0 + 1 / 6) ** 2) / 3)
+    assert stats.advantage_std == pytest.approx(expected_std)
+    # The loop's clip_fraction derives from exactly these two counters.
+    assert stats.clipped_tokens / stats.loss_tokens == pytest.approx(2 / 3)
 
 
 def test_attach_advantages_batch_mean_centering() -> None:
     datum = _one_datum(sampled_logprobs=[-1.0, -1.0, -1.0])
     teacher: list[float | None] = [None, -0.1, -2.0, -1.0, 0.5]  # raw: -1.0, 0.0, +1.5
-    attached, _ = attach_advantages([datum], [teacher], _cfg(center_advantages=True))
+    attached, stats = attach_advantages([datum], [teacher], _cfg(center_advantages=True))
     advantages = attached[0].advantages
     loss_values = [advantages[2], advantages[3], advantages[4]]
     assert sum(loss_values) == pytest.approx(0.0)
@@ -323,6 +332,21 @@ def test_attach_advantages_batch_mean_centering() -> None:
     assert loss_values == pytest.approx([-7 / 6, -1 / 6, 4 / 3])
     # Context positions stay exactly 0 even after centering.
     assert advantages[0] == 0.0 and advantages[1] == 0.0
+    # The stats describe the CENTERED values (what training actually sees):
+    # mean 0, population std of [-7/6, -1/6, 4/3].
+    assert stats.advantage_mean == pytest.approx(0.0)
+    expected_std = math.sqrt(((7 / 6) ** 2 + (1 / 6) ** 2 + (4 / 3) ** 2) / 3)
+    assert stats.advantage_std == pytest.approx(expected_std)
+    assert stats.loss_tokens == 3
+
+
+def test_attach_advantages_empty_batch_reports_no_distribution() -> None:
+    attached, stats = attach_advantages([], [], _cfg())
+    assert attached == []
+    assert stats.loss_tokens == 0
+    assert stats.clipped_tokens == 0
+    assert stats.advantage_mean is None
+    assert stats.advantage_std is None
 
 
 def test_attach_advantages_length_mismatch_drops_loudly(
@@ -339,6 +363,8 @@ def test_attach_advantages_length_mismatch_drops_loudly(
     assert stats.mismatch_drops == 1
     assert stats.datums == 1
     assert len(attached) == 1
+    # Token counters cover only the kept datum, never the dropped one.
+    assert stats.loss_tokens == 3
     assert "task-a__x1" in caplog.text
     assert "3 logprob(s) for 5 token(s)" in caplog.text
 
@@ -353,6 +379,26 @@ def test_attach_advantages_none_at_loss_position_drops_loudly(
     assert attached == []
     assert stats.mismatch_drops == 1
     assert "loss position 3" in caplog.text
+
+
+def test_dropped_datum_clips_are_not_counted(caplog: pytest.LogCaptureFixture) -> None:
+    """A mismatch-dropped datum is never trained on, so its clips are not signal."""
+    dropped = _one_datum(sampled_logprobs=[-1.0, -2.0, -3.0])
+    # The first loss position clips hard (+9.5 against clip 2.0), then the
+    # None at the next loss position drops the whole datum.
+    dropped_teacher: list[float | None] = [None, -0.1, 8.5, None, -3.0]
+    kept = _one_datum(sampled_logprobs=[-1.0, -2.0, -3.0])
+    kept_teacher: list[float | None] = [None, -0.1, -1.0, -2.0, -3.0]  # raws all 0: no clips
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.data"):
+        attached, stats = attach_advantages(
+            [dropped, kept],
+            [dropped_teacher, kept_teacher],
+            _cfg(advantage_clip=2.0, center_advantages=False),
+        )
+    assert len(attached) == 1
+    assert stats.mismatch_drops == 1
+    assert stats.clipped_tokens == 0
+    assert stats.loss_tokens == 3
 
 
 def test_attach_advantages_rejects_wrong_batch_shape() -> None:

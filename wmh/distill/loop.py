@@ -52,7 +52,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast, runtime_checkable
 from uuid import uuid4
@@ -62,7 +62,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmh.config.store import validate_name
 from wmh.distill.config import DistillConfig, PricingConfig
-from wmh.distill.cost import METER_NAMES, BudgetExhausted, BudgetMeter, CostLine, MeterName
+from wmh.distill.cost import (
+    METER_NAMES,
+    BudgetExhausted,
+    BudgetMeter,
+    CostLine,
+    MeterName,
+    SpanBilling,
+    batch_billing,
+)
 from wmh.distill.data import (
     TrainDatum,
     attach_advantages,
@@ -88,7 +96,6 @@ from wmh.distill.teacher import (
     TinkerTeacher,
     tokenizer_fingerprint_check,
 )
-from wmh.distill.tokens import TrialRecord
 from wmh.distill.tracking import DistillTracker, build_tracker
 from wmh.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
@@ -267,16 +274,51 @@ class StepMetrics(BaseModel):
     reverse_kl_per_token: float | None
     """mean(sampled_lp - teacher_lp) over scored loss tokens; None when none."""
 
+    reward_mean: float | None
+    """Mean verifier reward over the step's trials; None when no trial ran.
+
+    Harbor's verifier rewards are binary today, so this equals `solve_rate`
+    and only diverges if a verifier ever emits fractional rewards.
+    """
+
+    advantage_mean: float | None
+    """Mean advantage over the trained loss tokens (post clip and centering,
+    so ~0.0 under `train.center_advantages`); None when nothing was trained."""
+
+    advantage_std: float | None
+    """Population std over the same loss tokens; None when nothing was trained."""
+
+    clip_fraction: float = Field(ge=0.0, le=1.0)
+    """Trained loss tokens whose raw advantage hit the clip bound, as a
+    fraction of the trained loss tokens (0.0 when nothing was trained)."""
+
+    pg_loss: float | None
+    """The batch loss the training backend reported for the step's
+    forward/backward; None when no optimizer step ran or the backend reported
+    no loss metric (tinker 0.23.3 has no typed loss field; see
+    `SDK_LOSS_METRIC_NAMES`)."""
+
+    grad_norm: float | None
+    """The gradient norm the optim step reported; None when no optimizer step
+    ran or the backend reported none (see `SDK_GRAD_NORM_METRIC_NAMES`)."""
+
     sampler_path: str
     """The tinker:// sampler path the step's rollouts sampled from."""
 
     student_prefill_tokens: int = Field(ge=0)
+    student_cached_prefill_tokens: int = Field(ge=0)
     student_sample_tokens: int = Field(ge=0)
     student_train_tokens: int = Field(ge=0)
     teacher_prefill_tokens: int = Field(ge=0)
+    teacher_cached_prefill_tokens: int = Field(ge=0)
+    teacher_sample_tokens: int = Field(ge=0)
     usd: float = Field(ge=0.0)
     """Priced spend since the previous metrics row (spend before the first row,
     the baselines and any warmup collection, folds into that first row)."""
+
+    cumulative_usd: float = Field(ge=0.0)
+    """Total priced spend through this row, across every session of the run
+    (the budget meter's total, matching the spend ledger)."""
 
 
 class WarmupMetrics(BaseModel):
@@ -309,9 +351,12 @@ class WarmupMetrics(BaseModel):
     """The effective warmup LR (warmup.learning_rate or train.learning_rate)."""
 
     student_prefill_tokens: int = Field(ge=0)
+    student_cached_prefill_tokens: int = Field(ge=0)
     student_sample_tokens: int = Field(ge=0)
     student_train_tokens: int = Field(ge=0)
     teacher_prefill_tokens: int = Field(ge=0)
+    teacher_cached_prefill_tokens: int = Field(ge=0)
+    teacher_sample_tokens: int = Field(ge=0)
     usd: float = Field(ge=0.0)
     """Priced spend since the previous metrics row (the teacher collection and
     any earlier baseline spend fold into warmup step 0's row)."""
@@ -350,6 +395,81 @@ class DistillResult(BaseModel):
 
 
 # -- injectable Tinker surface (fakes satisfy these directly) ------------------------------------
+
+
+SDK_LOSS_METRIC_NAMES = frozenset({"loss", "total_loss"})
+"""Metric names accepted as the batch loss in a tinker metrics dict.
+
+The pinned SDK (tinker 0.23.3) exposes no typed loss field anywhere:
+`ForwardBackwardOutput` carries exactly `loss_fn_output_type`, the per-datum
+`loss_fn_outputs` (field name -> TensorData; the cookbook reads a per-datum
+"logprobs" tensor from it), and a server-populated `metrics: dict[str, float]`
+whose only documented keys are MoE routing diagnostics. The cookbook's
+off-policy distillation reads a `total_loss` key from that dict, so these
+spellings (bare, or with the SDK chunk combiner's ":reduction" suffix) are
+what `sdk_metric_value` recognizes; anything else stays un-surfaced.
+"""
+
+SDK_GRAD_NORM_METRIC_NAMES = frozenset({"grad_norm"})
+"""Metric names accepted as the gradient norm in a tinker metrics dict.
+
+`OptimStepResponse` (tinker 0.23.3) carries only an untyped
+`metrics: Optional[Dict[str, float]]` with no documented keys, and no grad
+norm appears anywhere in the SDK or the cookbook; the value is surfaced only
+if the service ever reports one under this name.
+"""
+
+
+def sdk_metric_value(metrics: Mapping[str, float] | None, names: frozenset[str]) -> float | None:
+    """Pull one named scalar out of a tinker metrics dict, if it is present.
+
+    Server metric keys carry a ":reduction" suffix (e.g. "total_loss:sum")
+    that the SDK's chunk combiner folds over, so the match is on the name
+    part before an optional suffix.
+
+    Args:
+        metrics: The SDK output's metrics mapping (None on some responses).
+        names: The metric names to accept.
+
+    Returns:
+        The first matching value in mapping order, or None when the backend
+        reported no such metric (never a fabricated stand-in).
+    """
+    if not metrics:
+        return None
+    for key, value in metrics.items():
+        if key.split(":", 1)[0] in names:
+            return float(value)
+    return None
+
+
+class TrainStepOutput(BaseModel):
+    """What one `forward_backward` reports back, in loop currency.
+
+    Only real backend-reported values are ever set: `SdkTrainingClient`
+    extracts `loss` from `ForwardBackwardOutput.metrics` (see
+    `SDK_LOSS_METRIC_NAMES` for exactly what the SDK exposes), and None means
+    the backend reported nothing, which the loop logs as an absent metric.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    loss: float | None = None
+    """The batch loss the backend reported; None when it reported none."""
+
+
+class OptimStepOutput(BaseModel):
+    """What one `optim_step` reports back, in loop currency.
+
+    `SdkTrainingClient` extracts `grad_norm` from `OptimStepResponse.metrics`
+    (see `SDK_GRAD_NORM_METRIC_NAMES`); None means the backend reported
+    nothing, which the loop logs as an absent metric.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    grad_norm: float | None = None
+    """The gradient norm the backend reported; None when it reported none."""
 
 
 class DistillSamplingClient(Protocol):
@@ -396,12 +516,22 @@ class DistillTrainingClient(Protocol):
         """The student base model's tokenizer."""
         ...
 
-    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
-        """Accumulate gradients for one batch under the named loss."""
+    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> TrainStepOutput:
+        """Accumulate gradients for one batch under the named loss.
+
+        Returns:
+            The backend-reported step output; `loss` is None when the
+            backend reported no loss metric (never fabricated).
+        """
         ...
 
-    def optim_step(self, learning_rate: float) -> None:
-        """Apply one optimizer step."""
+    def optim_step(self, learning_rate: float) -> OptimStepOutput:
+        """Apply one optimizer step.
+
+        Returns:
+            The backend-reported output; `grad_norm` is None when the
+            backend reported no such metric (never fabricated).
+        """
         ...
 
     def save_state(self) -> str:
@@ -526,7 +656,7 @@ class SdkTrainingClient:
         """The student base model's HF tokenizer (deadline-bounded fetch)."""
         return cast("EncodingTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
 
-    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
+    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> TrainStepOutput:
         """Convert to real tinker datums and run one bounded forward/backward.
 
         The loss decides the wire conversion: cross_entropy datums (the
@@ -537,6 +667,13 @@ class SdkTrainingClient:
         Never retried on a deadline expiry: gradients may already have been
         accumulated server-side, so a re-submit could count the batch twice.
         The typed error aborts the step; resume restores the last checkpoint.
+
+        Returns:
+            The step output. The SDK's `ForwardBackwardOutput` has no typed
+            loss field (only `loss_fn_output_type`, per-datum
+            `loss_fn_outputs`, and the untyped `metrics` dict), so `loss` is
+            whatever `metrics` reports under `SDK_LOSS_METRIC_NAMES`, or
+            None when the service reports no such key.
         """
         converted = (
             to_tinker_sft_datums(datums)
@@ -544,19 +681,29 @@ class SdkTrainingClient:
             else to_tinker_datums(datums)
         )
         future = self._client.forward_backward(converted, cast("tinker_types.LossFnType", loss_fn))
-        wait_with_deadline("forward_backward", future)
+        output = wait_with_deadline("forward_backward", future)
+        return TrainStepOutput(loss=sdk_metric_value(output.metrics, SDK_LOSS_METRIC_NAMES))
 
-    def optim_step(self, learning_rate: float) -> None:
+    def optim_step(self, learning_rate: float) -> OptimStepOutput:
         """One bounded Adam step at the given learning rate.
 
         Never retried on a deadline expiry: the step may have been applied
         server-side before the deadline fired, and re-applying would
         double-step the optimizer. The typed error aborts the step cleanly.
+
+        Returns:
+            The step output. The SDK's `OptimStepResponse` carries only the
+            untyped optional `metrics` dict with no documented keys, so
+            `grad_norm` is whatever `metrics` reports under
+            `SDK_GRAD_NORM_METRIC_NAMES`, or None when absent.
         """
         from tinker import types
 
-        wait_with_deadline(
+        response = wait_with_deadline(
             "optim_step", self._client.optim_step(types.AdamParams(learning_rate=learning_rate))
+        )
+        return OptimStepOutput(
+            grad_norm=sdk_metric_value(response.metrics, SDK_GRAD_NORM_METRIC_NAMES)
         )
 
     def save_state(self) -> str:
@@ -984,28 +1131,6 @@ def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:
     return HarnessDoc(name=harness.name, version=harness.version, surfaces=surfaces)
 
 
-def _span_token_counts(records: Sequence[TrialRecord]) -> tuple[int, int]:
-    """Actual (prefill, sampled) token counts across trials' recorded spans.
-
-    Prefill counts only NEW prompt tokens under the prefix property (a prompt
-    extending the accumulated episode tokens charges just its delta); a
-    non-prefix prompt re-prefills in full, matching how the service meters it.
-    """
-    prefill = 0
-    sampled = 0
-    for record in records:
-        accumulated: list[int] = []
-        for span in sorted(record.spans, key=lambda item: item.call_index):
-            prompt = span.prompt_token_ids
-            if accumulated and prompt[: len(accumulated)] == accumulated:
-                prefill += len(prompt) - len(accumulated)
-            else:
-                prefill += len(prompt)
-            sampled += len(span.sampled_token_ids)
-            accumulated = list(prompt) + list(span.sampled_token_ids)
-    return prefill, sampled
-
-
 def _teacher_rows(
     teacher: TeacherClient, datums: Sequence[TrainDatum]
 ) -> tuple[list[list[float | None]], float | None]:
@@ -1226,6 +1351,36 @@ class _DistillRun:
             consecutive_steps=self._empty_step_streak,
         )
 
+    def _charge_rollout_billing(self, billing: SpanBilling, *, teacher: bool) -> None:
+        """Charge one rollout batch's per-request billing to its model's meters.
+
+        Both models bill the same way (unique tokens at the full prefill
+        rate, the repeated per-request volume at the cached rate, sampled
+        tokens at the sampling rate); only the meter family differs.
+        Teacher-in-harness episodes bill teacher_sample on what they
+        generate, which is what estimate_run_cost projects for them.
+
+        Args:
+            billing: The batch's measured volumes (`batch_billing`).
+            teacher: Charge the teacher meters (teacher-in-harness episodes:
+                warmup collection, the gate's teacher baseline) instead of
+                the student meters.
+        """
+        if teacher:
+            self._budget.charge("teacher_prefill", billing.unique_tokens)
+            self._budget.charge("teacher_cached_prefill", billing.cached_tokens)
+            self._budget.charge("teacher_sample", billing.sampled_tokens)
+        else:
+            self._budget.charge("student_prefill", billing.unique_tokens)
+            self._budget.charge("student_cached_prefill", billing.cached_tokens)
+            self._budget.charge("student_sample", billing.sampled_tokens)
+
+    def _meter_deltas(self) -> dict[MeterName, int]:
+        """Per-meter token deltas since the previous metrics row's cursor."""
+        return {
+            meter: self._budget.tokens(meter) - self._prev_tokens[meter] for meter in METER_NAMES
+        }
+
     def _student_provider(self) -> ProviderConfig:
         return self._sampler.provider_config(self._cfg.student.base_model)
 
@@ -1330,9 +1485,9 @@ class _DistillRun:
             attempts: Attempts per task (the eval's k).
             provider: The worker provider config for the trials.
             phase: The progress phase to emit under.
-            teacher_metered: Charge all tokens to teacher_prefill (the
-                teacher-in-harness approximation `estimate_run_cost`
-                documents) instead of the student meters.
+            teacher_metered: Charge the batch to the teacher meters (sampled
+                tokens at teacher_sample plus per-request prefill; see
+                `_charge_rollout_billing`) instead of the student meters.
             completed_step: Forwarded to the budget abort for checkpointing.
         """
         cfg = self._cfg
@@ -1353,12 +1508,7 @@ class _DistillRun:
             provider,
             self._run_dir / EVAL_ROLLOUTS_DIR / validate_name(key),
         )
-        prefill, sampled = _span_token_counts(records)
-        if teacher_metered:
-            self._budget.charge("teacher_prefill", prefill + sampled)
-        else:
-            self._budget.charge("student_prefill", prefill)
-            self._budget.charge("student_sample", sampled)
+        self._charge_rollout_billing(batch_billing(records), teacher=teacher_metered)
         report = DistillEvalReport(
             name=key,
             provider_model=provider.model,
@@ -1423,7 +1573,7 @@ class _DistillRun:
         learning_rate: float,
     ) -> WarmupMetrics:
         """One warmup metrics row carrying the meter deltas since the last row."""
-        tokens_now = {meter: self._budget.tokens(meter) for meter in METER_NAMES}
+        deltas = self._meter_deltas()
         return WarmupMetrics(
             tasks=len(self._train_ids),
             trials=trials,
@@ -1433,13 +1583,13 @@ class _DistillRun:
             loss_tokens=loss_tokens,
             context_tokens=context_tokens,
             learning_rate=learning_rate,
-            student_prefill_tokens=tokens_now["student_prefill"]
-            - self._prev_tokens["student_prefill"],
-            student_sample_tokens=tokens_now["student_sample"]
-            - self._prev_tokens["student_sample"],
-            student_train_tokens=tokens_now["student_train"] - self._prev_tokens["student_train"],
-            teacher_prefill_tokens=tokens_now["teacher_prefill"]
-            - self._prev_tokens["teacher_prefill"],
+            student_prefill_tokens=deltas["student_prefill"],
+            student_cached_prefill_tokens=deltas["student_cached_prefill"],
+            student_sample_tokens=deltas["student_sample"],
+            student_train_tokens=deltas["student_train"],
+            teacher_prefill_tokens=deltas["teacher_prefill"],
+            teacher_cached_prefill_tokens=deltas["teacher_cached_prefill"],
+            teacher_sample_tokens=deltas["teacher_sample"],
             usd=max(self._budget.session_usd - self._prev_usd, 0.0),
         )
 
@@ -1484,11 +1634,10 @@ class _DistillRun:
             self._teacher_provider(),
             self._run_dir / WARMUP_ROLLOUTS_DIR,
         )
-        prefill, sampled = _span_token_counts(records)
-        # Teacher sampling is metered like the teacher-in-harness baseline:
-        # every token at the teacher_prefill price (the config carries no
-        # teacher sampling meter; estimate_run_cost documents the approximation).
-        self._budget.charge("teacher_prefill", prefill + sampled)
+        # Teacher-in-harness billing, same as the gate's teacher baseline:
+        # sampled tokens at teacher_sample, per-request prefill split between
+        # teacher_prefill (unique) and teacher_cached_prefill (repeats).
+        self._charge_rollout_billing(batch_billing(records), teacher=True)
         try:
             self._budget.check()
         except BudgetExhausted as exc:
@@ -1599,9 +1748,7 @@ class _DistillRun:
         records, roll_stats = collect_rollouts(
             step, batch, cfg, self._harness, self._student_provider(), self._run_dir
         )
-        prefill, sampled = _span_token_counts(records)
-        self._budget.charge("student_prefill", prefill)
-        self._budget.charge("student_sample", sampled)
+        self._charge_rollout_billing(batch_billing(records), teacher=False)
 
         datums, datum_stats = build_datums(records, cfg)
         teacher_usage_before = self._teacher.usage()
@@ -1610,9 +1757,15 @@ class _DistillRun:
         attached, adv_stats = attach_advantages(datums, rows, cfg)
 
         train_tokens = sum(len(datum.model_input_tokens) for datum in attached)
+        pg_loss: float | None = None
+        grad_norm: float | None = None
         if attached:
-            self._training.forward_backward(attached, loss_fn=IMPORTANCE_SAMPLING_LOSS)
-            self._training.optim_step(cfg.train.learning_rate)
+            train_output = self._training.forward_backward(
+                attached, loss_fn=IMPORTANCE_SAMPLING_LOSS
+            )
+            optim_output = self._training.optim_step(cfg.train.learning_rate)
+            pg_loss = train_output.loss
+            grad_norm = optim_output.grad_norm
             self._budget.charge("student_train", train_tokens)
         else:
             logger.warning(
@@ -1627,7 +1780,7 @@ class _DistillRun:
                 adv_stats.mismatch_drops,
             )
 
-        tokens_now = {meter: self._budget.tokens(meter) for meter in METER_NAMES}
+        deltas = self._meter_deltas()
         metrics = StepMetrics(
             tasks=len(batch),
             trials=roll_stats.trials,
@@ -1643,19 +1796,30 @@ class _DistillRun:
             loss_tokens=datum_stats.loss_tokens,
             context_tokens=datum_stats.context_tokens,
             reverse_kl_per_token=reverse_kl,
+            reward_mean=(
+                sum(record.reward for record in records) / len(records) if records else None
+            ),
+            advantage_mean=adv_stats.advantage_mean,
+            advantage_std=adv_stats.advantage_std,
+            clip_fraction=(
+                adv_stats.clipped_tokens / adv_stats.loss_tokens if adv_stats.loss_tokens else 0.0
+            ),
+            pg_loss=pg_loss,
+            grad_norm=grad_norm,
             sampler_path=sampler_path,
-            student_prefill_tokens=tokens_now["student_prefill"]
-            - self._prev_tokens["student_prefill"],
-            student_sample_tokens=tokens_now["student_sample"]
-            - self._prev_tokens["student_sample"],
-            student_train_tokens=tokens_now["student_train"] - self._prev_tokens["student_train"],
-            teacher_prefill_tokens=tokens_now["teacher_prefill"]
-            - self._prev_tokens["teacher_prefill"],
+            student_prefill_tokens=deltas["student_prefill"],
+            student_cached_prefill_tokens=deltas["student_cached_prefill"],
+            student_sample_tokens=deltas["student_sample"],
+            student_train_tokens=deltas["student_train"],
+            teacher_prefill_tokens=deltas["teacher_prefill"],
+            teacher_cached_prefill_tokens=deltas["teacher_cached_prefill"],
+            teacher_sample_tokens=deltas["teacher_sample"],
             usd=max(self._budget.session_usd - self._prev_usd, 0.0),
+            cumulative_usd=max(self._budget.total_usd, 0.0),
         )
         self._store.append_metrics(step, metrics)
         self._tracker.log_step(step, metrics)
-        self._prev_tokens = tokens_now
+        self._prev_tokens = {meter: self._budget.tokens(meter) for meter in METER_NAMES}
         self._prev_usd = self._budget.session_usd
         kl_text = "n/a" if reverse_kl is None else f"{reverse_kl:.4f}"
         self._emit(

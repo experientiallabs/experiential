@@ -16,6 +16,7 @@ from wmh.distill.config import (
     TeacherConfig,
 )
 from wmh.distill.gate import DistillGateRecord
+from wmh.distill.loop import StepMetrics
 from wmh.distill.store import (
     CHAMPION_ALIAS,
     DEFAULT_TINKER_OPENAI_ENDPOINT,
@@ -94,6 +95,51 @@ def test_metrics_helpers_on_fresh_run(tmp_path: Path) -> None:
     assert store.read_metrics() == []
     assert store.last_step() is None
     assert store.budget_spent() == 0.0
+
+
+def test_step_metrics_row_round_trips_the_rl_and_cost_fields(tmp_path: Path) -> None:
+    """The real StepMetrics shape (cumulative_usd, RL metrics included) persists."""
+    metrics = StepMetrics(
+        tasks=2,
+        trials=4,
+        solve_rate=0.5,
+        empty_span_trials=0,
+        datums=4,
+        fragments=0,
+        fragmentation_rate=0.0,
+        overflow_drops=0,
+        overlong_drops=0,
+        mismatch_drops=0,
+        clipped_tokens=3,
+        loss_tokens=40,
+        context_tokens=200,
+        reverse_kl_per_token=-0.25,
+        reward_mean=0.5,
+        advantage_mean=0.05,
+        advantage_std=1.2,
+        clip_fraction=0.075,
+        pg_loss=1.5,
+        grad_norm=None,
+        sampler_path="tinker://fake/sampler/0001",
+        student_prefill_tokens=120,
+        student_cached_prefill_tokens=30,
+        student_sample_tokens=40,
+        student_train_tokens=200,
+        teacher_prefill_tokens=160,
+        teacher_cached_prefill_tokens=0,
+        teacher_sample_tokens=0,
+        usd=0.75,
+        cumulative_usd=3.25,
+    )
+    store = DistillRunStore(tmp_path / "run")
+    store.append_metrics(4, metrics)
+    (row,) = store.read_metrics()
+    assert row == {"step": 4, **metrics.model_dump(mode="json")}
+    assert row["cumulative_usd"] == 3.25
+    assert row["reward_mean"] == 0.5
+    assert row["clip_fraction"] == 0.075
+    assert row["pg_loss"] == 1.5
+    assert row["grad_norm"] is None  # unreported backend metrics persist as null
 
 
 def test_append_metrics_rejects_conflicting_step(tmp_path: Path) -> None:
