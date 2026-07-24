@@ -42,7 +42,7 @@ Export the FULL trace: `GET /api/public/traces/{traceId}` (`TraceWithFullDetails
 Langfuse's native OTLP endpoint `POST /api/public/otel/v1/traces` and the `otel-genai` source, which
 is the better route for framework traces where tool calls are separate child observations).
 
-Pull: `from_vendor` fetches traces live over the public REST API with plain httpx (no SDK) — it
+Pull: `from_vendor` fetches traces live over the public REST API with plain httpx (no SDK): it
 pages the list endpoint, then re-fetches each trace by id for full observations. See
 `_pull_payloads`. File exports remain fully supported via `from_file`.
 """

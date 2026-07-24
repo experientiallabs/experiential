@@ -95,11 +95,11 @@ class BaseTraceAdapter:
         return spans
 
     def spans_from_file(self, path: str) -> list[SpanRecord]:
-        """All (uniquely re-stamped) spans in a file export — the streaming ingest's seam."""
+        """All (uniquely re-stamped) spans in a file export: the streaming ingest's seam."""
         return self.collect_all(load_payloads(Path(path).read_text(encoding="utf-8")))
 
     def spans_from_pull(self, pull: VendorPull) -> list[SpanRecord]:
-        """All (uniquely re-stamped) spans from a vendor pull — the streaming ingest's seam."""
+        """All (uniquely re-stamped) spans from a vendor pull: the streaming ingest's seam."""
         return self.collect_all(self._pull_payloads(pull))
 
     def from_file(self, path: str) -> list[Trace]:

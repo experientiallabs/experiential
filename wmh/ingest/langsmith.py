@@ -50,7 +50,7 @@ Accepted file shapes (`from_file`): a single run object, a JSON array of runs, a
 wrapper, or JSONL (one run per line). Grouping is by `trace_id` (falling back to `id` for a root
 run that omits it).
 
-Pull: `from_vendor` fetches runs live over the REST API with plain httpx (no SDK) — see
+Pull: `from_vendor` fetches runs live over the REST API with plain httpx (no SDK); see
 `_pull_payloads`. File exports remain fully supported via `from_file`.
 """
 
@@ -275,8 +275,8 @@ class LangSmithAdapter(BaseTraceAdapter):
         """Fetch runs live from the LangSmith REST API (plain httpx, no SDK).
 
         `pull.api_key` (else `$LANGCHAIN_API_KEY`/`$LANGSMITH_API_KEY`) auths; `pull.project` is
-        the project (session) UUID passed to `POST /api/v1/runs/query` — the list endpoint is a
-        POST with a JSON filter body. Pagination follows `cursors.next` until exhausted, `--limit`
+        the project (session) UUID passed to `POST /api/v1/runs/query`: the list endpoint is a
+        POST with a JSON filter body). Pagination follows `cursors.next` until exhausted, `--limit`
         traces are covered, or a run-count backstop trips.
         """
         api_key = pull.api_key or next(
@@ -298,7 +298,10 @@ class LangSmithAdapter(BaseTraceAdapter):
         cursor: str | None = None
         while True:
             body = dict(base_body)
-            body["cursor"] = cursor
+            # The cursor key is present only when following a page: cursor-based APIs
+            # commonly reject an explicit null on the first request.
+            if cursor is not None:
+                body["cursor"] = cursor
             resp = httpx.post(
                 f"{endpoint}/api/v1/runs/query",
                 headers={"x-api-key": api_key},

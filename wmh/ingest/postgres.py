@@ -3,26 +3,26 @@
 Teams that don't run an observability vendor usually have agent runs in Postgres already, in one
 of three shapes this adapter reads directly:
 
-  1. **Row per step/span** — a `trace_id` column plus a JSON `payload` column holding one span or
+  1. **Row per step/span**: a `trace_id` column plus a JSON `payload` column holding one span or
      event in any shape the file adapters accept (OTLP span, Langfuse observation, PostHog event,
      ...). Rows sharing a `trace_id` become one episode.
-  2. **Row per message** — a session/thread table where each row's payload is one chat message
+  2. **Row per message**: a session/thread table where each row's payload is one chat message
      (`{"role": ..., ...}`). Rows are assembled per `trace_id` into one conversation and read by
      the `chat-json` converter.
-  3. **Row per trace** — each row's payload is a self-contained session (a `{"messages": [...]}`
+  3. **Row per trace**: each row's payload is a self-contained session (a `{"messages": [...]}`
      blob, a Langfuse trace object, an OTLP envelope, ...). No `trace_id` column needed.
 
 The payload column's *format* is auto-detected with the same detector files use
 (`wmh.ingest.detect`), so Postgres stays pure transport and schema knowledge lives in the existing
 adapters. Default columns: `trace_id` (used when present), `payload` (required), `created_at`
-(ordering, when present) — all overridable via `VendorPull.trace_id_column` /
+(ordering, when present): all overridable via `VendorPull.trace_id_column` /
 `payload_column` / `order_column`. When the table has a `trace_id` column its value overrides any
 trace id inside the payload, so episode boundaries always follow the table.
 
 The driver (`psycopg`) is an optional extra (`world-model-harness[postgres]`), imported lazily
 inside the pull path like the vendor SDKs. Driver failures are re-raised as stdlib
-`PermissionError` (bad credentials) / `ConnectionError` (unreachable), so callers — the streaming
-ingest's error classifier in particular — never need psycopg imported.
+`PermissionError` (bad credentials) / `ConnectionError` (unreachable), so callers: the streaming
+ingest's error classifier in particular: never need psycopg imported.
 """
 
 from __future__ import annotations

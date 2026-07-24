@@ -103,7 +103,7 @@ def detect_format(payloads: list[JsonValue]) -> str:
 
     Samples the first payloads with a recognizable shape and requires them to agree. Raises
     `ValueError` (telling the caller to pass `--source` explicitly) when nothing is recognized
-    or when the sample is mixed — silent misdetection would normalize a corpus wrongly.
+    or when the sample is mixed: silent misdetection would normalize a corpus wrongly.
     """
     verdicts: list[str] = []
     for payload in payloads:

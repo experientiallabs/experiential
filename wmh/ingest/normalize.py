@@ -510,9 +510,9 @@ def _opt_str(value: JsonValue) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-# `start_nano` scale sniffing for latency: adapters put three kinds of value in start/end —
+# `start_nano` scale sniffing for latency: adapters put three kinds of value in start/end:
 # real OTLP epoch NANOseconds (~2e18 today), `iso_to_ordinal` epoch MICROseconds (~2e15 today),
-# and synthetic ordinals (list indexes, the writer's i*10 stamps — tiny). Only the first two are
+# and synthetic ordinals (list indexes, the writer's i*10 stamps: tiny). Only the first two are
 # real clocks a latency can be derived from; synthetic ordinals must not masquerade as durations.
 _EPOCH_NANO_FLOOR = 10**17  # ≥ 1973 when read as ns
 _EPOCH_MICRO_FLOOR = 10**14  # ≥ 1973 when read as µs

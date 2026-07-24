@@ -3,7 +3,7 @@
 This is the library seam behind `wmh ingest` and the platform's SSE trace-ingest endpoint. The
 event vocabulary is pinned by the D-INGEST contract (mirrored in the platform frontend's
 `parseTraceIngestEvent`): exactly one `detected {format, traces}`, then repeated
-`progress {normalized, total|null, note?}`, then a terminal `done {traces, steps, otel_object}` —
+`progress {normalized, total|null, note?}`, then a terminal `done {traces, steps, otel_object}`,
 or a terminal `error {message, code?}` at any point. `event_json` serializes an event to exactly
 those keys (optional fields dropped when unset, `total` kept even when null).
 
@@ -83,7 +83,7 @@ def event_json(event: IngestEvent) -> JsonObject:
     """Serialize one event to exactly the D-INGEST wire keys.
 
     Optional fields (`note`, `code`) are dropped when unset, but `progress.total` stays present
-    as null — the pinned frontend parser requires `total` to be a number or null, not absent.
+    as null: the pinned frontend parser requires `total` to be a number or null, not absent.
     """
     dump = event.model_dump(mode="json", exclude_none=True)
     if isinstance(event, ProgressEvent) and "total" not in dump:
@@ -198,6 +198,6 @@ def ingest_events(
             steps=sum(len(t.steps) for t in traces),
             otel_object=str(out),
         )
-    except Exception as exc:  # noqa: BLE001 — the wire contract IS "never raise, emit error"
+    except Exception as exc:  # noqa: BLE001: the wire contract IS "never raise, emit error"
         failure = _classify(exc)
         yield ErrorEvent(message=str(failure), code=failure.code)
