@@ -174,10 +174,19 @@ def run_distill(
         seed_version = record.seed_version
         effective_backend = record.backend
     else:
-        if record_path.exists() or store.config_path.exists():
+        if store.config_path.exists():
             raise typer.BadParameter(
                 f"{run_path} already holds a distillation run; pass --resume to "
                 "continue it or choose a fresh --run-dir"
+            )
+        if record_path.exists():
+            # The record is written before the loop starts, but the loop's very
+            # first durable action is the config.toml snapshot: a record with no
+            # snapshot means a previous start failed before doing (or spending)
+            # anything, so treat the dir as fresh instead of bricking it.
+            console.print(
+                f"[yellow]note[/yellow] {run_path} holds a run record from a start "
+                "that never began (no config.toml snapshot); starting fresh"
             )
         missing = [
             flag
@@ -269,6 +278,10 @@ def run_distill(
             resume=resume,
             on_progress=_on_progress,
             adapter_store=AdapterStore(root),
+            # Resume commands must print the agent string as typed (it may carry
+            # an @ref that `base` strips), or the printed command would trip the
+            # CLI's resume conflict check.
+            cli_agent=agent_name,
         )
     except DistillBudgetError as exc:
         console.print(f"[red]budget exhausted[/red] {escape(str(exc))}")
@@ -280,7 +293,9 @@ def run_distill(
         console.print(f"[red]distillation failed[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
 
-    _print_result(console, result, store, adapters=AdapterStore(root))
+    _print_result(
+        console, result, store, adapters=AdapterStore(root), base_model=cfg.student.base_model
+    )
     if promote:
         _maybe_promote(console, result, cfg, root)
 
@@ -472,7 +487,12 @@ def _confirm_cost(
 
 
 def _print_result(
-    console: Console, result: DistillResult, store: DistillRunStore, *, adapters: AdapterStore
+    console: Console,
+    result: DistillResult,
+    store: DistillRunStore,
+    *,
+    adapters: AdapterStore,
+    base_model: str,
 ) -> None:
     """Print the gate verdict, artifact paths, and the serving handoff snippet."""
     gate = result.gate
@@ -499,7 +519,7 @@ def _print_result(
         soft_wrap=True,
     )
     try:
-        handoff = build_handoff_toml(result.final_sampler_path)
+        handoff = build_handoff_toml(result.final_sampler_path, base_model=base_model)
     except ValueError as exc:
         console.print(f"[yellow]no handoff snippet[/yellow]: {escape(str(exc))}")
         return

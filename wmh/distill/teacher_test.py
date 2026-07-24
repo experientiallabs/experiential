@@ -283,10 +283,14 @@ def test_score_deadline_drops_and_rebuilds_the_lazy_scorer(
 
     with pytest.raises(TinkerDeadlineError, match="timed out"):
         teacher.score([_datum([1, 2], [3, 4])])
-    assert teacher.usage() == 0  # the wedged batch was never counted
+    # The wedged batch still counts: every submitted compute_logprobs call runs
+    # (and bills) server-side before the pool join propagates the error, so
+    # dropping it from usage would leak real spend past the budget ledger.
+    assert teacher.usage() == 4
     # The retry (here: calling score again) rebuilds a fresh session and works.
     [row] = teacher.score([_datum([1, 2], [3, 4])])
     assert len(row) == 4
+    assert teacher.usage() == 8
     assert len(builds) == 2
 
 

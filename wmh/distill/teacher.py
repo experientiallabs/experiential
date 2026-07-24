@@ -10,7 +10,7 @@ Indexing convention (verified against both the real SDK and the fakes):
 is the logprob of token p given tokens < p, and entry 0 is None because the
 first token has no context. The datum's `model_input_tokens` IS that full
 sequence and its `loss_mask` names the sampled positions, so the returned rows
-align index for index with the datum — `teacher_test.py` pins the alignment
+align index for index with the datum; `teacher_test.py` pins the alignment
 against the fake sampler's echoed logprobs to guard any off-by-one.
 
 The tinker SDK is an optional extra imported lazily (`uv sync --extra
@@ -239,9 +239,14 @@ class TinkerTeacher:
             # pool's shutdown join above stays bounded too.
             self._drop_wedged_scorer()
             raise
+        finally:
+            # Counted whether or not scoring succeeded: pool.map submits every
+            # datum up front and the executor's shutdown join runs them all, so
+            # the service bills the whole batch even when one call raises. The
+            # caller's finally-charge turns this into ledgered spend.
+            self._usage_tokens += sum(len(datum.model_input_tokens) for datum in datum_list)
         results: list[list[float | None]] = []
         for index, (datum, logprobs) in enumerate(zip(datum_list, per_datum, strict=True)):
-            self._usage_tokens += len(datum.model_input_tokens)
             results.append(self._loss_position_row(index, datum, logprobs))
         logger.debug(
             "teacher scored %d datum(s), %d tokens total so far",

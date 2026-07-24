@@ -330,6 +330,14 @@ def optimize(
                 f"{', '.join(world_model_only)} apply only to a world-model environment; "
                 "drop them for `wmh optimize <agent> harbor ...`"
             )
+        # Shared by both modes: 'harbor' must unambiguously mean the benchmark
+        # environment, never a stored world model that happens to carry the name.
+        if WorldModelStore(root).exists(_HARBOR_ENVIRONMENT):
+            raise typer.BadParameter(
+                "a stored world model is literally named 'harbor', which now selects the "
+                "harbor benchmark environment; rename that model directory under "
+                "<root>/models/ and retry"
+            )
         if mode == "distill":
             search_only = [
                 flag
@@ -624,12 +632,20 @@ class _HarborRunConfig(BaseModel):
 
 
 def _model_identity(config: ProviderConfig) -> JsonObject:
-    """The provider identity fields a run pins (and a resume must re-resolve identically)."""
+    """The provider identity fields a run pins (and a resume must re-resolve identically).
+
+    `model_type` and `endpoint` are part of the identity: for a tinker-provider
+    role model_type selects the renderer/tokenizer, and endpoint selects the
+    serving host, so a mid-run settings edit to either would silently change
+    the worker under test if they were not pinned.
+    """
     return {
         "provider": config.kind.value,
         "model": config.model,
+        "model_type": config.model_type,
         "deployment": config.deployment,
         "region": config.region,
+        "endpoint": config.endpoint,
         "reasoning_effort": config.reasoning_effort,
     }
 
@@ -680,11 +696,8 @@ def _optimize_harbor(
         raise typer.BadParameter(
             "--run-dir is required for the harbor environment: it holds all durable run state"
         )
-    if WorldModelStore(root).exists(_HARBOR_ENVIRONMENT):
-        raise typer.BadParameter(
-            "a stored world model is literally named 'harbor', which now selects the harbor "
-            "benchmark environment; rename that model directory under <root>/models/ and retry"
-        )
+    # The 'harbor'-named world model ambiguity is rejected by optimize() before
+    # either mode dispatches here.
 
     run_dir = Path(run_dir_option)
     config_path = run_dir / "run-config.json"
