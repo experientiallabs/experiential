@@ -26,7 +26,7 @@ from wmh.distill.loop import (
     ProgressCallback,
     SpendSummary,
 )
-from wmh.distill.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore
+from wmh.distill.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore, DistillRunStore
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.store import HarnessStore
 
@@ -112,6 +112,7 @@ class _RunRecorder:
         service_client: DistillServiceClient | None = None,
         adapter_store: AdapterStore | None = None,
         live_trial_preflight: LiveTrialPreflight | None = None,
+        cli_agent: str | None = None,
     ) -> DistillResult:
         self.calls.append(
             {
@@ -122,9 +123,14 @@ class _RunRecorder:
                 "holdout": tuple(holdout_task_ids),
                 "run_dir": run_dir,
                 "resume": resume,
+                "cli_agent": cli_agent,
                 "adapter_store": adapter_store,
             }
         )
+        # Mirror the real loop's first durable action: the config snapshot is
+        # what marks a run dir as started (the CLI's fresh/resume guards key
+        # on it), so the stand-in must uphold that contract too.
+        DistillRunStore(run_dir).snapshot_config(cfg)
         if on_progress is not None:
             for event in self._progress:
                 on_progress(event)
@@ -548,6 +554,26 @@ def test_distill_fresh_run_refuses_a_used_run_dir(
 
     assert second.exit_code == 2
     assert "already holds a distillation run" in _flat(second)
+
+
+def test_distill_record_without_config_snapshot_starts_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run record with no config.toml means the previous start failed before
+    the loop's first durable action (e.g. a missing SDK): the dir must stay
+    usable, not brick both the fresh and resume paths."""
+    _write_inputs(tmp_path)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "distill-run.json").write_text("{}", encoding="utf-8")
+
+    result = _invoke(tmp_path, "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert "never began" in _flat(result)
+    assert len(recorder.calls) == 1
 
 
 def test_distill_resume_reuses_the_pinned_splits(

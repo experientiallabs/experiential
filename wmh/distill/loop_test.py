@@ -51,9 +51,11 @@ from wmh.distill.fake_tinker import (
     FakeTrainingClient,
 )
 from wmh.distill.loop import (
+    EVAL_ROLLOUTS_DIR,
     MAX_CONSECUTIVE_EMPTY_STEPS,
     SDK_GRAD_NORM_METRIC_NAMES,
     SDK_LOSS_METRIC_NAMES,
+    STUDENT_AFTER_EVAL,
     STUDENT_BEFORE_EVAL,
     WARMUP_ROLLOUTS_DIR,
     DistillBudgetError,
@@ -226,6 +228,9 @@ class _FakeRollouts:
         self.empty_span_train_steps: set[int] = set()
         """TRAIN steps whose every trial records zero spans (a dead provider)."""
 
+        self.zero_trial_train_steps: set[int] = set()
+        """TRAIN steps whose batch returns no trials at all (harbor scored nothing)."""
+
     def __call__(
         self,
         step_index: int,
@@ -246,6 +251,19 @@ class _FakeRollouts:
         # A dead student provider: every trial ends span-less ("submitted"
         # with zero turns), exactly what swallowed worker failures produce.
         empty_batch = is_train_batch and step_index in self.empty_span_train_steps
+        if is_train_batch and step_index in self.zero_trial_train_steps:
+            self.calls.append(
+                _RolloutCall(
+                    step_index=step_index,
+                    task_ids=tuple(task_ids),
+                    attempts=cfg.train.group_size,
+                    provider_model=provider_config.model,
+                    run_dir=run_dir,
+                    doc_hash=harness.doc_hash,
+                )
+            )
+            stats = RolloutStats(trials=0, trials_with_spans=0, solve_rate=0.0, empty_span_trials=0)
+            return [], stats
         client = self.service.create_sampling_client(provider_config.model)
         records: list[TrialRecord] = []
         for task_index, task_id in enumerate(task_ids):
@@ -418,6 +436,16 @@ def _warmup_calls(env: _Env) -> list[_RolloutCall]:
     return [call for call in env.rollouts.calls if call.run_dir == warmup_dir]
 
 
+def _eval_run_counts(env: _Env) -> dict[str, int]:
+    """How many collector batches each eval key actually ran (reuse skips runs)."""
+    eval_root = env.run_dir / EVAL_ROLLOUTS_DIR
+    counts: dict[str, int] = {}
+    for call in env.rollouts.calls:
+        if call.run_dir.parent == eval_root:
+            counts[call.run_dir.name] = counts.get(call.run_dir.name, 0) + 1
+    return counts
+
+
 def _loss_fns(env: _Env) -> list[str]:
     training = env.service.training
     assert training is not None
@@ -430,6 +458,7 @@ def _run(
     *,
     resume: bool = False,
     tracker: DistillTracker | None = None,
+    cli_agent: str | None = None,
 ) -> DistillResult:
     return run_distillation(
         _NAME,
@@ -443,6 +472,7 @@ def _run(
         service_client=env.service,
         adapter_store=env.adapters,
         tracker=tracker,
+        cli_agent=cli_agent,
     )
 
 
@@ -793,6 +823,63 @@ def test_budget_abort_persists_state_and_the_resume_command(
     assert not store.gate_path.exists()
 
 
+def test_resume_command_prints_the_agent_string_as_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run seeded from a stored version is invoked as 'name@ref'; the printed
+    resume command must carry that exact string or the CLI's resume conflict
+    check rejects the one command the abort message tells the user to run."""
+    env = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(DistillBudgetError) as excinfo:
+        _run(env, _train_priced_cfg(budget_max=1.0), cli_agent=f"{_NAME}@v3")
+
+    expected = resume_command(f"{_NAME}@v3", env.run_dir)
+    assert excinfo.value.resume_command == expected
+    assert expected in str(excinfo.value)
+
+
+def test_resume_rejects_a_changed_gate_k(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Baselines recorded at one k must not gate a student-after measured at
+    another; the resume refuses instead of comparing different estimators."""
+    env = _setup(tmp_path, monkeypatch)
+    with pytest.raises(DistillBudgetError):
+        _run(env, _train_priced_cfg(budget_max=1.0))
+
+    changed = _cfg().model_copy(update={"gate": GateConfig(k=2)})
+    with pytest.raises(RuntimeError, match="measured at k=1"):
+        _run(env, changed, resume=True)
+
+
+def test_resume_rejects_a_changed_teacher_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The teacher baseline is reusable precisely because the teacher identity
+    is stable; swapping the teacher mid-run would gate against a stale rate."""
+    env = _setup(tmp_path, monkeypatch)
+    with pytest.raises(DistillBudgetError):
+        _run(env, _train_priced_cfg(budget_max=1.0))
+
+    changed = _cfg().model_copy(update={"teacher": TeacherConfig(model="other/teacher")})
+    with pytest.raises(RuntimeError, match="mid-run model swap"):
+        _run(env, changed, resume=True)
+
+
+def test_zero_trial_steps_count_toward_the_empty_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch that scores no trials at all is at least as dead as an all-empty
+    one; it must extend the dead-provider streak, not reset it."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.zero_trial_train_steps = {0}
+    env.rollouts.empty_span_train_steps = {1}
+
+    with pytest.raises(DistillEmptyBatchError) as excinfo:
+        _run(env, _cfg())
+
+    assert excinfo.value.consecutive_steps == MAX_CONSECUTIVE_EMPTY_STEPS
+
+
 def test_two_consecutive_all_empty_steps_abort_with_the_resume_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1092,11 +1179,19 @@ def test_warmup_keep_all_trains_on_failing_trials_too(
 def test_resume_never_reruns_a_completed_warmup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A finalize interrupted after the gate eval resumes without re-running
+    warmup or the student-after eval. (Resuming a fully COMPLETED run is
+    refused outright: see test_resume_of_a_completed_run_is_refused.)"""
     env = _setup(tmp_path, monkeypatch)
     cfg = _warmup_cfg()
     _run(env, cfg)
     assert len(_warmup_calls(env)) == 1
     assert _loss_fns(env).count("cross_entropy") == 2
+
+    store = DistillRunStore(env.run_dir)
+    after_evals_before = _eval_run_counts(env)[STUDENT_AFTER_EVAL]
+    # Simulate a crash between the student-after eval and the gate verdict.
+    store.gate_path.unlink()
 
     result = _run(env, cfg, resume=True)
 
@@ -1104,6 +1199,21 @@ def test_resume_never_reruns_a_completed_warmup(
     # Neither the teacher collection nor the SFT passes ran again.
     assert len(_warmup_calls(env)) == 1
     assert _loss_fns(env).count("cross_entropy") == 2
+    # The recorded student-after eval was reused, not re-spent.
+    assert _eval_run_counts(env)[STUDENT_AFTER_EVAL] == after_evals_before
+
+
+def test_resume_of_a_completed_run_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resuming a run whose gate verdict is recorded would re-spend the holdout
+    eval and could promote a duplicate adapter version; it must refuse."""
+    env = _setup(tmp_path, monkeypatch)
+    cfg = _warmup_cfg()
+    _run(env, cfg)
+
+    with pytest.raises(RuntimeError, match="already completed"):
+        _run(env, cfg, resume=True)
 
 
 def test_budget_abort_mid_warmup_reruns_warmup_whole_on_resume(

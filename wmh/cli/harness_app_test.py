@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmh.cli import app
@@ -818,7 +819,7 @@ class _DistillRecorder:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def __call__(self, console: object, **kwargs: object) -> None:
+    def __call__(self, console: Console, **kwargs: object) -> None:
         self.calls.append({"console": console, **kwargs})
 
 
@@ -897,6 +898,58 @@ def test_harbor_distill_rejects_search_only_flags(tmp_path: Path) -> None:
     assert "--harbor-config" in flat
     assert "--iterations" in flat
     assert "apply only to --mode search" in flat
+
+
+def test_model_identity_pins_model_type_and_endpoint() -> None:
+    """A settings edit to model_type (renderer/tokenizer) or endpoint (serving
+    host) between sessions changes the worker under test; the pinned identity
+    must catch it at resume instead of silently continuing."""
+    from wmh.cli.harness_app import _model_identity
+
+    config = ProviderConfig(
+        kind=ProviderKind.TINKER,
+        model="tinker://run/weights/0",
+        model_type="Qwen/Qwen3-8B",
+        endpoint="https://serve.example/v1",
+    )
+    identity = _model_identity(config)
+    assert identity["model_type"] == "Qwen/Qwen3-8B"
+    assert identity["endpoint"] == "https://serve.example/v1"
+
+
+def test_distill_mode_rejects_a_world_model_named_harbor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 'harbor'-name ambiguity guard covers both modes: distill must refuse
+    exactly like search instead of silently reading 'harbor' as the benchmark."""
+    recorder = _DistillRecorder()
+    monkeypatch.setattr(harness_app_module, "run_distill", recorder)
+    root = tmp_path / ".wmh"
+    model_dir = root / "models" / "harbor"
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.toml").write_text("", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "pi",
+            "harbor",
+            "--mode",
+            "distill",
+            "--distill-config",
+            str(tmp_path / "run.toml"),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 2
+    flat = " ".join(result.output.split())
+    assert "literally named 'harbor'" in flat
+    assert recorder.calls == []
 
 
 def test_harbor_distill_routes_to_run_distill_with_the_flag_wiring(

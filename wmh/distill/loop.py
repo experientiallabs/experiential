@@ -1079,10 +1079,12 @@ def tito_recompute_check(
 def resume_command(name: str, run_dir: Path) -> str:
     """The CLI command that resumes a distillation run.
 
-    This is the planned `wmh optimize ... --mode distill` surface; the CLI
-    layer reuses this helper so the command printed on a budget abort stays
-    the command that actually works. On resume the run's pinned config is the
-    `config.toml` snapshot inside the run dir.
+    The CLI layer (`wmh/cli/harness_distill.py`) reuses this helper so the
+    command printed on a budget abort stays the command that actually works.
+    On resume the run's pinned config is the `config.toml` snapshot inside
+    the run dir. `name` must be the agent string as the user typed it (an
+    @ref included) or the printed command trips the CLI resume conflict
+    check.
     """
     return f"wmh optimize {name} harbor --mode distill --run-dir {run_dir} --resume"
 
@@ -1171,8 +1173,9 @@ class _RunBudget:
     The cap is enforced over the TOTAL (prior + session) so a resumed run
     cannot spend the budget twice; the inner meter never enforces on its own.
     Every charge is pushed through `on_spend` (the run store's spend ledger)
-    so the cumulative total survives a crash at ANY point — metrics rows alone
-    would lose everything charged since the last completed step.
+    so every recorded charge survives a crash (metrics rows alone would lose
+    everything charged since the last completed step; work still in flight when
+    a session dies is charged only when its batch returns).
     """
 
     def __init__(
@@ -1239,8 +1242,12 @@ class _DistillRun:
         on_progress: ProgressCallback | None,
         live_trial_preflight: LiveTrialPreflight | None,
         tracker: DistillTracker,
+        cli_agent: str | None = None,
     ) -> None:
         self._name = name
+        # The agent string resume commands print; the run/adapter name strips any
+        # @ref, but a resume must be invoked with the string the run started with.
+        self._cli_agent = cli_agent if cli_agent is not None else name
         self._cfg = cfg
         self._harness = pin_rollout_params(harness, cfg)
         self._train_ids = list(train_task_ids)
@@ -1263,6 +1270,7 @@ class _DistillRun:
         self._prev_tokens: dict[MeterName, int] = dict.fromkeys(METER_NAMES, 0)
         self._prev_usd = 0.0
         self._empty_step_streak = 0
+        self._resumed = False
 
     # -- plumbing --------------------------------------------------------------------------------
 
@@ -1297,7 +1305,7 @@ class _DistillRun:
                 "no training step completed in this session, so the run resumes "
                 "from its recorded artifacts"
             )
-        command = resume_command(self._name, self._run_dir)
+        command = resume_command(self._cli_agent, self._run_dir)
         raise DistillBudgetError(
             f"budget exhausted: ${exc.spent_usd:.2f} spent against the "
             f"${exc.max_usd:.2f} cap (budget.max_usd); {saved}. Raise budget.max_usd "
@@ -1318,11 +1326,12 @@ class _DistillRun:
 
         Raises:
             DistillEmptyBatchError: After `MAX_CONSECUTIVE_EMPTY_STEPS` steps
-                in a row where every trial produced zero spans and no datums;
-                the step's state is checkpointed first and the message carries
-                the exact resume command.
+                in a row where every trial produced zero spans and no datums
+                (a step with zero trials counts: no trials is at least as dead
+                as all-empty trials); the step's state is checkpointed first
+                and the message carries the exact resume command.
         """
-        if not (trials > 0 and empty == trials and datums == 0):
+        if not (empty == trials and datums == 0):
             self._empty_step_streak = 0
             return
         self._empty_step_streak += 1
@@ -1338,7 +1347,7 @@ class _DistillRun:
             return
         state_path = self._training.save_state()
         self._store.record_checkpoint(step, state_path, self._sampler.sampler_path)
-        command = resume_command(self._name, self._run_dir)
+        command = resume_command(self._cli_agent, self._run_dir)
         raise DistillEmptyBatchError(
             f"aborting after {self._empty_step_streak} consecutive training steps in "
             "which every trial produced zero token spans (0 trainable datums): the "
@@ -1536,10 +1545,40 @@ class _DistillRun:
         phase: DistillPhase,
         teacher_metered: bool,
         reuse: bool,
+        pin_provider: bool = False,
+        completed_step: int | None = None,
     ) -> DistillEvalReport:
+        """Run the eval, or return the recorded report when `reuse` allows it.
+
+        A reused report must have been measured at the same `attempts` (the
+        gate compares solve rates, so mixing estimators of different k would
+        silently invalidate the verdict), and with `pin_provider` also under
+        the same provider model (the teacher's identity is stable across
+        sessions; student sampler paths carry a per-session nonce and are
+        intentionally NOT pinned).
+
+        Raises:
+            RuntimeError: If a recorded report conflicts with the current
+                config; the message says which knob changed and how to
+                recover.
+        """
         if reuse:
             existing = self._load_eval(key)
             if existing is not None:
+                if existing.attempts != attempts:
+                    raise RuntimeError(
+                        f"recorded eval {key!r} was measured at k={existing.attempts} but the "
+                        f"config now asks for k={attempts}; the gate would compare solve "
+                        "rates from different estimators. Restore the original gate/eval k "
+                        "in the config and resume, or start a fresh run dir"
+                    )
+                if pin_provider and existing.provider_model != provider.model:
+                    raise RuntimeError(
+                        f"recorded eval {key!r} was measured against {existing.provider_model!r} "
+                        f"but the config now names {provider.model!r}; a mid-run model swap "
+                        "would gate against a stale baseline. Restore the original model in "
+                        "the config and resume, or start a fresh run dir"
+                    )
                 logger.info("reusing recorded eval %s (solve rate %.3f)", key, existing.solve_rate)
                 return existing
         return self._run_eval(
@@ -1549,7 +1588,7 @@ class _DistillRun:
             provider,
             phase=phase,
             teacher_metered=teacher_metered,
-            completed_step=None,
+            completed_step=completed_step,
         )
 
     # -- warmup ----------------------------------------------------------------------------------
@@ -1752,8 +1791,13 @@ class _DistillRun:
 
         datums, datum_stats = build_datums(records, cfg)
         teacher_usage_before = self._teacher.usage()
-        rows, reverse_kl = _teacher_rows(self._teacher, datums)
-        self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
+        try:
+            rows, reverse_kl = _teacher_rows(self._teacher, datums)
+        finally:
+            # Charged even when scoring raises mid-batch: the pool joins every
+            # submitted call before propagating, so the whole batch was billed
+            # server-side whether or not a row came back.
+            self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
         attached, adv_stats = attach_advantages(datums, rows, cfg)
 
         train_tokens = sum(len(datum.model_input_tokens) for datum in attached)
@@ -1868,11 +1912,20 @@ class _DistillRun:
         """Run (or resume) the whole distillation to a gate verdict."""
         cfg = self._cfg
         store = self._store
+        self._resumed = resume
         if resume:
             if not store.config_path.exists():
                 raise RuntimeError(
                     f"nothing to resume in {self._run_dir}: no config.toml snapshot "
                     "from a prior run; start a fresh run without resume"
+                )
+            if store.gate_path.exists():
+                raise RuntimeError(
+                    f"the run in {self._run_dir} already completed: its gate verdict is "
+                    f"recorded at {store.gate_path} (see model_card.json for the final "
+                    "artifacts). Resuming a finished run would re-spend the holdout eval "
+                    "and could promote a duplicate adapter version; start a fresh "
+                    "--run-dir to distill again"
                 )
             latest = store.latest_checkpoint()
             start_step = latest.step + 1 if latest is not None else 0
@@ -1942,6 +1995,7 @@ class _DistillRun:
             phase="baseline",
             teacher_metered=True,
             reuse=resume,
+            pin_provider=True,
         )
         before_report = self._eval_or_load(
             STUDENT_BEFORE_EVAL,
@@ -1990,13 +2044,17 @@ class _DistillRun:
         final_step = max(cfg.train.steps - 1, 0)
         self._store.record_checkpoint(final_step, final_state, final_sampler)
 
-        after_report = self._run_eval(
+        # Reuse a recorded student-after report on resume: a budget abort inside
+        # a prior session's finalize already paid for it, and the resumed weights
+        # restore the same final checkpoint it measured.
+        after_report = self._eval_or_load(
             STUDENT_AFTER_EVAL,
             self._holdout_ids,
             cfg.gate.k,
             self._student_provider(),
             phase="eval",
             teacher_metered=False,
+            reuse=self._resumed,
             completed_step=final_step,
         )
         record = gate_distillation(
@@ -2019,7 +2077,9 @@ class _DistillRun:
         version: int | None = None
         if record.accepted:
             version = self._adapters.save_version(self._name, card)
-            self._store.write_handoff(build_handoff_toml(final_sampler))
+            self._store.write_handoff(
+                build_handoff_toml(final_sampler, base_model=cfg.student.base_model)
+            )
             logger.info("adapter %s v%d promoted: %s", self._name, version, record.reason)
         else:
             logger.warning("adapter %s not promoted: %s", self._name, record.reason)
@@ -2065,6 +2125,7 @@ def run_distillation(
     adapter_store: AdapterStore | None = None,
     live_trial_preflight: LiveTrialPreflight | None = None,
     tracker: DistillTracker | None = None,
+    cli_agent: str | None = None,
 ) -> DistillResult:
     """Run one on-policy distillation end to end (preflight to gate verdict).
 
@@ -2115,6 +2176,10 @@ def run_distillation(
             `[wandb]` section via `build_tracker` (the no-op `NullTracker`
             unless `wandb.enabled` is set). `finish()` is guaranteed on both
             the finalize and budget-abort paths.
+        cli_agent: The agent string as the user typed it (it may carry an
+            `@ref`, which `name` strips); resume commands print this string
+            so the printed command passes the CLI's resume conflict check.
+            None falls back to `name`.
 
     Returns:
         The `DistillResult`: gate record, final sampler/state paths, run dir,
@@ -2169,6 +2234,7 @@ def run_distillation(
         on_progress=on_progress,
         live_trial_preflight=live_trial_preflight,
         tracker=resolved_tracker,
+        cli_agent=cli_agent,
     )
     try:
         return run.execute(resume=resume)

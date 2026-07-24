@@ -260,7 +260,9 @@ def test_gate_model_card_and_handoff_writes(tmp_path: Path) -> None:
     store = DistillRunStore(tmp_path / "run")
     store.write_gate(_gate_record())
     store.write_model_card(_card())
-    store.write_handoff(build_handoff_toml("tinker://fake/sampler/final/0"))
+    store.write_handoff(
+        build_handoff_toml("tinker://fake/sampler/final/0", base_model="Qwen/Qwen3-4B")
+    )
     gate = DistillGateRecord.model_validate_json(store.gate_path.read_text(encoding="utf-8"))
     assert gate == _gate_record()
     card = DistillModelCard.model_validate_json(store.model_card_path.read_text(encoding="utf-8"))
@@ -342,13 +344,14 @@ def test_list_names_ignores_dirs_without_versions(tmp_path: Path) -> None:
 
 
 def test_handoff_snippet_content_and_default_endpoint() -> None:
-    text = build_handoff_toml("tinker://runs/abc/sampler/final")
+    text = build_handoff_toml("tinker://runs/abc/sampler/final", base_model="Qwen/Qwen3-4B")
     parsed = tomllib.loads(text)
     assert parsed == {
         "models": {
             "agent": {
                 "provider": "openai",
                 "model": "tinker://runs/abc/sampler/final",
+                "model_type": "Qwen/Qwen3-4B",
                 "endpoint": DEFAULT_TINKER_OPENAI_ENDPOINT,
             }
         }
@@ -360,7 +363,9 @@ def test_handoff_snippet_content_and_default_endpoint() -> None:
 
 def test_handoff_snippet_honors_custom_endpoint() -> None:
     text = build_handoff_toml(
-        "tinker://runs/abc/sampler/final", endpoint="http://localhost:8000/v1"
+        "tinker://runs/abc/sampler/final",
+        base_model="Qwen/Qwen3-4B",
+        endpoint="http://localhost:8000/v1",
     )
     parsed = tomllib.loads(text)
     assert parsed["models"]["agent"]["endpoint"] == "http://localhost:8000/v1"
@@ -368,9 +373,9 @@ def test_handoff_snippet_honors_custom_endpoint() -> None:
 
 def test_handoff_rejects_non_tinker_sampler_path() -> None:
     with pytest.raises(ValueError, match="not a tinker://"):
-        build_handoff_toml("s3://bucket/weights")
+        build_handoff_toml("s3://bucket/weights", base_model="Qwen/Qwen3-4B")
 
 
 def test_handoff_rejects_unembeddable_values() -> None:
     with pytest.raises(ValueError, match="cannot be embedded"):
-        build_handoff_toml('tinker://bad"path')
+        build_handoff_toml('tinker://bad"path', base_model="Qwen/Qwen3-4B")
