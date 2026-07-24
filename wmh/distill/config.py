@@ -52,6 +52,12 @@ class HarborConfig(BaseModel):
     backend: Literal["local", "e2b"] = "local"
     reward_key: str = "reward"
 
+    retries: int = Field(default=1, ge=0)
+    """Harbor-level retries per failed trial. Distill batches see transient
+    sandbox/runner deaths (e.g. an E2B transport drop killing the pi runner
+    mid-episode); one retry absorbs them, and any trial that still ends
+    without a verifier reward scores 0.0 instead of aborting the run."""
+
 
 class RolloutConfig(BaseModel):
     """Per-episode rollout limits."""
