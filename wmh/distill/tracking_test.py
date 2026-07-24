@@ -1,0 +1,375 @@
+"""Tests for the wandb tracking seam, against a recording fake wandb module.
+
+The fake is installed into `sys.modules["wandb"]` so `WandbTracker`'s lazy
+import resolves to it; no test talks to the real SDK or network. Credential
+resolution is tested against a temporary HOME so the developer's real
+~/.netrc can never leak into (or satisfy) an assertion.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from collections.abc import Mapping
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+from wmh.core.types import JsonObject, JsonValue
+from wmh.distill.config import (
+    DistillConfig,
+    HarborConfig,
+    StudentConfig,
+    TeacherConfig,
+    WandbConfig,
+)
+from wmh.distill.loop import StepMetrics
+from wmh.distill.tracking import (
+    WANDB_API_KEY_ENV,
+    NullTracker,
+    WandbTracker,
+    build_tracker,
+)
+
+_AGENT = "pi"
+
+
+class _FakeSummary:
+    """Records `summary.update` payloads."""
+
+    def __init__(self) -> None:
+        self.updates: list[dict[str, JsonValue]] = []
+
+    def update(self, values: Mapping[str, JsonValue]) -> None:
+        self.updates.append(dict(values))
+
+
+class _FakeRun:
+    """The object the fake `wandb.init` returns."""
+
+    def __init__(self) -> None:
+        self.summary = _FakeSummary()
+
+
+class _FakeWandb(ModuleType):
+    """A recording stand-in for the wandb module (installed in sys.modules)."""
+
+    def __init__(self) -> None:
+        super().__init__("wandb")
+        self.init_calls: list[JsonObject] = []
+        self.log_calls: list[tuple[dict[str, JsonValue], int]] = []
+        self.finish_calls = 0
+        self.run = _FakeRun()
+        self.fail_logging = False
+
+    def init(
+        self,
+        *,
+        project: str,
+        entity: str | None,
+        name: str,
+        tags: list[str],
+        dir: str,  # the wandb SDK's own keyword name
+        config: JsonObject,
+    ) -> _FakeRun:
+        self.init_calls.append(
+            {
+                "project": project,
+                "entity": entity,
+                "name": name,
+                "tags": list(tags),
+                "dir": dir,
+                "config": config,
+            }
+        )
+        return self.run
+
+    def log(self, data: Mapping[str, JsonValue], *, step: int) -> None:
+        if self.fail_logging:
+            raise RuntimeError("wandb service unavailable")
+        self.log_calls.append((dict(data), step))
+
+    def finish(self) -> None:
+        if self.fail_logging:
+            raise RuntimeError("wandb service unavailable")
+        self.finish_calls += 1
+
+
+def _cfg(wandb: WandbConfig | None = None) -> DistillConfig:
+    return DistillConfig(
+        student=StudentConfig(base_model="fake/student-4b"),
+        teacher=TeacherConfig(model="fake/teacher-70b"),
+        harbor=HarborConfig(job_template="jobs/tb2.yaml"),
+        wandb=wandb if wandb is not None else WandbConfig(enabled=True),
+    )
+
+
+def _metrics(*, reverse_kl: float | None = -0.25) -> StepMetrics:
+    return StepMetrics(
+        tasks=2,
+        trials=4,
+        solve_rate=0.5,
+        empty_span_trials=0,
+        datums=4,
+        fragments=0,
+        fragmentation_rate=0.0,
+        overflow_drops=0,
+        overlong_drops=1,
+        mismatch_drops=0,
+        clipped_tokens=3,
+        loss_tokens=40,
+        context_tokens=200,
+        reverse_kl_per_token=reverse_kl,
+        sampler_path="tinker://fake/sampler/0001",
+        student_prefill_tokens=120,
+        student_sample_tokens=40,
+        student_train_tokens=200,
+        teacher_prefill_tokens=160,
+        usd=0.75,
+    )
+
+
+@pytest.fixture
+def fake_wandb(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _FakeWandb:
+    """A recording wandb module with credentials present, in a clean HOME."""
+    fake = _FakeWandb()
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv(WANDB_API_KEY_ENV, "test-key")
+    return fake
+
+
+def _tracker(fake: _FakeWandb, run_dir: Path, cfg: DistillConfig | None = None) -> WandbTracker:
+    del fake  # already installed by the fixture; kept for call-site clarity
+    return WandbTracker(cfg if cfg is not None else _cfg(), run_dir, _AGENT)
+
+
+# -- build_tracker ---------------------------------------------------------------------------
+
+
+def test_build_tracker_disabled_is_a_null_tracker(tmp_path: Path) -> None:
+    tracker = build_tracker(_cfg(WandbConfig()), tmp_path / "run", _AGENT)
+    assert isinstance(tracker, NullTracker)
+    # Every NullTracker call is a harmless no-op.
+    tracker.log_step(0, _metrics())
+    tracker.log_eval("baseline-teacher", 0.5, None)
+    tracker.log_summary(
+        gate_accepted=True,
+        gate_reason="ok",
+        teacher_solve_rate=0.5,
+        student_before_solve_rate=0.25,
+        student_after_solve_rate=0.5,
+        total_usd=1.0,
+        steps_completed=3,
+    )
+    tracker.finish()
+
+
+def test_build_tracker_enabled_builds_a_wandb_tracker(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    tracker = build_tracker(_cfg(), tmp_path / "run", _AGENT)
+    assert isinstance(tracker, WandbTracker)
+    assert len(fake_wandb.init_calls) == 1
+
+
+# -- init ------------------------------------------------------------------------------------
+
+
+def test_init_kwargs_carry_the_config_section(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "smoke-01"
+    cfg = _cfg(
+        WandbConfig(
+            enabled=True,
+            project="my-project",
+            entity="my-team",
+            run_name="explicit-name",
+            tags=["smoke", "tb2"],
+        )
+    )
+    _tracker(fake_wandb, run_dir, cfg)
+    (call,) = fake_wandb.init_calls
+    assert call["project"] == "my-project"
+    assert call["entity"] == "my-team"
+    assert call["name"] == "explicit-name"
+    assert call["tags"] == ["smoke", "tb2"]
+    assert call["dir"] == str(run_dir)
+    assert run_dir.is_dir()  # wandb needs its dir to exist
+    # The run config is the same plain dict snapshot_toml renders.
+    assert call["config"] == cfg.model_dump(mode="json", exclude_none=True)
+
+
+def test_default_run_name_derives_from_agent_and_run_dir(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    _tracker(fake_wandb, tmp_path / "runs" / "smoke-02")
+    (call,) = fake_wandb.init_calls
+    assert call["name"] == "pi-smoke-02"
+
+
+def test_missing_sdk_error_names_the_extra(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # None in sys.modules makes `import wandb` raise ImportError (the halted-import
+    # convention), simulating an environment without the distill extra.
+    monkeypatch.setitem(sys.modules, "wandb", None)
+    monkeypatch.setenv(WANDB_API_KEY_ENV, "test-key")
+    with pytest.raises(ImportError, match=r"uv sync --extra distill"):
+        WandbTracker(_cfg(), tmp_path / "run", _AGENT)
+
+
+# -- credentials -----------------------------------------------------------------------------
+
+
+def test_missing_credentials_error_names_both_fixes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", _FakeWandb())
+    monkeypatch.delenv(WANDB_API_KEY_ENV, raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))  # no ~/.netrc at all
+    with pytest.raises(ValueError, match=r"WANDB_API_KEY.*wandb login") as excinfo:
+        WandbTracker(_cfg(), tmp_path / "run", _AGENT)
+    message = str(excinfo.value)
+    assert "api.wandb.ai" in message
+    assert ".netrc" in message
+
+
+def test_netrc_without_a_wandb_machine_is_not_a_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setitem(sys.modules, "wandb", _FakeWandb())
+    monkeypatch.delenv(WANDB_API_KEY_ENV, raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    netrc_path = home / ".netrc"
+    netrc_path.write_text("machine example.com login user password hunter2\n", encoding="utf-8")
+    os.chmod(netrc_path, 0o600)  # netrc rejects world-readable password files
+    monkeypatch.setenv("HOME", str(home))
+    with pytest.raises(ValueError, match="no credentials were found"):
+        WandbTracker(_cfg(), tmp_path / "run", _AGENT)
+
+
+def test_netrc_wandb_login_satisfies_the_credential_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake = _FakeWandb()
+    monkeypatch.setitem(sys.modules, "wandb", fake)
+    monkeypatch.delenv(WANDB_API_KEY_ENV, raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    netrc_path = home / ".netrc"
+    netrc_path.write_text("machine api.wandb.ai login user password test-key\n", encoding="utf-8")
+    os.chmod(netrc_path, 0o600)
+    monkeypatch.setenv("HOME", str(home))
+    WandbTracker(_cfg(), tmp_path / "run", _AGENT)
+    assert len(fake.init_calls) == 1
+
+
+# -- logging ---------------------------------------------------------------------------------
+
+
+def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_step(3, _metrics())
+    (payload, step) = fake_wandb.log_calls[-1]
+    assert step == 3
+    assert payload == {
+        "train/tasks": 2,
+        "train/trials": 4,
+        "train/solve_rate": 0.5,
+        "train/empty_span_trials": 0,
+        "train/datums": 4,
+        "train/fragments": 0,
+        "train/fragmentation_rate": 0.0,
+        "train/overflow_drops": 0,
+        "train/overlong_drops": 1,
+        "train/mismatch_drops": 0,
+        "train/clipped_tokens": 3,
+        "train/loss_tokens": 40,
+        "train/context_tokens": 200,
+        "train/reverse_kl_per_token": -0.25,
+        "tokens/student_prefill": 120,
+        "tokens/student_sample": 40,
+        "tokens/student_train": 200,
+        "tokens/teacher_prefill": 160,
+        "cost/usd": 0.75,
+    }
+    # The sampler path (a string) never lands in a chartable payload.
+    assert not any("sampler" in key for key in payload)
+
+
+def test_log_step_drops_an_unscored_reverse_kl(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_step(0, _metrics(reverse_kl=None))
+    (payload, _) = fake_wandb.log_calls[-1]
+    assert "train/reverse_kl_per_token" not in payload
+
+
+def test_log_eval_uses_the_eval_namespace_and_step(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_eval("baseline-teacher", 0.5, None)
+    tracker.log_eval("step-0001", 0.75, 1)
+    assert fake_wandb.log_calls == [
+        ({"eval/baseline-teacher": 0.5}, 0),  # pre-training evals chart at step 0
+        ({"eval/step-0001": 0.75}, 1),
+    ]
+
+
+def test_log_summary_updates_the_run_summary(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_summary(
+        gate_accepted=True,
+        gate_reason="student reached 100% of the teacher",
+        teacher_solve_rate=0.5,
+        student_before_solve_rate=0.25,
+        student_after_solve_rate=0.5,
+        total_usd=12.5,
+        steps_completed=3,
+    )
+    assert fake_wandb.run.summary.updates == [
+        {
+            "gate_accepted": True,
+            "gate_reason": "student reached 100% of the teacher",
+            "teacher_solve_rate": 0.5,
+            "student_before_solve_rate": 0.25,
+            "student_after_solve_rate": 0.5,
+            "total_usd": 12.5,
+            "steps_completed": 3,
+        }
+    ]
+
+
+def test_finish_closes_the_wandb_run(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.finish()
+    assert fake_wandb.finish_calls == 1
+
+
+def test_a_log_failure_degrades_to_noop_with_one_warning(
+    fake_wandb: _FakeWandb, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A dead dashboard must never abort a paid run: one warning, then silence."""
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    fake_wandb.fail_logging = True
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.tracking"):
+        tracker.log_step(0, _metrics())  # first failure: warns, marks dead
+        tracker.log_eval("step-0000", 0.5, 0)  # dead: skipped silently
+        tracker.log_summary(
+            gate_accepted=False,
+            gate_reason="regressed",
+            teacher_solve_rate=0.5,
+            student_before_solve_rate=0.5,
+            student_after_solve_rate=0.25,
+            total_usd=1.0,
+            steps_completed=1,
+        )
+        tracker.finish()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "training continues" in warnings[0].getMessage()
+    # Nothing reached wandb after the failure, and nothing raised.
+    assert fake_wandb.log_calls == []
+    assert fake_wandb.run.summary.updates == []
+    assert fake_wandb.finish_calls == 0
