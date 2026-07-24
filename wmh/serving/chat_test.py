@@ -10,7 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from wmh.optimize.policy import ClusterAssignment, EmbedderSpec, RoutingPolicy
+from wmh.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmh.providers.base import (
     Completion,
     Message,
@@ -87,13 +87,18 @@ def _cluster_policy() -> RoutingPolicy:
     embedder = HashingEmbedder(dim=64)
     sql, prose = embedder.embed(["SELECT count(*) FROM superheroes", "write a friendly email"])
     return RoutingPolicy(
-        kind="cluster",
+        kind="rank",
         default_model="haiku-4-5",
         pool=_pool(),
         embedder=EmbedderSpec(dim=64),
+        top_k_clusters=1,
         clusters=[
-            ClusterAssignment(cluster_id=0, label="sql", centroid=sql, model="fable-5"),
-            ClusterAssignment(cluster_id=1, label="prose", centroid=prose, model="haiku-4-5"),
+            ClusterRanking(
+                cluster_id=0, label="sql", centroid=sql, ranking=["fable-5", "haiku-4-5"]
+            ),
+            ClusterRanking(
+                cluster_id=1, label="prose", centroid=prose, ranking=["haiku-4-5", "fable-5"]
+            ),
         ],
     )
 

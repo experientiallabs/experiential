@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmh.optimize.policy import ClusterAssignment, EmbedderSpec, RoutingPolicy
+from wmh.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmh.optimize.report import build_report
 from wmh.providers.base import ProviderKind, TokenUsage
 from wmh.providers.pool import PoolEntry
@@ -62,13 +62,16 @@ def _cluster_policy() -> RoutingPolicy:
     embedder = HashingEmbedder(dim=64)
     sql, prose = embedder.embed([_SQL_TASK, _PROSE_TASK])
     return RoutingPolicy(
-        kind="cluster",
+        kind="rank",
         default_model="cheap",
         pool=_entries(),
         embedder=EmbedderSpec(dim=64),
+        top_k_clusters=1,
         clusters=[
-            ClusterAssignment(cluster_id=0, label="sql", centroid=sql, model="fable-5"),
-            ClusterAssignment(cluster_id=1, label="prose", centroid=prose, model="cheap"),
+            ClusterRanking(cluster_id=0, label="sql", centroid=sql, ranking=["fable-5", "cheap"]),
+            ClusterRanking(
+                cluster_id=1, label="prose", centroid=prose, ranking=["cheap", "fable-5"]
+            ),
         ],
     )
 

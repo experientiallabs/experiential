@@ -1,4 +1,4 @@
-"""Tests for the routing policy artifact and serve-time model selection."""
+"""Tests for the routing policy artifact and the Avengers-style rank selection."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from wmh.optimize.policy import (
-    ClusterAssignment,
+    ClusterRanking,
     EmbedderSpec,
     RoutingPolicy,
     select_model,
@@ -28,17 +28,32 @@ def _static() -> RoutingPolicy:
     return RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())
 
 
-def _cluster_policy() -> RoutingPolicy:
+def _rank_policy(top_k_clusters: int = 1) -> RoutingPolicy:
     embedder = HashingEmbedder(dim=64)
     sql, prose = embedder.embed(["SELECT count(*) FROM superheroes", "write a friendly email"])
     return RoutingPolicy(
-        kind="cluster",
+        kind="rank",
         default_model="haiku-4-5",
         pool=_pool(),
         embedder=EmbedderSpec(dim=64),
+        top_k_clusters=top_k_clusters,
         clusters=[
-            ClusterAssignment(cluster_id=0, label="sql", centroid=sql, model="fable-5"),
-            ClusterAssignment(cluster_id=1, label="prose", centroid=prose, model="haiku-4-5"),
+            ClusterRanking(
+                cluster_id=0,
+                label="sql",
+                centroid=sql,
+                ranking=["fable-5", "haiku-4-5"],
+                scores={"fable-5": 0.9, "haiku-4-5": 0.5},
+                total=10,
+            ),
+            ClusterRanking(
+                cluster_id=1,
+                label="prose",
+                centroid=prose,
+                ranking=["haiku-4-5", "fable-5"],
+                scores={"haiku-4-5": 0.8, "fable-5": 0.7},
+                total=10,
+            ),
         ],
     )
 
@@ -50,25 +65,48 @@ def test_static_policy_routes_to_default() -> None:
     assert "static" in decision.reason
 
 
-def test_cluster_policy_routes_to_nearest_centroid() -> None:
-    policy = _cluster_policy()
+def test_rank_policy_routes_by_nearest_cluster_ranking() -> None:
+    policy = _rank_policy()
     sql_decision = select_model(policy, "SELECT name FROM superheroes WHERE power = 'flight'")
     assert sql_decision.model == "fable-5"
     assert sql_decision.cluster_label == "sql"
+    assert "rank router" in sql_decision.reason
     prose_decision = select_model(policy, "write a friendly email to the team")
     assert prose_decision.model == "haiku-4-5"
     assert prose_decision.cluster_label == "prose"
 
 
+def test_rank_policy_soft_mixing_follows_the_closer_cluster() -> None:
+    # With both clusters mixed in (top_k=2) and symmetric opposite rankings, the winner is
+    # decided by which cluster is closer: score(m) = sum_c p_c / (rank_c(m) + 0.1).
+    policy = _rank_policy(top_k_clusters=2)
+    assert select_model(policy, "SELECT count(*) FROM superheroes").model == "fable-5"
+    assert select_model(policy, "write a friendly email").model == "haiku-4-5"
+
+
+def test_models_missing_from_rankings_score_default_rank() -> None:
+    # Ranking mentions only fable-5; haiku scores 1/default_rank and cannot win.
+    embedder = HashingEmbedder(dim=32)
+    (centroid,) = embedder.embed(["anything"])
+    policy = RoutingPolicy(
+        kind="rank",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        embedder=EmbedderSpec(dim=32),
+        top_k_clusters=1,
+        clusters=[ClusterRanking(cluster_id=0, centroid=centroid, ranking=["fable-5"])],
+    )
+    assert select_model(policy, "anything").model == "fable-5"
+
+
 def test_incumbent_sticks_by_default() -> None:
-    policy = _cluster_policy()
-    decision = select_model(policy, "SELECT 1", incumbent="haiku-4-5")
+    decision = select_model(_rank_policy(), "SELECT 1", incumbent="haiku-4-5")
     assert decision.model == "haiku-4-5"  # affinity wins over the cluster preference
     assert "sticky" in decision.reason
 
 
 def test_retired_incumbent_reroutes() -> None:
-    decision = select_model(_cluster_policy(), "SELECT 1", incumbent="gone-model")
+    decision = select_model(_rank_policy(), "SELECT 1", incumbent="gone-model")
     assert decision.model == "fable-5"
 
 
@@ -77,27 +115,27 @@ def test_default_model_must_be_in_pool() -> None:
         RoutingPolicy(kind="static", default_model="nope", pool=_pool())
 
 
-def test_cluster_model_must_be_in_pool() -> None:
-    with pytest.raises(ValueError, match="cluster"):
+def test_ranking_models_must_be_in_pool() -> None:
+    with pytest.raises(ValueError, match="missing"):
         RoutingPolicy(
-            kind="cluster",
+            kind="rank",
             default_model="haiku-4-5",
             pool=_pool(),
             embedder=EmbedderSpec(dim=4),
-            clusters=[ClusterAssignment(cluster_id=0, centroid=[1, 0, 0, 0], model="missing")],
+            clusters=[ClusterRanking(cluster_id=0, centroid=[1, 0, 0, 0], ranking=["missing"])],
         )
 
 
-def test_cluster_kind_requires_clusters_and_matching_dims() -> None:
+def test_rank_kind_requires_clusters_and_matching_dims() -> None:
     with pytest.raises(ValueError, match="cluster"):
-        RoutingPolicy(kind="cluster", default_model="haiku-4-5", pool=_pool())
+        RoutingPolicy(kind="rank", default_model="haiku-4-5", pool=_pool())
     with pytest.raises(ValueError, match="dim"):
         RoutingPolicy(
-            kind="cluster",
+            kind="rank",
             default_model="haiku-4-5",
             pool=_pool(),
             embedder=EmbedderSpec(dim=8),
-            clusters=[ClusterAssignment(cluster_id=0, centroid=[1.0, 0.0], model="fable-5")],
+            clusters=[ClusterRanking(cluster_id=0, centroid=[1.0, 0.0], ranking=["fable-5"])],
         )
 
 
@@ -108,12 +146,12 @@ def test_static_kind_rejects_clusters() -> None:
             default_model="haiku-4-5",
             pool=_pool(),
             embedder=EmbedderSpec(dim=2),
-            clusters=[ClusterAssignment(cluster_id=0, centroid=[1.0, 0.0], model="fable-5")],
+            clusters=[ClusterRanking(cluster_id=0, centroid=[1.0, 0.0], ranking=["fable-5"])],
         )
 
 
 def test_policy_round_trips_through_json(tmp_path: Path) -> None:
-    policy = _cluster_policy()
+    policy = _rank_policy()
     path = tmp_path / "policy.json"
     policy.save(path)
     assert RoutingPolicy.load(path) == policy
