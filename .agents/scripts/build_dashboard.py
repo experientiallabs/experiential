@@ -56,6 +56,8 @@ run on the held-out split; hover anything for the full record. Rebuild with --al
 the fitter-validation matrices (other papers' model pools).</p>
 <div class="filters" id="matrixFilter"></div>
 <div class="legend" id="variantLegend"></div>
+<h2>Headlines: best routed run vs best single model</h2>
+<div id="heads" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px"></div>
 <h2>Cost vs quality (Pareto), per matrix</h2>
 <div class="grid2" id="pareto"></div>
 <h2>Model mix per run (all models)</h2>
@@ -196,7 +198,33 @@ function table(){
   el.addEventListener('mousemove',e=>showTip(e,el.dataset.t));
   el.addEventListener('mouseleave',hideTip);});
 }
+function headlines(){
+ const cont=document.getElementById('heads'); cont.innerHTML='';
+ for(const m of matrices.filter(x=>active.has(x))){
+  const rows=DATA.filter(r=>r.matrix===m);
+  const bs=rows.find(r=>r.variant==='best-single');
+  const routed=rows.filter(r=>r.variant!=='best-single');
+  if(!bs||!routed.length) continue;
+  // Best routed = highest accuracy; ties break cheaper.
+  const best=routed.slice().sort((a,b)=>(b.result.accuracy-a.result.accuracy)||(a.result.cost_per_call-b.result.cost_per_call))[0];
+  const r=best.result, b=bs.result;
+  const dAcc=(100*(r.accuracy-b.accuracy));
+  const xCost=b.cost_per_call/r.cost_per_call;
+  const xLat=(r.latency_p50_s&&b.latency_p50_s)?(b.latency_p50_s/r.latency_p50_s):null;
+  const good=v=>v>=0?'var(--c3)':'var(--c4)';
+  const div=document.createElement('div');
+  div.style.cssText='border:1px solid var(--grid);border-radius:10px;padding:14px 16px';
+  div.innerHTML=`<div style="color:var(--muted);font-size:12px">${m} · ${best.variant} ${JSON.stringify(best.params)} vs ${bs.params.model} · n=${r.scenarios}</div>
+   <div style="font-size:22px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
+   <div style="color:var(--muted)">${fmt$(r.cost_per_call)}/call <b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
+   (xLat?` · p50 ${r.latency_p50_s.toFixed(2)}s <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+
+   `</div>
+   <div style="color:var(--muted);font-size:12px;margin-top:4px">baseline: ${fmtP(b.accuracy)} @ ${fmt$(b.cost_per_call)}${b.latency_p50_s?` · p50 ${b.latency_p50_s.toFixed(2)}s`:''}${r.scenarios<60?' · <b>small n - wide noise floor</b>':''}</div>`;
+  cont.appendChild(div);
+ }
+}
 function render(){
+ headlines();
  const p=document.getElementById('pareto'); p.innerHTML='';
  matrices.filter(m=>active.has(m)).forEach(m=>p.appendChild(paretoChart(m)));
  stacked('mix', r=>r.result.model_mix, '%');
