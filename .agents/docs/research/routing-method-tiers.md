@@ -201,3 +201,28 @@ its job - on saturated corpora the improvement report should recommend a STATIC 
 specialization demonstrably exists (the bird-sql smoke: haiku 1.0 vs gpt-5.4-mini 0.0 on
 identical scenarios); (3) fitter iteration queue: per-cluster support thresholds, k selection
 on validation, DARS-style multi-sample labels.
+
+## LLMRouterBench flagship track (2026-07-24): the modern-benchmark validation
+
+Per Silen's pointer, github.com/ynulihao/LLMRouterBench (2601.07206; NOT what Avengers used -
+it postdates Avengers and re-implements it as a baseline). Its performance-cost track = 13
+flagship 2025 models with measured costs on hard datasets (AIME, GPQA, HLE, LiveCodeBench,
+arenahard, ...). Our fitter on the shared-coverage matrix (1,560 scenarios, 70/30 split seed 0,
+hashing-1024, k=64):
+
+| point | accuracy | cost/call | PerfGain | CostSave |
+| --- | --- | --- | --- | --- |
+| best-single (gemini-2.5-pro) | 0.7938 | $0.04770 | - | - |
+| rank, lam=0 | 0.7895 | $0.00951 | -0.5% | +80.1% |
+| rank, lam=0.02 | 0.7799 | $0.00495 | -1.7% | +89.6% |
+| rank, lam=0.1 | 0.7682 | $0.00232 | -3.2% | +95.1% |
+| oracle | 0.9861 | $0.00242 | +24% | +95% |
+
+AIQ ours 0.7652 vs Zero-Router 0.7506: the router BEATS the price-mixing floor here, unlike
+saturated stage B - this matrix is unsaturated and specialized (qwen3-235b $0.001/0.740 vs
+claude-sonnet-4 $0.020/0.544), so routing has real signal to harvest. Consistent with the
+paper's own findings (top routers ~= each other; gains from coarse domain structure; some
+routers fail to beat Best Single on accuracy; Avengers-Pro wins the Pareto). Oracle at 0.986
+shows the tier-2 predictor headroom. Full comparison against their published Avengers rows =
+next (their baseline configs/seeds), but the replication is squarely in the leading-router
+band on their data.
