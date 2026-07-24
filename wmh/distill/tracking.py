@@ -9,7 +9,9 @@ credentials are checked at init so a misconfigured run fails fast BEFORE any
 paid rollout. After a successful init the contract inverts: a wandb failure
 mid-run (network blip, service outage) logs one warning and every later
 tracker call degrades to a no-op, because a dead dashboard must never abort a
-paid training run.
+paid training run. A restarted run continues its dashboard run: the wandb run
+id persists in `<run_dir>/wandb-run.json` and later inits resume it (see
+`WandbTracker` for the id/resume and step-monotonicity reasoning).
 """
 
 from __future__ import annotations
@@ -19,7 +21,9 @@ import netrc
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmh.core.types import JsonObject, JsonValue
 from wmh.distill.config import DistillConfig
@@ -31,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 WANDB_API_KEY_ENV = "WANDB_API_KEY"
 WANDB_NETRC_MACHINE = "api.wandb.ai"
+
+WANDB_RUN_FILE = "wandb-run.json"
+"""Run-dir file persisting the wandb run id so a restart resumes the same run."""
 
 _MISSING_WANDB_EXTRA = (
     "the wandb SDK is not installed; run `uv sync --extra distill` to enable "
@@ -118,7 +125,12 @@ class WandbSummaryLike(Protocol):
 
 
 class WandbRunLike(Protocol):
-    """The active-run slice: only the summary is touched directly."""
+    """The active-run slice: the id (persisted for resume) and the summary."""
+
+    @property
+    def id(self) -> str:
+        """The run's wandb id (what a restart passes back to `init`)."""
+        ...
 
     @property
     def summary(self) -> WandbSummaryLike:
@@ -136,11 +148,14 @@ class WandbModuleLike(Protocol):
         entity: str | None,
         name: str,
         tags: list[str],
-        # `dir` shadows the builtin, but it is the wandb SDK's own keyword name.
+        # `dir` and `id` shadow builtins, but they are the wandb SDK's own
+        # keyword names.
         dir: str,
         config: JsonObject,
+        id: str | None,
+        resume: Literal["allow"] | None,
     ) -> WandbRunLike:
-        """Start a wandb run."""
+        """Start (or, with an id and resume mode, continue) a wandb run."""
         ...
 
     def log(self, data: Mapping[str, JsonValue], *, step: int) -> None:
@@ -193,20 +208,56 @@ def _require_wandb_credentials() -> None:
     )
 
 
+class WandbRunRecord(BaseModel):
+    """The `wandb-run.json` shape: the run id a restarted session resumes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+
+
+def _read_wandb_run_id(path: Path) -> str | None:
+    """The persisted wandb run id, or None when absent or unreadable.
+
+    A corrupt record is downgraded to a fresh run (with a warning) rather
+    than raised: losing dashboard continuity must never block a paid run,
+    and the caller rewrites the file after init either way.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        return WandbRunRecord.model_validate_json(text).run_id
+    except ValidationError:
+        logger.warning(
+            "corrupt wandb run record at %s; starting a fresh wandb run and rewriting the file",
+            path,
+            exc_info=True,
+        )
+        return None
+
+
 def _flatten_step_metrics(metrics: StepMetrics) -> dict[str, float | int]:
     """One step's metrics row as flat, namespaced numeric wandb keys.
 
     Per-meter token counts land under `tokens/`, the step's priced spend
-    under `cost/usd`, and every other number under `train/`. Non-numeric
-    fields (the sampler path) and unscored values (`reverse_kl_per_token`
-    when None) are dropped: wandb charts numbers.
+    under `cost/usd` (with the run's all-session total as `cost/usd_cum`),
+    and every other number under `train/`. Non-numeric fields (the sampler
+    path) and unreported values (`reverse_kl_per_token`, `reward_mean`, the
+    advantage stats, `pg_loss`, and `grad_norm` when None) are dropped:
+    wandb charts numbers, and absent backend metrics are never fabricated.
     """
     explicit = {
         "student_prefill_tokens": "tokens/student_prefill",
+        "student_cached_prefill_tokens": "tokens/student_cached_prefill",
         "student_sample_tokens": "tokens/student_sample",
         "student_train_tokens": "tokens/student_train",
         "teacher_prefill_tokens": "tokens/teacher_prefill",
+        "teacher_cached_prefill_tokens": "tokens/teacher_cached_prefill",
+        "teacher_sample_tokens": "tokens/teacher_sample",
         "usd": "cost/usd",
+        "cumulative_usd": "cost/usd_cum",
     }
     payload: dict[str, float | int] = {}
     for key, value in metrics.model_dump(mode="json").items():
@@ -225,6 +276,20 @@ class WandbTracker:
     every later call becomes a no-op, because a dead dashboard must never
     abort a paid training run).
 
+    Restart continuity: the wandb run id is persisted to
+    `<run_dir>/wandb-run.json` on first init, and when that file exists a
+    later construction passes `id=<persisted>` with `resume="allow"` so a
+    restarted run CONTINUES the same dashboard run ("allow" resumes the run
+    when the id exists and starts one under that id otherwise). A missing or
+    corrupt record starts fresh and rewrites the file. Resumed logging stays
+    step-monotonic: `log_step` logs at the training step number, which only
+    moves forward across sessions (a resume continues from the last
+    checkpoint; the rare re-run of an un-checkpointed step re-logs at its own
+    index, which wandb treats as an update to or drop at that step, never a
+    decrease), and warmup rows always log at wandb step 0 under `warmup/`
+    keys before any training row exists, so wandb never sees a step go
+    backwards.
+
     Args:
         cfg: The validated run config; its `[wandb]` section names the run
             and its snapshot dump becomes the wandb run config.
@@ -242,6 +307,8 @@ class WandbTracker:
         _require_wandb_credentials()
         run_name = cfg.wandb.run_name or f"{agent_name}-{run_dir.name}"
         run_dir.mkdir(parents=True, exist_ok=True)
+        run_record_path = run_dir / WANDB_RUN_FILE
+        persisted_id = _read_wandb_run_id(run_record_path)
         self._wandb = wandb
         self._run = wandb.init(
             project=cfg.wandb.project,
@@ -252,9 +319,22 @@ class WandbTracker:
             # The same plain dict snapshot_toml renders, so the wandb run
             # config matches the run dir's config.toml exactly.
             config=cfg.model_dump(mode="json", exclude_none=True),
+            id=persisted_id,
+            resume="allow" if persisted_id is not None else None,
+        )
+        run_record_path.write_text(
+            WandbRunRecord(run_id=self._run.id).model_dump_json(indent=2), encoding="utf-8"
         )
         self._dead = False
-        logger.info("wandb tracking started: project %s, run %s", cfg.wandb.project, run_name)
+        if persisted_id is not None:
+            logger.info(
+                "wandb tracking resumed: project %s, run %s (id %s)",
+                cfg.wandb.project,
+                run_name,
+                persisted_id,
+            )
+        else:
+            logger.info("wandb tracking started: project %s, run %s", cfg.wandb.project, run_name)
 
     def _guarded(self, action: Callable[[], None]) -> None:
         """Run one wandb call, degrading to a no-op if the dashboard dies.
