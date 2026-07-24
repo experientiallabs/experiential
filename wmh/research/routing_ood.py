@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING
 
 import numpy as np
 from sklearn.cluster import KMeans
@@ -29,8 +29,6 @@ if TYPE_CHECKING:
     from wmh.optimize.policy import EmbedderSpec
 
 logger = logging.getLogger(__name__)
-
-GroupKey = TypeVar("GroupKey", int, str)
 
 
 def split_holdout_clusters(
@@ -84,7 +82,7 @@ def split_holdout_tasks(
     return _holdout_groups(groups, test_fraction=test_fraction, seed=seed)
 
 
-def _holdout_groups(
+def _holdout_groups[GroupKey: (int, str)](
     groups: dict[GroupKey, list[str]],
     *,
     test_fraction: float,
