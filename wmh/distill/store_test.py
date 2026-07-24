@@ -24,8 +24,11 @@ from wmh.distill.store import (
     DistillModelCard,
     DistillRunStore,
     WarmupRecord,
+    WarmupTrialsManifest,
     build_handoff_toml,
 )
+from wmh.distill.tokens import TrialRecord
+from wmh.providers.tinker import TokenSpan
 
 
 class _MetricsRow(BaseModel):
@@ -220,6 +223,48 @@ def test_corrupt_warmup_record_is_actionable(tmp_path: Path) -> None:
         store.read_warmup()
 
 
+def _trial_record(task_id: str, *, passed: bool) -> TrialRecord:
+    return TrialRecord(
+        task_id=task_id,
+        attempt=1,
+        trial_name=f"{task_id}__s1",
+        reward=1.0 if passed else 0.0,
+        passed=passed,
+        spans=[
+            TokenSpan(
+                call_index=0,
+                prompt_token_ids=[65, 66],
+                sampled_token_ids=[67, 68],
+                sampled_logprobs=[-0.5, -0.25],
+            )
+        ],
+        stop_reason="submitted",
+        artifact_dir=f"/trials/{task_id}",
+    )
+
+
+def test_warmup_trials_manifest_round_trips(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    assert store.read_warmup_trials() is None  # fresh dir: nothing collected
+    manifest = WarmupTrialsManifest(
+        teacher_model="Qwen/Qwen3-235B-A22B-Instruct-2507",
+        records=[_trial_record("task-a", passed=True), _trial_record("task-b", passed=False)],
+    )
+    path = store.write_warmup_trials(manifest)
+    assert path == store.warmup_trials_path
+    assert store.read_warmup_trials() == manifest
+
+
+def test_corrupt_warmup_trials_manifest_is_actionable(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    store.write_warmup_trials(
+        WarmupTrialsManifest(teacher_model="teacher", records=[_trial_record("t", passed=True)])
+    )
+    store.warmup_trials_path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="corrupt warmup trial manifest"):
+        store.read_warmup_trials()
+
+
 def test_write_eval_places_payload_under_evals(tmp_path: Path) -> None:
     store = DistillRunStore(tmp_path / "run")
     path = store.write_eval("baseline-teacher", _EvalReport(split="holdout", solve_rate=0.6))
@@ -232,6 +277,23 @@ def test_write_eval_rejects_path_traversal_names(tmp_path: Path) -> None:
     store = DistillRunStore(tmp_path / "run")
     with pytest.raises(ValueError, match="invalid"):
         store.write_eval("../escape", _EvalReport(split="holdout", solve_rate=0.6))
+
+
+def test_write_samples_places_markdown_under_samples(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    path = store.write_samples("step-0000", "### trial t\nepisode text\n")
+    assert path == store.samples_dir / "step-0000.md"
+    assert path.read_text(encoding="utf-8") == "### trial t\nepisode text\n"
+    # A rewrite replaces the file whole (tmp plus atomic replace, no append).
+    store.write_samples("step-0000", "replaced\n")
+    assert path.read_text(encoding="utf-8") == "replaced\n"
+    assert sorted(p.name for p in store.samples_dir.iterdir()) == ["step-0000.md"]
+
+
+def test_write_samples_rejects_path_traversal_names(tmp_path: Path) -> None:
+    store = DistillRunStore(tmp_path / "run")
+    with pytest.raises(ValueError, match="invalid"):
+        store.write_samples("../escape", "boom")
 
 
 def test_checkpoint_manifest_round_trips(tmp_path: Path) -> None:
