@@ -83,6 +83,37 @@ class FakeSampledSequence:
 
 
 @dataclass(frozen=True)
+class FakeForwardBackwardOutput:
+    """One forward/backward result, mirroring tinker.types.ForwardBackwardOutput.
+
+    The real output carries per-datum `loss_fn_outputs` tensors (the cookbook
+    reads a per-datum "logprobs" TensorData) plus a server-populated
+    `metrics: dict[str, float]` whose keys carry a ":reduction" suffix for
+    the SDK's chunk combiner. The fake keeps the per-datum shape (one empty
+    dict per datum) and reports a deterministic batch loss under
+    "total_loss:sum" (the cookbook's "total_loss" name plus the combiner
+    suffix), so adapters exercise the same suffix-tolerant metric extraction
+    they run against the real SDK.
+    """
+
+    loss_fn_output_type: str
+    loss_fn_outputs: list[dict[str, list[float]]]
+    metrics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class FakeOptimStepResponse:
+    """One optimizer-step result, mirroring tinker.types.OptimStepResponse.
+
+    The real response carries only an untyped optional metrics mapping; the
+    fake reports a deterministic "grad_norm:mean" so adapters can prove their
+    extraction plumbing on a stable value.
+    """
+
+    metrics: dict[str, float] | None
+
+
+@dataclass(frozen=True)
 class IssuedSample:
     """A record of one span a sampling client issued: the TITO ground truth."""
 
@@ -304,7 +335,7 @@ class FakeTrainingClient:
         """The deterministic char-level tokenizer for this fake model."""
         return FakeTokenizer()
 
-    def forward_backward(self, datums: list[FakeDatum], loss_fn: str) -> None:
+    def forward_backward(self, datums: list[FakeDatum], loss_fn: str) -> FakeForwardBackwardOutput:
         """Record a training batch after asserting the TITO invariant.
 
         Every sampled span in every datum (maximal nonzero-weight run of
@@ -319,6 +350,11 @@ class FakeTrainingClient:
             loss_fn: Loss function name (e.g. "importance_sampling" or
                 "cross_entropy"); recorded but not interpreted.
 
+        Returns:
+            A deterministic SDK-shaped output: the metrics dict carries a
+            "total_loss:sum" value derived purely from (loss_fn, batch
+            target tokens), so the same batch always reports the same loss.
+
         Raises:
             AssertionError: If a sampled span was never issued by an eligible
                 issuer; the message names the datum, the span, and the first
@@ -332,6 +368,14 @@ class FakeTrainingClient:
                     continue
                 raise AssertionError(self._tito_message(datum_index, span, records))
         self.forward_backward_calls.append((list(datums), loss_fn))
+        loss = -_derived_logprob(
+            "batch-loss", loss_fn, *(_ids_key(datum.target_tokens) for datum in datums)
+        )
+        return FakeForwardBackwardOutput(
+            loss_fn_output_type="FakeLossReturn",
+            loss_fn_outputs=[{} for _ in datums],
+            metrics={"total_loss:sum": loss},
+        )
 
     def _issuer_records(self) -> list[IssuedSample]:
         """Every span an eligible issuer recorded: linked ledger + service clients."""
@@ -372,10 +416,17 @@ class FakeTrainingClient:
             )
         return f"TITO violation in datum {datum_index}: {detail}"
 
-    def optim_step(self, learning_rate: float) -> None:
-        """Apply one optimizer step: increments the step counter."""
+    def optim_step(self, learning_rate: float) -> FakeOptimStepResponse:
+        """Apply one optimizer step: increments the step counter.
+
+        Returns:
+            A deterministic SDK-shaped response whose metrics carry a
+            "grad_norm:mean" derived purely from (step count, learning rate).
+        """
         self.optim_step_lrs.append(learning_rate)
         self.step_count += 1
+        grad_norm = -_derived_logprob("grad-norm", str(self.step_count), str(learning_rate))
+        return FakeOptimStepResponse(metrics={"grad_norm:mean": grad_norm})
 
     def save_state(self) -> str:
         """Save training state, returning a fake tinker:// state path."""
