@@ -1,0 +1,382 @@
+"""Faithful ProxRouter (arXiv 2510.09852): proximity-weighted nonparametric routing.
+
+ProxRouter estimates each pool model's objective on a query as a weighted average over a
+reference set (their eq 6): U_hat^(m)(x) = sum_i w_i(x) * V_i^(m), where V_i^(m) is model m's
+mean observed objective at reference element i. Weights come in two stages (their Algorithm 1):
+
+1. Minimum-variance priors: p_i ∝ 1 / Var[V_i]. For the KMeans reference set (KM-Prox) the
+   paper estimates Var[V_i] ∝ s_i / n_i (s_i = intra-cluster spread, the mean cosine distance
+   of members to their centroid; n_i = cluster size), giving p_i ∝ n_i / s_i. For the kNN
+   reference set (kNN-Prox) the prior is uniform 1/k over the k nearest references, 0 elsewhere.
+2. Proximity tilt: w_i(x) ∝ p_i(x) * exp(-phi_i(x) / tau), phi_i = cosine distance from the
+   query to reference i. The paper runs 1/tau = 20 (KM: K=32; kNN: k=100).
+
+This is a different scoring family from the Avengers rank router (`wmh.optimize.routing`):
+it aggregates VALUE estimates over ALL reference elements (no top-k cluster cutoff, no
+reciprocal-rank transform). Its published claim is drift robustness: +2.8-8.1pp outlier AUC
+on Leave-Task-Out / Few-Shot-Outlier splits with inlier performance unchanged.
+
+Deliberate deltas from the paper, all recorded in findings/r2.md before the first run:
+(a) rewards may be graded, not binary; (b) the cost term of their objective (acc - lambda*cost)
+is applied at DECISION time in fit-set cost_scale units, matching `rerank_policy`'s
+fit-once-slide semantics (identical at lambda=0, where all headline comparisons run);
+(c) spreads are floored (s_i + SPREAD_FLOOR) so a singleton or duplicate-text cluster cannot
+claim infinite prior weight (the paper is silent on s_i = 0).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Literal
+
+import numpy as np
+from pydantic import BaseModel, Field
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import Normalizer
+
+from wmh.optimize.policy import EmbedderSpec, RoutingDecision
+from wmh.providers.pool import PoolEntry
+
+if TYPE_CHECKING:
+    from wmh.optimize.outcomes import OutcomeMatrix
+
+logger = logging.getLogger(__name__)
+
+# Fallback floor for intra-cluster spread when every cluster is a singleton (no multi-member
+# spread to estimate the noise scale from); see the data-driven floor in `fit_km_prox`.
+SPREAD_FLOOR = 1e-3
+
+
+class ProxReference(BaseModel):
+    """One reference element: a cluster summary (KM-Prox) or a single fit query (kNN-Prox)."""
+
+    vector: list[float]  # L2-normalized position in embedding space
+    prior: float  # minimum-variance prior p_i, unnormalized
+    rewards: dict[str, float]  # V_i^(m): per-model mean reward at this reference
+    costs: dict[str, float]  # per-model mean cost (the objective's lambda leg + guard evidence)
+    counts: dict[str, int] = Field(default_factory=dict)  # scored episodes behind each mean
+    label: str = ""  # human-readable (majority scenario-id prefix), for the request log
+    total: int = 0  # fit scenarios summarized by this reference
+
+
+class ProxPolicy(BaseModel):
+    """A fitted ProxRouter policy (either reference-set flavor)."""
+
+    kind: Literal["km-prox", "knn-prox"]
+    pool: list[PoolEntry]
+    embedder: EmbedderSpec = Field(default_factory=EmbedderSpec)
+    references: list[ProxReference]
+    tau_inv: float = 20.0  # 1/tau; the paper's experimental value
+    knn_k: int = 100  # kNN-Prox: nonzero prior on this many nearest references
+    default_model: str  # fallback for degenerate inputs; also the guard baseline's home
+    cost_scale: float = 0.0  # fit-set mean cost per scored episode (the lambda unit)
+    fitted_from: str | None = None
+
+
+def fit_km_prox(
+    matrix: OutcomeMatrix,
+    *,
+    fit_ids: list[str] | None = None,
+    embedder: EmbedderSpec | None = None,
+    n_clusters: int = 32,
+    seed: int = 42,
+    tau_inv: float = 20.0,
+    fitted_from: str | None = None,
+) -> ProxPolicy:
+    """Fit the KMeans-reference ProxRouter (paper defaults: K=32, 1/tau=20).
+
+    Clustering mirrors `fit_rank_policy` exactly (k-means++ / elkan / max_iter=1000 / seeded)
+    so KM-Prox vs rank comparisons isolate the scoring rule, not the clustering.
+    """
+    spec = embedder or EmbedderSpec()
+    scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec)
+
+    k = min(n_clusters, len(scenario_ids))
+    kmeans = KMeans(
+        n_clusters=k,
+        random_state=seed,
+        init="k-means++",
+        n_init="auto",
+        max_iter=1000,
+        algorithm="elkan",
+    )
+    labels = kmeans.fit_predict(embeddings)
+    centres = kmeans.cluster_centers_
+    # Cosine geometry throughout: normalize centres so spreads and query distances share units.
+    centres = Normalizer(norm="l2").transform(centres)
+
+    cluster_of = {sid: int(label) for sid, label in zip(scenario_ids, labels, strict=True)}
+    members: dict[int, list[int]] = {c: [] for c in range(k)}
+    for row, sid in enumerate(scenario_ids):
+        members[cluster_of[sid]].append(row)
+
+    stats = _reference_stats(matrix, {sid: cluster_of[sid] for sid in scenario_ids})
+    spreads = {
+        cluster: float(np.mean(1.0 - embeddings[rows] @ centres[cluster]))
+        for cluster, rows in members.items()
+        if rows
+    }
+    # Data-driven spread floor (delta (c), findings/r2.md): the paper's Var[V_i] ∝ s_i/n_i
+    # sends a singleton's variance to 0, which is exactly backwards (one sample carries the
+    # FULL per-query noise). Flooring by the mean multi-member spread keeps a singleton's
+    # prior at ~1 sample's worth of evidence instead of infinity.
+    multi = [spreads[c] for c, rows in members.items() if len(rows) > 1 and c in spreads]
+    floor = max(float(np.mean(multi)) if multi else SPREAD_FLOOR, SPREAD_FLOOR)
+    references: list[ProxReference] = []
+    for cluster in range(k):
+        rows = members[cluster]
+        if not rows:
+            continue
+        n_i = len(rows)
+        prior = n_i / (max(spreads[cluster], 0.0) + floor)
+        rewards, costs, counts, label = stats.get(cluster, ({}, {}, {}, ""))
+        references.append(
+            ProxReference(
+                vector=[float(v) for v in centres[cluster]],
+                prior=prior,
+                rewards=rewards,
+                costs=costs,
+                counts=counts,
+                label=label,
+                total=n_i,
+            )
+        )
+    logger.info("km-prox: %d references over %d fit scenarios", len(references), len(scenario_ids))
+    return _finish_policy(
+        matrix, "km-prox", references, spec, tau_inv, 0, set(scenario_ids), fitted_from
+    )
+
+
+def fit_knn_prox(
+    matrix: OutcomeMatrix,
+    *,
+    fit_ids: list[str] | None = None,
+    embedder: EmbedderSpec | None = None,
+    knn_k: int = 100,
+    tau_inv: float = 20.0,
+    fitted_from: str | None = None,
+) -> ProxPolicy:
+    """Fit the kNN-reference ProxRouter (paper defaults: k=100, 1/tau=20).
+
+    Every fit scenario becomes one reference with a uniform prior; the k-nearest cutoff is
+    applied at decision time (`ProxScorer`), so the artifact stays split-independent.
+    """
+    spec = embedder or EmbedderSpec()
+    scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec)
+    stats = _reference_stats(matrix, {sid: index for index, sid in enumerate(scenario_ids)})
+    references: list[ProxReference] = []
+    for row, sid in enumerate(scenario_ids):
+        rewards, costs, counts, label = stats.get(row, ({}, {}, {}, ""))
+        if not rewards:
+            continue  # an unscored fit scenario carries no evidence; skip it, logged below
+        references.append(
+            ProxReference(
+                vector=[float(v) for v in embeddings[row]],
+                prior=1.0,
+                rewards=rewards,
+                costs=costs,
+                counts=counts,
+                label=label or (sid.split(":", 1)[0] if ":" in sid else ""),
+                total=1,
+            )
+        )
+    if len(references) < len(scenario_ids):
+        logger.info(
+            "knn-prox: dropped %d unscored fit scenarios", len(scenario_ids) - len(references)
+        )
+    return _finish_policy(
+        matrix, "knn-prox", references, spec, tau_inv, knn_k, set(scenario_ids), fitted_from
+    )
+
+
+class ProxScorer:
+    """Vectorized decision path for one fitted policy (shared by serve and batch eval).
+
+    Precomputes the reference matrices once; `estimates` runs the paper's Algorithm 1 on an
+    already-embedded query. Models missing from some references renormalize their weights over
+    the references that DO carry them (dense matrices never hit this; sparse ones stay sane).
+    """
+
+    def __init__(self, policy: ProxPolicy) -> None:
+        self.policy = policy
+        self.models = [entry.name for entry in policy.pool]
+        self.vectors = np.asarray([ref.vector for ref in policy.references])  # [R, D]
+        self.priors = np.asarray([ref.prior for ref in policy.references], dtype=np.float64)
+        index = {name: column for column, name in enumerate(self.models)}
+        shape = (len(policy.references), len(self.models))
+        self.rewards = np.full(shape, np.nan)
+        self.costs = np.full(shape, np.nan)
+        for row, ref in enumerate(policy.references):
+            for name, value in ref.rewards.items():
+                if name in index:
+                    self.rewards[row, index[name]] = value
+                    self.costs[row, index[name]] = ref.costs.get(name, 0.0)
+        self.known = ~np.isnan(self.rewards)  # [R, M]
+
+    def estimates(self, query: np.ndarray) -> tuple[dict[str, float], dict[str, float], int]:
+        """Per-model (U_hat reward, U_hat cost) plus the nearest reference's index."""
+        query = np.asarray(query, dtype=np.float64)
+        norm = float(np.linalg.norm(query))
+        if norm > 0:
+            query = query / norm
+        distance = 1.0 - self.vectors @ query  # [R], cosine distance (vectors are unit)
+        nearest = int(np.argmin(distance))
+
+        priors = self.priors.copy()
+        if self.policy.kind == "knn-prox":
+            k = min(self.policy.knn_k, len(priors))
+            cutoff = np.partition(distance, k - 1)[k - 1]
+            priors = np.where(distance <= cutoff, priors, 0.0)
+        # exp(-phi/tau) with the max shifted out for numerical safety; the shift cancels in
+        # the per-model normalization.
+        logits = -self.policy.tau_inv * distance
+        tilt = np.exp(logits - logits.max())
+        weights = priors * tilt  # [R]
+
+        masked = np.where(self.known, weights[:, None], 0.0)  # [R, M]
+        denom = masked.sum(axis=0)  # [M]
+        rewards = np.where(denom > 0, np.nansum(self.rewards * masked, axis=0), np.nan)
+        costs = np.where(denom > 0, np.nansum(self.costs * masked, axis=0), np.nan)
+        with np.errstate(invalid="ignore"):
+            rewards = rewards / np.where(denom > 0, denom, 1.0)
+            costs = costs / np.where(denom > 0, denom, 1.0)
+        reward_out = {
+            model: float(rewards[column])
+            for column, model in enumerate(self.models)
+            if denom[column] > 0
+        }
+        cost_out = {
+            model: float(costs[column])
+            for column, model in enumerate(self.models)
+            if denom[column] > 0
+        }
+        return reward_out, cost_out, nearest
+
+    def decide(
+        self,
+        query: np.ndarray,
+        *,
+        lam: float = 0.0,
+        guard_model: str | None = None,
+        guard_margin: float = 0.0,
+    ) -> RoutingDecision:
+        """Argmax of U_hat = reward - lam * cost / cost_scale, with the baseline guard.
+
+        The guard is the shared protocol: the pick must beat `guard_model`'s estimated score
+        by `guard_margin` (doubled when the pick's estimated cost is higher), else the request
+        goes to the guard model. Guarding at decision time (not fit time) keeps the artifact
+        guard-free, so one fit serves any baseline.
+        """
+        rewards, costs, nearest = self.estimates(query)
+        if not rewards:
+            return RoutingDecision(
+                model=self.policy.default_model, reason="prox: no reference evidence"
+            )
+        scale = self.policy.cost_scale or 1.0
+        scores = {model: rewards[model] - lam * costs.get(model, 0.0) / scale for model in rewards}
+        pool_order = {entry.name: index for index, entry in enumerate(self.policy.pool)}
+        pick = max(scores.items(), key=lambda kv: (kv[1], -pool_order[kv[0]]))[0]
+        reason = f"{self.policy.kind}: value aggregation (1/tau={self.policy.tau_inv:g})"
+        if guard_model is not None and pick != guard_model:
+            margin = guard_margin
+            if costs.get(pick, 0.0) > costs.get(guard_model, float("inf")):
+                margin = 2 * guard_margin
+            if scores.get(guard_model) is None or scores[pick] <= scores[guard_model] + margin:
+                pick = guard_model
+                reason = f"{self.policy.kind}: guard reverted to baseline"
+        ref = self.policy.references[nearest]
+        return RoutingDecision(
+            model=pick,
+            cluster_id=nearest,
+            cluster_label=ref.label,
+            reason=reason,
+        )
+
+
+def _fit_embeddings(
+    matrix: OutcomeMatrix, fit_ids: list[str] | None, spec: EmbedderSpec
+) -> tuple[list[str], np.ndarray]:
+    """Resolve fit scenario ids and their L2-normalized embeddings."""
+    scenario_tasks: dict[str, str] = {}
+    for outcome in matrix.outcomes:
+        scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
+    if fit_ids is not None:
+        wanted = set(fit_ids)
+        missing = wanted - scenario_tasks.keys()
+        if missing:
+            raise ValueError(f"fit_ids not in the matrix: {sorted(missing)[:5]}")
+        scenario_tasks = {sid: scenario_tasks[sid] for sid in fit_ids}
+    if not scenario_tasks:
+        raise ValueError("no scenarios to fit on")
+    scenario_ids = list(scenario_tasks)
+    embeddings = np.asarray(spec.build().embed([scenario_tasks[sid] for sid in scenario_ids]))
+    return scenario_ids, Normalizer(norm="l2").fit_transform(embeddings)
+
+
+def _reference_stats(
+    matrix: OutcomeMatrix, group_of: dict[str, int]
+) -> dict[int, tuple[dict[str, float], dict[str, float], dict[str, int], str]]:
+    """Per-group per-model (mean reward, mean cost, count) plus a majority-prefix label."""
+    sums: dict[int, dict[str, tuple[float, float, int]]] = {}
+    prefixes: dict[int, dict[str, int]] = {}
+    for outcome in matrix.outcomes:
+        group = group_of.get(outcome.scenario_id)
+        if group is None or outcome.reward is None:
+            continue
+        by_model = sums.setdefault(group, {})
+        reward_sum, cost_sum, count = by_model.get(outcome.model, (0.0, 0.0, 0))
+        by_model[outcome.model] = (
+            reward_sum + outcome.reward,
+            cost_sum + outcome.cost_usd,
+            count + 1,
+        )
+        if ":" in outcome.scenario_id:
+            counter = prefixes.setdefault(group, {})
+            prefix = outcome.scenario_id.split(":", 1)[0]
+            counter[prefix] = counter.get(prefix, 0) + 1
+    out: dict[int, tuple[dict[str, float], dict[str, float], dict[str, int], str]] = {}
+    for group, by_model in sums.items():
+        rewards = {model: rs / count for model, (rs, _cs, count) in by_model.items()}
+        costs = {model: cs / count for model, (_rs, cs, count) in by_model.items()}
+        counts = {model: count for model, (_rs, _cs, count) in by_model.items()}
+        label = ""
+        if prefixes.get(group):
+            label = max(prefixes[group].items(), key=lambda kv: kv[1])[0]
+        out[group] = (rewards, costs, counts, label)
+    return out
+
+
+def _finish_policy(
+    matrix: OutcomeMatrix,
+    kind: Literal["km-prox", "knn-prox"],
+    references: list[ProxReference],
+    spec: EmbedderSpec,
+    tau_inv: float,
+    knn_k: int,
+    fit_set: set[str],
+    fitted_from: str | None,
+) -> ProxPolicy:
+    if not references:
+        raise ValueError("no scored references; cannot fit a prox policy")
+    best: dict[str, tuple[float, int]] = {}
+    total_cost, total_count = 0.0, 0
+    for outcome in matrix.outcomes:
+        if outcome.scenario_id not in fit_set or outcome.reward is None:
+            continue
+        reward_sum, count = best.get(outcome.model, (0.0, 0))
+        best[outcome.model] = (reward_sum + outcome.reward, count + 1)
+        total_cost += outcome.cost_usd
+        total_count += 1
+    pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
+    default = min(best, key=lambda m: (-(best[m][0] / best[m][1]), pool_order[m]))
+    return ProxPolicy(
+        kind=kind,
+        pool=matrix.pool,
+        embedder=spec,
+        references=references,
+        tau_inv=tau_inv,
+        knn_k=knn_k or 100,
+        default_model=default,
+        cost_scale=(total_cost / total_count) if total_count else 0.0,
+        fitted_from=fitted_from,
+    )
