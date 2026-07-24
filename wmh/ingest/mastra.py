@@ -44,6 +44,7 @@ response is handed to the same flexible span extractor, so it tolerates the serv
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 import httpx
@@ -235,8 +236,6 @@ class MastraAdapter(BaseTraceAdapter):
         sid = span.get("id") or span.get("spanId") or span.get("span_id")
         if isinstance(sid, str) and sid:
             return sid
-        import hashlib
-
         return hashlib.sha256(as_text(span).encode()).hexdigest()[:32]
 
     def _spans_for_trace(self, trace_id: str, raw_spans: list[JsonObject]) -> list[SpanRecord]:

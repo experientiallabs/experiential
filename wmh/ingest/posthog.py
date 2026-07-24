@@ -36,6 +36,7 @@ export to a file and use `from_file` if you prefer.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -197,8 +198,6 @@ class PostHogAdapter(BaseTraceAdapter):
         eid = event.get("id") or event.get("uuid")
         if isinstance(eid, str) and eid:
             return eid
-        import hashlib
-
         return hashlib.sha256(as_text(event).encode()).hexdigest()[:32]
 
     def _spans_for_trace(self, trace_id: str, events: list[JsonObject]) -> list[SpanRecord]:

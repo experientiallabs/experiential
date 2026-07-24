@@ -48,6 +48,7 @@ Pull: live pull via the Langfuse SDK is not implemented; export to a file and us
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from pydantic import JsonValue
@@ -217,8 +218,6 @@ class LangfuseAdapter(BaseTraceAdapter):
         tid = trace.get("id")
         if isinstance(tid, str) and tid:
             return tid
-        import hashlib
-
         return hashlib.sha256(as_text(trace).encode()).hexdigest()[:32]
 
 

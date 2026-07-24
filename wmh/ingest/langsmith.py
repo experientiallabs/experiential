@@ -57,6 +57,8 @@ config gate stays SDK-free.
 
 from __future__ import annotations
 
+import hashlib
+
 from pydantic import JsonValue
 
 from wmh.core.types import JsonObject
@@ -370,8 +372,6 @@ class LangSmithAdapter(BaseTraceAdapter):
             value = run.get(key)
             if isinstance(value, str) and value:
                 return value
-        import hashlib
-
         return hashlib.sha256(as_text(run).encode()).hexdigest()[:32]
 
 
