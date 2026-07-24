@@ -1,9 +1,12 @@
 # Ingesting traces from anywhere
 
-The harness builds a world model from **recorded agent traces**. Ingestion is part of `wmh build`,
-not a separate step: you pick a **source** and `build` turns traces from whatever you already have -
-an observability provider, an OTLP export, or a plain chat/tool-call log - into the normalized
-`wmh.core.types.Trace` shape and runs the pipeline.
+The harness builds a world model from **recorded agent traces**. You pick a **source** and the
+harness turns traces from whatever you already have - an observability provider, an OTLP export, a
+Postgres table, or a plain chat/tool-call log - into the normalized `wmh.core.types.Trace` shape.
+
+Ingestion runs two ways: as the first stage of `wmh build`, or standalone via **`wmh ingest`**,
+which normalizes a source into an OTel-GenAI JSONL corpus (with live progress) that any later
+command reads.
 
 Everything plugs into **one interface** (`TraceAdapter`) and **one normalizer**
 (`wmh.ingest.normalize`), so adding a source is a thin adapter, never a rewrite.
@@ -11,19 +14,38 @@ Everything plugs into **one interface** (`TraceAdapter`) and **one normalizer**
 ## Quickstart
 
 ```bash
+# Standalone normalize (format auto-detected from the file; live progress):
+wmh ingest --file <export>                                   # -> <export>.otel.jsonl
+wmh ingest --file <export> --json                            # machine-readable event lines
+wmh ingest --source langfuse --pull --api-key 'pk-...:sk-...'
+wmh ingest --dsn postgresql://... --table agent_traces       # postgres rows (see below)
+
+# Or ingest as part of a build:
 wmh build --name m --source <name> --file <export>          # build from a file export
 wmh build --name m --source <name> --pull --project <p>     # build from a live vendor pull
 wmh build                                                   # or pick the source in the wizard
 ```
 
 `--source` is a registered adapter (`otel-genai`, `chat-json`, `braintrust`, `phoenix`, `langfuse`,
-`langsmith`, `posthog`, `mastra`); `--file` reads an export, `--pull` fetches live (with
-`--project`/`--api-key`) for
-sources that support it. On an interactive terminal, `wmh build` with no source launches a wizard
-that lists the sources and prompts for file-or-pull.
+`langsmith`, `posthog`, `mastra`, `postgres`); `--file` reads an export, `--pull` fetches live
+(with `--project`/`--api-key`) for sources that support it. `wmh ingest` auto-detects a file's
+format when `--source` is omitted (`wmh.ingest.detect`); an unrecognized or mixed corpus errors
+with guidance instead of guessing. On an interactive terminal, `wmh build` with no source launches
+a wizard that lists the sources and prompts for file-or-pull.
 
 Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL - the same format the bundled
-`examples/*.otel.jsonl` use - so a source is interchangeable with any other corpus the harness reads.
+`examples/*.otel.jsonl` use - so a source is interchangeable with any other corpus the harness
+reads: `wmh ingest`'s output feeds `wmh build --source otel-genai --file <out>` directly.
+
+### Progress events (the streaming contract)
+
+`wmh ingest --json` (and the library generator `wmh.ingest.stream.ingest_events`) emit one JSON
+event per line: `{"type": "detected", "format", "traces"}`, then repeated
+`{"type": "progress", "normalized", "total", "note"?}`, then a terminal
+`{"type": "done", "traces", "steps", "otel_object"}` or `{"type": "error", "message", "code"?}`.
+`error.code` is one of `bad_credentials | unreachable | bad_format | empty | internal`, so a
+wrapping UI can tell a bad key from a dead endpoint. The generator never raises; failures arrive
+as the terminal event.
 
 ## Sources
 
@@ -31,12 +53,13 @@ Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL - the same
 |---|---|---|---|
 | `otel-genai` | OTLP-JSON spans (OTel GenAI semconv) | ✅ | ✅ (generic OTLP query backend) |
 | `chat-json` | recorded OpenAI/LangChain-style chat + tool-call conversations | ✅ | - |
-| `phoenix` | Arize Phoenix / OpenInference spans | ✅ | provider-dependent |
-| `langfuse` | Langfuse trace + observation tree | ✅ | provider-dependent |
-| `langsmith` | LangSmith run tree | ✅ | provider-dependent |
+| `phoenix` | Arize Phoenix / OpenInference spans | ✅ | - (export to a file) |
+| `langfuse` | Langfuse trace + observation tree | ✅ | ✅ (public REST API) |
+| `langsmith` | LangSmith run tree | ✅ | ✅ (runs/query REST API) |
 | `braintrust` | Braintrust span/log rows | ✅ | ✅ (REST fetch API) |
 | `posthog` | PostHog LLM-observability `$ai_*` events | ✅ | ✅ (HogQL query API) |
 | `mastra` | Mastra AI-tracing spans (`type` = model_generation/tool_call/…) | ✅ | ✅ (server API) |
+| `postgres` | rows in your own Postgres table (steps, messages, or session blobs) | - | ✅ (`--dsn`/`--table`) |
 
 Per-provider export instructions, payload shapes, and caveats:
 [Phoenix](#ingesting-arize-phoenix-traces) · [Langfuse](#ingesting-langfuse-traces) ·
@@ -64,14 +87,35 @@ them at a file or an OTLP query backend and use `--source otel-genai`:
 If a provider isn't listed and doesn't emit OTLP, it's a ~30-line adapter (see below) - open an issue
 or add one.
 
-### Databases and other stores
+### Databases: the `postgres` source
 
-There is no bespoke database adapter - instead, **point your store at OpenTelemetry** and ingest with
-`--source otel-genai`. If your agent runs are in a SQL table, a warehouse, or a custom log, the clean
-hook-up is to emit OTel GenAI spans (most agent frameworks and the OTel GenAI instrumentations do
-this out of the box) and either export them to a file (`--file spans.otlp.json`) or serve them from
-an OTLP-compatible query backend and `--pull`. One OTel format, any store behind it - no per-database
-code to maintain.
+If your agent runs live in your own Postgres, ingest them directly - no exporter needed:
+
+```bash
+uv run wmh ingest --dsn "postgresql://user:pass@host:5432/db" --table agent_traces
+# needs the driver extra once: pip install 'world-model-harness[postgres]'
+```
+
+The table contract is three columns, all overridable: `trace_id` (groups rows into episodes; used
+when present, `--trace-id-column` to rename), `payload` (required JSON/JSONB column,
+`--payload-column`), and `created_at` (ordering, `--order-column`). The payload column's format is
+**auto-detected with the same detector files use**, so Postgres is pure transport - three row
+shapes work out of the box:
+
+1. **Row per step/span**: each payload is one span/event in any accepted shape (OTLP span,
+   Langfuse observation, PostHog event, ...); rows sharing a `trace_id` become one episode.
+2. **Row per message**: a session/thread table where each payload is one chat message
+   (`{"role": ..., ...}`); rows are assembled per `trace_id` into one conversation.
+3. **Row per trace**: each payload is a self-contained session (a `{"messages": [...]}` blob, a
+   Langfuse trace object, an OTLP envelope); no `trace_id` column needed.
+
+When the table has a `trace_id` column its value wins over any id inside the payload, so episode
+boundaries always follow your table. `--since <iso>` filters on the order column. The DSN can also
+come from `$WMH_POSTGRES_DSN`.
+
+For other stores (warehouses, custom logs), **point them at OpenTelemetry** and ingest with
+`--source otel-genai`: emit OTel GenAI spans and either export them to a file
+(`--file spans.otlp.json`) or serve them from an OTLP-compatible query backend and `--pull`.
 
 **File vs. pull.** Every adapter supports `--file` (an export you already have); `--pull` (live from
 the vendor API) is opt-in per adapter and errors with a clear "export to a file" message when a
@@ -118,6 +162,14 @@ A `Trace` is `{trace_id, steps, source, metadata}`. Each `Step` is one
 `metadata` carries provenance and anything a source wants to thread through. Open-loop replay scores
 a predicted observation for `(state_before, action)` against the recorded one, so faithful `action`
 and `observation` are what matter most.
+
+Each step also carries optional **`attribution`** (`wmh.core.types.StepAttribution`): the model
+and provider that produced the action, token counts, cost, latency, and an `error_class`
+(`controllable` = the LLM call failed, `environmental` = the tool failed). The normalizer fills it
+best-effort from the GenAI/OpenInference vocabularies (`gen_ai.response.model`, `gen_ai.usage.*`,
+span timing/status), an explicit `wmh.attribution` JSON attribute wins verbatim, and the OTel
+writer round-trips it - this is what makes an ingested corpus usable for policy training, not just
+replay.
 
 ## How the pieces fit
 
@@ -329,8 +381,10 @@ See `examples/ingest/langfuse_to_wmh.sh` for the end-to-end script.
 
 ### Caveats
 
-- **No live pull.** This adapter is file-only; `--pull` raises a friendly error. Export to a file
-  first. (The Langfuse SDK would be lazy-imported in `_pull_payloads` if/when pull is added.)
+- **Live pull** uses the public REST API with plain httpx (no SDK): `--pull` with
+  `--api-key 'pk-...:sk-...'` (or `$LANGFUSE_PUBLIC_KEY`/`$LANGFUSE_SECRET_KEY`; `$LANGFUSE_HOST`
+  or `--project` for self-hosted instances). The list endpoint is paged and each trace re-fetched
+  by id for full observations.
 - The richest pairing comes from the OpenAI-style `tool_calls` on a GENERATION `output`. Custom
   output shapes that don't carry `tool_calls` fall back to a plain message step.
 - A tool observation's `input` is used as the call arguments only when the preceding GENERATION
@@ -414,9 +468,9 @@ See `examples/ingest/langsmith_to_wmh.sh` for the end-to-end script.
 
 ### Caveats
 
-- **No live pull.** This adapter is file-only; `--pull` raises a friendly error. Export to a file
-  first. (The `langsmith` SDK would be lazy-imported in `_pull_payloads` if/when pull is added, so
-  the config gate stays SDK-free.)
+- **Live pull** uses `POST /api/v1/runs/query` with plain httpx (no SDK): `--pull` with
+  `--api-key` (or `$LANGCHAIN_API_KEY`/`$LANGSMITH_API_KEY`) and `--project <project-uuid>`;
+  pagination follows `cursors.next`.
 - **Tool-call paths are version-dependent.** LangChain's run-output shape varies across versions;
   the adapter digs the common locations but a custom/unusual dump that doesn't carry `tool_calls`
   falls back to a plain message step.
@@ -496,8 +550,9 @@ See `examples/ingest/braintrust_to_wmh.sh` for the end-to-end script.
 
 ### Caveats
 
-- **No live pull.** This adapter is file-only; `--pull` raises a friendly error. Export to a file
-  first. (The Braintrust SDK would be lazy-imported in `_pull_payloads` if/when pull is added.)
+- **Live pull** uses the REST fetch API with plain httpx (no SDK): `--pull` with `--api-key` (or
+  `$BRAINTRUST_API_KEY`) and `--project` (a project name or id; names are resolved via
+  `/v1/project`).
 - The richest pairing comes from OpenAI-style `tool_calls` on an llm row's `output`. Custom output
   shapes that don't carry `tool_calls` fall back to a plain message step.
 - A tool row's `input` is used as the call arguments only when the preceding llm action lacked them

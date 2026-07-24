@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wmh.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmh.core.types import (
+    Action,
+    ActionKind,
+    EnvState,
+    ErrorClass,
+    Observation,
+    Step,
+    StepAttribution,
+    Trace,
+)
 from wmh.ingest.otel_genai import OtelGenAIAdapter
 from wmh.ingest.otel_writer import trace_to_spans, write_traces_jsonl
 
@@ -70,3 +79,31 @@ def test_roundtrip_preserves_steps_state_and_metadata(tmp_path: Path) -> None:
 def test_writer_is_deterministic() -> None:
     # No wall-clock: the same trace serializes byte-identically across calls.
     assert trace_to_spans(_trace()) == trace_to_spans(_trace())
+
+
+def test_roundtrip_preserves_attribution(tmp_path: Path) -> None:
+    """`Trace -> file -> Trace` keeps per-step attribution (the policy-training fields)."""
+    trace = Trace(
+        trace_id="c" * 32,
+        source="test",
+        steps=[
+            Step(
+                action=Action(kind=ActionKind.TOOL_CALL, name="t", arguments={"a": 1}),
+                observation=Observation(content="ok"),
+                attribution=StepAttribution(
+                    model="claude-haiku-4-5",
+                    provider="anthropic",
+                    input_tokens=10,
+                    output_tokens=2,
+                    latency_ms=99.5,
+                    cost_usd=0.001,
+                    error_class=ErrorClass.ENVIRONMENTAL,
+                    provenance="unit-test",
+                ),
+            )
+        ],
+    )
+    path = tmp_path / "attr.otel.jsonl"
+    write_traces_jsonl([trace], path)
+    (back,) = OtelGenAIAdapter().from_file(str(path))
+    assert back.steps[0].attribution == trace.steps[0].attribution

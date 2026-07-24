@@ -31,18 +31,13 @@ Accepted file shapes (`from_file`):
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from pydantic import JsonValue
 
-from wmh.core.types import JsonObject, Trace
+from wmh.core.types import JsonObject
 from wmh.ingest.adapter import VendorPull, register_adapter
-from wmh.ingest.normalize import (
-    SpanRecord,
-    as_text,
-    openai_call_name_args,
-    spans_to_traces,
-)
+from wmh.ingest.base import BaseTraceAdapter
+from wmh.ingest.normalize import SpanRecord, as_text, openai_call_name_args
 
 
 def _hash_id(*parts: str) -> str:
@@ -154,32 +149,18 @@ def _conversation_records(payload: JsonValue) -> list[tuple[str, list[JsonValue]
     return out
 
 
-class ChatMessagesAdapter:
+class ChatMessagesAdapter(BaseTraceAdapter):
     """Convert recorded chat/tool-call conversations (OpenAI-style) into `Trace`s. No SDK."""
 
     name = "chat-json"
 
-    def from_file(self, path: str) -> list[Trace]:
-        text = Path(path).read_text(encoding="utf-8")
-        payloads: list[JsonValue] = []
-        try:
-            payloads.append(json.loads(text))
-        except json.JSONDecodeError:
-            for line in text.splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    payloads.append(json.loads(stripped))
-                except json.JSONDecodeError:
-                    continue
+    def spans_from_payload(self, payload: JsonValue) -> list[SpanRecord]:
         spans: list[SpanRecord] = []
-        for payload in payloads:
-            for trace_id, messages, metadata in _conversation_records(payload):
-                spans.extend(_spans_for_conversation(messages, trace_id, metadata))
-        return spans_to_traces(spans, source=f"chat-json:{path}")
+        for trace_id, messages, metadata in _conversation_records(payload):
+            spans.extend(_spans_for_conversation(messages, trace_id, metadata))
+        return spans
 
-    def from_vendor(self, pull: VendorPull) -> list[Trace]:
+    def _pull_payloads(self, pull: VendorPull) -> list[JsonValue]:
         raise ValueError(
             "chat-json converts local conversation files; it has no vendor API. "
             "Use `from_file` with an exported messages JSON/JSONL."

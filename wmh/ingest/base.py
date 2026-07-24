@@ -33,6 +33,27 @@ from wmh.ingest.adapter import VendorPull
 from wmh.ingest.normalize import SpanRecord, collect_spans, spans_to_traces
 
 
+def load_payloads(text: str) -> list[JsonValue]:
+    """Parse a whole-document JSON payload, or per-line JSONL on a top-level decode failure.
+
+    Module-level (not only a `BaseTraceAdapter` method) because format auto-detection and the
+    streaming ingest need the payloads BEFORE an adapter has been chosen.
+    """
+    try:
+        return [json.loads(text)]
+    except json.JSONDecodeError:
+        payloads: list[JsonValue] = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                payloads.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                continue  # tolerate a truncated/corrupt line; keep the rest
+        return payloads
+
+
 class BaseTraceAdapter:
     """Default file+vendor plumbing around the shared span normalizer."""
 
@@ -50,28 +71,12 @@ class BaseTraceAdapter:
         """Fetch raw payloads from the vendor API/SDK. Override to support live pulls."""
         raise ValueError(
             f"{self.name!r} does not support live vendor pulls yet; export traces to a file and "
-            f"use `from_file` (or `wmh ingest run --source {self.name} --file <export>`)"
+            f"use `from_file` (or `wmh ingest --source {self.name} --file <export>`)"
         )
 
     # --- public API (rarely overridden) -------------------------------------------------------
 
-    def _load_payloads(self, text: str) -> list[JsonValue]:
-        """Parse a whole-document JSON payload, or per-line JSONL on a top-level decode failure."""
-        try:
-            return [json.loads(text)]
-        except json.JSONDecodeError:
-            payloads: list[JsonValue] = []
-            for line in text.splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    payloads.append(json.loads(stripped))
-                except json.JSONDecodeError:
-                    continue  # tolerate a truncated/corrupt line; keep the rest
-            return payloads
-
-    def _collect_all(self, payloads: list[JsonValue]) -> list[SpanRecord]:
+    def collect_all(self, payloads: list[JsonValue]) -> list[SpanRecord]:
         """Map every payload to spans and re-stamp `span_id` globally unique in emission order.
 
         Adapters assign `span_id`/`start_nano` per payload, so a trace split across payloads (e.g.
@@ -89,14 +94,21 @@ class BaseTraceAdapter:
                 spans.append(span)
         return spans
 
+    def spans_from_file(self, path: str) -> list[SpanRecord]:
+        """All (uniquely re-stamped) spans in a file export — the streaming ingest's seam."""
+        return self.collect_all(load_payloads(Path(path).read_text(encoding="utf-8")))
+
+    def spans_from_pull(self, pull: VendorPull) -> list[SpanRecord]:
+        """All (uniquely re-stamped) spans from a vendor pull — the streaming ingest's seam."""
+        return self.collect_all(self._pull_payloads(pull))
+
     def from_file(self, path: str) -> list[Trace]:
-        text = Path(path).read_text(encoding="utf-8")
-        spans = self._collect_all(self._load_payloads(text))
-        return spans_to_traces(spans, source=f"{self.name}:{path}")
+        return spans_to_traces(self.spans_from_file(path), source=f"{self.name}:{path}")
 
     def from_vendor(self, pull: VendorPull) -> list[Trace]:
-        spans = self._collect_all(self._pull_payloads(pull))
-        traces = spans_to_traces(spans, source=f"{self.name}:{pull.project or 'vendor'}")
+        traces = spans_to_traces(
+            self.spans_from_pull(pull), source=f"{self.name}:{pull.project or 'vendor'}"
+        )
         if pull.limit is not None:
             traces = traces[: pull.limit]
         return traces

@@ -11,8 +11,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wmh.core.types import ActionKind
 from wmh.ingest import get_adapter
+from wmh.ingest.adapter import VendorPull
 from wmh.ingest.langsmith import LangSmithAdapter
 
 # A realistic `Client.list_runs` / `GET /api/v1/runs` export: a flat list of runs in one trace.
@@ -232,18 +235,6 @@ def test_jsonl_and_chain_runs_skipped(tmp_path: Path) -> None:
     assert by_id["tr-llm"].steps[0].action.content is not None
 
 
-def test_vendor_pull_unsupported_is_friendly() -> None:
-    from wmh.ingest.adapter import VendorPull
-
-    try:
-        LangSmithAdapter().from_vendor(VendorPull())
-    except ValueError as exc:
-        assert "does not support live vendor pulls" in str(exc)
-        assert "langsmith" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected ValueError")
-
-
 def test_empty_string_error_is_not_an_error(tmp_path: Path) -> None:
     """Some LangSmith dumps set error="" on a successful run; it must NOT mark the step errored."""
     run = {
@@ -260,3 +251,43 @@ def test_empty_string_error_is_not_an_error(tmp_path: Path) -> None:
 
     trace = LangSmithAdapter().from_file(str(path))[0]
     assert trace.steps[0].observation.is_error is False
+
+
+def test_vendor_pull_without_key_is_friendly(monkeypatch) -> None:  # noqa: ANN001 - fixture
+    monkeypatch.delenv("LANGCHAIN_API_KEY", raising=False)
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="API key"):
+        LangSmithAdapter().from_vendor(VendorPull())
+
+
+def test_vendor_pull_queries_runs_with_cursor_pagination(monkeypatch) -> None:  # noqa: ANN001
+    """Live-pull path with httpx mocked: POST runs/query, follow the next cursor, normalize."""
+    import wmh.ingest.langsmith as ls
+
+    bodies: list[dict] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):  # noqa: ANN001, ANN202 - test stub
+        class _Resp:
+            def __init__(self, payload) -> None:  # noqa: ANN001
+                self._payload = payload
+
+            def raise_for_status(self) -> None: ...
+
+            def json(self):  # noqa: ANN202
+                return self._payload
+
+        assert url.endswith("/api/v1/runs/query")
+        assert headers == {"x-api-key": "k"}
+        assert isinstance(json, dict)
+        bodies.append(json)
+        if json.get("cursor") is None:
+            return _Resp({"runs": _RUNS[:2], "cursors": {"next": "c2"}})
+        assert json["cursor"] == "c2"
+        return _Resp({"runs": _RUNS[2:], "cursors": {"next": None}})
+
+    monkeypatch.setattr(ls.httpx, "post", fake_post)
+    traces = LangSmithAdapter().from_vendor(VendorPull(api_key="k", project="proj-uuid"))
+    assert len(bodies) == 2  # followed the pagination cursor
+    assert all(body["session"] == ["proj-uuid"] for body in bodies)
+    assert len(traces) == 1
+    assert traces[0].steps

@@ -42,18 +42,21 @@ Export the FULL trace: `GET /api/public/traces/{traceId}` (`TraceWithFullDetails
 Langfuse's native OTLP endpoint `POST /api/public/otel/v1/traces` and the `otel-genai` source, which
 is the better route for framework traces where tool calls are separate child observations).
 
-Pull: live pull via the Langfuse SDK is not implemented; export to a file and use `from_file`. The
-`BaseTraceAdapter` default raises a friendly error pointing at `--file`.
+Pull: `from_vendor` fetches traces live over the public REST API with plain httpx (no SDK) — it
+pages the list endpoint, then re-fetches each trace by id for full observations. See
+`_pull_payloads`. File exports remain fully supported via `from_file`.
 """
 
 from __future__ import annotations
 
 import json
+import os
 
+import httpx
 from pydantic import JsonValue
 
 from wmh.core.types import JsonObject
-from wmh.ingest.adapter import register_adapter
+from wmh.ingest.adapter import VendorPull, register_adapter
 from wmh.ingest.base import BaseTraceAdapter
 from wmh.ingest.normalize import (
     SpanRecord,
@@ -92,10 +95,69 @@ def _observation_tool_name(observation: JsonObject) -> str:
     return ""
 
 
+_PUBLIC_KEY_ENV = "LANGFUSE_PUBLIC_KEY"
+_SECRET_KEY_ENV = "LANGFUSE_SECRET_KEY"
+_HOST_ENV = "LANGFUSE_HOST"
+_DEFAULT_HOST = "https://cloud.langfuse.com"
+_PAGE_SIZE = 50
+
+
 class LangfuseAdapter(BaseTraceAdapter):
     """Map a Langfuse trace export (observation tree) into normalized `Trace`s. No SDK."""
 
     name = "langfuse"
+
+    def _pull_payloads(self, pull: VendorPull) -> list[JsonValue]:
+        """Fetch traces live from the Langfuse public API (plain httpx, no SDK).
+
+        Credentials are a public/secret key pair: `pull.api_key` as `"pk-...:sk-..."`, else
+        `$LANGFUSE_PUBLIC_KEY`/`$LANGFUSE_SECRET_KEY`. Host: `pull.project` (the keys already pin
+        the Langfuse project, so the field carries the host for self-hosted instances), else
+        `$LANGFUSE_HOST`, else Langfuse Cloud. The LIST endpoint returns observation-id strings
+        only, so each listed trace is re-fetched by id for its full observation objects.
+        """
+        api_key = pull.api_key
+        if not api_key:
+            public = os.environ.get(_PUBLIC_KEY_ENV)
+            secret = os.environ.get(_SECRET_KEY_ENV)
+            api_key = f"{public}:{secret}" if public and secret else None
+        if not api_key or ":" not in api_key:
+            raise ValueError(
+                "langfuse pull needs a key pair: pass --api-key 'pk-...:sk-...' or set "
+                f"${_PUBLIC_KEY_ENV} and ${_SECRET_KEY_ENV}"
+            )
+        public, secret = api_key.split(":", 1)
+        auth = (public, secret)
+        host = (pull.project or os.environ.get(_HOST_ENV) or _DEFAULT_HOST).rstrip("/")
+
+        trace_ids: list[str] = []
+        page = 1
+        while True:
+            params = {"page": str(page), "limit": str(_PAGE_SIZE)}
+            if pull.since is not None:
+                params["fromTimestamp"] = pull.since
+            resp = httpx.get(f"{host}/api/public/traces", auth=auth, params=params, timeout=60.0)
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data") if isinstance(body, dict) else None
+            if not isinstance(data, list) or not data:
+                break
+            for trace in data:
+                if isinstance(trace, dict) and isinstance(trace.get("id"), str):
+                    trace_ids.append(trace["id"])
+            if pull.limit is not None and len(trace_ids) >= pull.limit:
+                trace_ids = trace_ids[: pull.limit]
+                break
+            if len(data) < _PAGE_SIZE:
+                break
+            page += 1
+
+        payloads: list[JsonValue] = []
+        for trace_id in trace_ids:
+            resp = httpx.get(f"{host}/api/public/traces/{trace_id}", auth=auth, timeout=60.0)
+            resp.raise_for_status()
+            payloads.append(resp.json())
+        return payloads
 
     def spans_from_payload(self, payload: JsonValue) -> list[SpanRecord]:
         """Map one Langfuse trace (or a list/`{data:[...]}` page of them) to `SpanRecord`s."""

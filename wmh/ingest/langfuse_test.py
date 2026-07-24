@@ -9,8 +9,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wmh.core.types import ActionKind
 from wmh.ingest import get_adapter
+from wmh.ingest.adapter import VendorPull
 from wmh.ingest.langfuse import LangfuseAdapter
 
 # A realistic Langfuse `GET /api/public/traces/{id}` export: a trace with nested observations.
@@ -178,13 +181,43 @@ def test_jsonl_multiple_traces(tmp_path: Path) -> None:
     assert len(traces) == 2
 
 
-def test_vendor_pull_unsupported_is_friendly() -> None:
-    from wmh.ingest.adapter import VendorPull
-
-    try:
+def test_vendor_pull_without_keys_is_friendly(monkeypatch) -> None:  # noqa: ANN001 - fixture
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    with pytest.raises(ValueError, match="LANGFUSE_PUBLIC_KEY"):
         LangfuseAdapter().from_vendor(VendorPull())
-    except ValueError as exc:
-        assert "does not support live vendor pulls" in str(exc)
-        assert "langfuse" in str(exc)
-    else:  # pragma: no cover
-        raise AssertionError("expected ValueError")
+
+
+def test_vendor_pull_lists_then_fetches_each_trace(monkeypatch) -> None:  # noqa: ANN001 - fixture
+    """Live-pull path with httpx mocked: page the trace list, fetch each id in full, normalize.
+
+    The list endpoint returns observation-id STRINGS only (no steps), so the pull must re-fetch
+    each trace by id; a pull that normalized list-page traces directly would yield zero steps.
+    """
+    import wmh.ingest.langfuse as lf
+
+    calls: list[str] = []
+
+    def fake_get(url, auth=None, params=None, timeout=None):  # noqa: ANN001, ANN202 - test stub
+        class _Resp:
+            def __init__(self, payload) -> None:  # noqa: ANN001
+                self._payload = payload
+
+            def raise_for_status(self) -> None: ...
+
+            def json(self):  # noqa: ANN202
+                return self._payload
+
+        calls.append(url)
+        assert auth == ("pk-1", "sk-1")
+        if url.endswith("/api/public/traces"):
+            listed = {**_TRACE, "observations": ["o1", "o2"]}
+            return _Resp({"data": [listed], "meta": {"totalPages": 1}})
+        assert url.endswith(f"/api/public/traces/{_TRACE['id']}")
+        return _Resp(_TRACE)
+
+    monkeypatch.setattr(lf.httpx, "get", fake_get)
+    traces = LangfuseAdapter().from_vendor(VendorPull(api_key="pk-1:sk-1"))
+    assert len(traces) == 1
+    assert traces[0].steps, "full-trace fetch must yield real steps"
+    assert any(url.endswith(f"/api/public/traces/{_TRACE['id']}") for url in calls)

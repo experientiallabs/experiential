@@ -285,6 +285,7 @@ def test_cli_exposes_the_small_command_set() -> None:
     names = {cmd.name for cmd in app.registered_commands}
     core = {
         "build",
+        "ingest",
         "list",
         "serve",
         "demo",

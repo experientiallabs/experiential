@@ -50,17 +50,19 @@ Accepted file shapes (`from_file`): a single run object, a JSON array of runs, a
 wrapper, or JSONL (one run per line). Grouping is by `trace_id` (falling back to `id` for a root
 run that omits it).
 
-Pull: a live pull via the `langsmith` SDK is not implemented here; export to a file and use
-`from_file`. The `BaseTraceAdapter` default raises a friendly error pointing at `--file`, so the
-config gate stays SDK-free.
+Pull: `from_vendor` fetches runs live over the REST API with plain httpx (no SDK) — see
+`_pull_payloads`. File exports remain fully supported via `from_file`.
 """
 
 from __future__ import annotations
 
+import os
+
+import httpx
 from pydantic import JsonValue
 
 from wmh.core.types import JsonObject
-from wmh.ingest.adapter import register_adapter
+from wmh.ingest.adapter import VendorPull, register_adapter
 from wmh.ingest.base import BaseTraceAdapter
 from wmh.ingest.normalize import SpanRecord, as_text, iso_to_ordinal
 
@@ -256,10 +258,71 @@ def _message_content(message: JsonObject) -> str:
     return ""
 
 
+_API_KEY_ENVS = ("LANGCHAIN_API_KEY", "LANGSMITH_API_KEY")
+_ENDPOINT_ENV = "LANGCHAIN_ENDPOINT"
+_DEFAULT_ENDPOINT = "https://api.smith.langchain.com"
+_PAGE_SIZE = 100
+# Backstop on unbounded pulls (no --limit): runs, not traces, are what the API pages by.
+_MAX_RUNS = 2000
+
+
 class LangSmithAdapter(BaseTraceAdapter):
     """Map a LangSmith run-tree export into normalized `Trace`s. No SDK; pure JSON."""
 
     name = "langsmith"
+
+    def _pull_payloads(self, pull: VendorPull) -> list[JsonValue]:
+        """Fetch runs live from the LangSmith REST API (plain httpx, no SDK).
+
+        `pull.api_key` (else `$LANGCHAIN_API_KEY`/`$LANGSMITH_API_KEY`) auths; `pull.project` is
+        the project (session) UUID passed to `POST /api/v1/runs/query` — the list endpoint is a
+        POST with a JSON filter body. Pagination follows `cursors.next` until exhausted, `--limit`
+        traces are covered, or a run-count backstop trips.
+        """
+        api_key = pull.api_key or next(
+            (value for env in _API_KEY_ENVS if (value := os.environ.get(env))), None
+        )
+        if not api_key:
+            raise ValueError(
+                f"langsmith pull needs an API key: pass --api-key or set ${_API_KEY_ENVS[0]}"
+            )
+        endpoint = (os.environ.get(_ENDPOINT_ENV) or _DEFAULT_ENDPOINT).rstrip("/")
+        base_body: JsonObject = {"limit": _PAGE_SIZE}
+        if pull.project:
+            base_body["session"] = [pull.project]
+        if pull.since is not None:
+            base_body["start_time"] = pull.since
+
+        runs: list[JsonValue] = []
+        trace_ids: set[str] = set()
+        cursor: str | None = None
+        while True:
+            body = dict(base_body)
+            body["cursor"] = cursor
+            resp = httpx.post(
+                f"{endpoint}/api/v1/runs/query",
+                headers={"x-api-key": api_key},
+                json=body,
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            page = resp.json()
+            page_runs = page.get("runs") if isinstance(page, dict) else None
+            if not isinstance(page_runs, list) or not page_runs:
+                break
+            for run in page_runs:
+                if isinstance(run, dict):
+                    runs.append(run)
+                    trace_ids.add(self._trace_id(run))
+            if pull.limit is not None and len(trace_ids) >= pull.limit:
+                break
+            if len(runs) >= _MAX_RUNS:
+                break
+            cursors = page.get("cursors")
+            cursor = cursors.get("next") if isinstance(cursors, dict) else None
+            if not isinstance(cursor, str) or not cursor:
+                break
+        return [{"runs": runs}]
 
     def spans_from_payload(self, payload: JsonValue) -> list[SpanRecord]:
         """Map one payload (single run, list, `{runs:[...]}`) to ordered `SpanRecord`s by trace."""

@@ -14,12 +14,19 @@ from wmh.core.types import Trace
 
 
 class VendorPull(BaseModel):
-    """Parameters for pulling traces from an observability vendor's API."""
+    """Parameters for pulling traces from an observability vendor's API or a database."""
 
     api_key: str | None = None  # falls back to the vendor's env var when None
     project: str | None = None  # vendor project / workspace to pull from
     since: str | None = None  # ISO-8601 lower bound on trace start time
     limit: int | None = None  # max traces to pull
+
+    # Database-source transport params (the `postgres` adapter); API-vendor adapters ignore them.
+    dsn: str | None = None  # connection string; falls back to $WMH_POSTGRES_DSN
+    table: str | None = None  # table holding the trace rows
+    trace_id_column: str | None = None  # override; default "trace_id" (absent -> row-per-trace)
+    payload_column: str | None = None  # override; default "payload"
+    order_column: str | None = None  # override; default "created_at" when the table has it
 
 
 @runtime_checkable
