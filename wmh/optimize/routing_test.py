@@ -200,3 +200,36 @@ def test_rerank_requires_cost_scale() -> None:
     zeroed = policy.model_copy(update={"cost_scale": 0.0})
     with pytest.raises(ValueError, match="cost_scale"):
         rerank_policy(zeroed, cost_weight=0.5)
+
+
+def test_baseline_guard_reverts_thin_or_losing_clusters() -> None:
+    # Cluster evidence: prose-model barely ahead in a thin cluster -> guard reverts to the
+    # global best (sql-model); a cluster where prose wins with support keeps prose first.
+    matrix = _matrix()
+    policy = fit_rank_policy(
+        matrix,
+        embedder=EmbedderSpec(dim=256),
+        n_clusters=2,
+        seed=42,
+        top_k_clusters=1,
+        guard_model="sql-model",
+        min_support=100,  # nothing has this support -> EVERY cluster reverts
+    )
+    for cluster in policy.clusters:
+        assert cluster.ranking[0] == "sql-model"
+
+
+def test_baseline_guard_keeps_real_winners() -> None:
+    matrix = _matrix()
+    policy = fit_rank_policy(
+        matrix,
+        embedder=EmbedderSpec(dim=256),
+        n_clusters=2,
+        seed=42,
+        top_k_clusters=1,
+        guard_model="sql-model",
+        min_support=2,
+    )
+    # The prose-majority cluster has strong prose evidence (support >= 2, mean 1.0 vs 0.0):
+    # prose-model must survive the guard there.
+    assert any(c.ranking[0] == "prose-model" for c in policy.clusters)

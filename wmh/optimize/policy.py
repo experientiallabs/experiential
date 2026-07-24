@@ -126,6 +126,10 @@ class RoutingPolicy(BaseModel):
     beta: float = Field(default=DEFAULT_BETA, gt=0.0)
     default_rank: int = Field(default=DEFAULT_RANK, ge=1)
     sticky: bool = True  # keep a conversation's incumbent model (see module docstring)
+    # ProxRouter-inspired support tilt (2510.09852, ADAPTED to clusters: their exponential
+    # tilt reweights nonparametric scores by a prior; ours multiplies cluster probabilities
+    # by support^gamma so thin outlier clusters lose routing weight). 0 = off (reference).
+    support_tilt_gamma: float = 0.0
     # Fit-set mean cost per scored episode (all models): the unit the cost knob trades against
     # one reward point. 0 when the fit carried no usable costs.
     cost_scale: float = 0.0
@@ -202,6 +206,11 @@ def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     top = np.argsort(dists)[: policy.top_k_clusters]
     logits = -policy.beta * dists[top]
     probs = np.exp(logits - logits.max())
+    if policy.support_tilt_gamma > 0.0:
+        support = np.asarray(
+            [max(policy.clusters[int(index)].total, 1) for index in top], dtype=np.float64
+        )
+        probs = probs * support**policy.support_tilt_gamma
     probs /= probs.sum()
 
     scores: dict[str, float] = {}

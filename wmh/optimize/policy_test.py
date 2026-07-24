@@ -193,3 +193,27 @@ def test_azure_embedder_spec_missing_key_env_fails_loudly(
     )
     with pytest.raises(ValueError, match="AZ_EMBED_KEY"):
         spec.build()
+
+
+def test_support_tilt_shifts_weight_to_supported_clusters() -> None:
+    # Two near-equidistant clusters with opposite rankings; the tiny cluster (total=1) wins
+    # untilted (slightly closer), the big one (total=400) wins under tilt.
+    embedder = HashingEmbedder(dim=64)
+    near, far = embedder.embed(["SELECT count(*) FROM t", "SELECT sum(x) FROM t"])
+    base = dict(
+        kind="rank",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        embedder=EmbedderSpec(dim=64),
+        top_k_clusters=2,
+        beta=1.0,
+    )
+    clusters = lambda: [  # noqa: E731
+        ClusterRanking(cluster_id=0, centroid=near, ranking=["fable-5", "haiku-4-5"], total=1),
+        ClusterRanking(cluster_id=1, centroid=far, ranking=["haiku-4-5", "fable-5"], total=400),
+    ]
+    untilted = RoutingPolicy(**base, clusters=clusters())
+    tilted = RoutingPolicy(**base, clusters=clusters(), support_tilt_gamma=1.0)
+    query = "SELECT count(*) FROM t"
+    assert select_model(untilted, query).model == "fable-5"
+    assert select_model(tilted, query).model == "haiku-4-5"

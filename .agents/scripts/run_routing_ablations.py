@@ -129,6 +129,7 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
     started = time.monotonic()
     policy = fit_rank_policy(
         matrix, fit_ids=fit_ids, embedder=EmbedderSpec(dim=DIM), n_clusters=K, seed=42,
+        guard_model=best_name, min_support=4,
         fitted_from=f"{name} split{split_seed}",
     )
     logger.info("%s: rank fit in %.0fs", name, time.monotonic() - started)
@@ -160,14 +161,107 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
     penalties = np.asarray(
         [mean_cost.get(m, cost_scale) / cost_scale for m in head.models]
     )
+    baseline_index = head.models.index(best_name)
     for lam in LAMS:
         scores = probs - lam * penalties
-        picks = [head.models[int(index)] for index in np.argmax(scores, axis=1)]
+        raw = np.argmax(scores, axis=1)
+        # Guard: keep the best-single baseline unless the picked model's score actually
+        # exceeds the baseline's (worst case == 1x best-single, per product requirement).
+        picks = [
+            head.models[int(index)] if scores[row, index] > scores[row, baseline_index]
+            else best_name
+            for row, index in enumerate(raw)
+        ]
         decisions = dict(zip(test_ids, picks, strict=True))
         record(
-            "irt", {"hidden": 256, "dim": 64, "epochs": 300, "lam": lam},
+            "irt", {"hidden": 256, "dim": 64, "epochs": 300, "lam": lam, "guard": True},
             evaluate_choices(matrix, test_ids, lambda sid: decisions[sid]),
         )
+
+    # ProxRouter-inspired support tilt on the guarded rank policy.
+    tilted = policy.model_copy(update={"support_tilt_gamma": 0.5})
+    decisions = {
+        sid: rank_decision(tilted, test_vecs[index]).model
+        for index, sid in enumerate(test_ids)
+    }
+    record(
+        "rank-tilt", {"k": K, "gamma": 0.5, "lam": 0.0},
+        evaluate_choices(matrix, test_ids, lambda sid: decisions[sid]),
+    )
+
+    # JiSi phase-1, PROXY mode (deployable; the paper's s2s mode peeks at test responses).
+    replies = {}
+    for outcome in matrix.outcomes:
+        if outcome.replies and outcome.reward is not None:
+            replies[(outcome.scenario_id, outcome.model)] = outcome.replies[0]
+    rewards_cell = {}
+    for outcome in matrix.outcomes:
+        if outcome.reward is not None:
+            rewards_cell.setdefault((outcome.scenario_id, outcome.model), []).append(
+                outcome.reward
+            )
+    fit_norm = Normalizer(norm="l2").transform(fit_vecs)
+    sims_all = test_vecs @ fit_norm.T  # [T, F]
+    model_names = [entry.name for entry in matrix.pool]
+    jisi_picks: dict[str, str] = {}
+    for row, sid in enumerate(test_ids):
+        sims = sims_all[row]
+        k = min(50, len(fit_ids))
+        kth = np.sort(sims)[-k]
+        neighbor_rows = np.where(sims > 0.95 * kth)[0]
+        if not len(neighbor_rows):
+            neighbor_rows = np.asarray([int(np.argmax(sims))])
+        def profile(rows_idx, weights):
+            scores_local = {}
+            for m in model_names:
+                num = den = 0.0
+                for j, weight in zip(rows_idx, weights, strict=True):
+                    cell = rewards_cell.get((fit_ids[int(j)], m))
+                    if cell:
+                        num += weight * (sum(cell) / len(cell))
+                        den += weight
+                if den:
+                    scores_local[m] = num / den
+            return scores_local
+        first = profile(neighbor_rows, sims[neighbor_rows])
+        if not first:
+            jisi_picks[sid] = best_name
+            continue
+        needles = sorted(first, key=lambda m: -first[m])[:3]
+        # proxy_s2s: neighbor quality = how consistent each neighbor's needle responses are
+        # with the OTHER neighbors' (train-side only; no test response needed).
+        refine = []
+        for j in neighbor_rows:
+            sims_resp = []
+            for m in needles:
+                mine = replies.get((fit_ids[int(j)], m))
+                if not mine:
+                    continue
+                others = [
+                    replies.get((fit_ids[int(o)], m))
+                    for o in neighbor_rows
+                    if o != j and replies.get((fit_ids[int(o)], m))
+                ]
+                if not others:
+                    continue
+                vecs = np.asarray(embedder.embed([mine, *others[:5]]))
+                sims_resp.append(float(vecs[0] @ vecs[1:].T.mean(axis=1)))
+            resp = float(np.mean(sims_resp)) if sims_resp else 0.0
+            refine.append(0.5 * sims[int(j)] + 0.5 * resp)
+        refine = np.asarray(refine)
+        keep = max(1, int(len(neighbor_rows) * 0.5))
+        top_idx = np.argsort(refine)[-keep:]
+        second = profile(neighbor_rows[top_idx], refine[top_idx])
+        pick = max(second, key=lambda m: (second[m] - LAMS[1] * 0
+                    , -model_names.index(m))) if second else best_name
+        # Guard: revert to baseline unless the pick's profile beats the baseline's.
+        if second.get(pick, 0.0) <= second.get(best_name, 0.0):
+            pick = best_name
+        jisi_picks[sid] = pick
+    record(
+        "jisi", {"mode": "proxy", "rag": 50, "thres": 0.95, "guard": True},
+        evaluate_choices(matrix, test_ids, lambda sid: jisi_picks[sid]),
+    )
 
 
 def main() -> None:

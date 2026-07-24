@@ -60,6 +60,8 @@ def fit_rank_policy(
     beta: float = DEFAULT_BETA,
     default_rank: int = DEFAULT_RANK,
     default_model: str | None = None,
+    guard_model: str | None = None,
+    min_support: int = 0,
     fitted_from: str | None = None,
 ) -> RoutingPolicy:
     """Fit a rank policy on `matrix` (restricted to `fit_ids` when given).
@@ -141,6 +143,16 @@ def fit_rank_policy(
             # default_rank scores. Logged, never silent.
             logger.warning("cluster %d has no scored episodes; it ranks no models", cluster)
         ranking = sorted(means, key=lambda m: (-means[m], pool_order[m]))
+        if guard_model is not None and ranking:
+            # Only-replace-if-better, per cluster: the router's worst case must be the
+            # baseline model, so a cluster keeps its own winner ONLY when that winner beats
+            # the baseline's in-cluster evidence with enough support; otherwise the baseline
+            # leads. Thin clusters (support < min_support) always revert.
+            top = ranking[0]
+            support = sums[cluster].get(top, (0.0, 0.0, 0))[2]
+            baseline_mean = means.get(guard_model, 0.0)
+            if top != guard_model and (support < min_support or means[top] <= baseline_mean):
+                ranking = [guard_model, *[m for m in ranking if m != guard_model]]
         label = ""
         if prefix_counts[cluster]:
             label = prefix_counts[cluster].most_common(1)[0][0]
