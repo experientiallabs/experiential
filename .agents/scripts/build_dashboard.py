@@ -216,13 +216,14 @@ function table(){
   el.addEventListener('mouseleave',hideTip);});
 }
 function groupKey(r){return r.matrix+'|'+r.variant+'|'+JSON.stringify(r.params);}
-function aggregate(rows){ // mean +- half-range across split seeds
+function aggregate(rows){ // rows are already seed-aggregated by the builder (seeds, acc_sd)
  const acc=rows.map(r=>r.result.accuracy), cost=rows.map(r=>r.result.cost_per_call);
  const p50s=rows.map(r=>r.result.latency_p50_s).filter(v=>v!=null);
  const mean=a=>a.reduce((x,y)=>x+y,0)/a.length;
- return {acc:mean(acc), accSpread:(Math.max(...acc)-Math.min(...acc))/2,
-  cost:mean(cost), p50:p50s.length?mean(p50s):null,
-  n:Math.round(mean(rows.map(r=>r.result.scenarios))), seeds:rows.length, runs:rows};
+ const seeds=rows.length>1?rows.length:(rows[0].seeds||1);
+ const spread=rows.length>1?(Math.max(...acc)-Math.min(...acc))/2:(rows[0].acc_sd||0);
+ return {acc:mean(acc), accSpread:spread, cost:mean(cost), p50:p50s.length?mean(p50s):null,
+  n:rows[0].result.scenarios, seeds:seeds, runs:rows};
 }
 function headlines(){
  const cont=document.getElementById('heads'); cont.innerHTML='';
@@ -246,7 +247,7 @@ function headlines(){
    <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(G.acc)}<span style="font-size:12px;color:var(--muted)"> ±${(100*G.accSpread).toFixed(1)}</span> <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt${sig?'':' (within spread)'}</span></div>
    <div style="color:var(--muted)"><b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
    (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>`;
-  const perSeed=G.runs.map(r=>`<tr><td>seed ${r.split_seed}</td><td>${fmtP(r.result.accuracy)}</td><td>${fmt$(r.result.cost_per_call)}</td><td>${r.result.scenarios}</td></tr>`).join('');
+  const perSeed=G.runs.length>1?G.runs.map(r=>`<tr><td>seed ${r.split_seed}</td><td>${fmtP(r.result.accuracy)}</td><td>${fmt$(r.result.cost_per_call)}</td><td>${r.result.scenarios}</td></tr>`).join(''):'';
   const r=G.runs[0].result;
   const counts={}; Object.entries(r.model_mix).forEach(([mo,s])=>counts[mo]=Math.round(s*r.scenarios));
   const totCost={}; Object.entries(r.per_model_cost_per_call||{}).forEach(([mo,c])=>totCost[mo]=c*(counts[mo]||0));
@@ -265,11 +266,11 @@ function headlines(){
    `<tr><td>routed</td><td><b>${fmtP(G.acc)} ±${(100*G.accSpread).toFixed(1)}</b></td><td><b>${fmt$(G.cost)}</b></td><td><b>${G.p50?G.p50.toFixed(2)+'s':'-'}</b></td></tr>`+
    `<tr><td>baseline · <b>${bsA.r0.params.model}</b></td><td>${fmtP(B.acc)} ±${(100*B.accSpread).toFixed(1)}</td><td>${fmt$(B.cost)}</td><td>${B.p50?B.p50.toFixed(2)+'s':'-'}</td></tr></table>`+
    `<div style="margin:8px 0 10px;padding:6px 10px;border:1px solid var(--grid);border-radius:6px">`+
-   `<b style="font-size:14px;color:${G.n<60?'var(--c1)':'var(--ink)'}">n ≈ ${G.n}</b> held-out per seed × ${G.seeds} seeds`+
+   `<b style="font-size:14px;color:${G.n<60?'var(--c1)':'var(--ink)'}">n = ${G.n}</b> held-out evaluations across ${G.seeds} seeds`+
    `${G.n<60?' · <b style="color:var(--c1)">small n - wide noise floor</b>':''}`+
    `${sig?'':' · <b style="color:var(--c1)">delta within seed spread - treat as tie</b>'}</div>`+
-   `<table><tr><th>per seed</th><th>acc</th><th>cost</th><th>n</th></tr>${perSeed}</table>`+
-   `<div style="font-weight:600;margin:10px 0 4px">Cost by model (seed ${G.runs[0].split_seed})</div>`+
+   (perSeed?`<table><tr><th>per seed</th><th>acc</th><th>cost</th><th>n</th></tr>${perSeed}</table>`:'')+
+   `<div style="font-weight:600;margin:10px 0 4px">Cost by model (all seeds)</div>`+
    `<svg viewBox="0 0 ${W} 16" style="width:100%;display:block">${seg}</svg>`+
    `<table style="margin-top:6px"><tr><th>model</th><th>calls</th><th>tok %</th><th>cost</th><th>cost %</th></tr>${rows2}</table>`;
   div.addEventListener('mousemove',e=>showPop(e,detail));
