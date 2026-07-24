@@ -231,10 +231,12 @@ function headlines(){
   const div=document.createElement('div');
   div.style.cssText='border:1px solid var(--grid);border-radius:10px;padding:14px 16px;cursor:help';
   // Headline only; everything else lives on hover.
+  const nWarn=r.scenarios<60;
   div.innerHTML=`<div style="color:var(--muted);font-size:12px">${m}</div>
    <div style="font-size:24px;font-weight:650;margin:6px 0 2px">${fmtP(r.accuracy)} <span style="font-size:13px;color:${good(dAcc)};font-weight:600">${dAcc>=0?'+':''}${dAcc.toFixed(1)}pt</span></div>
    <div style="color:var(--muted)"><b style="color:${good(xCost-1)}">${xCost>=1?xCost.toFixed(1)+'x cheaper':(1/xCost).toFixed(1)+'x pricier'}</b>`+
-   (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>`;
+   (xLat?` · <b style="color:${good(xLat-1)}">${xLat>=1?xLat.toFixed(1)+'x faster':(1/xLat).toFixed(1)+'x slower'}</b>`:'')+`</div>
+   <div style="margin-top:7px;font-size:12px;color:var(--muted)">vs best single <b style="color:var(--ink)">${bs.params.model}</b> · <b style="color:${nWarn?'var(--c1)':'var(--ink)'}">n=${r.scenarios}</b>${nWarn?' <span style="color:var(--c1)">(small)</span>':''}</div>`;
   // Per-model economics for this run: routed calls, total cost, token share.
   const counts={}; Object.entries(r.model_mix).forEach(([mo,s])=>counts[mo]=Math.round(s*r.scenarios));
   const totCost={}; Object.entries(r.per_model_cost_per_call||{}).forEach(([mo,c])=>totCost[mo]=c*(counts[mo]||0));
