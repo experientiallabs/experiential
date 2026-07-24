@@ -34,6 +34,7 @@ from pydantic import BaseModel, Field
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import Normalizer
 
+from wmh.optimize.cluster_labels import label_clusters, tokenize
 from wmh.optimize.policy import EmbedderSpec, RoutingDecision
 from wmh.providers.pool import PoolEntry
 
@@ -131,6 +132,12 @@ def fit_km_prox(
     # prior at ~1 sample's worth of evidence instead of infinity.
     multi = [spreads[c] for c, rows in members.items() if len(rows) > 1 and c in spreads]
     floor = max(float(np.mean(multi)) if multi else SPREAD_FLOOR, SPREAD_FLOOR)
+    tasks: dict[str, str] = {}
+    for outcome in matrix.outcomes:
+        tasks.setdefault(outcome.scenario_id, outcome.task)
+    text_labels = label_clusters(
+        [[tasks[scenario_ids[row]] for row in members[c]] for c in range(k)]
+    )
     references: list[ProxReference] = []
     for cluster in range(k):
         rows = members[cluster]
@@ -139,6 +146,7 @@ def fit_km_prox(
         n_i = len(rows)
         prior = n_i / (max(spreads[cluster], 0.0) + floor)
         rewards, costs, counts, label = stats.get(cluster, ({}, {}, {}, ""))
+        label = label or text_labels[cluster]
         references.append(
             ProxReference(
                 vector=[float(v) for v in centres[cluster]],
@@ -173,11 +181,17 @@ def fit_knn_prox(
     spec = embedder or EmbedderSpec()
     scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec)
     stats = _reference_stats(matrix, {sid: index for index, sid in enumerate(scenario_ids)})
+    tasks: dict[str, str] = {}
+    for outcome in matrix.outcomes:
+        tasks.setdefault(outcome.scenario_id, outcome.task)
     references: list[ProxReference] = []
     for row, sid in enumerate(scenario_ids):
         rewards, costs, counts, label = stats.get(row, ({}, {}, {}, ""))
         if not rewards:
             continue  # an unscored fit scenario carries no evidence; skip it, logged below
+        if not label:
+            # Per-query reference on prefix-less ids: first distinctive task terms.
+            label = " ".join(tokenize(tasks.get(sid, ""))[:3])
         references.append(
             ProxReference(
                 vector=[float(v) for v in embeddings[row]],
@@ -185,7 +199,7 @@ def fit_knn_prox(
                 rewards=rewards,
                 costs=costs,
                 counts=counts,
-                label=label or (sid.split(":", 1)[0] if ":" in sid else ""),
+                label=label,
                 total=1,
             )
         )

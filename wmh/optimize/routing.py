@@ -32,6 +32,7 @@ from pydantic import BaseModel
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import Normalizer
 
+from wmh.optimize.cluster_labels import label_clusters
 from wmh.optimize.policy import (
     DEFAULT_BETA,
     DEFAULT_RANK,
@@ -110,9 +111,14 @@ def fit_rank_policy(
     sums: dict[int, dict[str, tuple[float, float, int]]] = {c: {} for c in range(k)}
     counts: Counter[int] = Counter(cluster_of.values())
     prefix_counts: dict[int, Counter[str]] = {c: Counter() for c in range(k)}
+    member_texts: dict[int, list[str]] = {c: [] for c in range(k)}
     for sid, cluster in cluster_of.items():
+        member_texts[cluster].append(scenario_tasks[sid])
         if ":" in sid:
             prefix_counts[cluster][sid.split(":", 1)[0]] += 1
+    # Fallback labels for prefix-less ids (wm corpora use raw trace hashes): distinctive
+    # c-TF-IDF terms of each cluster's task texts. Labels never affect selection.
+    text_labels = label_clusters([member_texts[c] for c in range(k)])
     pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
     total_cost = 0.0
     total_count = 0
@@ -162,7 +168,7 @@ def fit_rank_policy(
                 support < min_support or means[top] <= baseline_mean + margin
             ):
                 ranking = [guard_model, *[m for m in ranking if m != guard_model]]
-        label = ""
+        label = text_labels[cluster]
         if prefix_counts[cluster]:
             label = prefix_counts[cluster].most_common(1)[0][0]
         clusters.append(
