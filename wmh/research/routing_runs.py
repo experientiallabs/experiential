@@ -147,6 +147,17 @@ def evaluate_call_sequences(
     bound, never a deployable router - and its runs must be labeled `oracle-*`. Deployable
     policies may only read `replies`, `steps`, `stop_reason`, `usage`, `cost_usd`,
     `call_seconds`.
+
+    COMPARABILITY TRAP, do not skip. A row from here is comparable to an `evaluate_choices` row
+    ONLY when the policy's value is order-independent. `evaluate_choices` averages a cell's
+    episodes, which is the expected value of one call; this function consumes the k-th episode, so
+    an order-DEPENDENT policy (anything that answers with a fixed call index, a 1-call sequence
+    being the simplest case) scores one specific draw instead. Scoring a 1-call fallback here made
+    it read 10pt worse than the identical best-single policy on terminal-tasks, purely from
+    episode-0 luck. If a policy's answer depends on call order, either score its 1x arm through
+    `evaluate_choices` or average over episode permutations; otherwise every paired delta against
+    best-single carries that offset. Selection rules that rank the transcript by a feature (the
+    best-of-n selectors in `wmh.research.posthoc_bounds`) are order-independent and safe.
     """
     by_cell: dict[tuple[str, str], list[ScenarioOutcome]] = {}
     for outcome in matrix.outcomes:

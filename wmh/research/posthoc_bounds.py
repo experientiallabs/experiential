@@ -191,6 +191,7 @@ def best_of_n_by_model(
     baseline_accuracy: float,
     baseline_cost: float,
     selector: str = DEFAULT_SELECTOR,
+    key: Callable[[ScenarioOutcome], tuple[float, ...]] | None = None,
     depth: int | None = None,
 ) -> list[BestOfNBound]:
     """Per-model best-of-n ceiling and achievable point over `ids` (all scenarios when None).
@@ -204,8 +205,11 @@ def best_of_n_by_model(
     skipped for that model (reported in `cells`) rather than padded, so the ceiling is never
     inflated by a model that happened to be sampled more often. `beats_best_single_accuracy`
     compares the ACHIEVABLE point against `baseline_accuracy`, not the oracle.
+
+    `key` overrides the named `selector` with any ranking callable, which is how a fitted verifier
+    (`wmh.research.reply_verifier`) is scored through this same path as the free features.
     """
-    key = SELECTOR_KEYS[selector]
+    key = key if key is not None else SELECTOR_KEYS[selector]
     cells = scored_cells(matrix)
     wanted = set(ids) if ids is not None else {sid for sid, _ in cells}
     cells = {(sid, model): episodes for (sid, model), episodes in cells.items() if sid in wanted}
