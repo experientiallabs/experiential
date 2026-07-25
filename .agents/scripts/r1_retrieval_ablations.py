@@ -54,12 +54,17 @@ class RetrievalParams(BaseModel):
     weighted: bool = True  # sim-weighted profile; False = uniform mean
     # Guard modes. margin: fixed profile-gap margin (the master jisi guard). stat: paired
     # per-neighbor reward differences must clear z standard errors (support-aware: the margin
-    # shrinks as neighbor evidence grows, unlike the fixed margin). none: unguarded.
-    guard: str = "margin"  # none | margin | stat
+    # shrinks as neighbor evidence grows, unlike the fixed margin). stat_asym: pricier picks
+    # must be significantly better (> z*se), cheaper picks merely not significantly worse
+    # (> -z*se): the economic asymmetry that lets a cost knob act. none: unguarded.
+    guard: str = "margin"  # none | margin | stat | stat_asym
     guard_margin: float = 0.03  # margin mode: doubled when the pick is pricier than baseline
     z: float = 0.5  # stat mode: required standard errors (doubled when pricier)
     min_pairs: int = 8  # stat mode: revert picks with fewer paired neighbors than this
     distance_floor: float | None = None  # abstain to baseline when max sim < floor
+    sim_gamma: float = 1.0  # weight = sim^gamma (weighted mode); >1 sharpens toward near items
+    smooth_alpha: float = 0.0  # Laplace pseudo-count toward the fit-global mean per model
+    pick_lam: float = 0.0  # cost-aware pick: argmax(profile - lam * cost / cost_scale)
 
 
 def _openai_embed(texts: list[str], cache_path: Path) -> np.ndarray:
@@ -197,7 +202,16 @@ def route(
     fit_matrix = np.stack([ctx.task_vecs[sid] for sid in fit_ids])
     mean_cost = ctx.mean_cost(fit_ids)
     base_cost = mean_cost.get(best_name, 0.0)
+    cost_scale = (sum(mean_cost.values()) / len(mean_cost)) if mean_cost else 1.0
     picks: dict[str, str] = {}
+
+    # Fit-global per-model means: the smoothing prior (and nothing else) uses them.
+    global_mean: dict[str, float] = {}
+    if params.smooth_alpha > 0:
+        for model in ctx.model_names:
+            values = [sum(cell) / len(cell) for sid in fit_ids if (cell := cells.get((sid, model)))]
+            if values:
+                global_mean[model] = sum(values) / len(values)
 
     def profile(rows_idx: np.ndarray, weights: np.ndarray) -> dict[str, float]:
         scores: dict[str, float] = {}
@@ -206,9 +220,12 @@ def route(
             for j, weight in zip(rows_idx, weights, strict=True):
                 cell = cells.get((fit_ids[int(j)], model))
                 if cell:
-                    w = float(weight) if params.weighted else 1.0
+                    w = max(float(weight), 0.0) ** params.sim_gamma if params.weighted else 1.0
                     num += w * (sum(cell) / len(cell))
                     den += w
+            if params.smooth_alpha > 0 and model in global_mean:
+                num += params.smooth_alpha * global_mean[model]
+                den += params.smooth_alpha
             if den:
                 scores[model] = num / den
         return scores
@@ -265,7 +282,10 @@ def route(
                 used_rows = neighbor_rows[top_idx]
         pick = max(
             chosen_profile,
-            key=lambda m: (chosen_profile[m], -ctx.model_names.index(m)),
+            key=lambda m: (
+                chosen_profile[m] - params.pick_lam * mean_cost.get(m, cost_scale) / cost_scale,
+                -ctx.model_names.index(m),
+            ),
         )
         guarded = False
         if params.guard == "margin":
@@ -275,14 +295,18 @@ def route(
             if chosen_profile.get(pick, 0.0) <= chosen_profile.get(best_name, 0.0) + margin:
                 pick = best_name
                 guarded = True
-        elif params.guard == "stat" and pick != best_name:
+        elif params.guard in ("stat", "stat_asym") and pick != best_name:
             diffs = []
             for j in used_rows:
                 cell_pick = cells.get((fit_ids[int(j)], pick))
                 cell_base = cells.get((fit_ids[int(j)], best_name))
                 if cell_pick and cell_base:
                     diffs.append(sum(cell_pick) / len(cell_pick) - sum(cell_base) / len(cell_base))
-            z_eff = 2 * params.z if mean_cost.get(pick, 0.0) > base_cost else params.z
+            pricier = mean_cost.get(pick, 0.0) > base_cost
+            if params.guard == "stat_asym":
+                z_eff = params.z if pricier else -params.z
+            else:
+                z_eff = 2 * params.z if pricier else params.z
             if len(diffs) < params.min_pairs:
                 pick = best_name
                 guarded = True
@@ -429,6 +453,63 @@ OAI_CORE: list[tuple[str, RetrievalParams]] = [
 ]
 
 
+def _p(**kwargs) -> RetrievalParams:  # noqa: ANN003 (sweep shorthand)
+    return RetrievalParams(second_route=False, guard="stat", z=0.5, **kwargs)
+
+
+# Round 3: exhaust the cheap knobs on ours9 under the semantic embedder (--embed openai).
+ROUND3: list[tuple[str, RetrievalParams]] = [
+    # Neighbor rule re-tune (0.95 was chosen for compressed hashing sims).
+    ("r1-knn3-thres90", _p(rag_thres=0.90)),
+    ("r1-knn3-thres93", _p(rag_thres=0.93)),
+    ("r1-knn3-thres97", _p(rag_thres=0.97)),
+    ("r1-knn3-thres99", _p(rag_thres=0.99)),
+    ("r1-knn3-rag25", _p(rag_num=25)),
+    ("r1-knn3-rag100", _p(rag_num=100)),
+    ("r1-knn3-rag200", _p(rag_num=200)),
+    # Guard strictness under the semantic embedder.
+    ("r1-knn3-z025", RetrievalParams(second_route=False, guard="stat", z=0.25)),
+    ("r1-knn3-z075", RetrievalParams(second_route=False, guard="stat", z=0.75)),
+    ("r1-knn3-z1", RetrievalParams(second_route=False, guard="stat", z=1.0)),
+    # Weight sharpening (gamma=0 is uniform) and profile smoothing toward the global mean.
+    ("r1-knn3-g0", _p(weighted=False)),
+    ("r1-knn3-g2", _p(sim_gamma=2.0)),
+    ("r1-knn3-g4", _p(sim_gamma=4.0)),
+    ("r1-knn3-a2", _p(smooth_alpha=2.0)),
+    ("r1-knn3-a5", _p(smooth_alpha=5.0)),
+    ("r1-knn3-a10", _p(smooth_alpha=10.0)),
+    # Asymmetric guard, alone and as the enabler of the cost knob.
+    ("r1-knn3-asym", RetrievalParams(second_route=False, guard="stat_asym", z=0.5)),
+    (
+        "r1-knn3-asym-lam002",
+        RetrievalParams(second_route=False, guard="stat_asym", z=0.5, pick_lam=0.02),
+    ),
+    (
+        "r1-knn3-asym-lam005",
+        RetrievalParams(second_route=False, guard="stat_asym", z=0.5, pick_lam=0.05),
+    ),
+    (
+        "r1-knn3-asym-lam01",
+        RetrievalParams(second_route=False, guard="stat_asym", z=0.5, pick_lam=0.1),
+    ),
+]
+
+# Round 3b: post-hoc composition of the individually helpful knobs (labeled as such) plus
+# the missing control for the Pareto-extension row.
+ROUND3B: list[tuple[str, RetrievalParams]] = [
+    (
+        "r1-knn3-combo",
+        RetrievalParams(
+            second_route=False, guard="stat", z=0.25, smooth_alpha=5.0, sim_gamma=2.0
+        ),
+    ),
+    (
+        "r1-knn3-asym-lam002",
+        RetrievalParams(second_route=False, guard="stat_asym", z=0.5, pick_lam=0.02),
+    ),
+]
+
+
 def run_matrix(
     name: str,
     ctx: MatrixContext,
@@ -494,7 +575,16 @@ def run_matrix(
 
     if controls:
         cells = shuffled_cells(ctx, fit_ids, seed=split_seed)
-        control_names = {"r1-jisi-proxy", "r1-knn", "r1-knn-noguard", "r1-knn-statz05"}
+        control_names = {
+            "r1-jisi-proxy",
+            "r1-knn",
+            "r1-knn-noguard",
+            "r1-knn-statz05",
+            "r1-knn3-asym",
+            "r1-knn3-asym-lam005",
+            "r1-knn3-asym-lam002",
+            "r1-knn3-combo",
+        }
         for variant, params in [v for v in variants if v[0] in control_names]:
             picks = route(ctx, params, fit_ids, test_ids, best_name, rewards_cell=cells)
             record(
@@ -509,12 +599,17 @@ def main() -> None:
     wanted = [a for a in sys.argv[1:] if not a.startswith("--")]
     seeds = SPLIT_SEEDS if "--seeds" in sys.argv else [0]
     debug = "--debug" in sys.argv
-    if "--embed" in sys.argv and "openai" in sys.argv:
-        variants, embed = OAI_CORE, "openai"
+    embed = "openai" if ("--embed" in sys.argv and "openai" in sys.argv) else "hashing"
+    if "--round3b" in sys.argv:
+        variants = ROUND3B
+    elif "--round3" in sys.argv:
+        variants = ROUND3
     elif "--round2" in sys.argv:
-        variants, embed = ROUND2, "hashing"
+        variants = ROUND2
+    elif embed == "openai":
+        variants = OAI_CORE
     else:
-        variants, embed = ROUND1, "hashing"
+        variants = ROUND1
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
             continue
