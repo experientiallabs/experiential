@@ -81,7 +81,7 @@ class PoolEntry(BaseModel):
 
         Cache-adjusted: cached prompt tokens (`usage.cached_input_tokens`) bill at
         `cached_input_per_mtok` when the entry carries a cache-read price, and at the full
-        input rate otherwise — never silently free. The global `wmh.tracking.pricing.cost_usd`
+        input rate otherwise (never silently free). The global `wmh.tracking.pricing.cost_usd`
         only knows the built-in table; pool entries with explicit prices must be costed here
         or they would silently read $0.
         """
