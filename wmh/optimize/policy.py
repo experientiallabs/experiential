@@ -268,6 +268,10 @@ class RoutingPolicy(BaseModel):
     knn_z: float = Field(default=DEFAULT_KNN_Z, ge=0.0)
     knn_min_pairs: int = Field(default=DEFAULT_KNN_MIN_PAIRS, ge=0)  # neighbors scored on both
     se_floor: bool = True  # small-sample variance floor (see SE_FLOOR_MAX_PAIRS)
+    # Novelty floor: queries whose best bank similarity is below this abstain to the baseline
+    # (None = off). Set at fit time from the floor_q quantile of bank self-NN similarities;
+    # the serving-side coverage/robustness knob for task drift.
+    floor_sim: float | None = None
 
     # Set by `save`/`load` so a relative `knn_bank_path` resolves against the policy file, and
     # the lazily loaded bank. Private: not part of the artifact.
@@ -515,6 +519,14 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     if norm > 0.0:
         vector = vector / norm
     sims = bank.embeddings @ vector
+    if policy.floor_sim is not None and float(np.max(sims)) < policy.floor_sim:
+        return RoutingDecision(
+            model=baseline,
+            reason=(
+                f"knn novelty abstain: best similarity {float(np.max(sims)):.3f} below the "
+                f"fit-bank floor {policy.floor_sim:.3f}, serving {baseline}"
+            ),
+        )
 
     budget = min(policy.rag_num, sims.shape[0])
     kth = float(np.sort(sims)[-budget])

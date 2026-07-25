@@ -133,6 +133,7 @@ def fit_knn_policy(
     z: float = DEFAULT_KNN_Z,
     min_pairs: int = DEFAULT_KNN_MIN_PAIRS,
     se_floor: bool = True,
+    floor_q: float = 0.0,
     fitted_from: str | None = None,
 ) -> RoutingPolicy:
     """Fit a kNN policy on `matrix` (restricted to `fit_ids` when given) and write its sidecar.
@@ -163,6 +164,23 @@ def fit_knn_policy(
 
     bank = build_knn_bank(matrix, scenario_ids, embedder=embed_with or spec.build())
     bank.save(bank_path)
+    # Adaptive neighborhood (R1 promotion-hardening H1): scale the neighbor budget and the
+    # evidence bar to the bank instead of letting a 50-neighbor budget swallow a 20-row bank
+    # (which turns the profile into a global mean and routing to 0%). min() against the
+    # caller's values keeps banks >= 2x the budget BIT-IDENTICAL to the validated champion.
+    n_bank = len(bank.scenario_ids)
+    rag_num = min(rag_num, max(4, -(-n_bank // 2)))
+    min_pairs = min(min_pairs, max(3, rag_num // 2))
+    # Novelty floor (R1 promotion-hardening H2): abstain to the baseline when a query's best
+    # similarity falls below the floor_q quantile of the bank's own nearest-neighbor
+    # similarities. iid wins hold at every q; under task drift coverage degrades gracefully
+    # toward all-baseline. 0.0 = off (the exact validated champion).
+    floor_sim: float | None = None
+    if floor_q > 0.0:
+        gram = bank.embeddings @ bank.embeddings.T
+        np.fill_diagonal(gram, -np.inf)
+        self_nn = gram.max(axis=1)
+        floor_sim = float(np.quantile(self_nn, floor_q))
     policy = RoutingPolicy(
         kind="knn",
         default_model=baseline,
@@ -175,6 +193,7 @@ def fit_knn_policy(
         knn_z=z,
         knn_min_pairs=min_pairs,
         se_floor=se_floor,
+        floor_sim=floor_sim,
         fitted_from=fitted_from,
     )
     policy.attach_bank(bank)

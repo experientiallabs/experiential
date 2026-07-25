@@ -71,6 +71,13 @@ def fit(
     min_pairs: int = typer.Option(
         8, "--min-pairs", min=0, help="(knn) Neighbors scored on both sides before routing away."
     ),
+    floor_q: float = typer.Option(
+        0.05,
+        "--floor-q",
+        help="Novelty floor quantile: abstain to the fallback when a query's best bank "
+        "similarity is below this quantile of the bank's own nearest-neighbor sims "
+        "(coverage/robustness knob for task drift; 0 = off, the exact validated champion).",
+    ),
     se_floor: bool = typer.Option(
         True,
         "--se-floor/--no-se-floor",
@@ -130,7 +137,8 @@ def fit(
             z=z,
             min_pairs=min_pairs,
             se_floor=se_floor,
-            fitted_from=f"{matrix_file} knn z={z} k={rag_num} {embedder}-{dim}",
+            floor_q=floor_q,
+            fitted_from=f"{matrix_file} knn z={z} k={rag_num} q={floor_q} {embedder}-{dim}",
         )
     else:
         policy = fit_rank_policy(

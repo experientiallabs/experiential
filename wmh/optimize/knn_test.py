@@ -9,7 +9,13 @@ import pytest
 
 from wmh.optimize.knn import best_single_on_fit, build_knn_bank, fit_knn_policy
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmh.optimize.policy import KNN_BANK_FILENAME, POLICY_FILENAME, EmbedderSpec, RoutingPolicy
+from wmh.optimize.policy import (
+    KNN_BANK_FILENAME,
+    POLICY_FILENAME,
+    EmbedderSpec,
+    RoutingPolicy,
+    knn_decision,
+)
 from wmh.optimize.routing import evaluate_policy
 from wmh.providers.base import ProviderKind
 from wmh.providers.pool import PoolEntry
@@ -222,18 +228,64 @@ def test_a_saved_knn_policy_reloads_and_routes_from_disk(tmp_path: Path) -> None
     assert evaluate_policy(reloaded, matrix, matrix.scenario_ids()).accuracy == pytest.approx(1.0)
 
 
-def test_a_budget_as_large_as_the_bank_collapses_to_the_fallback(tmp_path: Path) -> None:
-    # The relative rule keeps every fit row once the budget covers the bank, so the profile
-    # becomes the global average and the guard sees no signal. That collapse is the safe
-    # failure: a router with no local evidence serves the fallback, it does not guess.
+def test_the_adaptive_cap_prevents_the_whole_bank_neighborhood_collapse(tmp_path: Path) -> None:
+    # Pre-hardening behavior: a budget covering the bank made every profile the global
+    # average and routing inert. The adaptive rule (R1 promotion hardening) caps the budget
+    # at half the bank, so local evidence survives and the router still routes.
     policy = _fit(tmp_path, rag_num=20)
+    assert policy.rag_num == 10  # capped at ceil(20-row bank / 2)
     matrix = _matrix()
     result = evaluate_policy(policy, matrix, matrix.scenario_ids())
-    assert result.model_mix == {"cheap": 1.0}
-    assert result.accuracy == pytest.approx(0.5)  # the fallback's own score
+    assert set(result.model_mix) == {"cheap", "pricey"}  # routing is alive, not collapsed
+    assert result.accuracy > 0.8  # far above the fallback's 0.5; one boundary miss is fine
 
 
 def test_fit_carries_the_guard_knobs_onto_the_policy(tmp_path: Path) -> None:
     policy = _fit(tmp_path, rag_num=17, rag_thres=0.9, z=1.25, min_pairs=3, se_floor=False)
-    assert (policy.rag_num, policy.rag_thres) == (17, 0.9)
+    # rag_num 17 exceeds the adaptive cap (ceil(20 / 2) = 10) and is capped there.
+    assert (policy.rag_num, policy.rag_thres) == (10, 0.9)
     assert (policy.knn_z, policy.knn_min_pairs, policy.se_floor) == (1.25, 3, False)
+
+
+def test_adaptive_rule_scales_neighborhood_to_small_banks(tmp_path: Path) -> None:
+    # A 50-neighbor budget on a tiny bank makes every profile the global mean and routing
+    # inert; the fitted policy must scale the budget and the evidence bar to the bank.
+    policy = fit_knn_policy(
+        _matrix(),
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        embedder=EmbedderSpec(dim=256),
+        guard_model="cheap",
+    )
+    assert policy.rag_num == 10  # ceil(20-row bank / 2), not the 50 default
+    assert policy.knn_min_pairs == 5  # max(3, 10 // 2)
+
+
+def test_adaptive_rule_keeps_caller_values_below_the_cap(tmp_path: Path) -> None:
+    # Explicit smaller settings pass through untouched: min() semantics, never a raise.
+    policy = _fit(tmp_path, rag_num=5, min_pairs=2)
+    assert policy.rag_num == 5
+    assert policy.knn_min_pairs == 2
+
+
+def test_novelty_floor_abstains_on_far_queries(tmp_path: Path) -> None:
+    policy = fit_knn_policy(
+        _matrix(),
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        embedder=EmbedderSpec(dim=256),
+        guard_model="cheap",
+        rag_num=5,
+        min_pairs=3,
+        floor_q=0.99,  # floor at the 99th pct of self-NN sims: nearly everything abstains
+    )
+    assert policy.floor_sim is not None
+    embedder = policy.embedder.build() if policy.embedder is not None else None
+    assert embedder is not None
+    query = embedder.embed(["zzz qqq xww utterly unrelated novel gibberish"])[0]
+    decision = knn_decision(policy, np.asarray(query))
+    assert decision.model == "cheap"
+    assert "novelty abstain" in decision.reason
+
+
+def test_floor_off_by_default(tmp_path: Path) -> None:
+    policy = _fit(tmp_path)
+    assert policy.floor_sim is None
