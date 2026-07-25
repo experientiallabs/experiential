@@ -4,6 +4,15 @@ Variants (identical splits, embeddings, and evaluator per matrix): best-single (
 rank router (Avengers replication, cost-knob sweep), IRT head (cost-knob sweep). Each run
 persists a RunRecord with the explain block; per-run markdown reports land in
 .wmh/evals/reports/. The dashboard (build_dashboard.py) renders runs.jsonl.
+
+`bo2-free` (best-of-2 on one model, picked by the free post-hoc selector) has its OWN entry point
+rather than living in `run_matrix`, so it can be appended to a runs.jsonl that already has the
+other variants swept without re-emitting duplicate rows for them:
+
+    uv run .agents/scripts/run_routing_ablations.py --only bo2-free --seeds
+
+It is also the only variant scored by `evaluate_call_sequences` (two calls, cost summed) rather
+than `evaluate_choices`.
 """
 
 from __future__ import annotations
@@ -12,6 +21,7 @@ import logging
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -19,10 +29,19 @@ import numpy as np
 from sklearn.preprocessing import Normalizer
 
 from wmh.optimize.irt import fit_irt_head
-from wmh.optimize.outcomes import OutcomeMatrix
+from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmh.optimize.policy import EmbedderSpec, rank_decision
 from wmh.optimize.routing import fit_rank_policy, rerank_policy
-from wmh.research.routing_runs import RunRecord, append_run, evaluate_choices, run_report
+from wmh.research.posthoc_bounds import DEFAULT_SELECTOR, SELECTOR_KEYS, best_of_n_by_model
+from wmh.research.routing_runs import (
+    ChoiceEval,
+    Finish,
+    RunRecord,
+    append_run,
+    evaluate_call_sequences,
+    evaluate_choices,
+    run_report,
+)
 from wmh.retrieval.embedders import HashingEmbedder
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -90,23 +109,26 @@ def _emit(record: RunRecord) -> None:
     )
 
 
-def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
+Recorder = Callable[[str, dict, ChoiceEval], None]
+
+
+def _prepare(
+    name: str, matrix: OutcomeMatrix, split_seed: int
+) -> tuple[list[str], list[str], str, ChoiceEval, Recorder]:
+    """The split, the best-single baseline, and the RunRecord factory every variant shares.
+
+    Shared so `run_matrix` and `run_bo2_free` cannot drift apart on the split, the baseline, or
+    the record shape - which is what makes their rows comparable paired-by-seed.
+    """
     from wmh.research.routerbench import best_single_model, oracle, split_scenario_ids
 
     fit_ids, test_ids = split_scenario_ids(matrix, train_fraction=0.7, seed=split_seed)
-    tasks = {o.scenario_id: o.task for o in matrix.outcomes}
-    embedder = HashingEmbedder(dim=DIM)
-    fit_vecs = np.asarray(embedder.embed([tasks[s] for s in fit_ids]))
-    test_vecs = Normalizer(norm="l2").transform(
-        np.asarray(embedder.embed([tasks[s] for s in test_ids]))
-    )
     ts = datetime.now(tz=UTC).isoformat()
-
     best_name, _acc, _cost = best_single_model(matrix, fit_ids=fit_ids, eval_ids=test_ids)
     best_eval = evaluate_choices(matrix, test_ids, lambda _sid: best_name)
     oracle_acc, oracle_cost = oracle(matrix, test_ids)
 
-    def record(variant: str, params: dict, result) -> None:  # noqa: ANN001
+    def record(variant: str, params: dict, result: ChoiceEval) -> None:
         _emit(
             RunRecord(
                 run_id=f"{name}-{variant}-{uuid.uuid4().hex[:8]}",
@@ -123,6 +145,18 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
                 f"cost=${oracle_cost:.5f}; embedder=hashing-{DIM}",
             )
         )
+
+    return fit_ids, test_ids, best_name, best_eval, record
+
+
+def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
+    fit_ids, test_ids, best_name, best_eval, record = _prepare(name, matrix, split_seed)
+    tasks = {o.scenario_id: o.task for o in matrix.outcomes}
+    embedder = HashingEmbedder(dim=DIM)
+    fit_vecs = np.asarray(embedder.embed([tasks[s] for s in fit_ids]))
+    test_vecs = Normalizer(norm="l2").transform(
+        np.asarray(embedder.embed([tasks[s] for s in test_ids]))
+    )
 
     record("best-single", {"model": best_name}, best_eval)
 
@@ -269,14 +303,110 @@ def run_matrix(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
     )
 
 
+def run_bo2_free(name: str, matrix: OutcomeMatrix, split_seed: int = 0) -> None:
+    """Best-of-2 on ONE model, choosing between that model's own two rollouts.
+
+    Every other variant picks a model from the QUERY. This one spends 2x on a single model and
+    picks between the finished rollouts using the free post-hoc selector, which reads only
+    `stop_reason` and `steps` - the DEPLOYABLE side of `evaluate_call_sequences`' information
+    boundary, never `reward` or `critique`.
+
+    The model is DISCOVERED on the fit split, never assumed: a candidate must clear fit-split
+    best-single by the same margin the other guarded variants use (0.03, doubled to 0.06 when its
+    2x cost exceeds best-single's 1x cost, since paying more has to buy more). If none qualifies
+    the variant collapses to best-single 1-shot, so it cannot be worse than the 1x baseline by
+    construction.
+    """
+    from wmh.research.routerbench import best_single_model
+
+    fit_ids, test_ids, best_name, best_eval, record = _prepare(name, matrix, split_seed)
+
+    fit_best, fit_acc, fit_cost = best_single_model(matrix, fit_ids=fit_ids, eval_ids=fit_ids)
+    fit_bounds = best_of_n_by_model(
+        matrix, fit_ids, baseline_accuracy=fit_acc, baseline_cost=fit_cost
+    )
+    if not fit_bounds:
+        logger.info("%s: no cell sampled more than once, skipping bo2-free", name)
+        return
+
+    qualified = [
+        bound
+        for bound in fit_bounds
+        if bound.selected_of_n_accuracy
+        > fit_acc + (0.06 if bound.oracle_of_n_cost_per_call > fit_cost else 0.03)
+    ]
+    qualified.sort(key=lambda b: (-b.selected_of_n_accuracy, b.oracle_of_n_cost_per_call, b.model))
+    chosen = qualified[0].model if qualified else None
+    logger.info(
+        "%s seed%d: bo2-free -> %s (fit best-single %s %.4f @ $%.5f); %d/%d qualified",
+        name,
+        split_seed,
+        chosen or f"NONE, falls back to {best_name} 1-shot",
+        fit_best,
+        fit_acc,
+        fit_cost,
+        len(qualified),
+        len(fit_bounds),
+    )
+
+    params = {
+        "selector": DEFAULT_SELECTOR,
+        "model": chosen or best_name,
+        "n": 2 if chosen else 1,
+        "guard_margin": 0.03,
+        "guard_margin_costly": 0.06,
+        "fell_back": chosen is None,
+    }
+    if chosen is None:
+        # Fall back to best-single's OWN evaluation, not a one-call sequence. The two evaluators
+        # treat a multi-episode cell differently: evaluate_choices averages the cell's episodes
+        # (the expected value of one call), while evaluate_call_sequences consumes the k-th
+        # episode, so a 1-call sequence scores episode 0 alone. Scoring the fallback that way made
+        # it look 10pt WORSE than best-single on terminal-tasks purely from episode-0 luck, which
+        # would both break the "never worse than 1x" guarantee and corrupt the paired delta.
+        record("bo2-free", params, best_eval)
+        return
+
+    episodes_available: dict[tuple[str, str], int] = {}
+    for outcome in matrix.outcomes:
+        if outcome.reward is not None:
+            cell = (outcome.scenario_id, outcome.model)
+            episodes_available[cell] = episodes_available.get(cell, 0) + 1
+    selector = SELECTOR_KEYS[DEFAULT_SELECTOR]
+    target = chosen
+
+    def policy(sid: str, transcript: list[ScenarioOutcome]) -> str | Finish:
+        # `or 1` keeps a scenario with no stored episode at one attempted call, which
+        # evaluate_call_sequences then reports as unscored rather than silently skipping it.
+        # The selector is order-independent, so the 2-call value is a true expectation (unlike a
+        # 1-call sequence, which would be one draw) and stays comparable to best-single's row.
+        budget = min(2, episodes_available.get((sid, target), 1)) or 1
+        if len(transcript) < budget:
+            return target
+        return Finish(pick=min(range(len(transcript)), key=lambda i: selector(transcript[i])))
+
+    record("bo2-free", params, evaluate_call_sequences(matrix, test_ids, policy))
+
+
 def main() -> None:
-    wanted = [a for a in sys.argv[1:] if not a.startswith("--")]
-    seeds = SPLIT_SEEDS if "--seeds" in sys.argv else [0]
+    argv = sys.argv[1:]
+    only = None
+    if "--only" in argv:
+        index = argv.index("--only")
+        only = argv[index + 1] if index + 1 < len(argv) else None
+        argv = argv[:index] + argv[index + 2 :]  # drop the flag AND its value
+    if only is not None and only != "bo2-free":
+        raise SystemExit("--only currently supports just 'bo2-free' (the rest share run_matrix)")
+    wanted = [a for a in argv if not a.startswith("--")]
+    seeds = SPLIT_SEEDS if "--seeds" in argv else [0]
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
             continue
         for seed in seeds:
-            run_matrix(name, matrix, split_seed=seed)
+            if only == "bo2-free":
+                run_bo2_free(name, matrix, split_seed=seed)
+            else:
+                run_matrix(name, matrix, split_seed=seed)
     logger.info("runs -> %s, reports -> %s", RUNS, REPORTS)
 
 

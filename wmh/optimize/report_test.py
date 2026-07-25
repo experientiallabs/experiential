@@ -7,7 +7,7 @@ import pytest
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmh.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmh.optimize.report import build_report
-from wmh.providers.base import ProviderKind, TokenUsage
+from wmh.providers.base import Embedder, ProviderKind, TokenUsage
 from wmh.providers.pool import PoolEntry
 from wmh.retrieval.embedders import HashingEmbedder
 
@@ -126,6 +126,80 @@ def test_report_static_policy_and_unscored_rows() -> None:
     by_name = {c.model.model_id: c for c in report.candidates}
     assert by_name["cheap"].unscored_episodes == 1  # surfaced, never averaged as 0
     assert by_name["cheap"].accuracy == pytest.approx(0.75)
+
+
+def test_headline_compares_only_commonly_scored_scenarios() -> None:
+    # The cheap model CRASHED on the two hard scenarios and scored well on the two easy ones.
+    # Averaging each side over whatever it happened to score would hand the cheap model a
+    # winning headline (0.85 vs 0.72) on the strength of the scenarios it skipped.
+    pool = _entries()
+    outcomes: list[ScenarioOutcome] = []
+    for index in range(4):
+        hard = index < 2
+        task = f"task {index}"
+        outcomes.append(
+            _outcome(f"s{index}", task, "fable-5", reward=0.3 if hard else 0.9, cost=0.02)
+        )
+        if hard:
+            outcomes.append(
+                ScenarioOutcome(scenario_id=f"s{index}", task=task, model="cheap", error="timeout")
+            )
+        else:
+            outcomes.append(_outcome(f"s{index}", task, "cheap", reward=0.85, cost=0.001))
+    matrix = OutcomeMatrix(pool=pool, outcomes=outcomes)
+    report = build_report(
+        matrix,
+        RoutingPolicy(kind="static", default_model="cheap", pool=pool),
+        baseline="fable-5",
+        endpoint="e",
+        generated_at="2026-07-24T00:00:00Z",
+    )
+    # Both sides over the two commonly-scored scenarios: the baseline wins, as it should.
+    assert report.headline.accuracy == pytest.approx(0.85)
+    assert report.headline.baseline_accuracy == pytest.approx(0.9)
+    assert report.headline.scenarios_compared == 2
+    assert report.headline.scenarios_excluded == 2
+    assert report.scenario_count == 4  # the excluded scenarios are still counted, not hidden
+
+
+def test_report_over_a_fully_unscored_matrix_raises() -> None:
+    pool = _entries()
+    matrix = OutcomeMatrix(
+        pool=pool,
+        outcomes=[
+            ScenarioOutcome(scenario_id=f"s{i}", task=f"t{i}", model=name, error="provider 429")
+            for i in range(3)
+            for name in ("fable-5", "cheap")
+        ],
+    )
+    with pytest.raises(ValueError, match="nothing to compare"):
+        build_report(
+            matrix,
+            RoutingPolicy(kind="static", default_model="cheap", pool=pool),
+            baseline="fable-5",
+            endpoint="e",
+            generated_at="2026-07-24T00:00:00Z",
+        )
+
+
+def test_report_builds_the_embedder_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    builds = 0
+    original = EmbedderSpec.build
+
+    def counted(self: EmbedderSpec) -> Embedder:
+        nonlocal builds
+        builds += 1
+        return original(self)
+
+    monkeypatch.setattr(EmbedderSpec, "build", counted)
+    build_report(
+        _matrix(),
+        _cluster_policy(),
+        baseline="fable-5",
+        endpoint="e",
+        generated_at="2026-07-24T00:00:00Z",
+    )
+    assert builds == 1  # not one per routed scenario
 
 
 def test_report_requires_baseline_in_matrix() -> None:

@@ -34,7 +34,12 @@ from wmh.engine.world_model import WorldModel
 from wmh.optimize.policy import POLICY_FILENAME, RoutingPolicy
 from wmh.optimize.reward import EpisodeScore
 from wmh.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
-from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
+from wmh.serving.chat import (
+    EndpointRuntime,
+    RequestLog,
+    create_chat_router,
+    install_openai_error_shapes,
+)
 from wmh.serving.traces_source import (
     TRACES_FILENAME,
     TracesDownloader,
@@ -228,17 +233,26 @@ def create_app(
         for model_name, model_dir in model_dirs.items():
             policy_path = model_dir / POLICY_FILENAME
             if policy_path.is_file():
-                endpoint_policies[model_name] = RoutingPolicy.load(policy_path)
-    if endpoint_policies:
-        request_log = RequestLog(Path(artifact_dirs[0]) / "serving" / "requests.jsonl")
-        app.include_router(
-            create_chat_router(
-                {
-                    endpoint_name: EndpointRuntime(endpoint_name, policy, log=request_log)
-                    for endpoint_name, policy in endpoint_policies.items()
-                }
-            )
+                try:
+                    endpoint_policies[model_name] = RoutingPolicy.load(policy_path)
+                except Exception as exc:
+                    # Fail fast, but name the file: a bare ValidationError at startup doesn't
+                    # say WHICH model's policy.json is broken.
+                    raise ValueError(f"invalid routing policy at {policy_path}: {exc}") from exc
+    # Mounted even with zero policies so a client wired up before a policy is fitted gets an
+    # empty /v1/models list and an OpenAI-shaped "no endpoint" error instead of a bare 404.
+    # With no artifact root (injected-models tests) the log keeps its in-memory tail only.
+    log_path = Path(artifact_dirs[0]) / "serving" / "requests.jsonl" if artifact_dirs else None
+    request_log = RequestLog(log_path)
+    app.include_router(
+        create_chat_router(
+            {
+                endpoint_name: EndpointRuntime(endpoint_name, policy, log=request_log)
+                for endpoint_name, policy in endpoint_policies.items()
+            }
         )
+    )
+    install_openai_error_shapes(app)
 
     def _register(name: str, model_dir: Path) -> None:
         """A finished serve-side build joins the live serving set immediately.

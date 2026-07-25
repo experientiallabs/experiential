@@ -33,7 +33,7 @@ wmh build --file traces.jsonl --name my-environment
 Then optimize an agent harness against that model and a set of tasks:
 
 ```bash
-wmh optimize my-agent my-environment --tasks tasks.jsonl
+wmh optimize harness my-agent my-environment --tasks tasks.jsonl
 ```
 
 ### Hosted platform
@@ -59,7 +59,7 @@ E2B, install the extra and provide an E2B key:
 ```bash
 pip install "world-model-harness[e2b]"
 export E2B_API_KEY=...
-wmh optimize my-agent my-environment --tasks tasks.jsonl --backend e2b
+wmh optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
 ```
 
 ## Use a world model as an API
@@ -109,7 +109,7 @@ WMH can run the real [pi](https://github.com/earendil-works/pi) worker inside is
 evaluation rollouts run in parallel, and model credentials stay outside the sandbox.
 
 ```bash
-wmh optimize my-agent my-environment --tasks tasks.jsonl --backend e2b
+wmh optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
 wmh eval tasks.jsonl --mode closed-loop --harness my-agent --harness-backend e2b
 ```
 

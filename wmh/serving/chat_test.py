@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from fastapi import FastAPI
@@ -25,6 +26,7 @@ from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import Any
 
     from wmh.providers.base import ProviderConfig
 
@@ -128,7 +130,12 @@ def test_completion_matches_openai_shape(tmp_path: Path) -> None:
     assert body["model"] == "tau-bench"  # the endpoint, not the mechanism
     assert body["choices"][0]["message"]["content"] == "served by haiku-4-5"
     assert body["choices"][0]["finish_reason"] == "stop"
-    assert body["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert body["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
     assert response.headers["x-wmh-routed-model"] == "haiku-4-5"
 
 
@@ -140,6 +147,7 @@ def test_streaming_emits_openai_chunks(tmp_path: Path) -> None:
         json={
             "model": "tau-bench",
             "stream": True,
+            "stream_options": {"include_usage": True},
             "messages": [{"role": "user", "content": "hi"}],
         },
     ) as response:
@@ -150,9 +158,11 @@ def test_streaming_emits_openai_chunks(tmp_path: Path) -> None:
     assert payloads[-1] == "[DONE]"
     chunks = [json.loads(p) for p in payloads[:-1]]
     assert all(c["object"] == "chat.completion.chunk" for c in chunks)
-    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c["choices"])
     assert text == "served by haiku-4-5"
-    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    # OpenAI include_usage framing: finish_reason chunk, THEN a choices-less usage chunk.
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"]["total_tokens"] == 15
 
 
@@ -190,7 +200,10 @@ def test_unknown_endpoint_404s_with_available(tmp_path: Path) -> None:
         json={"model": "nope", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 404
-    assert "tau-bench" in response.json()["detail"]
+    body = response.json()
+    # OpenAI error shape: clients read body["error"]["message"], never FastAPI's "detail".
+    assert body["error"]["code"] == "model_not_found"
+    assert "tau-bench" in body["error"]["message"]
 
 
 def test_models_endpoint_lists_endpoints(tmp_path: Path) -> None:
@@ -244,12 +257,22 @@ def test_create_app_mounts_endpoints_from_policies(tmp_path: Path) -> None:
     assert [m["id"] for m in body["data"]] == ["tau-bench"]
 
 
-def test_create_app_without_policies_has_no_chat_routes(tmp_path: Path) -> None:
+def test_create_app_without_policies_serves_empty_model_list(tmp_path: Path) -> None:
+    # A client wired up before any policy is fitted gets an empty list and an OpenAI-shaped
+    # "no endpoint" error, never a bare 404 on the whole /v1 surface.
     from wmh.serving.server import create_app
 
     app = create_app(artifact_dirs=(str(tmp_path),), world_models={})
     client = TestClient(app)
-    assert client.get("/v1/models").status_code == 404
+    models = client.get("/v1/models")
+    assert models.status_code == 200
+    assert models.json()["data"] == []
+    chat = client.post(
+        "/v1/chat/completions",
+        json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert chat.status_code == 404
+    assert chat.json()["error"]["code"] == "model_not_found"
 
 
 def test_provider_failure_logs_error_and_502s(tmp_path: Path) -> None:
@@ -282,3 +305,80 @@ def test_provider_failure_logs_error_and_502s(tmp_path: Path) -> None:
     row = json.loads(log_path.read_text().splitlines()[0])
     assert row["status"] == "error"
     assert "upstream on fire" in row["error_message"]
+
+
+def test_abandoned_stream_still_records_metering(tmp_path: Path) -> None:
+    # A client that disconnects mid-stream closes the generator; the upstream call still
+    # consumed tokens, so a request-log row must land anyway (D-METERING: no silent loss).
+    class _EndlessProvider(_EchoProvider):
+        def stream(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Iterator[StreamChunk]:
+            for _ in range(1_000_000):  # far more than any client buffer; never finishes
+                yield StreamChunk(delta="x")
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=_EndlessProvider,
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+
+    # Drive the ASGI app directly: after the request body, `receive` reports
+    # http.disconnect, which is what starlette listens for to cancel a StreamingResponse
+    # and close its body iterator (GeneratorExit in the generator).
+    body = json.dumps(
+        {"model": "tau-bench", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    ).encode()
+    state = {"request_sent": False}
+
+    async def receive() -> dict[str, object]:
+        if not state["request_sent"]:
+            state["request_sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        return None
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("test", 0),
+        "server": ("test", 80),
+    }
+    asyncio.run(app(cast("Any", scope), cast("Any", receive), cast("Any", send)))
+
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "error"
+    assert "disconnected" in rows[0]["error_message"]
+
+
+def test_create_app_with_injected_policies_and_no_artifact_dirs(tmp_path: Path) -> None:
+    # The injected-policies test pattern must not require an artifact root for the request log.
+    from wmh.serving.server import create_app
+
+    app = create_app(
+        artifact_dirs=(),
+        world_models={},
+        policies={"ep": RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())},
+    )
+    client = TestClient(app)
+    assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["ep"]

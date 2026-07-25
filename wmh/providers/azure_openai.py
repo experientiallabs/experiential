@@ -187,7 +187,45 @@ class AzureOpenAIProvider:
                 ),
             )
         return _openai_common.complete(
-            self._get_client().chat.completions, self._deployment(), system, messages, max_tokens
+            self._get_client().chat.completions,
+            self._deployment(),
+            system,
+            messages,
+            max_tokens,
+            # Open-tier deployments (DeepSeek, Kimi) genuinely sample and take the classic
+            # max_tokens param; GPT-5.x rejects sampling params and wants max_completion_tokens.
+            temperature=temperature if self._forward_temperature else None,
+            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
+        )
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Stream a completion natively from the deployment.
+
+        Temperature is forwarded only for deployments that sample (open-tier models like
+        DeepSeek/Kimi); GPT-5.x deployments reject sampling params, mirroring `complete`.
+        """
+        if self.config.reasoning_effort is not None:
+            # The api-versioned chat-completions stream would silently drop reasoning_effort;
+            # honest failure until a native Responses-route stream lands with the serving PR.
+            raise NotImplementedError(
+                "streaming is not yet implemented for reasoning_effort Azure configs; "
+                "unset reasoning_effort or use complete()"
+            )
+        return _openai_common.stream(
+            self._get_client().chat.completions,
+            self._deployment(),
+            system,
+            messages,
+            max_tokens,
+            temperature=temperature if self._forward_temperature else None,
+            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
         )
 
     def stream(

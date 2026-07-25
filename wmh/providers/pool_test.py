@@ -5,9 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from wmh.providers.azure_openai import AzureOpenAIProvider
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import ProviderConfig, ProviderKind, TokenUsage
 from wmh.providers.pool import DEFAULT_POOL_PATH, PoolEntry, load_pool, pool_provider
 from wmh.providers.registry import get_provider
 
@@ -154,3 +155,65 @@ def test_get_provider_rejects_api_key_for_bedrock() -> None:
     config = ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")
     with pytest.raises(ValueError, match="[Bb]edrock"):
         get_provider(config, api_key="sk-nope")
+
+
+def test_cost_usd_is_cache_adjusted() -> None:
+    entry = PoolEntry(
+        name="cached",
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="gpt-5.5",
+        input_per_mtok=10.0,
+        output_per_mtok=20.0,
+        cached_input_per_mtok=1.0,
+    )
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cached_input_tokens=400_000)
+    # 600k fresh @ $10/M + 400k cached @ $1/M = $6.40 - never the $10 list price.
+    assert entry.cost_usd(usage) == pytest.approx(6.4)
+
+
+def test_cost_usd_without_cache_price_bills_cached_tokens_at_full_rate() -> None:
+    entry = PoolEntry(
+        name="no-cache-price",
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="gpt-5.5",
+        input_per_mtok=10.0,
+        output_per_mtok=20.0,
+    )
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cached_input_tokens=400_000)
+    assert entry.cost_usd(usage) == pytest.approx(10.0)  # honest fallback, never free
+
+
+def test_bedrock_entry_pins_region() -> None:
+    entry = PoolEntry(
+        name="opus-4-8",
+        kind=ProviderKind.BEDROCK,
+        model="us.anthropic.claude-opus-4-8",
+        region="us-east-1",
+    )
+    assert entry.provider_config().region == "us-east-1"
+
+
+def test_unknown_pool_keys_fail_at_load() -> None:
+    # A typo like api_key_evn must fail at load, not surface as a 401 at request time.
+    with pytest.raises(ValidationError, match="api_key_evn"):
+        PoolEntry.model_validate(
+            {
+                "name": "typo",
+                "kind": "anthropic",
+                "model": "claude-haiku-4-5",
+                "api_key_evn": "SOME_KEY",
+            }
+        )
+
+
+def test_azure_entry_requires_deployment() -> None:
+    with pytest.raises(ValidationError, match="deployment"):
+        PoolEntry(
+            name="no-deploy",
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.5",
+            input_per_mtok=1.0,
+            output_per_mtok=2.0,
+        )

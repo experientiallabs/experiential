@@ -23,7 +23,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind, TokenUsage
 from wmh.providers.registry import get_provider
@@ -37,7 +37,13 @@ Tier = Literal["frontier", "open"]
 
 
 class PoolEntry(BaseModel):
-    """One candidate model. `name` is the stable handle policy artifacts and request logs key on."""
+    """One candidate model. `name` is the stable handle policy artifacts and request logs key on.
+
+    `extra="forbid"`: a typo like `api_key_evn` must fail at load, not surface as a 401 at
+    request time with no hint (same policy as `.wmh/fallback.toml`'s rungs).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
     kind: ProviderKind
@@ -45,6 +51,7 @@ class PoolEntry(BaseModel):
     endpoint: str | None = None
     deployment: str | None = None  # Azure deployment name
     api_version: str | None = None  # Azure api-version
+    region: str | None = None  # AWS Bedrock region (bedrock entries only)
     api_key_env: str | None = None  # env var holding this entry's API key (multi-account pools)
     tier: Tier = "frontier"
     input_per_mtok: float | None = None
@@ -62,6 +69,13 @@ class PoolEntry(BaseModel):
                 f"pool model '{self.name}': '{self.model}' has no built-in price; add "
                 "input_per_mtok and output_per_mtok (USD per 1M tokens) to its pool entry"
             )
+        if self.kind is ProviderKind.AZURE_OPENAI and self.deployment is None:
+            # Without this the entry loads fine and the first request routed to it 500s
+            # from AzureOpenAIProvider._deployment(); load is the validation boundary.
+            raise ValueError(
+                f"pool model '{self.name}': azure entries need `deployment` (the Azure "
+                "deployment name to call)"
+            )
         return self
 
     def price(self) -> ModelPrice:
@@ -76,14 +90,25 @@ class PoolEntry(BaseModel):
         return price
 
     def cost_usd(self, usage: TokenUsage) -> float:
-        """USD cost of `usage` priced by THIS entry's row (overrides included).
+        """Effective USD cost of `usage` priced by THIS entry's row (overrides included).
 
-        The global `wmh.tracking.pricing.cost_usd` only knows the built-in table; pool entries
-        with explicit prices must be costed here or they would silently read $0.
+        Cache-adjusted: cached prompt tokens (`usage.cached_input_tokens`) bill at
+        `cached_input_per_mtok` when the entry carries a cache-read price, and at the full
+        input rate otherwise (never silently free). The global `wmh.tracking.pricing.cost_usd`
+        only knows the built-in table; pool entries with explicit prices must be costed here
+        or they would silently read $0.
         """
         price = self.price()
+        cached = min(usage.cached_input_tokens, usage.input_tokens)
+        cached_rate = (
+            self.cached_input_per_mtok
+            if self.cached_input_per_mtok is not None
+            else price.input_per_mtok
+        )
         return (
-            usage.input_tokens * price.input_per_mtok + usage.output_tokens * price.output_per_mtok
+            (usage.input_tokens - cached) * price.input_per_mtok
+            + cached * cached_rate
+            + usage.output_tokens * price.output_per_mtok
         ) / 1_000_000
 
     def provider_config(self) -> ProviderConfig:
@@ -93,6 +118,7 @@ class PoolEntry(BaseModel):
             endpoint=self.endpoint,
             deployment=self.deployment,
             api_version=self.api_version,
+            region=self.region,
         )
 
 

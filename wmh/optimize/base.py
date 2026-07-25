@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmh.core.types import JsonObject, Trace
 
@@ -26,18 +26,63 @@ from wmh.core.types import JsonObject, Trace
 # else) is the extension point for a new optimizer type.
 ArtifactKind = Literal["prompt", "routing_policy", "model_weights", "adapter"]
 
+# Ownership boundary (pricing/commercial contract, carried as type shape): artifacts trained
+# on a customer's traces (prompts, checkpoints, adapters) are customer-owned and exportable;
+# routing policies encode OUR serving intelligence and are never exportable, whatever a caller
+# passes. Enforced by `ArtifactRef._enforce_exportability`.
+_NEVER_EXPORTABLE: frozenset[str] = frozenset({"routing_policy"})
+
+
+class ArtifactProvenance(BaseModel):
+    """Where an artifact came from: enough to audit, reproduce, and hand over ownership.
+
+    Required on exportable artifacts (a customer-owned checkpoint without provenance is not
+    auditable); optional on internal ones. `trace_sha256` fingerprints the training corpus
+    without carrying it; `config` holds the small reproducibility facts (seed, budget,
+    hyperparameters), not datasets.
+    """
+
+    optimizer: str  # e.g. "gepa", "route-fit"
+    base_model: str = ""  # the model the artifact was trained from/for ("" when N/A)
+    trace_count: int = 0
+    trace_sha256: str = ""  # sha256 over the ordered training trace ids ("" when N/A)
+    created_at: str = ""  # ISO timestamp, stamped by the producing optimizer
+    config: JsonObject = Field(default_factory=dict)
+
 
 class ArtifactRef(BaseModel):
     """A typed reference to something an optimizer produced.
 
     `path` is a filesystem path or URI to the persisted artifact; None for artifacts carried
     inline on the result (the GEPA prompt). `metadata` holds small artifact-specific facts
-    (adapter rank, checkpoint step, policy version), not the artifact itself.
+    (adapter rank, checkpoint step, policy version), not the artifact itself. `exportable`
+    marks whether the artifact may leave the platform (customer-owned checkpoints/adapters:
+    yes, with `provenance`; routing policies: never - forced False regardless of input).
+
+    `validate_assignment` re-runs the exportability validator on every field write, so
+    `ref.exportable = True` cannot flip the boundary after construction. Two documented ways
+    around it remain, both by pydantic design and neither reachable by accident:
+    `model_copy(update=...)` writes fields without validating, and `model_construct` skips
+    validation entirely. Anything crossing a serialization boundary is re-normalized, since
+    `model_validate`/`model_validate_json` run the validator again.
     """
+
+    model_config = ConfigDict(validate_assignment=True)
 
     kind: ArtifactKind
     path: str | None = None
     metadata: JsonObject = Field(default_factory=dict)
+    exportable: bool = True
+    provenance: ArtifactProvenance | None = None
+
+    @model_validator(mode="after")
+    def _enforce_exportability(self) -> ArtifactRef:
+        # The guard on `self.exportable` is what makes this terminate under
+        # validate_assignment: the corrective write re-enters the validator exactly once, and
+        # the second pass has nothing left to correct.
+        if self.kind in _NEVER_EXPORTABLE and self.exportable:
+            self.exportable = False
+        return self
 
 
 class OptimizeMetrics(BaseModel):
@@ -76,4 +121,23 @@ class Optimizer(Protocol):
         budget: int,
         *,
         rag_corpus: list[Trace] | None = None,
+    ) -> OptimizeResult: ...
+
+
+@runtime_checkable
+class ResumableOptimizer(Protocol):
+    """Continual-learning hook: extend a prior artifact with newly ingested traces.
+
+    Type shape only for now - no optimizer implements it yet. The contract: `prior` is an
+    `ArtifactRef` a previous `optimize`/`resume` run produced (its provenance identifies the
+    corpus already learned from), `new_traces` is the increment, and the result's artifacts
+    supersede `prior`. Optimizers that cannot warm-start simply never claim this protocol,
+    and callers fall back to a full `optimize`.
+    """
+
+    def resume(
+        self,
+        prior: ArtifactRef,
+        new_traces: list[Trace],
+        budget: int,
     ) -> OptimizeResult: ...
