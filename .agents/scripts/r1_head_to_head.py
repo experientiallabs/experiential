@@ -157,11 +157,26 @@ def main() -> None:
         for seed in seeds:
             fit_ids, test_ids = _splits(matrix, kind, seed)
             best_name, _, _ = best_single_model(matrix, fit_ids=fit_ids, eval_ids=test_ids)
-            best_eval = evaluate_choices(matrix, test_ids, lambda _s: best_name)
+            best_eval = evaluate_choices(matrix, test_ids, lambda _s, b=best_name: b)
             oracle_acc, oracle_cost = oracle(matrix, test_ids)
             ts = datetime.now(tz=UTC).isoformat()
 
-            def record(variant: str, params: dict, result, extra: str = "") -> None:  # noqa: ANN001
+            def record(  # noqa: PLR0913
+                variant: str,
+                params: dict,
+                result,  # noqa: ANN001
+                extra: str = "",
+                *,
+                kind: str = kind,
+                seed: int = seed,
+                fit_ids: list[str] = fit_ids,
+                test_ids: list[str] = test_ids,
+                best_name: str = best_name,
+                best_eval=best_eval,  # noqa: ANN001
+                oracle_acc: float = oracle_acc,
+                oracle_cost: float = oracle_cost,
+                ts: str = ts,
+            ) -> None:
                 append_run(
                     RunRecord(
                         run_id=f"ours9-{variant}-{uuid.uuid4().hex[:8]}",
