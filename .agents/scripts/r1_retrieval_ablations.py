@@ -124,7 +124,13 @@ def _openai_embed(texts: list[str], cache_path: Path) -> np.ndarray:
 class MatrixContext:
     """Split-independent precomputation for one matrix: embeddings, reply vectors, cells."""
 
-    def __init__(self, matrix: OutcomeMatrix, name: str, embed: str = "hashing") -> None:
+    def __init__(
+        self,
+        matrix: OutcomeMatrix,
+        name: str,
+        embed: str = "hashing",
+        embed_replies: bool = True,
+    ) -> None:
         self.matrix = matrix
         self.embed_kind = embed
         self.model_names = [entry.name for entry in matrix.pool]
@@ -139,7 +145,7 @@ class MatrixContext:
                 continue
             key = (outcome.scenario_id, outcome.model)
             self.rewards_cell.setdefault(key, []).append(outcome.reward)
-            if outcome.replies and key not in reply_texts:
+            if embed_replies and outcome.replies and key not in reply_texts:
                 reply_texts[key] = outcome.replies[0]
         reply_keys = list(reply_texts)
 
@@ -157,9 +163,15 @@ class MatrixContext:
                 [self.tasks[sid] for sid in self.scenario_ids],
                 cache / f"{name}-oai3l-tasks.npy",
             )
-            rvecs = _openai_embed(
-                [reply_texts[k] for k in reply_keys],
-                cache / f"{name}-oai3l-replies.npy",
+            # Skip the reply call entirely when replies are unused: calling it with an
+            # empty list would overwrite the shared reply cache with a 0-row array.
+            rvecs = (
+                _openai_embed(
+                    [reply_texts[k] for k in reply_keys],
+                    cache / f"{name}-oai3l-replies.npy",
+                )
+                if reply_keys
+                else np.zeros((0, 1))
             )
         else:
             raise ValueError(f"unknown embed kind: {embed}")
@@ -192,11 +204,15 @@ def route(
     rewards_cell: dict[tuple[str, str], list[float]] | None = None,
     debug: list[dict] | None = None,
     query_vecs: dict[str, np.ndarray] | None = None,
+    evidence: dict[str, dict] | None = None,
 ) -> dict[str, str]:
     """Route every test scenario; returns sid -> model. Faithful jisi-proxy at defaults.
 
     `query_vecs` overrides the query embedding per sid (the dup-traffic experiment routes a
-    perturbed text while scoring against the original scenario's cells).
+    perturbed text while scoring against the original scenario's cells). `evidence`, when
+    given, receives per-sid PRE-GUARD routing evidence (raw pick, paired mean delta vs the
+    baseline over the used neighbors, its standard error, pair count, pricier flag): the
+    conformal guard calibrates its accept threshold on exactly this.
     """
     cells = rewards_cell if rewards_cell is not None else ctx.rewards_cell
     fit_matrix = np.stack([ctx.task_vecs[sid] for sid in fit_ids])
@@ -287,6 +303,30 @@ def route(
                 -ctx.model_names.index(m),
             ),
         )
+
+        def paired_stats(candidate: str, rows: np.ndarray = used_rows) -> tuple[float, float, int]:
+            """Paired per-neighbor reward differences of `candidate` vs the baseline."""
+            diffs = []
+            for j in rows:
+                cell_pick = cells.get((fit_ids[int(j)], candidate))
+                cell_base = cells.get((fit_ids[int(j)], best_name))
+                if cell_pick and cell_base:
+                    diffs.append(sum(cell_pick) / len(cell_pick) - sum(cell_base) / len(cell_base))
+            if not diffs:
+                return 0.0, 0.0, 0
+            mean_d = float(np.mean(diffs))
+            se = float(np.std(diffs, ddof=1)) / len(diffs) ** 0.5 if len(diffs) > 1 else 0.0
+            return mean_d, se, len(diffs)
+
+        if evidence is not None:
+            mean_d, se, n_pairs = paired_stats(pick)
+            evidence[sid] = {
+                "pick": pick,
+                "mean_d": mean_d,
+                "se": se,
+                "n_pairs": n_pairs,
+                "pricier": mean_cost.get(pick, 0.0) > base_cost,
+            }
         guarded = False
         if params.guard == "margin":
             margin = params.guard_margin
@@ -296,26 +336,15 @@ def route(
                 pick = best_name
                 guarded = True
         elif params.guard in ("stat", "stat_asym") and pick != best_name:
-            diffs = []
-            for j in used_rows:
-                cell_pick = cells.get((fit_ids[int(j)], pick))
-                cell_base = cells.get((fit_ids[int(j)], best_name))
-                if cell_pick and cell_base:
-                    diffs.append(sum(cell_pick) / len(cell_pick) - sum(cell_base) / len(cell_base))
+            mean_d, se, n_pairs = paired_stats(pick)
             pricier = mean_cost.get(pick, 0.0) > base_cost
             if params.guard == "stat_asym":
                 z_eff = params.z if pricier else -params.z
             else:
                 z_eff = 2 * params.z if pricier else params.z
-            if len(diffs) < params.min_pairs:
+            if n_pairs < params.min_pairs or not mean_d > z_eff * se:
                 pick = best_name
                 guarded = True
-            else:
-                mean_d = float(np.mean(diffs))
-                se = float(np.std(diffs, ddof=1)) / len(diffs) ** 0.5
-                if not mean_d > z_eff * se:
-                    pick = best_name
-                    guarded = True
         picks[sid] = pick
         if debug is not None:
             neighbor_ids = [fit_ids[int(j)] for j in neighbor_rows]
@@ -499,9 +528,7 @@ ROUND3: list[tuple[str, RetrievalParams]] = [
 ROUND3B: list[tuple[str, RetrievalParams]] = [
     (
         "r1-knn3-combo",
-        RetrievalParams(
-            second_route=False, guard="stat", z=0.25, smooth_alpha=5.0, sim_gamma=2.0
-        ),
+        RetrievalParams(second_route=False, guard="stat", z=0.25, smooth_alpha=5.0, sim_gamma=2.0),
     ),
     (
         "r1-knn3-asym-lam002",
