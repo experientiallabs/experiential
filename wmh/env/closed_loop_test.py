@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from wmh.core.types import Action, EnvState, Observation
 from wmh.env.closed_loop import evaluate_pool
 from wmh.env.scenarios import Scenario
+from wmh.optimize.outcomes import ScenarioOutcome
 from wmh.optimize.reward import EpisodeScore
 from wmh.providers.base import (
     Completion,
@@ -23,6 +26,27 @@ class _FakeEnv:
 
     def __init__(self, score: EpisodeScore | None) -> None:
         self.last_score = score
+
+    def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
+        return EnvState()
+
+    def step(self, action: Action) -> Observation:
+        return Observation(content="ok")
+
+    def close(self) -> None:
+        return None
+
+
+class _ThrottledScoringEnv:
+    """Env shaped like WorldModelEnv: `last_score` is a property that RAISES when scoring failed.
+
+    A throttled judge call at close time surfaces exactly this way, and it must cost one cell,
+    not the sweep.
+    """
+
+    @property
+    def last_score(self) -> EpisodeScore:
+        raise RuntimeError("Bedrock ThrottlingException while scoring the session")
 
     def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
         return EnvState()
@@ -62,6 +86,20 @@ class _ScriptedProvider:
 
     def verify(self) -> VerifyResult:
         raise NotImplementedError
+
+
+class _FailFirstProvider(_ScriptedProvider):
+    """Provider that throws on its first completion: an agent-side failure mid-episode."""
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        raise RuntimeError("RateLimitError: 429 too many requests")
 
 
 def _pool() -> ModelPool:
@@ -157,3 +195,71 @@ def test_scenario_ids_fall_back_to_task_hash() -> None:
         provider_factory=_ScriptedProvider,
     )
     assert rerun.scenario_ids() == [scenario_id]
+
+
+def test_scoring_failure_costs_one_cell_not_the_sweep() -> None:
+    # A raising last_score (throttled judge at close) leaves the cell unscored WITH the reason,
+    # and every other cell of the sweep still gets measured.
+    matrix = evaluate_pool(
+        _ThrottledScoringEnv,
+        _pool(),
+        _SCENARIOS,
+        provider_factory=_ScriptedProvider,
+    )
+    assert len(matrix.outcomes) == 4  # 2 models x 2 scenarios: nothing aborted
+    for outcome in matrix.outcomes:
+        assert outcome.reward is None
+        assert outcome.success is False
+        assert outcome.error is not None
+        assert "ThrottlingException" in outcome.error
+        assert outcome.steps == 1  # the episode itself ran fine; only scoring failed
+
+
+def test_errored_episode_is_unscored_even_when_the_env_scored_it() -> None:
+    # The agent died on its first call, so the env's score grades a run that never happened:
+    # recording it as reward would read a provider throttle as incapability.
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.05, success=False, critique="did nothing")),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=_FailFirstProvider,
+    )
+    outcome = matrix.outcomes[0]
+    assert outcome.reward is None
+    assert outcome.success is False
+    assert outcome.error is not None and "429" in outcome.error
+    # The judge text survives, labelled for what it is.
+    assert outcome.critique == "salvage-judged despite error: did nothing"
+
+
+def test_broken_progress_callback_does_not_abort_the_sweep() -> None:
+    seen: list[str] = []
+
+    def explode(outcome: ScenarioOutcome) -> None:
+        seen.append(outcome.model)
+        raise RuntimeError("progress socket closed")
+
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS,
+        provider_factory=_ScriptedProvider,
+        on_outcome=explode,
+    )
+    assert len(seen) == 4  # every cell still reported
+    assert len(matrix.outcomes) == 4
+    assert all(o.reward == pytest.approx(0.8) for o in matrix.outcomes)
+
+
+def test_wrong_typed_score_yields_unscored_row_with_reason() -> None:
+    # A last_score that isn't an EpisodeScore must not silently become an
+    # unscored-with-no-error row: unscored rows always say why (outcomes contract).
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(cast("EpisodeScore", {"reward": 1.0})),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=_ScriptedProvider,
+    )
+    outcome = matrix.outcomes[0]
+    assert outcome.reward is None
+    assert outcome.error is not None and "not EpisodeScore" in outcome.error

@@ -9,7 +9,14 @@ import pytest
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmh.providers.base import ProviderKind, TokenUsage
 from wmh.providers.pool import PoolEntry
-from wmh.research.routing_runs import RunRecord, append_run, evaluate_choices, run_report
+from wmh.research.routing_runs import (
+    Finish,
+    RunRecord,
+    append_run,
+    evaluate_call_sequences,
+    evaluate_choices,
+    run_report,
+)
 
 
 def _matrix() -> OutcomeMatrix:
@@ -105,3 +112,73 @@ def test_run_record_persists_and_report_explains(tmp_path: Path) -> None:
     assert "tokens by model" in report.lower()
     assert "latency" in report.lower()
     assert "vs best_single" in report.lower()
+
+
+def test_cascade_escalates_and_sums_cost() -> None:
+    matrix = _matrix()
+    ids = matrix.scenario_ids()
+
+    # Try fast-cheap first; escalate to slow-pricey only where it failed (s3 in _matrix).
+    def cascade(sid: str, transcript: list) -> str | Finish:  # noqa: ANN001
+        if not transcript:
+            return "fast-cheap"
+        if transcript[-1].model == "fast-cheap" and sid == "s3":
+            return "slow-pricey"
+        return Finish()
+
+    result = evaluate_call_sequences(matrix, ids, cascade)
+    assert result.accuracy == pytest.approx(1.0)  # the escalation rescued s3
+    # s0-s2 cost one cheap call; s3 cost a cheap call PLUS a pricey one.
+    assert result.cost_per_call == pytest.approx((0.001 * 4 + 0.02) / 4)
+    assert result.calls_per_scenario == pytest.approx(5 / 4)
+    assert result.model_mix == {"fast-cheap": 4 / 5, "slow-pricey": 1 / 5}
+
+
+def test_best_of_two_consumes_episodes_in_order() -> None:
+    pool = [
+        PoolEntry(
+            name="m",
+            kind=ProviderKind.OPENAI,
+            model="m",
+            input_per_mtok=1.0,
+            output_per_mtok=1.0,
+        )
+    ]
+    outcomes = [
+        ScenarioOutcome(
+            scenario_id="s0",
+            task="t",
+            model="m",
+            episode=episode,
+            reward=reward,
+            cost_usd=0.01,
+            usage=TokenUsage(input_tokens=10, output_tokens=10),
+        )
+        for episode, reward in ((0, 0.0), (1, 1.0))
+    ]
+    matrix = OutcomeMatrix(pool=pool, outcomes=outcomes)
+
+    # Oracle best-of-2: call m twice, keep the better episode (upper-bound simulation).
+    def best_of_two(sid: str, transcript: list) -> str | Finish:  # noqa: ANN001
+        if len(transcript) < 2:
+            return "m"
+        rewards = [o.reward for o in transcript]
+        return Finish(pick=rewards.index(max(rewards)))
+
+    result = evaluate_call_sequences(matrix, ["s0"], best_of_two)
+    assert result.accuracy == pytest.approx(1.0)  # picked episode 1, not episode 0
+    assert result.cost_per_call == pytest.approx(0.02)  # but paid for BOTH episodes
+    assert result.calls_per_scenario == pytest.approx(2.0)
+
+    # A third call to the same model has no stored episode left: scenario goes unscored.
+    def best_of_three(sid: str, transcript: list) -> str | Finish:  # noqa: ANN001
+        return "m" if len(transcript) < 3 else Finish()
+
+    with pytest.raises(ValueError, match="no scored outcomes"):
+        evaluate_call_sequences(matrix, ["s0"], best_of_three)
+
+
+def test_runaway_policy_hits_max_calls() -> None:
+    matrix = _matrix()
+    with pytest.raises(ValueError, match="max_calls"):
+        evaluate_call_sequences(matrix, ["s0"], lambda sid, transcript: "fast-cheap", max_calls=1)

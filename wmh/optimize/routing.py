@@ -49,6 +49,45 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _guarded_ranking(
+    ranking: list[str],
+    *,
+    guard_model: str,
+    scores: dict[str, float],
+    costs: dict[str, float],
+    support: dict[str, int],
+    min_support: int,
+    guard_margin: float,
+) -> list[str]:
+    """Only-replace-if-better, per cluster: the router's worst case must be the guard model.
+
+    A cluster keeps its own winner ONLY when that winner beats the guard's in-cluster evidence by
+    `guard_margin` (doubled when the winner is also pricier, which kills the confidently-wrong
+    pricier-and-worse mode) on at least `min_support` scored EPISODES. Otherwise the guard leads.
+
+    Absence of guard evidence is not a pass: when the guard model has no scored episode in the
+    cluster there is nothing to beat, so the cluster reverts rather than admitting a challenger
+    that was never compared. A cluster with no scored evidence at all is left alone (its ranking
+    is the fitter's global fallback, not a claim about this cluster).
+    """
+    if not ranking or not scores:
+        return ranking
+    top = ranking[0]
+    if top == guard_model:
+        return ranking
+    reverted = [guard_model, *[model for model in ranking if model != guard_model]]
+    if guard_model not in scores:
+        return reverted
+    if support.get(top, 0) < min_support:
+        return reverted
+    margin = guard_margin
+    if costs.get(top, 0.0) > costs.get(guard_model, float("inf")):
+        margin = 2 * guard_margin
+    if scores[top] <= scores[guard_model] + margin:
+        return reverted
+    return ranking
+
+
 def fit_rank_policy(
     matrix: OutcomeMatrix,
     *,
@@ -70,6 +109,11 @@ def fit_rank_policy(
     Defaults mirror the reference (n_clusters=64, seed=42, top_k=2, beta=6.0).
     `default_model` falls back to the best overall mean reward on the fit scenarios
     (ties break by pool order).
+
+    `guard_model` turns on the only-replace-if-better guard (`_guarded_ranking`): a challenger
+    must beat the guard's in-cluster mean by `guard_margin` on at least `min_support` scored
+    EPISODES (not scenarios) to lead its cluster. The three parameters are recorded on the
+    returned policy so `rerank_policy` can re-apply the identical check off the stored evidence.
     """
     scenario_tasks: dict[str, str] = {}
     for outcome in matrix.outcomes:
@@ -139,29 +183,22 @@ def fit_rank_policy(
             model: cost_sum / count
             for model, (_reward_sum, cost_sum, count) in sums[cluster].items()
         }
+        support = {model: count for model, (_reward_sum, _cost_sum, count) in sums[cluster].items()}
         if not means:
             # A cluster with no scored episodes ranks nothing; selection falls through to
             # default_rank scores. Logged, never silent.
             logger.warning("cluster %d has no scored episodes; it ranks no models", cluster)
         ranking = sorted(means, key=lambda m: (-means[m], pool_order[m]))
-        if guard_model is not None and ranking:
-            # Only-replace-if-better, per cluster: the router's worst case must be the
-            # baseline model, so a cluster keeps its own winner ONLY when that winner beats
-            # the baseline's in-cluster evidence with enough support; otherwise the baseline
-            # leads. Thin clusters (support < min_support) always revert.
-            top = ranking[0]
-            support = sums[cluster].get(top, (0.0, 0.0, 0))[2]
-            baseline_mean = means.get(guard_model, 0.0)
-            # Margin: the cluster winner must beat the baseline's evidence by guard_margin
-            # (doubled when the winner is pricier), or the cluster reverts. Kills the
-            # confidently-wrong pricier-and-worse failure mode.
-            margin = guard_margin
-            if mean_costs.get(top, 0.0) > mean_costs.get(guard_model, float("inf")):
-                margin = 2 * guard_margin
-            if top != guard_model and (
-                support < min_support or means[top] <= baseline_mean + margin
-            ):
-                ranking = [guard_model, *[m for m in ranking if m != guard_model]]
+        if guard_model is not None:
+            ranking = _guarded_ranking(
+                ranking,
+                guard_model=guard_model,
+                scores=means,
+                costs=mean_costs,
+                support=support,
+                min_support=min_support,
+                guard_margin=guard_margin,
+            )
         label = ""
         if prefix_counts[cluster]:
             label = prefix_counts[cluster].most_common(1)[0][0]
@@ -173,6 +210,7 @@ def fit_rank_policy(
                 ranking=ranking or [_overall_best(matrix, set(scenario_ids))],
                 scores={model: round(mean, 6) for model, mean in means.items()},
                 costs={model: round(mean, 8) for model, mean in mean_costs.items()},
+                support=support,
                 total=counts[cluster],
             )
         )
@@ -188,6 +226,9 @@ def fit_rank_policy(
         beta=beta,
         default_rank=default_rank,
         cost_scale=(total_cost / total_count) if total_count else 0.0,
+        guard_model=guard_model,
+        min_support=min_support if guard_model is not None else None,
+        guard_margin=guard_margin if guard_model is not None else None,
         fitted_from=fitted_from,
     )
 
@@ -214,6 +255,12 @@ def rerank_policy(policy: RoutingPolicy, *, cost_weight: float) -> RoutingPolicy
     so cost_weight trades one reward point against one average call). `cost_weight=0` returns
     the policy unchanged - the faithful Avengers behavior; the reference has no cost term
     (Avengers-Pro's alpha is the published analogue).
+
+    The fit-time guard travels with the policy and is re-applied here: sliding the knob may not
+    undo the only-replace-if-better floor, or every guarded cluster would flip back to its
+    unguarded winner at the first non-zero cost weight (the cost term reorders, the guard then
+    has to re-veto). Cost pressure can still demote a challenger BELOW the guard; it can never
+    promote one the guard rejected.
     """
     if cost_weight == 0.0:
         return policy
@@ -230,6 +277,16 @@ def rerank_policy(policy: RoutingPolicy, *, cost_weight: float) -> RoutingPolicy
             for model in cluster.ranking
         }
         ranking = sorted(keyed, key=lambda m: (-keyed[m], pool_order[m]))
+        if policy.guard_model is not None:
+            ranking = _guarded_ranking(
+                ranking,
+                guard_model=policy.guard_model,
+                scores=cluster.scores,
+                costs=cluster.costs,
+                support=cluster.support,
+                min_support=policy.min_support or 0,
+                guard_margin=policy.guard_margin or 0.0,
+            )
         clusters.append(cluster.model_copy(update={"ranking": ranking}))
     provenance = f"{policy.fitted_from or 'unknown'} | cost_weight={cost_weight:g}"
     return policy.model_copy(update={"clusters": clusters, "fitted_from": provenance})

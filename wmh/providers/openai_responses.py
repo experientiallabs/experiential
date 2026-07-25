@@ -113,18 +113,20 @@ class OpenAIResponsesProvider:
         # The evolving Responses stream-event union stays behind this one SDK-boundary cast
         # (same pattern as _openai_common.complete_chat).
         events = cast("Any", self._get_client().responses).create(**kwargs)
-        for event in events:
-            kind = getattr(event, "type", "")
-            if kind == "response.output_text.delta":
-                if event.delta:
-                    yield StreamChunk(delta=event.delta)
-            elif kind == "response.completed":
-                event_usage = event.response.usage
-                if event_usage is not None:
-                    usage = TokenUsage(
-                        input_tokens=event_usage.input_tokens,
-                        output_tokens=event_usage.output_tokens,
-                    )
+        try:
+            for event in events:
+                kind = getattr(event, "type", "")
+                if kind == "response.output_text.delta":
+                    if event.delta:
+                        yield StreamChunk(delta=event.delta)
+                elif kind == "response.completed":
+                    # Same extractor as complete(): keeps the cached-token split, which OpenAI
+                    # populates automatically for prompts >= 1024 tokens.
+                    usage = _usage_from_response(event.response)
+        finally:
+            close = getattr(events, "close", None)
+            if callable(close):
+                close()
         yield StreamChunk(done=True, usage=usage)
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
@@ -230,7 +232,9 @@ def _usage_from_response(response: object) -> TokenUsage:
     usage = _get(response, "usage")
     if usage is None:
         return TokenUsage()
+    details = _get(usage, "input_tokens_details")
     return TokenUsage(
         input_tokens=_as_int(_get(usage, "input_tokens")),
         output_tokens=_as_int(_get(usage, "output_tokens")),
+        cached_input_tokens=_as_int(_get(details, "cached_tokens")) if details is not None else 0,
     )

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from wmh.optimize.policy import (
     ClusterRanking,
     EmbedderSpec,
     RoutingPolicy,
+    rank_decision,
     select_model,
 )
 from wmh.providers.base import ProviderKind
@@ -223,3 +226,50 @@ def test_support_tilt_shifts_weight_to_supported_clusters() -> None:
     query = "SELECT count(*) FROM t"
     assert select_model(build(0.0), query).model == "fable-5"
     assert select_model(build(1.0), query).model == "haiku-4-5"
+
+
+def test_select_model_uses_a_caller_supplied_embedder() -> None:
+    # The seam a many-request caller needs: build the policy's embedder once and hand it in.
+    # Proven by handing in one that maps SQL text onto the prose centroid.
+    class _ProseEmbedder:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            (prose,) = HashingEmbedder(dim=64).embed(["write a friendly email"])
+            return [prose for _ in texts]
+
+    policy = _rank_policy()
+    assert select_model(policy, "SELECT 1").model == "fable-5"
+    assert select_model(policy, "SELECT 1", embedder=_ProseEmbedder()).model == "haiku-4-5"
+
+
+def test_support_tilt_gamma_rejects_negative_values() -> None:
+    # A negative tilt would reweight AWAY from supported clusters, silently inverting the lever.
+    with pytest.raises(ValidationError):
+        RoutingPolicy(
+            kind="static", default_model="haiku-4-5", pool=_pool(), support_tilt_gamma=-1.0
+        )
+
+
+def test_rank_decision_normalizes_the_query_itself() -> None:
+    # `beta * distance` is a softmax temperature, so an unnormalized query silently changes how
+    # sharply the top clusters mix (with the support tilt on, that flips the winner). The
+    # normalization is enforced inside rank_decision, so no caller can skip it.
+    embedder = HashingEmbedder(dim=64)
+    near, far = embedder.embed(["SELECT count(*) FROM t", "SELECT sum(x) FROM t"])
+    policy = RoutingPolicy(
+        kind="rank",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        embedder=EmbedderSpec(dim=64),
+        top_k_clusters=2,
+        beta=1.0,
+        support_tilt_gamma=1.0,
+        clusters=[
+            ClusterRanking(cluster_id=0, centroid=near, ranking=["fable-5", "haiku-4-5"], total=1),
+            ClusterRanking(cluster_id=1, centroid=far, ranking=["haiku-4-5", "fable-5"], total=400),
+        ],
+    )
+    unit = np.asarray(embedder.embed(["SELECT count(*) FROM t"])[0])
+    expected = rank_decision(policy, unit)
+    assert expected.model == "haiku-4-5"
+    for scale in (0.02, 50.0):  # 50.0 selected fable-5 before the fix
+        assert rank_decision(policy, unit * scale) == expected

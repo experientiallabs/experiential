@@ -8,8 +8,11 @@ An endpoint = {world model, policy, evidence, URL}; this module is the policy le
   reference implementation (ZhangYiqun018/Avengers, core/routing/rank_router.py): embed the
   request, softmax the distances to the `top_k_clusters` nearest k-means centres
   (`-beta * (1 - centre . query)` logits), score every pool model by the probability-weighted
-  reciprocal of its per-cluster accuracy rank (`1 / (rank + 0.1)`; models absent from a
-  cluster's ranking score `1 / default_rank`), and route to the argmax.
+  reciprocal of its per-cluster accuracy rank (`1 / (rank + 0.1)`, summed over the mixed
+  clusters the model appears in), and route to the argmax. `default_rank` is the floor for a
+  model absent from ALL of the mixed clusters (`1 / default_rank`); a model ranked in one and
+  absent from another simply collects nothing from the latter, it is not charged a default rank
+  there. This matches the reference.
 
 The FIT that produces rank policies lives in `wmh.optimize.routing`; this module pins the
 artifact schema and the serve-time selection so serving, reports, and the platform stay stable
@@ -101,6 +104,9 @@ class ClusterRanking(BaseModel):
     ranking: list[str] = Field(min_length=1)  # pool entry names, best first
     scores: dict[str, float] = Field(default_factory=dict)  # per-model mean reward (evidence)
     costs: dict[str, float] = Field(default_factory=dict)  # per-model mean cost (evidence)
+    # Per-model scored EPISODES behind those means: the support the fit-time guard weighs, kept
+    # so `rerank_policy` can re-apply the identical check without the outcome matrix.
+    support: dict[str, int] = Field(default_factory=dict)
     total: int = 0  # fit scenarios that landed in this cluster
 
 
@@ -129,10 +135,16 @@ class RoutingPolicy(BaseModel):
     # ProxRouter-inspired support tilt (2510.09852, ADAPTED to clusters: their exponential
     # tilt reweights nonparametric scores by a prior; ours multiplies cluster probabilities
     # by support^gamma so thin outlier clusters lose routing weight). 0 = off (reference).
-    support_tilt_gamma: float = 0.0
+    support_tilt_gamma: float = Field(default=0.0, ge=0.0)
     # Fit-set mean cost per scored episode (all models): the unit the cost knob trades against
     # one reward point. 0 when the fit carried no usable costs.
     cost_scale: float = 0.0
+    # The fit-time only-replace-if-better guard, recorded so any later transform of this policy
+    # (today `rerank_policy`) re-applies the SAME floor instead of quietly dropping it. None
+    # means the fit ran unguarded.
+    guard_model: str | None = None
+    min_support: int | None = None  # scored episodes a challenger needs to lead its cluster
+    guard_margin: float | None = None  # reward the challenger must beat the guard by
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
 
     @model_validator(mode="after")
@@ -141,6 +153,11 @@ class RoutingPolicy(BaseModel):
         if self.default_model not in names:
             raise ValueError(
                 f"default_model '{self.default_model}' is not in the policy pool "
+                f"(available: {sorted(names)})"
+            )
+        if self.guard_model is not None and self.guard_model not in names:
+            raise ValueError(
+                f"guard_model '{self.guard_model}' is not in the policy pool "
                 f"(available: {sorted(names)})"
             )
         if self.kind == "static" and self.clusters:
@@ -172,7 +189,11 @@ class RoutingPolicy(BaseModel):
 
 
 def select_model(
-    policy: RoutingPolicy, text: str, *, incumbent: str | None = None
+    policy: RoutingPolicy,
+    text: str,
+    *,
+    incumbent: str | None = None,
+    embedder: Embedder | None = None,
 ) -> RoutingDecision:
     """Pick the pool model for one request.
 
@@ -180,6 +201,11 @@ def select_model(
     message). `incumbent` is the model already serving this conversation, if any: a sticky
     policy keeps it (per-model prompt caches make switching expensive), unless it has been
     retired from the pool, in which case the request re-routes as if fresh.
+
+    `embedder` lets a caller that routes many requests reuse ONE embedder built from
+    `policy.embedder` (an azure spec otherwise constructs a fresh HTTP client per call); it must
+    be the function this policy's spec describes, or the centroids are meaningless. Default None
+    builds it from the spec per call.
     """
     names = {entry.name for entry in policy.pool}
     if incumbent is not None and incumbent in names and policy.sticky:
@@ -187,7 +213,7 @@ def select_model(
     if policy.kind == "static":
         return RoutingDecision(model=policy.default_model, reason="static policy")
 
-    query = np.asarray(policy.embedder.build().embed([text])[0])
+    query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
     return rank_decision(policy, query)
 
 
@@ -196,13 +222,20 @@ def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
 
     Shared by `select_model` (one live request) and batch evaluation (the benchmark embeds
     all scenarios once) so the served path and the measured path can never diverge. Faithful
-    to the reference implementation: the embedder output is L2-normalized (their Normalizer
-    step); centres are used exactly as fitted, NOT re-normalized (k-means centres of unit
-    vectors are near-unit; the reference dots them raw, so we do too).
+    to the reference implementation: the query is L2-normalized HERE, so no caller can skip the
+    step and silently change the softmax temperature (`beta * distance` is scale-sensitive even
+    though the nearest-cluster order is not); centres are used exactly as fitted, NOT
+    re-normalized (k-means centres of unit vectors are near-unit; the reference dots them raw,
+    so we do too).
     """
     names = {entry.name for entry in policy.pool}
     centres = np.asarray([cluster.centroid for cluster in policy.clusters])
-    dists = 1.0 - centres @ query
+    vector = np.asarray(query, dtype=np.float64)
+    norm = float(np.linalg.norm(vector))
+    if norm > 0.0:
+        # A zero query keeps its zeros, exactly like sklearn's Normalizer.
+        vector = vector / norm
+    dists = 1.0 - centres @ vector
     top = np.argsort(dists)[: policy.top_k_clusters]
     logits = -policy.beta * dists[top]
     probs = np.exp(logits - logits.max())

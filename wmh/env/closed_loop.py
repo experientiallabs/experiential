@@ -13,6 +13,11 @@ Measurement notes:
 - Every raw candidate reply is stored (`ScenarioOutcome.replies`): that is the future
   distillation feed. Providers do not yet surface separated thinking blocks; when they do, the
   capture point is `_TimedProvider.complete`.
+- A cell is recorded SCORED only when the episode also ran clean. An episode that errored
+  mid-flight (provider throttle, agent crash) is unscored even if the env still produced a
+  score, because that score grades a run the candidate never got to finish: counting it as
+  reward would read infrastructure failure as incapability. The salvaged critique is kept on
+  the row, prefixed, so the diagnostic text is not lost.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
 
 from wmh.env.base import Env
 from wmh.env.episode import run_episode
@@ -74,6 +79,8 @@ class _TimedProvider:
         self.replies.append(completion.text)
         self.usage = TokenUsage(
             input_tokens=self.usage.input_tokens + completion.usage.input_tokens,
+            cached_input_tokens=self.usage.cached_input_tokens
+            + completion.usage.cached_input_tokens,
             output_tokens=self.usage.output_tokens + completion.usage.output_tokens,
         )
         return completion
@@ -83,6 +90,50 @@ class _TimedProvider:
 
     def verify(self) -> VerifyResult:
         return self._provider.verify()
+
+
+_NEEDS_SCORING_ENV = (
+    "env produced no episode score; evaluate_pool needs a scoring env "
+    "(e.g. WorldModelEnv(world_model, score_on_close=True))"
+)
+
+# Prefix on a critique salvaged from an episode that errored: the text is diagnostic, the
+# verdict is not evidence (see the module docstring).
+_SALVAGE_PREFIX = "salvage-judged despite error: "
+
+
+class _ScoringEnv(Protocol):
+    """The scoring surface `evaluate_pool` needs on top of `Env`; `WorldModelEnv` provides it."""
+
+    @property
+    def last_score(self) -> EpisodeScore: ...
+
+
+def _read_episode_score(env: Env) -> tuple[EpisodeScore | None, str | None]:
+    """Read `env.last_score` defensively, returning (score, reason it is missing).
+
+    The two failure modes are NOT the same failure. A missing attribute means the caller handed
+    `evaluate_pool` a non-scoring env, so no cell of the sweep can ever be evidence and the
+    error is fatal. A `last_score` that RAISES (WorldModelEnv re-raises a close-time scoring
+    failure, e.g. a throttled judge call) is per-episode: that one cell is unscored with the
+    reason recorded, and the sweep keeps its other completed cells.
+    """
+    scoring = cast("_ScoringEnv", env)
+    try:
+        raw: object = scoring.last_score
+    except AttributeError as exc:
+        raise ValueError(_NEEDS_SCORING_ENV) from exc
+    except RuntimeError as exc:
+        return None, f"episode scoring failed: {exc}"
+    if raw is None:
+        return None, None
+    if not isinstance(raw, EpisodeScore):
+        # An unscored row must always say WHY (the outcomes contract); a wrong-typed score
+        # silently becoming reward=None/error=None would violate it.
+        return None, (
+            f"env last_score is {type(raw).__name__}, not EpisodeScore; episode left unscored"
+        )
+    return raw, None
 
 
 def scenario_id(scenario: Scenario) -> str:
@@ -111,9 +162,11 @@ def evaluate_pool(
     """Run every pool candidate over `scenarios`, one fresh env per episode.
 
     The env must score episodes on close (`WorldModelEnv(..., score_on_close=True)`): a matrix
-    without verified rewards is not evidence. Episodes that error before scoring are recorded
-    unscored (`reward=None`, `error` set) rather than defaulted to 0. `on_outcome` fires after
-    each cell for progress display.
+    without verified rewards is not evidence. Episodes that error, and episodes whose scoring
+    itself fails, are recorded unscored (`reward=None`, `error` set) rather than defaulted to 0,
+    and never abort the sweep. `on_outcome` fires after each cell for progress display; a
+    callback that raises is logged and ignored, since a broken progress pipe must not throw away
+    the cells already paid for.
     """
     outcomes: list[ScenarioOutcome] = []
     for entry in pool.models:
@@ -124,13 +177,17 @@ def evaluate_pool(
                 agent = LLMAgent(timed, temperature=agent_temperature, tools_hint=tools_hint)
                 env = env_factory()
                 result = run_episode(env, agent, scenario.task, max_steps=max_steps)
-                score = getattr(env, "last_score", None)
-                if score is None and result.error is None:
-                    raise ValueError(
-                        "env produced no episode score; evaluate_pool needs a scoring env "
-                        "(e.g. WorldModelEnv(world_model, score_on_close=True))"
-                    )
-                if not isinstance(score, EpisodeScore):
+                score, score_error = _read_episode_score(env)
+                error = result.error
+                if score_error is not None:
+                    error = f"{error}; {score_error}" if error else score_error
+                if score is None and error is None:
+                    raise ValueError(_NEEDS_SCORING_ENV)
+                critique = score.critique if score else ""
+                if score is not None and result.error is not None:
+                    # The episode broke mid-flight, so this verdict grades an unfinished run:
+                    # keep the text, drop the reward (see the module docstring).
+                    critique = f"{_SALVAGE_PREFIX}{critique}" if critique else ""
                     score = None
                 outcome = ScenarioOutcome(
                     scenario_id=sid,
@@ -139,18 +196,27 @@ def evaluate_pool(
                     episode=episode,
                     reward=score.reward if score else None,
                     success=score.success if score else False,
-                    critique=score.critique if score else "",
+                    critique=critique,
                     steps=len(result.steps),
                     stop_reason=str(result.stop_reason),
                     usage=timed.usage,
                     cost_usd=entry.cost_usd(timed.usage),
                     call_seconds=timed.call_seconds,
                     replies=timed.replies,
-                    error=result.error,
+                    error=error,
                 )
                 outcomes.append(outcome)
                 if on_outcome is not None:
-                    on_outcome(outcome)
+                    try:
+                        on_outcome(outcome)
+                    except Exception:  # noqa: BLE001 - a broken progress pipe never costs cells
+                        logger.warning(
+                            "on_outcome callback failed for %s on %s ep%d; sweep continues",
+                            entry.name,
+                            sid,
+                            episode,
+                            exc_info=True,
+                        )
                 logger.info(
                     "closed-loop %s on %s ep%d: reward=%s cost=$%.5f steps=%d",
                     entry.name,

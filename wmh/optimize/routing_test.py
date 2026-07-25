@@ -219,6 +219,67 @@ def test_baseline_guard_reverts_thin_or_losing_clusters() -> None:
         assert cluster.ranking[0] == "sql-model"
 
 
+def test_guard_without_in_cluster_evidence_reverts_the_cluster() -> None:
+    # The guard model errored out everywhere, so no cluster has evidence about it. Zero-filling
+    # its mean would make the guard PASS exactly where it cannot be checked; the cluster must
+    # revert to the guard instead.
+    matrix = _matrix()
+    matrix.outcomes = [
+        o.model_copy(update={"reward": None, "success": False, "error": "provider 500"})
+        if o.model == "sql-model"
+        else o
+        for o in matrix.outcomes
+    ]
+    policy = fit_rank_policy(
+        matrix,
+        embedder=EmbedderSpec(dim=256),
+        n_clusters=2,
+        seed=42,
+        top_k_clusters=1,
+        guard_model="sql-model",
+        min_support=1,
+        guard_margin=0.0,
+    )
+    for cluster in policy.clusters:
+        assert "sql-model" not in cluster.scores  # nothing measured about the guard here
+        assert cluster.ranking[0] == "sql-model"  # and it still leads
+
+
+def test_guard_survives_the_cost_knob() -> None:
+    # The guard is a property of the fitted policy, not of one call: re-ranking under cost
+    # pressure re-sorts the cluster and must then re-apply the same floor.
+    matrix = _matrix()
+    guarded = fit_rank_policy(
+        matrix,
+        embedder=EmbedderSpec(dim=256),
+        n_clusters=2,
+        seed=42,
+        top_k_clusters=1,
+        guard_model="sql-model",
+        min_support=100,  # nothing has this support -> every cluster reverts to the guard
+    )
+    assert guarded.guard_model == "sql-model"
+    assert guarded.min_support == 100
+    reranked = rerank_policy(guarded, cost_weight=1e-6)
+    for cluster in reranked.clusters:
+        assert cluster.ranking[0] == "sql-model"
+
+    # Control: the identical fit WITHOUT a guard does flip under the same knob, so the
+    # assertion above is testing the guard and not an inert cost term.
+    unguarded = fit_rank_policy(
+        matrix, embedder=EmbedderSpec(dim=256), n_clusters=2, seed=42, top_k_clusters=1
+    )
+    flipped = rerank_policy(unguarded, cost_weight=1e-6)
+    assert any(cluster.ranking[0] == "prose-model" for cluster in flipped.clusters)
+
+
+def test_fit_records_per_model_support() -> None:
+    policy = _fit()
+    for cluster in policy.clusters:
+        assert set(cluster.support) == set(cluster.scores)
+        assert sum(cluster.support.values()) == 2 * cluster.total  # both models, one episode each
+
+
 def test_baseline_guard_keeps_real_winners() -> None:
     matrix = _matrix()
     policy = fit_rank_policy(

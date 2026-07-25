@@ -180,8 +180,11 @@ def resolve_provider_model(provider: ProviderKind, model: str) -> ProviderModel:
     is identical. This preserves WMH's open-ended provider contract while
     canonicalizing every model in the built-in catalog.
     """
+    # Case-insensitive: Azure deployments are often created with vendor casing
+    # ("DeepSeek-V4-Pro") while the catalog rows are lowercase.
+    wanted = model.lower()
     for spec in _MODELS:
-        if spec.provider is provider and model in (spec.model_type, spec.model_id):
+        if spec.provider is provider and wanted in (spec.model_type.lower(), spec.model_id.lower()):
             return spec
     return ProviderModel(provider=provider, model_type=model, model_id=model)
 
@@ -193,7 +196,10 @@ def resolve_chat_max_tokens_field(
     fallback: ChatMaxTokensField = "max_completion_tokens",
 ) -> ChatMaxTokensField:
     """Resolve a known model contract, or preserve a custom endpoint's fallback."""
+    # Case-insensitive for the same reason as resolve_provider_model: Azure deployments
+    # carry vendor casing ("DeepSeek-V4-Pro") while catalog rows are lowercase.
+    wanted = model.lower()
     for spec in _MODELS:
-        if spec.provider is provider and model in (spec.model_type, spec.model_id):
+        if spec.provider is provider and wanted in (spec.model_type.lower(), spec.model_id.lower()):
             return spec.chat_max_tokens_field
     return fallback
