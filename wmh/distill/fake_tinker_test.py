@@ -247,19 +247,89 @@ def test_optim_step_reports_a_deterministic_grad_norm() -> None:
     assert second_a.metrics != first_a.metrics  # the step count advanced
 
 
-def test_save_and_load_state() -> None:
-    training = _make_training()
-    training.optim_step(1e-4)
-    path = training.save_state()
+def test_save_and_load_state_across_training_clients() -> None:
+    """States live on the service, so a later client restores them.
+
+    This is the resume shape: the session that saved the checkpoint is gone
+    and a freshly created (uninitialized) training client loads it, which is
+    the only ordering the live service accepts.
+    """
+    service = FakeServiceClient()
+    first = service.create_lora_training_client("base-model", rank=16)
+    first.optim_step(1e-4)
+    path = first.save_state()
     assert path == "tinker://fake/state/0"
-    training.optim_step(1e-4)
-    assert training.step_count == 2
-    training.load_state(path)
-    assert training.step_count == 1
-    second = training.save_state()
-    assert second == "tinker://fake/state/1"
+    first.optim_step(1e-4)
+    assert first.step_count == 2
+
+    second = service.create_lora_training_client("base-model", rank=16)
+    second.load_state(path)
+    assert second.step_count == 1
+    assert second.save_state() == "tinker://fake/state/1"  # the service-wide counter
+
+    third = service.create_lora_training_client("base-model", rank=16)
     with pytest.raises(ValueError, match="never returned by save_state"):
-        training.load_state("tinker://fake/state/999")
+        third.load_state("tinker://fake/state/999")
+    assert third.calls == []  # a rejected restore left the client uninitialized
+
+
+def test_load_state_after_a_weights_call_is_refused() -> None:
+    """The live service's rule, mirrored: LoadWeights needs an uninitialized model.
+
+    A resumed distill run that let anything touch the training client before
+    restoring the checkpoint died on this exact error, so the fake fails the
+    same way instead of silently accepting the restore.
+    """
+    service = FakeServiceClient()
+    training = service.create_lora_training_client("base-model", rank=16)
+    path = training.save_state()
+    training.save_weights_for_sampler("s0")
+
+    with pytest.raises(RuntimeError, match="LoadWeights can only be called on uninitialized"):
+        training.load_state(path)
+
+    # A second restore is refused for the same reason (the live failure was
+    # precisely a retried load_state on one client).
+    fresh = service.create_lora_training_client("base-model", rank=16)
+    fresh.load_state(path)
+    with pytest.raises(RuntimeError, match=r"after \['load_state'\]"):
+        fresh.load_state(path)
+
+
+def test_the_call_log_records_order_and_excludes_get_tokenizer() -> None:
+    """`calls` is the ordered log tests assert against.
+
+    get_tokenizer is logged but is NOT model-initializing (the SDK answers it
+    from a metadata-only GetInfo), so it may precede a restore.
+    """
+    service = FakeServiceClient()
+    training = service.create_lora_training_client("base-model", rank=16)
+    path = training.save_state()
+
+    restored = service.create_lora_training_client("base-model", rank=16)
+    restored.get_tokenizer()
+    restored.load_state(path)
+    sampler = restored.save_weights_and_get_sampling_client("s0")
+    seq = sampler.sample([1, 2], max_tokens=3, temperature=0.7)
+    restored.forward_backward(
+        [
+            FakeDatum(
+                model_input_tokens=[1, 2] + seq.tokens,
+                target_tokens=list(seq.tokens),
+                weights=[1.0] * len(seq.tokens),
+            )
+        ],
+        "importance_sampling",
+    )
+    restored.optim_step(1e-4)
+
+    assert restored.calls == [
+        "get_tokenizer",
+        "load_state",
+        "save_weights_for_sampler",
+        "forward_backward",
+        "optim_step",
+    ]
 
 
 def test_sampler_refresh_distinct_but_linked() -> None:

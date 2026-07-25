@@ -63,7 +63,7 @@ def test_defaults_match_the_documented_values() -> None:
         "forward_backward": 120.0,
         "optim_step": 120.0,
         "save_state": 120.0,
-        "load_state": 120.0,
+        "load_state": 600.0,
         "save_weights_for_sampler": 600.0,
         "connect": 60.0,
     }

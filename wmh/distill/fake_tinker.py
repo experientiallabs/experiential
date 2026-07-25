@@ -13,6 +13,15 @@ Everything is deterministic: sampled tokens and logprobs are derived from
 SHA-256 hashes of (seed, prompt ids, position), never from time or global
 randomness, so a run replayed with the same inputs produces identical outputs.
 
+The fakes also mirror the live service's model-initialization ordering rule:
+tinker accepts LoadWeights only on an uninitialized model, so
+`FakeTrainingClient.load_state` raises once any weight-affecting call has run
+on that client (see `MODEL_INITIALIZING_CALLS`), and every client keeps an
+ordered `calls` log so tests can assert what ran before what. Saved states
+therefore live on the `FakeServiceClient`, not the client that wrote them,
+exactly as real tinker:// state paths outlive their session: a later session's
+freshly created training client can restore them.
+
 The fakes also enforce the tokens-in-tokens-out (TITO) invariant that on-policy
 distillation depends on: every sampled span trained on must be byte-identical
 to a span some sampling client actually issued. The issuer set is the training
@@ -37,6 +46,19 @@ from typing import Literal
 _SAMPLED_TOKEN_BASE = 32
 _SAMPLED_TOKEN_RANGE = 95
 """Sampled token ids stay in the printable ASCII range so decode() is total."""
+
+MODEL_INITIALIZING_CALLS = frozenset(
+    {"load_state", "save_state", "save_weights_for_sampler", "forward_backward", "optim_step"}
+)
+"""Training-client calls after which the live service refuses LoadWeights.
+
+Tinker's error is "LoadWeights can only be called on uninitialized models
+(before any weights have been loaded or training has started)", so
+`FakeTrainingClient.load_state` refuses once any of these ran on the same
+client. `get_tokenizer` is deliberately absent: the SDK serves it from a
+metadata-only GetInfo request that never touches weights, so it is safe
+before a restore.
+"""
 
 
 def _digest(*parts: str) -> bytes:
@@ -422,6 +444,10 @@ class FakeTrainingClient:
     vs the real client: results return directly (no APIFuture), datums are
     FakeDatum (plain lists rather than tensors), and optim_step takes a bare
     learning rate rather than AdamParams.
+
+    Like the real client this one is UNINITIALIZED until a weight-affecting
+    call runs on it, and `load_state` is legal only while it stays that way
+    (see `MODEL_INITIALIZING_CALLS` and `load_state`).
     """
 
     def __init__(self, service: FakeServiceClient, base_model: str, rank: int) -> None:
@@ -430,14 +456,21 @@ class FakeTrainingClient:
         self.step_count = 0
         self.forward_backward_calls: list[tuple[list[FakeDatum], str]] = []
         self.optim_step_lrs: list[float] = []
+        self.calls: list[str] = []
+        """Ordered log of every method called on this client, oldest first."""
+
         self._service = service
         self._ledger = _SpanLedger()
-        self._saved_states: dict[str, int] = {}
-        self._state_counter = 0
         self._sampler_counter = 0
 
     def get_tokenizer(self) -> FakeTokenizer:
-        """The deterministic char-level tokenizer for this fake model."""
+        """The deterministic char-level tokenizer for this fake model.
+
+        Logged like every other call, but absent from
+        `MODEL_INITIALIZING_CALLS`: the real SDK answers it from a
+        metadata-only GetInfo request, so it never blocks a later restore.
+        """
+        self.calls.append("get_tokenizer")
         return FakeTokenizer()
 
     def forward_backward(self, datums: list[FakeDatum], loss_fn: str) -> FakeForwardBackwardOutput:
@@ -504,6 +537,7 @@ class FakeTrainingClient:
                 if span in issued:
                     continue
                 raise AssertionError(self._tito_message(datum_index, span, records))
+        self.calls.append("forward_backward")
         self.forward_backward_calls.append((list(datums), loss_fn))
         loss = -_derived_logprob(
             "batch-loss", loss_fn, *(_ids_key(datum.target_tokens) for datum in datums)
@@ -560,33 +594,52 @@ class FakeTrainingClient:
             A deterministic SDK-shaped response whose metrics carry a
             "grad_norm:mean" derived purely from (step count, learning rate).
         """
+        self.calls.append("optim_step")
         self.optim_step_lrs.append(learning_rate)
         self.step_count += 1
         grad_norm = -_derived_logprob("grad-norm", str(self.step_count), str(learning_rate))
         return FakeOptimStepResponse(metrics={"grad_norm:mean": grad_norm})
 
     def save_state(self) -> str:
-        """Save training state, returning a fake tinker:// state path."""
-        path = f"tinker://fake/state/{self._state_counter}"
-        self._state_counter += 1
-        self._saved_states[path] = self.step_count
-        return path
+        """Save training state, returning a fake tinker:// state path.
+
+        The state lands in the owning FakeServiceClient's artifact store, not
+        on this client: real tinker:// state paths outlive the session that
+        wrote them, which is what lets a later session restore them on a
+        freshly created training client.
+        """
+        self.calls.append("save_state")
+        return self._service._register_state(self.step_count)
 
     def load_state(self, path: str) -> None:
-        """Restore a previously saved state.
+        """Restore a previously saved state; must be this client's FIRST call.
+
+        Mirrors the live service's rule that LoadWeights is accepted only on
+        an uninitialized model: once any call in `MODEL_INITIALIZING_CALLS`
+        has run here, restoring is refused. That is the exact failure a
+        resumed distillation run hits when anything (a sampler-weights save,
+        a forward pass, or an earlier abandoned restore) touches the training
+        client before the checkpoint is loaded.
 
         Args:
-            path: A path returned by save_state on this client.
+            path: A path returned by save_state on any training client of the
+                owning service.
 
         Raises:
-            ValueError: If the path was never saved by this client.
+            RuntimeError: If a weight-affecting call already ran on this
+                client; the message names them in order.
+            ValueError: If the path was never returned by save_state.
         """
-        if path not in self._saved_states:
-            raise ValueError(
-                f"unknown state path {path!r}: it was never returned by save_state "
-                "on this training client"
+        initialized = [call for call in self.calls if call in MODEL_INITIALIZING_CALLS]
+        if initialized:
+            raise RuntimeError(
+                "LoadWeights can only be called on uninitialized models: load_state "
+                f"came after {initialized} on this training client. Restore the "
+                "checkpoint as the first call on a freshly created training client"
             )
-        self.step_count = self._saved_states[path]
+        step_count = self._service._saved_state_step(path)
+        self.calls.append("load_state")
+        self.step_count = step_count
 
     def save_weights_for_sampler(self, name: str) -> str:
         """Save current weights for sampling, returning a fake sampler path.
@@ -594,6 +647,7 @@ class FakeTrainingClient:
         The path can be exchanged for a linked FakeSamplingClient via
         FakeServiceClient.create_sampling_client.
         """
+        self.calls.append("save_weights_for_sampler")
         path = f"tinker://fake/sampler/{name}/{self._sampler_counter}"
         self._sampler_counter += 1
         self._service._register_sampler_path(path, self)
@@ -618,14 +672,21 @@ class FakeServiceClient:
     student through the same account, so tokens the teacher client genuinely
     sampled are legitimate training targets for the warmup phase, while ids no
     client ever issued remain violations.
+
+    The service also owns the saved-state artifact store, so a state one
+    training client wrote can be restored by another (what a resumed run
+    does): every `create_lora_training_client` call yields a fresh,
+    uninitialized client, just like the real service.
     """
 
     def __init__(self) -> None:
         self._sampler_paths: dict[str, FakeTrainingClient] = {}
         self._sampling_clients: list[FakeSamplingClient] = []
+        self._states: dict[str, int] = {}
+        self._state_counter = 0
 
     def create_lora_training_client(self, base_model: str, rank: int = 32) -> FakeTrainingClient:
-        """Create a fake LoRA training client for the given base model."""
+        """Create a fresh, uninitialized fake LoRA training client."""
         return FakeTrainingClient(service=self, base_model=base_model, rank=rank)
 
     def create_sampling_client(self, model_path: str) -> FakeSamplingClient:
@@ -651,3 +712,23 @@ class FakeServiceClient:
 
     def _register_sampler_path(self, path: str, training: FakeTrainingClient) -> None:
         self._sampler_paths[path] = training
+
+    def _register_state(self, step_count: int) -> str:
+        """Store one saved state, returning its fresh service-wide path."""
+        path = f"tinker://fake/state/{self._state_counter}"
+        self._state_counter += 1
+        self._states[path] = step_count
+        return path
+
+    def _saved_state_step(self, path: str) -> int:
+        """The step count a saved state carries.
+
+        Raises:
+            ValueError: If no training client of this service saved `path`.
+        """
+        if path not in self._states:
+            raise ValueError(
+                f"unknown state path {path!r}: it was never returned by save_state "
+                "on a training client of this service"
+            )
+        return self._states[path]

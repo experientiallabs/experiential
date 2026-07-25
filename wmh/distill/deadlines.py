@@ -12,15 +12,20 @@ error: callers retry with a fresh session instead of hanging.
 Defaults carry generous headroom over measured live latencies (sample mean
 2.8s / p95 7.7s / max 10.2s; compute_logprobs max 1.5s; forward_backward
 ~1.5s; optim_step ~0.5s; save_state ~2.4s; save_weights_for_sampler mean
-4.4s / max 18s with one observed 80s outlier). Each default is overridable
-via one env var per kind, `WMH_TINKER_DEADLINE_<KIND>` in seconds:
+4.4s / max 18s with one observed 80s outlier). `load_state` gets the same
+600s as save_weights_for_sampler for a different reason: restoring a large
+student's weights plus optimizer state exceeded 120s on a live 120B resume,
+and the call cannot be retried on the same client (tinker refuses LoadWeights
+once anything initialized the model, see `SdkTrainingClient`), so its deadline
+is the whole budget rather than the first of two attempts. Each default is
+overridable via one env var per kind, `WMH_TINKER_DEADLINE_<KIND>` in seconds:
 
 - sample: 120s (WMH_TINKER_DEADLINE_SAMPLE)
 - compute_logprobs: 60s (WMH_TINKER_DEADLINE_COMPUTE_LOGPROBS)
 - forward_backward: 120s (WMH_TINKER_DEADLINE_FORWARD_BACKWARD)
 - optim_step: 120s (WMH_TINKER_DEADLINE_OPTIM_STEP)
 - save_state: 120s (WMH_TINKER_DEADLINE_SAVE_STATE)
-- load_state: 120s (WMH_TINKER_DEADLINE_LOAD_STATE)
+- load_state: 600s (WMH_TINKER_DEADLINE_LOAD_STATE)
 - save_weights_for_sampler: 600s (WMH_TINKER_DEADLINE_SAVE_WEIGHTS_FOR_SAMPLER)
 - connect: 60s (WMH_TINKER_DEADLINE_CONNECT)
 
@@ -73,7 +78,7 @@ DEFAULT_DEADLINES_S: dict[TinkerCallKind, float] = {
     "forward_backward": 120.0,
     "optim_step": 120.0,
     "save_state": 120.0,
-    "load_state": 120.0,
+    "load_state": 600.0,
     "save_weights_for_sampler": 600.0,
     "connect": 60.0,
 }
