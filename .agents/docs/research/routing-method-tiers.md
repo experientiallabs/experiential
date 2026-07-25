@@ -461,6 +461,58 @@ holds:
   judge-noise decomposition (re-judge one stored reply twice, ~450 calls/corpus) gates how much
   of the ceiling is real.
 
+## Distilled reply verifier (2026-07-25): beats free features, still cannot pay for 2x
+
+Reproduce with `.agents/scripts/fit_reply_verifier.py --embedder azure --seeds 0,1,2,3,4`; head code
+in `wmh/research/reply_verifier.py`. Zooter path (2311.08692, 149 cites, NAACL'24): ridge over
+text-embedding-3-large embeddings of the whole stored rollout transcript, trained on fit-split
+rewards, numpy only. 3,977 unique reply texts embedded once and cached
+(`wmh-routing-data/cache/wm-oai3l-replies.npz`), so reruns are free.
+
+Selection credit on IDENTICAL reward-decisive test cells (~211/seed), pooled wm-all, 5 seeds. A
+selector that cannot rank the two episodes scores 0.5, which is what makes these comparable - the
+per-selector "decisive" counts in `selector_bound` are NOT (free ties on 129 cells, a continuous
+score on 211, so those correct-fractions have different denominators):
+
+| selector | credit | paired vs free | seeds better |
+| --- | --- | --- | --- |
+| free (finished-then-more-steps) | 0.6125 +- 0.0281 | - | - |
+| **absolute (reply -> reward)** | **0.7089 +- 0.0172** | **+0.096** | **5/5** |
+| pairwise (difference -> gap) | 0.6992 +- 0.0344 | +0.087 | 5/5 |
+| pairwise + PCA-64 | 0.6952 +- 0.0229 | +0.083 | 5/5 |
+| absolute + PCA-64 | 0.6786 +- 0.0131 | +0.066 | 5/5 |
+| **shuffled-label control** | **0.5278 +- 0.0931** | -0.085 | 0/5 |
+
+Verdict against the pre-registered bars: bar 1 (beat free) **PASSED** decisively; bar 2 (harvest
+>60% of the oracle-of-2 gap) **MISSED**, absolute reaches 58%, pairwise 52%, free 31%.
+
+Consequence for best-of-2, which is the decisive practical test: the verifier lifts fable-5's
+selected-of-2 on wm-all from +0.017 over best-single (free) to +0.021..+0.036 (verifier), but the
+guard demands +0.06 because 2x cost exceeds best-single's 1x. It fails on 5/5 seeds; a cost-aware
+guard passes on 1/5 (opus-4-8 at 0.78x). **So bo2 still declines, and the reason is now precise:
+selection is no longer the bottleneck, the 2x price is.** That points the verifier at CASCADES
+rather than best-of-n - escalation pays 1x plus (escalation rate x extra) instead of 2x on
+everything, so a +0.10 selection edge buys much more there.
+
+Three things worth carrying to the next experiment:
+
+1. **Two predictions of mine were wrong, both instructive.** The naive `absolute` head beat the
+   `pairwise` head, though I expected the reverse from the between/within confound; it has ~2,891
+   training rows against pairwise's ~1,126, and the semantic embedding evidently separates good
+   from bad rollouts well enough globally that within-cell ranking follows. And PCA-64 HURT every
+   head, so the "600 rows vs 3072 dims" capacity worry was unfounded - full-dimensional ridge at
+   alpha=1 is better.
+2. **Embedding choice decides whether the control is clean.** With hashing-1024 (lexical trigrams)
+   the shuffled control scored 0.589, NOT chance, because trigram features encode reply length and
+   length is a real within-cell quality cue. With semantic 3-large the same control collapses to
+   0.528. Any future verifier must report its shuffled control, and a lexical embedding will
+   flatter it.
+3. Fit data provenance: these matrices predate the merged `evaluate_pool` change (error rows now
+   recorded unscored rather than salvage-scored). 27 of 4,032 rows (0.67%) carry an error AND a
+   reward, i.e. old-semantics salvage scores; too few to matter, recorded for completeness.
+
+## The evaluator seam
+
 The engineering blocker this survey flagged - `evaluate_choices` typing `choose` as
 `Callable[[str], str]`, one model out, so cascades and best-of-n could not be scored through the
 shared evaluator - is CLOSED as of 3a98e3b0: `evaluate_call_sequences` takes a policy over the
