@@ -241,7 +241,9 @@ def create_app(
                     raise ValueError(f"invalid routing policy at {policy_path}: {exc}") from exc
     # Mounted even with zero policies so a client wired up before a policy is fitted gets an
     # empty /v1/models list and an OpenAI-shaped "no endpoint" error instead of a bare 404.
-    request_log = RequestLog(Path(artifact_dirs[0]) / "serving" / "requests.jsonl")
+    # With no artifact root (injected-models tests) the log keeps its in-memory tail only.
+    log_path = Path(artifact_dirs[0]) / "serving" / "requests.jsonl" if artifact_dirs else None
+    request_log = RequestLog(log_path)
     app.include_router(
         create_chat_router(
             {

@@ -369,3 +369,16 @@ def test_abandoned_stream_still_records_metering(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["status"] == "error"
     assert "disconnected" in rows[0]["error_message"]
+
+
+def test_create_app_with_injected_policies_and_no_artifact_dirs(tmp_path: Path) -> None:
+    # The injected-policies test pattern must not require an artifact root for the request log.
+    from wmh.serving.server import create_app
+
+    app = create_app(
+        artifact_dirs=(),
+        world_models={},
+        policies={"ep": RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())},
+    )
+    client = TestClient(app)
+    assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["ep"]
