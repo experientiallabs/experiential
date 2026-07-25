@@ -71,6 +71,9 @@ class StepAttribution(BaseModel):
 
     model: str | None = None  # the serving model id (response model preferred over request)
     provider: str | None = None  # the model provider/system (e.g. "anthropic", "openai")
+    config: JsonObject = Field(
+        default_factory=dict
+    )  # request params (temperature, max_tokens, ...)
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None

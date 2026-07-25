@@ -104,6 +104,10 @@ _OUTPUT_TOKEN_KEYS = (
     "llm.token_count.completion",
 )
 _COST_KEYS = ("gen_ai.usage.cost", "llm.usage.total_cost")
+# `gen_ai.request.*` keys that are NOT sampling/config knobs: the model has its own field, and
+# "arguments" is a legacy tool-args location (see _TOOL_ARG_KEYS), not an LLM parameter.
+_NON_CONFIG_REQUEST_KEYS = frozenset({"gen_ai.request.model", "gen_ai.request.arguments"})
+_REQUEST_PREFIX = "gen_ai.request."
 
 
 class SpanRecord(BaseModel):
@@ -551,16 +555,24 @@ def _attribution(
     latency_ms: float | None = None
     if action_span is not None and 0 < action_span.start_nano < action_span.end_nano:
         latency_ms = _span_latency_ms(action_span.start_nano, action_span.end_nano)
+    config = {
+        key[len(_REQUEST_PREFIX) :]: value
+        for key, value in attrs.items()
+        if key.startswith(_REQUEST_PREFIX) and key not in _NON_CONFIG_REQUEST_KEYS
+    }
     attribution = StepAttribution(
         model=_opt_str(_first(attrs, _MODEL_KEYS)),
         provider=_opt_str(_first(attrs, _PROVIDER_KEYS)),
+        config=config,
         input_tokens=_opt_int(_first(attrs, _INPUT_TOKEN_KEYS)),
         output_tokens=_opt_int(_first(attrs, _OUTPUT_TOKEN_KEYS)),
         cost_usd=_opt_float(_first(attrs, _COST_KEYS)),
         latency_ms=latency_ms,
         error_class=error_class,
     )
-    return attribution if attribution.model_dump(exclude_none=True) else None
+    # exclude_defaults so an empty config dict does not make an otherwise-unknown step
+    # carry an all-empty attribution object.
+    return attribution if attribution.model_dump(exclude_defaults=True) else None
 
 
 def _build_steps(spans: list[SpanRecord]) -> list[Step]:

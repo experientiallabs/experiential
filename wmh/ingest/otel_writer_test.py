@@ -93,6 +93,7 @@ def test_roundtrip_preserves_attribution(tmp_path: Path) -> None:
                 attribution=StepAttribution(
                     model="claude-haiku-4-5",
                     provider="anthropic",
+                    config={"temperature": 0.2, "max_tokens": 512},
                     input_tokens=10,
                     output_tokens=2,
                     latency_ms=99.5,

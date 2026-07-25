@@ -165,3 +165,27 @@ def test_step_attribution_latency_ignores_synthetic_ordinals_and_scales_microsec
     attribution = trace.steps[0].attribution
     assert attribution is not None
     assert attribution.latency_ms == 250.0
+
+
+def test_step_attribution_captures_request_config() -> None:
+    """`gen_ai.request.*` sampling params land in attribution.config (policy-relevant knobs)."""
+    spans = [
+        SpanRecord(
+            trace_id="t1",
+            span_id="a",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.completion": "hi",
+                "gen_ai.request.model": "m",
+                "gen_ai.request.temperature": 0.2,
+                "gen_ai.request.max_tokens": 512,
+                "gen_ai.request.top_p": 0.9,
+            },
+        ),
+    ]
+    (trace,) = spans_to_traces(spans, source="test")
+    attribution = trace.steps[0].attribution
+    assert attribution is not None
+    assert attribution.config == {"temperature": 0.2, "max_tokens": 512, "top_p": 0.9}
+    # The model key is attribution.model, never duplicated into config.
+    assert "model" not in attribution.config

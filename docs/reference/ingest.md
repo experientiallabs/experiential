@@ -92,8 +92,19 @@ or add one.
 If your agent runs live in your own Postgres, ingest them directly - no exporter needed:
 
 ```bash
-uv run wmh ingest --dsn "postgresql://user:pass@host:5432/db" --table agent_traces
+uv run wmh ingest --source postgres --dsn "postgresql://user:pass@host:5432/db" --table agent_traces
+# (--source postgres is implied whenever --dsn/--table are passed)
 # needs the driver extra once: pip install 'world-model-harness[postgres]'
+```
+
+On a TTY this renders a progress bar; `--json` emits the D-INGEST event lines, e.g. against a
+session table holding two chat threads as message-per-row:
+
+```
+{"type": "detected", "format": "postgres", "traces": 2}
+{"type": "progress", "normalized": 1, "total": 2}
+{"type": "progress", "normalized": 2, "total": 2, "note": "wrote 5 spans"}
+{"type": "done", "traces": 2, "steps": 3, "otel_object": "postgres.otel.jsonl"}
 ```
 
 The table contract is three columns, all overridable: `trace_id` (groups rows into episodes; used
