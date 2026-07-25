@@ -17,6 +17,11 @@ ready-to-paste serving snippet.
   teacher scores there too.
 - **`E2B_API_KEY`** when the run config sets `harbor.backend = "e2b"` (rollout trials in E2B
   sandboxes); `backend = "local"` runs them on your machine instead.
+- **Free E2B sandbox capacity** for `backend = "e2b"`: a running trial holds two concurrent
+  sandboxes (harbor's task environment plus the sandbox hosting the pi harness process), so a
+  run needs `2 x train.trial_concurrency` free slots against your account's concurrent-sandbox
+  limit (100 by default; set `WMH_E2B_SANDBOX_CAP` when yours differs). See
+  [Sandbox capacity](#sandbox-capacity).
 - **A harbor job template**: the Harbor `JobConfig` YAML/JSON naming the benchmark dataset the
   trials run against, pointed at by the config's `[harbor] job_template`.
 - **Task-id splits**: two JSON files, each a plain array of task-id strings. The train split
@@ -114,7 +119,39 @@ pi-node harness; it is pinned for the whole run). `--backend local|e2b` override
 
 Before spending anything the run preflights: renderer resolution, a student/teacher tokenizer
 fingerprint check, one-token pings, and a tokens-in-tokens-out (TITO) recompute proof that the
-sampling and scoring paths agree on the student's own tokens.
+sampling and scoring paths agree on the student's own tokens. On `backend = "e2b"` it also
+checks sandbox capacity first (below).
+
+## Sandbox capacity
+
+E2B caps concurrent sandboxes per account, and a harbor trial's task-environment sandbox lives
+for its own multi-hour timeout. A run that dies without graceful shutdown (crash, SIGKILL,
+budget abort, machine sleep) therefore leaves its sandboxes running, and the next run starves at
+the cap: every trial fails at sandbox creation with
+`RateLimitException: 429 ... maximum number of concurrent E2B sandboxes`, which surfaces as
+trials producing zero token spans and looks exactly like a broken model.
+
+Two mechanisms keep that from happening silently.
+
+- Every sandbox a wmh run creates is recorded, with its owning process id, in a per-process
+  JSONL ledger under the WMH user state directory (`$WMH_HOME/e2b-sandboxes`, else
+  `~/.wmh/e2b-sandboxes`), and marked released when its kill is proved. A ledger entry whose
+  owning process is gone is a provable orphan that can be killed by exact id.
+- An e2b-backed distill run preflights capacity: it counts running sandboxes, auto-reclaims
+  those provable orphans, and refuses to start when `2 x train.trial_concurrency` slots are
+  still not free, naming the numbers instead of starving.
+
+To inspect or reclaim capacity by hand:
+
+```bash
+wmh e2b reap                      # dry run: what is running, and what would be killed
+wmh e2b reap --yes                # kill orphans of dead local runs (exact recorded ids)
+wmh e2b reap --stale-minutes 60   # ALSO match harbor trial sandboxes account-wide by age
+```
+
+`--stale-minutes` matches on the account, not just this machine, so it can kill a run on another
+machine or in another checkout; sandboxes whose local owner process is still alive are never
+selected. Both forms are dry runs until `--yes`.
 
 ## What a run produces
 
@@ -165,6 +202,9 @@ flags are rejected rather than silently changing the run.
 | Symptom | Meaning and fix |
 |---|---|
 | TITO preflight failure (`TITO recompute disagreement ...`) | The sampling and scoring paths disagree on the student's own tokens, so training data would be corrupt; check that the sampler path matches the student base model and that the pinned `tinker` SDK version is unchanged. |
-| Empty-batch abort (`... every trial produced zero token spans`) | Consecutive steps sampled no completions at all: the student provider or its sessions are failing upstream; check the runner logs for worker completion warnings, then `--resume` once the provider is healthy. |
+| Empty-batch abort (`... every trial produced zero token spans`) | Consecutive steps sampled no completions at all. Either the student provider or its sessions are failing upstream (check the runner logs for worker completion warnings), or, on `backend = "e2b"`, trials are dying at sandbox creation because the account is at its concurrent-sandbox cap (`wmh e2b reap`). Fix the cause, then `--resume`. |
+| Every trial 429s at sandbox creation (`maximum number of concurrent E2B sandboxes`) | The account is at its concurrent-sandbox cap, usually because a crashed run's sandboxes are still running out their multi-hour timeout. Run `wmh e2b reap` to see what is holding the slots, then `wmh e2b reap --yes` (orphans of dead local runs) or `wmh e2b reap --stale-minutes N --yes` (account-wide by age). See [Sandbox capacity](#sandbox-capacity). |
+| Start refused (`not enough free E2B sandbox slots ...`) | The capacity preflight found fewer free slots than `2 x train.trial_concurrency` even after reclaiming provable orphans; free slots as above, lower `train.trial_concurrency`, or raise the cap (`WMH_E2B_SANDBOX_CAP`). |
 | Deadline expiries (`TinkerDeadlineError: tinker <call> timed out after ...`) | A wedged Tinker session was cut off instead of hanging; transient ones retry with a fresh session on their own, and a persistent one can be given more headroom via the `WMH_TINKER_DEADLINE_<KIND>` env vars the error names. |
+| Resume rejected (`LoadWeights can only be called on uninitialized models`) | Tinker accepts a checkpoint restore only on a model nothing has touched yet, so a resume loads its state as the very first call on a freshly created training client. If a restore is slow enough to blow its deadline, the run retries it on another fresh client; `WMH_TINKER_DEADLINE_LOAD_STATE` (600s by default) is how long one attempt may take, which large students may need raised. |
 | Fragmentation warning (`N of M datum(s) are fragments ...`) | The agent edited its prompt history mid-episode, so shared context re-prefills at full price and teacher scoring multiplies; keep `rollout.compaction = false` and check the harness keeps its prompt prefix stable across turns. |

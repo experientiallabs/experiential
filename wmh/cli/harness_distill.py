@@ -41,6 +41,7 @@ from wmh.distill.loop import (
     DistillResult,
     run_distillation,
 )
+from wmh.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
 from wmh.distill.store import (
     DEFAULT_TINKER_OPENAI_ENDPOINT,
     AdapterStore,
@@ -48,6 +49,14 @@ from wmh.distill.store import (
     build_handoff_toml,
 )
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_reap import (
+    DEFAULT_E2B_SANDBOX_CAP,
+    E2B_API_KEY_ENV,
+    E2B_SANDBOX_CAP_ENV,
+    CapacityCheck,
+    check_capacity,
+    is_credential_error,
+)
 from wmh.harness.population import write_json_atomic
 from wmh.harness.store import HarnessStore
 
@@ -236,6 +245,8 @@ def run_distill(
             "config's [harbor] job_template at the harbor JobConfig YAML/JSON the "
             "rollouts should run"
         )
+    if effective_backend == "e2b":
+        _preflight_e2b_capacity(console, trial_concurrency=cfg.train.trial_concurrency)
 
     console.print(
         f"distilling [bold]{base}[/bold]: student {cfg.student.base_model} <- teacher "
@@ -413,6 +424,81 @@ def _pinned_seed_doc(
             "harness version or start a fresh --run-dir"
         )
     return base, doc
+
+
+# -- e2b capacity preflight ------------------------------------------------------------------
+
+
+def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None:
+    """Refuse to start an e2b run that cannot claim the concurrency it asks for.
+
+    E2B caps concurrent sandboxes per account, and a running trial holds
+    `E2B_SANDBOXES_PER_TRIAL` of them (harbor's task environment, which lives for its own
+    multi-hour timeout, plus the pooled pi worker). When orphans of an earlier crashed run fill
+    the account, every trial fails at sandbox creation with a 429 and the run produces zero
+    token spans, which reads exactly like a broken model. So: count what is running, reclaim
+    this machine's provable orphans (exact ids whose owning process is gone), and fail with the
+    numbers if that is still not enough. The account-wide sweep is never automatic; the message
+    names it instead.
+
+    Raises:
+        typer.BadParameter: If capacity cannot be measured (missing extra or credential) or
+            too few slots are free after reaping the safe class.
+    """
+    required = trial_concurrency * E2B_SANDBOXES_PER_TRIAL
+    try:
+        check = check_capacity(required=required)
+    except ImportError as error:
+        raise typer.BadParameter(
+            f"{error}; the distill config selects harbor.backend = 'e2b'"
+        ) from error
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    except Exception as error:  # noqa: BLE001 - a monitoring call must not break a resume
+        if is_credential_error(error):
+            raise typer.BadParameter(
+                f"E2B rejected the sandbox capacity check ({error}); harbor.backend = 'e2b' "
+                f"runs every trial in E2B, so set ${E2B_API_KEY_ENV} to an account key (or "
+                "switch the distill config to backend = 'local')"
+            ) from error
+        console.print(
+            f"[yellow]warning[/yellow] could not check E2B sandbox capacity "
+            f"({type(error).__name__}: {escape(str(error))}); starting anyway"
+        )
+        return
+    if check.reaped:
+        console.print(
+            f"reaped {check.reaped} orphaned E2B sandbox(es) from dead local runs "
+            f"({check.alive_before} -> {check.alive} of {check.cap} in use)"
+        )
+    if not check.ok:
+        raise typer.BadParameter(_capacity_failure_message(check, trial_concurrency))
+    console.print(
+        f"e2b capacity ok: {check.alive}/{check.cap} sandbox(es) in use, {check.free} free, "
+        f"{required} needed ({E2B_SANDBOXES_PER_TRIAL} per trial x "
+        f"train.trial_concurrency={trial_concurrency})"
+    )
+
+
+def _capacity_failure_message(check: CapacityCheck, trial_concurrency: int) -> str:
+    """The actionable message for a run that cannot get enough sandbox slots."""
+    reaped = (
+        f" Reaping orphans of dead local runs freed {check.reaped} slot(s) and was not enough."
+        if check.reaped
+        else " No orphan of a dead local run was left to reclaim."
+    )
+    affordable = check.free // E2B_SANDBOXES_PER_TRIAL
+    lower = f"lower train.trial_concurrency to at most {affordable}, " if affordable >= 1 else ""
+    return (
+        f"not enough free E2B sandbox slots: {check.alive} of {check.cap} concurrent "
+        f"sandboxes are in use, leaving {check.free} free, but this run needs "
+        f"{check.required} ({E2B_SANDBOXES_PER_TRIAL} per trial x "
+        f"train.trial_concurrency={trial_concurrency}: harbor's task environment plus the pi "
+        f"worker).{reaped} Either run `wmh e2b reap --stale-minutes 60 --yes` to kill older "
+        f"harbor trial sandboxes (account-wide: it can kill another machine's run), {lower}wait "
+        f"for the other runs to finish, or raise the account cap (set ${E2B_SANDBOX_CAP_ENV} "
+        f"when your cap is not {DEFAULT_E2B_SANDBOX_CAP})"
+    )
 
 
 # -- cost confirmation -----------------------------------------------------------------------
