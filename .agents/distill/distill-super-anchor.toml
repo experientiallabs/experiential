@@ -21,7 +21,7 @@ reward_key = "reward"
 
 [rollout]
 max_turns = 20
-context_budget_tokens = 65536
+context_budget_tokens = 60000
 compaction = false
 
 [train]
@@ -32,10 +32,10 @@ group_size = 4
 learning_rate = 5e-5
 advantage_clip = 4.0
 center_advantages = true
-max_datum_tokens = 65536
+max_datum_tokens = 64000
 sampler_refresh_every = 1
 save_state_every = 4
-trial_concurrency = 16
+trial_concurrency = 8
 
 # temperature 1.0 keeps issued sampler logprobs comparable to the untempered
 # teacher logprobs (unbiased reverse-KL advantages).
@@ -72,7 +72,7 @@ student_sample = 1.44
 student_train = 1.276
 
 [budget]
-max_usd = 200.0
+max_usd = 500.0
 
 [wandb]
 enabled = true

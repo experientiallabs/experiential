@@ -26,8 +26,10 @@ from wmh.distill.loop import (
     ProgressCallback,
     SpendSummary,
 )
+from wmh.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
 from wmh.distill.store import DEFAULT_TINKER_OPENAI_ENDPOINT, AdapterStore, DistillRunStore
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.e2b_reap import CapacityCheck, ReapOutcome
 from wmh.harness.store import HarnessStore
 
 if TYPE_CHECKING:
@@ -698,3 +700,184 @@ def test_promote_skips_on_a_rejected_gate(tmp_path: Path, monkeypatch: pytest.Mo
     assert result.exit_code == 0, result.output
     assert "--promote skipped" in _flat(result)
     assert load_settings(tmp_path / ".wmh").models.agent is None
+
+
+# -- e2b capacity preflight --------------------------------------------------------------------
+
+
+def _capacity(
+    *, cap: int = 100, alive_before: int, alive: int, required: int, freed: int = 0
+) -> CapacityCheck:
+    outcome = (
+        ReapOutcome(
+            killed=tuple(f"orphan-{index}" for index in range(freed)),
+            already_gone=(),
+            failed=(),
+            pruned_ledgers=(),
+        )
+        if freed
+        else None
+    )
+    return CapacityCheck(
+        cap=cap, alive_before=alive_before, alive=alive, required=required, outcome=outcome
+    )
+
+
+def _patch_capacity(monkeypatch: pytest.MonkeyPatch, check: CapacityCheck | Exception) -> list[int]:
+    """Stand in for the live account count; returns the `required` values it was asked for."""
+    asked: list[int] = []
+
+    def fake_check_capacity(*, required: int) -> CapacityCheck:
+        asked.append(required)
+        if isinstance(check, Exception):
+            raise check
+        return check
+
+    monkeypatch.setattr(harness_distill_module, "check_capacity", fake_check_capacity)
+    return asked
+
+
+def test_e2b_preflight_passes_when_enough_slots_are_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 12\n{_BUDGET_TOML}")
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    asked = _patch_capacity(monkeypatch, _capacity(alive_before=40, alive=40, required=24))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code == 0, result.output
+    # A trial holds TWO sandboxes at once: harbor's task environment plus the pi worker.
+    assert asked == [12 * E2B_SANDBOXES_PER_TRIAL]
+    flat = _flat(result)
+    assert "e2b capacity ok: 40/100 sandbox(es) in use, 60 free, 24 needed" in flat
+    assert "(2 per trial x train.trial_concurrency=12)" in flat
+    assert len(recorder.calls) == 1
+
+
+def test_e2b_preflight_reaps_dead_owner_orphans_and_then_proceeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 8\n{_BUDGET_TOML}")
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    _patch_capacity(monkeypatch, _capacity(alive_before=97, alive=84, required=16, freed=13))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code == 0, result.output
+    flat = _flat(result)
+    assert (
+        "reaped 13 orphaned E2B sandbox(es) from dead local runs (97 -> 84 of 100 in use)" in flat
+    )
+    assert "e2b capacity ok: 84/100" in flat
+    assert len(recorder.calls) == 1
+
+
+def test_e2b_preflight_fails_fast_when_slots_stay_short(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live failure mode: 73 orphans held the account and every trial 429'd instead."""
+    _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 12\n{_BUDGET_TOML}")
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    _patch_capacity(monkeypatch, _capacity(alive_before=98, alive=95, required=24, freed=3))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code != 0
+    flat = _flat(result)
+    assert "not enough free E2B sandbox slots: 95 of 100 concurrent sandboxes are in use" in flat
+    assert "leaving 5 free, but this run needs 24 (2 per trial x train.trial_concurrency=12" in flat
+    assert "harbor's task environment plus the pi worker)" in flat
+    assert "freed 3 slot(s) and was not enough" in flat
+    assert "wmh e2b reap --stale-minutes 60 --yes" in flat
+    assert "lower train.trial_concurrency to at most 2" in flat  # 5 free // 2 per trial
+    assert "WMH_E2B_SANDBOX_CAP" in flat
+    assert recorder.calls == []  # nothing was spent
+
+
+def test_e2b_preflight_message_names_the_missing_orphan_class(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 4\n{_BUDGET_TOML}")
+    _patch_run(monkeypatch, _RunRecorder())
+    _patch_capacity(monkeypatch, _capacity(alive_before=99, alive=99, required=8))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code != 0
+    assert "No orphan of a dead local run was left to reclaim." in _flat(result)
+
+
+def test_a_missing_e2b_extra_fails_the_preflight_with_the_sync_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_inputs(tmp_path)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    _patch_capacity(monkeypatch, ImportError("the e2b SDK is not installed; run `uv sync`"))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code != 0
+    assert "uv sync" in _flat(result)
+    assert recorder.calls == []
+
+
+def test_an_unreachable_account_warns_but_still_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A monitoring call must not brick a resume: an unreachable API warns and continues."""
+    _write_inputs(tmp_path)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    _patch_capacity(monkeypatch, RuntimeError("connection reset"))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code == 0, result.output
+    assert "could not check E2B sandbox capacity" in _flat(result)
+    assert len(recorder.calls) == 1
+
+
+def test_a_missing_credential_fails_fast_instead_of_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unset key is a configuration error: every trial would 401, so do not start."""
+
+    class AuthenticationException(Exception):
+        """Name-matched stand-in for the e2b SDK's own credential error."""
+
+    _write_inputs(tmp_path)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    _patch_capacity(monkeypatch, AuthenticationException("API key is required"))
+
+    result = _invoke(tmp_path, "--yes", "--backend", "e2b")
+
+    assert result.exit_code != 0
+    flat = _flat(result)
+    assert "E2B rejected the sandbox capacity check" in flat
+    assert "$E2B_API_KEY" in flat
+    assert "backend = 'local'" in flat
+    assert recorder.calls == []
+
+
+def test_a_local_backend_never_touches_the_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_inputs(tmp_path)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+
+    def fake_check_capacity(*, required: int) -> CapacityCheck:
+        raise AssertionError(f"the local backend must not check E2B capacity ({required})")
+
+    monkeypatch.setattr(harness_distill_module, "check_capacity", fake_check_capacity)
+
+    result = _invoke(tmp_path, "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert len(recorder.calls) == 1
