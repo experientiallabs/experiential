@@ -53,6 +53,10 @@ class TokenUsage(BaseModel):
     # addition to it). Cache reads bill at a discounted rate, so effective-cost accounting
     # (PoolEntry.cost_usd, D-METERING records) needs the split; providers that don't report
     # cache usage leave it 0, which prices the whole prompt at the full input rate.
+    # Providers whose APIs report cache reads BESIDE the input count (Anthropic Messages,
+    # Bedrock Converse) normalize at the construction site: input_tokens = fresh + cache_read.
+    # Cache WRITES (billed at a premium) are not captured yet; nothing sends cache_control
+    # today, and the field lands with the cache-aware routing work.
     cached_input_tokens: int = 0
 
 

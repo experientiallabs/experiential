@@ -65,3 +65,13 @@ def test_matrix_round_trips_through_json(tmp_path: Path) -> None:
 def test_mean_reward_unknown_model_errors() -> None:
     with pytest.raises(KeyError, match="fable-5"):
         _matrix().mean_reward("nope")
+
+
+def test_outcomes_must_name_pool_models() -> None:
+    # A ghost model used to reach the fitter and die on a bare KeyError; the matrix names it.
+    matrix = _matrix()
+    with pytest.raises(ValueError, match="ghost-model"):
+        OutcomeMatrix(
+            pool=matrix.pool,
+            outcomes=[*matrix.outcomes, _outcome("s1", "ghost-model")],
+        )

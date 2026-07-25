@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from wmh.providers.base import TokenUsage
 from wmh.providers.pool import PoolEntry
@@ -55,6 +55,23 @@ class OutcomeMatrix(BaseModel):
 
     pool: list[PoolEntry]
     outcomes: list[ScenarioOutcome]
+
+    @model_validator(mode="after")
+    def _outcomes_name_pool_models(self) -> OutcomeMatrix:
+        """Every outcome must name a pool entry, or the matrix is not self-describing.
+
+        Consumers index the pool by outcome model (`fit_rank_policy`'s `pool_order`, the report's
+        per-candidate table). A row naming a model the pool never heard of used to surface as a
+        bare `KeyError` deep inside a fitter; caught here it names the offender instead.
+        """
+        names = {entry.name for entry in self.pool}
+        ghosts = sorted({o.model for o in self.outcomes if o.model not in names})
+        if ghosts:
+            raise ValueError(
+                f"outcomes name models missing from the pool: {ghosts[:5]}; "
+                f"pool models are {sorted(names)}"
+            )
+        return self
 
     def model_names(self) -> list[str]:
         return [entry.name for entry in self.pool]

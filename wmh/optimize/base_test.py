@@ -66,6 +66,18 @@ def test_routing_policies_are_never_exportable() -> None:
     weights = ArtifactRef(kind="model_weights", path="s3://bucket/ckpt")
     assert weights.exportable is True
 
+    # Assignment re-validates, so the boundary cannot be flipped after construction.
+    policy.exportable = True
+    assert policy.exportable is False
+    # Switching an exportable artifact's kind pulls its exportability with it.
+    weights.kind = "routing_policy"
+    assert weights.exportable is False
+    # model_copy(update=...) bypasses validation by pydantic design (documented on ArtifactRef);
+    # anything that crosses a serialization boundary is re-normalized.
+    leaked = policy.model_copy(update={"exportable": True})
+    assert leaked.exportable is True
+    assert ArtifactRef.model_validate_json(leaked.model_dump_json()).exportable is False
+
 
 def test_exportable_checkpoint_carries_provenance() -> None:
     ref = ArtifactRef(

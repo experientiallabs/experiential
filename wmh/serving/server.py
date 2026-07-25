@@ -34,7 +34,12 @@ from wmh.engine.world_model import WorldModel
 from wmh.optimize.policy import POLICY_FILENAME, RoutingPolicy
 from wmh.optimize.reward import EpisodeScore
 from wmh.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
-from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
+from wmh.serving.chat import (
+    EndpointRuntime,
+    RequestLog,
+    create_chat_router,
+    install_openai_error_shapes,
+)
 from wmh.serving.traces_source import (
     TRACES_FILENAME,
     TracesDownloader,
@@ -234,16 +239,18 @@ def create_app(
                     # Fail fast, but name the file: a bare ValidationError at startup doesn't
                     # say WHICH model's policy.json is broken.
                     raise ValueError(f"invalid routing policy at {policy_path}: {exc}") from exc
-    if endpoint_policies:
-        request_log = RequestLog(Path(artifact_dirs[0]) / "serving" / "requests.jsonl")
-        app.include_router(
-            create_chat_router(
-                {
-                    endpoint_name: EndpointRuntime(endpoint_name, policy, log=request_log)
-                    for endpoint_name, policy in endpoint_policies.items()
-                }
-            )
+    # Mounted even with zero policies so a client wired up before a policy is fitted gets an
+    # empty /v1/models list and an OpenAI-shaped "no endpoint" error instead of a bare 404.
+    request_log = RequestLog(Path(artifact_dirs[0]) / "serving" / "requests.jsonl")
+    app.include_router(
+        create_chat_router(
+            {
+                endpoint_name: EndpointRuntime(endpoint_name, policy, log=request_log)
+                for endpoint_name, policy in endpoint_policies.items()
+            }
         )
+    )
+    install_openai_error_shapes(app)
 
     def _register(name: str, model_dir: Path) -> None:
         """A finished serve-side build joins the live serving set immediately.

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmh.core.types import JsonObject, Trace
 
@@ -58,7 +58,16 @@ class ArtifactRef(BaseModel):
     (adapter rank, checkpoint step, policy version), not the artifact itself. `exportable`
     marks whether the artifact may leave the platform (customer-owned checkpoints/adapters:
     yes, with `provenance`; routing policies: never - forced False regardless of input).
+
+    `validate_assignment` re-runs the exportability validator on every field write, so
+    `ref.exportable = True` cannot flip the boundary after construction. Two documented ways
+    around it remain, both by pydantic design and neither reachable by accident:
+    `model_copy(update=...)` writes fields without validating, and `model_construct` skips
+    validation entirely. Anything crossing a serialization boundary is re-normalized, since
+    `model_validate`/`model_validate_json` run the validator again.
     """
+
+    model_config = ConfigDict(validate_assignment=True)
 
     kind: ArtifactKind
     path: str | None = None
@@ -68,7 +77,10 @@ class ArtifactRef(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_exportability(self) -> ArtifactRef:
-        if self.kind in _NEVER_EXPORTABLE:
+        # The guard on `self.exportable` is what makes this terminate under
+        # validate_assignment: the corrective write re-enters the validator exactly once, and
+        # the second pass has nothing left to correct.
+        if self.kind in _NEVER_EXPORTABLE and self.exportable:
             self.exportable = False
         return self
 

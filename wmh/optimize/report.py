@@ -11,6 +11,14 @@ held-out scenarios and is labeled as such; cost and latency are real measurement
 episodes; `cost_assumptions` states what the cost numbers do and do not include (today:
 single-shot eval, list prices, cache effects not yet modeled). Unscored episodes are counted
 and surfaced, never averaged in as zeros.
+
+Paired comparison (why the headline is not a plain per-side mean): skipping unscored episodes
+per side would let the two sides average DIFFERENT scenario subsets, and unscored is not random
+- a candidate that times out on the hardest scenarios gets graded on the easy remainder and can
+out-score a baseline that answered everything. So the headline aggregates both sides over the
+intersection of scenarios scored on BOTH sides, and reports how many scenarios that left in
+(`scenarios_compared`) and out (`scenarios_excluded`). With an empty intersection there is
+nothing to report and `build_report` raises.
 """
 
 from __future__ import annotations
@@ -38,7 +46,11 @@ class ModelRef(BaseModel):
 
 
 class Headline(BaseModel):
-    """The endpoint's big numbers: routed policy vs the frontier baseline, same scenarios."""
+    """The endpoint's big numbers: routed policy vs the frontier baseline, same scenarios.
+
+    "Same scenarios" is literal and enforced: every number here is measured over the
+    `scenarios_compared` scenarios that BOTH sides scored (see the module docstring).
+    """
 
     accuracy: float
     baseline_accuracy: float
@@ -48,6 +60,8 @@ class Headline(BaseModel):
     baseline_latency_p50_ms: float
     latency_p95_ms: float
     baseline_latency_p95_ms: float
+    scenarios_compared: int = 0  # scenarios scored on BOTH sides: what the numbers cover
+    scenarios_excluded: int = 0  # held out of the comparison because one side went unscored
 
 
 class CandidateResult(BaseModel):
@@ -89,6 +103,9 @@ def _p50_p95_ms(seconds: list[float]) -> tuple[float, float]:
 
 
 def _mean(values: list[float]) -> float:
+    # 0.0 on empty is safe ONLY in the per-candidate table, where `scored_episodes` sits beside
+    # the number and says it rests on nothing. The headline never takes this path: `build_report`
+    # raises rather than quote a mean over zero commonly-scored scenarios.
     return sum(values) / len(values) if values else 0.0
 
 
@@ -117,7 +134,11 @@ def build_report(
     The routed side replays the policy's serve-time selection over each held-out scenario's
     task text and takes THAT model's measured outcomes for the scenario; the baseline side is
     `baseline`'s own rows on the same scenarios. Both sides therefore quote real, per-scenario
-    measurements from the identical matrix.
+    measurements from the identical matrix, over the identical scenarios (module docstring:
+    the headline is a PAIRED comparison over commonly-scored scenarios).
+
+    Raises ValueError when no scenario was scored on both sides: a matrix that measured nothing
+    comparable has no honest report in it.
     """
     names = {entry.name: entry for entry in matrix.pool}
     if baseline not in names:
@@ -127,16 +148,39 @@ def build_report(
     for outcome in matrix.outcomes:
         scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
 
-    routed: list[ScenarioOutcome] = []
+    # One embedder for the whole report: an azure spec builds an HTTP client per `build()`, and
+    # a report routes every held-out scenario.
+    embedder = policy.embedder.build() if policy.kind == "rank" else None
+
+    routed_rows: dict[str, list[ScenarioOutcome]] = {}
+    baseline_rows: dict[str, list[ScenarioOutcome]] = {}
     assignment_counts: dict[str, int] = {}
     for scenario_id, task in scenario_tasks.items():
-        decision = select_model(policy, task)
+        decision = select_model(policy, task, embedder=embedder)
         assignment_counts[decision.model] = assignment_counts.get(decision.model, 0) + 1
-        routed.extend(o for o in matrix.for_scenario(scenario_id) if o.model == decision.model)
-    baseline_rows = [o for o in matrix.outcomes if o.model == baseline]
+        rows = matrix.for_scenario(scenario_id)
+        routed_rows[scenario_id] = [o for o in rows if o.model == decision.model]
+        baseline_rows[scenario_id] = [o for o in rows if o.model == baseline]
 
-    routed_acc, _, routed_cost, routed_p50, routed_p95 = _aggregate(routed)
-    base_acc, _, base_cost, base_p50, base_p95 = _aggregate(baseline_rows)
+    compared = [
+        scenario_id
+        for scenario_id in scenario_tasks
+        if any(o.reward is not None for o in routed_rows[scenario_id])
+        and any(o.reward is not None for o in baseline_rows[scenario_id])
+    ]
+    if not compared:
+        raise ValueError(
+            f"no scenario has a scored episode on BOTH sides (routed policy and baseline "
+            f"'{baseline}'), so there is nothing to compare over "
+            f"{len(scenario_tasks)} scenarios; check the matrix for unscored episodes"
+        )
+
+    routed_acc, _, routed_cost, routed_p50, routed_p95 = _aggregate(
+        [o for scenario_id in compared for o in routed_rows[scenario_id]]
+    )
+    base_acc, _, base_cost, base_p50, base_p95 = _aggregate(
+        [o for scenario_id in compared for o in baseline_rows[scenario_id]]
+    )
 
     def _ref(name: str) -> ModelRef:
         entry = names[name]
@@ -175,6 +219,8 @@ def build_report(
             baseline_latency_p50_ms=base_p50,
             latency_p95_ms=routed_p95,
             baseline_latency_p95_ms=base_p95,
+            scenarios_compared=len(compared),
+            scenarios_excluded=total - len(compared),
         ),
         candidates=candidates,
         model_mix=[

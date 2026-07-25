@@ -11,7 +11,6 @@ tests prove wire compatibility without network or keys.
 
 from __future__ import annotations
 
-import socket
 import threading
 import time
 from collections.abc import Iterator
@@ -32,7 +31,12 @@ from wmh.providers.base import (
     VerifyResult,
 )
 from wmh.providers.pool import PoolEntry
-from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
+from wmh.serving.chat import (
+    EndpointRuntime,
+    RequestLog,
+    create_chat_router,
+    install_openai_error_shapes,
+)
 
 
 class _FakeProvider:
@@ -90,17 +94,18 @@ def live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     )
     app = FastAPI()
     app.include_router(create_chat_router({"tau-bench": runtime}))
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    install_openai_error_shapes(app)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
     while not server.started:
+        if not thread.is_alive():
+            raise RuntimeError("uvicorn thread died during startup")
         if time.monotonic() > deadline:
             raise RuntimeError("uvicorn did not start within 10s")
         time.sleep(0.02)
+    port = server.servers[0].sockets[0].getsockname()[1]
     yield f"http://127.0.0.1:{port}/v1"
     server.should_exit = True
     thread.join(timeout=5)
@@ -170,3 +175,38 @@ def test_real_client_gets_typed_error_with_message(live_server: str) -> None:
     assert body["code"] == "model_not_found"
     assert "no endpoint 'no-such-endpoint'" in body["message"]
     assert "tau-bench" in body["message"]  # the error names what IS available
+
+
+def test_real_client_validation_error_is_openai_shaped_400(live_server: str) -> None:
+    with pytest.raises(openai.BadRequestError) as excinfo:
+        _client(live_server).chat.completions.create(
+            model="tau-bench",
+            messages=[],  # violates min_length=1
+        )
+    assert isinstance(excinfo.value.body, dict)
+    body = cast("dict[str, str]", excinfo.value.body)
+    assert body["code"] == "invalid_request"
+    assert "messages" in body["message"]
+
+
+def test_real_client_tools_rejected_not_silently_dropped(live_server: str) -> None:
+    with pytest.raises(openai.BadRequestError) as excinfo:
+        _client(live_server).chat.completions.create(
+            model="tau-bench",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "f", "parameters": {}}}],
+        )
+    body = cast("dict[str, str]", excinfo.value.body)
+    assert body["code"] == "unsupported_parameter"
+    assert "tools" in body["message"]
+
+
+def test_real_client_developer_role_and_content_parts(live_server: str) -> None:
+    completion = _client(live_server).chat.completions.create(
+        model="tau-bench",
+        messages=[
+            {"role": "developer", "content": "be terse"},
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ],
+    )
+    assert completion.choices[0].message.content == "served by haiku-4-5"

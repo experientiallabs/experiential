@@ -30,9 +30,10 @@ from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, JsonValue, field_validator
 from starlette.background import BackgroundTask
 
 from wmh.optimize.policy import RoutingDecision, RoutingPolicy, select_model
@@ -59,8 +60,35 @@ ChatRole = Literal["system", "user", "assistant"]
 
 
 class ChatMessage(BaseModel):
+    """One chat turn, normalized from the OpenAI request shapes clients actually send.
+
+    `developer` (OpenAI's system replacement on gpt-5-class models) maps to `system`, and
+    multi-part text content (`[{"type": "text", "text": ...}]`, emitted by LangChain and the
+    Vercel AI SDK) is joined; a non-text part is a hard error, not a silent drop.
+    """
+
     role: ChatRole
     content: str
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _developer_is_system(cls, value: object) -> object:
+        return "system" if value == "developer" else value
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _join_text_parts(cls, value: object) -> object:
+        if not isinstance(value, list):
+            return value
+        parts: list[str] = []
+        for part in value:
+            if not (isinstance(part, dict) and part.get("type") == "text"):
+                raise ValueError(
+                    "only text content parts are supported; images and other modalities "
+                    "are not available on this endpoint yet"
+                )
+            parts.append(str(part.get("text", "")))
+        return "".join(parts)
 
 
 class StreamOptions(BaseModel):
@@ -70,7 +98,11 @@ class StreamOptions(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    """The OpenAI request subset the endpoint serves (text chat; tools are future work)."""
+    """The OpenAI request subset the endpoint serves (text chat; tools are future work).
+
+    Unsupported FUNCTIONAL parameters are declared here so they can be rejected explicitly
+    (see `unsupported_features`); genuinely unknown extra fields are ignored like OpenAI does.
+    """
 
     model: str  # the ENDPOINT name
     messages: list[ChatMessage] = Field(min_length=1)
@@ -79,12 +111,35 @@ class ChatCompletionRequest(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
+    # Declared only to be REJECTED with a clear 400 (silently ignoring tools would make a
+    # tool-calling client read prose where it expects tool_calls).
+    tools: list[JsonValue] | None = None
+    tool_choice: JsonValue | None = None
+    response_format: JsonValue | None = None
+    n: int = 1
+    logprobs: bool | None = None
 
     def output_budget(self) -> int:
         return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
     def wants_stream_usage(self) -> bool:
         return self.stream_options is not None and self.stream_options.include_usage
+
+    def unsupported_features(self) -> str:
+        """Name the requested-but-unsupported params, '' when the request is serveable."""
+        used = [
+            name
+            for name, value in (
+                ("tools", self.tools),
+                ("tool_choice", self.tool_choice),
+                ("response_format", self.response_format),
+                ("logprobs", self.logprobs),
+            )
+            if value
+        ]
+        if self.n != 1:
+            used.append("n != 1")
+        return ", ".join(used)
 
 
 def _error_response(status_code: int, message: str, *, err_type: str, code: str) -> Response:
@@ -101,6 +156,24 @@ def _error_response(status_code: int, message: str, *, err_type: str, code: str)
         status_code=status_code,
         media_type="application/json",
     )
+
+
+def install_openai_error_shapes(app: FastAPI) -> None:
+    """Convert request-validation failures to OpenAI's 400 + error-body shape.
+
+    Without this a malformed request gets FastAPI's 422 `{"detail": [...]}`, which OpenAI
+    clients surface as an empty error. App-level because exception handlers cannot attach to
+    a router; every app that mounts `create_chat_router` should call this.
+    """
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(_request: Request, exc: RequestValidationError) -> Response:
+        first = exc.errors()[0] if exc.errors() else {}
+        location = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+        message = f"invalid request: {location}: {first.get('msg', 'validation failed')}"
+        return _error_response(
+            400, message, err_type="invalid_request_error", code="invalid_request"
+        )
 
 
 class RequestLogRecord(BaseModel):
@@ -197,9 +270,13 @@ class EndpointRuntime:
         entry = next(e for e in self.policy.pool if e.name == pool_name)
         with self._lock:
             provider = self._providers.get(pool_name)
-            if provider is None:
-                provider = self._provider_factory(entry)
-                self._providers[pool_name] = provider
+        if provider is None:
+            # Construct OUTSIDE the lock: a slow client build (TLS handshake, credential
+            # resolution) must not head-of-line-block every other request's affinity lookup.
+            # A racing duplicate build is harmless; first insert wins.
+            provider = self._provider_factory(entry)
+            with self._lock:
+                provider = self._providers.setdefault(pool_name, provider)
         return entry, provider
 
 
@@ -281,8 +358,49 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 err_type="invalid_request_error",
                 code="model_not_found",
             )
-        decision = runtime.decide(request.messages)
-        entry, provider = runtime.provider_for(decision.model)
+        unsupported = request.unsupported_features()
+        if unsupported:
+            # Silently dropping tools/n/response_format would make a tool-calling client read
+            # plain text where it expects tool_calls: a compatibility gap disguised as a
+            # model-quality problem. Reject loudly instead.
+            return _error_response(
+                400,
+                f"this endpoint does not support {unsupported} yet",
+                err_type="invalid_request_error",
+                code="unsupported_parameter",
+            )
+        if not any(m.role != "system" for m in request.messages):
+            return _error_response(
+                400,
+                "at least one user or assistant message is required",
+                err_type="invalid_request_error",
+                code="invalid_messages",
+            )
+        try:
+            decision = runtime.decide(request.messages)
+            entry, provider = runtime.provider_for(decision.model)
+        except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502 + log row
+            # The likeliest production failure: an unset api_key_env or a failing embed call.
+            # Without this guard it surfaces as a bare text/plain 500 with no log row.
+            logger.error("routing/provider setup for %s failed: %s", runtime.name, exc)
+            runtime.log.append(
+                RequestLogRecord(
+                    id=f"chatcmpl-{uuid.uuid4().hex}",
+                    ts=datetime.now(tz=UTC).isoformat(),
+                    endpoint=runtime.name,
+                    model="",
+                    provider_model="",
+                    routing_reason="error-before-routing",
+                    status="error",
+                    error_message=str(exc),
+                )
+            )
+            return _error_response(
+                502,
+                f"endpoint setup failed ({type(exc).__name__})",
+                err_type="api_error",
+                code="routing_error",
+            )
         system, turns = _split_for_provider(request.messages)
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
@@ -323,7 +441,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 completion = provider.complete(
                     system,
                     turns,
-                    temperature=request.temperature if request.temperature is not None else 0.7,
+                    temperature=request.temperature if request.temperature is not None else 1.0,
                     max_tokens=request.output_budget(),
                 )
             except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
@@ -362,6 +480,13 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             )
 
         if not isinstance(provider, StreamingProvider):
+            # A real endpoint-level failure: keep one-record-per-request intact.
+            _record(
+                TokenUsage(),
+                ttfb_ms=None,
+                status="error",
+                error_message=f"pool model '{entry.name}' has no native streaming backend",
+            )
             return _error_response(
                 501,
                 f"pool model '{entry.name}' has no native streaming backend",
@@ -372,7 +497,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             upstream = provider.stream(
                 system,
                 turns,
-                temperature=request.temperature if request.temperature is not None else 0.7,
+                temperature=request.temperature if request.temperature is not None else 1.0,
                 max_tokens=request.output_budget(),
             )
             first = next(upstream, None)

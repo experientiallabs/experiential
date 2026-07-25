@@ -159,10 +159,13 @@ class BedrockProvider:
         raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
         data = cast("_BedrockResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
+        # Anthropic-native semantics: cache reads reported BESIDE input_tokens; normalize to
+        # TokenUsage's cached-as-subset contract by summing.
+        cache_read = data["usage"].get("cache_read_input_tokens", 0)
         usage = TokenUsage(
-            input_tokens=data["usage"]["input_tokens"],
+            input_tokens=data["usage"]["input_tokens"] + cache_read,
             output_tokens=data["usage"]["output_tokens"],
-            cached_input_tokens=data["usage"].get("cache_read_input_tokens", 0),
+            cached_input_tokens=cache_read,
         )
         return Completion(text=text, usage=usage)
 
@@ -200,19 +203,29 @@ class BedrockProvider:
             kwargs["system"] = [{"text": system}]
         response = self._get_client().converse_stream(**kwargs)
         usage = TokenUsage()
-        for event in response["stream"]:
-            if "contentBlockDelta" in event:
-                text = event["contentBlockDelta"]["delta"].get("text", "")
-                if text:
-                    yield StreamChunk(delta=text)
-            elif "metadata" in event:
-                event_usage = event["metadata"].get("usage")
-                if event_usage is not None:
-                    usage = TokenUsage(
-                        input_tokens=int(event_usage["inputTokens"]),
-                        output_tokens=int(event_usage["outputTokens"]),
-                        cached_input_tokens=int(event_usage.get("cacheReadInputTokens", 0) or 0),
-                    )
+        stream = response["stream"]
+        try:
+            for event in stream:
+                if "contentBlockDelta" in event:
+                    text = event["contentBlockDelta"]["delta"].get("text", "")
+                    if text:
+                        yield StreamChunk(delta=text)
+                elif "metadata" in event:
+                    event_usage = event["metadata"].get("usage")
+                    if event_usage is not None:
+                        # Converse reports cacheReadInputTokens beside inputTokens; normalize
+                        # to the cached-as-subset contract.
+                        cache_read = int(event_usage.get("cacheReadInputTokens", 0) or 0)
+                        usage = TokenUsage(
+                            input_tokens=int(event_usage["inputTokens"]) + cache_read,
+                            output_tokens=int(event_usage["outputTokens"]),
+                            cached_input_tokens=cache_read,
+                        )
+        finally:
+            # botocore's EventStream pins the HTTP connection until closed.
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
         yield StreamChunk(done=True, usage=usage)
 
     def _complete_converse(
@@ -238,10 +251,11 @@ class BedrockProvider:
         response = self._get_client().converse(**kwargs)
         blocks = response["output"]["message"]["content"]
         text = "".join(block["text"] for block in blocks if "text" in block)
+        cache_read = int(response["usage"].get("cacheReadInputTokens", 0) or 0)
         usage = TokenUsage(
-            input_tokens=int(response["usage"]["inputTokens"]),
+            input_tokens=int(response["usage"]["inputTokens"]) + cache_read,
             output_tokens=int(response["usage"]["outputTokens"]),
-            cached_input_tokens=int(response["usage"].get("cacheReadInputTokens", 0) or 0),
+            cached_input_tokens=cache_read,
         )
         return Completion(text=text, usage=usage)
 

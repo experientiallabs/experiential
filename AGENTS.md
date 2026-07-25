@@ -65,7 +65,7 @@ uv run pytest -q
 
 ## Harness optimization
 
-- `wmh optimize <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
+- `wmh optimize harness <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
   harness-creation workflow. Keep CLI wiring in `wmh/cli/harness_app.py` and search behavior in
   `wmh/harness/create.py` (world-model delta search) or `wmh/harness/population.py` plus
   `wmh/harness/project_proposer.py` (the `harbor` environment's complete-source population
@@ -83,7 +83,7 @@ uv run pytest -q
 - Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
   deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
   promotion or rollback.
-- `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize --tasks` currently
+- `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize harness --tasks` currently
   requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
 - Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,
   `proposer_test.py`, and the scenario builder or verification tests as applicable.

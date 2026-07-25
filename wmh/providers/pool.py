@@ -23,7 +23,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmh.providers.base import Provider, ProviderConfig, ProviderKind, TokenUsage
 from wmh.providers.registry import get_provider
@@ -37,7 +37,13 @@ Tier = Literal["frontier", "open"]
 
 
 class PoolEntry(BaseModel):
-    """One candidate model. `name` is the stable handle policy artifacts and request logs key on."""
+    """One candidate model. `name` is the stable handle policy artifacts and request logs key on.
+
+    `extra="forbid"`: a typo like `api_key_evn` must fail at load, not surface as a 401 at
+    request time with no hint (same policy as `.wmh/fallback.toml`'s rungs).
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1)
     kind: ProviderKind
@@ -62,6 +68,13 @@ class PoolEntry(BaseModel):
             raise ValueError(
                 f"pool model '{self.name}': '{self.model}' has no built-in price; add "
                 "input_per_mtok and output_per_mtok (USD per 1M tokens) to its pool entry"
+            )
+        if self.kind is ProviderKind.AZURE_OPENAI and self.deployment is None:
+            # Without this the entry loads fine and the first request routed to it 500s
+            # from AzureOpenAIProvider._deployment(); load is the validation boundary.
+            raise ValueError(
+                f"pool model '{self.name}': azure entries need `deployment` (the Azure "
+                "deployment name to call)"
             )
         return self
 

@@ -257,12 +257,22 @@ def test_create_app_mounts_endpoints_from_policies(tmp_path: Path) -> None:
     assert [m["id"] for m in body["data"]] == ["tau-bench"]
 
 
-def test_create_app_without_policies_has_no_chat_routes(tmp_path: Path) -> None:
+def test_create_app_without_policies_serves_empty_model_list(tmp_path: Path) -> None:
+    # A client wired up before any policy is fitted gets an empty list and an OpenAI-shaped
+    # "no endpoint" error, never a bare 404 on the whole /v1 surface.
     from wmh.serving.server import create_app
 
     app = create_app(artifact_dirs=(str(tmp_path),), world_models={})
     client = TestClient(app)
-    assert client.get("/v1/models").status_code == 404
+    models = client.get("/v1/models")
+    assert models.status_code == 200
+    assert models.json()["data"] == []
+    chat = client.post(
+        "/v1/chat/completions",
+        json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert chat.status_code == 404
+    assert chat.json()["error"]["code"] == "model_not_found"
 
 
 def test_provider_failure_logs_error_and_502s(tmp_path: Path) -> None:
