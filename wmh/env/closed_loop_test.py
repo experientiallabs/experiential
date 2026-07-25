@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from wmh.core.types import Action, EnvState, Observation
@@ -157,3 +159,17 @@ def test_scenario_ids_fall_back_to_task_hash() -> None:
         provider_factory=_ScriptedProvider,
     )
     assert rerun.scenario_ids() == [scenario_id]
+
+
+def test_wrong_typed_score_yields_unscored_row_with_reason() -> None:
+    # A last_score that isn't an EpisodeScore must not silently become an
+    # unscored-with-no-error row: unscored rows always say why (outcomes contract).
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(cast("EpisodeScore", {"reward": 1.0})),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=_ScriptedProvider,
+    )
+    outcome = matrix.outcomes[0]
+    assert outcome.reward is None
+    assert outcome.error is not None and "not EpisodeScore" in outcome.error

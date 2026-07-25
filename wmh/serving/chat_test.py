@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from fastapi import FastAPI
@@ -25,6 +26,7 @@ from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import Any
 
     from wmh.providers.base import ProviderConfig
 
@@ -293,3 +295,67 @@ def test_provider_failure_logs_error_and_502s(tmp_path: Path) -> None:
     row = json.loads(log_path.read_text().splitlines()[0])
     assert row["status"] == "error"
     assert "upstream on fire" in row["error_message"]
+
+
+def test_abandoned_stream_still_records_metering(tmp_path: Path) -> None:
+    # A client that disconnects mid-stream closes the generator; the upstream call still
+    # consumed tokens, so a request-log row must land anyway (D-METERING: no silent loss).
+    class _EndlessProvider(_EchoProvider):
+        def stream(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Iterator[StreamChunk]:
+            for _ in range(1_000_000):  # far more than any client buffer; never finishes
+                yield StreamChunk(delta="x")
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=_EndlessProvider,
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+
+    # Drive the ASGI app directly: after the request body, `receive` reports
+    # http.disconnect, which is what starlette listens for to cancel a StreamingResponse
+    # and close its body iterator (GeneratorExit in the generator).
+    body = json.dumps(
+        {"model": "tau-bench", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+    ).encode()
+    state = {"request_sent": False}
+
+    async def receive() -> dict[str, object]:
+        if not state["request_sent"]:
+            state["request_sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        return None
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/chat/completions",
+        "raw_path": b"/v1/chat/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("test", 0),
+        "server": ("test", 80),
+    }
+    asyncio.run(app(cast("Any", scope), cast("Any", receive), cast("Any", send)))
+
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "error"
+    assert "disconnected" in rows[0]["error_message"]

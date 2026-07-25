@@ -180,3 +180,13 @@ def test_cost_usd_without_cache_price_bills_cached_tokens_at_full_rate() -> None
     )
     usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cached_input_tokens=400_000)
     assert entry.cost_usd(usage) == pytest.approx(10.0)  # honest fallback, never free
+
+
+def test_bedrock_entry_pins_region() -> None:
+    entry = PoolEntry(
+        name="opus-4-8",
+        kind=ProviderKind.BEDROCK,
+        model="us.anthropic.claude-opus-4-8",
+        region="us-east-1",
+    )
+    assert entry.provider_config().region == "us-east-1"

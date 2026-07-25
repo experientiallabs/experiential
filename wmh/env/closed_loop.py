@@ -127,12 +127,19 @@ def evaluate_pool(
                 env = env_factory()
                 result = run_episode(env, agent, scenario.task, max_steps=max_steps)
                 score = getattr(env, "last_score", None)
-                if score is None and result.error is None:
+                error = result.error
+                if score is None and error is None:
                     raise ValueError(
                         "env produced no episode score; evaluate_pool needs a scoring env "
                         "(e.g. WorldModelEnv(world_model, score_on_close=True))"
                     )
-                if not isinstance(score, EpisodeScore):
+                if score is not None and not isinstance(score, EpisodeScore):
+                    # An unscored row must always say WHY (the outcomes contract); a wrong-typed
+                    # score silently becoming reward=None/error=None would violate it.
+                    error = error or (
+                        f"env last_score is {type(score).__name__}, not EpisodeScore; "
+                        "episode left unscored"
+                    )
                     score = None
                 outcome = ScenarioOutcome(
                     scenario_id=sid,
@@ -148,7 +155,7 @@ def evaluate_pool(
                     cost_usd=entry.cost_usd(timed.usage),
                     call_seconds=timed.call_seconds,
                     replies=timed.replies,
-                    error=result.error,
+                    error=error,
                 )
                 outcomes.append(outcome)
                 if on_outcome is not None:

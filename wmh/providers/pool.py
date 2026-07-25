@@ -45,6 +45,7 @@ class PoolEntry(BaseModel):
     endpoint: str | None = None
     deployment: str | None = None  # Azure deployment name
     api_version: str | None = None  # Azure api-version
+    region: str | None = None  # AWS Bedrock region (bedrock entries only)
     api_key_env: str | None = None  # env var holding this entry's API key (multi-account pools)
     tier: Tier = "frontier"
     input_per_mtok: float | None = None
@@ -104,6 +105,7 @@ class PoolEntry(BaseModel):
             endpoint=self.endpoint,
             deployment=self.deployment,
             api_version=self.api_version,
+            region=self.region,
         )
 
 

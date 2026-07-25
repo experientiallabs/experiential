@@ -19,6 +19,7 @@ cache-aware routing model.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -32,6 +33,7 @@ from typing import TYPE_CHECKING, Literal
 from fastapi import APIRouter, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from wmh.optimize.policy import RoutingDecision, RoutingPolicy, select_model
 from wmh.providers.base import (
@@ -325,10 +327,13 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     max_tokens=request.output_budget(),
                 )
             except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
+                # Full detail goes to the request log and server log only: upstream exception
+                # text can carry internal endpoints/stack info (CodeQL: information exposure).
                 _record(TokenUsage(), ttfb_ms=None, status="error", error_message=str(exc))
+                logger.error("upstream call for %s failed: %s", entry.name, exc)
                 return _error_response(
                     502,
-                    f"upstream model call failed: {exc}",
+                    f"upstream model call failed ({type(exc).__name__})",
                     err_type="api_error",
                     code="upstream_error",
                 )
@@ -373,13 +378,21 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             first = next(upstream, None)
         except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
             _record(TokenUsage(), ttfb_ms=None, status="error", error_message=str(exc))
+            logger.error("stream start for %s failed: %s", entry.name, exc)
             return _error_response(
                 502,
-                f"upstream model call failed: {exc}",
+                f"upstream model call failed ({type(exc).__name__})",
                 err_type="api_error",
                 code="upstream_error",
             )
         ttfb_ms = (time.monotonic() - started) * 1000
+
+        # Shared with _finalize: a disconnecting client makes starlette CANCEL the stream
+        # without ever closing the sync generator, so cleanup inside the generator (finally,
+        # GeneratorExit) never runs on that path. The BackgroundTask below is the only hook
+        # that fires on both normal completion and disconnect.
+        stream_state = {"recorded": False}
+        partial_usage = TokenUsage()
 
         def _events() -> Iterator[str]:
             yield _sse(
@@ -388,7 +401,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 )
             )
             parts: list[str] = []
-            usage = TokenUsage()
+            usage = partial_usage
             try:
                 chunk = first
                 while chunk is not None:
@@ -407,6 +420,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                         )
                     chunk = next(upstream, None)
             except Exception as exc:  # noqa: BLE001 - response already started; log and end
+                stream_state["recorded"] = True
                 _record(usage, ttfb_ms=ttfb_ms, status="error", error_message=str(exc))
                 logger.error("stream from %s failed mid-response: %s", entry.name, exc)
                 yield "data: [DONE]\n\n"
@@ -429,12 +443,34 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 )
             yield "data: [DONE]\n\n"
             runtime.remember(request.messages, "".join(parts), decision.model)
+            stream_state["recorded"] = True
             _record(usage, ttfb_ms=ttfb_ms)
+
+        def _finalize() -> None:
+            """Runs after the response ends, HOWEVER it ends (starlette BackgroundTask).
+
+            An abandoned stream still consumed upstream tokens: leaving it unrecorded would
+            be silent usage loss (D-METERING). Also closes the upstream iterator, which the
+            cancelled threadpool iteration otherwise leaks.
+            """
+            close = getattr(upstream, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+            if not stream_state["recorded"]:
+                stream_state["recorded"] = True
+                _record(
+                    partial_usage,
+                    ttfb_ms=ttfb_ms,
+                    status="error",
+                    error_message="client disconnected mid-stream",
+                )
 
         return StreamingResponse(
             _events(),
             media_type="text/event-stream",
             headers={**headers, "Cache-Control": "no-cache"},
+            background=BackgroundTask(_finalize),
         )
 
     return router
