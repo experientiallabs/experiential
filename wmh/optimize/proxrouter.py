@@ -69,6 +69,11 @@ class ProxPolicy(BaseModel):
     references: list[ProxReference]
     tau_inv: float = 20.0  # 1/tau; the paper's experimental value
     knn_k: int = 100  # kNN-Prox: nonzero prior on this many nearest references
+    # Neighborhood rule for knn-prox: "fixed" = the paper's k nearest; "relative" = r1's
+    # adaptive rule (keep references whose similarity exceeds rag_thres times the knn_k-th
+    # best), which lets dense regions widen and sparse regions shrink the evidence set.
+    neighbor_rule: str = "fixed"
+    rag_thres: float = 0.95
     default_model: str  # fallback for degenerate inputs; also the guard baseline's home
     cost_scale: float = 0.0  # fit-set mean cost per scored episode (the lambda unit)
     # Empirical-Bayes shrinkage (r2 extension, NOT in the paper): each reference's per-model
@@ -268,8 +273,16 @@ class ProxScorer:
         priors = self.priors.copy()
         if self.policy.kind == "knn-prox":
             k = min(self.policy.knn_k, len(priors))
-            cutoff = np.partition(distance, k - 1)[k - 1]
-            priors = np.where(distance <= cutoff, priors, 0.0)
+            if self.policy.neighbor_rule == "relative":
+                sims = 1.0 - distance
+                kth = np.partition(sims, len(sims) - k)[len(sims) - k]
+                keep = sims > self.policy.rag_thres * kth
+                if not keep.any():
+                    keep = sims >= sims.max()
+                priors = np.where(keep, priors, 0.0)
+            else:
+                cutoff = np.partition(distance, k - 1)[k - 1]
+                priors = np.where(distance <= cutoff, priors, 0.0)
         # exp(-phi/tau) with the max shifted out for numerical safety; the shift cancels in
         # the per-model normalization.
         logits = -self.policy.tau_inv * distance
