@@ -96,9 +96,32 @@ def answers_match(gold: str, predicted: str | None) -> bool:
     """
     if predicted is None:
         return False
-    if normalize(gold) == normalize(predicted):
+    left = normalize(gold)
+    right = normalize(predicted)
+    if left == right:
         return True
-    return normalize(gold.rsplit("=", 1)[-1]) == normalize(predicted.rsplit("=", 1)[-1])
+    # AIME gold answers are zero-padded to three digits ('025'), while models
+    # answer '25'. Observed live: 4 of GLM-5.2's 8 apparent AIME errors were
+    # only this. Integers are compared by VALUE, which is unambiguous.
+    if _as_int(left) is not None and _as_int(left) == _as_int(right):
+        return True
+    tail_gold = normalize(gold.rsplit("=", 1)[-1])
+    tail_pred = normalize(predicted.rsplit("=", 1)[-1])
+    if tail_gold == tail_pred:
+        return True
+    return _as_int(tail_gold) is not None and _as_int(tail_gold) == _as_int(tail_pred)
+
+
+def _as_int(text: str) -> int | None:
+    """The integer a normalized answer denotes, or None when it is not one."""
+    stripped = text.lstrip("+")
+    candidate = stripped[1:] if stripped.startswith("-") else stripped
+    if not candidate or not candidate.isdigit():
+        return None
+    try:
+        return int(stripped)
+    except ValueError:  # pragma: no cover - isdigit already guarantees this parses
+        return None
 
 
 def _jsonl_rows(repo: str, filename: str) -> list[dict[str, str]]:
