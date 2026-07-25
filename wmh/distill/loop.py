@@ -1230,6 +1230,33 @@ def _teacher_rows(
     return rows, _batch_reverse_kl(datums, rows)
 
 
+def _require_span_recording_provider(config: ProviderConfig, *, purpose: str, remedy: str) -> None:
+    """Refuse a rollout provider that cannot record the tokens `purpose` trains on.
+
+    Only the Tinker provider reports the exact token ids it sampled
+    (`wmh.distill.agents`), and every training datum is built from those ids, so
+    any batch whose tokens become datums must sample Tinker. Generation-only
+    batches (the gate's teacher holdout baseline) are exempt and never call
+    this. Checked BEFORE the batch runs, so a provider that cannot be trained on
+    costs nothing instead of yielding a batch of span-less trials.
+
+    Args:
+        config: The provider config the batch is about to sample.
+        purpose: What would train on the spans, named in the error message.
+        remedy: The configuration fix, appended to the error message.
+
+    Raises:
+        ValueError: If the provider kind is not tinker.
+    """
+    if config.kind is ProviderKind.TINKER:
+        return
+    raise ValueError(
+        f"{purpose} train on exact sampled token spans, which only the Tinker "
+        f"provider records, but {config.model!r} is provider kind "
+        f"{config.kind.value!r}; {remedy}"
+    )
+
+
 class _RunBudget:
     """This session's `BudgetMeter` plus the USD prior sessions already spent.
 
@@ -1460,10 +1487,35 @@ class _DistillRun:
         return self._sampler.provider_config(self._cfg.student.base_model)
 
     def _teacher_provider(self) -> ProviderConfig:
+        """The provider config teacher-in-harness episodes sample the teacher through.
+
+        Keyed by `teacher.backend`, because the two teachers are reached over
+        different transports: a `tinker` teacher samples through the Tinker
+        service like the student, while an `openai_compat` teacher is a served
+        OpenAI-compatible chat endpoint (`wmh.providers.openai` points the client
+        at `config.endpoint` and authenticates with `WMH_ENDPOINT_API_KEY`, never
+        `OPENAI_API_KEY`). A served teacher cannot score the student's token ids,
+        which is the whole reason the cross-tokenizer path exists, but it can
+        GENERATE, and generation is all a teacher-in-harness episode needs (the
+        gate's holdout baseline is verifier rewards, not tokens).
+        """
+        teacher = self._cfg.teacher
+        if teacher.backend == "tinker":
+            return ProviderConfig(
+                kind=ProviderKind.TINKER,
+                model=self._teacher_identity,
+                model_type=teacher.model,
+            )
         return ProviderConfig(
-            kind=ProviderKind.TINKER,
-            model=self._teacher_identity,
-            model_type=self._cfg.teacher.model,
+            kind=ProviderKind.OPENAI,
+            model=teacher.model,
+            model_type=teacher.model,
+            # TeacherConfig validation guarantees an endpoint for this backend.
+            endpoint=teacher.endpoint,
+            # Every OpenAI-compatible server (vLLM, Fireworks) accepts `max_tokens`,
+            # while `max_completion_tokens` is a newer OpenAI-only spelling some of
+            # them reject outright; the endpoint is never real OpenAI here.
+            chat_max_tokens_field="max_tokens",
         )
 
     def _log_sample_rollouts(
@@ -1501,6 +1553,18 @@ class _DistillRun:
         """
         cfg = self._cfg
         self._emit("preflight", "running preflight checks before any spend")
+        if cfg.warmup.steps > 0:
+            # Warmup SFT trains on the TEACHER's own sampled tokens, so a teacher
+            # that records no spans would silently produce zero warmup datums.
+            _require_span_recording_provider(
+                self._teacher_provider(),
+                purpose="supervised warmup passes",
+                remedy=(
+                    "set teacher.backend = 'tinker' to warm up on a Tinker teacher's "
+                    "trajectories, or leave warmup.steps = 0 (the default) so the run "
+                    "goes straight to on-policy steps"
+                ),
+            )
         tokenizer = self._training.get_tokenizer()
         # The renderer must exist for the base model before any trial runs; the
         # tokenizer satisfies the renderer's slice at runtime (rendering.py makes
@@ -2085,8 +2149,17 @@ class _DistillRun:
             step=step,
         )
         sampler_path = self._sampler.sampler_path
+        student = self._student_provider()
+        _require_span_recording_provider(
+            student,
+            purpose="on-policy distillation steps",
+            remedy=(
+                "sample the student through Tinker (student.base_model must be a Tinker "
+                "catalog model, sampled from this run's tinker:// sampler path)"
+            ),
+        )
         records, roll_stats = collect_rollouts(
-            step, batch, cfg, self._harness, self._student_provider(), self._run_dir
+            step, batch, cfg, self._harness, student, self._run_dir
         )
         self._charge_rollout_billing(batch_billing(records), teacher=False)
         self._log_sample_rollouts(kind="train", name=f"step-{step:04d}", step=step, records=records)
