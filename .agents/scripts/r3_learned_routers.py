@@ -1248,6 +1248,87 @@ def cmd_nested_cv(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
                 )
 
 
+def cmd_statz(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
+    """Head-to-head climb: irt2 PROPOSES, neighbor evidence CERTIFIES (r1's stat guard).
+
+    Pick = argmax(calibrated irt2 P - lam*penalty). Certification: over the pick's k=50
+    nearest fit neighbors (3-large cosine when cached, else hashing; relative threshold
+    0.95 like r1), paired per-neighbor reward deltas (pick minus baseline) must clear
+    z standard errors (z=0.5, doubled when the pick is pricier; revert below 8 pairs).
+    Hypothesis: if irt2 proposals beat kNN's profile-argmax anywhere, this exceeds r1's
+    champion; if picks converge to r1's, the P family is irrelevant behind the stat guard.
+    """
+    z_base = 0.5
+    for name, matrix in matrices.items():
+        model_names = matrix.model_names()
+        cell: dict[tuple[str, str], list[float]] = {}
+        for o in matrix.outcomes:
+            if o.reward is not None:
+                cell.setdefault((o.scenario_id, o.model), []).append(o.reward)
+        oai_cache = DATA / "cache" / f"{name}-oai3l-tasks.npy"
+        for seed in seeds:
+            ctx = SplitContext(name, matrix, seed)
+            cal, _vb, _e, meta = _fit_irt2(ctx, matrix)
+            if oai_cache.exists():
+                by_sid = cached_oai_vecs(name, matrix)
+                fit_n = np.stack([by_sid[s] for s in ctx.fit_ids])
+                te_n = np.stack([by_sid[s] for s in ctx.test_ids])
+                nbr_embed = "oai"
+            else:
+                fit_n, te_n, nbr_embed = ctx.fit_vecs, ctx.test_vecs, EMBED_KIND
+            sims_all = te_n @ fit_n.T  # both L2-normalized
+            cost_scale = sum(ctx.costs.values()) / len(ctx.costs)
+            pen = np.asarray([ctx.costs.get(m, cost_scale) / cost_scale for m in model_names])
+            base_cost = ctx.costs.get(ctx.best_name, cost_scale)
+            k = min(50, len(ctx.fit_ids))
+            for lam in [0.0, 0.01, 0.02]:
+                scores = cal - lam * pen
+                pick_idx = np.argmax(scores, axis=1)
+                picks, certified = [], 0
+                for t in range(len(ctx.test_ids)):
+                    pick = model_names[int(pick_idx[t])]
+                    if pick == ctx.best_name:
+                        picks.append(pick)
+                        continue
+                    sims = sims_all[t]
+                    kth = np.sort(sims)[-k]
+                    nbr = np.where(sims > 0.95 * kth)[0]
+                    deltas = []
+                    for j in nbr:
+                        sid = ctx.fit_ids[int(j)]
+                        pv = cell.get((sid, pick))
+                        bv = cell.get((sid, ctx.best_name))
+                        if pv and bv:
+                            deltas.append(float(np.mean(pv)) - float(np.mean(bv)))
+                    z_need = 2 * z_base if ctx.costs.get(pick, 0.0) > base_cost else z_base
+                    ok = False
+                    if len(deltas) >= 8:
+                        arr = np.asarray(deltas)
+                        se = float(arr.std(ddof=1) / np.sqrt(len(arr)))
+                        ok = se > 0 and float(arr.mean()) / se >= z_need
+                    picks.append(pick if ok else ctx.best_name)
+                    certified += int(ok)
+                record(
+                    matrix_name=name,
+                    matrix=matrix,
+                    variant="r3-irt2-statz",
+                    params={
+                        **meta,
+                        "lam": lam,
+                        "z": z_base,
+                        "nbr_embed": nbr_embed,
+                        "certified": certified,
+                    },
+                    split_seed=seed,
+                    fit_ids=ctx.fit_ids,
+                    test_ids=ctx.test_ids,
+                    picks=dict(zip(ctx.test_ids, picks, strict=True)),
+                    best_eval=ctx.best_eval,
+                    best_name=ctx.best_name,
+                    oracle_acc=ctx.oracle_acc,
+                )
+
+
 def cmd_adaptive(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
     """Q4: n-aware guard margin max(0.03, c/sqrt(n_fit)) on irt2 (Platt'd P).
 
@@ -1485,6 +1566,7 @@ def main() -> None:
             "coverage",
             "nested",
             "nested-cv",
+            "statz",
         ],
     )
     parser.add_argument("--matrices", nargs="*", default=None)
@@ -1512,6 +1594,7 @@ def main() -> None:
         "coverage": cmd_coverage,
         "nested": cmd_nested,
         "nested-cv": cmd_nested_cv,
+        "statz": cmd_statz,
     }
     commands[args.command](matrices, args.seeds)
     logger.info("runs -> %s", RUNS)
