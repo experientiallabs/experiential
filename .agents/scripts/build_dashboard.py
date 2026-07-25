@@ -24,7 +24,8 @@ TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root{--ink:#0a0a0a;--muted:#6b6b6b;--grid:#ececec;--surface:#ffffff;
---c0:#0070f3;--c1:#b8770a;--c2:#7928ca;--c3:#0d9488;--c4:#ee0000;--other:#9a9a9a}
+--c0:#0070f3;--c1:#b8770a;--c2:#7928ca;--c3:#0d9488;--c4:#ee0000;--c5:#c2007a;
+--other:#9a9a9a}
 *{box-sizing:border-box}
 body{margin:0;background:var(--surface);color:var(--ink);
 font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;padding:32px 40px 80px}
@@ -104,8 +105,9 @@ const VARIANT_INFO = {
  'irt': 'No clusters: learn a small report card per model (what it\u2019s good at) and a difficulty score per question, then predict who passes - like matching students to exam questions. Needs much less data. (IrtNet, arXiv 2510.00844)',
  'jisi': 'Find the most similar past tasks, throw out false matches (neighbors where models answered very differently from the rest - looked alike, wasn\u2019t alike), then route to whoever did best on what remains. (JiSi proxy mode, arXiv 2601.01330)',
  'static': 'A fixed hand-picked model for everything.',
+ 'bo2-free': 'Does not choose a model from the question at all: runs ONE model twice and keeps the better attempt — the one that finished rather than running out of steps, and did more work getting there. Costs 2x per request, so it only switches on when doubling up beat the single best model on the fit data by a clear margin; otherwise it falls back to one call. Judging which attempt is better is free (no extra model call), and uses only how the attempt ran, never its score.',
 };
-const VC = {"best-single":"var(--c0)","rank":"var(--c1)","rank-tilt":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)"};
+const VC = {"best-single":"var(--c0)","rank":"var(--c1)","rank-tilt":"var(--c1)","irt":"var(--c2)","jisi":"var(--c3)","static":"var(--c4)","bo2-free":"var(--c5)"};
 const HOLLOW = new Set(["rank-tilt"]); // same hue family as rank, hollow marks = the tilt variant
 const tip = document.getElementById('tip');
 const pop = document.getElementById('pop');

@@ -184,19 +184,77 @@ def _selected_reward(
     return sum(picked) / len(picked)
 
 
+def best_of_n_by_model(
+    matrix: OutcomeMatrix,
+    ids: Sequence[str] | None = None,
+    *,
+    baseline_accuracy: float,
+    baseline_cost: float,
+    selector: str = DEFAULT_SELECTOR,
+    depth: int | None = None,
+) -> list[BestOfNBound]:
+    """Per-model best-of-n ceiling and achievable point over `ids` (all scenarios when None).
+
+    This is the primitive behind both `corpus_bounds` (which passes the whole matrix) and the
+    fit-split model discovery a deployable best-of-n router needs (which passes only fit ids, so
+    the chosen model is never selected on test data). Returns [] when the subset has no cell
+    sampled more than once, i.e. best-of-n is undefined there.
+
+    `depth` defaults to the modal episode count over the subset: cells carrying fewer episodes are
+    skipped for that model (reported in `cells`) rather than padded, so the ceiling is never
+    inflated by a model that happened to be sampled more often. `beats_best_single_accuracy`
+    compares the ACHIEVABLE point against `baseline_accuracy`, not the oracle.
+    """
+    key = SELECTOR_KEYS[selector]
+    cells = scored_cells(matrix)
+    wanted = set(ids) if ids is not None else {sid for sid, _ in cells}
+    cells = {(sid, model): episodes for (sid, model), episodes in cells.items() if sid in wanted}
+    if not cells:
+        return []
+    scenario_ids = sorted({sid for sid, _ in cells})
+    models = sorted({model for _, model in cells})
+    if depth is None:
+        depth = st.mode(len(episodes) for episodes in cells.values())
+    if depth < 2:
+        return []
+
+    bounds: list[BestOfNBound] = []
+    for model in models:
+        present = [cells[(sid, model)] for sid in scenario_ids if (sid, model) in cells]
+        full = [episodes for episodes in present if len(episodes) >= depth]
+        if not full:
+            continue
+        oracle_rewards = [
+            max(o.reward for o in episodes[:depth] if o.reward is not None) for episodes in full
+        ]
+        oracle_costs = [sum(o.cost_usd for o in episodes[:depth]) for episodes in full]
+        selected_rewards = [_selected_reward(episodes[:depth], key) for episodes in full]
+        oracle_cost = sum(oracle_costs) / len(oracle_costs)
+        selected_accuracy = sum(selected_rewards) / len(selected_rewards)
+        bounds.append(
+            BestOfNBound(
+                model=model,
+                cells=len(full),
+                episodes=depth,
+                one_shot_accuracy=sum(_cell_reward(e) for e in present) / len(present),
+                one_shot_cost_per_call=sum(_cell_cost(e) for e in present) / len(present),
+                oracle_of_n_accuracy=sum(oracle_rewards) / len(oracle_rewards),
+                oracle_of_n_cost_per_call=oracle_cost,
+                selected_of_n_accuracy=selected_accuracy,
+                beats_best_single_accuracy=selected_accuracy > baseline_accuracy,
+                beats_best_single_cost=oracle_cost < baseline_cost,
+            )
+        )
+    bounds.sort(key=lambda bound: -bound.selected_of_n_accuracy)
+    return bounds
+
+
 def corpus_bounds(
     matrix: OutcomeMatrix,
     corpus: str,
     selector: str = DEFAULT_SELECTOR,
 ) -> CorpusBounds:
-    """Anchors + per-model best-of-n ceiling and achievable point for one matrix.
-
-    `n` is the modal episode count: cells carrying fewer episodes are skipped for that model's
-    bound (reported in `cells`) rather than padded, so the ceiling is never inflated by a model
-    that happened to be sampled more often. `selector` names the free within-cell selector used for
-    the achievable point.
-    """
-    key = SELECTOR_KEYS[selector]
+    """Anchors + per-model best-of-n ceiling and achievable point for one whole matrix."""
     cells = scored_cells(matrix)
     if not cells:
         raise ValueError(f"matrix '{corpus}' has no scored outcomes")
@@ -231,41 +289,12 @@ def corpus_bounds(
         if len(episodes) > 1
     ]
 
-    # n = the modal episode count, i.e. the depth the corpus was actually sampled at.
-    depth = st.mode(len(episodes) for episodes in cells.values())
-    bounds: list[BestOfNBound] = []
-    if depth > 1:
-        for model in models:
-            full = [
-                cells[(sid, model)]
-                for sid in scenario_ids
-                if (sid, model) in cells and len(cells[(sid, model)]) >= depth
-            ]
-            if not full:
-                continue
-            oracle_rewards = [
-                max(o.reward for o in episodes[:depth] if o.reward is not None) for episodes in full
-            ]
-            oracle_costs = [sum(o.cost_usd for o in episodes[:depth]) for episodes in full]
-            oracle_accuracy = sum(oracle_rewards) / len(oracle_rewards)
-            oracle_cost = sum(oracle_costs) / len(oracle_costs)
-            selected_rewards = [_selected_reward(episodes[:depth], key) for episodes in full]
-            selected_accuracy = sum(selected_rewards) / len(selected_rewards)
-            bounds.append(
-                BestOfNBound(
-                    model=model,
-                    cells=len(full),
-                    episodes=depth,
-                    one_shot_accuracy=mean_reward(model),
-                    one_shot_cost_per_call=mean_cost(model),
-                    oracle_of_n_accuracy=oracle_accuracy,
-                    oracle_of_n_cost_per_call=oracle_cost,
-                    selected_of_n_accuracy=selected_accuracy,
-                    beats_best_single_accuracy=selected_accuracy > best_accuracy,
-                    beats_best_single_cost=oracle_cost < best_cost,
-                )
-            )
-        bounds.sort(key=lambda bound: -bound.selected_of_n_accuracy)
+    bounds = best_of_n_by_model(
+        matrix,
+        baseline_accuracy=best_accuracy,
+        baseline_cost=best_cost,
+        selector=selector,
+    )
 
     return CorpusBounds(
         corpus=corpus,

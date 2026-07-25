@@ -18,6 +18,7 @@ from wmh.research.posthoc_bounds import (
     DEFAULT_SELECTOR,
     SELECTOR_KEYS,
     all_finished,
+    best_of_n_by_model,
     corpus_bounds,
     feature_correlations,
     one_finished,
@@ -117,6 +118,32 @@ def test_corpus_bounds_anchors_and_ceiling() -> None:
     assert pricey.oracle_of_n_accuracy == pytest.approx(1.0)
     assert pricey.beats_best_single_accuracy is True
     assert pricey.beats_best_single_cost is False
+
+
+def test_best_of_n_by_model_restricts_to_the_given_scenarios() -> None:
+    """The fit-split discovery path: only `ids` may inform the choice, never held-out scenarios."""
+    matrix = _matrix()
+    fit_only = best_of_n_by_model(matrix, ["s0"], baseline_accuracy=0.0, baseline_cost=1.0)
+    by_model = {bound.model: bound for bound in fit_only}
+    assert by_model["cheap"].cells == 1
+    # s0 alone: cheap's episodes are (0.0, 1.0), so oracle-of-2 is 1.0 where the full matrix gave
+    # 0.5. A discovery step that leaked s1 in would not see this number.
+    assert by_model["cheap"].oracle_of_n_accuracy == pytest.approx(1.0)
+    assert by_model["pricey"].oracle_of_n_accuracy == pytest.approx(1.0)
+    # Baselines are passed in, so the flags reflect the caller's reference, not the subset's own.
+    assert all(bound.beats_best_single_accuracy for bound in fit_only)
+
+
+def test_best_of_n_by_model_is_empty_without_repeated_episodes() -> None:
+    outcomes = [
+        _episode("s0", "cheap", 0, 1.0, steps=1, cost=0.001),
+        _episode("s1", "cheap", 0, 0.0, steps=1, cost=0.001),
+    ]
+    matrix = OutcomeMatrix(pool=_pool(), outcomes=outcomes)
+    assert best_of_n_by_model(matrix, baseline_accuracy=0.5, baseline_cost=0.001) == []
+    # An explicit depth of 1 is still best-of-nothing, so it is rejected rather than silently
+    # reporting 1-shot numbers as a best-of-n row.
+    assert best_of_n_by_model(_matrix(), baseline_accuracy=0.5, baseline_cost=0.01, depth=1) == []
 
 
 def test_default_selector_reaches_the_ceiling_when_effort_tracks_reward() -> None:
