@@ -1068,6 +1068,186 @@ def cmd_coverage(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
                     )
 
 
+def cmd_nested(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
+    """Round 3a: coverage chosen on the VAL split (nested; kills the post-hoc caveat).
+
+    Selection rule, self-gating by design: for each lam, pick the LARGEST coverage q whose
+    paired val delta (routed reward minus baseline reward, per val scenario) has
+    mean - z*SE >= 0 (z=1). Tiny val splits (wm corpora) produce huge SEs, so q*=0 and the
+    router reverts to best-single by construction; no separate n-floor constant needed.
+    """
+    qs = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+    for name, matrix in matrices.items():
+        model_names = matrix.model_names()
+        cell: dict[tuple[str, str], list[float]] = {}
+        for o in matrix.outcomes:
+            if o.reward is not None:
+                cell.setdefault((o.scenario_id, o.model), []).append(o.reward)
+
+        def cell_mean(sid: str, model: str, cell: dict = cell) -> float | None:
+            vals = cell.get((sid, model))
+            return float(np.mean(vals)) if vals else None
+
+        for seed in seeds:
+            ctx = SplitContext(name, matrix, seed)
+            tr_rows, va_rows = val_split(ctx)
+            tr_ids = [ctx.fit_ids[i] for i in tr_rows]
+            va_ids = [ctx.fit_ids[i] for i in va_rows]
+            tr_vecs, va_vecs = ctx.fit_vecs[tr_rows], ctx.fit_vecs[va_rows]
+            q, mi, y = pairs_for(matrix, tr_ids, tr_vecs)
+            vq, vmi, vy = pairs_for(matrix, va_ids, va_vecs)
+            v_rows, v_mis, v_ys = scored_triples(matrix, va_ids)
+            params, _tc, vc = fit_irt_cfg(q, mi, y, len(model_names), (vq, vmi, vy), IRT2)
+            v_pred = np.clip(irt_probs(params, va_vecs)[v_rows, v_mis], 1e-6, 1 - 1e-6)
+            a, b_ = platt(np.log(v_pred / (1 - v_pred)), v_ys)
+            cal_va = _platt_apply(a, b_, irt_probs(params, va_vecs))
+            cal_te = _platt_apply(a, b_, irt_probs(params, ctx.test_vecs))
+            cost_scale = sum(ctx.costs.values()) / len(ctx.costs)
+            pen = np.asarray([ctx.costs.get(m, cost_scale) / cost_scale for m in model_names])
+            base_idx = model_names.index(ctx.best_name)
+            for lam in [0.01, 0.02]:
+                # Val-side confidence ordering and paired deltas.
+                s_va = cal_va - lam * pen
+                pick_va = np.argmax(s_va, axis=1)
+                gap_va = s_va[np.arange(len(s_va)), pick_va] - s_va[:, base_idx]
+                order_va = np.argsort(-gap_va)
+                deltas = np.zeros(len(va_ids))
+                known = np.zeros(len(va_ids), dtype=bool)
+                for r, sid in enumerate(va_ids):
+                    routed_r = cell_mean(sid, model_names[int(pick_va[r])])
+                    base_r = cell_mean(sid, ctx.best_name)
+                    if routed_r is not None and base_r is not None:
+                        deltas[r] = routed_r - base_r
+                        known[r] = True
+                q_star = 0.0
+                for cov in qs:
+                    top = order_va[: int(round(cov * len(order_va)))]
+                    d = deltas[top][known[top]]
+                    if len(d) < 8:
+                        continue  # too few paired val observations to certify
+                    lcb = float(np.mean(d)) - float(np.std(d, ddof=1) / np.sqrt(len(d)))
+                    if lcb >= 0:
+                        q_star = cov
+                # Apply q_star on test.
+                s_te = cal_te - lam * pen
+                pick_te = np.argmax(s_te, axis=1)
+                gap_te = s_te[np.arange(len(s_te)), pick_te] - s_te[:, base_idx]
+                order_te = np.argsort(-gap_te)
+                routed = set(order_te[: int(round(q_star * len(order_te)))].tolist())
+                picks = [
+                    model_names[int(pick_te[t])] if t in routed else ctx.best_name
+                    for t in range(len(ctx.test_ids))
+                ]
+                record(
+                    matrix_name=name,
+                    matrix=matrix,
+                    variant="r3-cov-nested",
+                    params={"lam": lam, "q_star": q_star, "val_n": int(known.sum())},
+                    split_seed=seed,
+                    fit_ids=ctx.fit_ids,
+                    test_ids=ctx.test_ids,
+                    picks=dict(zip(ctx.test_ids, picks, strict=True)),
+                    best_eval=ctx.best_eval,
+                    best_name=ctx.best_name,
+                    oracle_acc=ctx.oracle_acc,
+                )
+
+
+def cmd_nested_cv(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
+    """Round 3a': coverage selection on 5-fold OUT-OF-FOLD predictions over the full fit.
+
+    Same LCB rule as cmd_nested, but the selection set is every fit scenario's
+    out-of-fold calibrated P (each fold predicted by a model trained on the other four,
+    with its own inner 15% val for early stop + Platt), ~6.7x more selection data than
+    the single val split. Final routing model = irt2 on the full fit (round-1 protocol).
+    """
+    qs = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+    folds = 5
+    for name, matrix in matrices.items():
+        model_names = matrix.model_names()
+        cell: dict[tuple[str, str], list[float]] = {}
+        for o in matrix.outcomes:
+            if o.reward is not None:
+                cell.setdefault((o.scenario_id, o.model), []).append(o.reward)
+
+        def cell_mean(sid: str, model: str, cell: dict = cell) -> float | None:
+            vals = cell.get((sid, model))
+            return float(np.mean(vals)) if vals else None
+
+        for seed in seeds:
+            ctx = SplitContext(name, matrix, seed)
+            n_fit = len(ctx.fit_ids)
+            rng = np.random.default_rng(3000 + seed)
+            fold_of = rng.permutation(n_fit) % folds
+            oof = np.zeros((n_fit, len(model_names)))
+            for fold in range(folds):
+                tr = np.where(fold_of != fold)[0]
+                ho = np.where(fold_of == fold)[0]
+                inner_tr, inner_va = val_split_rows(len(tr))
+                tr_ids = [ctx.fit_ids[i] for i in tr[inner_tr]]
+                va_ids = [ctx.fit_ids[i] for i in tr[inner_va]]
+                q, mi, y = pairs_for(matrix, tr_ids, ctx.fit_vecs[tr[inner_tr]])
+                vq, vmi, vy = pairs_for(matrix, va_ids, ctx.fit_vecs[tr[inner_va]])
+                params, _tc, _vc = fit_irt_cfg(q, mi, y, len(model_names), (vq, vmi, vy), IRT2)
+                v_rows, v_mis, v_ys = scored_triples(matrix, va_ids)
+                v_pred = np.clip(
+                    irt_probs(params, ctx.fit_vecs[tr[inner_va]])[v_rows, v_mis],
+                    1e-6,
+                    1 - 1e-6,
+                )
+                a, b_ = platt(np.log(v_pred / (1 - v_pred)), v_ys)
+                oof[ho] = _platt_apply(a, b_, irt_probs(params, ctx.fit_vecs[ho]))
+            # Final model on the full fit (standard irt2 protocol).
+            cal_te, _vb, _e, meta = _fit_irt2(ctx, matrix)
+            cost_scale = sum(ctx.costs.values()) / len(ctx.costs)
+            pen = np.asarray([ctx.costs.get(m, cost_scale) / cost_scale for m in model_names])
+            base_idx = model_names.index(ctx.best_name)
+            for lam in [0.01, 0.02]:
+                s_of = oof - lam * pen
+                pick_of = np.argmax(s_of, axis=1)
+                gap_of = s_of[np.arange(n_fit), pick_of] - s_of[:, base_idx]
+                order_of = np.argsort(-gap_of)
+                deltas = np.zeros(n_fit)
+                known = np.zeros(n_fit, dtype=bool)
+                for r, sid in enumerate(ctx.fit_ids):
+                    routed_r = cell_mean(sid, model_names[int(pick_of[r])])
+                    base_r = cell_mean(sid, ctx.best_name)
+                    if routed_r is not None and base_r is not None:
+                        deltas[r] = routed_r - base_r
+                        known[r] = True
+                q_star = 0.0
+                for cov in qs:
+                    top = order_of[: int(round(cov * n_fit))]
+                    d = deltas[top][known[top]]
+                    if len(d) < 8:
+                        continue
+                    lcb = float(np.mean(d)) - float(np.std(d, ddof=1) / np.sqrt(len(d)))
+                    if lcb >= 0:
+                        q_star = cov
+                s_te = cal_te - lam * pen
+                pick_te = np.argmax(s_te, axis=1)
+                gap_te = s_te[np.arange(len(s_te)), pick_te] - s_te[:, base_idx]
+                order_te = np.argsort(-gap_te)
+                routed = set(order_te[: int(round(q_star * len(order_te)))].tolist())
+                picks = [
+                    model_names[int(pick_te[t])] if t in routed else ctx.best_name
+                    for t in range(len(ctx.test_ids))
+                ]
+                record(
+                    matrix_name=name,
+                    matrix=matrix,
+                    variant="r3-cov-nested-cv",
+                    params={"lam": lam, "q_star": q_star, "sel_n": int(known.sum())},
+                    split_seed=seed,
+                    fit_ids=ctx.fit_ids,
+                    test_ids=ctx.test_ids,
+                    picks=dict(zip(ctx.test_ids, picks, strict=True)),
+                    best_eval=ctx.best_eval,
+                    best_name=ctx.best_name,
+                    oracle_acc=ctx.oracle_acc,
+                )
+
+
 def cmd_adaptive(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
     """Q4: n-aware guard margin max(0.03, c/sqrt(n_fit)) on irt2 (Platt'd P).
 
@@ -1303,6 +1483,8 @@ def main() -> None:
             "adaptive",
             "ensemble",
             "coverage",
+            "nested",
+            "nested-cv",
         ],
     )
     parser.add_argument("--matrices", nargs="*", default=None)
@@ -1328,6 +1510,8 @@ def main() -> None:
         "adaptive": cmd_adaptive,
         "ensemble": cmd_ensemble,
         "coverage": cmd_coverage,
+        "nested": cmd_nested,
+        "nested-cv": cmd_nested_cv,
     }
     commands[args.command](matrices, args.seeds)
     logger.info("runs -> %s", RUNS)
