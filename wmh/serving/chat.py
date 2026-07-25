@@ -36,7 +36,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, JsonValue, field_validator
 from starlette.background import BackgroundTask
 
-from wmh.optimize.policy import RoutingDecision, RoutingPolicy, select_model
+from wmh.optimize.policy import Embedder, RoutingDecision, RoutingPolicy, select_model
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
     Message,
@@ -245,6 +245,7 @@ class EndpointRuntime:
         self.log = log
         self._provider_factory = provider_factory
         self._providers: dict[str, Provider] = {}
+        self._policy_embedder: Embedder | None = None
         self._affinity: OrderedDict[str, str] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -254,7 +255,25 @@ class EndpointRuntime:
             with self._lock:
                 incumbent = self._affinity.get(_fingerprint(messages[:-1]))
         text = _routable_text(messages)
-        return select_model(self.policy, text, incumbent=incumbent)
+        return select_model(self.policy, text, incumbent=incumbent, embedder=self._embedder())
+
+    def _embedder(self) -> Embedder | None:
+        """Build the policy's embedder once per runtime, not once per request.
+
+        An azure spec otherwise constructs a fresh SDK client (TLS handshake and all) inside
+        every request's latency budget. Double-checked locking mirrors provider_for.
+        """
+        if self.policy.embedder is None:
+            return None
+        with self._lock:
+            embedder = self._policy_embedder
+        if embedder is None:
+            embedder = self.policy.embedder.build()
+            with self._lock:
+                if self._policy_embedder is None:
+                    self._policy_embedder = embedder
+                embedder = self._policy_embedder
+        return embedder
 
     def remember(self, messages: list[ChatMessage], assistant_text: str, model: str) -> None:
         """Record the finished exchange so the conversation's next request finds its incumbent."""

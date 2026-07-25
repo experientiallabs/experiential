@@ -445,3 +445,26 @@ def test_knn_policy_routes_a_request_end_to_end(tmp_path: Path) -> None:
     assert [row["model"] for row in rows] == ["fable-5", "haiku-4-5"]
     assert rows[0]["routing_reason"].startswith("knn: ")
     assert rows[0]["cluster_id"] is None  # a knn decision cites neighbors, not clusters
+
+
+def test_runtime_builds_the_policy_embedder_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An azure embedder spec would otherwise construct a fresh SDK client per request.
+    from wmh.optimize.policy import EmbedderSpec
+
+    builds = {"n": 0}
+    original = EmbedderSpec.build
+
+    def counting_build(self: EmbedderSpec) -> object:
+        builds["n"] += 1
+        return original(self)
+
+    monkeypatch.setattr(EmbedderSpec, "build", counting_build)
+    client, _ = _client(tmp_path, policy=_cluster_policy())
+    for _ in range(3):
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert builds["n"] == 1
