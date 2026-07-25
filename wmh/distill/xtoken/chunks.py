@@ -235,12 +235,17 @@ def _chunk_totals(
     datum: TrainDatum,
     plan: ChunkPlan,
     teacher_logprobs: Sequence[float | None],
-    clip: float,
+    clip: float | None,
 ) -> tuple[list[float], int] | None:
     """Per-chunk clipped totals for one datum, or None when the teacher row fails.
 
     Returns `(totals, clipped)` where `totals[i]` is chunk i's contribution
     after per-token clipping, and `clipped` counts chunks that hit the bound.
+
+    `clip` of None disables clipping entirely and reports zero clipped chunks,
+    which is what `train.advantage_clip = None` means. The same-tokenizer lane
+    made that field optional, so typing it as a bare float here would raise
+    TypeError on a perfectly valid config rather than train unclipped.
     """
     totals: list[float] = []
     clipped_count = 0
@@ -267,7 +272,7 @@ def _chunk_totals(
         # Divide by the STUDENT length so the chunk's total influence is
         # exactly its reverse-KL gap (see the module docstring).
         per_token = (teacher_sum - student_sum) / chunk.student_len
-        bounded = min(max(per_token, -clip), clip)
+        bounded = per_token if clip is None else min(max(per_token, -clip), clip)
         if bounded != per_token:
             clipped_count += 1
         totals.append(bounded * chunk.student_len)
