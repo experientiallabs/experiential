@@ -13,6 +13,16 @@ from pydantic import BaseModel
 from wmh.core.types import Trace
 
 
+class SourceCredentialError(PermissionError):
+    """A source rejected the supplied credentials (API key, DSN password).
+
+    Adapters raise this instead of bare `PermissionError` so the streaming ingest can map it
+    to the `bad_credentials` wire code without misclassifying OS-level permission failures
+    (e.g. an unreadable local file) as credential problems. Subclassing `PermissionError`
+    keeps it a stdlib type: callers never need a driver import to catch it.
+    """
+
+
 class VendorPull(BaseModel):
     """Parameters for pulling traces from an observability vendor's API or a database."""
 

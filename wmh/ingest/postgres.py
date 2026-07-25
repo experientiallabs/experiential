@@ -34,7 +34,12 @@ import re
 from pydantic import JsonValue
 
 from wmh.core.types import Trace
-from wmh.ingest.adapter import VendorPull, get_adapter, register_adapter
+from wmh.ingest.adapter import (
+    SourceCredentialError,
+    VendorPull,
+    get_adapter,
+    register_adapter,
+)
 from wmh.ingest.base import BaseTraceAdapter
 from wmh.ingest.detect import detect_format
 from wmh.ingest.normalize import SpanRecord
@@ -185,7 +190,7 @@ class PostgresAdapter(BaseTraceAdapter):
         except psycopg.OperationalError as exc:
             message = str(exc).strip()
             if "authentication" in message or "password" in message:
-                raise PermissionError(f"postgres authentication failed: {message}") from exc
+                raise SourceCredentialError(f"postgres authentication failed: {message}") from exc
             raise ConnectionError(f"could not connect to postgres: {message}") from exc
         rows: list[tuple[str | None, JsonValue]] = []
         for fetched_row in fetched:

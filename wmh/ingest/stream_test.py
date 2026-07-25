@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from wmh.ingest.adapter import SourceCredentialError
 from wmh.ingest.stream import (
     DetectedEvent,
     DoneEvent,
@@ -133,11 +134,29 @@ def test_event_json_matches_pinned_contract_shapes() -> None:
 
 
 def test_driver_failures_classify_to_credentials_and_unreachable() -> None:
-    """The postgres adapter raises stdlib PermissionError/ConnectionError; codes must map."""
-    assert _classify(PermissionError("postgres authentication failed")).code is (
+    """Adapters raise SourceCredentialError/ConnectionError; codes must map."""
+    assert _classify(SourceCredentialError("postgres authentication failed")).code is (
         ErrorCode.BAD_CREDENTIALS
     )
     assert _classify(ConnectionError("could not connect")).code is ErrorCode.UNREACHABLE
+
+
+def test_unreadable_file_is_bad_format_not_bad_credentials(tmp_path: Path) -> None:
+    """An OS PermissionError (unreadable local file) must not render "check your credentials".
+
+    Regression (Greptile P1): bare PermissionError was mapped to bad_credentials, so a
+    chmod-000 upload told the user their API key was wrong.
+    """
+    assert _classify(PermissionError("denied")).code is ErrorCode.BAD_FORMAT
+    src = tmp_path / "locked.json"
+    src.write_text('{"messages": []}', encoding="utf-8")
+    src.chmod(0)
+    try:
+        (event,) = list(ingest_events(file=str(src), out=tmp_path / "o.jsonl"))
+    finally:
+        src.chmod(0o644)
+    assert isinstance(event, ErrorEvent)
+    assert event.code is ErrorCode.BAD_FORMAT
 
 
 def test_file_ingest_honors_limit(tmp_path: Path) -> None:

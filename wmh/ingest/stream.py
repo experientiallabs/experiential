@@ -25,7 +25,7 @@ import httpx
 from pydantic import BaseModel
 
 from wmh.core.types import JsonObject, Trace
-from wmh.ingest.adapter import VendorPull, get_adapter
+from wmh.ingest.adapter import SourceCredentialError, VendorPull, get_adapter
 from wmh.ingest.base import BaseTraceAdapter, load_payloads
 from wmh.ingest.detect import detect_format
 from wmh.ingest.normalize import SpanRecord, group_spans, trace_from_group
@@ -115,9 +115,11 @@ def _classify(exc: Exception) -> _IngestFailure:
         return _IngestFailure(ErrorCode.UNREACHABLE, f"the source returned an error: {exc}")
     if isinstance(exc, httpx.TransportError):
         return _IngestFailure(ErrorCode.UNREACHABLE, f"could not reach the source: {exc}")
-    # The postgres adapter re-raises driver failures as stdlib exceptions so no psycopg import is
-    # needed here; order matters, both are OSError subclasses.
-    if isinstance(exc, PermissionError):
+    # Adapters raise SourceCredentialError/ConnectionError (both stdlib subclasses, no driver
+    # import needed here) for source-side failures; order matters, both are OSError subclasses.
+    # A BARE PermissionError (an unreadable local file) is deliberately NOT a credential error:
+    # it falls through to the OSError branch as bad_format.
+    if isinstance(exc, SourceCredentialError):
         return _IngestFailure(ErrorCode.BAD_CREDENTIALS, str(exc))
     if isinstance(exc, ConnectionError):
         return _IngestFailure(ErrorCode.UNREACHABLE, str(exc))
