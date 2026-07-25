@@ -92,14 +92,18 @@ def fit_km_prox(
     seed: int = 42,
     tau_inv: float = 20.0,
     fitted_from: str | None = None,
+    precomputed: np.ndarray | None = None,
 ) -> ProxPolicy:
     """Fit the KMeans-reference ProxRouter (paper defaults: K=32, 1/tau=20).
 
     Clustering mirrors `fit_rank_policy` exactly (k-means++ / elkan / max_iter=1000 / seeded)
     so KM-Prox vs rank comparisons isolate the scoring rule, not the clustering.
+    `precomputed` (rows aligned to `fit_ids`) bypasses the spec's embedder: the offline path
+    for embedding backends EmbedderSpec cannot rebuild yet (research runs only; the policy
+    then cannot serve without the same vectors).
     """
     spec = embedder or EmbedderSpec()
-    scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec)
+    scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec, precomputed=precomputed)
 
     k = min(n_clusters, len(scenario_ids))
     kmeans = KMeans(
@@ -172,14 +176,16 @@ def fit_knn_prox(
     knn_k: int = 100,
     tau_inv: float = 20.0,
     fitted_from: str | None = None,
+    precomputed: np.ndarray | None = None,
 ) -> ProxPolicy:
     """Fit the kNN-reference ProxRouter (paper defaults: k=100, 1/tau=20).
 
     Every fit scenario becomes one reference with a uniform prior; the k-nearest cutoff is
     applied at decision time (`ProxScorer`), so the artifact stays split-independent.
+    `precomputed` as in `fit_km_prox`.
     """
     spec = embedder or EmbedderSpec()
-    scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec)
+    scenario_ids, embeddings = _fit_embeddings(matrix, fit_ids, spec, precomputed=precomputed)
     stats = _reference_stats(matrix, {sid: index for index, sid in enumerate(scenario_ids)})
     tasks: dict[str, str] = {}
     for outcome in matrix.outcomes:
@@ -250,8 +256,8 @@ class ProxScorer:
                 self.costs = (counts * local_c + m * global_c[None, :]) / (counts + m)
         self.known = ~np.isnan(self.rewards)  # [R, M]
 
-    def estimates(self, query: np.ndarray) -> tuple[dict[str, float], dict[str, float], int]:
-        """Per-model (U_hat reward, U_hat cost) plus the nearest reference's index."""
+    def _weights(self, query: np.ndarray) -> tuple[np.ndarray, int]:
+        """Tilted aggregation weights over references for one query, plus the nearest index."""
         query = np.asarray(query, dtype=np.float64)
         norm = float(np.linalg.norm(query))
         if norm > 0:
@@ -268,8 +274,11 @@ class ProxScorer:
         # the per-model normalization.
         logits = -self.policy.tau_inv * distance
         tilt = np.exp(logits - logits.max())
-        weights = priors * tilt  # [R]
+        return priors * tilt, priors, nearest
 
+    def estimates(self, query: np.ndarray) -> tuple[dict[str, float], dict[str, float], int]:
+        """Per-model (U_hat reward, U_hat cost) plus the nearest reference's index."""
+        weights, _priors, nearest = self._weights(query)
         masked = np.where(self.known, weights[:, None], 0.0)  # [R, M]
         denom = masked.sum(axis=0)  # [M]
         rewards = np.where(denom > 0, np.nansum(self.rewards * masked, axis=0), np.nan)
@@ -296,15 +305,36 @@ class ProxScorer:
         lam: float = 0.0,
         guard_model: str | None = None,
         guard_margin: float = 0.0,
+        guard_z: float | None = None,
+        min_pairs: float = 8.0,
     ) -> RoutingDecision:
         """Argmax of U_hat = reward - lam * cost / cost_scale, with the baseline guard.
 
-        The guard is the shared protocol: the pick must beat `guard_model`'s estimated score
-        by `guard_margin` (doubled when the pick's estimated cost is higher), else the request
-        goes to the guard model. Guarding at decision time (not fit time) keeps the artifact
-        guard-free, so one fit serves any baseline.
+        Two guard modes against `guard_model`, applied when the argmax differs from it:
+
+        - Margin (default): the pick's score must beat the baseline's by `guard_margin`
+          (doubled when the pick's estimated cost is higher). Flat: blind to evidence volume.
+        - Paired z (when `guard_z` is set; overrides the margin): the mean of the
+          per-reference paired differences d_i = V_i^pick - V_i^base over the UNTILTED
+          neighborhood (the prior support: k nearest for knn, prior-weighted clusters for
+          km) must clear `guard_z` weighted standard errors (doubled when pricier), with the
+          effective sample size (sum w)^2 / sum w^2 at least `min_pairs`. The tilt proposes
+          (bias-reduced estimate), the neighborhood disposes (statistical power): testing
+          with the tilted weights would shrink the effective sample to the 2-3 nearest
+          references and revert everything. Support-aware: a wide gap on thin evidence
+          reverts, a modest gap on massive evidence routes.
+
+        Guarding at decision time (not fit time) keeps the artifact guard-free, so one fit
+        serves any baseline.
         """
-        rewards, costs, nearest = self.estimates(query)
+        weights, test_weights, nearest = self._weights(query)
+        masked = np.where(self.known, weights[:, None], 0.0)
+        denom = masked.sum(axis=0)
+        with np.errstate(invalid="ignore"):
+            reward_est = np.nansum(self.rewards * masked, axis=0) / np.where(denom > 0, denom, 1)
+            cost_est = np.nansum(self.costs * masked, axis=0) / np.where(denom > 0, denom, 1)
+        rewards = {m: float(reward_est[c]) for c, m in enumerate(self.models) if denom[c] > 0}
+        costs = {m: float(cost_est[c]) for c, m in enumerate(self.models) if denom[c] > 0}
         if not rewards:
             return RoutingDecision(
                 model=self.policy.default_model, reason="prox: no reference evidence"
@@ -315,12 +345,17 @@ class ProxScorer:
         pick = max(scores.items(), key=lambda kv: (kv[1], -pool_order[kv[0]]))[0]
         reason = f"{self.policy.kind}: value aggregation (1/tau={self.policy.tau_inv:g})"
         if guard_model is not None and pick != guard_model:
-            margin = guard_margin
-            if costs.get(pick, 0.0) > costs.get(guard_model, float("inf")):
-                margin = 2 * guard_margin
-            if scores.get(guard_model) is None or scores[pick] <= scores[guard_model] + margin:
-                pick = guard_model
-                reason = f"{self.policy.kind}: guard reverted to baseline"
+            pricier = costs.get(pick, 0.0) > costs.get(guard_model, float("inf"))
+            if guard_z is not None:
+                z = guard_z * (2 if pricier else 1)
+                if not self._paired_gap_clears(test_weights, pick, guard_model, z, min_pairs):
+                    pick = guard_model
+                    reason = f"{self.policy.kind}: z-guard reverted to baseline"
+            else:
+                margin = guard_margin * (2 if pricier else 1)
+                if scores.get(guard_model) is None or scores[pick] <= scores[guard_model] + margin:
+                    pick = guard_model
+                    reason = f"{self.policy.kind}: guard reverted to baseline"
         ref = self.policy.references[nearest]
         return RoutingDecision(
             model=pick,
@@ -329,9 +364,34 @@ class ProxScorer:
             reason=reason,
         )
 
+    def _paired_gap_clears(
+        self, weights: np.ndarray, pick: str, base: str, z: float, min_pairs: float
+    ) -> bool:
+        """Weighted paired test: does pick's gap over base clear z standard errors?"""
+        columns = {name: column for column, name in enumerate(self.models)}
+        if pick not in columns or base not in columns:
+            return False
+        pi, bi = columns[pick], columns[base]
+        mask = self.known[:, pi] & self.known[:, bi] & (weights > 0)
+        if not mask.any():
+            return False
+        w = weights[mask]
+        d = self.rewards[mask, pi] - self.rewards[mask, bi]
+        sw = float(w.sum())
+        n_eff = sw**2 / float((w**2).sum())
+        if n_eff < min_pairs:
+            return False
+        gap = float((w * d).sum() / sw)
+        variance = float((w * (d - gap) ** 2).sum() / sw)
+        se = (variance / n_eff) ** 0.5
+        return gap > z * se
+
 
 def _fit_embeddings(
-    matrix: OutcomeMatrix, fit_ids: list[str] | None, spec: EmbedderSpec
+    matrix: OutcomeMatrix,
+    fit_ids: list[str] | None,
+    spec: EmbedderSpec,
+    precomputed: np.ndarray | None = None,
 ) -> tuple[list[str], np.ndarray]:
     """Resolve fit scenario ids and their L2-normalized embeddings."""
     scenario_tasks: dict[str, str] = {}
@@ -346,7 +406,15 @@ def _fit_embeddings(
     if not scenario_tasks:
         raise ValueError("no scenarios to fit on")
     scenario_ids = list(scenario_tasks)
-    embeddings = np.asarray(spec.build().embed([scenario_tasks[sid] for sid in scenario_ids]))
+    if precomputed is not None:
+        if len(precomputed) != len(scenario_ids):
+            raise ValueError(
+                f"precomputed embeddings have {len(precomputed)} rows, "
+                f"need {len(scenario_ids)} (aligned to fit_ids)"
+            )
+        embeddings = np.asarray(precomputed, dtype=np.float64)
+    else:
+        embeddings = np.asarray(spec.build().embed([scenario_tasks[sid] for sid in scenario_ids]))
     return scenario_ids, Normalizer(norm="l2").fit_transform(embeddings)
 
 

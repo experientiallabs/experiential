@@ -208,6 +208,157 @@ class _Cell:
         }
 
 
+def _oai_vectors(name: str, matrix: OutcomeMatrix) -> dict[str, np.ndarray] | None:
+    """Cached text-embedding-3-large task vectors keyed by scenario id, or None if absent.
+
+    Cache rows follow each corpus matrix's `scenario_ids()` order (the convention shared
+    with r1's scripts and the locality diagnostic). wm-all reassembles from the per-corpus
+    caches with the corpus prefix.
+    """
+    cache = DATA / "cache"
+    if name == "wm-all":
+        out: dict[str, np.ndarray] = {}
+        for path in sorted((DATA / "matrices").glob("*_matrix.json")):
+            corpus = path.stem.removesuffix("_matrix")
+            if corpus == "routerbench-ours9":
+                continue
+            sub = OutcomeMatrix.load(path)
+            sids = sub.scenario_ids()
+            if len(sids) < MIN_SCENARIOS:
+                continue
+            npy = cache / f"{corpus}-oai3l-tasks.npy"
+            if not npy.exists():
+                return None
+            vecs = np.load(npy)
+            if len(vecs) != len(sids):
+                return None
+            for sid, vec in zip(sids, vecs, strict=True):
+                out[f"{corpus}:{sid}"] = vec
+        return out if set(matrix.scenario_ids()) <= out.keys() else None
+    npy = cache / f"{name}-oai3l-tasks.npy"
+    if not npy.exists():
+        return None
+    vecs = np.load(npy)
+    sids = matrix.scenario_ids()
+    if len(vecs) != len(sids):
+        return None
+    return dict(zip(sids, vecs, strict=True))
+
+
+def run_cell_exp3(
+    name: str, matrix: OutcomeMatrix, split_kind: str, seed: int, *, control: bool = False
+) -> None:
+    """Experiment 3: decision-time paired z-guard, hashing and 3-large embeddings.
+
+    Same guarded protocol; the z-guard replaces the flat margin (guard_z=0.5/1.0,
+    min_pairs=8 effective co-scored references). The -oai variants refit prox on the cached
+    3-large vectors (offline; serving parity is a pending master QUESTION).
+    """
+    cell = _Cell(name, matrix, split_kind, seed)
+    fit_ids, test_ids, spec = cell.fit_ids, cell.test_ids, cell.spec
+    best_name = cell.best_name
+
+    def picks_for(policy, vecs, **guard) -> dict[str, str]:  # noqa: ANN001, ANN003
+        scorer = ProxScorer(policy)
+        return {
+            sid: scorer.decide(vecs[row], guard_model=best_name, **guard).model
+            for row, sid in enumerate(test_ids)
+        }
+
+    knn = fit_knn_prox(
+        matrix,
+        fit_ids=fit_ids,
+        embedder=spec,
+        knn_k=KNN_K,
+        tau_inv=TAU_INV,
+        fitted_from=f"{name} {split_kind} s{seed}",
+    )
+    km = fit_km_prox(
+        matrix,
+        fit_ids=fit_ids,
+        embedder=spec,
+        n_clusters=PROX_K,
+        seed=42,
+        tau_inv=TAU_INV,
+        fitted_from=f"{name} {split_kind} s{seed}",
+    )
+    for variant, policy, z in (
+        ("knn-prox-z05", knn, 0.5),
+        ("knn-prox-z1", knn, 1.0),
+        ("km-prox-z05", km, 0.5),
+    ):
+        picks = picks_for(policy, cell.test_vecs, guard_z=z, min_pairs=8.0)
+        cell.record(
+            variant,
+            {"kind": policy.kind, "tau_inv": TAU_INV, "z": z, "min_pairs": 8, "guard": "z"},
+            evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+        )
+
+    oai = _oai_vectors(name, matrix)
+    if oai is not None:
+        fit_vecs = np.asarray([oai[sid] for sid in fit_ids], dtype=np.float64)
+        test_vecs = Normalizer(norm="l2").transform(
+            np.asarray([oai[sid] for sid in test_ids], dtype=np.float64)
+        )
+        knn_oai = fit_knn_prox(
+            matrix,
+            fit_ids=fit_ids,
+            embedder=spec,
+            knn_k=KNN_K,
+            tau_inv=TAU_INV,
+            fitted_from=f"{name} {split_kind} s{seed} oai3l",
+            precomputed=fit_vecs,
+        )
+        km_oai = fit_km_prox(
+            matrix,
+            fit_ids=fit_ids,
+            embedder=spec,
+            n_clusters=PROX_K,
+            seed=42,
+            tau_inv=TAU_INV,
+            fitted_from=f"{name} {split_kind} s{seed} oai3l",
+            precomputed=fit_vecs,
+        )
+        for variant, policy, guard in (
+            ("knn-prox-oai", knn_oai, {"guard_margin": GUARD_MARGIN}),
+            ("knn-prox-z05-oai", knn_oai, {"guard_z": 0.5, "min_pairs": 8.0}),
+            ("km-prox-z05-oai", km_oai, {"guard_z": 0.5, "min_pairs": 8.0}),
+        ):
+            picks = picks_for(policy, test_vecs, **guard)
+            cell.record(
+                variant,
+                {
+                    "kind": policy.kind,
+                    "embed": "oai3l",
+                    "tau_inv": TAU_INV,
+                    **{k: v for k, v in guard.items()},
+                },
+                evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+            )
+
+    # Leak control for the NEW guard semantics: shuffled labels + z-guard must collapse.
+    if control:
+        shuffled = _shuffled(matrix, seed=0)
+        s_best, _a, _c = best_single_model(shuffled, fit_ids=fit_ids, eval_ids=test_ids)
+        s_best_eval = evaluate_choices(shuffled, test_ids, lambda _sid: s_best)
+        policy = fit_knn_prox(
+            shuffled, fit_ids=fit_ids, embedder=spec, knn_k=KNN_K, tau_inv=TAU_INV
+        )
+        scorer = ProxScorer(policy)
+        picks = {
+            sid: scorer.decide(
+                cell.test_vecs[row], guard_model=s_best, guard_z=0.5, min_pairs=8.0
+            ).model
+            for row, sid in enumerate(test_ids)
+        }
+        cell.record(
+            "knn-prox-z05-shuffled",
+            {"control": "labels shuffled within model", "z": 0.5},
+            evaluate_choices(shuffled, test_ids, lambda sid, p=picks: p[sid]),
+            baseline=s_best_eval,
+        )
+
+
 def run_cell(
     name: str,
     matrix: OutcomeMatrix,
@@ -510,6 +661,7 @@ def main() -> None:
             seeds = [int(s) for s in arg.split("=", 1)[1].split(",")]
     quick = "--quick" in args
     exp2 = "--exp2" in args
+    exp3 = "--exp3" in args
 
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
@@ -519,7 +671,15 @@ def main() -> None:
             if split_kind == "ood-task" and not has_prefixes:
                 continue
             for seed in seeds:
-                if exp2:
+                if exp3:
+                    run_cell_exp3(
+                        name,
+                        matrix,
+                        split_kind,
+                        seed,
+                        control=(name == "routerbench-ours9" and split_kind == "iid" and seed == 0),
+                    )
+                elif exp2:
                     run_cell_exp2(name, matrix, split_kind, seed)
                 else:
                     run_cell(

@@ -173,6 +173,66 @@ def test_mild_shrinkage_keeps_strong_local_signal() -> None:
     assert rewards["alpha"] > rewards["beta"] + 0.2  # signal survives
 
 
+def test_z_guard_keeps_consistent_evidence_and_reverts_thin() -> None:
+    matrix = _matrix()
+    policy = fit_knn_prox(matrix, embedder=EmbedderSpec(dim=256), knn_k=8, tau_inv=5.0)
+    scorer = ProxScorer(policy)
+    query = _embed(policy.embedder, "solve the integral dx calculus")
+    # 8 co-scored neighbors, alpha beats beta on every math one: the gap clears any small z.
+    kept = scorer.decide(query, guard_model="beta", guard_z=0.5, min_pairs=2)
+    assert kept.model == "alpha"
+    # Demanding more effective pairs than the neighborhood carries must revert.
+    reverted = scorer.decide(query, guard_model="beta", guard_z=0.5, min_pairs=1000)
+    assert reverted.model == "beta"
+    assert "z-guard" in reverted.reason
+
+
+def test_z_guard_reverts_when_evidence_is_noise() -> None:
+    """Alternating rewards: mean gap ~0 with high variance cannot clear the z-test."""
+    outcomes = []
+    for index in range(12):
+        sid = f"t:{index}"
+        task = f"shared generic wording task number {index}"
+        alpha_wins = index % 2 == 0
+        outcomes += [
+            ScenarioOutcome(
+                scenario_id=sid,
+                task=task,
+                model="alpha",
+                reward=1.0 if alpha_wins else 0.0,
+                cost_usd=0.01,
+            ),
+            ScenarioOutcome(
+                scenario_id=sid,
+                task=task,
+                model="beta",
+                reward=0.0 if alpha_wins else 1.0,
+                cost_usd=0.01,
+            ),
+        ]
+    matrix = OutcomeMatrix(pool=_pool(), outcomes=outcomes)
+    policy = fit_knn_prox(matrix, embedder=EmbedderSpec(dim=256), knn_k=12, tau_inv=0.0)
+    scorer = ProxScorer(policy)
+    decision = scorer.decide(
+        _embed(policy.embedder, "shared generic wording task"),
+        guard_model="beta",
+        guard_z=0.5,
+        min_pairs=2,
+    )
+    assert decision.model == "beta"
+
+
+def test_precomputed_embeddings_match_spec_path() -> None:
+    matrix = _matrix()
+    spec = EmbedderSpec(dim=256)
+    fit_ids = sorted({o.scenario_id for o in matrix.outcomes})
+    tasks = {o.scenario_id: o.task for o in matrix.outcomes}
+    vecs = np.asarray(spec.build().embed([tasks[sid] for sid in fit_ids]))
+    via_spec = fit_knn_prox(matrix, fit_ids=fit_ids, embedder=spec, knn_k=4)
+    via_pre = fit_knn_prox(matrix, fit_ids=fit_ids, embedder=spec, knn_k=4, precomputed=vecs)
+    assert via_spec.references[0].vector == via_pre.references[0].vector
+
+
 def test_cost_lambda_prefers_cheaper_at_parity() -> None:
     """With rewards tied, any positive lambda must route to the cheaper model."""
     outcomes = []
