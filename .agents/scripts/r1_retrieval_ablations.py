@@ -61,6 +61,13 @@ class RetrievalParams(BaseModel):
     guard_margin: float = 0.03  # margin mode: doubled when the pick is pricier than baseline
     z: float = 0.5  # stat mode: required standard errors (doubled when pricier)
     min_pairs: int = 8  # stat mode: revert picks with fewer paired neighbors than this
+    # Variance floor for the stat guard: se_eff = max(se, sqrt(0.25/n_pairs)), the maximal
+    # binomial SE. Kills the small-bank failure where a lucky zero-variance neighborhood
+    # makes any mean_d > 0 look significant (pricier-and-worse picks on 18-item banks).
+    # Applied only below se_floor_max_pairs: a SMALL-SAMPLE correction (large-n empirical
+    # SE is reliable; flooring it there just taxes real wins).
+    se_floor: bool = False
+    se_floor_max_pairs: int = 30
     distance_floor: float | None = None  # abstain to baseline when max sim < floor
     sim_gamma: float = 1.0  # weight = sim^gamma (weighted mode); >1 sharpens toward near items
     smooth_alpha: float = 0.0  # Laplace pseudo-count toward the fit-global mean per model
@@ -337,6 +344,8 @@ def route(
                 guarded = True
         elif params.guard in ("stat", "stat_asym") and pick != best_name:
             mean_d, se, n_pairs = paired_stats(pick)
+            if params.se_floor and 0 < n_pairs < params.se_floor_max_pairs:
+                se = max(se, (0.25 / n_pairs) ** 0.5)
             pricier = mean_cost.get(pick, 0.0) > base_cost
             if params.guard == "stat_asym":
                 z_eff = params.z if pricier else -params.z

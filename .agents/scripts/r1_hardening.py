@@ -176,6 +176,138 @@ def _wm_all() -> OutcomeMatrix:
     return OutcomeMatrix(pool=pool, outcomes=pooled)
 
 
+def cmd_adaptive2(seeds: list[int]) -> None:
+    """H1 fix: adaptive rag + binomial SE floor (blocks lucky small-bank acceptances)."""
+    jobs: list[tuple[str, OutcomeMatrix]] = [
+        (
+            "routerbench-ours9",
+            OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json"),
+        ),
+        ("wm-all", _wm_all()),
+    ]
+    jobs += [(f"wm-{corpus}", _wm_matrix(corpus)) for corpus in WM_CORPORA]
+    for name, matrix in jobs:
+        ctx = MatrixContext(matrix, name, embed="openai", embed_replies=False)
+        for seed in seeds:
+            fit_ids, test_ids = _splits(matrix, "iid", seed)
+            best_name, _, _ = best_single_model(matrix, fit_ids=fit_ids, eval_ids=test_ids)
+            rag, min_pairs = adaptive_rag(len(fit_ids))
+            params = RetrievalParams(
+                second_route=False,
+                guard="stat",
+                z=0.5,
+                rag_num=rag,
+                min_pairs=min_pairs,
+                se_floor=True,
+            )
+            picks = _mod.route(ctx, params, fit_ids, test_ids, best_name)
+            _record(
+                matrix_name=name,
+                ctx=ctx,
+                split_kind="iid",
+                seed=seed,
+                fit_ids=fit_ids,
+                test_ids=test_ids,
+                best_name=best_name,
+                variant="r1-knn-adapt3-oai" if "--v3" in sys.argv else "r1-knn-adapt2-oai",
+                params={
+                    "guard": "stat",
+                    "z": 0.5,
+                    "rule": "rag=min(50,ceil(bank/2))",
+                    "se_floor": True,
+                },
+                picks=picks,
+                notes_extra=f"; rag={rag} min_pairs={min_pairs} bank={len(fit_ids)}",
+            )
+
+
+def cmd_crc_floor(seeds: list[int]) -> None:
+    """H3 fix candidate: CRC accept AND quantile floor (q=0.05); violations re-measured."""
+    matrix = OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json")
+    ctx = MatrixContext(matrix, "routerbench-ours9", embed="openai", embed_replies=False)
+    for kind in ("iid", "ood-cluster", "ood-task"):
+        for seed in seeds:
+            fit_ids, test_ids = _splits(matrix, kind, seed)
+            best_name, _, _ = best_single_model(matrix, fit_ids=fit_ids, eval_ids=test_ids)
+            rng = random.Random(7 * seed + 13)
+            shuffled = fit_ids[:]
+            rng.shuffle(shuffled)
+            n_cal = max(1, int(len(shuffled) * CAL_FRAC))
+            cal_ids, bank_ids = shuffled[:n_cal], shuffled[n_cal:]
+            params = RetrievalParams(second_route=False, guard="none")
+            cal_ev: dict[str, dict] = {}
+            _mod.route(ctx, params, bank_ids, cal_ids, best_name, evidence=cal_ev)
+            test_ev: dict[str, dict] = {}
+            test_raw = _mod.route(ctx, params, bank_ids, test_ids, best_name, evidence=test_ev)
+            bank = np.stack([ctx.task_vecs[sid] for sid in bank_ids])
+            self_nn = bank @ bank.T
+            np.fill_diagonal(self_nn, -1.0)
+            floor = float(np.quantile(self_nn.max(axis=1), 0.05))
+            cal_max = {s: float(np.max(bank @ ctx.task_vecs[s])) for s in cal_ids}
+            test_max = {s: float(np.max(bank @ ctx.task_vecs[s])) for s in test_ids}
+
+            def regret(sid: str, pick: str, best: str = best_name) -> float | None:
+                cp = ctx.rewards_cell.get((sid, pick))
+                cb = ctx.rewards_cell.get((sid, best))
+                if not cp or not cb:
+                    return None
+                return max(0.0, sum(cb) / len(cb) - sum(cp) / len(cp))
+
+            def accepted(
+                ev: dict,
+                lam: float | None,
+                sim: float,
+                best: str = best_name,
+                floor_value: float = floor,
+            ) -> bool:
+                return (
+                    ev["pick"] != best
+                    and lam is not None
+                    and sim >= floor_value
+                    and ev["mean_d"] > lam * ev["se"]
+                )
+
+            # The floor is part of the PREDICTOR now, so calibration losses see it too:
+            # the certificate is over the floored accept rule, not floored post hoc.
+            lam_hat = None
+            for lam in LAMBDA_GRID:
+                losses = [
+                    (regret(s, cal_ev[s]["pick"]) or 0.0)
+                    if accepted(cal_ev[s], lam, cal_max[s])
+                    else 0.0
+                    for s in cal_ids
+                ]
+                n = len(losses)
+                if n and (n / (n + 1)) * float(np.mean(losses)) + 1.0 / (n + 1) <= CRC_ALPHA:
+                    lam_hat = lam
+                    break
+            picks = {
+                s: test_raw[s] if accepted(test_ev[s], lam_hat, test_max[s]) else best_name
+                for s in test_ids
+            }
+            realized = [
+                r
+                for s in test_ids
+                if picks[s] != best_name and (r := regret(s, picks[s])) is not None
+            ]
+            risk = float(np.sum(realized)) / max(1, len(test_ids))
+            _record(
+                matrix_name="routerbench-ours9",
+                ctx=ctx,
+                split_kind=kind,
+                seed=seed,
+                fit_ids=fit_ids,
+                test_ids=test_ids,
+                best_name=best_name,
+                variant="r1-knn-crcfloor-a02-oai",
+                params={"alpha": CRC_ALPHA, "floor_q": 0.05},
+                picks=picks,
+                notes_extra=(
+                    f"; lambda_hat={lam_hat} floor={floor:.3f} realized_test_risk={risk:.4f}"
+                ),
+            )
+
+
 def cmd_adaptive(seeds: list[int]) -> None:
     """H1: the adaptive neighborhood rule across ours9 + wm corpora + wm-all + monopolies."""
     jobs: list[tuple[str, OutcomeMatrix]] = [
@@ -374,7 +506,13 @@ def cmd_crc(seeds: list[int]) -> None:
 def main() -> None:
     seeds = SEEDS if "--seeds" in sys.argv else [0]
     command = next((a for a in sys.argv[1:] if not a.startswith("--")), "adaptive")
-    {"adaptive": cmd_adaptive, "floor": cmd_floor, "crc": cmd_crc}[command](seeds)
+    {
+        "adaptive": cmd_adaptive,
+        "adaptive2": cmd_adaptive2,
+        "floor": cmd_floor,
+        "crc": cmd_crc,
+        "crc-floor": cmd_crc_floor,
+    }[command](seeds)
     logger.info("runs -> %s", RUNS)
 
 
