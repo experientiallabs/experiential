@@ -57,6 +57,9 @@ DATA = Path("~/Desktop/Projects/wmh-routing-data").expanduser()
 RUNS = DATA / "runs" / "r2.jsonl"
 CACHE = DATA / "cache" / "wm-oai3l-replies.npz"
 ALPHA = 1.0  # master's validated verifier recipe: full-dim ridge, alpha=1
+# Round 8b selection constraints (pre-registered in findings/r2.md before running):
+CAP_FACTOR = 0.85  # fit cost cap safety margin against fit->test cost drift (+8-15%)
+CHEAP_RATIO = 0.6  # a real cascade: cheap must cost <= this fraction of strong
 FOLDS = 5
 SEEDS = [0, 1, 2, 3, 4]
 MAX_CHARS = 28_000  # MUST match fit_reply_verifier.reply_text or cache hashes miss
@@ -155,6 +158,7 @@ def _select(
     best_name: str,
     *,
     scorer: dict[EpisodeKey, float] | None,
+    fixed_pair: tuple[str, str] | None = None,
 ) -> tuple[str, str, float, float, float] | None:
     """(cheap, strong, threshold, fit_acc, fit_cost) or None when the cascade declines.
 
@@ -169,7 +173,9 @@ def _select(
     model_cost = {
         m: _mean([costs[(sid, m)] for sid in fit_ids if (sid, m) in costs]) for m in models
     }
-    cap = _mean([costs[(sid, best_name)] for sid in fit_ids if (sid, best_name) in costs])
+    cap = CAP_FACTOR * _mean(
+        [costs[(sid, best_name)] for sid in fit_ids if (sid, best_name) in costs]
+    )
 
     def statistic(sid: str, cheap: str) -> float | None:
         if scorer is None:
@@ -178,11 +184,21 @@ def _select(
         values = [scorer[k] for k in keys if k in scorer]
         return _mean(values) if values else None
 
+    rng = np.random.default_rng(0)
+    resamples = [
+        [fit_ids[i] for i in rng.integers(0, len(fit_ids), size=len(fit_ids))]
+        for _ in range(200)
+    ]
+
     best = None
     for cheap in models:
         for strong in models:
-            if cheap == strong or model_cost.get(cheap, 0) >= model_cost.get(strong, 0):
+            if fixed_pair is not None and (cheap, strong) != fixed_pair:
                 continue
+            if cheap == strong:
+                continue
+            if model_cost.get(cheap, 0) > CHEAP_RATIO * model_cost.get(strong, 0):
+                continue  # lateral hop, not a cascade (round 8a lesson)
             stats = {sid: statistic(sid, cheap) for sid in fit_ids}
             known = [v for v in stats.values() if v is not None]
             if len(known) < len(fit_ids) * 0.5:
@@ -207,7 +223,25 @@ def _select(
                 if not accs:
                     continue
                 acc, cost = _mean(accs), _mean(costs_out)
-                if cost <= cap and (best is None or (acc, -cost) > (best[3], -best[4])):
+                if scorer is not None:
+                    # 8c robust cost check: bootstrap the fit scenarios; the 80th-percentile
+                    # cascade cost must clear the cap (mean caps do not survive the pooled
+                    # corpora's heavy-tailed per-scenario costs - the 8a/8b lesson).
+                    per_sid_cost = {}
+                    for sid in fit_ids:
+                        value = stats[sid]
+                        escalate = value is None or value < threshold
+                        cost_sid = costs.get((sid, cheap), model_cost.get(cheap, 0.0))
+                        if escalate:
+                            cost_sid += costs.get((sid, strong), model_cost.get(strong, 0.0))
+                        per_sid_cost[sid] = cost_sid
+                    boot = sorted(
+                        _mean([per_sid_cost[sid] for sid in sample]) for sample in resamples
+                    )
+                    cost_check = boot[int(0.8 * len(boot))]
+                else:
+                    cost_check = cost
+                if cost_check <= cap and (best is None or (acc, -cost) > (best[3], -best[4])):
                     best = (cheap, strong, threshold, acc, cost)
     return best
 
@@ -291,8 +325,12 @@ def run_matrix(name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle_onl
                     )
                 )
 
+        oracle_pair: tuple[str, str] | None = None
         for variant, scorer, shuffled in arms:
-            chosen = _select(matrix, fit_ids, best_name, scorer=scorer)
+            chosen = _select(
+                matrix, fit_ids, best_name, scorer=scorer,
+                fixed_pair=oracle_pair if scorer is not None else None,
+            )
             if chosen is None:
                 record(
                     variant,
@@ -302,6 +340,8 @@ def run_matrix(name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle_onl
                 )
                 continue
             cheap, strong, threshold, fit_acc, fit_cost = chosen
+            if scorer is None:
+                oracle_pair = (cheap, strong)  # fit-label pair choice, reused by real arms
 
             if scorer is None:
 
