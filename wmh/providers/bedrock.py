@@ -14,6 +14,7 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    StreamChunk,
     TokenUsage,
     VerifyResult,
     normalize_chat_temperature,
@@ -21,6 +22,8 @@ from wmh.providers.base import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from botocore.client import BaseClient
 
 # Bedrock speaks the same Anthropic Messages schema as the direct API, pinned by this version tag.
@@ -79,7 +82,14 @@ def _is_nova(model_id: str) -> bool:
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
+        if api_key is not None:
+            # Keeps the backend union uniformly constructible from get_provider while failing
+            # loudly: Bedrock has no API-key auth to send the credential to.
+            raise ValueError(
+                "Bedrock authenticates with AWS credentials (profile/role), not an API key; "
+                "drop api_key/api_key_env for this provider"
+            )
         self.config = config
         self._client: BaseClient | None = None
         # Model capability lives in WMH's canonical catalog. Subclasses may
@@ -162,6 +172,45 @@ class BedrockProvider:
         )
         raw = self._get_client().converse(**converse_request(normalized, self.config.model))
         return converse_response(raw, self.config.model)
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Stream a completion via ConverseStream (model-agnostic, Claude included).
+
+        Temperature is forwarded only when the model catalog says the model samples (Claude 4.8+
+        rejects sampling params), matching the non-streaming paths.
+        """
+        inference_config: dict[str, JsonValue] = {"maxTokens": max_tokens}
+        if self._forward_temperature:
+            inference_config["temperature"] = temperature
+        kwargs: dict[str, JsonValue] = {
+            "modelId": self.config.model,
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
+            "inferenceConfig": inference_config,
+        }
+        if system:
+            kwargs["system"] = [{"text": system}]
+        response = self._get_client().converse_stream(**kwargs)
+        usage = TokenUsage()
+        for event in response["stream"]:
+            if "contentBlockDelta" in event:
+                text = event["contentBlockDelta"]["delta"].get("text", "")
+                if text:
+                    yield StreamChunk(delta=text)
+            elif "metadata" in event:
+                event_usage = event["metadata"].get("usage")
+                if event_usage is not None:
+                    usage = TokenUsage(
+                        input_tokens=int(event_usage["inputTokens"]),
+                        output_tokens=int(event_usage["outputTokens"]),
+                    )
+        yield StreamChunk(done=True, usage=usage)
 
     def _complete_converse(
         self,
