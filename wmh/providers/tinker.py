@@ -10,6 +10,14 @@ ids, and per-token logprobs) into an optional `TokenRecorder`. Downstream
 training consumes ONLY these recorded ids (tokens-in tokens-out); text is
 never re-encoded, and a sample without per-token logprobs fails loudly.
 
+Each span also carries the canonical message DELTA it added to the episode's
+conversation plus that call's tool schemas, so a cross-tokenizer teacher can
+re-render the same multi-turn conversation with its own chat template
+(`wmh.distill.tokens.reconstruct_conversation`). Only the delta is stored: a
+full history per call would be quadratic in text, and real agentic prompts
+reach tens of thousands of tokens. The delta boundary is the SAME boundary the
+suffix render uses, so the message and token deltas cannot disagree.
+
 Multi-turn prompts are built incrementally from the episode's own token
 history: agents re-serialize earlier assistant turns (reformatted tool-call
 JSON, collapsed think framing), so re-rendering the full history never
@@ -200,6 +208,13 @@ class TokenSpan(BaseModel):
 
     This is the tokens-in-tokens-out ground truth for one completion: training
     data is assembled from these ids verbatim, never from re-encoded text.
+
+    `delta_messages` and `tools` are the canonical (tokenizer-independent) view
+    of the same call, for cross-tokenizer teacher re-rendering. They default to
+    None so sinks written before they existed still load; a None
+    `delta_messages` therefore means "this span carries no canonical messages",
+    and callers must degrade instead of guessing (see
+    `wmh.distill.tokens.reconstruct_conversation`).
     """
 
     call_index: int
@@ -209,6 +224,26 @@ class TokenSpan(BaseModel):
     sampled_token_ids: list[int]
     sampled_logprobs: list[float]
     """Sampler-assigned logprob for each sampled token, aligned one to one."""
+
+    delta_messages: list[ChatMessage] | None = None
+    """The messages this call ADDED to the conversation, not the full history.
+
+    The delta starts exactly where this call's prompt stops being a verbatim
+    token-prefix extension of (previous prompt + previous sampled ids), i.e. it
+    excludes the caller's echo of the previous assistant turn, whose ground
+    truth is the previous span's sampled ids. Concatenating the deltas and
+    re-inserting each span's own parsed assistant turn replays the whole
+    episode conversation.
+
+    None when the span carries no canonical messages: an old sink, or a call
+    whose prompt was NOT a clean suffix extension (a reused prompt after a
+    discarded turn, or the full-re-render fallback of a genuine history edit),
+    where a concatenated delta would silently describe a different
+    conversation than the one sampled.
+    """
+
+    tools: list[ChatTool] | None = None
+    """The tool schemas rendered into this call's prompt; None when none were."""
 
     @model_validator(mode="after")
     def _check_alignment(self) -> TokenSpan:
@@ -349,6 +384,21 @@ class SdkSampler:
         # HF stubs type decode as `str | list[str]` depending on the input
         # shape; for the list[int] calls renderers make it is always str.
         return cast("RendererTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
+
+
+class _BuiltPrompt(BaseModel):
+    """One call's prompt ids plus the message boundary they start adding at (internal)."""
+
+    token_ids: list[int]
+    """The exact prompt ids to sample from."""
+
+    delta_start: int | None
+    """Index of the first incoming message this prompt adds over the previous call.
+
+    None when the prompt is not a clean suffix extension of the previous one (a
+    reused prompt or a full-re-render fallback), so no message delta can be
+    recorded for the span (see `TokenSpan.delta_messages`).
+    """
 
 
 class _SampledTurn(BaseModel):
@@ -524,9 +574,9 @@ class TinkerChatProvider:
             self._rendering = build_renderer(base_model, sampler.get_tokenizer())
         return self._rendering
 
-    def _build_prompt_tokens(
+    def _build_prompt(
         self, messages: list[ChatMessage], tools: list[ChatTool] | None
-    ) -> list[int]:
+    ) -> _BuiltPrompt:
         """Build the prompt ids, extending the episode's own token history when possible.
 
         When the previous call's message list is a tolerant prefix of the
@@ -539,23 +589,38 @@ class TinkerChatProvider:
         previous prompt unchanged. Anything else (a genuine history edit or
         compaction) falls back to a full re-render, which is counted on the
         recorder because every fallback fragments the episode's datums.
+
+        Returns:
+            The prompt ids plus the message index the suffix render started at
+            (0 for the episode's first call, None when the prompt was reused or
+            fully re-rendered), so the span records the message delta over
+            exactly the SAME boundary as the token delta.
         """
         rendering = self._get_rendering()
         state = self._prompt_state
         if state is None:
-            return rendering.build_generation_prompt(messages, tools)
+            return _BuiltPrompt(
+                token_ids=rendering.build_generation_prompt(messages, tools), delta_start=0
+            )
         signature = _tool_signature(tools)
         mismatch = _first_incompatible_index(state.messages, messages)
         if mismatch is None and signature == state.tool_signature:
             if len(messages) == len(state.messages):
-                return list(state.prompt_tokens)
+                return _BuiltPrompt(token_ids=list(state.prompt_tokens), delta_start=None)
+            # One boundary for both deltas: messages[delta_start:] is exactly the
+            # region render_suffix turns into tokens (index len(state.messages) is
+            # the caller's echo of the previous sampled turn, already in tokens).
+            delta_start = len(state.messages) + 1
             suffix = rendering.render_suffix(
                 messages,
-                len(state.messages) + 1,
+                delta_start,
                 tools,
                 previous_sampled_ids=state.sampled_tokens,
             )
-            return state.prompt_tokens + state.sampled_tokens + suffix
+            return _BuiltPrompt(
+                token_ids=state.prompt_tokens + state.sampled_tokens + suffix,
+                delta_start=delta_start,
+            )
         if self._recorder is not None:
             self._recorder.record_fallback()
         if mismatch is not None:
@@ -571,7 +636,9 @@ class TinkerChatProvider:
                 "call; re-rendering the full prompt, which fragments this episode's "
                 "training datums"
             )
-        return rendering.build_generation_prompt(messages, tools)
+        return _BuiltPrompt(
+            token_ids=rendering.build_generation_prompt(messages, tools), delta_start=None
+        )
 
     def _sample_turn(
         self,
@@ -584,7 +651,8 @@ class TinkerChatProvider:
         """Render, sample, parse, and (on success) record exactly one span."""
         try:
             rendering = self._get_rendering()
-            prompt_ids = self._build_prompt_tokens(messages, tools)
+            built = self._build_prompt(messages, tools)
+            prompt_ids = built.token_ids
             sequence = self._get_sampler().sample(
                 prompt_ids,
                 max_tokens=max_tokens,
@@ -620,12 +688,23 @@ class TinkerChatProvider:
             sampled_tokens=sampled_ids,
         )
         if self._recorder is not None:
+            # Deep copies: the agent owns these message objects and may mutate
+            # them after this call returns, while the recorder's in-memory spans
+            # outlive the call (the jsonl sink is already a snapshot).
+            delta_start = built.delta_start
+            delta_messages = (
+                None
+                if delta_start is None
+                else [message.model_copy(deep=True) for message in messages[delta_start:]]
+            )
             self._recorder.record(
                 TokenSpan(
                     call_index=len(self._recorder),
                     prompt_token_ids=prompt_ids,
                     sampled_token_ids=sampled_ids,
                     sampled_logprobs=list(logprobs),
+                    delta_messages=delta_messages,
+                    tools=[tool.model_copy(deep=True) for tool in tools] if tools else None,
                 )
             )
         return _SampledTurn(
