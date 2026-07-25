@@ -193,9 +193,7 @@ def main() -> None:  # noqa: C901 - a linear driver reads better than split phas
     student_tokenizer = AutoTokenizer.from_pretrained(args.student)
     teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_TOKENIZER)
     rendering = build_renderer(args.student, student_tokenizer)
-    teacher = PromptLogprobClient(
-        FIREWORKS_URL, TEACHER_MODEL, api_key=key, dialect="echo", max_attempts=4
-    )
+    teacher = PromptLogprobClient(FIREWORKS_URL, TEACHER_MODEL, api_key=key, dialect="echo")
     verify = teacher.verify()
     logger.info("teacher verify: ok=%s %s", verify.ok, (verify.detail or "")[:80])
     if not verify.ok:

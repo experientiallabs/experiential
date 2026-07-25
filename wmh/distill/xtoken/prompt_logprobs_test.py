@@ -16,6 +16,7 @@ import pytest
 
 from wmh.distill.xtoken.prompt_logprobs import (
     DEFAULT_MAX_ATTEMPTS,
+    PLACEHOLDER_ZERO_FRACTION,
     PromptLogprobClient,
     PromptLogprobError,
     PromptLogprobTimeoutError,
@@ -344,3 +345,51 @@ def test_short_spans_are_exempt_from_the_placeholder_check() -> None:
     with _client(handler) as client:
         row = client.score(ids)
     assert row[1] == 0.0
+
+
+def test_mixed_placeholder_response_is_rejected() -> None:
+    """A response that is part real and part placeholder must not pass.
+
+    Measured by a sibling lane: responses come back MIXED, so a whole-response
+    fraction test alone lets a half-corrupt row through and poisons half the
+    span. Here only 40% of positions are zero, well under the 90% fraction
+    threshold, but they form one contiguous block.
+    """
+    ids = list(range(100, 160))
+    real = [-1.2, -0.7, -3.1, -2.2]
+    values: list[float | None] = [0.0]
+    while len(values) < 36:
+        values.append(real[len(values) % len(real)])
+    values.extend([0.0] * (len(ids) - len(values)))
+    zero_fraction = sum(1 for v in values[1:] if v == 0.0) / (len(ids) - 1)
+    assert zero_fraction < PLACEHOLDER_ZERO_FRACTION
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=_echo_body(ids, values))
+        return httpx.Response(200, json=_echo_body(ids, [0.0] + [-1.1] * (len(ids) - 1)))
+
+    with _client(handler, max_attempts=3) as client:
+        row = client.score(ids)
+    assert calls["n"] == 2
+    assert client.placeholder_responses() == 1
+    assert row[-1] == pytest.approx(-1.1)
+
+
+def test_scattered_legitimate_zeros_still_pass() -> None:
+    """Isolated exact zeros are real: near-certain tokens return -0.0."""
+    ids = list(range(100, 160))
+    values: list[float | None] = [0.0]
+    for index in range(1, len(ids)):
+        values.append(0.0 if index % 7 == 0 else -1.4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_echo_body(ids, values))
+
+    with _client(handler) as client:
+        row = client.score(ids)
+    assert client.placeholder_responses() == 0
+    assert row[1] == pytest.approx(-1.4)

@@ -59,8 +59,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_S = 1200.0
 """Per-request wall-clock bound; see the module docstring for the sizing."""
 
-DEFAULT_MAX_ATTEMPTS = 3
-"""Attempts per `score` call, counting the first; only transient failures retry."""
+DEFAULT_MAX_ATTEMPTS = 30
+"""Attempts per `score` call, counting the first; only transient failures retry.
+
+Sized against the MEASURED placeholder-corruption rate, not against ordinary
+transient-failure intuition. A sibling lane re-measured 26-45% of echo requests
+returning all-zero logprobs, and at 45% bad the retry depth is load-bearing: 6
+attempts leaves ~0.8% failure per sequence, which across 32 sequences in a step
+is a ~23% chance of losing the ENTIRE step (they hit exactly that, failing at
+7178/7178 positions after 6 attempts). 30 attempts puts it near 1e-11. Retries
+are cheap here because a placeholder response is refused before any span is
+summed, and each retry reconnects so it can reach a different replica.
+"""
 
 _RETRY_BASE_DELAY_S = 2.0
 _RETRY_MAX_DELAY_S = 30.0
@@ -92,10 +102,10 @@ class PromptLogprobError(RuntimeError):
 PLACEHOLDER_ZERO_FRACTION = 0.9
 """Fraction of exactly-0.0 scored positions above which a row is placeholder junk.
 
-Fireworks' serverless echo has a measured silent-corruption mode: 26 to 38% of
+Fireworks' serverless echo has a measured silent-corruption mode: 26 to 45% of
 requests return all-zero `token_logprobs` (with a junk one-entry `top_logprobs`
-of `{"!": 0.0}`) and HTTP 200, and one 12k-token response came back partly real
-and partly placeholder. Nothing in the response marks it, so an unchecked
+of `{"!": 0.0}`) and HTTP 200, and responses also come back partly real and
+partly placeholder, so see `MAX_PLACEHOLDER_RUN` for the mixed case. Nothing in the response marks it, so an unchecked
 consumer trains on zeros: every chunk's teacher sum becomes 0.0 and its
 advantage becomes `-student_logprob`, which is not a KL signal at all.
 
@@ -119,31 +129,59 @@ class PromptLogprobPlaceholderError(PromptLogprobError):
     """
 
 
+MAX_PLACEHOLDER_RUN = 24
+"""Longest run of consecutive exactly-0.0 scored positions treated as real.
+
+A whole-response fraction test is not enough: responses come back MIXED, part
+real and part placeholder (measured by a sibling lane on a 12k-token response),
+and a half-corrupt row passes any 90%-zeros threshold while silently poisoning
+half the span. Placeholder corruption appears as a contiguous BLOCK of exact
+zeros, whereas genuine near-certain tokens are isolated (observed: -0.0 on
+individual digits inside an equation). So a long consecutive run is the
+signature to reject on, independently of the overall fraction.
+"""
+
+
 def _reject_placeholder_row(row: list[float | None], url: str) -> None:
-    """Raise when a scored row looks like the all-zero placeholder.
+    """Raise when a scored row looks like placeholder output, whole or partial.
+
+    Two independent tests, because the corruption has two shapes:
+    a high overall fraction of exact zeros (whole-response placeholder), and a
+    long contiguous run of them (a mixed response whose fraction stays low).
 
     Args:
         row: The per-position row, position 0 already None.
         url: Endpoint, for the error message.
 
     Raises:
-        PromptLogprobPlaceholderError: If nearly every scored position is
-            exactly 0.0.
+        PromptLogprobPlaceholderError: If the row looks placeholder-corrupted.
     """
     scored = [value for value in row[1:] if value is not None]
     if len(scored) < _MIN_POSITIONS_FOR_PLACEHOLDER_CHECK:
         return
     zeros = sum(1 for value in scored if value == 0.0)
     fraction = zeros / len(scored)
-    if fraction < PLACEHOLDER_ZERO_FRACTION:
+    longest_run = 0
+    current_run = 0
+    for value in scored:
+        current_run = current_run + 1 if value == 0.0 else 0
+        longest_run = max(longest_run, current_run)
+    whole = fraction >= PLACEHOLDER_ZERO_FRACTION
+    partial = longest_run >= MAX_PLACEHOLDER_RUN
+    if not whole and not partial:
         return
+    reason = (
+        f"{zeros} of {len(scored)} scored positions are exactly 0.0 ({fraction:.0%})"
+        if whole
+        else f"a run of {longest_run} consecutive exactly-0.0 positions (a MIXED response, "
+        f"only {fraction:.0%} zeros overall, which a fraction test alone would pass)"
+    )
     raise PromptLogprobPlaceholderError(
-        f"teacher scoring from {url} returned {zeros} of {len(scored)} scored positions "
-        f"as exactly 0.0 ({fraction:.0%}), which is the known placeholder response rather "
-        "than real logprobs. This is a per-replica fault that HTTP 200 hides, so it is "
-        "retried; if it persists, the endpoint is serving corrupt echo responses and the "
-        "run must stop rather than train on zeros (do NOT pin session affinity, which "
-        "locks onto the bad replica)"
+        f"teacher scoring from {url} returned {reason}, which is the known placeholder "
+        "response rather than real logprobs. This is a per-replica fault that HTTP 200 "
+        "hides, so it is retried on a fresh connection; if it persists the endpoint is "
+        "serving corrupt echo responses and the run must stop rather than train on zeros "
+        "(do NOT pin session affinity, which locks onto the bad replica)"
     )
 
 
