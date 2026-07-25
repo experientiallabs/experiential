@@ -74,6 +74,8 @@ class _TimedProvider:
         self.replies.append(completion.text)
         self.usage = TokenUsage(
             input_tokens=self.usage.input_tokens + completion.usage.input_tokens,
+            cached_input_tokens=self.usage.cached_input_tokens
+            + completion.usage.cached_input_tokens,
             output_tokens=self.usage.output_tokens + completion.usage.output_tokens,
         )
         return completion

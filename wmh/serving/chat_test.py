@@ -128,7 +128,12 @@ def test_completion_matches_openai_shape(tmp_path: Path) -> None:
     assert body["model"] == "tau-bench"  # the endpoint, not the mechanism
     assert body["choices"][0]["message"]["content"] == "served by haiku-4-5"
     assert body["choices"][0]["finish_reason"] == "stop"
-    assert body["usage"] == {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    assert body["usage"] == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "prompt_tokens_details": {"cached_tokens": 0},
+    }
     assert response.headers["x-wmh-routed-model"] == "haiku-4-5"
 
 
@@ -140,6 +145,7 @@ def test_streaming_emits_openai_chunks(tmp_path: Path) -> None:
         json={
             "model": "tau-bench",
             "stream": True,
+            "stream_options": {"include_usage": True},
             "messages": [{"role": "user", "content": "hi"}],
         },
     ) as response:
@@ -150,9 +156,11 @@ def test_streaming_emits_openai_chunks(tmp_path: Path) -> None:
     assert payloads[-1] == "[DONE]"
     chunks = [json.loads(p) for p in payloads[:-1]]
     assert all(c["object"] == "chat.completion.chunk" for c in chunks)
-    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c["choices"])
     assert text == "served by haiku-4-5"
-    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    # OpenAI include_usage framing: finish_reason chunk, THEN a choices-less usage chunk.
+    assert chunks[-2]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-1]["choices"] == []
     assert chunks[-1]["usage"]["total_tokens"] == 15
 
 
@@ -190,7 +198,10 @@ def test_unknown_endpoint_404s_with_available(tmp_path: Path) -> None:
         json={"model": "nope", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 404
-    assert "tau-bench" in response.json()["detail"]
+    body = response.json()
+    # OpenAI error shape: clients read body["error"]["message"], never FastAPI's "detail".
+    assert body["error"]["code"] == "model_not_found"
+    assert "tau-bench" in body["error"]["message"]
 
 
 def test_models_endpoint_lists_endpoints(tmp_path: Path) -> None:

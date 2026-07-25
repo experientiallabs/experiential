@@ -76,14 +76,25 @@ class PoolEntry(BaseModel):
         return price
 
     def cost_usd(self, usage: TokenUsage) -> float:
-        """USD cost of `usage` priced by THIS entry's row (overrides included).
+        """Effective USD cost of `usage` priced by THIS entry's row (overrides included).
 
-        The global `wmh.tracking.pricing.cost_usd` only knows the built-in table; pool entries
-        with explicit prices must be costed here or they would silently read $0.
+        Cache-adjusted: cached prompt tokens (`usage.cached_input_tokens`) bill at
+        `cached_input_per_mtok` when the entry carries a cache-read price, and at the full
+        input rate otherwise — never silently free. The global `wmh.tracking.pricing.cost_usd`
+        only knows the built-in table; pool entries with explicit prices must be costed here
+        or they would silently read $0.
         """
         price = self.price()
+        cached = min(usage.cached_input_tokens, usage.input_tokens)
+        cached_rate = (
+            self.cached_input_per_mtok
+            if self.cached_input_per_mtok is not None
+            else price.input_per_mtok
+        )
         return (
-            usage.input_tokens * price.input_per_mtok + usage.output_tokens * price.output_per_mtok
+            (usage.input_tokens - cached) * price.input_per_mtok
+            + cached * cached_rate
+            + usage.output_tokens * price.output_per_mtok
         ) / 1_000_000
 
     def provider_config(self) -> ProviderConfig:

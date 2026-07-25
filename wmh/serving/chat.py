@@ -12,8 +12,9 @@ including the assistant reply) and, when the next request arrives with that tran
 prefix, `select_model` sees the incumbent and sticks to it by default.
 
 Request log: one JSONL row per call with the D-SERVING-LOG fields (id, ts, endpoint, routed
-model, cluster, tokens, cost, latency, ttfb, status, reason). Cached-token counts and
-provider cache controls are not captured yet; they land with the cache-aware cost model.
+model, cluster, tokens incl. cached, cache-adjusted cost, latency, ttfb, status, reason).
+Provider cache CONTROLS (breakpoint placement, TTL) are not exposed yet; they land with the
+cache-aware routing model.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from collections import OrderedDict, deque
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -60,12 +61,19 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class StreamOptions(BaseModel):
+    """OpenAI `stream_options`: opt-in for the trailing usage chunk on streamed responses."""
+
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     """The OpenAI request subset the endpoint serves (text chat; tools are future work)."""
 
     model: str  # the ENDPOINT name
     messages: list[ChatMessage] = Field(min_length=1)
     stream: bool = False
+    stream_options: StreamOptions | None = None
     temperature: float | None = None
     max_tokens: int | None = None
     max_completion_tokens: int | None = None
@@ -73,14 +81,35 @@ class ChatCompletionRequest(BaseModel):
     def output_budget(self) -> int:
         return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
+    def wants_stream_usage(self) -> bool:
+        return self.stream_options is not None and self.stream_options.include_usage
+
+
+def _error_response(status_code: int, message: str, *, err_type: str, code: str) -> Response:
+    """An OpenAI-shaped error body: real OpenAI clients read `body["error"]["message"]`.
+
+    FastAPI's default `{"detail": ...}` shape parses as a generic APIStatusError in the openai
+    SDK but loses the message; this shape surfaces it exactly like the upstream API does.
+    """
+    return Response(
+        content=json.dumps(
+            {"error": {"message": message, "type": err_type, "param": None, "code": code}},
+            ensure_ascii=False,
+        ),
+        status_code=status_code,
+        media_type="application/json",
+    )
+
 
 class RequestLogRecord(BaseModel):
     """One metered call, as the request log persists it (D-METERING / D-SERVING-LOG shape).
 
     This is the wmh half of the metering contract: the platform wrap adds tenancy
-    (org_id, api_key_id) when it persists these rows. `cached_tokens` is carried but always 0
-    until providers surface cache-read counts; `router_cost_usd` is the policy's OWN inference
-    cost per call, 0 for the free hashing policy and real once a trained router serves.
+    (org_id, api_key_id) when it persists these rows. `cached_tokens` mirrors
+    `TokenUsage.cached_input_tokens` (cache-read prompt tokens, a subset of `input_tokens`);
+    `cost_usd` is cache-adjusted via `PoolEntry.cost_usd`. `router_cost_usd` is the policy's
+    OWN inference cost per call, 0 for the free hashing policy and real once a trained router
+    serves.
     """
 
     id: str
@@ -94,8 +123,8 @@ class RequestLogRecord(BaseModel):
     routing_reason: str
     input_tokens: int = 0
     output_tokens: int = 0
-    cached_tokens: int = 0  # cache-read tokens; 0 until providers surface them
-    cost_usd: float = 0.0  # cache-adjusted once cached_tokens are real; list-priced until then
+    cached_tokens: int = 0  # cache-read prompt tokens (subset of input_tokens)
+    cost_usd: float = 0.0  # effective cost: cached tokens billed at the cache-read rate
     router_cost_usd: float = 0.0  # the routing decision's own inference cost, passed through
     latency_ms: float = 0.0
     ttfb_ms: float | None = None
@@ -191,11 +220,13 @@ def _split_for_provider(messages: list[ChatMessage]) -> tuple[str, list[Message]
     return "\n\n".join(system_parts), turns
 
 
-def _usage_dict(usage: TokenUsage) -> dict[str, int]:
+def _usage_dict(usage: TokenUsage) -> dict[str, object]:
     return {
         "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
         "total_tokens": usage.input_tokens + usage.output_tokens,
+        # OpenAI's cached-prompt reporting shape; 0 when the upstream provider reported none.
+        "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens},
     }
 
 
@@ -210,30 +241,22 @@ def _chunk_payload(
     delta: dict[str, str],
     *,
     finish_reason: str | None = None,
-    usage: TokenUsage | None = None,
 ) -> dict[str, object]:
-    payload: dict[str, object] = {
+    return {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": endpoint,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
-    if usage is not None:
-        payload["usage"] = _usage_dict(usage)
-    return payload
 
 
 def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
     """Mount `/v1/models` + `/v1/chat/completions` over the given endpoints."""
     router = APIRouter()
 
-    def _endpoint_or_404(name: str) -> EndpointRuntime:
-        runtime = endpoints.get(name)
-        if runtime is None:
-            available = ", ".join(sorted(endpoints)) or "(none)"
-            raise HTTPException(status_code=404, detail=f"no endpoint {name!r}; have: {available}")
-        return runtime
+    def _endpoint_or_none(name: str) -> EndpointRuntime | None:
+        return endpoints.get(name)
 
     @router.get("/v1/models")
     def list_models() -> dict[str, object]:
@@ -247,7 +270,15 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
 
     @router.post("/v1/chat/completions")
     def chat_completions(request: ChatCompletionRequest) -> Response:
-        runtime = _endpoint_or_404(request.model)
+        runtime = _endpoint_or_none(request.model)
+        if runtime is None:
+            available = ", ".join(sorted(endpoints)) or "(none)"
+            return _error_response(
+                404,
+                f"no endpoint {request.model!r}; have: {available}",
+                err_type="invalid_request_error",
+                code="model_not_found",
+            )
         decision = runtime.decide(request.messages)
         entry, provider = runtime.provider_for(decision.model)
         system, turns = _split_for_provider(request.messages)
@@ -274,6 +305,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     routing_reason=decision.reason,
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
+                    cached_tokens=usage.cached_input_tokens,
                     cost_usd=entry.cost_usd(usage),
                     latency_ms=(time.monotonic() - started) * 1000,
                     ttfb_ms=ttfb_ms,
@@ -292,11 +324,14 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     temperature=request.temperature if request.temperature is not None else 0.7,
                     max_tokens=request.output_budget(),
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
                 _record(TokenUsage(), ttfb_ms=None, status="error", error_message=str(exc))
-                raise HTTPException(
-                    status_code=502, detail=f"upstream model call failed: {exc}"
-                ) from exc
+                return _error_response(
+                    502,
+                    f"upstream model call failed: {exc}",
+                    err_type="api_error",
+                    code="upstream_error",
+                )
             runtime.remember(request.messages, completion.text, decision.model)
             _record(completion.usage, ttfb_ms=None)
             return Response(
@@ -322,9 +357,11 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             )
 
         if not isinstance(provider, StreamingProvider):
-            raise HTTPException(
-                status_code=501,
-                detail=f"pool model '{entry.name}' has no native streaming backend",
+            return _error_response(
+                501,
+                f"pool model '{entry.name}' has no native streaming backend",
+                err_type="api_error",
+                code="streaming_unsupported",
             )
         try:
             upstream = provider.stream(
@@ -334,11 +371,14 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 max_tokens=request.output_budget(),
             )
             first = next(upstream, None)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
             _record(TokenUsage(), ttfb_ms=None, status="error", error_message=str(exc))
-            raise HTTPException(
-                status_code=502, detail=f"upstream model call failed: {exc}"
-            ) from exc
+            return _error_response(
+                502,
+                f"upstream model call failed: {exc}",
+                err_type="api_error",
+                code="upstream_error",
+            )
         ttfb_ms = (time.monotonic() - started) * 1000
 
         def _events() -> Iterator[str]:
@@ -372,15 +412,21 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 yield "data: [DONE]\n\n"
                 return
             yield _sse(
-                _chunk_payload(
-                    completion_id,
-                    created,
-                    runtime.name,
-                    {},
-                    finish_reason="stop",
-                    usage=usage,
-                )
+                _chunk_payload(completion_id, created, runtime.name, {}, finish_reason="stop")
             )
+            if request.wants_stream_usage():
+                # OpenAI's include_usage framing: one extra chunk with NO choices and the
+                # final usage, after the finish_reason chunk and before [DONE].
+                yield _sse(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": runtime.name,
+                        "choices": [],
+                        "usage": _usage_dict(usage),
+                    }
+                )
             yield "data: [DONE]\n\n"
             runtime.remember(request.messages, "".join(parts), decision.model)
             _record(usage, ttfb_ms=ttfb_ms)

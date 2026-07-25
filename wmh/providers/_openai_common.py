@@ -91,11 +91,7 @@ def complete(
         raise ValueError(f"{model} returned no choices")
     text = response.choices[0].message.content or ""
     usage = response.usage
-    token_usage = (
-        TokenUsage(input_tokens=usage.prompt_tokens, output_tokens=usage.completion_tokens)
-        if usage is not None
-        else TokenUsage()
-    )
+    token_usage = _chat_usage(usage) if usage is not None else TokenUsage()
     return Completion(text=text, usage=token_usage)
 
 
@@ -133,11 +129,18 @@ def stream(
                 yield StreamChunk(delta=text)
         chunk_usage = getattr(chunk, "usage", None)
         if chunk_usage is not None:
-            usage = TokenUsage(
-                input_tokens=chunk_usage.prompt_tokens,
-                output_tokens=chunk_usage.completion_tokens,
-            )
+            usage = _chat_usage(chunk_usage)
     yield StreamChunk(done=True, usage=usage)
+
+
+def _chat_usage(usage: object) -> TokenUsage:
+    """Chat-completions usage -> TokenUsage, including the cached-prompt split when reported."""
+    details = getattr(usage, "prompt_tokens_details", None)
+    return TokenUsage(
+        input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        cached_input_tokens=(getattr(details, "cached_tokens", None) or 0) if details else 0,
+    )
 
 
 def complete_chat(

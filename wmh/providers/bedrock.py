@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from wmh.core.types import JsonValue
 from wmh.providers._bedrock_chat import converse_request, converse_response
@@ -41,6 +41,7 @@ class _ContentBlock(TypedDict):
 class _Usage(TypedDict):
     input_tokens: int
     output_tokens: int
+    cache_read_input_tokens: NotRequired[int]
 
 
 class _BedrockResponse(TypedDict):
@@ -161,6 +162,7 @@ class BedrockProvider:
         usage = TokenUsage(
             input_tokens=data["usage"]["input_tokens"],
             output_tokens=data["usage"]["output_tokens"],
+            cached_input_tokens=data["usage"].get("cache_read_input_tokens", 0),
         )
         return Completion(text=text, usage=usage)
 
@@ -209,6 +211,7 @@ class BedrockProvider:
                     usage = TokenUsage(
                         input_tokens=int(event_usage["inputTokens"]),
                         output_tokens=int(event_usage["outputTokens"]),
+                        cached_input_tokens=int(event_usage.get("cacheReadInputTokens", 0) or 0),
                     )
         yield StreamChunk(done=True, usage=usage)
 
@@ -238,6 +241,7 @@ class BedrockProvider:
         usage = TokenUsage(
             input_tokens=int(response["usage"]["inputTokens"]),
             output_tokens=int(response["usage"]["outputTokens"]),
+            cached_input_tokens=int(response["usage"].get("cacheReadInputTokens", 0) or 0),
         )
         return Completion(text=text, usage=usage)
 

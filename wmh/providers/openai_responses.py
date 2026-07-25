@@ -230,7 +230,9 @@ def _usage_from_response(response: object) -> TokenUsage:
     usage = _get(response, "usage")
     if usage is None:
         return TokenUsage()
+    details = _get(usage, "input_tokens_details")
     return TokenUsage(
         input_tokens=_as_int(_get(usage, "input_tokens")),
         output_tokens=_as_int(_get(usage, "output_tokens")),
+        cached_input_tokens=_as_int(_get(details, "cached_tokens")) if details is not None else 0,
     )

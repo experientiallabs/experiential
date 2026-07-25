@@ -67,6 +67,7 @@ class AnthropicProvider:
         usage = TokenUsage(
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            cached_input_tokens=getattr(response.usage, "cache_read_input_tokens", None) or 0,
         )
         return Completion(text=text, usage=usage)
 
@@ -100,6 +101,9 @@ class AnthropicProvider:
             kind = getattr(event, "type", "")
             if kind == "message_start":
                 usage.input_tokens = event.message.usage.input_tokens
+                usage.cached_input_tokens = (
+                    getattr(event.message.usage, "cache_read_input_tokens", None) or 0
+                )
             elif kind == "content_block_delta":
                 delta = event.delta
                 if getattr(delta, "type", "") == "text_delta" and delta.text:

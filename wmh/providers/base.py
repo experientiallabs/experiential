@@ -49,6 +49,11 @@ class Message(BaseModel):
 class TokenUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
+    # Prompt tokens served from the provider's cache (a SUBSET of input_tokens, never in
+    # addition to it). Cache reads bill at a discounted rate, so effective-cost accounting
+    # (PoolEntry.cost_usd, D-METERING records) needs the split; providers that don't report
+    # cache usage leave it 0, which prices the whole prompt at the full input rate.
+    cached_input_tokens: int = 0
 
 
 class Completion(BaseModel):
