@@ -33,6 +33,11 @@ import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import numpy as np
 
@@ -51,9 +56,11 @@ R1_SCRIPT = (
 SPLIT_SEEDS = [0, 1, 2, 3, 4]
 
 
-def load_r1() -> object:
+def load_r1() -> ModuleType:
     """Import r1's ablation module from its worktree (champion code, unmodified)."""
     spec = importlib.util.spec_from_file_location("r1_retrieval_ablations", R1_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot import r1 module from {R1_SCRIPT}")
     module = importlib.util.module_from_spec(spec)
     sys.modules["r1_retrieval_ablations"] = module
     spec.loader.exec_module(module)
@@ -64,7 +71,7 @@ CHAMP = {"second_route": False, "guard": "stat", "z": 0.5}
 
 
 def champion_picks(
-    r1: object,
+    r1: ModuleType,
     ctx: object,
     fit_ids: list[str],
     test_ids: list[str],
@@ -141,7 +148,9 @@ def oracle_winner_labels(matrix: OutcomeMatrix, fit_ids: list[str]) -> tuple[lis
     return labels, names
 
 
-def fit_winner_lr(vecs: np.ndarray, labels: list[int], n_classes: int) -> object:
+def fit_winner_lr(
+    vecs: np.ndarray, labels: list[int], n_classes: int
+) -> Callable[[np.ndarray], np.ndarray]:
     """Multinomial LR on the oracle-winner class; returns logits(x) [*, n_classes]."""
     from sklearn.linear_model import LogisticRegression
 
@@ -162,7 +171,10 @@ def fit_winner_lr(vecs: np.ndarray, labels: list[int], n_classes: int) -> object
 
 
 def transform_vecs(
-    base: dict[str, np.ndarray], logits: object, alpha: float, sids: list[str]
+    base: dict[str, np.ndarray],
+    logits: Callable[[np.ndarray], np.ndarray],
+    alpha: float,
+    sids: list[str],
 ) -> dict[str, np.ndarray]:
     """z = normalize([x ; alpha * softmax(logits)]) per sid."""
     xs = np.stack([base[s] for s in sids])
@@ -339,7 +351,9 @@ def cmd_metric(args: argparse.Namespace) -> None:
             ctx.task_vecs = dict(base_vecs)
 
 
-def clf_family(kind: str, vecs: np.ndarray, wins: np.ndarray) -> object:
+def clf_family(
+    kind: str, vecs: np.ndarray, wins: np.ndarray
+) -> Callable[[np.ndarray], np.ndarray]:
     """Fit one win-vs-baseline classifier; returns predict_p(x) in [0,1]."""
     if kind == "svm":
         from sklearn.svm import SVC
