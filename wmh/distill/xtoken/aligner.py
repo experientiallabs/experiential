@@ -28,6 +28,34 @@ sides' text to be equal. `exact_match_score >= 2 * combination_score_multiplier`
 is what keeps a 1-to-1 match from being the one block that prefers to stay
 merged, and is enforced.
 
+TEXT EQUALITY ALONE IS NOT ENOUGH, and this is the subtlest thing in the module.
+A block move whose two sides merely SPELL the same characters can still pair
+content from two different places in the text, and the path can reach it over
+gap moves that quietly skip the tokens in between. It happens exactly when the
+true cell is wider than `max_comb_len` on one side, so the honest cell is
+inexpressible and some spuriously equal token from elsewhere scores better than
+mismatching. Measured on random 40-character texts at `max_comb_len` 8, 300
+trials produced 7 pairs that were labelled exact while covering different bytes
+on the two sides, and on a two-symbol alphabet 188 of 200 trials did. Inside the
+expressible regime (every cell of the reference partition at most `max_comb_len`
+tokens on both sides) there were 0 disagreements over about 5,800 trials, so the
+scoring argument above is sound and this is purely about the inexpressible
+regime. Every candidate span therefore also has to be BOUNDARY CONSISTENT:
+`_boundary_codes` labels each token boundary with its offset in the part of the
+text the two sides agree on, and a span is only accepted when its start and end
+boundaries carry the same label on both sides. Anchors, DP blocks, and coalesced
+regions all go through the same check, so a wrong pair cannot be emitted at all
+rather than being caught downstream.
+
+The agreeing part is a REGION, not the whole span. Two renders of one turn
+usually agree over a long prefix and a long suffix and differ somewhere in the
+middle, so a single global "are these two texts equal" flag would switch the
+guard off for the whole span the moment one token differs anywhere, which is
+backwards. `_comparable_regions` therefore measures the shared prefix and the
+shared suffix separately and the guard keeps protecting both of them; only spans
+that touch the differing middle go unchecked, and those are reported non-exact
+anyway.
+
 Three engineering constraints drive the rest, all of them measured rather than
 assumed (upstream NeMo-RL's aligner gets all three wrong):
 
@@ -61,17 +89,20 @@ logger = logging.getLogger(__name__)
 MAX_DP_CELLS = 4_000_000
 """Default cell budget for one `align_tokens` call.
 
-At the measured `SECONDS_PER_CELL` this is about 1.8 s of DP per call, which is
-the most a rollout-scoring step can spend on one span before the aligner, rather
-than the model, becomes the bottleneck.
+At the measured `SECONDS_PER_CELL` this is about 2 s of DP per call, which is the
+most a rollout-scoring step can spend on one span before the aligner, rather than
+the model, becomes the bottleneck.
 """
 
-SECONDS_PER_CELL = 4.4e-7
+SECONDS_PER_CELL = 5.0e-7
 """Measured wall clock per DP cell for this kernel, used to report the budget.
 
 Measured over anchor-free 300 x 300, 600 x 600, and 1,200 x 1,200 alignments at
-`max_comb_len` 4 (4.45e-7, 4.52e-7, 4.44e-7 s/cell); the block scan is a
-constant factor per cell, so the rate does not drift with size.
+`max_comb_len` 4 (4.75e-7, 4.96e-7, 4.98e-7 s/cell); the block scan is a
+constant factor per cell, so the rate does not drift with size. It went up from
+4.4e-7 when the boundary-consistency check landed: one code comparison per cell
+buys the guarantee that a pair covers the same bytes on both sides, which is
+worth 13%.
 """
 
 MAX_COMBINATION_LEN = 10
@@ -207,6 +238,153 @@ def _check_parameters(
         )
 
 
+class _ComparableRegions(BaseModel):
+    """The prefix and the suffix over which two canonical texts spell the same bytes.
+
+    Inside either region the two sides' character offsets stand for the same
+    content, so an offset comparison PROVES whether a candidate span pairs the
+    same bytes. Between the regions the texts genuinely differ and no offset
+    comparison means anything, which is why this is two lengths rather than one
+    global flag: one differing token in the middle must not disable the guard
+    over the parts that do agree.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    student_length: int
+    """Characters in the student's canonical text."""
+
+    teacher_length: int
+    """Characters in the teacher's canonical text."""
+
+    prefix_length: int
+    """Characters both texts share from the start; 0 when they differ at once."""
+
+    suffix_length: int
+    """Characters both texts share from the end, clamped so the two regions
+    cannot overlap on either side."""
+
+
+def _comparable_regions(student_text: str, teacher_text: str) -> _ComparableRegions:
+    """Measure the shared prefix and shared suffix of two canonical texts.
+
+    Args:
+        student_text: The student's canonical tokens, joined.
+        teacher_text: The teacher's canonical tokens, joined.
+
+    Returns:
+        The regions. When the two texts are equal the prefix covers everything
+        and the suffix is empty, which is the byte-identical case this package is
+        built for: then every boundary is checked.
+    """
+    prefix_length = 0
+    for student_character, teacher_character in zip(student_text, teacher_text, strict=False):
+        if student_character != teacher_character:
+            break
+        prefix_length += 1
+    suffix_length = 0
+    for student_character, teacher_character in zip(
+        reversed(student_text), reversed(teacher_text), strict=False
+    ):
+        if student_character != teacher_character:
+            break
+        suffix_length += 1
+    suffix_length = min(
+        suffix_length,
+        len(student_text) - prefix_length,
+        len(teacher_text) - prefix_length,
+    )
+    return _ComparableRegions(
+        student_length=len(student_text),
+        teacher_length=len(teacher_text),
+        prefix_length=prefix_length,
+        suffix_length=suffix_length,
+    )
+
+
+def _boundary_codes(
+    offsets: list[int], total: int, regions: _ComparableRegions
+) -> list[int | None]:
+    """Label every token boundary with a code that is comparable across sides.
+
+    Two boundaries carrying the same code stand for the same position in the text
+    both sides agree on, so a span whose start and end boundaries match on both
+    sides covers the same bytes on both sides. A boundary in the differing middle
+    gets None, meaning "no claim": it compares equal to anything, so the guard
+    never rejects a span merely because the aligner cannot check it.
+
+    Args:
+        offsets: Cumulative character offset before each token, plus the total,
+            as `_character_offsets` returns it.
+        total: Characters in this side's canonical text.
+        regions: The shared prefix and suffix lengths for the two sides.
+
+    Returns:
+        One code per entry of `offsets`. A boundary in the shared suffix codes as
+        the negation of its distance from the END, minus one; one in the shared
+        prefix codes as its offset from the START, so a prefix code can never
+        collide with a suffix code (a span that crosses the differing middle is
+        rejected rather than silently accepted).
+
+    The SUFFIX test comes first, and the order is load-bearing. Testing the
+    prefix first makes `0 <= prefix_length` true unconditionally, so offset 0
+    always claims prefix code 0 even when the two texts differ at their very
+    first character and `prefix_length` is therefore 0. Both sides then claim
+    code 0 for positions that hold different content, and the guard accepts a
+    span pairing them. Concretely, aligning ["xx","hello","world"] against
+    ["hello","world"] paired "xxhello" with "hello" and destroyed the legitimate
+    exact "hello"/"hello" pair; plan.py's byte check then dropped the bad pair,
+    so those student tokens lost coverage entirely (measured 32.6% versus 35.6%
+    student-token coverage over 544 such trials). With the suffix tested first,
+    the shorter side's offset 0 falls inside the shared suffix and codes from the
+    END, so it no longer collides with the longer side's true start.
+    """
+    codes: list[int | None] = []
+    for offset in offsets:
+        if total - offset <= regions.suffix_length:
+            codes.append(-(total - offset) - 1)
+        elif offset <= regions.prefix_length:
+            codes.append(offset)
+        else:
+            codes.append(None)
+    return codes
+
+
+def _codes_compatible(student_code: int | None, teacher_code: int | None) -> bool:
+    """Whether two boundary codes can stand for the same position in the text."""
+    return student_code is None or teacher_code is None or student_code == teacher_code
+
+
+def _span_compatible(
+    student_codes: list[int | None],
+    teacher_codes: list[int | None],
+    *,
+    student_start: int,
+    student_end: int,
+    teacher_start: int,
+    teacher_end: int,
+) -> bool:
+    """Whether a candidate span's two sides sit at the same place in the text.
+
+    Args:
+        student_codes: Boundary codes for the student side, indexed by token
+            boundary (so `len(student_tokens) + 1` entries).
+        teacher_codes: Boundary codes for the teacher side.
+        student_start: First student token of the span.
+        student_end: One past the last student token of the span.
+        teacher_start: First teacher token of the span.
+        teacher_end: One past the last teacher token of the span.
+
+    Returns:
+        True when both the opening and the closing boundary are compatible. Both
+        ends are checked because a span may open inside the shared prefix and
+        close beyond it, in which case only the closing boundary is wrong.
+    """
+    return _codes_compatible(
+        student_codes[student_start], teacher_codes[teacher_start]
+    ) and _codes_compatible(student_codes[student_end], teacher_codes[teacher_end])
+
+
 def _joined_spans(tokens: list[str], max_comb_len: int) -> list[list[str]]:
     """Joined text of every span of up to `max_comb_len` tokens, by span length.
 
@@ -233,6 +411,8 @@ def _align_dp(
     student: list[str],
     teacher: list[str],
     *,
+    student_codes: list[int | None],
+    teacher_codes: list[int | None],
     exact_match_score: float,
     combination_score_multiplier: float,
     gap_penalty: float,
@@ -242,12 +422,19 @@ def _align_dp(
 
     Moves are: a 1-to-1 pair whose text differs (`-exact_match_score`), a gap on
     either side (`gap_penalty`, emitting no pair), and a k-to-l block whose
-    joined text matches (`exact_match_score` when k = l = 1, else
-    `combination_score_multiplier * (max(k, l) + 1)`).
+    joined text matches AND whose two sides sit at the same place in the text
+    (`exact_match_score` when k = l = 1, else
+    `combination_score_multiplier * (max(k, l) + 1)`). Requiring the second
+    condition is what stops the DP from pairing a spuriously equal token from
+    elsewhere in the text, reached over gap moves, when the honest cell is wider
+    than `max_comb_len`; see the module docstring for the measured rate.
 
     Args:
         student: Canonical student tokens for this segment.
         teacher: Canonical teacher tokens for this segment.
+        student_codes: Boundary codes for this segment's student tokens, one per
+            boundary (`len(student) + 1` entries), from `_boundary_codes`.
+        teacher_codes: Boundary codes for this segment's teacher tokens.
         exact_match_score: Score for a matching 1-to-1 pair; a mismatched pair
             scores its negation.
         combination_score_multiplier: Per-`max(k, l)` score for a matching block.
@@ -288,25 +475,37 @@ def _align_dp(
         moves[row_index, 0] = _MOVE_STUDENT_GAP
         above = previous[0]
         span_limit = min(row_index, max_comb_len)
+        row_code = student_codes[row_index]
         for column_index in range(1, columns + 1):
             best = above[column_index - 1] + mismatch_score
             best_move = _MOVE_MISMATCH
             column_limit = min(column_index, max_comb_len)
-            for student_span in range(1, span_limit + 1):
-                text = student_joined[student_span][row_index]
-                back = previous[student_span - 1]
-                scores = block_scores[student_span]
-                for teacher_span in range(1, column_limit + 1):
-                    if teacher_joined[teacher_span][column_index] != text:
-                        continue
-                    candidate = back[column_index - teacher_span] + scores[teacher_span]
-                    if candidate > best:
-                        best = candidate
-                        best_move = (
-                            _MOVE_BLOCK_BASE
-                            + (student_span - 1) * max_comb_len
-                            + (teacher_span - 1)
-                        )
+            column_code = teacher_codes[column_index]
+            # Hoisted out of the block scan: every block ending in this cell
+            # shares this closing boundary, so an incompatible one rules them all
+            # out at once. Inlined rather than calling `_codes_compatible`
+            # because this runs once per DP cell.
+            if row_code is None or column_code is None or row_code == column_code:
+                for student_span in range(1, span_limit + 1):
+                    text = student_joined[student_span][row_index]
+                    start_code = student_codes[row_index - student_span]
+                    back = previous[student_span - 1]
+                    scores = block_scores[student_span]
+                    for teacher_span in range(1, column_limit + 1):
+                        if teacher_joined[teacher_span][column_index] != text:
+                            continue
+                        if not _codes_compatible(
+                            start_code, teacher_codes[column_index - teacher_span]
+                        ):
+                            continue
+                        candidate = back[column_index - teacher_span] + scores[teacher_span]
+                        if candidate > best:
+                            best = candidate
+                            best_move = (
+                                _MOVE_BLOCK_BASE
+                                + (student_span - 1) * max_comb_len
+                                + (teacher_span - 1)
+                            )
             candidate = above[column_index] + gap_penalty
             if candidate > best:
                 best = candidate
@@ -409,24 +608,23 @@ def _select_anchors(
     teacher: list[str],
     anchor_length: int,
     *,
-    student_offsets: list[int],
-    teacher_offsets: list[int],
-    offsets_comparable: bool,
+    student_codes: list[int | None],
+    teacher_codes: list[int | None],
 ) -> list[tuple[int, int]]:
     """Pick a monotone, non-overlapping chain of anchors, greedily by student index.
+
+    An anchor whose two sides carry different boundary codes provably pairs
+    different content (the n-gram is spelled the same but occurs elsewhere in the
+    text) and is dropped. Upstream keeps such anchors and mis-aligns everything
+    between them. The codes are per-region, so this still fires inside the parts
+    of a partially mismatched span where the two texts do agree.
 
     Args:
         student: Canonical student tokens.
         teacher: Canonical teacher tokens.
         anchor_length: n-gram length for an anchor.
-        student_offsets: Character offset before each student token.
-        teacher_offsets: Character offset before each teacher token.
-        offsets_comparable: True when both sides canonicalize to the SAME text,
-            which makes character offsets directly comparable. Then an anchor
-            whose two sides sit at different offsets provably pairs different
-            content (the n-gram is spelled the same but occurs elsewhere in the
-            text) and is dropped. Upstream keeps such anchors and mis-aligns
-            everything between them.
+        student_codes: Boundary codes for the student side.
+        teacher_codes: Boundary codes for the teacher side.
 
     Returns:
         Selected `(student_index, teacher_index)` anchors, sorted, with both
@@ -438,7 +636,14 @@ def _select_anchors(
     for student_index, teacher_index in _unique_ngram_anchors(student, teacher, anchor_length):
         if student_index < next_student or teacher_index < next_teacher:
             continue
-        if offsets_comparable and student_offsets[student_index] != teacher_offsets[teacher_index]:
+        if not _span_compatible(
+            student_codes,
+            teacher_codes,
+            student_start=student_index,
+            student_end=student_index + anchor_length,
+            teacher_start=teacher_index,
+            teacher_end=teacher_index + anchor_length,
+        ):
             continue
         selected.append((student_index, teacher_index))
         next_student = student_index + anchor_length
@@ -517,7 +722,14 @@ def _plan_segments(
     return segments
 
 
-def _coalesce_mismatches(pairs: list[_Pair], student: list[str], teacher: list[str]) -> list[_Pair]:
+def _coalesce_mismatches(
+    pairs: list[_Pair],
+    student: list[str],
+    teacher: list[str],
+    *,
+    student_codes: list[int | None],
+    teacher_codes: list[int | None],
+) -> list[_Pair]:
     """Merge each mismatched region between exact pairs into one span, then recheck it.
 
     A run of mismatched 1-to-1 pairs plus the gaps around it is what the DP falls
@@ -531,10 +743,17 @@ def _coalesce_mismatches(pairs: list[_Pair], student: list[str], teacher: list[s
     non-exact pair, which is honest: the caller can score it as a
     lower-confidence chunk or drop it.
 
+    A merged region only claims `exact` when its two sides both spell the same
+    text AND sit at the same place in it: merging is the one step that can widen
+    a span, so it has to satisfy the same boundary check as every other pair or
+    it becomes a second way to emit a wrong exact pair.
+
     Args:
         pairs: Pairs from the DP, in order, in canonical index space.
         student: Canonical student tokens.
         teacher: Canonical teacher tokens.
+        student_codes: Boundary codes for the student side.
+        teacher_codes: Boundary codes for the teacher side.
 
     Returns:
         The pairs with mismatched regions coalesced. Exact pairs pass through
@@ -560,13 +779,21 @@ def _coalesce_mismatches(pairs: list[_Pair], student: list[str], teacher: list[s
         teacher_end = pairs[last + 1].teacher_start if last + 1 < count else len(teacher)
         merged_student = "".join(student[student_cursor:student_end])
         merged_teacher = "".join(teacher[teacher_cursor:teacher_end])
+        merged_exact = merged_student == merged_teacher and _span_compatible(
+            student_codes,
+            teacher_codes,
+            student_start=student_cursor,
+            student_end=student_end,
+            teacher_start=teacher_cursor,
+            teacher_end=teacher_end,
+        )
         out.append(
             _Pair(
                 student_start=student_cursor,
                 student_end=student_end,
                 teacher_start=teacher_cursor,
                 teacher_end=teacher_end,
-                exact=merged_student == merged_teacher,
+                exact=merged_exact,
             )
         )
         student_cursor = student_end
@@ -638,14 +865,15 @@ def align_tokens(
     teacher_canon, teacher_spans = canonicalize_sequence(teacher_tokens)
     student_offsets = _character_offsets(student_canon)
     teacher_offsets = _character_offsets(teacher_canon)
-    offsets_comparable = "".join(student_canon) == "".join(teacher_canon)
+    regions = _comparable_regions("".join(student_canon), "".join(teacher_canon))
+    student_codes = _boundary_codes(student_offsets, regions.student_length, regions)
+    teacher_codes = _boundary_codes(teacher_offsets, regions.teacher_length, regions)
     anchors = _select_anchors(
         student_canon,
         teacher_canon,
         anchor_length,
-        student_offsets=student_offsets,
-        teacher_offsets=teacher_offsets,
-        offsets_comparable=offsets_comparable,
+        student_codes=student_codes,
+        teacher_codes=teacher_codes,
     )
     segments = _plan_segments(len(student_canon), len(teacher_canon), anchors, anchor_length)
     cells = sum(segment.cells for segment in segments)
@@ -687,6 +915,8 @@ def align_tokens(
         for pair in _align_dp(
             student_canon[segment.student_start : segment.student_end],
             teacher_canon[segment.teacher_start : segment.teacher_end],
+            student_codes=student_codes[segment.student_start : segment.student_end + 1],
+            teacher_codes=teacher_codes[segment.teacher_start : segment.teacher_end + 1],
             exact_match_score=exact_match_score,
             combination_score_multiplier=combination_score_multiplier,
             gap_penalty=gap_penalty,
@@ -702,7 +932,13 @@ def align_tokens(
                 )
             )
 
-    pairs = _coalesce_mismatches(pairs, student_canon, teacher_canon)
+    pairs = _coalesce_mismatches(
+        pairs,
+        student_canon,
+        teacher_canon,
+        student_codes=student_codes,
+        teacher_codes=teacher_codes,
+    )
     return [
         AlignedPair(
             student_start=student_spans[pair.student_start][0],

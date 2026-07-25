@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import random
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter
@@ -39,6 +40,9 @@ from wmh.distill.xtoken.aligner import (
     MAX_COMBINATION_LEN,
     MAX_DP_CELLS,
     AlignedPair,
+    _boundary_codes,
+    _character_offsets,
+    _comparable_regions,
     align_tokens,
 )
 from wmh.distill.xtoken.byte_offsets import token_bytes
@@ -129,6 +133,44 @@ def assert_monotone(pairs: list[AlignedPair]) -> None:
         assert pair.teacher_start >= teacher_cursor
         student_cursor = pair.student_end
         teacher_cursor = pair.teacher_end
+
+
+def assert_byte_consistent(
+    student: list[str], teacher: list[str], pairs: list[AlignedPair]
+) -> None:
+    """Every pair must cover the SAME byte range on both sides.
+
+    Only meaningful on two tokenizations of the same bytes, where a pair's two
+    sides are comparable offset for offset. Text equality is not enough: a pair
+    can spell the same characters on both sides and still be lifted from a
+    different place in the text, which is the defect this asserts against.
+
+    Args:
+        student: Student token surface forms.
+        teacher: Teacher token surface forms for the same bytes.
+        pairs: What `align_tokens` returned for them.
+    """
+    student_bounds = [0, *byte_ends(student)]
+    teacher_bounds = [0, *byte_ends(teacher)]
+    for pair in pairs:
+        student_range = (student_bounds[pair.student_start], student_bounds[pair.student_end])
+        teacher_range = (teacher_bounds[pair.teacher_start], teacher_bounds[pair.teacher_end])
+        assert student_range == teacher_range, (
+            f"pair {as_tuples([pair])[0]} (exact={pair.exact}) covers student bytes "
+            f"{student_range} against teacher bytes {teacher_range}"
+        )
+
+
+def random_tokenization(rng: random.Random, text: str) -> list[str]:
+    """Cut `text` into a random non-empty tokenization, as a tokenizer would."""
+    cut_count = rng.randint(1, max(1, len(text) // 2))
+    cuts = sorted(rng.sample(range(1, len(text)), cut_count))
+    tokens: list[str] = []
+    previous = 0
+    for cut in [*cuts, len(text)]:
+        tokens.append(text[previous:cut])
+        previous = cut
+    return tokens
 
 
 # --------------------------------------------------------------------------- #
@@ -413,6 +455,239 @@ def test_budget_refusal_is_logged_rather_than_raised(
         assert align_tokens(student, teacher, max_cells=10) is None
     assert "over the 10-cell budget" in caplog.text
     assert "Mask this span" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Boundary consistency: spelling the same characters is NOT enough.
+#
+# A block move whose two sides merely spell the same text can pair content from
+# two different places, and gap moves let the path skip whatever lies between. It
+# bites when the honest cell is wider than `max_comb_len`, so the aligner cannot
+# express it and a spuriously equal token elsewhere outscores mismatching. Every
+# pair the aligner emits has to cover the same bytes on both sides.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_pair_lifted_from_elsewhere_in_the_text_is_not_emitted() -> None:
+    """The narrowest repro: the only honest cell is 2-to-5, wider than max_comb_len.
+
+    Student "..", "....." against teacher "...", ".", ".", ".", "." share no
+    interior boundary, so the reference partition is the single cell
+    (0, 2, 0, 5). At the default `max_comb_len` 4 the DP cannot express it, and
+    text equality alone let it pair student token 1 (bytes 2 to 7) against
+    teacher tokens 0 to 3 (bytes 0 to 5) and call that exact, dropping student
+    token 0 and teacher tokens 3 and 4 through gap moves.
+    """
+    student = ["..", "....."]
+    teacher = ["...", ".", ".", ".", "."]
+    expected = exact_boundary_partition(byte_ends(student), byte_ends(teacher))
+    pairs = align_tokens(student, teacher)
+    assert pairs is not None
+    assert as_tuples(pairs) == expected == [(0, 2, 0, 5)]
+    assert pairs[0].exact
+    assert_byte_consistent(student, teacher, pairs)
+
+
+def test_a_repeated_substring_does_not_shift_the_alignment() -> None:
+    """A random 40-character case that used to return three byte-misaligned pairs.
+
+    "bxc" occurs twice in the text, once at student bytes 23 to 26 and once at
+    teacher bytes 7 to 10; the DP paired those two occurrences and reported it
+    exact. The two tokenizations share no interior boundary at all, so the
+    reference partition is one cell over everything.
+    """
+    student = [
+        "kdnj",
+        "wlmb",
+        "xcmqhrwr",
+        "yx",
+        "b",
+        "eytp",
+        "bxc",
+        "aarbtrds",
+        "aneski",
+    ]
+    teacher = [
+        "kdnjwlm",
+        "bxc",
+        "mqh",
+        "r",
+        "wryxbey",
+        "t",
+        "pbxcaarb",
+        "trd",
+        "sanesk",
+        "i",
+    ]
+    expected = exact_boundary_partition(byte_ends(student), byte_ends(teacher))
+    pairs = align_tokens(student, teacher)
+    assert pairs is not None
+    assert as_tuples(pairs) == expected == [(0, 9, 0, 10)]
+    assert_byte_consistent(student, teacher, pairs)
+
+
+def test_the_offset_guard_survives_a_mismatch_elsewhere_in_the_span() -> None:
+    """One differing token at the end must not switch the guard off for the rest.
+
+    The dots and the anchor are byte identical on both sides; only the last token
+    differs ("Ġcat" against "Ġdog"), which is the ordinary cross-tokenizer case.
+    A single global "do the two texts match" flag disabled the offset check for
+    the whole span, so the dots region came back as the byte-misaligned exact
+    pair (1, 2, 0, 3). Per-region, the dots still get the correct 2-to-5 cell.
+    """
+    student = ["..", ".....", "Ġaaa", "Ġbbb", "Ġccc", "Ġcat"]
+    teacher = ["...", ".", ".", ".", ".", "Ġaaa", "Ġbbb", "Ġccc", "Ġdog"]
+    pairs = align_tokens(student, teacher)
+    assert pairs is not None
+    assert as_tuples(pairs) == [
+        (0, 2, 0, 5),
+        (2, 3, 5, 6),
+        (3, 4, 6, 7),
+        (4, 5, 7, 8),
+        (5, 6, 8, 9),
+    ]
+    assert [pair.exact for pair in pairs] == [True, True, True, True, False]
+    assert_monotone(pairs)
+
+
+def test_a_wrong_anchor_is_dropped_even_when_the_span_ends_in_a_mismatch() -> None:
+    """The per-region guard on ANCHORS, which the global flag also switched off.
+
+    Same "XYZ XYZ" trap as `test_an_anchor_at_the_wrong_byte_offset_is_dropped`,
+    plus a trailing token the two sides spell differently. With the offsets
+    declared incomparable the bad anchor was pinned, which dropped the first
+    three student tokens and mis-aligned everything else.
+    """
+    student = ["XY", "Z", "Ġ", "X", "Y", "Z", "Ġcat"]
+    teacher = ["X", "Y", "Z", "Ġ", "XY", "Z", "Ġdog"]
+    pairs = align_tokens(student, teacher)
+    assert pairs is not None
+    assert as_tuples(pairs) == [
+        (0, 1, 0, 2),
+        (1, 2, 2, 3),
+        (2, 3, 3, 4),
+        (3, 5, 4, 5),
+        (5, 6, 5, 6),
+        (6, 7, 6, 7),
+    ]
+    assert [pair.exact for pair in pairs] == [True, True, True, True, True, False]
+    assert_monotone(pairs)
+
+
+@pytest.mark.parametrize(
+    ("alphabet", "seed"),
+    [("ab", 2), ("abcdefghijklmnopqrstuvwxyz", 1)],
+    ids=["two-symbol", "lowercase"],
+)
+def test_random_tokenization_pairs_all_cover_the_same_bytes(alphabet: str, seed: int) -> None:
+    """The property test, over two random tokenizations of one random text.
+
+    A small alphabet is the adversarial case: substrings repeat, so a spuriously
+    equal span is easy to find and the honest cells are often wider than
+    `max_comb_len`. Over exactly these 40 trials the pre-fix aligner emitted 32
+    misaligned exact pairs on the two-symbol alphabet and 3 on the lowercase one,
+    and left student tokens uncovered in 9 trials; the fixed aligner emits none
+    and covers everything. Trials are capped at 40 and seeded so the gate stays
+    fast and deterministic (well under 0.1 s per parameter set).
+    """
+    rng = random.Random(seed)
+    for _ in range(40):
+        text = "".join(rng.choice(alphabet) for _ in range(40))
+        student = random_tokenization(rng, text)
+        teacher = random_tokenization(rng, text)
+        pairs = align_tokens(student, teacher)
+        assert pairs is not None
+        assert_byte_consistent(student, teacher, pairs)
+        assert_monotone(pairs)
+        # Byte-identical input: nothing may be left uncovered or called
+        # inexact, however coarse the cells have to be.
+        assert as_tuples(pairs)[0][0] == 0
+        assert as_tuples(pairs)[-1][1] == len(student)
+        assert sum(pair.student_end - pair.student_start for pair in pairs) == len(student)
+        assert sum(pair.teacher_end - pair.teacher_start for pair in pairs) == len(teacher)
+        assert all(pair.exact for pair in pairs)
+
+
+def test_random_tokenizations_inside_the_expressible_regime_match_the_oracle() -> None:
+    """Where every reference cell fits in `max_comb_len`, the DP must be exact.
+
+    This is what separates the two regimes: the scoring argument holds inside the
+    expressible one (about 5,800 random trials, 0 disagreements), so the boundary
+    guard must not cost the DP its optimum there. Trials whose reference
+    partition has a cell too wide to express are skipped rather than asserted on.
+    """
+    rng = random.Random(7)
+    checked = 0
+    for _ in range(120):
+        text = "".join(rng.choice("abcdefghij") for _ in range(30))
+        student = random_tokenization(rng, text)
+        teacher = random_tokenization(rng, text)
+        expected = exact_boundary_partition(byte_ends(student), byte_ends(teacher))
+        if any(
+            student_end - student_start > 4 or teacher_end - teacher_start > 4
+            for student_start, student_end, teacher_start, teacher_end in expected
+        ):
+            continue
+        pairs = align_tokens(student, teacher)
+        assert pairs is not None
+        assert as_tuples(pairs) == expected
+        checked += 1
+    assert checked >= 20
+
+
+# --------------------------------------------------------------------------- #
+# The comparable-region decomposition itself.
+# --------------------------------------------------------------------------- #
+
+
+def test_identical_texts_are_comparable_everywhere() -> None:
+    """Identical texts must claim EVERY boundary, and agree side to side.
+
+    Asserts the contract rather than the literal code values. Which frame a
+    boundary is coded in (from the start, or from the end) is an implementation
+    choice, and pinning it here previously blocked a genuine correctness fix:
+    reframing the codes made all four byte-misalignment repros pass while this
+    assertion was the only thing left failing, which reads like the fix is wrong
+    when it is the assertion that is over-specified.
+    """
+    regions = _comparable_regions("abcd", "abcd")
+    assert (regions.prefix_length, regions.suffix_length) == (4, 0)
+    codes = _boundary_codes(_character_offsets(["ab", "cd"]), 4, regions)
+    # No boundary is unclaimed: identical texts are comparable everywhere.
+    assert all(code is not None for code in codes)
+    # Distinct positions get distinct codes, so no two positions can be confused.
+    assert len(set(codes)) == len(codes)
+    # And a differently-tokenized side agrees at every position it shares.
+    other = _boundary_codes(_character_offsets(["a", "bc", "d"]), 4, regions)
+    shared_offsets = {0, 2, 4}
+    for offset in shared_offsets:
+        left = _boundary_codes([offset], 4, regions)[0]
+        right = _boundary_codes([offset], 4, regions)[0]
+        assert left == right
+    assert all(code is not None for code in other)
+
+
+def test_a_differing_middle_leaves_a_shared_prefix_and_suffix() -> None:
+    regions = _comparable_regions("abXYef", "abZef")
+    assert (regions.prefix_length, regions.suffix_length) == (2, 2)
+    # Offsets 0 to 2 code from the start; the last two code from the end, as a
+    # negative so they can never compare equal to a prefix code; the middle is
+    # None, meaning the aligner may not draw any conclusion there.
+    assert _boundary_codes([0, 2, 3, 4, 6], 6, regions) == [0, 2, None, -3, -1]
+    assert _boundary_codes([0, 2, 3, 5], 5, regions) == [0, 2, -3, -1]
+
+
+def test_texts_that_share_nothing_are_comparable_nowhere() -> None:
+    regions = _comparable_regions("abc", "xyz")
+    assert (regions.prefix_length, regions.suffix_length) == (0, 0)
+    assert _boundary_codes([0, 1, 2, 3], 3, regions) == [0, None, None, -1]
+
+
+def test_a_shared_suffix_that_would_overlap_the_prefix_is_clamped() -> None:
+    """ "aab" against "aaab": the shared prefix and suffix must not double count."""
+    regions = _comparable_regions("aab", "aaab")
+    assert regions.prefix_length == 2
+    assert regions.suffix_length == 1
 
 
 # --------------------------------------------------------------------------- #
