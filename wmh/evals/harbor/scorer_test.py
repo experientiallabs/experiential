@@ -713,6 +713,51 @@ def test_custom_agent_import_path_and_extra_kwargs_thread_into_the_job(tmp_path:
     assert agent.kwargs["e2b_template"] == "pi-template"
 
 
+def test_agent_model_name_overrides_the_provider_provenance_label(tmp_path: Path) -> None:
+    """Harbor's terminus-2 reads AgentConfig.model_name as a REAL model identity.
+
+    It picks its renderer and tokenizer from it, so the distill collector sends the base model
+    there while the sampler path travels in the agent kwargs. The default (the WMH bridge, which
+    treats the field as provenance) is unchanged.
+    """
+    default = HarborScorer(
+        job_template=_job_template(tmp_path),
+        tasks=_tasks(tmp_path, ("task-a",)),
+        provider_config=_provider(),
+        harness_backend="e2b",
+        agent_concurrency=1,
+        runner=_Runner([]),
+    )
+    [agent] = default._candidate_job(HarnessDoc.baseline()).agents
+    assert agent.model_name == "bedrock/worker-model"
+
+    overridden = HarborScorer(
+        job_template=_job_template(tmp_path),
+        tasks=_tasks(tmp_path, ("task-a",)),
+        provider_config=_provider(),
+        harness_backend="e2b",
+        agent_concurrency=1,
+        agent_import_path="harbor.agents.terminus_2.terminus_2:Terminus2",
+        agent_model_name="Qwen/Qwen3-8B",
+        runner=_Runner([]),
+    )
+    [agent] = overridden._candidate_job(HarnessDoc.baseline()).agents
+    assert agent.model_name == "Qwen/Qwen3-8B"
+    # The provider identity is still recorded in the kwargs, which is what the collector's
+    # stale-policy check reads to spot a job dir from another session's sampler weights.
+    assert agent.kwargs["provider_config"]["model"] == "worker-model"
+
+    with pytest.raises(ValueError, match="agent_model_name must be a nonempty string"):
+        HarborScorer(
+            job_template=_job_template(tmp_path),
+            tasks=_tasks(tmp_path, ("task-a",)),
+            provider_config=_provider(),
+            harness_backend="e2b",
+            agent_concurrency=1,
+            agent_model_name="",
+        )
+
+
 def test_extra_agent_kwargs_and_import_path_are_validated(tmp_path: Path) -> None:
     """Extras may extend the agent kwargs but never shadow the scorer-owned ones."""
     with pytest.raises(ValueError, match=r"scorer-owned agent kwargs \['harness'\]"):

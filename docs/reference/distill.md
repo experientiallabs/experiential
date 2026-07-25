@@ -1,9 +1,8 @@
 # Distill mode (`wmh optimize <agent> harbor --mode distill`)
 
 The other optimizer modes edit the agent's *harness*; distill mode trains the agent's *model*.
-It runs on-policy distillation of a Tinker LoRA student: the pi agent, with its harness held
-fixed, rolls out on real harbor benchmark tasks while sampling from the student's current
-weights; a larger teacher model scores the exact tokens the student sampled; and each training
+It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
+out on real harbor benchmark tasks while sampling from the student's current weights; a larger teacher model scores the exact tokens the student sampled; and each training
 step nudges the student toward the teacher with a per-token reverse-KL objective (the
 teacher-minus-student logprob gap as the advantage, trained under Tinker's `importance_sampling`
 or `ppo` loss). A holdout gate at the end compares teacher, student-before, and
@@ -18,9 +17,9 @@ ready-to-paste serving snippet.
   teacher scores there too.
 - **`E2B_API_KEY`** when the run config sets `harbor.backend = "e2b"` (rollout trials in E2B
   sandboxes); `backend = "local"` runs them on your machine instead.
-- **Free E2B sandbox capacity** for `backend = "e2b"`: a running trial holds two concurrent
-  sandboxes (harbor's task environment plus the sandbox hosting the pi harness process), so a
-  run needs `2 x train.trial_concurrency` free slots against your account's concurrent-sandbox
+- **Free E2B sandbox capacity** for `backend = "e2b"`: a running trial holds one concurrent
+  sandbox (harbor's task environment; terminus-2 itself runs in the `wmh` process), so a
+  run needs `train.trial_concurrency` free slots against your account's concurrent-sandbox
   limit (100 by default; set `WMH_E2B_SANDBOX_CAP` when yours differs). See
   [Sandbox capacity](#sandbox-capacity).
 - **A harbor job template**: the Harbor `JobConfig` YAML/JSON naming the benchmark dataset the
@@ -47,12 +46,29 @@ job_template = "tb2-job-template.yaml"  # Harbor JobConfig for the benchmark
 backend = "local"                       # or "e2b" (needs E2B_API_KEY)
 
 [rollout]
-max_turns = 100                # per-episode turn cap, pinned into the harness
-episode_timeout_s = 1800.0     # per-episode wall budget the pi runtimes enforce
+max_turns = 100                # per-episode turn cap (terminus-2's max_episodes)
+episode_timeout_s = 1800.0     # per-episode wall budget, applied as harbor's
+                               # agent-phase timeout (terminus-2 has none of its own)
 context_budget_tokens = 65536  # episodes that outgrow this are dropped whole;
-                               # also the context window sent to the pi runner,
-                               # so keep it sampling.max_tokens below the served
-                               # window or a full-budget call exceeds it
+                               # also terminus-2's TinkerLLM context_limit, so keep
+                               # it sampling.max_tokens below the served window or a
+                               # full-budget call exceeds it
+
+# REQUIRED for any REASONING student or teacher. Terminus-2 keeps only the parsed text of
+# each assistant turn, and the auto-discovered renderer of a reasoning model (nemotron3,
+# nemotron3_ultra, qwen3_5, which also serves Qwen3.6) hands the terminus parser a list
+# instead of a string, raising TypeError before the trial grades anything. Those renderers
+# also strip the thinking block when they re-render a turn as history, so turn N+1's prompt
+# no longer extends turn N's and every turn becomes its own datum fragment, at a cost
+# quadratic in turn count (measured: 2.7x the tokens at 6 turns, 7.8x at 20, 15.1x at 40).
+# The wmh verbatim renderers fix both: the parser sees the action text as a plain string,
+# and history replays each turn from its exact sampled ids, so the reasoning is trained on
+# and the episode stays one datum. Keyed per base model because the teacher's own rollouts
+# (warmup, teacher baseline) sample a different one. A typo here fails at config load.
+[rollout.renderers]
+"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmh/nemotron3_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmh/nemotron3_ultra_verbatim"
+# Qwen3.5 and Qwen3.6 both use "wmh/qwen3_5_verbatim"; plain Qwen3 uses "wmh/qwen3_verbatim".
 
 [train]
 steps = 40           # optimizer steps
@@ -190,8 +206,8 @@ Everything durable lands under `--run-dir`:
                       # KL/token, entropy_per_token and mean_generation_tokens
                       # with their baselines and ratios, the objective that
                       # trained the step (loss) and its advantage mean/std and
-                      # clip fraction, datum and drop counts, per-meter
-                      # tokens, USD
+                      # clip fraction, datum and drop counts, truncated_spans,
+                      # per-meter tokens, USD
   spend.json          # cumulative priced USD, updated on every charge
   checkpoints.json    # saved tinker:// training-state + sampler paths, plus the
                       # tripwire baseline (it has to survive --resume)
@@ -199,7 +215,8 @@ Everything durable lands under `--run-dir`:
   gate.json           # the promotion verdict
   model_card.json     # base model, teacher, artifact paths, gate record
   handoff.toml        # the [models.agent] serving snippet
-  harbor/  tokens/    # per-step rollout artifacts and token sinks
+  harbor/             # per-step harbor jobs dirs; each trial dir's result.json carries
+                      # that trial's exact sampled token spans (rollout_details)
   eval-rollouts/  warmup-rollouts/  # isolated rollout roots for eval/warmup batches
 ```
 
@@ -296,4 +313,5 @@ tripwire would never fire again.
 | An eval refuses to record (`eval ... is a NULL measurement, not a 0.0`) | Every trial died before the verifier ran, so there is no solve rate to write. Almost always the concurrent-sandbox cap (a distill trial holds two sandboxes); see the E2B rows below, lower `train.trial_concurrency`, then `--resume`. |
 | Deadline expiries (`TinkerDeadlineError: tinker <call> timed out after ...`) | A wedged Tinker session was cut off instead of hanging; transient ones retry with a fresh session on their own, and a persistent one can be given more headroom via the `WMH_TINKER_DEADLINE_<KIND>` env vars the error names. |
 | Resume rejected (`LoadWeights can only be called on uninitialized models`) | Tinker accepts a checkpoint restore only on a model nothing has touched yet, so a resume loads its state as the very first call on a freshly created training client. If a restore is slow enough to blow its deadline, the run retries it on another fresh client; `WMH_TINKER_DEADLINE_LOAD_STATE` (600s by default) is how long one attempt may take, which large students may need raised. |
-| Fragmentation warning (`N of M datum(s) are fragments ...`) | The agent edited its prompt history mid-episode, so shared context re-prefills at full price and teacher scoring multiplies; keep `rollout.compaction = false` and check the harness keeps its prompt prefix stable across turns. |
+| Fragmentation warning (`N of M datum(s) are fragments ...`) | The agent edited its prompt history mid-episode, so shared context re-prefills at full price and teacher scoring multiplies; keep `rollout.compaction = false`, check `[rollout.renderers]` names a `wmh/*_verbatim` renderer for every reasoning model, and check `truncated_spans` in the same row. |
+| Nonzero `truncated_spans` in `metrics.jsonl` | Turns sampled the full `sampling.max_tokens` and were cut off mid-answer. Nothing else reports this (harbor's own truncation guard cannot fire), so without this counter it reads as a model that writes broken actions. A truncated turn also cannot be replayed verbatim, so it fragments the episode. Raise `sampling.max_tokens`, keeping `rollout.context_budget_tokens` that far below the served window. |

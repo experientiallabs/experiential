@@ -53,6 +53,12 @@ def _running_runs() -> list[tuple[str, Path]]:
                 name = Path(argv[i + 1]).stem.replace("distill-", "")
             elif token == "--run-dir":
                 run_dir = Path(argv[i + 1])
+        # Other lanes share this machine and this CLI: a sibling agent's run (e.g. under
+        # `.wmh/xtoken-runs/`) matches the same pgrep and would be reported here as though it
+        # were ours. Reporting another lane's numbers as our own is worse than reporting
+        # nothing, so only runs under OUR runs dir count.
+        if run_dir is not None and RUNS_DIR not in run_dir.parents:
+            continue
         # One launch shows up as several pids (the `uv` wrapper and the python child both carry
         # the same argv), so key on the run dir: one run, one line.
         if name and run_dir and all(run_dir != seen for _, seen in runs):

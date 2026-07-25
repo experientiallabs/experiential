@@ -17,8 +17,9 @@ same request's realized logprobs), and finally the holdout gate that decides
 whether the adapter is promoted into the `AdapterStore`.
 
 Layout: everything lands in the `DistillRunStore` run directory. The rollout
-collector writes its per-step `harbor/step-NNNN/` and `tokens/step-NNNN/`
-dirs under the run dir for training batches; eval batches (baselines, interim
+collector writes its per-step `harbor/step-NNNN/` jobs dir under the run dir
+for training batches (each trial's sampled token spans live inside its own
+harbor trial dir, in `result.json`); eval batches (baselines, interim
 evals, student-after) get their own isolated roots under
 `eval-rollouts/<eval-name>/` so their harbor job dirs never collide with a
 training step's, and the warmup phase's teacher trials likewise land under
@@ -439,6 +440,14 @@ class StepMetrics(BaseModel):
     `output_truncated`, `unparsed_tool_call`, `provider_error`, `unknown`)."""
 
     empty_span_trials: int = Field(ge=0)
+    truncated_spans: int = Field(default=0, ge=0)
+    """Turns that sampled the full `sampling.max_tokens` and were cut off mid-answer.
+
+    Charts as `train/truncated_spans`. Nothing else reports it: harbor's own truncation guard is
+    unreachable (see `RolloutStats.truncated_spans`), so without this series a run whose output
+    cap is too low reads as a run whose model writes broken actions. 0 on rows from before this
+    field."""
+
     datums: int = Field(ge=0)
     fragments: int = Field(ge=0)
     fragmentation_rate: float = Field(ge=0.0, le=1.0)
@@ -2081,8 +2090,8 @@ class _DistillRun:
                 "carries a verifier reward, so no solve rate exists to record. Read the cells' "
                 f"`infra-failure:` notes under {self._run_dir / EVAL_ROLLOUTS_DIR / key} for the "
                 "exact causes. Trials that never started are almost always the E2B "
-                "concurrent-sandbox account cap (a distill trial holds TWO sandboxes: the task "
-                "environment plus the pi harness), so lower train.trial_concurrency (currently "
+                "concurrent-sandbox account cap (a distill trial holds one sandbox: harbor's "
+                "task environment), so lower train.trial_concurrency (currently "
                 f"{cfg.train.trial_concurrency}), reap orphaned sandboxes, and re-run; trials that "
                 "ran but were never graded (VerifierTimeoutError) usually need a longer "
                 "verifier.override_timeout_sec in the harbor job template. Writing 0.0% here "
@@ -2394,7 +2403,11 @@ class _DistillRun:
                 "trajectories, so point warmup.trajectories_from at a run with a "
                 "matching teacher, or unset it to collect fresh"
             )
-        return list(manifest.records), rollout_stats(manifest.records)
+        # THIS run's output cap, not the source run's: the truncation count is read
+        # beside this run's metrics and must answer "would these turns be cut off here".
+        return list(manifest.records), rollout_stats(
+            manifest.records, max_tokens=self._cfg.sampling.max_tokens
+        )
 
     def _collect_warmup_trials(self) -> tuple[list[TrialRecord], RolloutStats]:
         """Collect the warmup phase's teacher rollouts and persist their manifest.
@@ -2677,6 +2690,7 @@ class _DistillRun:
             scaffold_loss_rate=roll_stats.scaffold_loss_rate,
             stop_reason_counts=dict(roll_stats.stop_reason_counts),
             empty_span_trials=roll_stats.empty_span_trials,
+            truncated_spans=roll_stats.truncated_spans,
             datums=len(trained),
             fragments=datum_stats.fragments,
             fragmentation_rate=datum_stats.fragmentation_rate,
@@ -3083,7 +3097,8 @@ def run_distillation(
     Args:
         name: The adapter/run name (a safe single path segment).
         cfg: The validated run config; snapshotted into the run dir.
-        harness: The pinned harness document the pi agent runs in every trial.
+        harness: The pinned document whose hash keys every trial's harbor job
+            dir; the rollout agent itself is harbor's terminus-2.
         train_task_ids: The train split's task ids (unique, non-empty).
         holdout_task_ids: The holdout split's task ids (unique, non-empty,
             disjoint from the train split); baselines and the gate run here.

@@ -427,6 +427,7 @@ def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Pat
         "stop/submitted": 1,
         "stop/unknown": 2,
         "train/empty_span_trials": 0,
+        "train/truncated_spans": 0,
         "train/datums": 4,
         "train/fragments": 0,
         "train/fragmentation_rate": 0.0,

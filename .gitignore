@@ -42,3 +42,6 @@ settings.toml
 .agents/docs/research/distill/*.json
 .agents/docs/research/distill/*.jsonl
 .agents/docs/research/distill/*.html
+
+# wandb run directories (local mirrors of what is already on the server)
+wandb/

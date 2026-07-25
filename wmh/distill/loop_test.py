@@ -357,7 +357,7 @@ class _FakeRollouts:
                     doc_hash=harness.doc_hash,
                 )
             )
-            return [], rollout_stats([])
+            return [], rollout_stats([], max_tokens=4096)
         client = self.service.create_sampling_client(provider_config.model)
         records: list[TrialRecord] = []
         for task_index, task_id in enumerate(task_ids):
@@ -397,7 +397,7 @@ class _FakeRollouts:
                     )
                 )
         # The real aggregator, so the fake cannot drift from the stats the loop reads.
-        stats = rollout_stats(records)
+        stats = rollout_stats(records, max_tokens=4096)
         self.calls.append(
             _RolloutCall(
                 step_index=step_index,

@@ -85,7 +85,12 @@ uv run pytest -q
   promotion or rollback.
 - `wmh optimize <agent> harbor --mode distill` is the third optimization surface: instead of
   editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
-  student from pi-agent rollouts on harbor tasks (the harness stays pinned for the run). The
+  student from rollouts of harbor's OWN `terminus_2` agent on harbor tasks (measured: our pi
+  scaffold needed 2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59%
+  harness loss, and this mode measures model quality, not scaffold quality). Terminus-2 samples
+  the student through `llm_backend="tinker"` with `collect_rollout_details=True`, and harbor
+  persists the per-turn token ids that become the training targets verbatim into each trial's
+  `result.json`. The
   loss is per-token reverse KL against the teacher's logprobs on the student's own sampled
   tokens (Tinker's `importance_sampling`, with an optional supervised warmup on the teacher's
   passing trajectories), and promotion is gated on holdout solve rates: student-after must

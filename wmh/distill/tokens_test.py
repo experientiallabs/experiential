@@ -10,8 +10,11 @@ from pydantic import ValidationError
 
 from wmh.distill.tokens import (
     TrialRecord,
+    assemble_harbor_trial_records,
     assemble_trial_records,
+    load_trial_rollout_spans,
     load_trial_spans,
+    read_terminus_stop_reason,
     read_trial_stop_reason,
 )
 from wmh.harness.scoring import GradedTests, ScoreCell
@@ -250,3 +253,197 @@ def test_trial_record_validation() -> None:
             passed=True,
             artifact_dir="x",
         )
+
+
+# --- harbor terminus-2 rollout details (the distillation span source) ----------------------------
+
+
+def _write_result(trial_dir: Path, payload: dict[str, object]) -> None:
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    (trial_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _rollout_detail(turns: int) -> dict[str, object]:
+    return {
+        "prompt_token_ids": [[1, 2, index] for index in range(turns)],
+        "completion_token_ids": [[65, 66] for _ in range(turns)],
+        "logprobs": [[-0.5, -1.5] for _ in range(turns)],
+    }
+
+
+def _trajectory(*, complete: bool) -> dict[str, object]:
+    tool_calls = (
+        [{"tool_call_id": "c1", "function_name": "mark_task_complete", "arguments": {}}]
+        if complete
+        else [{"tool_call_id": "c1", "function_name": "bash_command", "arguments": {}}]
+    )
+    return {
+        "steps": [
+            {"step_id": 1, "source": "user"},
+            {"step_id": 2, "source": "agent", "tool_calls": tool_calls},
+        ]
+    }
+
+
+def test_load_trial_rollout_spans_reads_harbors_per_turn_token_ids(tmp_path: Path) -> None:
+    """The ids the sampler issued reach training verbatim, straight out of result.json."""
+    trial = tmp_path / "task-a__s1"
+    _write_result(trial, {"agent_result": {"rollout_details": [_rollout_detail(3)]}})
+
+    spans = load_trial_rollout_spans(trial)
+
+    assert [span.call_index for span in spans] == [0, 1, 2]
+    assert [span.prompt_token_ids for span in spans] == [[1, 2, 0], [1, 2, 1], [1, 2, 2]]
+    assert all(span.sampled_token_ids == [65, 66] for span in spans)
+    assert all(span.sampled_logprobs == [-0.5, -1.5] for span in spans)
+
+
+def test_load_trial_rollout_spans_uses_only_the_main_agent_segment(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Subagent segments are separate conversations; their prompts extend nothing."""
+    trial = tmp_path / "task-a__s1"
+    _write_result(
+        trial,
+        {"agent_result": {"rollout_details": [_rollout_detail(2), _rollout_detail(1)]}},
+    )
+
+    with caplog.at_level("WARNING"):
+        spans = load_trial_rollout_spans(trial)
+
+    assert len(spans) == 2
+    assert "Summarization must stay OFF" in caplog.text
+
+
+def test_load_trial_rollout_spans_refuses_to_pair_desynchronized_turn_lists(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A turn that returned no completion desynchronizes harbor's three per-turn lists.
+
+    Nothing can realign them afterwards, so the trial contributes no training data at all
+    rather than training the wrong prompts against the wrong completions.
+    """
+    trial = tmp_path / "task-a__s1"
+    detail = _rollout_detail(3)
+    detail["completion_token_ids"] = [[65, 66], [65, 66]]
+    _write_result(trial, {"agent_result": {"rollout_details": [detail]}})
+
+    with caplog.at_level("WARNING"):
+        assert load_trial_rollout_spans(trial) == []
+    assert "cannot be aligned" in caplog.text
+
+
+def test_load_trial_rollout_spans_refuses_logprobs_that_do_not_match_their_tokens(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    trial = tmp_path / "task-a__s1"
+    detail = _rollout_detail(1)
+    detail["logprobs"] = [[-0.5]]
+    _write_result(trial, {"agent_result": {"rollout_details": [detail]}})
+
+    with caplog.at_level("WARNING"):
+        assert load_trial_rollout_spans(trial) == []
+    assert "no training data" in caplog.text
+
+
+def test_load_trial_rollout_spans_missing_or_empty_evidence_is_empty_not_an_error(
+    tmp_path: Path,
+) -> None:
+    assert load_trial_rollout_spans(tmp_path / "never-ran") == []
+    unreadable = tmp_path / "task-a__s1"
+    unreadable.mkdir()
+    (unreadable / "result.json").write_text("{not json", encoding="utf-8")
+    assert load_trial_rollout_spans(unreadable) == []
+    no_details = tmp_path / "task-b__s1"
+    _write_result(no_details, {"agent_result": {"rollout_details": None}})
+    assert load_trial_rollout_spans(no_details) == []
+
+
+def test_read_terminus_stop_reason_maps_the_recorded_exception(tmp_path: Path) -> None:
+    timed_out = tmp_path / "task-a__s1"
+    _write_result(
+        timed_out,
+        {
+            "exception_info": {"exception_type": "AgentTimeoutError"},
+            "agent_result": {"metadata": {"n_episodes": 4}},
+        },
+    )
+    assert read_terminus_stop_reason(timed_out, max_turns=100) == "budget"
+
+    overflowed = tmp_path / "task-b__s1"
+    _write_result(overflowed, {"exception_info": {"exception_type": "ContextLengthExceededError"}})
+    assert read_terminus_stop_reason(overflowed, max_turns=100) == "provider_error"
+
+    other = tmp_path / "task-c__s1"
+    _write_result(other, {"exception_info": {"exception_type": "EnvironmentStartTimeoutError"}})
+    assert read_terminus_stop_reason(other, max_turns=100) == "error"
+
+
+def test_read_terminus_stop_reason_reads_completion_from_the_trajectory(tmp_path: Path) -> None:
+    trial = tmp_path / "task-a__s1"
+    _write_result(trial, {"agent_result": {"metadata": {"n_episodes": 7}}})
+    (trial / "agent").mkdir()
+    (trial / "agent" / "trajectory.json").write_text(
+        json.dumps(_trajectory(complete=True)), encoding="utf-8"
+    )
+    assert read_terminus_stop_reason(trial, max_turns=100) == "submitted"
+
+    (trial / "agent" / "trajectory.json").write_text(
+        json.dumps(_trajectory(complete=False)), encoding="utf-8"
+    )
+    # Ran, never claimed completion, never hit the cap: terminus-2 only leaves that loop when
+    # its tmux session dies, which is a harness failure rather than a task verdict.
+    assert read_terminus_stop_reason(trial, max_turns=100) == "error"
+
+
+def test_read_terminus_stop_reason_prefers_the_turn_cap_at_the_boundary(tmp_path: Path) -> None:
+    """A completion claim on the last allowed turn still reads as a scaffold loss."""
+    trial = tmp_path / "task-a__s1"
+    _write_result(trial, {"agent_result": {"metadata": {"n_episodes": 10}}})
+    (trial / "agent").mkdir()
+    (trial / "agent" / "trajectory.json").write_text(
+        json.dumps(_trajectory(complete=True)), encoding="utf-8"
+    )
+    assert read_terminus_stop_reason(trial, max_turns=10) == "max_turns"
+
+
+def test_read_terminus_stop_reason_is_none_without_readable_evidence(tmp_path: Path) -> None:
+    assert read_terminus_stop_reason(tmp_path / "never-ran", max_turns=100) is None
+    no_episodes = tmp_path / "task-a__s1"
+    _write_result(no_episodes, {"agent_result": {"metadata": {}}})
+    assert read_terminus_stop_reason(no_episodes, max_turns=100) is None
+
+
+def test_assemble_harbor_trial_records_joins_rewards_with_harbor_spans(tmp_path: Path) -> None:
+    solved = tmp_path / "job" / "task-a__s1"
+    _write_result(
+        solved,
+        {
+            "agent_result": {
+                "rollout_details": [_rollout_detail(2)],
+                "metadata": {"n_episodes": 2},
+            }
+        },
+    )
+    (solved / "agent").mkdir()
+    (solved / "agent" / "trajectory.json").write_text(
+        json.dumps(_trajectory(complete=True)), encoding="utf-8"
+    )
+    dead = tmp_path / "job" / "task-b__d1"
+    dead.mkdir(parents=True)
+
+    records = assemble_harbor_trial_records(
+        [
+            _cell("task-a", 1, reward=1.0, artifact_dir=solved),
+            _cell("task-b", 1, reward=0.0, artifact_dir=dead),
+        ],
+        max_turns=100,
+    )
+
+    assert [record.trial_name for record in records] == ["task-a__s1", "task-b__d1"]
+    assert len(records[0].spans) == 2
+    assert records[0].stop_reason == "submitted"
+    assert records[0].artifact_dir == str(solved)
+    # A trial that left no evidence is kept with empty spans, never dropped.
+    assert records[1].spans == []
+    assert records[1].stop_reason is None

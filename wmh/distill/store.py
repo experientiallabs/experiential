@@ -16,8 +16,8 @@ or needs to resume lives under it:
       gate.json           # the DistillGateRecord verdict
       model_card.json     # the run's DistillModelCard
       handoff.toml        # the [models.agent] serving snippet for the user
-      harbor/step-NNNN/   # per-step harbor jobs dirs (written by the rollout collector)
-      tokens/step-NNNN/   # per-step token sinks (written by the rollout collector)
+      harbor/step-NNNN/   # per-step harbor jobs dirs (written by the rollout collector;
+                          # each trial dir's result.json carries that trial's token spans)
       warmup-rollouts/    # the warmup phase's isolated rollout root (teacher trials)
 
 `AdapterStore` mirrors `wmh/harness/store.py`'s `HarnessStore` idiom for the

@@ -208,6 +208,7 @@ class HarborScorer:
         harbor_retries: int = 0,
         agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
         extra_agent_kwargs: JsonObject | None = None,
+        agent_model_name: str | None = None,
         missing_reward: MissingRewardMode = "raise",
         context_window: int | None = None,
         runner: HarborRunner | None = None,
@@ -242,6 +243,8 @@ class HarborScorer:
                 f"{agent_import_path!r}; use the exported constant of the agent bridge "
                 "(e.g. WMH_HARBOR_AGENT_IMPORT_PATH)"
             )
+        if agent_model_name is not None and not agent_model_name:
+            raise ValueError("agent_model_name must be a nonempty string when given")
         overridden = _SCORER_OWNED_AGENT_KWARGS & set(extra_agent_kwargs or {})
         if overridden:
             raise ValueError(
@@ -295,6 +298,7 @@ class HarborScorer:
         self._attempts = attempts
         self._agent_import_path = agent_import_path
         self._extra_agent_kwargs: JsonObject = dict(extra_agent_kwargs or {})
+        self._agent_model_name = agent_model_name
         self._missing_reward: MissingRewardMode = missing_reward
         self._harness_backend: HarnessBackend = harness_backend
         self._episode_timeout_s = episode_timeout_s
@@ -333,6 +337,7 @@ class HarborScorer:
         harbor_retries: int = 0,
         agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
         extra_agent_kwargs: JsonObject | None = None,
+        agent_model_name: str | None = None,
         missing_reward: MissingRewardMode = "raise",
         context_window: int | None = None,
         runner: HarborRunner | None = None,
@@ -345,6 +350,9 @@ class HarborScorer:
         `agent_import_path` plus `extra_agent_kwargs` route trials through a custom agent
         bridge (e.g. the distill collector's token-recording subclass); the defaults preserve
         the standard WMH agent, and extra kwargs may never shadow the scorer-owned ones.
+        `agent_model_name` overrides the harbor `AgentConfig.model_name` for agents that read
+        it as a real model identity (harbor's own terminus_2 derives its renderer and tokenizer
+        from it) instead of as the provenance label the WMH bridge treats it as.
         """
         if len(job_template.datasets) != 1 or job_template.tasks:
             raise ValueError("HarborScorer requires exactly one dataset and no direct tasks")
@@ -365,6 +373,7 @@ class HarborScorer:
             harbor_retries=harbor_retries,
             agent_import_path=agent_import_path,
             extra_agent_kwargs=extra_agent_kwargs,
+            agent_model_name=agent_model_name,
             missing_reward=missing_reward,
             context_window=context_window,
             runner=runner,
@@ -447,7 +456,11 @@ class HarborScorer:
             {
                 "name": None,
                 "import_path": self._agent_import_path,
-                "model_name": f"{self._provider_config.kind.value}/{self._provider_config.model}",
+                "model_name": (
+                    self._agent_model_name
+                    if self._agent_model_name is not None
+                    else f"{self._provider_config.kind.value}/{self._provider_config.model}"
+                ),
                 "skills": [],
                 "env": {},
                 "mcp_servers": [],

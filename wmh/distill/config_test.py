@@ -817,6 +817,64 @@ def test_checked_in_run_configs_resolve_cookbook_renderers() -> None:
             assert get_recommended_renderer_name(model), f"{path.name}: {model}"
 
 
+def test_checked_in_run_configs_name_a_verbatim_renderer_for_every_tinker_model() -> None:
+    """Every model a run SAMPLES needs an explicit renderer, and it must be a wmh one.
+
+    The auto-discovered reasoning renderer of every model in this lineup kills the
+    trial before it grades anything (harbor's terminus-2 parsers are handed a list),
+    so a config that leaves `[rollout.renderers]` unset for a sampled model does not
+    run at all. The value check lives in the validator; this pins that the checked-in
+    configs actually carry the entries.
+    """
+    pytest.importorskip("tinker_cookbook")
+    from wmh.distill.renderers import VERBATIM_RENDERERS
+
+    config_dir = Path(__file__).resolve().parents[2] / ".agents" / "distill"
+    paths = sorted(config_dir.glob("*.toml"))
+    if not paths:
+        pytest.skip("no checked-in distill run configs in this tree")
+    for path in paths:
+        cfg = load_distill_config(path)
+        # An openai_compat teacher is served outside Tinker and renders with its own
+        # template, so it never reaches terminus-2's renderer.
+        sampled = [cfg.student.base_model]
+        if cfg.teacher.backend == "tinker":
+            sampled.append(cfg.teacher.model)
+        for model in sampled:
+            renderer = cfg.rollout.renderers.get(model)
+            assert renderer is not None, f"{path.name}: no rollout.renderers entry for {model}"
+            assert renderer in VERBATIM_RENDERERS, f"{path.name}: {model} = {renderer}"
+
+
+def test_a_renderer_name_the_cookbook_cannot_build_is_rejected_at_load(tmp_path: Path) -> None:
+    """A typo must fail here, not on the first (paid) rollout of the run."""
+    pytest.importorskip("tinker_cookbook")
+    text = MINIMAL_TOML + (
+        '\n[rollout.renderers]\n"Qwen/Qwen3-8B" = "wmh/qwen3_5_verbatm"\n'  # codespell:ignore
+    )
+    with pytest.raises(ValueError, match="tinker-cookbook cannot build"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def test_the_wmh_verbatim_and_builtin_renderer_names_load(tmp_path: Path) -> None:
+    pytest.importorskip("tinker_cookbook")
+    text = MINIMAL_TOML + (
+        "\n[rollout.renderers]\n"
+        '"Qwen/Qwen3-8B" = "wmh/qwen3_verbatim"\n'
+        '"Qwen/Qwen3-235B-A22B-Instruct-2507" = "qwen3_disable_thinking"\n'
+    )
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.rollout.renderers["Qwen/Qwen3-8B"] == "wmh/qwen3_verbatim"
+
+
+def test_a_renderer_key_naming_a_model_the_run_never_samples_is_rejected(tmp_path: Path) -> None:
+    """The more dangerous typo: an unmatched key is silently ignored everywhere else."""
+    pytest.importorskip("tinker_cookbook")
+    text = MINIMAL_TOML + '\n[rollout.renderers]\n"Qwen/Qwen3-9B" = "wmh/qwen3_verbatim"\n'
+    with pytest.raises(ValueError, match="never samples"):
+        load_distill_config(_write(tmp_path, text))
+
+
 def _checked_in_config(name: str) -> DistillConfig:
     path = Path(__file__).resolve().parents[2] / ".agents" / "distill" / name
     if not path.exists():

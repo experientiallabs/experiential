@@ -333,7 +333,7 @@ def test_the_probe_graded_rate_reproduces_its_measured_values(tmp_path: Path) ->
     cells = _probe_cells(tmp_path / "job")
     records = assemble_trial_records(cells, tmp_path / "sinks")
 
-    stats = rollout_stats(records)
+    stats = rollout_stats(records, max_tokens=4096)
 
     assert (stats.trials, stats.executed_trials, stats.infra_failed_trials) == (48, 46, 2)
     # The two ungradeable trials are out of the graded denominator too, not zeros inside it.

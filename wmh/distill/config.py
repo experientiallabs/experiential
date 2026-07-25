@@ -23,6 +23,8 @@ from pydantic import (
     model_validator,
 )
 
+from wmh.distill.rendering import MISSING_DISTILL_EXTRA
+
 
 class StudentConfig(BaseModel):
     """The Tinker LoRA student under training."""
@@ -127,7 +129,7 @@ class TeacherConfig(BaseModel):
 
 
 class HarborConfig(BaseModel):
-    """How rollouts are produced: the pi agent on harbor tasks.
+    """How rollouts are produced: harbor's terminus-2 agent on harbor tasks.
 
     Attempts per task are NOT configured here: training rollouts use
     `train.group_size` (the on-policy group) and evals use `eval.k` / `gate.k`.
@@ -154,20 +156,23 @@ class RolloutConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_turns: int = Field(default=100, ge=1)
-    """Episode turn cap; pinned into the harness doc's `param:max-turns`.
+    """Episode turn cap; passed to terminus-2 as `max_turns` (f.k.a. `max_episodes`).
 
-    100, not the harness-wide 20 that world-model closed-loop eval uses. The reference terminus-2
-    agent is effectively unbounded (`_max_episodes = 1_000_000`) and TerminalBench-2 tasks routinely
-    need 50 to 200 turns; at 20 the cap fired mid-tool-call on 45% of Ultra trials and 12% of Super
-    trials, and every one of those scored reward 0. 100 is the point where a cap still bounds a
-    looping agent (a real 100-turn episode also runs into `episode_timeout_s` first) without being
-    the thing that decides the score."""
+    100, not the harness-wide 20 that world-model closed-loop eval uses. Terminus-2 is unbounded by
+    default (`_max_episodes = 1_000_000`) and TerminalBench-2 tasks routinely need 50 to 200 turns;
+    at 20 the cap fired mid-tool-call on 45% of Ultra trials and 12% of Super trials, and every one
+    of those scored reward 0. 100 is the point where a cap still bounds a looping agent (a real
+    100-turn episode also runs into `episode_timeout_s` first) without being the thing that decides
+    the score. Also pinned into the harness doc's `param:max-turns`, which no longer steers the
+    rollout agent but still keys the per-candidate harbor job dir."""
 
     episode_timeout_s: float = Field(default=1800.0, gt=0)
-    """Per-episode wall budget, host-enforced by the pi runtimes.
+    """Per-episode wall budget.
 
-    Threaded into `HarborScorer.create`; without it every rollout and eval wave silently inherited
-    the 300s evaluation default, which ended 31% of Super trials on the clock. 1800s covers the
+    Terminus-2 has no internal wall clock, so this is applied as harbor's own agent-phase timeout
+    (`AgentConfig.override_timeout_sec`), which raises `AgentTimeoutError`; harbor swallows that
+    and still verifies the work, so an episode cut off by the clock stays a graded trial. Without
+    it every rollout and eval wave inherited the task's declared agent timeout. 1800s covers the
     real work in this suite (a single `apt-get install build-essential` observation was 45,131 chars
     and tens of seconds; the suite also compiles CompCert and boots QEMU) while staying inside the
     E2B sandbox lease ceiling (`MAX_EVAL_EPISODE_LIFETIME_S`, 3600s, minus one lease of cleanup
@@ -178,10 +183,91 @@ class RolloutConfig(BaseModel):
     it are dropped whole from training (`build_datums`), and the cost estimate
     caps per-episode tokens here.
 
-    Also the context window sent to the pi runner, so pi's own context guard clamps and trims
-    against the real serving limit instead of a hardcoded 128,000. Keep it at least
-    `sampling.max_tokens` below the served window, or a full-budget prompt plus its output cap
-    exceeds the window and the sampling call 400s."""
+    Also the context window the rollout agent's LLM is built with (terminus-2's
+    `TinkerLLM(context_limit=...)`), so the agent measures its own prompts against the real
+    serving limit instead of harbor's 32,000 default. Keep it at least `sampling.max_tokens`
+    below the served window, or a full-budget prompt plus its output cap exceeds the window and
+    the sampling call 400s."""
+
+    renderers: dict[str, str] = Field(default_factory=dict)
+    """Per-base-model override of the chat renderer terminus-2's `TinkerLLM` builds prompts with,
+    keyed by the base model name (`student.base_model`, `teacher.model`). A model with no entry
+    auto-discovers its renderer through
+    `tinker_cookbook.model_info.get_recommended_renderer_name`.
+
+    Keyed per model, not one value, because a run samples MORE than one base model: the student's
+    rollouts, plus the teacher's own rollouts for the warmup collection and the teacher baseline
+    eval. A Nemotron Nano student and a Nemotron Ultra teacher need different renderer names.
+
+    Exists because the auto-discovered renderer of every REASONING model in this lineup is
+    unusable under terminus-2 as the cookbook ships it, measured offline against the real
+    tokenizers. Terminus-2 keeps only `parse_response(...)["content"]` in its chat history, and
+    `nemotron3`, `nemotron3_ultra` and `qwen3_5` (the auto renderer for both Qwen3.5 and Qwen3.6)
+    return that content as a LIST of thinking/text parts, which harbor's
+    `TerminusJSONPlainParser` raises `TypeError` on, killing the trial before it grades anything.
+    Those same renderers also strip the thinking block when they re-render an assistant turn that
+    is no longer last, so turn N+1's prompt diverges from turn N's and EVERY turn becomes its own
+    datum fragment, at a cost quadratic in turn count (2.7x the tokens at 6 turns, 7.8x at 20,
+    15.1x at 40).
+
+    What to name here: the wmh VERBATIM renderer for every Nemotron-3 or Qwen3.5/3.6 model in the
+    run. `wmh.distill.renderers` wraps each reasoning renderer so the parser sees a plain `str`
+    of the action text while the model's own reasoning is replayed into history token for token,
+    which fixes both failures at once and keeps the episode a single datum:
+
+        [rollout.renderers]
+        "Qwen/Qwen3.5-9B" = "wmh/qwen3_5_verbatim"
+        "Qwen/Qwen3.6-27B" = "wmh/qwen3_5_verbatim"
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmh/nemotron3_verbatim"
+        "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmh/nemotron3_ultra_verbatim"
+
+    The disable-thinking renderers (`nemotron3_disable_thinking`,
+    `nemotron3_ultra_disable_thinking`) also hold the prefix property and parse, but they buy that
+    by throwing the reasoning away, which is exactly the behavior distillation is meant to teach.
+    Name one only when a run deliberately trains a non-reasoning policy."""
+
+    @field_validator("renderers")
+    @classmethod
+    def _reject_blank_renderers(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject blank or unknown renderer entries at config load, not at trial 1.
+
+        Args:
+            value: The raw `model -> renderer name` mapping.
+
+        Returns:
+            The mapping unchanged when every entry names a renderer the cookbook can build.
+
+        Raises:
+            ValueError: If either side of an entry is blank, or the renderer name is one
+                `tinker_cookbook.renderers.get_renderer` does not know.
+            ImportError: If the distill extra is missing, so no name can be checked.
+        """
+        for model, renderer in value.items():
+            if not model.strip() or not renderer.strip():
+                raise ValueError(
+                    "rollout.renderers maps a base model name to a tinker-cookbook renderer "
+                    f"name; got the entry {model!r} = {renderer!r}, which has an empty side"
+                )
+        if not value:
+            return value
+        # Deferred: wmh.distill.renderers subclasses cookbook classes at module scope, and
+        # wmh.distill.config is imported by the CLI, which must work without the distill extra.
+        try:
+            from wmh.distill.renderers import VERBATIM_RENDERERS, is_known_renderer
+        except ImportError as exc:
+            raise ImportError(MISSING_DISTILL_EXTRA) from exc
+        for model, renderer in value.items():
+            if is_known_renderer(renderer):
+                continue
+            raise ValueError(
+                f"rollout.renderers names the renderer {renderer!r} for {model!r}, which "
+                "tinker-cookbook cannot build; a name that does not resolve would only fail on "
+                "the run's first rollout. Use one of the wmh verbatim renderers "
+                f"({', '.join(sorted(VERBATIM_RENDERERS))}) or a built-in cookbook name "
+                "(qwen3, qwen3_5, nemotron3, nemotron3_ultra, their *_disable_thinking "
+                "variants, ...)"
+            )
+        return value
 
     compaction: bool = False
 
@@ -316,7 +402,7 @@ class WarmupConfig(BaseModel):
 
     The remedy for a student that samples only failing trajectories (on-policy
     distillation then matches the teacher on failures): before the OPD step
-    loop, the teacher runs the pi harness on the TRAIN tasks, its kept trials
+    loop, the teacher runs the same terminus-2 rollouts on the TRAIN tasks, its kept trials
     become cross_entropy SFT datums via the same prefix merge, and the student
     trains `steps` full-batch passes over them. 0 steps (the default) disables
     the phase entirely.
@@ -648,6 +734,34 @@ class DistillConfig(BaseModel):
                 "alignment (they name different text); use loss = "
                 '"importance_sampling" or "ppo", which only need the teacher\'s '
                 "total logprob over each chunk of the student's own tokens"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_renderer_models(self) -> DistillConfig:
+        """Reject a `rollout.renderers` key naming a model this run never samples.
+
+        The value side is checked where it is declared (`RolloutConfig`); the KEY
+        is the more dangerous typo, because a key that matches nothing is not an
+        error anywhere downstream. The lookup simply misses, the model falls back
+        to its auto-discovered renderer, and the run dies on trial 1 with the
+        failure this setting existed to prevent.
+
+        Returns:
+            This config, unchanged, when every key names a sampled base model.
+
+        Raises:
+            ValueError: If a key is neither `student.base_model` nor `teacher.model`.
+        """
+        sampled = {self.student.base_model, self.teacher.model}
+        unknown = sorted(set(self.rollout.renderers) - sampled)
+        if unknown:
+            raise ValueError(
+                f"rollout.renderers names the model(s) {unknown} that this run never samples; "
+                "the keys are base model names and must be student.base_model "
+                f"({self.student.base_model!r}) or teacher.model ({self.teacher.model!r}). An "
+                "unmatched key is silently ignored, and the model it meant to fix would fall "
+                "back to its auto-discovered renderer"
             )
         return self
 
