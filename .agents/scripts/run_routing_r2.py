@@ -949,11 +949,14 @@ def run_cell_exp6(name: str, matrix: OutcomeMatrix, split_kind: str, seed: int) 
                 acc = ibest_acc  # a candidate that cannot fit scores as the baseline
             stats.setdefault((base, kind), []).append(acc - ibest_acc)
 
+    # Tiny fit sides make 2/3 inner wins flukeable (bird-sql ood lesson: a +0.10 inner
+    # mean off 5-scenario folds lost -0.094 on test); small corpora demand unanimity.
+    needed_wins = 3 if len(fit_ids) < 50 else 2
     promoted = [
         (base, kind)
         for (base, kind), deltas in stats.items()
         if sum(deltas) / len(deltas) > 0
-        and sum(d > 0 for d in deltas) >= 2
+        and sum(d > 0 for d in deltas) >= needed_wins
         and (base, kind) != (AUTO_DEFAULT, "hash")
     ]
     if promoted:
