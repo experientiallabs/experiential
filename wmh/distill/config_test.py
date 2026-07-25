@@ -54,7 +54,8 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.teacher.checkpoint is None
     assert cfg.harbor.backend == "local"
     assert cfg.harbor.reward_key == "reward"
-    assert cfg.rollout.max_turns == 20
+    assert cfg.rollout.max_turns == 100
+    assert cfg.rollout.episode_timeout_s == pytest.approx(1800.0)
     assert cfg.rollout.context_budget_tokens == 65536
     assert cfg.rollout.compaction is False
     assert cfg.train.steps == 40

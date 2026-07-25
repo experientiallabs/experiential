@@ -84,8 +84,9 @@ from wmh.distill.store import AdapterStore, DistillRunStore
 from wmh.distill.teacher import EncodingTokenizer
 from wmh.distill.tokens import TrialRecord
 from wmh.distill.tracking import DistillTracker
+from wmh.distill.xtoken.chunks import ChunkAdvantageStats
 from wmh.harness.doc import HarnessDoc
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import ProviderConfig, ProviderKind, VerifyResult
 from wmh.providers.tinker import SampledSequenceLike, TokenSpan
 
 _NAME = "distill-loop-test"
@@ -375,11 +376,76 @@ class _Env:
     progress: list[DistillProgress] = field(default_factory=list)
 
 
+def _fake_chunk_advantage_stats(datums: int) -> ChunkAdvantageStats:
+    """Neutral stats for the stubbed chunk path (see `_setup`)."""
+    return ChunkAdvantageStats(
+        datums=datums,
+        mismatch_drops=0,
+        empty_coverage_drops=0,
+        chunks=datums,
+        scored_loss_tokens=datums,
+        unscored_loss_tokens=0,
+        clipped_chunks=0,
+        chunk_reverse_kl=0.0,
+        advantage_mean=0.0,
+        advantage_std=0.0,
+    )
+
+
+class _FakeChunkTeacher:
+    """Stands in for the cross-tokenizer HTTP scoring client.
+
+    The real `PromptLogprobClient` reaches a live endpoint in `verify()` and
+    retries up to 30 times on failure, so constructing it against a fake URL
+    wedges the suite. These tests exercise baseline/gate routing and budget
+    accounting, none of which depend on real scoring.
+    """
+
+    def __init__(self) -> None:
+        self.scored: list[list[int]] = []
+
+    def verify(self) -> VerifyResult:
+        return VerifyResult(ok=True, kind=ProviderKind.OPENAI, model=_TEACHER)
+
+    def usage(self) -> int:
+        return 0
+
+    def score(self, token_ids: list[int]) -> list[float | None]:
+        self.scored.append(list(token_ids))
+        return [None] + [-0.5] * (len(token_ids) - 1)
+
+
 def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Env:
     service = _Service()
     rollouts = _FakeRollouts(service)
     monkeypatch.setattr(loop_module, "collect_rollouts", rollouts)
     monkeypatch.setattr(loop_module, "build_renderer", _fake_build_renderer)
+    monkeypatch.setattr(
+        loop_module, "_build_chunk_teacher", lambda _teacher: _FakeChunkTeacher()
+    )
+    # The cross-tokenizer scoring path needs the teacher's real tokenizer, a real
+    # chat template and a live endpoint. These tests cover baseline/gate ROUTING
+    # for a served teacher, so the chunk mechanics are stubbed here and covered
+    # directly by `_chunk_scored_datums`'s own tests instead.
+    monkeypatch.setattr(loop_module, "_load_teacher_tokenizer", lambda _teacher: object())
+    monkeypatch.setattr(
+        loop_module,
+        "_chunk_scored_datums",
+        lambda datums, *_args, **_kwargs: (
+            list(datums),
+            [],
+            [],
+            loop_module._ChunkScoringStats(scored=len(datums), loss_tokens=1),
+        ),
+    )
+    monkeypatch.setattr(
+        loop_module,
+        "attach_chunk_advantages",
+        lambda datums, _plans, _rows, _cfg: (
+            list(datums),
+            _fake_chunk_advantage_stats(len(datums)),
+        ),
+    )
     return _Env(
         service=service,
         rollouts=rollouts,

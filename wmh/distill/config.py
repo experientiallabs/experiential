@@ -143,8 +143,21 @@ class RolloutConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    max_turns: int = Field(default=20, ge=1)
-    """Episode turn cap; pinned into the harness doc's `param:max-turns`."""
+    max_turns: int = Field(default=100, ge=1)
+    """Episode turn cap; pinned into the harness doc's `param:max-turns`.
+
+    Measured on real TerminalBench-2 episodes: p50 21 calls, p95 57, max 72. A
+    cap of 20 truncated the majority of episodes mid-task, so it is not a
+    safety limit but a silent rollout filter."""
+
+    episode_timeout_s: float = Field(default=1800.0, gt=0)
+    """Per-episode wall clock, passed through to the harbor scorer.
+
+    Without this the scorer's own default of 300 s applies, against a measured
+    per-trial p50 of 597 s and p95 of 1,185 s on TerminalBench-2 -- so most
+    trials would die on the clock and score 0, which reads as a capability
+    result rather than a timeout. Only honoured for the e2b backend; the local
+    runner rejects a non-default value because it shares one runner dir."""
 
     context_budget_tokens: int = Field(default=65536, ge=1024)
     """Context cap: episodes where any call's prompt plus sampled tokens exceed

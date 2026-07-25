@@ -1,15 +1,20 @@
 """Render the status figures for the Notion page as one self-contained HTML file.
 
-Two panels, in the order a reader needs them:
+Two panels, in the order a reader needs them to follow the lane's central claim:
 
-1. The headroom: measured AIME 2024+2025 pass@1 for the GLM-5.2 teacher and the
-   Qwen3.5-9B student, with the post-distillation bar left explicitly EMPTY
-   because it has not been measured. The question the page has to answer is "did
-   distillation help", and the honest answer today is "not yet measured", so the
-   figure says that rather than implying a result.
-2. Why run 3's falling gap is NOT that evidence: the student-teacher gap fell
-   every step while chunk coverage collapsed, so each step measured a different
-   and shrinking subset of tokens.
+1. The teacher does not dominate the student on math. On AIME the base
+   Qwen3.6-27B scores ABOVE the GLM-5.2 teacher on every available
+   measurement; on MATH-500 the teacher leads by ~6 points. A distillation
+   gain cannot be demonstrated where the teacher has no headroom, which is
+   why the lane moved to agentic tool use (TerminalBench-2).
+2. Why several earlier numbers were wrong: measured pass@1 is a FLOOR
+   whenever rollouts truncate. The same model and grader move 78.3% -> 93.3%
+   on AIME purely by lifting the token budget from 32,768 to 65,536.
+
+Every value is computed from the eval JSONs under `.wmh/xtoken-runs/evals/`
+rather than hardcoded. An earlier revision of this script hardcoded figures
+that were later withdrawn, and the figure kept asserting them after the page
+had been corrected.
 
 Palette per AGENTS.md rule 14 (ink, hairline grid, white ground, brand accents).
 
@@ -39,124 +44,198 @@ from matplotlib.ticker import PercentFormatter
 INK = "#0a0a0a"
 GRID = "#ececec"
 BLUE = "#0070f3"
-PURPLE = "#7928ca"
 AMBER = "#f5a623"
 RED = "#ee0000"
-TEAL = "#50e3c2"
 
-TEACHER_AIME = 75.0
-STUDENT_AIME = 53.3
-TEACHER_N = 60
-STUDENT_N = 60
+EVALS = Path(".wmh/xtoken-runs/evals")
+
+
+class Eval:
+    """One scored eval file, normalized across the two row schemas in use.
+
+    Rows carry either a `truncated` bool (the Tinker-side harness) or a
+    `finish_reason` string (the hosted-teacher harness), and the teacher's
+    Azure rows can carry neither. A row whose completion state is unknown is
+    counted as neither stopped nor truncated, so `stopped_rate` and
+    `truncation_rate` need not sum to 1 -- the shortfall IS the unknown
+    fraction and the caller must surface it rather than assume.
+    """
+
+    def __init__(self, name: str) -> None:
+        rows = json.loads((EVALS / f"{name}.json").read_text())
+        self.name = name
+        self.rows = rows if isinstance(rows, list) else rows["rows"]
+        self.n = len(self.rows)
+
+    def _state(self, row: dict) -> str:
+        if row.get("truncated") is True:
+            return "truncated"
+        reason = row.get("finish_reason")
+        if reason == "length":
+            return "truncated"
+        if reason == "stop" or row.get("truncated") is False:
+            return "stopped"
+        return "unknown"
+
+    @property
+    def pass_at_1(self) -> float:
+        return 100 * sum(1 for r in self.rows if r.get("correct")) / self.n
+
+    @property
+    def truncation_rate(self) -> float:
+        return 100 * sum(1 for r in self.rows if self._state(r) == "truncated") / self.n
+
+    @property
+    def unknown_rate(self) -> float:
+        return 100 * sum(1 for r in self.rows if self._state(r) == "unknown") / self.n
+
+    @property
+    def pass_at_1_stopped(self) -> tuple[float, int]:
+        """Accuracy over rows that verifiably stopped, and how many those are.
+
+        This is NOT an unbiased estimate of the model's accuracy: excluding
+        truncated rows conditions on finishing, which correlates with problem
+        difficulty. It is reported only as an upper bound on the floor.
+        """
+        stopped = [r for r in self.rows if self._state(r) == "stopped"]
+        if not stopped:
+            return float("nan"), 0
+        return 100 * sum(1 for r in stopped if r.get("correct")) / len(stopped), len(stopped)
 
 
 def _style(axis: plt.Axes) -> None:
-    """Minimal frame: hairline y grid, no top or right spine."""
-    axis.spines["top"].set_visible(False)
-    axis.spines["right"].set_visible(False)
+    axis.set_facecolor("white")
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
     for side in ("left", "bottom"):
         axis.spines[side].set_color(GRID)
     axis.tick_params(colors=INK, labelsize=9, length=0)
-    axis.set_axisbelow(True)
-    axis.yaxis.grid(True, color=GRID, linewidth=1)
-    axis.xaxis.grid(False)
-
-
-def headroom_panel(axis: plt.Axes) -> None:
-    """Measured baselines plus an explicitly unmeasured post-distillation bar."""
-    labels = ["Student\nbefore", "Student\nafter distillation", "Teacher\nGLM-5.2"]
-    values = [STUDENT_AIME, 0.0, TEACHER_AIME]
-    colors = [AMBER, GRID, BLUE]
-    bars = axis.bar(labels, values, color=colors, width=0.58, edgecolor="none")
-    # Standard error at n=60 for the two measured bars.
-    for index, value in ((0, STUDENT_AIME), (2, TEACHER_AIME)):
-        se = 100 * ((value / 100) * (1 - value / 100) / STUDENT_N) ** 0.5
-        axis.errorbar(index, value, yerr=se, color=INK, capsize=4, linewidth=1.1, capthick=1.1)
-        axis.text(index, value + se + 2.4, f"{value:.1f}%", ha="center", color=INK, fontsize=11,
-                  fontweight="bold")
-    axis.text(1, 3.0, "NOT YET\nMEASURED", ha="center", va="bottom", color=RED, fontsize=10,
-              fontweight="bold", linespacing=1.35)
-    axis.axhline(TEACHER_AIME, color=BLUE, linewidth=1, linestyle=(0, (4, 3)), alpha=0.55)
-    axis.annotate(
-        f"{TEACHER_AIME - STUDENT_AIME:.1f} pt headroom",
-        xy=(1.0, (TEACHER_AIME + STUDENT_AIME) / 2),
-        ha="center", color=INK, fontsize=9,
-    )
-    axis.set_ylim(0, 100)
     axis.yaxis.set_major_formatter(PercentFormatter())
-    axis.set_ylabel("AIME 2024+2025 pass@1", color=INK, fontsize=9)
-    axis.set_title(
-        "Did distillation help? Not measured yet.",
-        loc="left", color=INK, fontsize=13, fontweight="bold", pad=12,
-    )
+    axis.yaxis.grid(True, color=GRID, linewidth=1)
+    axis.set_axisbelow(True)
+
+
+def headroom_panel(axis: plt.Axes, evals: dict[str, Eval]) -> None:
+    """Teacher vs untrained student, at the budgets where nothing truncated."""
+    student = [evals["q27b_aime_65k"].pass_at_1, evals["q27b_math500_65k"].pass_at_1]
+    teacher_stopped, teacher_n = evals["glm_aime_azure"].pass_at_1_stopped
+    teacher = [teacher_stopped, evals["glm_math500_v2"].pass_at_1]
+
+    offsets = [-0.2, 0.2]
+    positions = [0, 1]
+    axis.bar([p + offsets[0] for p in positions], student, width=0.36,
+             color=AMBER, edgecolor="none", label="Qwen3.6-27B (untrained student)")
+    axis.bar([p + offsets[1] for p in positions], teacher, width=0.36,
+             color=BLUE, edgecolor="none", label="GLM-5.2 (teacher)")
+
+    for position, offset, value in ((0, -0.2, student[0]), (1, -0.2, student[1]),
+                                    (0, 0.2, teacher[0]), (1, 0.2, teacher[1])):
+        axis.text(position + offset, value + 1.8, f"{value:.1f}", ha="center",
+                  color=INK, fontsize=10.5, fontweight="bold")
+
+    axis.text(0.0, 112, "student ABOVE teacher", ha="center", color=RED,
+              fontsize=9.5, fontweight="bold")
+    axis.text(1.0, 112, f"teacher +{teacher[1] - student[1]:.1f} pt", ha="center",
+              color=INK, fontsize=9.5, fontweight="bold")
+    axis.plot([-0.2, 0.2], [107, 107], color=RED, linewidth=1)
+    axis.plot([0.8, 1.2], [107, 107], color=INK, linewidth=1)
+
+    axis.set_xticks(positions)
+    axis.set_xticklabels([f"AIME 24+25\n(n={evals['q27b_aime_65k'].n})",
+                          f"MATH-500\n(n={evals['q27b_math500_65k'].n})"], fontsize=9.5)
+    axis.set_ylim(0, 126)
+    axis.set_yticks([0, 20, 40, 60, 80, 100])
+    axis.set_ylabel("pass@1", color=INK, fontsize=9.5)
+    axis.legend(frameon=False, fontsize=9, loc="upper center", ncol=2,
+                bbox_to_anchor=(0.5, -0.09), handlelength=1.4, columnspacing=1.6)
+    axis.set_title("Math cannot show a distillation gain:\nthe teacher has no headroom to transfer",
+                   loc="left", color=INK, fontsize=13, fontweight="bold", pad=14)
     _style(axis)
-    for bar in bars:
-        bar.set_zorder(2)
 
 
-def confound_panel(axis: plt.Axes, rows: list[dict[str, float]]) -> None:
-    """Run 3's gap fell while coverage collapsed, so the gap is not evidence."""
-    steps = [int(r["step"]) for r in rows]
-    gaps = [float(r["chunk_reverse_kl"]) for r in rows]
-    coverage = [100 * float(r["coverage_rate"]) for r in rows]
+def floor_panel(axis: plt.Axes, evals: dict[str, Eval]) -> None:
+    """The same model and grader, two budgets: truncation suppresses accuracy."""
+    small, large = evals["q27b_aime"], evals["q27b_aime_65k"]
+    ninebee = evals["q9b_aime"]
 
-    axis.plot(steps, gaps, color=PURPLE, marker="o", markersize=5, linewidth=1.8,
-              label="student-teacher gap (fell)")
-    axis.set_ylabel("student-teacher gap", color=PURPLE, fontsize=9)
-    axis.tick_params(axis="y", colors=PURPLE)
-    axis.set_xlabel("training step", color=INK, fontsize=9)
-    axis.set_ylim(0, max(gaps) * 1.25)
+    labels = ["Qwen3.6-27B\n32,768", "Qwen3.6-27B\n65,536", "Qwen3.5-9B\n32,000"]
+    scores = [small.pass_at_1, large.pass_at_1, ninebee.pass_at_1]
+    truncs = [small.truncation_rate, large.truncation_rate, ninebee.truncation_rate]
+    colors = [AMBER, AMBER, RED]
+
+    axis.bar(labels, scores, width=0.5, color=colors, edgecolor="none")
+    for index, (score, trunc) in enumerate(zip(scores, truncs, strict=True)):
+        axis.text(index, score + 1.8, f"{score:.1f}", ha="center", color=INK,
+                  fontsize=10.5, fontweight="bold")
+        axis.text(index, 4.0, f"{trunc:.0f}% cut", ha="center", va="bottom",
+                  color="white" if colors[index] == RED else INK, fontsize=9,
+                  fontweight="bold")
+
+    axis.plot([0, 0, 1, 1], [small.pass_at_1 + 7, 112, 112, large.pass_at_1 + 7],
+              color=INK, linewidth=1)
+    axis.text(0.5, 114, f"+{large.pass_at_1 - small.pass_at_1:.1f} pt from budget alone",
+              ha="center", color=INK, fontsize=9.5, fontweight="bold")
+
+    axis.set_ylim(0, 126)
+    axis.set_yticks([0, 20, 40, 60, 80, 100])
+    axis.set_ylabel("AIME 24+25 pass@1", color=INK, fontsize=9.5)
+    axis.set_title("Any score with truncation is a FLOOR:\nsame model, same grader, budget swept",
+                   loc="left", color=INK, fontsize=13, fontweight="bold", pad=14)
     _style(axis)
 
-    twin = axis.twinx()
-    twin.plot(steps, coverage, color=RED, marker="s", markersize=5, linewidth=1.8,
-              linestyle=(0, (5, 2)), label="tokens actually scored (collapsed)")
-    twin.set_ylabel("% of student tokens scored", color=RED, fontsize=9)
-    twin.tick_params(axis="y", colors=RED, labelsize=9, length=0)
-    twin.set_ylim(0, 105)
-    twin.yaxis.set_major_formatter(PercentFormatter())
-    twin.spines["top"].set_visible(False)
-    twin.spines["left"].set_color(GRID)
-    twin.spines["right"].set_color(GRID)
 
-    axis.set_title(
-        "Run 3's falling gap is not evidence: coverage collapsed alongside it",
-        loc="left", color=INK, fontsize=13, fontweight="bold", pad=12,
-    )
-    handles = axis.get_lines() + twin.get_lines()
-    axis.legend(handles, [h.get_label() for h in handles], frameon=False, fontsize=8.5,
-                loc="lower left")
-
-
-def render(rows: list[dict[str, float]]) -> str:
-    """Both panels as one inline SVG string."""
-    figure, axis = plt.subplots(1, 1, figsize=(6.6, 4.0))
+def render(evals: dict[str, Eval]) -> str:
+    figure, axes = plt.subplots(1, 2, figsize=(13.6, 5.6))
     figure.patch.set_facecolor("white")
-    headroom_panel(axis)
-    figure.tight_layout(pad=2.0)
+    headroom_panel(axes[0], evals)
+    floor_panel(axes[1], evals)
+    figure.tight_layout(pad=2.4, rect=(0, 0.13, 1, 1))
+
+    teacher = evals["glm_aime_azure"]
+    stopped, count = teacher.pass_at_1_stopped
+    figure.text(
+        0.008, 0.075,
+        f"LEFT — Student bars: 0% truncation at a 65,536 budget. The teacher's AIME bar "
+        f"({stopped:.1f}%) covers only the {count}/{teacher.n} rows that verifiably stopped "
+        f"({teacher.truncation_rate:.0f}% truncated, {teacher.unknown_rate:.0f}% no "
+        f"finish_reason), "
+        f"so it conditions on finishing and flatters the teacher; raw is {teacher.pass_at_1:.1f}%. "
+        f"The student still leads on AIME.",
+        fontsize=7.8, color="#666666", ha="left", va="top", wrap=True)
+    figure.text(
+        0.008, 0.028,
+        "RIGHT — A truncated rollout emits no boxed answer and scores as wrong, so truncation "
+        "suppresses measured accuracy. Three conclusions in this lane were withdrawn after being "
+        "traced to this; treat any sub-65k number as a lower bound, never as an estimate.",
+        fontsize=7.8, color="#666666", ha="left", va="top", wrap=True)
     buffer = io.StringIO()
     figure.savefig(buffer, format="svg", bbox_inches="tight", facecolor="white")
     plt.close(figure)
-    svg = buffer.getvalue()
-    return svg[svg.index("<svg") :]
+    return buffer.getvalue()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--metrics", default=".wmh/xtoken-runs/run3/metrics.jsonl")
     parser.add_argument("--out", default="/tmp/xtoken_figures.html")
     args = parser.parse_args()
 
-    rows = [json.loads(line) for line in Path(args.metrics).read_text().splitlines() if line.strip()]
-    svg = render(rows)
-    html = (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<style>body{margin:0;padding:12px;background:#fff;"
-        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}"
-        "svg{max-width:100%;height:auto}</style></head><body>" + svg + "</body></html>"
+    names = ["q27b_aime", "q27b_aime_65k", "q27b_math500_65k", "q9b_aime",
+             "glm_aime_azure", "glm_math500_v2"]
+    evals = {name: Eval(name) for name in names}
+
+    for name, ev in evals.items():
+        stopped, count = ev.pass_at_1_stopped
+        print(f"{name:20s} n={ev.n:3d} pass@1={ev.pass_at_1:5.1f}% "
+              f"trunc={ev.truncation_rate:5.1f}% unknown={ev.unknown_rate:5.1f}% "
+              f"stopped-only={stopped:5.1f}% (n={count})")
+
+    svg = render(evals)
+    Path(args.out).write_text(
+        "<!doctype html><meta charset=utf-8>"
+        "<title>X-Token GLM-5.2 -> Qwen3.6-27B: status</title>"
+        f"<body style='margin:0;background:white'>{svg}</body>"
     )
-    Path(args.out).write_text(html, encoding="utf-8")
-    print(f"wrote {args.out} ({len(html) / 1024:.0f} KiB)")
+    print(f"wrote {args.out} ({len(svg) / 1024:.1f} KiB svg)")
 
 
 if __name__ == "__main__":

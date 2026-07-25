@@ -13,8 +13,11 @@ accuracy, and accuracy over the finished samples is reported beside it, which is
 the only pair that lets a reader tell "the student got worse" from "the student
 got more verbose".
 
-Reference numbers to compare against, both from this grader (AIME 2024+2025,
-30 problems): teacher GLM-5.2 75.0%, untrained student Qwen/Qwen3.5-9B 53.3%.
+No reference numbers are embedded here on purpose. Prior runs' summaries live in
+`.wmh/xtoken-runs/evals/`, and a difference between two of them is only a result
+when dataset, temperature AND token budget all match -- differencing runs at
+different budgets measures the budget. Every constant a previous revision of this
+docstring carried was later withdrawn for exactly that reason.
 
 Usage:
     # a trained checkpoint (path from training.save_weights_for_sampler(...).result().path)
@@ -53,11 +56,18 @@ logger = logging.getLogger("aime-eval")
 _CONTEXT_MARGIN = 16
 """Tokens held back from the context so the sampler cannot overrun it."""
 
-BASELINES: dict[str, dict[str, float]] = {
-    "aime": {"teacher": 75.0, "student": 53.3},
-    "math500": {"teacher": 87.5, "student": 75.0},
-}
-"""Measured pass@1 percentages from this same grader, for the closing comparison."""
+EVAL_ARCHIVE = Path(".wmh/xtoken-runs/evals")
+"""Where prior runs' summaries live, for a like-for-like comparison by hand.
+
+Deliberately NOT a table of baseline constants. An earlier revision hardcoded
+`aime: teacher 75.0, student 53.3` and `math500: teacher 87.5, student 75.0` and
+printed a delta against them; every one of those four numbers was later
+withdrawn, and because the delta controlled for neither temperature nor token
+budget it produced a reported -48.3pp "regression" that was really a comparison
+between a 45%-truncated run and a 0%-truncated one at different budgets. pass@1
+is only meaningful alongside its temperature, budget and truncation rate, so this
+script now reports its own conditions and leaves the comparison to a reader who
+can match them."""
 
 
 class EvalRow(BaseModel):
@@ -421,45 +431,30 @@ def main() -> None:
     )
     if summary.errors:
         logger.warning("api errors:       %d sample(s) excluded from every rate", summary.errors)
-    reference = BASELINES.get("aime" if args.dataset.startswith("aime") else args.dataset)
-    if reference:
-        # Only the delta against the untrained student answers "did distillation
-        # help". A share of the student-to-teacher gap is quoted only when the
-        # delta is positive: "gap closed -246%" is noise, not a result.
-        delta = 100 * summary.pass_at_1 - reference["student"]
-        gap = reference["teacher"] - reference["student"]
+    # No baseline delta is printed. Comparing pass@1 across runs is only valid at
+    # matched dataset, temperature and token budget, and this script cannot know
+    # whether an archived run matches -- several archived files record no
+    # temperature at all. Name the conditions and point at the archive instead.
+    logger.info(
+        "conditions:       %s, n=%d, k=%d, temperature %.1f, budget %d, truncation %.1f%%",
+        summary.dataset,
+        summary.problems,
+        summary.k,
+        summary.temperature,
+        summary.max_tokens,
+        100 * summary.truncation_rate,
+    )
+    if summary.truncation_rate > 0:
         logger.info(
-            "reference (same grader): untrained student %.1f%%, teacher %.1f%%",
-            reference["student"],
-            reference["teacher"],
+            "                  ^ any comparison against a run with a DIFFERENT truncation "
+            "rate measures the budget, not the model",
         )
-        if delta > 0:
-            logger.info(
-                "delta:            %+.1fpp vs the untrained student = %.0f%% of the %.1fpp "
-                "student-to-teacher gap",
-                delta,
-                100 * delta / gap,
-                gap,
-            )
-        else:
-            logger.info(
-                "delta:            %+.1fpp vs the untrained student: no gain to report",
-                delta,
-            )
-        if summary.truncation_rate > 0:
-            logger.info(
-                "                  ^ %.0f%% of samples truncated, so this delta is confounded "
-                "by the budget; rerun with a larger --max-tokens before reading it",
-                100 * summary.truncation_rate,
-            )
-        if args.dataset in ("aime24", "aime25") or (args.n and args.n > 0):
-            logger.info(
-                "note: this run scored %d problems of %s, a SUBSET of what the reference "
-                "numbers were measured on (AIME 2024+2025 is 30 problems), so the comparison "
-                "is indicative only",
-                summary.problems,
-                args.dataset,
-            )
+    if EVAL_ARCHIVE.is_dir():
+        logger.info(
+            "prior runs for a like-for-like comparison: %s (match temperature AND budget "
+            "before differencing)",
+            EVAL_ARCHIVE,
+        )
 
     if args.out:
         path = Path(args.out)

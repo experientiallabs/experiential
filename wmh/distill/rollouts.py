@@ -40,6 +40,7 @@ from wmh.core.types import JsonObject
 from wmh.distill.config import DistillConfig
 from wmh.distill.tokens import TrialRecord, assemble_trial_records
 from wmh.harness.doc import HarnessDoc
+from wmh.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
 from wmh.providers.base import ProviderConfig
 
 logger = logging.getLogger(__name__)
@@ -130,9 +131,67 @@ class RolloutStats(BaseModel):
     empty_span_trials: int = Field(ge=0)
     """Trials that recorded no token span (died before the first completion)."""
 
-    # TODO: surface TokenRecorder.fallback_count (incremental-prompt re-renders) here;
-    # it needs the per-trial span sink format to carry the counter across the
-    # agent-process boundary, so it is not trivially wireable today.
+    mean_sampled_tokens: float = Field(default=0.0, ge=0.0)
+    p50_sampled_tokens: int = Field(default=0, ge=0)
+    p99_sampled_tokens: int = Field(default=0, ge=0)
+    max_sampled_tokens: int = Field(default=0, ge=0)
+    """Per-trial totals of sampled tokens: the length distribution, not just its mean.
+
+    These exist because generation length is an UNSUPERVISED degree of freedom in
+    a pure-KL objective and it drifts. A sibling lane's run collapsed from 2,866
+    to 49 mean generated tokens (59x) with entropy below 0.2, while every
+    alignment and teacher-transfer metric it logged stayed inside its healthy
+    band -- coverage and projection accuracy are structurally blind to length
+    collapse. The distribution matters more than the mean: a mean can fall
+    because the policy became efficient or because it went bimodal (one mode
+    terminating immediately, one never terminating), and only the percentiles
+    separate those."""
+
+    entropy_estimate: float = Field(default=0.0, ge=0.0)
+    """Mean of `-sampled_logprobs` over every sampled token in the batch.
+
+    At temperature 1.0 this is an unbiased single-sample Monte Carlo estimate of
+    the policy's per-token entropy, since `H(pi) = E_{x~pi}[-log pi(x)]` and the
+    rollouts ARE draws from `pi`. It is therefore free -- the sampler already
+    records a logprob per token, so no distribution and no extra forward pass is
+    needed. **Only valid at temperature 1.0**: any other sampling temperature
+    makes the draws come from a tempered distribution while the logprobs remain
+    the untempered ones, and the estimate is biased. Read it as a collapse
+    tripwire, not as a calibrated entropy."""
+
+    trials_without_delta: int = Field(default=0, ge=0)
+    """Trials where at least one span has `delta_messages is None`.
+
+    This is the cross-tokenizer kill switch made visible.
+    `reconstruct_conversation` returns None if ANY span in a trial lost its
+    canonical messages, so one re-render fallback anywhere in an episode
+    discards that whole episode's teacher signal -- and it does so silently, in
+    the sense that the step still reports datums > 0 with coverage near zero
+    rather than raising. A recorded live batch fragmented 100 of 108 datums.
+    Counting it here replaces the older plan of plumbing
+    `TokenRecorder.fallback_count` across the agent-process boundary, because
+    `delta_messages` is already in the sink format and is the exact field the
+    consumer gates on."""
+
+
+def _percentile(sorted_values: Sequence[int], fraction: float) -> int:
+    """The nearest-rank percentile of an already-sorted sequence.
+
+    Nearest-rank rather than interpolated: these are token counts used as
+    tripwires, and an interpolated p99 of a 5-element batch invents a value no
+    rollout had. An empty sequence reports 0.
+
+    Args:
+        sorted_values: Values in ascending order.
+        fraction: The percentile as a fraction in [0, 1].
+
+    Returns:
+        The value at the nearest rank, or 0 when there are no values.
+    """
+    if not sorted_values:
+        return 0
+    index = min(len(sorted_values) - 1, int(fraction * len(sorted_values)))
+    return sorted_values[index]
 
 
 def rollout_stats(records: Sequence[TrialRecord]) -> RolloutStats:
@@ -150,6 +209,17 @@ def rollout_stats(records: Sequence[TrialRecord]) -> RolloutStats:
         solve rate.
     """
     with_spans = sum(1 for record in records if record.spans)
+    per_trial = sorted(
+        sum(len(span.sampled_token_ids) for span in record.spans)
+        for record in records
+        if record.spans
+    )
+    logprobs = [
+        value
+        for record in records
+        for span in record.spans
+        for value in span.sampled_logprobs
+    ]
     return RolloutStats(
         trials=len(records),
         trials_with_spans=with_spans,
@@ -157,6 +227,19 @@ def rollout_stats(records: Sequence[TrialRecord]) -> RolloutStats:
             sum(1 for record in records if record.passed) / len(records) if records else 0.0
         ),
         empty_span_trials=len(records) - with_spans,
+        mean_sampled_tokens=(sum(per_trial) / len(per_trial) if per_trial else 0.0),
+        p50_sampled_tokens=_percentile(per_trial, 0.50),
+        p99_sampled_tokens=_percentile(per_trial, 0.99),
+        max_sampled_tokens=(per_trial[-1] if per_trial else 0),
+        # Negated: sampled logprobs are <= 0, and entropy is the mean of their
+        # magnitudes. An empty batch reports 0.0 rather than nan so the metric
+        # stays plottable across a step that collected nothing.
+        entropy_estimate=(-sum(logprobs) / len(logprobs) if logprobs else 0.0),
+        trials_without_delta=sum(
+            1
+            for record in records
+            if record.spans and any(span.delta_messages is None for span in record.spans)
+        ),
     )
 
 
@@ -252,6 +335,13 @@ def collect_rollouts(
             # The local pi runner shares one runner dir, so local concurrency is
             # pinned to 1; e2b parallelizes up to the configured trial concurrency.
             agent_concurrency=1 if backend == "local" else cfg.train.trial_concurrency,
+            # The local runner rejects any non-default episode wall, so only the
+            # e2b backend carries the configured value through.
+            episode_timeout_s=(
+                DEFAULT_EVAL_EPISODE_TIMEOUT_S
+                if backend == "local"
+                else cfg.rollout.episode_timeout_s
+            ),
             harbor_retries=cfg.harbor.retries,
             agent_import_path=WMH_DISTILL_HARBOR_AGENT_IMPORT_PATH,
             extra_agent_kwargs={"token_sink_dir": str(token_sink_dir)},
