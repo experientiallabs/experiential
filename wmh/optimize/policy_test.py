@@ -309,17 +309,27 @@ def _knn_bank(
     )
 
 
-def _knn_policy(bank: KnnBank, **overrides: object) -> RoutingPolicy:
+def _knn_policy(
+    bank: KnnBank,
+    *,
+    embedder: EmbedderSpec | None = None,
+    rag_num: int = 50,
+    knn_z: float = 0.5,
+    knn_min_pairs: int = 8,
+    se_floor: bool = True,
+) -> RoutingPolicy:
     """A knn policy over `bank` with fable-5 as the pinned baseline (the production contract)."""
-    fields: dict[str, object] = {
-        "kind": "knn",
-        "default_model": "fable-5",
-        "guard_model": "fable-5",
-        "pool": _pool(),
-        "embedder": EmbedderSpec(dim=2),
-    }
-    fields.update(overrides)
-    policy = RoutingPolicy.model_validate(fields)
+    policy = RoutingPolicy(
+        kind="knn",
+        default_model="fable-5",
+        guard_model="fable-5",
+        pool=_pool(),
+        embedder=embedder or EmbedderSpec(dim=2),
+        rag_num=rag_num,
+        knn_z=knn_z,
+        knn_min_pairs=knn_min_pairs,
+        se_floor=se_floor,
+    )
     policy.attach_bank(bank)
     return policy
 
