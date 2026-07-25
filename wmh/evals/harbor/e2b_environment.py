@@ -18,6 +18,13 @@ everything else (mounts, network policy, uploads, verification) harbor's:
 - **Create pacing.** Every sandbox create routes through the same process-wide 4/sec admission
   gate as wmh's own pi-worker sandboxes, so the two consumers cannot jointly exceed E2B's
   published account rate.
+
+It also owns this backend's sandbox lifecycle hygiene. Every created sandbox is appended to the
+`wmh.harness.e2b_ledger` record the moment E2B returns it and released when its kill is proved,
+so a run that dies without graceful shutdown leaves its sandboxes reapable by exact id
+(`wmh e2b reap`) instead of holding account concurrency slots for their full multi-hour timeout.
+Creates that hit the account's concurrent-sandbox cap (a 429) wait and retry on a bounded
+schedule, so a transient spike costs latency rather than the trial.
 """
 
 from __future__ import annotations
@@ -55,12 +62,18 @@ from wmh.evals.harbor.e2b_template_policy import (
     qualify_harbor_e2b_template_name,
     resolve_e2b_template_resources,
 )
+from wmh.harness.e2b_ledger import default_ledger, harbor_trial_name
 from wmh.harness.e2b_sandbox import acquire_e2b_create_slot_async
 
 # Harbor's own _create_sandbox contract: two attempts with a short pause. Replicated here so
 # routing through the create gate does not change harbor's retry behavior.
 _CREATE_ATTEMPTS = 2
 _CREATE_RETRY_DELAY_S = 1.0
+# Waits before each retry of a create that E2B rejected as retryable, which in practice means a
+# 429 for the account's concurrent-sandbox cap. Slots free only as other trials finish, so the
+# schedule is patient but bounded (~4 minutes total): a spike waits, while a genuinely full
+# account still fails the trial in reasonable time instead of hanging the whole step.
+_CREATE_RATE_LIMIT_DELAYS_S = (5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0)
 
 
 @dataclass(frozen=True)
@@ -460,12 +473,23 @@ class WmhE2BEnvironment(E2BEnvironment):
 
     @override
     async def _create_sandbox(self) -> None:
+        """Create this trial's sandbox, pacing, ledgering, and waiting out 429s.
+
+        Two independent retry budgets. Harbor's contract (two attempts, one short pause)
+        governs genuine create failures. A retryable status error, which for a create means
+        E2B's 429 for the account's concurrent-sandbox cap, instead waits on
+        `_CREATE_RATE_LIMIT_DELAYS_S`: those slots free only as other trials finish, so waiting
+        is the correct response and failing the trial is not. Both budgets are bounded, so a
+        permanently full account still fails.
+        """
         metadata = {
             "environment_name": self.environment_name,
             "session_id": self.session_id,
         }
         self._sandbox = None
-        for attempt in range(_CREATE_ATTEMPTS):
+        attempts = 0
+        rate_limit_retries = 0
+        while True:
             await acquire_e2b_create_slot_async()
             try:
                 sandbox = await AsyncSandbox.create(
@@ -478,11 +502,31 @@ class WmhE2BEnvironment(E2BEnvironment):
                     ),
                     network=self._sandbox_create_network_options(),
                 )
-            except Exception:  # noqa: BLE001 - preserve Harbor's retry-all create contract
-                if attempt + 1 == _CREATE_ATTEMPTS:
+            except Exception as error:  # noqa: BLE001 - preserve Harbor's retry-all contract
+                if _is_retryable_status_error(error) and rate_limit_retries < len(
+                    _CREATE_RATE_LIMIT_DELAYS_S
+                ):
+                    delay = _CREATE_RATE_LIMIT_DELAYS_S[rate_limit_retries]
+                    rate_limit_retries += 1
+                    self.logger.warning(
+                        "E2B rejected a sandbox create as retryable (%s); waiting %.0fs "
+                        "(attempt %d of %d) for a concurrency slot",
+                        error,
+                        delay,
+                        rate_limit_retries,
+                        len(_CREATE_RATE_LIMIT_DELAYS_S),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                attempts += 1
+                if attempts >= _CREATE_ATTEMPTS:
                     raise
                 await asyncio.sleep(_CREATE_RETRY_DELAY_S)
                 continue
+            # Ledger the sandbox BEFORE anything else can fail: from here on E2B is holding a
+            # billable concurrency slot, and a crash between create and cleanup must still
+            # leave an exact id for `wmh e2b reap`.
+            self._record_created(sandbox)
             # One cheap identity check: the sandbox must really come from the qualified alias.
             # It lives INSIDE the create retry so one transient get_info failure retries the
             # whole create instead of failing it; a genuine mismatch stays immediately fatal.
@@ -490,7 +534,8 @@ class WmhE2BEnvironment(E2BEnvironment):
                 info = await sandbox.get_info()
             except BaseException as error:
                 await self._kill_quietly(sandbox)
-                if isinstance(error, Exception) and attempt + 1 < _CREATE_ATTEMPTS:
+                attempts += 1
+                if isinstance(error, Exception) and attempts < _CREATE_ATTEMPTS:
                     await asyncio.sleep(_CREATE_RETRY_DELAY_S)
                     continue
                 raise
@@ -499,7 +544,18 @@ class WmhE2BEnvironment(E2BEnvironment):
                 raise RuntimeError("E2B sandbox template name mismatch")
             self._sandbox = sandbox
             return
-        raise RuntimeError("E2B sandbox create returned no sandbox")
+
+    def _record_created(self, sandbox: AsyncSandbox) -> None:
+        """Append this sandbox to the reap ledger (never fatal: the sandbox already exists)."""
+        default_ledger().record_created(
+            sandbox_id=sandbox.sandbox_id,
+            template_id=self._template_name,
+            trial_name=harbor_trial_name(self.session_id),
+        )
+
+    def _record_released(self, sandbox: AsyncSandbox) -> None:
+        """Mark a proven kill in the reap ledger so no reaper considers the sandbox."""
+        default_ledger().record_released(sandbox.sandbox_id)
 
     async def _kill_quietly(self, sandbox: AsyncSandbox) -> None:
         """Best-effort kill of a sandbox this environment is abandoning."""
@@ -507,6 +563,16 @@ class WmhE2BEnvironment(E2BEnvironment):
             await sandbox.kill()
         except Exception:  # noqa: BLE001 - the create/identity error stays authoritative
             self.logger.warning("failed to kill an abandoned E2B sandbox", exc_info=True)
+            return
+        self._record_released(sandbox)
+
+    @override
+    async def _stop_sandbox(self) -> None:
+        """Harbor's teardown, plus a ledger release once the kill is proved."""
+        sandbox = self._sandbox
+        await super()._stop_sandbox()
+        if sandbox is not None:
+            self._record_released(sandbox)
 
     @override
     async def start(self, force_build: bool) -> None:

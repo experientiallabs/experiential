@@ -7,6 +7,7 @@ for the world model; `worker_fn` is injected so the worker-LLM callback needs no
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, cast
 
@@ -16,7 +17,7 @@ from llm_waterfall import ChatRequest, ChatResponse
 from wmh.core.types import Action, JsonObject, Observation
 from wmh.harness import runner_link as runner_link_module
 from wmh.harness.runner_link import RunnerLink, SocketChannel, read_frame, write_frame
-from wmh.harness.runtime import RuntimeCancelled, StopReason
+from wmh.harness.runtime import SCAFFOLD_LOSS_STOP_REASONS, RuntimeCancelled, StopReason
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
 
@@ -155,7 +156,7 @@ class _TimedPipeSock(_PipeSock):
 def test_frame_codec_roundtrip_and_eof() -> None:
     sock = _PipeSock()
     hello: JsonObject = {"type": "hello", "n": 1, "s": "x" * 5000}
-    done: JsonObject = {"type": "done", "answer": "café"}
+    done: JsonObject = {"type": "done", "reason": "submit", "answer": "café"}
     write_frame(sock, hello)
     write_frame(sock, done)
     assert read_frame(sock) == hello
@@ -165,7 +166,7 @@ def test_frame_codec_roundtrip_and_eof() -> None:
 
 def test_socket_channel_preserves_a_partial_frame_across_timed_polls() -> None:
     sock = _TimedPipeSock()
-    frame: JsonObject = {"type": "done", "answer": "fragmented"}
+    frame: JsonObject = {"type": "done", "reason": "submit", "answer": "fragmented"}
     write_frame(sock, frame)
     channel = SocketChannel(sock)
 
@@ -178,7 +179,7 @@ def test_socket_channel_preserves_a_partial_frame_across_timed_polls() -> None:
 
 # --- episode broker ---
 def test_episode_start_carries_task_tools_and_limits() -> None:
-    ch = _FakeChannel([{"type": "done", "answer": "x"}])
+    ch = _FakeChannel([{"type": "done", "reason": "submit", "answer": "x"}])
     _link(
         ch,
         system_prompt="sys",
@@ -204,7 +205,7 @@ def test_tool_request_routes_to_env_and_records_step() -> None:
     env = _Env()
     script = [
         {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {"command": "ls"}},
-        {"type": "done", "answer": "done-42"},
+        {"type": "done", "reason": "submit", "answer": "done-42"},
     ]
     ch = _FakeChannel(script)
     result = _link(ch).run("t1", "do it", env, tools=_tools())
@@ -222,7 +223,7 @@ def test_env_action_budget_enforced() -> None:
     script = [
         {"type": "tool_request", "req_id": i, "name": "bash", "arguments": {}} for i in range(4)
     ]
-    script.append({"type": "done", "answer": "ok"})
+    script.append({"type": "done", "reason": "submit", "answer": "ok"})
     ch = _FakeChannel(script)
     result = _link(ch, max_env_actions=2).run("t1", "x", env, tools=_tools())
     assert len(env.actions) == 2  # only budgeted calls reached the environment
@@ -240,7 +241,7 @@ def test_llm_request_answered_via_worker_fn() -> None:
 
     script = [
         {"type": "llm_request", "req_id": 7, "openai_body": {"messages": [{"role": "user"}]}},
-        {"type": "done", "answer": "fin"},
+        {"type": "done", "reason": "submit", "answer": "fin"},
     ]
     ch = _FakeChannel(script)
     RunnerLink(ch, worker_fn=worker).run("t1", "x", _Env(), tools=_tools())
@@ -264,7 +265,7 @@ def test_harness_temperature_overrides_the_runner_request_before_the_worker_call
                 "req_id": 1,
                 "openai_body": {"messages": [], "temperature": 1.75},
             },
-            {"type": "done", "answer": "ok"},
+            {"type": "done", "reason": "submit", "answer": "ok"},
         ]
     )
     RunnerLink(ch, worker_fn=worker, temperature=0.35).run("t1", "x", _Env(), tools=_tools())
@@ -287,7 +288,7 @@ def test_skill_library_implicitly_adds_and_serves_read_skill_without_env_budget(
             "name": "read_skill",
             "arguments": {"name": "ghost"},
         },
-        {"type": "done", "answer": "ok"},
+        {"type": "done", "reason": "submit", "answer": "ok"},
     ]
     channel = _FakeChannel(script)
     env = _Env()
@@ -316,7 +317,7 @@ def test_worker_fn_error_is_reported_not_crashed() -> None:
 
     script = [
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
-        {"type": "done", "answer": "ok"},
+        {"type": "done", "reason": "submit", "answer": "ok"},
     ]
     ch = _FakeChannel(script)
     result = RunnerLink(ch, worker_fn=boom).run("t1", "x", _Env(), tools=_tools())
@@ -324,6 +325,43 @@ def test_worker_fn_error_is_reported_not_crashed() -> None:
     assert len(responses) == 1
     resp = responses[0]
     assert "provider down" in resp["error"]  # surfaced to the runner, host survives
+    assert result.stop_reason is StopReason.SUBMITTED
+
+
+def test_worker_fn_error_is_logged_at_warning_with_type_and_bounded_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The live outage: a provider that failed every call was surfaced only to
+    # the runner, so the host logs showed clean zero-turn episodes. The host
+    # must warn (bounded, no traceback) before returning the error frame.
+    long_detail = "session capacity exceeded " + "x" * 2000
+
+    def boom(request: ChatRequest) -> ChatResponse:
+        del request
+        raise RuntimeError(long_detail)
+
+    script = [
+        {"type": "llm_request", "req_id": 1, "openai_body": {}},
+        {"type": "done", "reason": "submit", "answer": "ok"},
+    ]
+    ch = _FakeChannel(script)
+    with caplog.at_level(logging.WARNING, logger="wmh.harness.runner_link"):
+        result = RunnerLink(ch, worker_fn=boom).run("t1", "x", _Env(), tools=_tools())
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "worker completion failed" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0]
+    assert "session capacity exceeded" in warnings[0]
+    assert "(truncated)" in warnings[0]
+    assert len(warnings[0]) < 700  # bounded at warning level
+    # The error frame still flows to the runner and the episode still ends.
+    responses = _sent(ch, "llm_response")
+    assert len(responses) == 1
+    assert "session capacity exceeded" in responses[0]["error"]
     assert result.stop_reason is StopReason.SUBMITTED
 
 
@@ -492,7 +530,7 @@ def test_tools_bound_at_construction_satisfy_runtime_contract() -> None:
     env = _Env()
     script = [
         {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {"command": "ls"}},
-        {"type": "done", "answer": "done"},
+        {"type": "done", "reason": "submit", "answer": "done"},
     ]
     ch = _FakeChannel(script)
     link = RunnerLink(ch, tools=_tools(), worker_fn=lambda request: _completion())
@@ -505,8 +543,8 @@ def test_tools_bound_at_construction_satisfy_runtime_contract() -> None:
 def test_multiple_episodes_over_one_channel() -> None:
     # A persistent channel drives episodes sequentially (what closed-loop eval / the search do).
     script = [
-        {"type": "done", "answer": "a1"},  # episode 1
-        {"type": "done", "answer": "a2"},  # episode 2
+        {"type": "done", "reason": "submit", "answer": "a1"},  # episode 1
+        {"type": "done", "reason": "submit", "answer": "a2"},  # episode 2
     ]
     ch = _FakeChannel(script)
     link = _link(ch, tools=_tools())
@@ -591,7 +629,7 @@ def test_worker_usage_accumulates_across_llm_requests() -> None:
     script = [
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
         {"type": "llm_request", "req_id": 2, "openai_body": {}},
-        {"type": "done", "answer": "fin"},
+        {"type": "done", "reason": "submit", "answer": "fin"},
     ]
     ch = _FakeChannel(script)
     result = RunnerLink(ch, worker_fn=lambda request: next(replies)).run(
@@ -603,7 +641,112 @@ def test_worker_usage_accumulates_across_llm_requests() -> None:
     assert result.worker_usage.output_tokens == 7
     # No llm_request at all -> usage stays None (not zero: the runtime reported nothing).
     quiet = RunnerLink(
-        _FakeChannel([{"type": "done", "answer": "ok"}]),
+        _FakeChannel([{"type": "done", "reason": "submit", "answer": "ok"}]),
         worker_fn=lambda request: _completion(),
     ).run("t2", "x", _Env(), tools=_tools())
     assert quiet.worker_usage is None
+
+
+# --- termination disambiguation (the pi scaffold audit's headline defect) ---
+#
+# Every `done` frame used to map to StopReason.SUBMITTED, so a real submit, a prose-only turn, a
+# turn truncated at the output-token cap, and a tool call the renderer dropped were
+# indistinguishable and all scored reward 0 as clean completions. 88.8% of Super trials and 92.2%
+# of Ultra trials ended that way.
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("submit", StopReason.SUBMITTED),
+        ("no_tool_call", StopReason.NO_TOOL_CALL),
+        ("output_truncated", StopReason.OUTPUT_TRUNCATED),
+        ("unparsed_tool_call", StopReason.UNPARSED_TOOL_CALL),
+        ("provider_error", StopReason.PROVIDER_ERROR),
+        ("max_turns", StopReason.MAX_TURNS),
+    ],
+)
+def test_done_reason_maps_to_a_distinct_stop_reason(reason: str, expected: StopReason) -> None:
+    ch = _FakeChannel([{"type": "done", "reason": reason, "answer": "text"}])
+    result = _link(ch).run("t1", "do it", _Env(), tools=_tools())
+    assert result.stop_reason is expected
+
+
+def test_only_an_explicit_submit_reads_as_a_completion() -> None:
+    """No non-submit termination may land in SUBMITTED; that is what hid the scaffold loss."""
+    for reason in ("no_tool_call", "output_truncated", "unparsed_tool_call", "provider_error"):
+        ch = _FakeChannel([{"type": "done", "reason": reason, "answer": "raw reasoning"}])
+        result = _link(ch).run("t1", "do it", _Env(), tools=_tools())
+        assert result.stop_reason is not StopReason.SUBMITTED, reason
+        assert result.stop_reason in SCAFFOLD_LOSS_STOP_REASONS
+
+
+def test_done_without_a_reason_is_a_scaffold_loss_not_a_completion(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stale runner must not read as success.
+
+    Failing toward SUBMITTED here would re-create the original defect one level up: every
+    episode from a runner older than the host reads as a clean submit, so `scaffold_loss_rate`
+    reads ~0 and a probe whose only job is to count scaffold losses passes.
+    """
+    ch = _FakeChannel([{"type": "done", "answer": "x"}])
+    with caplog.at_level(logging.WARNING, logger=runner_link_module.__name__):
+        result = _link(ch).run("t1", "do it", _Env(), tools=_tools())
+    assert result.stop_reason is StopReason.UNKNOWN_DONE_REASON
+    assert result.stop_reason in SCAFFOLD_LOSS_STOP_REASONS
+    assert "predates termination reporting" in caplog.text
+
+
+def test_done_with_an_unrecognized_reason_is_a_scaffold_loss() -> None:
+    """A reason the host does not know is unknown, not success."""
+    ch = _FakeChannel([{"type": "done", "reason": "wat", "answer": "x"}])
+    result = _link(ch).run("t1", "do it", _Env(), tools=_tools())
+    assert result.stop_reason is StopReason.UNKNOWN_DONE_REASON
+    assert result.stop_reason in SCAFFOLD_LOSS_STOP_REASONS
+
+
+def test_episode_start_carries_the_served_context_window() -> None:
+    """pi's context guard must be calibrated to the real window, not a hardcoded 128k."""
+    ch = _FakeChannel([{"type": "done", "reason": "submit", "answer": "x"}])
+    _link(ch, context_window=65_536).run("t1", "do it", _Env(), tools=_tools())
+    assert _sent(ch, "episode_start")[0]["context_window"] == 65_536
+
+
+def test_context_window_is_resolved_from_the_provider_when_unset() -> None:
+    class _WindowProvider:
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            del request
+            return _completion()
+
+        def context_window(self) -> int | None:
+            return 262_144
+
+    ch = _FakeChannel([{"type": "done", "reason": "submit", "answer": "x"}])
+    RunnerLink(ch, provider=cast(Any, _WindowProvider())).run("t1", "do it", _Env(), tools=_tools())
+    assert _sent(ch, "episode_start")[0]["context_window"] == 262_144
+
+
+def test_a_failing_context_window_probe_never_breaks_the_episode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class _AngryProvider:
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            del request
+            return _completion()
+
+        def context_window(self) -> int | None:
+            raise RuntimeError("capability probe unavailable")
+
+    ch = _FakeChannel([{"type": "done", "reason": "submit", "answer": "x"}])
+    with caplog.at_level(logging.WARNING, logger=runner_link_module.__name__):
+        result = RunnerLink(ch, provider=cast(Any, _AngryProvider())).run(
+            "t1", "do it", _Env(), tools=_tools()
+        )
+    assert result.stop_reason is StopReason.SUBMITTED
+    assert _sent(ch, "episode_start")[0]["context_window"] is None
+    assert "could not resolve the served context window" in caplog.text
+
+
+@pytest.mark.parametrize("value", [True, 512, "65536"])
+def test_context_window_rejects_values_that_would_miscalibrate_the_guard(value: object) -> None:
+    with pytest.raises(ValueError, match="context_window"):
+        _link(_FakeChannel([]), context_window=value)

@@ -109,6 +109,40 @@ def test_configured_role_forwards_fields_and_defaults_the_azure_api_version(
     assert config.reasoning_effort == "high"
 
 
+def test_tinker_role_forwards_model_type_for_weights_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A distilled student is a tinker:// weights path plus the base model identity in
+    # model_type; without the pass-through, the tinker provider cannot resolve its
+    # renderer and tokenizer from settings-configured roles.
+    root = tmp_path / ".wmh"
+    save_settings(
+        _settings_for_role(
+            "agent",
+            ModelRole(
+                provider="tinker",
+                model="tinker://run/weights/42",
+                model_type="Qwen/Qwen3-8B",
+            ),
+        ),
+        root,
+    )
+    configs: list[ProviderConfig] = []
+
+    def fake_get_provider(config: ProviderConfig) -> _Provider:
+        configs.append(config)
+        return _Provider()
+
+    monkeypatch.setattr(model_roles_module, "get_provider", fake_get_provider)
+
+    resolve_opt_in_model_provider(str(root), "agent", _Provider())
+
+    [config] = configs
+    assert config.kind is ProviderKind.TINKER
+    assert config.model == "tinker://run/weights/42"
+    assert config.model_type == "Qwen/Qwen3-8B"
+
+
 def test_explicit_api_version_overrides_the_azure_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

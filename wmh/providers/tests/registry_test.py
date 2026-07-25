@@ -6,12 +6,21 @@ import pytest
 
 from wmh.providers import ProviderConfig, ProviderKind, get_provider, verify_embedder
 from wmh.providers.base import Provider
+from wmh.providers.tinker import TinkerChatProvider
 
 
-def test_all_four_providers_construct_and_satisfy_protocol() -> None:
+def test_all_provider_kinds_construct_and_satisfy_protocol() -> None:
     for kind in ProviderKind:
         provider = get_provider(ProviderConfig(kind=kind, model="m"))
         assert isinstance(provider, Provider)
+
+
+def test_tinker_kind_constructs_tinker_provider() -> None:
+    # Construction is SDK-free: the tinker extra is imported lazily on first use.
+    config = ProviderConfig(
+        kind=ProviderKind.TINKER, model_type="Qwen/Qwen3-8B", model="tinker://run/weights/0"
+    )
+    assert isinstance(get_provider(config), TinkerChatProvider)
 
 
 def test_verify_never_raises_and_reports_failure(monkeypatch: pytest.MonkeyPatch) -> None:

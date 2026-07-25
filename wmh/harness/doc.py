@@ -46,6 +46,7 @@ from wmh.harness.runtime import (
     DEFAULT_SYSTEM_PROMPT,
     AgentRuntime,
     Runtime,
+    strip_json_protocol_clause,
     validate_episode_timeout_s,
 )
 from wmh.harness.skills import Skill, SkillLibrary
@@ -326,6 +327,7 @@ class HarnessDoc(BaseModel):
         e2b_template: str | None = None,
         e2b_pool: E2BSandboxPool | None = None,
         episode_timeout_s: float | None = None,
+        context_window: int | None = None,
         transport_retries: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> Runtime:
@@ -341,8 +343,12 @@ class HarnessDoc(BaseModel):
         npm deps) is already done; default is $WMH_E2B_TEMPLATE. Under `local`, "pi-node" uses
         the SSH shim (or the RunnerLink frame transport when PI_TRANSPORT=link); otherwise a
         `code:runtime` surface drives episodes with the harness's own in-process program; with
-        neither, the fixed baseline loop runs. `episode_timeout_s` controls the E2B pi-node
-        episode wall budget; omitting it preserves the 300-second default. `transport_retries`
+        neither, the fixed baseline loop runs. `episode_timeout_s` is the pi-node episode wall
+        budget, host-enforced on the e2b and link transports and applied as the remote node timeout
+        on the SSH transport; omitting it preserves the 300-second default. `context_window` is the
+        served context window the runner calibrates pi's context guard to; omitting it asks the
+        provider (`ContextWindowProvider`) and otherwise leaves the runner's documented fallback,
+        because a wrong window is worse than none. `transport_retries`
         controls whole-episode replay after an E2B transport death; omitting it preserves that
         runtime's one-retry default, and a side-effectful real environment passes 0. Other
         execution modes reject both instead of silently ignoring them. `should_cancel` is
@@ -362,8 +368,10 @@ class HarnessDoc(BaseModel):
         runtime_kind = self.runtime_kind()
         if episode_timeout_s is not None:
             episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
-            if backend != "e2b" or runtime_kind != "pi-node":
-                raise ValueError("episode_timeout_s applies only to e2b pi-node execution")
+            if runtime_kind != "pi-node":
+                raise ValueError("episode_timeout_s applies only to pi-node execution")
+        if context_window is not None and runtime_kind != "pi-node":
+            raise ValueError("context_window applies only to pi-node execution")
         if transport_retries is not None and (backend != "e2b" or runtime_kind != "pi-node"):
             raise ValueError("transport_retries applies only to e2b pi-node execution")
         if runtime_kind == "pi-node":
@@ -393,7 +401,7 @@ class HarnessDoc(BaseModel):
                     provider=structured_provider,
                     files=code_files,
                     tools=tools,
-                    system_prompt=self.assembled_prompt(skills),
+                    system_prompt=self.assembled_prompt(skills, structured_tools=True),
                     temperature=self.temperature(),
                     skills=skills,
                     template=e2b_template,
@@ -405,6 +413,7 @@ class HarnessDoc(BaseModel):
                         if episode_timeout_s is None
                         else episode_timeout_s
                     ),
+                    context_window=context_window,
                     transport_retries=(1 if transport_retries is None else transport_retries),
                     should_cancel=should_cancel,
                 )
@@ -428,12 +437,14 @@ class HarnessDoc(BaseModel):
                     channel,
                     tools=tools,
                     provider=structured_provider,
-                    system_prompt=self.assembled_prompt(skills),
+                    system_prompt=self.assembled_prompt(skills, structured_tools=True),
                     files=code_files,
                     temperature=self.temperature(),
                     skills=skills,
                     max_turns=self.max_turns(),
                     max_output_tokens=self.max_output_tokens(),
+                    episode_timeout_s=episode_timeout_s,
+                    context_window=context_window,
                     should_cancel=should_cancel,
                 )
             from wmh.harness.pi_runtime import PiRuntime  # circular: pi_runtime imports doc
@@ -444,9 +455,15 @@ class HarnessDoc(BaseModel):
                 tools=tools,
                 temperature=self.temperature(),
                 skills=skills,
-                system_prompt=self.assembled_prompt(skills),
+                system_prompt=self.assembled_prompt(skills, structured_tools=True),
                 max_turns=self.max_turns(),
                 max_output_tokens=self.max_output_tokens(),
+                episode_timeout_s=(
+                    DEFAULT_EVAL_EPISODE_TIMEOUT_S
+                    if episode_timeout_s is None
+                    else episode_timeout_s
+                ),
+                context_window=context_window,
             )
         if backend == "e2b":
             raise ValueError(
@@ -474,13 +491,31 @@ class HarnessDoc(BaseModel):
             skills=skills,
         )
 
-    def assembled_prompt(self, skills: SkillLibrary | None = None) -> str:
-        """Return the system prompt shared by episode and project session runtimes."""
+    def assembled_prompt(
+        self, skills: SkillLibrary | None = None, *, structured_tools: bool = False
+    ) -> str:
+        """Return the system prompt shared by episode and project session runtimes.
+
+        Args:
+            skills: The resolved skill library; defaults to this document's skills.
+            structured_tools: True when the runtime passes STRUCTURED tool schemas to the model and
+                its own renderer defines the calling convention (every pi runtime). The
+                JSON-action clause is then dropped: carrying it declares a protocol that is not in
+                use, and in the Nemotron-3 runs 14.7% of trials spent reasoning on a JSON envelope
+                the renderer never parses. Only the runtimes that really call `parse_tool_call`
+                (`AgentRuntime`, `CodeRuntime`) leave it in.
+
+        Returns:
+            The assembled system prompt.
+        """
         resolved_skills = skills if skills is not None else SkillLibrary(self.skills())
         tool_names = self.tools()
         if len(resolved_skills) and READ_SKILL.name not in tool_names:
             tool_names.append(READ_SKILL.name)
-        prompt = f"{self.system_prompt()}\n\n## Tools\n{render_tools(resolve_tools(tool_names))}"
+        core = self.system_prompt()
+        if structured_tools:
+            core = strip_json_protocol_clause(core)
+        prompt = f"{core}\n\n## Tools\n{render_tools(resolve_tools(tool_names))}"
         index = resolved_skills.render_index()
         if index:
             prompt += f"\n\n## Your skills (read a body with read_skill)\n{index}"

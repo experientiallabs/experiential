@@ -16,15 +16,21 @@ class _BotocoreShaped(Exception):
 
 
 def _sdk_exception(
-    name: str, module: str, message: str = "", status_code: int | None = None
+    name: str,
+    module: str,
+    message: str = "",
+    status_code: int | None = None,
+    category: str | None = None,
 ) -> Exception:
-    """Build a fake SDK exception with a chosen class name, module, and optional status_code."""
+    """Build a fake SDK exception with a chosen class name, module, and optional attributes."""
     attrs: dict[str, int] = {}
     cls = type(name, (Exception,), attrs)
     cls.__module__ = module
     exc = cls(message)
     if status_code is not None:
         exc.status_code = status_code
+    if category is not None:
+        exc.category = category
     return exc
 
 
@@ -79,6 +85,53 @@ def test_access_denied_is_client_error() -> None:
 @pytest.mark.parametrize("module", ["openai", "anthropic._exceptions", "httpx", "httpcore"])
 def test_sdk_capacity_types_are_capacity(name: str, module: str) -> None:
     assert is_capacity_error(_sdk_exception(name, module))
+
+
+@pytest.mark.parametrize("name", ["RateLimitError", "APITimeoutError", "APIConnectionError"])
+def test_tinker_capacity_types_are_capacity(name: str) -> None:
+    # The tinker SDK defines openai-shaped exceptions in the `tinker` module; without the
+    # module gate trusting it, a transient tinker 429/timeout would classify as client_error
+    # and kill a whole trial instead of being retried.
+    assert is_capacity_error(_sdk_exception(name, "tinker._exceptions"))
+
+
+def test_tinker_status_and_bad_request_classify_like_openai() -> None:
+    assert is_capacity_error(_sdk_exception("APIStatusError", "tinker", status_code=503))
+    exc = _sdk_exception("BadRequestError", "tinker", status_code=400)
+    assert outcome_for(exc) == "client_error"
+
+
+def _tinker_sidecar_exception(name: str, module: str = "tinker._exceptions") -> Exception:
+    """Build a fake subclass of tinker's SidecarError base, mirroring the real hierarchy."""
+    base = type("SidecarError", (Exception,), {})
+    base.__module__ = module
+    cls = type(name, (base,), {})
+    cls.__module__ = module
+    return cls("sidecar failed")
+
+
+@pytest.mark.parametrize("name", ["SidecarDiedError", "SidecarStartupError", "SidecarIPCError"])
+def test_tinker_sidecar_family_is_capacity(name: str) -> None:
+    # The sidecar subprocess dying carries no status_code, no openai-shaped name, and no
+    # transport phrasing; without the MRO family match it would classify as client_error
+    # and kill a whole trial instead of retrying against a respawned sidecar.
+    assert is_capacity_error(_tinker_sidecar_exception(name))
+
+
+def test_sidecar_lookalike_from_foreign_module_is_client_error() -> None:
+    exc = _tinker_sidecar_exception("SidecarDiedError", module="myapp.errors")
+    assert outcome_for(exc) == "client_error"
+
+
+def test_tinker_request_failed_classifies_by_category() -> None:
+    # tinker.RequestFailedError (an async request completing in a failed state) carries a
+    # StrEnum category instead of a status code: "user" is a bad request, everything else
+    # is the service failing transiently.
+    for category in ("server", "unknown"):
+        exc = _sdk_exception("RequestFailedError", "tinker", category=category)
+        assert outcome_for(exc) == "capacity_error"
+    user = _sdk_exception("RequestFailedError", "tinker", category="user")
+    assert outcome_for(user) == "client_error"
 
 
 def test_sdk_type_name_from_foreign_module_is_client_error() -> None:

@@ -73,6 +73,7 @@ def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderCon
     return ProviderConfig(
         kind=kind,
         model=configured.model,
+        model_type=configured.model_type,
         region=configured.region,
         endpoint=configured.endpoint,
         deployment=configured.deployment,

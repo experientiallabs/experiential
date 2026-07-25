@@ -19,10 +19,11 @@ from wmh.evals.harbor.agent import (
     MAX_OBSERVATION_CHARS,
     HarborAgentEnvironment,
     WmhHarborAgent,
+    _bounded_observation_text,
 )
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.runtime import RunResult, RuntimeCancelled, StopReason, TokenUsage
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import Provider, ProviderConfig, ProviderKind
 from wmh.providers.retry import RetryingProvider
 
 
@@ -68,6 +69,7 @@ def _agent(
     e2b_template: str | None = None,
     episode_timeout_sec: float = 300.0,
     episode_workers: int = 64,
+    context_window: int | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> WmhHarborAgent:
     return WmhHarborAgent(
@@ -79,6 +81,7 @@ def _agent(
         e2b_template=e2b_template,
         episode_timeout_sec=episode_timeout_sec,
         episode_workers=episode_workers,
+        context_window=context_window,
         extra_env=extra_env,
     )
 
@@ -254,12 +257,44 @@ def test_oversized_command_output_is_truncated_before_it_reaches_the_channel() -
             ),
         )
         assert observation.is_error is False
-        assert len(observation.content) < MAX_OBSERVATION_CHARS + 200
+        assert len(observation.content) <= MAX_OBSERVATION_CHARS
         assert "characters truncated" in observation.content
         assert observation.content.startswith("x" * 100)
         assert observation.content.endswith("x" * 100)
 
     asyncio.run(run())
+
+
+def test_the_observation_cap_fits_inside_a_model_context_window() -> None:
+    """The cap protects the MODEL's context, not just the wire.
+
+    At the old 262,144 chars (roughly 75,000 tokens) ONE observation could exceed a whole
+    65,536-token serving window by itself, and `gcode-to-text` died at step 1 in every attempt of
+    every model because its first natural move returns 262,227 chars. 10,000 is parity with the
+    reference terminus-2 agent's own single-observation cap.
+    """
+    assert MAX_OBSERVATION_CHARS == 10_000
+    # Roughly 4 chars per token: one capped observation must stay a small slice of the window.
+    assert MAX_OBSERVATION_CHARS / 4 < 0.1 * 65_536
+
+
+def test_a_bounded_observation_keeps_both_ends_and_elides_the_middle() -> None:
+    """Head carries the format signature, tail carries any trailing summary."""
+    content = "HEAD" + ("m" * (MAX_OBSERVATION_CHARS * 3)) + "TAIL"
+    bounded = _bounded_observation_text(content)
+
+    assert len(bounded) <= MAX_OBSERVATION_CHARS
+    assert bounded.startswith("HEAD")
+    assert bounded.endswith("TAIL")
+    assert "truncated from the middle" in bounded
+    # Only the middle is gone; nothing is rewritten or reordered.
+    assert "m" * 100 in bounded
+
+
+def test_a_short_observation_is_returned_untouched() -> None:
+    assert _bounded_observation_text("small output") == "small output"
+    exact = "y" * MAX_OBSERVATION_CHARS
+    assert _bounded_observation_text(exact) == exact
 
 
 def test_cleanup_failure_never_masks_the_episode_outcome(
@@ -391,6 +426,53 @@ def test_agent_exception_persists_a_partial_transcript_with_the_error(
     assert trace["error"] == "RuntimeError: sandbox died"
 
 
+def test_build_provider_hook_runs_with_logs_dir_set_and_feeds_the_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider-construction seam: an override sees the validated config after
+    BaseAgent has set logs_dir, and its provider is the exact one the runtime drives
+    (the distill agent keys its per-trial token sink off both)."""
+    observed: dict[str, object] = {}
+    hook_provider = _FakeProvider()
+
+    class _HookAgent(WmhHarborAgent):
+        def _build_provider(self, config: ProviderConfig) -> Provider:
+            observed["logs_dir"] = self.logs_dir
+            observed["config"] = config
+            return cast("Provider", hook_provider)
+
+    class _Runtime:
+        def run(
+            self,
+            task_id: str,
+            _instruction: str,
+            _environment: HarborAgentEnvironment,
+        ) -> RunResult:
+            return RunResult(task_id=task_id, stop_reason=StopReason.SUBMITTED, answer="done")
+
+        def close(self) -> None:
+            return None
+
+    def runtime(_self: HarnessDoc, provider: object, **_kwargs: object) -> _Runtime:
+        observed["runtime_provider"] = provider
+        return _Runtime()
+
+    monkeypatch.setattr(HarnessDoc, "runtime", runtime)
+    agent = _HookAgent(
+        logs_dir=tmp_path,
+        model_name="bedrock/worker-model",
+        harness=HarnessDoc.baseline().model_dump(mode="json"),
+        provider_config=_provider_config().model_dump(mode="json"),
+    )
+
+    assert observed["logs_dir"] == tmp_path
+    assert observed["config"] == _provider_config()
+
+    asyncio.run(agent.run("solve it", cast("BaseEnvironment", _Environment()), AgentContext()))
+    assert observed["runtime_provider"] is hook_provider
+
+
 def test_agent_rejects_invalid_construction(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="environment variables"):
         _agent(tmp_path, extra_env={"TOKEN": "secret"})
@@ -398,7 +480,11 @@ def test_agent_rejects_invalid_construction(tmp_path: Path) -> None:
         _agent(tmp_path, model_name="openai/other-model")
     with pytest.raises(ValueError, match="requires harness_backend='e2b'"):
         _agent(tmp_path, e2b_template="tmpl")
-    with pytest.raises(ValueError, match="episode_timeout_sec requires"):
-        _agent(tmp_path, episode_timeout_sec=12_000)
+    # episode_timeout_sec is no longer e2b-only: the local SSH transport applies it as the remote
+    # node timeout instead of the fixed 300s it used to hardcode. Only nonsense values are rejected.
+    with pytest.raises(ValueError, match="episode_timeout_sec"):
+        _agent(tmp_path, episode_timeout_sec=0)
+    with pytest.raises(ValueError, match="context_window"):
+        _agent(tmp_path, context_window=16)
     with pytest.raises(ValueError, match="episode_workers"):
         _agent(tmp_path, episode_workers=0)

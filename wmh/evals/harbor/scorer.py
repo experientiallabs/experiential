@@ -15,8 +15,19 @@ Two operational behaviors matter most here:
   interrupted boundary re-pays a handful of trials instead of the whole matrix.
 - **Candidate outcomes vs infra failures.** A trial that raised (e.g. AgentTimeoutError) but
   still carries a written verifier reward is a CANDIDATE outcome: it becomes a scored cell with
-  a note. The scorer raises (`HarborRewardMissingError`) only when verifier evidence or the
-  configured reward is absent; that is an infrastructure failure no reward can stand in for.
+  a note. Absent that reward there is nothing to score, so search mode raises
+  (`HarborRewardMissingError`) and evaluation-tolerant mode records the cell as an
+  infrastructure failure whose 0.0 is an explicit stand-in. The rule that decides it is a
+  single measurement question, not the shape of the exception: in `missing_reward="zero"` mode a
+  cell is `infra_failed` exactly when the verifier wrote no reward for the configured key, so a
+  verifier that timed out on work the agent really submitted can never be reported as a definite
+  task failure (see `_trial_outcome`).
+
+Each cell also carries the trial's CTRF test breakdown when the verifier wrote one
+(`wmh.evals.harbor.ctrf`), so a caller can read a graded test-pass score BESIDE the binary reward.
+The reward is unchanged and remains the benchmark's own verdict; the breakdown is None (never 0.0)
+whenever no report exists, so a graded rate can exclude it the way a solve rate excludes an
+ungradeable trial.
 """
 
 from __future__ import annotations
@@ -42,11 +53,13 @@ from harbor.models.trial.config import AgentConfig, TaskConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
+from wmh.core.types import JsonObject
 from wmh.evals.harbor.agent import (
     DEFAULT_EPISODE_WORKERS,
     MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
     WMH_HARBOR_AGENT_IMPORT_PATH,
 )
+from wmh.evals.harbor.ctrf import read_trial_graded_tests
 from wmh.evals.harbor.e2b_template_policy import WMH_HARBOR_E2B_ENVIRONMENT_IMPORT_PATH
 from wmh.evals.harbor.tasks import resolve_harbor_tasks
 from wmh.harness.doc import HarnessDoc
@@ -63,11 +76,32 @@ logger = logging.getLogger(__name__)
 
 TaskEnvironment = Literal["docker", "e2b"]
 HarnessBackend = Literal["local", "e2b"]
+MissingRewardMode = Literal["raise", "zero"]
+"""How a trial with no verifier reward scores: "raise" aborts (candidate search
+semantics: an unscoreable candidate is an infra failure), "zero" records a
+stand-in 0.0 flagged `infra_failed` with an auditable note (distillation evals:
+an ungradeable trial is an UNKNOWN outcome, kept out of every solve rate)."""
 
 # In-process registry of job dirs with a score() in flight: the entry prune is destructive, so
 # concurrent scores of the same candidate must be rejected, not interleaved.
 _ACTIVE_GUARD = threading.Lock()
 _ACTIVE_JOB_DIRS: set[Path] = set()
+
+# Agent kwargs the scorer computes and owns; `extra_agent_kwargs` may extend the kwargs dict but
+# never silently override these, or a custom agent would run a different candidate/provider than
+# the one this scorer reports on.
+_SCORER_OWNED_AGENT_KWARGS = frozenset(
+    {
+        "harness",
+        "provider_config",
+        "harness_backend",
+        "e2b_template",
+        "command_timeout_sec",
+        "episode_timeout_sec",
+        "episode_workers",
+        "context_window",
+    }
+)
 
 
 class HarborRewardMissingError(RuntimeError):
@@ -84,6 +118,15 @@ class HarborRun:
 
     result: JobResult
     job_dir: Path
+
+
+@dataclass(frozen=True)
+class _TrialOutcome:
+    """How one finished trial projects into a cell: its reward, note, and measurement status."""
+
+    reward: float
+    infra_failed: bool
+    note: str
 
 
 class HarborRunner(Protocol):
@@ -163,10 +206,16 @@ class HarborScorer:
         command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         agent_concurrency: int | None = None,
         harbor_retries: int = 0,
+        agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
+        extra_agent_kwargs: JsonObject | None = None,
+        missing_reward: MissingRewardMode = "raise",
+        context_window: int | None = None,
         runner: HarborRunner | None = None,
     ) -> None:
         if not tasks:
             raise ValueError("HarborScorer requires at least one resolved task")
+        if missing_reward not in ("raise", "zero"):
+            raise ValueError("missing_reward must be raise or zero")
         task_ids = [task.get_task_id().get_name() for task in tasks]
         if len(task_ids) != len(set(task_ids)):
             raise ValueError("HarborScorer requires unique task ids")
@@ -180,13 +229,25 @@ class HarborScorer:
             raise ValueError("harness_backend must be local or e2b")
         if harness_backend == "local" and e2b_template is not None:
             raise ValueError("e2b_template requires harness_backend='e2b'")
+        # Both harness backends honor the wall budget now: the local SSH transport applies it as
+        # the remote node timeout instead of the fixed 300s it used to hardcode.
         episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
-        if harness_backend == "local" and episode_timeout_s != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
-            raise ValueError("episode_timeout_s requires harness_backend='e2b'")
         if isinstance(harbor_retries, bool) or not isinstance(harbor_retries, int):
             raise ValueError("harbor_retries must be a nonnegative integer")
         if harbor_retries < 0:
             raise ValueError("harbor_retries must be a nonnegative integer")
+        if not agent_import_path or ":" not in agent_import_path:
+            raise ValueError(
+                f"agent_import_path must be a 'module:Class' import path, got "
+                f"{agent_import_path!r}; use the exported constant of the agent bridge "
+                "(e.g. WMH_HARBOR_AGENT_IMPORT_PATH)"
+            )
+        overridden = _SCORER_OWNED_AGENT_KWARGS & set(extra_agent_kwargs or {})
+        if overridden:
+            raise ValueError(
+                f"extra_agent_kwargs may not override the scorer-owned agent kwargs "
+                f"{sorted(overridden)}; configure those through the scorer's own parameters"
+            )
         if agent_concurrency is not None and (
             isinstance(agent_concurrency, bool)
             or not isinstance(agent_concurrency, int)
@@ -232,8 +293,12 @@ class HarborScorer:
         self._reward_key = reward_key
         self._reward_mode: RewardMode = reward_mode
         self._attempts = attempts
+        self._agent_import_path = agent_import_path
+        self._extra_agent_kwargs: JsonObject = dict(extra_agent_kwargs or {})
+        self._missing_reward: MissingRewardMode = missing_reward
         self._harness_backend: HarnessBackend = harness_backend
         self._episode_timeout_s = episode_timeout_s
+        self._context_window = context_window
         self._command_timeout_sec = command_timeout_sec
         # The dedicated episode executor must never be smaller than agent concurrency (episodes
         # + uncancellable cleanup share it), or queued episodes burn harbor timeout budget.
@@ -266,6 +331,10 @@ class HarborScorer:
         command_timeout_sec: int = MAX_ENVIRONMENT_COMMAND_TIMEOUT_SEC,
         agent_concurrency: int | None = None,
         harbor_retries: int = 0,
+        agent_import_path: str = WMH_HARBOR_AGENT_IMPORT_PATH,
+        extra_agent_kwargs: JsonObject | None = None,
+        missing_reward: MissingRewardMode = "raise",
+        context_window: int | None = None,
         runner: HarborRunner | None = None,
     ) -> Self:
         """Resolve the exact tasks and construct a scorer that can incur spend.
@@ -273,6 +342,9 @@ class HarborScorer:
         `job_template` supplies the run directory (`jobs_dir`), the task environment config,
         and harbor tuning (timeouts, concurrency); it must carry exactly one dataset, no direct
         tasks, and an untouched default agent + retry config (the scorer owns those).
+        `agent_import_path` plus `extra_agent_kwargs` route trials through a custom agent
+        bridge (e.g. the distill collector's token-recording subclass); the defaults preserve
+        the standard WMH agent, and extra kwargs may never shadow the scorer-owned ones.
         """
         if len(job_template.datasets) != 1 or job_template.tasks:
             raise ValueError("HarborScorer requires exactly one dataset and no direct tasks")
@@ -291,6 +363,10 @@ class HarborScorer:
             command_timeout_sec=command_timeout_sec,
             agent_concurrency=agent_concurrency,
             harbor_retries=harbor_retries,
+            agent_import_path=agent_import_path,
+            extra_agent_kwargs=extra_agent_kwargs,
+            missing_reward=missing_reward,
+            context_window=context_window,
             runner=runner,
         )
 
@@ -370,7 +446,7 @@ class HarborScorer:
         agent_fields.update(
             {
                 "name": None,
-                "import_path": WMH_HARBOR_AGENT_IMPORT_PATH,
+                "import_path": self._agent_import_path,
                 "model_name": f"{self._provider_config.kind.value}/{self._provider_config.model}",
                 "skills": [],
                 "env": {},
@@ -383,6 +459,10 @@ class HarborScorer:
                     "command_timeout_sec": self._command_timeout_sec,
                     "episode_timeout_sec": self._episode_timeout_s,
                     "episode_workers": self._episode_workers,
+                    "context_window": self._context_window,
+                    # Custom-bridge kwargs; collisions with the scorer-owned keys above
+                    # were rejected at construction, so this merge cannot shadow them.
+                    **self._extra_agent_kwargs,
                 },
             }
         )
@@ -437,15 +517,22 @@ class HarborScorer:
         for task_id in self._task_ids:
             trials = sorted(grouped[task_id], key=lambda trial: trial.trial_name)
             for attempt, trial in enumerate(trials, 1):
-                reward = _official_reward(trial, reward_key=self._reward_key)
+                outcome = self._trial_outcome(trial)
+                trial_dir = run.job_dir / trial.trial_name
                 cells.append(
                     ScoreCell(
                         task_id=task_id,
                         attempt=attempt,
-                        reward=reward,
-                        passed=reward_passed(reward, self._reward_mode),
-                        artifact_dir=str(run.job_dir / trial.trial_name),
-                        note=_trial_note(trial),
+                        reward=outcome.reward,
+                        passed=reward_passed(outcome.reward, self._reward_mode),
+                        artifact_dir=str(trial_dir),
+                        note=outcome.note,
+                        infra_failed=outcome.infra_failed,
+                        # Read for every trial, including infra failures: the report is evidence,
+                        # and whether it counts is an aggregation decision (a graded rate excludes
+                        # `infra_failed` cells exactly as a solve rate does). A trial whose verifier
+                        # died wrote no report anyway, so this is None there.
+                        tests=read_trial_graded_tests(trial_dir),
                     )
                 )
         return ScoreReport(
@@ -453,6 +540,59 @@ class HarborScorer:
             request=self.request,
             reward_mode=self._reward_mode,
             cells=tuple(cells),
+        )
+
+    def _trial_outcome(self, trial: TrialResult) -> _TrialOutcome:
+        """Classify one finished trial: a measured candidate outcome or an ungradeable failure.
+
+        Evaluation-tolerant mode (`missing_reward="zero"`, the distillation evals) reports a
+        cell as `infra_failed` exactly when the verifier wrote no reward for the configured key,
+        which reaches this method in two shapes that must be treated identically:
+
+        - Nothing was written and nothing explains it: `_official_reward` raises. The runner
+          died before verification (no sandbox, dead transport, rate limit).
+        - Nothing was written and a terminal verifier failure explains it
+          (`_UNGRADEABLE_VERIFIER_EXCEPTIONS`): `_official_reward` substitutes a stand-in 0.0.
+          The live case was two of 48 TerminalBench-2 probe trials whose E2B command stream
+          stalled until `VerifierTimeoutError` after the agent had submitted real work (5,039
+          and 12,459 sampled tokens); recorded as definite failures they held the measured
+          solve rate at 20.8% (10/48) when the gradeable denominator was 46.
+
+        Search mode is deliberately unchanged: it raises on the first shape and scores the
+        substituted 0.0 on the second, so a deterministic verifier failure cannot wedge a
+        boundary in a raise -> prune -> identical re-run loop.
+        """
+        try:
+            reward = _official_reward(trial, reward_key=self._reward_key)
+        except HarborRewardMissingError:
+            if self._missing_reward == "raise":
+                raise
+            # The 0.0 keeps advantage estimation defined; `infra_failed` keeps it out of every
+            # reported solve rate, and the note keeps the cause auditable per cell.
+            return self._ungradeable_outcome(trial, reward=0.0)
+        if (
+            self._missing_reward == "zero"
+            and _ungradeable_verifier_cause(trial, reward_key=self._reward_key) is not None
+        ):
+            return self._ungradeable_outcome(trial, reward=reward)
+        return _TrialOutcome(reward=reward, infra_failed=False, note=_trial_note(trial))
+
+    def _ungradeable_outcome(self, trial: TrialResult, *, reward: float) -> _TrialOutcome:
+        """One trial the verifier never graded, as an auditable stand-in cell."""
+        exception = trial.exception_info
+        cause = exception.exception_type if exception else "no exception info"
+        logger.warning(
+            "harbor trial %s: the VERIFIER produced no evidence for reward key %r (%s), so this "
+            "trial's reward is a stand-in; counting it as an infrastructure failure EXCLUDED "
+            "from the solve rate, not as a task failure",
+            trial.trial_name,
+            self._reward_key,
+            cause,
+        )
+        return _TrialOutcome(
+            reward=reward,
+            infra_failed=True,
+            note=f"infra-failure: {cause}; no verifier evidence, excluded from solve rate",
         )
 
 
@@ -593,9 +733,10 @@ def _trial_dir_is_scoreable(trial_dir: Path, *, reward_key: str) -> bool:
         return False
     if trial.exception_info is None:
         return True
-    if trial.exception_info.exception_type in _VERIFIER_OUTCOME_EXCEPTIONS:
-        # Scored 0 by _official_reward; re-running a deterministic verifier failure would
-        # loop forever without changing the outcome.
+    if trial.exception_info.exception_type in _UNGRADEABLE_VERIFIER_EXCEPTIONS:
+        # `_official_reward` substitutes a 0.0 for these, so the trial projects into a cell
+        # (an `infra_failed` one under evaluation-tolerant scoring); re-running a deterministic
+        # verifier failure would loop forever without changing the outcome.
         return True
     return _trial_reward(trial, reward_key=reward_key) is not None
 
@@ -614,28 +755,77 @@ def _trial_reward(trial: TrialResult, *, reward_key: str) -> float | None:
     return reward
 
 
-# Verifier failures harbor itself classifies as outcome-shaped (its default retry exclude
-# list): the verifier ran against the candidate's artifacts and terminally failed to produce
-# a reward. Scoring these 0 matches the benchmark's own semantics (an absent reward file is a
-# failed task) and keeps a deterministic verifier timeout from wedging the boundary in a
-# raise -> prune -> identical re-run loop.
-_VERIFIER_OUTCOME_EXCEPTIONS = frozenset(
+_UNGRADEABLE_VERIFIER_EXCEPTIONS = frozenset(
     {
+        # The verifier's own wall clock expired before it wrote a reward. Live cause on
+        # TerminalBench-2: an E2B command-stream stall (asyncio.CancelledError inside harbor's
+        # `harbor/environments/e2b.py exec` -> `command_handle.wait`) on trials whose agent had
+        # already submitted, so nothing about the agent's work was ever measured.
         "VerifierTimeoutError",
+        # The test script exited without writing /verifier/reward.{txt,json}: no grade exists,
+        # and nothing in the trial says whether the submitted work was right or wrong.
         "RewardFileNotFoundError",
+        # The reward file is there but empty (a write cut off mid-flight): same, no grade.
         "RewardFileEmptyError",
+        # The reward file's contents do not parse as a float/JSON: the grader's output is
+        # corrupt, which is a statement about the grader, not about the agent.
         "VerifierOutputParseError",
     }
 )
+"""Terminal verifier failures that leave the trial with NO grade for anyone to read.
+
+Three roles, all of them following from that one fact:
+
+- `_official_reward` substitutes a stand-in 0.0 instead of raising, so a deterministic verifier
+  failure cannot wedge a candidate boundary in a raise -> prune -> identical re-run loop.
+- `_trial_dir_is_scoreable` keeps such a trial on resume, for the same reason.
+- Evaluation-tolerant scoring flags the cell `infra_failed`, because "the grader never spoke" is
+  an UNKNOWN outcome and reporting it as a task failure biases every solve rate downward.
+
+Deaths BEFORE the verifier are deliberately absent (`AgentSetupTimeoutError`,
+`EnvironmentStartTimeoutError`, a failed sandbox build, an upload/download failure, anything the
+WMH bridge itself raises): they leave no reward at all, so the missing-reward branch of
+`_trial_outcome` already classifies them from the evidence, while listing them here would make the
+entry prune KEEP a transient environment failure instead of re-running it.
+
+Pinned against harbor's own retry-exclude vocabulary in `scorer_test.py`, together with
+`_GRADED_AGENT_EXCEPTIONS`, so a new harbor error type cannot silently join the wrong side."""
+
+_GRADED_AGENT_EXCEPTIONS = frozenset(
+    {
+        # The agent ran out of ITS wall budget. harbor swallows this inside `_run_agent` and
+        # still verifies, so the trial carries a real grade of the work the agent managed: a
+        # legitimate benchmark outcome that STAYS in the solve-rate denominator, and one already
+        # visible as the `cancelled-by-harbor-timeout` stop reason behind `scaffold_loss_rate`.
+        "AgentTimeoutError",
+        # The remaining four are `NonZeroAgentExitCodeError` subclasses harbor also swallows in
+        # `_run_agent` before verifying, all raised by harbor's own installed CLI agents (WMH's
+        # Python bridge never raises them). Classified anyway so a harbor upgrade cannot move one
+        # onto the ungradeable side unnoticed.
+        "ApiUsageLimitError",
+        "AgentSafetyRefusalError",
+        "AgentAuthenticationError",
+        "ModelNotFoundError",
+    }
+)
+"""Terminal agent-side failures that still reach the verifier, so a written grade is real.
+
+These are never reclassified as infrastructure: an agent that exhausted its budget produced a
+measurable outcome. When one of them leaves no reward at all the verifier still failed to grade
+the trial, and the missing-reward branch of `_trial_outcome` flags that on the evidence itself."""
 
 
 def _official_reward(trial: TrialResult, *, reward_key: str) -> float:
-    """The verifier's written reward; absence without an outcome-shaped cause is infra."""
+    """The verifier's reward; a terminal verifier failure substitutes 0.0, anything else raises.
+
+    A substituted 0.0 is NOT a measurement (`_ungradeable_verifier_cause` is how a caller tells
+    the two apart); it exists so search-mode scoring stays terminating.
+    """
     verifier = trial.verifier_result
     rewards = None if verifier is None else verifier.rewards
     if rewards is None or reward_key not in rewards:
         exception = trial.exception_info
-        if exception is not None and exception.exception_type in _VERIFIER_OUTCOME_EXCEPTIONS:
+        if exception is not None and exception.exception_type in _UNGRADEABLE_VERIFIER_EXCEPTIONS:
             return 0.0
         available = sorted(rewards or {})
         raise HarborRewardMissingError(
@@ -650,6 +840,21 @@ def _official_reward(trial: TrialResult, *, reward_key: str) -> float:
     if not math.isfinite(reward) or not 0.0 <= reward <= 1.0:
         raise ValueError(f"harbor reward {reward_key!r} must be finite and in [0, 1]")
     return reward
+
+
+def _ungradeable_verifier_cause(trial: TrialResult, *, reward_key: str) -> str | None:
+    """The exception type behind a reward the verifier never wrote, or None if it wrote one.
+
+    `_official_reward` substitutes a stand-in 0.0 for every cause in
+    `_UNGRADEABLE_VERIFIER_EXCEPTIONS`, so a cell can otherwise carry a reward no grader ever
+    produced. This is what separates that stand-in from a measured 0.0.
+    """
+    if _trial_reward(trial, reward_key=reward_key) is not None:
+        return None
+    exception = trial.exception_info
+    if exception is None or exception.exception_type not in _UNGRADEABLE_VERIFIER_EXCEPTIONS:
+        return None
+    return exception.exception_type
 
 
 def _trial_note(trial: TrialResult) -> str:

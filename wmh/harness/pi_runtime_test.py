@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from socket import socket
 from typing import cast
 
@@ -11,6 +12,7 @@ import pytest
 from llm_waterfall import ChatRequest, ChatResponse
 
 from wmh.core.types import Action, Observation
+from wmh.harness import pi_runtime as pi_runtime_module
 from wmh.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
@@ -28,8 +30,10 @@ from wmh.harness.pi_runtime import (
     _ShimHandler,
     _ShimServer,
 )
+from wmh.harness.runtime import StopReason
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY
+from wmh.providers.base import Provider
 
 
 class _Env:
@@ -213,8 +217,6 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
     assert [s.path for s in doc.code_files()] == ["src/agent.ts"]
     from typing import cast
 
-    from wmh.providers.base import Provider
-
     runtime = doc.runtime(cast("Provider", _P()))
     assert isinstance(runtime, PiRuntime)
     assert runtime._max_turns == 7  # noqa: SLF001 - document parameter reaches entry.ts
@@ -225,3 +227,139 @@ def test_doc_dispatches_pi_runtime_for_pi_node_kind() -> None:
         "submit",
         "read_skill",
     }
+
+
+# --- termination disambiguation on the SSH shim path (audit defect 1) ----------------------------
+def test_signal_json_reports_the_hosts_view_of_the_last_completion() -> None:
+    """entry.ts reads GET /signal to classify why it finished, so the host must record it.
+
+    The shim owns the provider call, so only it can see finish_reason "length" (truncated at the
+    output cap) and the renderer's tool-call parse errors; entry.ts sees neither on its own.
+    """
+    ep = _episode(_Env())
+    assert ep.signal_json() == {
+        "finish_reason": "",
+        "unparsed_tool_calls": [],
+        "provider_error": "",
+        "tool_call_turns": 0,
+    }
+    ep.finish_reason = "length"
+    ep.unparsed_tool_calls = ["Unexpected trailing content inside <function> block"]
+    ep.tool_call_turns = 3
+    assert ep.signal_json() == {
+        "finish_reason": "length",
+        "unparsed_tool_calls": ["Unexpected trailing content inside <function> block"],
+        "provider_error": "",
+        "tool_call_turns": 3,
+    }
+
+
+def test_task_json_carries_the_served_context_window() -> None:
+    ep = _Episode(
+        instruction="do it",
+        system_prompt="sys",
+        tools=[SUBMIT],
+        provider=_Provider(),
+        environment=_Env(),
+        temperature=0.7,
+        skills=SkillLibrary(),
+        max_env_actions=40,
+        max_turns=7,
+        max_output_tokens=16384,
+        context_window=262_144,
+    )
+    assert ep.task_json()["context_window"] == 262_144
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("submit", StopReason.SUBMITTED),
+        ("no_tool_call", StopReason.NO_TOOL_CALL),
+        ("output_truncated", StopReason.OUTPUT_TRUNCATED),
+        ("unparsed_tool_call", StopReason.UNPARSED_TOOL_CALL),
+    ],
+)
+def test_run_maps_the_shim_done_reason_to_a_distinct_stop_reason(
+    monkeypatch: pytest.MonkeyPatch, reason: str, expected: StopReason
+) -> None:
+    """Only an explicit submit is a completion, on this transport too."""
+    runtime = PiRuntime(
+        cast("Provider", _Provider()),
+        files={"src/agent.ts": "// a"},
+        tools=[TOOL_REGISTRY["bash"], SUBMIT],
+        port=8899,
+    )
+    monkeypatch.setattr(PiRuntime, "_materialize", lambda self: None)
+
+    def fake_run_node(self: PiRuntime) -> tuple[int, str]:
+        del self
+        # Stand in for entry.ts POSTing /done with its classified reason.
+        episode.answer = "text"
+        episode.done_reason = reason
+        episode.done.set()
+        return 0, ""
+
+    episode = _Episode(
+        instruction="do it",
+        system_prompt="",
+        tools=[SUBMIT],
+        provider=_Provider(),
+        environment=_Env(),
+        temperature=0.7,
+        skills=SkillLibrary(),
+        max_env_actions=40,
+        max_turns=7,
+        max_output_tokens=4096,
+    )
+    monkeypatch.setattr(PiRuntime, "_run_node", fake_run_node)
+    monkeypatch.setattr(
+        "wmh.harness.pi_runtime._Episode", lambda **kwargs: _capture_episode(episode, kwargs)
+    )
+
+    result = runtime.run("t1", "do it", _Env())
+    assert result.stop_reason is expected
+
+
+def _capture_episode(episode: _Episode, kwargs: dict[str, object]) -> _Episode:
+    """Return the test's episode so the fake node run can drive it."""
+    del kwargs
+    return episode
+
+
+def test_the_node_wall_budget_comes_from_the_configured_episode_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`timeout 300 node` was hardcoded, so a configured budget was silently ignored and 31% of
+    long TerminalBench-2 trials died on that clock."""
+    commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        commands.append(command)
+        assert kwargs["timeout"] == pytest.approx(1800.0 + 60.0)
+        return _Completed()
+
+    runtime = PiRuntime(
+        cast("Provider", _Provider()),
+        files={"src/agent.ts": "// a"},
+        tools=[SUBMIT],
+        port=8898,
+        episode_timeout_s=1800.0,
+    )
+    monkeypatch.setattr("wmh.harness.pi_runtime.subprocess.run", fake_run)
+
+    code, _note = runtime._run_node()  # noqa: SLF001 - the remote command is the contract
+
+    assert code == 0
+    assert "timeout 1800 node --experimental-strip-types entry.ts" in commands[0][-1]
+
+
+def test_the_shared_termination_policy_is_materialized_next_to_entry_ts() -> None:
+    """entry.ts imports ./runner_termination.ts, so the SSH blob must carry it."""
+    assert Path(pi_runtime_module._TERMINATION_TS).is_file()  # noqa: SLF001 - deploy contract
+    source = Path(pi_runtime_module.__file__).read_text(encoding="utf-8")
+    assert '"runner_termination.ts": _read(_TERMINATION_TS)' in source

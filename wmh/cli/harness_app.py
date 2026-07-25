@@ -27,6 +27,7 @@ from rich.table import Table
 from wmh.agents.default import default_agent
 from wmh.agents.optimizer import optimizer_agent
 from wmh.agents.project import AgentProject
+from wmh.cli.harness_distill import run_distill
 from wmh.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmh.config import ARTIFACT_DIR, WorldModelStore
 from wmh.config.store import validate_name
@@ -244,6 +245,32 @@ def optimize(
         help="(harbor) Stop after this many new boundaries this invocation; continue later "
         "with --resume.",
     ),
+    mode: str = typer.Option(
+        "search",
+        "--mode",
+        help="search (the default propose-and-gate optimizer) or distill (harbor only: "
+        "on-policy distillation of the agent MODEL itself; the harness stays fixed and "
+        "an accepted run produces a trained adapter).",
+    ),
+    distill_config: str = typer.Option(
+        None,
+        "--distill-config",
+        help="(distill) Per-run distillation TOML (student, teacher, harbor, train, gate, "
+        "pricing, budget sections). Required to start; a resume reuses the run dir's "
+        "config.toml snapshot.",
+    ),
+    holdout_task_ids_file: str = typer.Option(
+        None,
+        "--holdout-task-ids",
+        help="(distill) JSON file with the exact holdout task-id list; baselines and the "
+        "promotion gate are measured here, disjoint from --task-ids.",
+    ),
+    promote: bool = typer.Option(
+        False,
+        "--promote",
+        help="(distill) After an accepted gate, offer to write [models.agent] in "
+        "settings.toml pointing at the distilled adapter (always asks for confirmation).",
+    ),
 ) -> None:
     """Optimize an agent harness by searching against a world model or on harbor tasks.
 
@@ -256,7 +283,34 @@ def optimize(
     candidates are scored on real benchmark tasks: --backend controls the task environment and
     worker placement (local = docker tasks + local pi; e2b = E2B tasks + sandboxed pi), while
     the PROPOSER project always runs in E2B in this version.
+
+    `--mode distill` (harbor environment only) trains the agent model instead of editing
+    the harness: on-policy distillation of a Tinker LoRA student from pi-agent rollouts on
+    the harbor tasks, gated on holdout solve rates against the teacher.
     """
+    if mode not in ("search", "distill"):
+        raise typer.BadParameter(f"unknown --mode {mode!r}; choose search or distill")
+    if mode == "search":
+        distill_only = [
+            flag
+            for flag, provided in (
+                ("--distill-config", distill_config is not None),
+                ("--holdout-task-ids", holdout_task_ids_file is not None),
+                ("--promote", promote),
+            )
+            if provided
+        ]
+        if distill_only:
+            raise typer.BadParameter(
+                f"{', '.join(distill_only)} apply only to --mode distill; add "
+                "--mode distill (harbor environment) or drop them"
+            )
+    elif model != _HARBOR_ENVIRONMENT:
+        raise typer.BadParameter(
+            "--mode distill requires the harbor environment: "
+            "`wmh optimize <agent> harbor --mode distill ...`; a world-model distill "
+            "backend is a documented follow-on and is not available yet"
+        )
     if model == _HARBOR_ENVIRONMENT:
         world_model_only = [
             flag
@@ -276,6 +330,50 @@ def optimize(
                 f"{', '.join(world_model_only)} apply only to a world-model environment; "
                 "drop them for `wmh optimize <agent> harbor ...`"
             )
+        # Shared by both modes: 'harbor' must unambiguously mean the benchmark
+        # environment, never a stored world model that happens to carry the name.
+        if WorldModelStore(root).exists(_HARBOR_ENVIRONMENT):
+            raise typer.BadParameter(
+                "a stored world model is literally named 'harbor', which now selects the "
+                "harbor benchmark environment; rename that model directory under "
+                "<root>/models/ and retry"
+            )
+        if mode == "distill":
+            search_only = [
+                flag
+                for param, flag in (
+                    ("iterations", "--iterations"),
+                    ("harbor_config", "--harbor-config"),
+                    ("attempts", "--attempts"),
+                    ("reward_key", "--reward-key"),
+                    ("reward_mode", "--reward-mode"),
+                    ("harbor_retries", "--harbor-retries"),
+                    ("episode_timeout", "--episode-timeout"),
+                    ("max_iterations_this_run", "--max-iterations-this-run"),
+                    ("e2b_template", "--e2b-template"),
+                )
+                if _explicit(ctx, param)
+            ]
+            if search_only:
+                raise typer.BadParameter(
+                    f"{', '.join(search_only)} apply only to --mode search; a distill "
+                    "run's harbor job template, attempts, and schedule come from "
+                    "--distill-config"
+                )
+            run_distill(
+                _console,
+                agent_name=name,
+                distill_config_path=distill_config,
+                task_ids_path=task_ids_file,
+                holdout_task_ids_path=holdout_task_ids_file,
+                run_dir=run_dir,
+                backend=backend if _explicit(ctx, "backend") else None,
+                resume=resume,
+                yes=yes,
+                promote=promote,
+                root=root,
+            )
+            return
         _optimize_harbor(
             ctx,
             name=name,
@@ -534,12 +632,20 @@ class _HarborRunConfig(BaseModel):
 
 
 def _model_identity(config: ProviderConfig) -> JsonObject:
-    """The provider identity fields a run pins (and a resume must re-resolve identically)."""
+    """The provider identity fields a run pins (and a resume must re-resolve identically).
+
+    `model_type` and `endpoint` are part of the identity: for a tinker-provider
+    role model_type selects the renderer/tokenizer, and endpoint selects the
+    serving host, so a mid-run settings edit to either would silently change
+    the worker under test if they were not pinned.
+    """
     return {
         "provider": config.kind.value,
         "model": config.model,
+        "model_type": config.model_type,
         "deployment": config.deployment,
         "region": config.region,
+        "endpoint": config.endpoint,
         "reasoning_effort": config.reasoning_effort,
     }
 
@@ -590,11 +696,8 @@ def _optimize_harbor(
         raise typer.BadParameter(
             "--run-dir is required for the harbor environment: it holds all durable run state"
         )
-    if WorldModelStore(root).exists(_HARBOR_ENVIRONMENT):
-        raise typer.BadParameter(
-            "a stored world model is literally named 'harbor', which now selects the harbor "
-            "benchmark environment; rename that model directory under <root>/models/ and retry"
-        )
+    # The 'harbor'-named world model ambiguity is rejected by optimize() before
+    # either mode dispatches here.
 
     run_dir = Path(run_dir_option)
     config_path = run_dir / "run-config.json"

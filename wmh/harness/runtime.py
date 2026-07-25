@@ -34,14 +34,40 @@ from wmh.harness.tools import (
 )
 from wmh.providers.base import Message, Provider
 
-DEFAULT_SYSTEM_PROMPT = """You are a capable command-line agent working inside a Linux environment.
+JSON_PROTOCOL_CLAUSE = """Every reply MUST be a single JSON object and nothing else:
+{"tool": "<tool name>", "arguments": {<the tool's arguments>}}"""
+"""The JSON-action calling convention `parse_tool_call` implements.
+
+Only the runtimes that actually parse JSON replies (`AgentRuntime`, `CodeRuntime`) may show this
+to the model. The pi runtimes pass STRUCTURED tool schemas and their renderer emits its own
+(XML-ish) tool-call notation, so carrying this clause there states a protocol that is not in use;
+`strip_json_protocol_clause` removes it on that path."""
+
+DEFAULT_SYSTEM_PROMPT = f"""You are a capable command-line agent working inside a Linux environment.
 You are given a task. Accomplish it by taking ONE action at a time.
 
-Every reply MUST be a single JSON object and nothing else:
-{"tool": "<tool name>", "arguments": {<the tool's arguments>}}
+{JSON_PROTOCOL_CLAUSE}
 
 Work in small, verifiable steps: inspect state, act, check the result, then continue. When the
 task is done, call `submit` with your answer. Prefer composing small bash commands over guessing."""
+
+
+def strip_json_protocol_clause(prompt: str) -> str:
+    """Return `prompt` without the JSON-action clause, for structured tool calling.
+
+    A no-op when the clause is absent (an optimizer-edited prompt surface, or a seed harness that
+    never carried it), so this is safe to apply to any authored prompt.
+
+    Args:
+        prompt: The assembled system prompt.
+
+    Returns:
+        The prompt with the JSON-action paragraph (and the blank line it owned) removed.
+    """
+    if JSON_PROTOCOL_CLAUSE not in prompt:
+        return prompt
+    return prompt.replace(f"\n\n{JSON_PROTOCOL_CLAUSE}", "").replace(JSON_PROTOCOL_CLAUSE, "")
+
 
 DEFAULT_MAX_TURNS = 20  # small shell tasks converge well before this; raise for longer horizons
 # Per-call output budget used by the pi runtimes. This remains separate from the turn cap: a
@@ -133,11 +159,54 @@ class Runtime(Protocol):
 
 
 class StopReason(StrEnum):
+    """Why one episode ended.
+
+    The four `pi`-specific members below exist because a single `done` frame used to cover four
+    completely different events, all of them scored as clean submissions: a real `submit`, a
+    prose-only turn, a turn truncated at the output-token cap, and a tool call the renderer could
+    not parse. Anything other than `SUBMITTED` is a SCAFFOLD loss, not a measured task failure
+    (see `wmh.distill.rollouts.RolloutStats.scaffold_loss_rate`).
+    """
+
     SUBMITTED = "submitted"  # the agent called submit
     MAX_TURNS = "max_turns"  # hit the turn cap without submitting
     NO_ACTION = "no_action"  # the agent produced no parseable tool call
     ERROR = "error"  # harness code raised (CodeRuntime episodes only)
     BUDGET = "budget"  # harness code exhausted an episode budget (CodeRuntime episodes only)
+    NO_TOOL_CALL = "no_tool_call"  # prose-only turns exhausted the nudge budget
+    OUTPUT_TRUNCATED = "output_truncated"  # last turn was cut at the output-token cap
+    UNPARSED_TOOL_CALL = "unparsed_tool_call"  # the renderer could not parse the emitted call
+    PROVIDER_ERROR = "provider_error"  # the worker LLM call kept failing (e.g. context overflow)
+    UNKNOWN_DONE_REASON = "unknown_done_reason"  # a `done` frame carried no reason we recognize
+
+
+SCAFFOLD_LOSS_STOP_REASONS = frozenset(
+    {
+        StopReason.MAX_TURNS,
+        StopReason.NO_ACTION,
+        StopReason.ERROR,
+        StopReason.BUDGET,
+        StopReason.NO_TOOL_CALL,
+        StopReason.OUTPUT_TRUNCATED,
+        StopReason.UNPARSED_TOOL_CALL,
+        StopReason.PROVIDER_ERROR,
+        StopReason.UNKNOWN_DONE_REASON,
+    }
+)
+"""Every stop reason that is NOT a self-declared completion.
+
+An episode that ends on one of these was cut off by the harness, so its reward measures where the
+guillotine fell rather than what the model can do. Exactly the complement of `SUBMITTED`, spelled
+out so a new member cannot silently join the "looks like a completion" side."""
+
+MAX_NONACTION_TURNS = 3
+"""Consecutive non-action assistant turns a pi runner nudges through before giving up.
+
+The reference terminus-2 agent never ends an episode on a parse failure: it salvages what it can,
+feeds the parser's complaint back, and keeps going. Three is the bounded version of that: enough
+for a model to recover from one malformed emission or one truncation, few enough that a model
+which has genuinely stopped acting does not burn the whole wall budget on prose. Mirrored in
+`pi_entry/runner_termination.ts`, which is where the loop actually runs."""
 
 
 class TokenUsage(BaseModel):
