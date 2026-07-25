@@ -31,8 +31,10 @@ from wmh.config.card import ModelCard, load_card
 from wmh.core.types import Action, EnvState, Observation, Session
 from wmh.engine.loader import load_world_model
 from wmh.engine.world_model import WorldModel
+from wmh.optimize.policy import POLICY_FILENAME, RoutingPolicy
 from wmh.optimize.reward import EpisodeScore
 from wmh.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
+from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
 from wmh.serving.traces_source import (
     TRACES_FILENAME,
     TracesDownloader,
@@ -184,6 +186,7 @@ def create_app(
     cards: dict[str, ModelCard | None] | None = None,
     build_manager: BuildManager | None = None,
     max_fidelity: bool = False,
+    policies: dict[str, RoutingPolicy] | None = None,
 ) -> FastAPI:
     """Build the FastAPI app serving one or more named WorldModels.
 
@@ -193,6 +196,10 @@ def create_app(
     (the writable one, `.wmh` by convention); with injected models pass `build_manager`
     explicitly or the build routes return 503. `max_fidelity` serves every disk-loaded model
     with its online extras (the build-measured winner — see `WorldModel.load`).
+
+    A model whose artifact dir carries a `policy.json` also serves as an OpenAI-compatible
+    ENDPOINT: `/v1/chat/completions` (streaming included) routes each call through that policy
+    (`wmh.serving.chat`). `policies` injects them directly for tests.
     """
     app = FastAPI(title="World Model Harness")
     # The website (localhost:3000/6001/...) is a browser client of this API on another port.
@@ -213,6 +220,25 @@ def create_app(
             artifact_dirs, names, max_fidelity=max_fidelity
         )
     downloader = TracesDownloader()
+
+    # OpenAI-compatible endpoints: every served model whose artifact dir carries a policy.json
+    # (or every injected `policies` entry) answers /v1/chat/completions through that policy.
+    endpoint_policies = policies if policies is not None else {}
+    if policies is None:
+        for model_name, model_dir in model_dirs.items():
+            policy_path = model_dir / POLICY_FILENAME
+            if policy_path.is_file():
+                endpoint_policies[model_name] = RoutingPolicy.load(policy_path)
+    if endpoint_policies:
+        request_log = RequestLog(Path(artifact_dirs[0]) / "serving" / "requests.jsonl")
+        app.include_router(
+            create_chat_router(
+                {
+                    endpoint_name: EndpointRuntime(endpoint_name, policy, log=request_log)
+                    for endpoint_name, policy in endpoint_policies.items()
+                }
+            )
+        )
 
     def _register(name: str, model_dir: Path) -> None:
         """A finished serve-side build joins the live serving set immediately.

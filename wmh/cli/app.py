@@ -38,7 +38,7 @@ from rich.table import Table
 import wmh.providers as providers
 from wmh.cli.agent_session import register as register_agent_session_commands
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
-from wmh.cli.harness_app import harness_app, optimize
+from wmh.cli.harness_app import harness_app, optimize_app
 from wmh.cli.platform_cmds import register as register_platform_commands
 from wmh.cli.ui import (
     BuildParams,
@@ -143,7 +143,7 @@ app.add_typer(config_app, name="config")
 app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
-app.command("optimize")(optimize)
+app.add_typer(optimize_app, name="optimize")
 register_platform_commands(app)
 register_agent_session_commands(app)
 _console = Console()
@@ -538,7 +538,7 @@ def build(
         raise typer.BadParameter(str(err)) from None
     if params.name == "harbor":
         raise typer.BadParameter(
-            "world model name 'harbor' is reserved: `wmh optimize <agent> harbor` selects "
+            "world model name 'harbor' is reserved: `wmh optimize harness <agent> harbor` selects "
             "the harbor benchmark environment; choose another name"
         )
     try:

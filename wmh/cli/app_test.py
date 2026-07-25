@@ -292,10 +292,12 @@ def test_cli_exposes_the_small_command_set() -> None:
         "play",
         "download",
         "knowledge",
-        "optimize",
     }
     platform = {"login", "logout", "status", "push", "pull", "run"}
     assert names == core | platform
+    # `optimize` is a GROUP now (harness today; route and training-type optimizers join it).
+    groups = {group.name for group in app.registered_groups}
+    assert "optimize" in groups
 
 
 def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN001 - fixture

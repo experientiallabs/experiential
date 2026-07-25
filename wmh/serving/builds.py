@@ -285,7 +285,8 @@ class BuildManager:
         if request.name == "harbor":
             # Mirrors the `wmh build` CLI guard: the literal is the optimize environment.
             raise ValueError(
-                "world model name 'harbor' is reserved: `wmh optimize <agent> harbor` selects "
+                "world model name 'harbor' is reserved: `wmh optimize harness <agent> harbor` "
+                "selects "
                 "the harbor benchmark environment; choose another name"
             )
         config = HarnessConfig.for_build(
