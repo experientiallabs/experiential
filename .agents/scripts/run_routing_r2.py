@@ -820,6 +820,174 @@ def _select_rank_k(
     return best_k, sum(totals[best_k]) / len(totals[best_k])
 
 
+# ---------------------------------------------------------------------------
+# Experiment 6: r2-auto (validated method selection) + attribution ablation.
+# ---------------------------------------------------------------------------
+
+AUTO_DEFAULT = "z05-floor"
+
+
+def _costaware_single(matrix: OutcomeMatrix, fit_ids: list[str], lam: float = 0.1) -> str:
+    """Global cost-aware model selection: argmax of fit mean reward - lam*cost/scale."""
+    fit_set = set(fit_ids)
+    sums: dict[str, tuple[float, float, int]] = {}
+    total_cost, total_count = 0.0, 0
+    for o in matrix.outcomes:
+        if o.scenario_id in fit_set and o.reward is not None:
+            rs, cs, n = sums.get(o.model, (0.0, 0.0, 0))
+            sums[o.model] = (rs + o.reward, cs + o.cost_usd, n + 1)
+            total_cost += o.cost_usd
+            total_count += 1
+    scale = (total_cost / total_count) if total_count else 1.0
+    pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
+    return min(
+        sums,
+        key=lambda m: (
+            -(sums[m][0] / sums[m][2] - lam * (sums[m][1] / sums[m][2]) / scale),
+            sums[m][1] / sums[m][2],
+            pool_order[m],
+        ),
+    )
+
+
+def _candidate_picks(
+    candidate: str,
+    matrix: OutcomeMatrix,
+    fit_ids: list[str],
+    test_ids: list[str],
+    fit_vecs: np.ndarray,
+    test_vecs: np.ndarray,
+    best_name: str,
+    spec: EmbedderSpec,
+    precomputed: bool,
+) -> dict[str, str]:
+    """One candidate policy fit on (fit_ids, fit_vecs), applied to (test_ids, test_vecs)."""
+    if candidate == "costaware-single":
+        pick = _costaware_single(matrix, fit_ids)
+        return {sid: pick for sid in test_ids}
+    if candidate.startswith("l2d"):
+        rule = fit_l2d(matrix, fit_ids=fit_ids, embeddings=fit_vecs, baseline=best_name)
+        lam = 0.1 if candidate.endswith("lam01") else 0.0
+        return {sid: rule.decide(test_vecs[row], lam=lam) for row, sid in enumerate(test_ids)}
+    knn = fit_knn_prox(
+        matrix,
+        fit_ids=fit_ids,
+        embedder=spec,
+        knn_k=KNN_K,
+        tau_inv=TAU_INV,
+        precomputed=fit_vecs if precomputed else None,
+    )
+    if candidate == "margin":
+        guard: dict = {"guard_margin": GUARD_MARGIN}
+    elif candidate == "z05-floor":
+        guard = {
+            "guard_z": 0.5,
+            "min_pairs": 8.0,
+            "abstain_distance": support_floor(knn, quantile=0.95),
+        }
+    else:
+        raise ValueError(f"unknown candidate {candidate}")
+    scorer = ProxScorer(knn)
+    return {
+        sid: scorer.decide(test_vecs[row], guard_model=best_name, **guard).model
+        for row, sid in enumerate(test_ids)
+    }
+
+
+def run_cell_exp6(name: str, matrix: OutcomeMatrix, split_kind: str, seed: int) -> None:
+    """r2-auto: pick the method per corpus on fit-side inner validation.
+
+    Promotion rule (guard thinking at the method level): a challenger replaces the safe
+    default (z05+floor) only if it beats the INNER best-single on >= 2 of 3 inner seeds AND
+    on the inner mean; among promoted challengers highest inner mean wins, ties to cheaper.
+    """
+    cell = _Cell(name, matrix, split_kind, seed)
+    fit_ids, test_ids, spec = cell.fit_ids, cell.test_ids, cell.spec
+    best_name = cell.best_name
+    tasks = {o.scenario_id: o.task for o in matrix.outcomes}
+    embedder = HashingEmbedder(dim=DIM)
+    oai = _oai_vectors(name, matrix)
+
+    def vecs_for(ids: list[str], kind: str, fit_reference: np.ndarray | None = None):  # noqa: ANN202
+        if kind == "hash":
+            raw = np.asarray(embedder.embed([tasks[sid] for sid in ids]))
+        else:
+            raw = np.asarray([oai[sid] for sid in ids], dtype=np.float64)
+        return Normalizer(norm="l2").transform(raw)
+
+    cell.record("best-single", {"model": best_name}, cell.best_eval)
+
+    # Attribution ablation: featureless global cost-aware selection.
+    pick = _costaware_single(matrix, fit_ids)
+    cell.record(
+        "costaware-single",
+        {"lam": 0.1, "model": pick},
+        evaluate_choices(matrix, test_ids, lambda _sid, p=pick: p),
+    )
+
+    embed_kinds = ["hash"] + (["oai"] if oai is not None else [])
+    candidates = [
+        (base, kind) for kind in embed_kinds for base in ["z05-floor", "margin", "l2d", "l2d-lam01"]
+    ] + [("costaware-single", "hash")]
+
+    # Inner validation of every candidate on the fit side only.
+    sub = _sub_matrix(matrix, fit_ids)
+    stats: dict[tuple[str, str], list[float]] = {}
+    for inner_seed in INNER_SEEDS:
+        ifit, ival = split_scenario_ids(sub, train_fraction=0.7, seed=inner_seed)
+        ibest, _a, _c = best_single_model(sub, fit_ids=ifit, eval_ids=ival)
+        ibest_acc = evaluate_choices(sub, ival, lambda _sid, b=ibest: b).accuracy
+        for base, kind in candidates:
+            ifit_vecs = vecs_for(ifit, kind)
+            ival_vecs = vecs_for(ival, kind)
+            try:
+                picks = _candidate_picks(
+                    base, sub, ifit, ival, ifit_vecs, ival_vecs, ibest, spec, kind == "oai"
+                )
+                acc = evaluate_choices(sub, ival, lambda sid, p=picks: p[sid]).accuracy
+            except ValueError:
+                acc = ibest_acc  # a candidate that cannot fit scores as the baseline
+            stats.setdefault((base, kind), []).append(acc - ibest_acc)
+
+    promoted = [
+        (base, kind)
+        for (base, kind), deltas in stats.items()
+        if sum(deltas) / len(deltas) > 0
+        and sum(d > 0 for d in deltas) >= 2
+        and (base, kind) != (AUTO_DEFAULT, "hash")
+    ]
+    if promoted:
+        chosen = max(promoted, key=lambda c: sum(stats[c]) / len(stats[c]))
+    else:
+        chosen = (AUTO_DEFAULT, "oai" if oai is not None else "hash")
+
+    base, kind = chosen
+    fit_vecs = vecs_for(fit_ids, kind)
+    outer_test_vecs = vecs_for(test_ids, kind)
+    picks = _candidate_picks(
+        base,
+        matrix,
+        fit_ids,
+        test_ids,
+        fit_vecs,
+        outer_test_vecs,
+        best_name,
+        spec,
+        kind == "oai",
+    )
+    cell.record(
+        "auto",
+        {
+            "chosen": f"{base}/{kind}",
+            "promoted": [f"{b}/{k}" for b, k in promoted],
+            "inner_mean": round(sum(stats[chosen]) / len(stats[chosen]), 4)
+            if chosen in stats
+            else 0.0,
+        },
+        evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+    )
+
+
 def main() -> None:
     args = sys.argv[1:]
     wanted = [a for a in args if not a.startswith("--")]
@@ -836,6 +1004,7 @@ def main() -> None:
     exp3 = "--exp3" in args
     exp4 = "--exp4" in args
     exp5 = "--exp5" in args
+    exp6 = "--exp6" in args
 
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
@@ -845,7 +1014,9 @@ def main() -> None:
             if split_kind == "ood-task" and not has_prefixes:
                 continue
             for seed in seeds:
-                if exp5:
+                if exp6:
+                    run_cell_exp6(name, matrix, split_kind, seed)
+                elif exp5:
                     if name not in L2D_MATRICES:
                         continue
                     run_cell_exp5(
