@@ -6,6 +6,7 @@ tau_scenarios.json; re-run after a fresh build to refresh the numbers, then upda
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 OUT = Path(".agents/docs/research/gev_bench_results/gen/report.md")
@@ -200,10 +201,18 @@ uv run python .agents/scripts/gev_bench/write_report.py
 """
 
 
+_LOG = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
 def main() -> None:
+    _setup_logging()
     assert "—" not in REPORT, "no em dashes allowed"
     OUT.write_text(REPORT, encoding="utf-8")
-    print(f"wrote {OUT}")
+    _LOG.info(f"wrote {OUT}")
 
 
 if __name__ == "__main__":

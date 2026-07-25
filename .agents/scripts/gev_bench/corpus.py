@@ -24,10 +24,10 @@ from wmh.core.types import ActionKind, Trace
 from wmh.harness.runtime import TRANSCRIPT_OBS_CHARS
 from wmh.ingest.otel_genai import OtelGenAIAdapter
 
-# The committed corpus lives in the main checkout (the worktree carries only model artifacts).
-DEFAULT_CORPUS_ROOT = Path(
-    "/Users/silen/Desktop/Projects/world-model-harness/packages/environment-capture/bird-sql"
-)
+# Repo-root-relative default (this file sits three levels below the root). The bird-sql
+# trace corpus is not committed on every branch; load_cases fails with guidance when the
+# file is absent, and callers can point --corpus-root at a checkout that has it.
+DEFAULT_CORPUS_ROOT = Path(__file__).resolve().parents[3] / "packages/environment-capture/bird-sql"
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,12 @@ def load_cases(
 ) -> list[VerifyCase]:
     """Load every bird-sql trace that has a recorded reward and a gold-SQL sidecar."""
     traces_path = corpus_root / "traces.otel.jsonl"
+    if not traces_path.exists():
+        raise FileNotFoundError(
+            f"bird-sql trace corpus not found at {traces_path}; this branch may not commit it - "
+            "pass --corpus-root pointing at a checkout that has packages/environment-capture/"
+            "bird-sql/traces.otel.jsonl"
+        )
     gold_dir = gold_dir if gold_dir is not None else corpus_root / "gold"
     traces = OtelGenAIAdapter().from_file(str(traces_path))
 

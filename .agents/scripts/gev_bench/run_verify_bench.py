@@ -18,27 +18,36 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# Workspace scripts live outside any package tree by design (gate-exempt, nothing in
+# wmh/ may depend on them); this one-line bootstrap is what lets siblings share
+# gev_bench.corpus without promoting workspace code into the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gev_bench.corpus import VerifyCase, load_cases, select_balanced  # noqa: E402
 
+# Deliberate private-API reuse: the meta-eval must grade the EXACT production judge
+# (same prompt builder, same parser); a public re-implementation would test a copy.
+# The only deviation is temperature, which GoldJudge.score hardcodes to 0.0.
 from wmh.evals.gold import (  # noqa: E402
     GOLD_JUDGE_SYSTEM,
     _build_prompt,
     _parse,
 )
 from wmh.providers import ProviderConfig, ProviderKind, get_provider  # noqa: E402
-from wmh.providers.base import Message  # noqa: E402
+from wmh.providers.base import Message, Provider  # noqa: E402
+
+_LOG = logging.getLogger(__name__)
 
 OUT_DIR = Path(__file__).resolve().parents[2] / "docs/research/gev_bench_results/verify"
 
 
-def _judge_once(provider, case: VerifyCase, temperature: float) -> dict:
+def _judge_once(provider: Provider, case: VerifyCase, temperature: float) -> dict:
     """One judge pass, reusing GoldJudge's exact prompt + parser with temperature exposed."""
     user = _build_prompt(case.instruction, case.answer, case.transcript, case.gold)
     completion = provider.complete(
@@ -48,10 +57,14 @@ def _judge_once(provider, case: VerifyCase, temperature: float) -> dict:
         max_tokens=1024,
     )
     verdict = _parse(completion.text, case.gold)
-    return {"passed": bool(verdict.passed), "fraction": verdict.fraction, "rationale": verdict.rationale}
+    return {
+        "passed": bool(verdict.passed),
+        "fraction": verdict.fraction,
+        "rationale": verdict.rationale,
+    }
 
 
-def _score_case(provider, case: VerifyCase, k: int, temperature: float) -> dict:
+def _score_case(provider: Provider, case: VerifyCase, k: int, temperature: float) -> dict:
     votes = [_judge_once(provider, case, temperature) for _ in range(k)]
     n_pass = sum(v["passed"] for v in votes)
     predicted_pass = n_pass * 2 > k  # majority
@@ -77,20 +90,35 @@ def _score_case(provider, case: VerifyCase, k: int, temperature: float) -> dict:
     }
 
 
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
 def main() -> None:
+    _setup_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="us.anthropic.claude-opus-4-8")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--k", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--n-per-class", type=int, default=20)
+    parser.add_argument(
+        "--corpus-root",
+        type=Path,
+        default=None,
+        help="bird-sql corpus dir (default: this repo's committed copy)",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--limit", type=int, default=None, help="Cap #cases (smoke test).")
     parser.add_argument("--concurrency", type=int, default=8, help="Cases graded in parallel.")
     parser.add_argument("--out", default=str(OUT_DIR / "results.json"))
     args = parser.parse_args()
 
-    cases = select_balanced(load_cases(), n_per_class=args.n_per_class, seed=args.seed)
+    cases = select_balanced(
+        load_cases(args.corpus_root) if args.corpus_root is not None else load_cases(),
+        n_per_class=args.n_per_class,
+        seed=args.seed,
+    )
     if args.limit is not None:
         # Keep the smoke slice balanced: interleave pass/fail.
         passes = [c for c in cases if c.recorded_pass]
@@ -111,8 +139,8 @@ def main() -> None:
 
     n = len(results)
     correct = sum(r["correct"] for r in results)
-    print(f"graded {n} cases (k={args.k}, T={args.temperature}) in {elapsed:.0f}s")
-    print(f"accuracy: {correct}/{n} = {correct / n:.3f}")
+    _LOG.info(f"graded {n} cases (k={args.k}, T={args.temperature}) in {elapsed:.0f}s")
+    _LOG.info(f"accuracy: {correct}/{n} = {correct / n:.3f}")
 
     payload = {
         "config": {
@@ -132,7 +160,7 @@ def main() -> None:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"wrote {out}")
+    _LOG.info(f"wrote {out}")
 
 
 if __name__ == "__main__":

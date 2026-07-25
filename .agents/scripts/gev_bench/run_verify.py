@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
 
@@ -27,8 +28,15 @@ from wmh.scenarios.synthesis import ScenarioSet
 from wmh.scenarios.verification import ChecklistJudge
 from wmh.scenarios.verification.verify import verify_scenarios
 
+_LOG = logging.getLogger(__name__)
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
 
 def main() -> None:
+    _setup_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenarios", required=True)
     parser.add_argument("--file", required=True)
@@ -48,7 +56,7 @@ def main() -> None:
     agent_llm = providers.get_provider(worker_config) if worker_config else llm
     judge_llm = providers.get_provider(judge_config) if judge_config else llm
 
-    print(
+    _LOG.info(
         f"verifying {len(scenario_set.scenarios)} scenarios against WM '{resolved_name}' "
         f"(agent={'worker-role' if worker_config else 'wm-serve'}, "
         f"judge={'judge-role' if judge_config else 'wm-serve'}), max_steps={args.max_steps}"
@@ -65,7 +73,7 @@ def main() -> None:
     elapsed = time.time() - start
 
     Path(args.out).write_text(report.model_dump_json(indent=2), encoding="utf-8")
-    print(
+    _LOG.info(
         f"back-agreement {report.back_agreement_rate:.0%}, solvable {report.solvable_rate:.0%} "
         f"over {len(report.verdicts)} scenarios in {elapsed:.1f}s -> {args.out}"
     )

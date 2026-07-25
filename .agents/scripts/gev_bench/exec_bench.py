@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import shlex
 import sqlite3
 import time
-from dataclasses import replace
+from collections.abc import Callable
 from pathlib import Path
 from statistics import fmean
 
@@ -42,12 +43,14 @@ from environment_capture.trajectory import Task as BirdTask
 
 from wmh.core.types import Action, Observation
 from wmh.engine import load_world_model
-from wmh.evals.closed_loop import RolloutEvidence, evaluate_with_env
+from wmh.evals.closed_loop import RolloutEvidence, WorldModelEnvironment, evaluate_with_env
 from wmh.evals.gold import GoldJudge
 from wmh.evals.tasks import TaskSpec
 from wmh.harness.runtime import AgentRuntime
 from wmh.providers import get_provider
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+
+_LOG = logging.getLogger(__name__)
 
 _REPO = Path(__file__).resolve().parents[3]
 _BIRD_ROOT = _REPO / "packages" / "environment-capture" / "bird-sql"
@@ -111,7 +114,7 @@ class RealBirdEnvironment:
 
 
 def _gold_rows(bird_task: BirdTask, adapter: BirdSqlAdapter) -> tuple[list[tuple], str]:
-    """Execute the task's gold SQL against the real db; return (rows, compact repr for the judge)."""
+    """Execute the task's gold SQL on the real db; return (rows, compact judge repr)."""
     gold = json.loads((_BIRD_ROOT / "gold" / f"{bird_task.task_id}.json").read_text())
     db = _BIRD_ROOT / "databases" / f"{bird_task.data['db_name']}.sqlite"
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
@@ -186,9 +189,9 @@ def _grade_detail(bird_task: BirdTask, evidence: RolloutEvidence) -> tuple[float
     sql = extract_sql(evidence.answer)
     if not sql:
         return 0.0, "", "no_sql"
-    gold_sql = json.loads(
-        (_BIRD_ROOT / "gold" / f"{bird_task.task_id}.json").read_text()
-    )["gold_sql"]
+    gold_sql = json.loads((_BIRD_ROOT / "gold" / f"{bird_task.task_id}.json").read_text())[
+        "gold_sql"
+    ]
     db = _BIRD_ROOT / "databases" / f"{bird_task.data['db_name']}.sqlite"
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
@@ -219,8 +222,8 @@ def _run_condition(
     candidate: str,
     env_kind: str,
     specs: list[TaskSpec],
-    make_env,
-    agent_provider,
+    make_env: Callable[[TaskSpec], object],
+    agent_provider: Provider,
     judge: GoldJudge,
     bird_map: dict[str, BirdTask],
     adapter: BirdSqlAdapter,
@@ -235,9 +238,8 @@ def _run_condition(
     rows: list[dict] = []
     for task_id, outcome in report.per_task.items():
         bird_task = bird_map[task_id]
-        for attempt_idx, (verdict, attempt) in enumerate(
-            zip(outcome.verdicts, outcome.attempts)
-        ):
+        pairs = zip(outcome.verdicts, outcome.attempts, strict=True)
+        for attempt_idx, (verdict, attempt) in enumerate(pairs):
             det_score, sql, error_kind = _grade_detail(bird_task, attempt)
             rows.append(
                 {
@@ -249,7 +251,8 @@ def _run_condition(
                     "det_score": det_score,  # 1.0 = final SQL execution-matches gold on the real db
                     "judge_passed": verdict.passed,
                     "judge_fraction": verdict.fraction,
-                    "error_kind": error_kind,  # none|wrong_result|no_such_table|no_such_column|sql_error|no_sql
+                    # none|wrong_result|no_such_table|no_such_column|sql_error|no_sql
+                    "error_kind": error_kind,
                     "schema_hallucination": error_kind in _SCHEMA_HALLUCINATION_KINDS,
                     "pred_sql": sql,
                     "stop_reason": attempt.stop_reason.value,
@@ -273,7 +276,12 @@ def _confusion(
     rows: list[dict], candidate: str, task_ids: list[str], key: str, threshold: float = 0.5
 ) -> dict:
     """Sim-vs-real confusion for one candidate over its scenarios, binarized at `threshold`."""
-    c = {"sim_pass_real_pass": 0, "sim_pass_real_fail": 0, "sim_fail_real_pass": 0, "sim_fail_real_fail": 0}
+    c = {
+        "sim_pass_real_pass": 0,
+        "sim_pass_real_fail": 0,
+        "sim_fail_real_pass": 0,
+        "sim_fail_real_fail": 0,
+    }
     for task_id in task_ids:
         sim = _cell_rate(rows, candidate, "sim", task_id, key) >= threshold
         real = _cell_rate(rows, candidate, "real", task_id, key) >= threshold
@@ -394,7 +402,12 @@ def _error_kind_counts(rows: list[dict]) -> dict:
     return dict(sorted(counts.items()))
 
 
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
 def main() -> None:
+    _setup_logging()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenarios", type=int, default=8)
     parser.add_argument("--k", type=int, default=2)
@@ -416,7 +429,7 @@ def main() -> None:
     adapter = BirdSqlAdapter(data_root=_BIRD_ROOT)
     specs, bird_map = _load_scenarios(n_scen, adapter)
     task_ids = [s.task_id for s in specs]
-    print(f"scenarios ({len(specs)}): {task_ids}")
+    _LOG.info(f"scenarios ({len(specs)}): {task_ids}")
 
     judge_provider = get_provider(
         ProviderConfig(
@@ -447,7 +460,7 @@ def main() -> None:
     for cand in candidates:
         agent_provider = candidate_providers[cand]
         # Real environment.
-        print(f"[{cand}] real env, k={k} ...")
+        _LOG.info(f"[{cand}] real env, k={k} ...")
         real_rows = _run_condition(
             f"real@{cand}",
             cand,
@@ -464,9 +477,7 @@ def main() -> None:
         all_rows.extend(real_rows)
         # Simulated environment (world model). Freeze the index so concurrent stepping cannot
         # mutate the shared retrieval buffer mid-eval; sessions are already enrich=False.
-        print(f"[{cand}] sim env (world model), k={k} ...")
-        from wmh.evals.closed_loop import WorldModelEnvironment
-
+        _LOG.info(f"[{cand}] sim env (world model), k={k} ...")
         with world_model.frozen() as wm:
             sim_rows = _run_condition(
                 f"sim@{cand}",
@@ -502,9 +513,9 @@ def main() -> None:
         for r in all_rows:
             fh.write(json.dumps(r) + "\n")
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    print(f"\nwrote {len(all_rows)} episodes -> {raw_path}")
-    print(f"wrote metrics -> {metrics_path}")
-    print(json.dumps(metrics, indent=2))
+    _LOG.info(f"\nwrote {len(all_rows)} episodes -> {raw_path}")
+    _LOG.info(f"wrote metrics -> {metrics_path}")
+    _LOG.info(json.dumps(metrics, indent=2))
 
 
 if __name__ == "__main__":

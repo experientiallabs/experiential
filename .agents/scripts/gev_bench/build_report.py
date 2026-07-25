@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from collections import Counter
 from pathlib import Path
 
@@ -26,6 +27,8 @@ from wmh.core.types import ActionKind, Trace
 from wmh.ingest import get_adapter
 from wmh.scenarios.synthesis import ScenarioSet
 from wmh.scenarios.verification.verify import VerificationReport
+
+_LOG = logging.getLogger(__name__)
 
 
 def _tool_signature(trace: Trace) -> list[str]:
@@ -74,7 +77,12 @@ def _clean_task(task: str) -> str:
     return task
 
 
+def _setup_logging() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
 def main() -> None:
+    _setup_logging()
     parser = argparse.ArgumentParser()
     parser.add_argument("--scenarios", required=True)
     parser.add_argument("--file", required=True)
@@ -225,12 +233,26 @@ def main() -> None:
         )
 
     (outdir / "labeling_sheet.md").write_text(_nodash("\n".join(sheet)), encoding="utf-8")
-    (outdir / "labels_template.jsonl").write_text("\n".join(template_lines) + "\n", encoding="utf-8")
+    (outdir / "labels_template.jsonl").write_text(
+        "\n".join(template_lines) + "\n", encoding="utf-8"
+    )
 
-    print(f"wrote metrics.json, labeling_sheet.md, labels_template.jsonl to {outdir}")
-    print(json.dumps({k: metrics[k] for k in (
-        "scenario_count", "corpus_coverage", "cluster_count",
-        "back_agreement_rate", "solvable_rate")}, indent=2))
+    _LOG.info(f"wrote metrics.json, labeling_sheet.md, labels_template.jsonl to {outdir}")
+    _LOG.info(
+        json.dumps(
+            {
+                k: metrics[k]
+                for k in (
+                    "scenario_count",
+                    "corpus_coverage",
+                    "cluster_count",
+                    "back_agreement_rate",
+                    "solvable_rate",
+                )
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":
