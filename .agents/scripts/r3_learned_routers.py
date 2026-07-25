@@ -940,6 +940,134 @@ def cmd_audit2(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
             )
 
 
+def _platt_apply(a: float, b_: float, raw: np.ndarray) -> np.ndarray:
+    clipped = np.clip(raw, 1e-6, 1 - 1e-6)
+    return 1.0 / (1.0 + np.exp(-(a * np.log(clipped / (1 - clipped)) + b_)))
+
+
+def cmd_ensemble(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
+    """Round 2a: blend Platt'd irt2 P with Platt'd kNN-P, weight chosen on the val split.
+
+    kNN val predictions use a train-only neighbor store (no self-neighbor leak); kNN test
+    predictions use the full fit store. When r1's 3-large cache exists for the matrix, a
+    second variant runs the kNN side on those vectors (irt2 stays on hashing: round 1
+    showed semantic vectors do nothing for the parametric head but +1pt for retrieval).
+    """
+    for name, matrix in matrices.items():
+        model_names = matrix.model_names()
+        n_fit_margin = 0.5  # n-aware guard c
+        for seed in seeds:
+            ctx = SplitContext(name, matrix, seed)
+            tr_rows, va_rows = val_split(ctx)
+            tr_ids = [ctx.fit_ids[i] for i in tr_rows]
+            va_ids = [ctx.fit_ids[i] for i in va_rows]
+            tr_vecs, va_vecs = ctx.fit_vecs[tr_rows], ctx.fit_vecs[va_rows]
+            q, mi, y = pairs_for(matrix, tr_ids, tr_vecs)
+            vq, vmi, vy = pairs_for(matrix, va_ids, va_vecs)
+            v_rows, v_mis, v_ys = scored_triples(matrix, va_ids)
+            margin = max(MARGIN, n_fit_margin / np.sqrt(len(ctx.fit_ids)))
+
+            params, _tc, vc = fit_irt_cfg(q, mi, y, len(model_names), (vq, vmi, vy), IRT2)
+            irt_va_raw = irt_probs(params, va_vecs)
+            irt_te_raw = irt_probs(params, ctx.test_vecs)
+            v_pred = np.clip(irt_va_raw[v_rows, v_mis], 1e-6, 1 - 1e-6)
+            a_i, b_i = platt(np.log(v_pred / (1 - v_pred)), v_ys)
+            irt_va = _platt_apply(a_i, b_i, irt_va_raw)
+            irt_te = _platt_apply(a_i, b_i, irt_te_raw)
+
+            knn_sides: list[tuple[str, np.ndarray, np.ndarray]] = []
+            knn_va_raw = knn_probs(matrix, tr_ids, tr_vecs, va_vecs, k=50)
+            knn_te_raw = knn_probs(matrix, ctx.fit_ids, ctx.fit_vecs, ctx.test_vecs, k=50)
+            knn_sides.append(("hashing", knn_va_raw, knn_te_raw))
+            oai_cache = DATA / "cache" / f"{name}-oai3l-tasks.npy"
+            if oai_cache.exists() and EMBED_KIND != "oai":
+                by_sid = cached_oai_vecs(name, matrix)
+                fit_o = np.stack([by_sid[s] for s in ctx.fit_ids])
+                te_o = np.stack([by_sid[s] for s in ctx.test_ids])
+                knn_sides.append(
+                    (
+                        "oai",
+                        knn_probs(matrix, tr_ids, fit_o[tr_rows], fit_o[va_rows], k=50),
+                        knn_probs(matrix, ctx.fit_ids, fit_o, te_o, k=50),
+                    )
+                )
+            for knn_embed, kva_raw, kte_raw in knn_sides:
+                kv_pred = np.clip(kva_raw[v_rows, v_mis], 1e-6, 1 - 1e-6)
+                a_k, b_k = platt(np.log(kv_pred / (1 - kv_pred)), v_ys)
+                knn_va = _platt_apply(a_k, b_k, kva_raw)
+                knn_te = _platt_apply(a_k, b_k, kte_raw)
+                grid = [round(w * 0.1, 1) for w in range(11)]
+                val_bces = {
+                    w: bce((w * irt_va + (1 - w) * knn_va)[v_rows, v_mis], v_ys) for w in grid
+                }
+                w_best = min(val_bces, key=lambda w: val_bces[w])
+                logger.info(
+                    "%s seed%d ens(knn=%s): w*=%.1f val_bce=%.4f (irt-only %.4f, knn-only %.4f)",
+                    name,
+                    seed,
+                    knn_embed,
+                    w_best,
+                    val_bces[w_best],
+                    val_bces[1.0],
+                    val_bces[0.0],
+                )
+                blend_te = w_best * irt_te + (1 - w_best) * knn_te
+                for lam in [0.0, 0.01, 0.02]:
+                    ctx.rec(
+                        "r3-ens",
+                        {
+                            "w": w_best,
+                            "knn_embed": knn_embed,
+                            "val_bce": round(val_bces[w_best], 4),
+                            "margin": round(float(margin), 4),
+                        },
+                        blend_te,
+                        lam,
+                        margin=float(margin),
+                    )
+
+
+def cmd_coverage(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
+    """Round 2b: accuracy-coverage curves; confidence = score gap over the baseline.
+
+    Route the top-q most-confident fraction by raw argmax(P - lam*penalty); abstain the
+    rest to best-single. No margin inside the routed set: coverage IS the guard here.
+    """
+    qs = [0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+    for name, matrix in matrices.items():
+        model_names = matrix.model_names()
+        for seed in seeds:
+            ctx = SplitContext(name, matrix, seed)
+            cal, _val_bce, _e, meta = _fit_irt2(ctx, matrix)
+            cost_scale = sum(ctx.costs.values()) / len(ctx.costs)
+            penalties = np.asarray([ctx.costs.get(m, cost_scale) / cost_scale for m in model_names])
+            base_idx = model_names.index(ctx.best_name)
+            for lam in [0.01, 0.02]:
+                scores = cal - lam * penalties
+                pick_idx = np.argmax(scores, axis=1)
+                gap = scores[np.arange(len(scores)), pick_idx] - scores[:, base_idx]
+                order = np.argsort(-gap)
+                for cov in qs:
+                    routed = set(order[: int(round(cov * len(order)))].tolist())
+                    picks = [
+                        model_names[int(pick_idx[t])] if t in routed else ctx.best_name
+                        for t in range(len(ctx.test_ids))
+                    ]
+                    record(
+                        matrix_name=name,
+                        matrix=matrix,
+                        variant="r3-cov",
+                        params={**meta, "lam": lam, "coverage": cov},
+                        split_seed=seed,
+                        fit_ids=ctx.fit_ids,
+                        test_ids=ctx.test_ids,
+                        picks=dict(zip(ctx.test_ids, picks, strict=True)),
+                        best_eval=ctx.best_eval,
+                        best_name=ctx.best_name,
+                        oracle_acc=ctx.oracle_acc,
+                    )
+
+
 def cmd_adaptive(matrices: dict[str, OutcomeMatrix], seeds: list[int]) -> None:
     """Q4: n-aware guard margin max(0.03, c/sqrt(n_fit)) on irt2 (Platt'd P).
 
@@ -1173,6 +1301,8 @@ def main() -> None:
             "curves",
             "coldstart",
             "adaptive",
+            "ensemble",
+            "coverage",
         ],
     )
     parser.add_argument("--matrices", nargs="*", default=None)
@@ -1196,6 +1326,8 @@ def main() -> None:
         "curves": cmd_curves,
         "coldstart": cmd_coldstart,
         "adaptive": cmd_adaptive,
+        "ensemble": cmd_ensemble,
+        "coverage": cmd_coverage,
     }
     commands[args.command](matrices, args.seeds)
     logger.info("runs -> %s", RUNS)
