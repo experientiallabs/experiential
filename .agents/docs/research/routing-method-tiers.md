@@ -306,3 +306,11 @@ found the correct answer per the judge's own critique and scored 0.0 for not sub
 time); dabstep 49%. Clean wm corpora = terminal-tasks (3%) and bird-sql (12%). Full table +
 consequences in ~/Desktop/Projects/wmh-routing-data/findings/master.md; scaled round re-runs
 exploration corpora at max_steps 16, and stop_reason mix becomes a standard health metric.
+
+## Benchmark health: the headroom map (2026-07-24, master audit complete)
+
+Full table in wmh-routing-data/findings/master.md. Verdict: our demonstrated wins live on
+SATURATED corpora (ours9/terminal-tasks/bird-sql: oracle headroom +0.03-0.04) where
+cost-at-parity was the only prize; real accuracy headroom (+0.23-0.39) is on financebench /
+tau-bench / continual-learning (clean-ish) and crmarena / dabstep / tau-telecom (step-cap
+contaminated). Scaled-winners round targets the first three at max_steps 16, ~80 scenarios.
