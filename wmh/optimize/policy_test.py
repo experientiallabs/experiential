@@ -9,9 +9,12 @@ import pytest
 from pydantic import ValidationError
 
 from wmh.optimize.policy import (
+    KNN_BANK_FILENAME,
     ClusterRanking,
     EmbedderSpec,
+    KnnBank,
     RoutingPolicy,
+    knn_decision,
     rank_decision,
     select_model,
 )
@@ -273,3 +276,229 @@ def test_rank_decision_normalizes_the_query_itself() -> None:
     assert expected.model == "haiku-4-5"
     for scale in (0.02, 50.0):  # 50.0 selected fable-5 before the fix
         assert rank_decision(policy, unit * scale) == expected
+
+
+# --- kNN policies: the guarded nearest-neighbor champion (see wmh.optimize.knn) ------------
+
+_CHEAP, _PRICEY = 0.001, 0.010
+
+
+def _knn_bank(
+    rewards: list[list[float]],
+    *,
+    sims: list[float] | None = None,
+    costs: list[float] | None = None,
+) -> KnnBank:
+    """A 2-dimensional bank: one row per neighbor, columns [fable-5, haiku-4-5].
+
+    Rows sit on the unit circle at the requested cosine similarity to the query (1, 0), which
+    makes neighbor selection and the similarity weights exact rather than embedder-dependent.
+    Per-model costs default to fable-5 pricey / haiku-4-5 cheap.
+    """
+    similarities = sims if sims is not None else [1.0] * len(rewards)
+    reward_rows = np.asarray(rewards, dtype=np.float32)
+    model_costs = costs if costs is not None else [_PRICEY, _CHEAP]
+    return KnnBank(
+        embeddings=np.asarray(
+            [[sim, (1.0 - sim**2) ** 0.5] for sim in similarities], dtype=np.float32
+        ),
+        rewards=reward_rows,
+        costs=np.where(np.isnan(reward_rows), np.nan, np.asarray(model_costs, dtype=np.float32)),
+        models=["fable-5", "haiku-4-5"],
+        scenario_ids=[f"s{index}" for index in range(len(rewards))],
+    )
+
+
+def _knn_policy(bank: KnnBank, **overrides: object) -> RoutingPolicy:
+    """A knn policy over `bank` with fable-5 as the pinned baseline (the production contract)."""
+    fields: dict[str, object] = {
+        "kind": "knn",
+        "default_model": "fable-5",
+        "guard_model": "fable-5",
+        "pool": _pool(),
+        "embedder": EmbedderSpec(dim=2),
+    }
+    fields.update(overrides)
+    policy = RoutingPolicy.model_validate(fields)
+    policy.attach_bank(bank)
+    return policy
+
+
+_QUERY = np.asarray([1.0, 0.0])
+
+
+class _UnitEmbedder:
+    """Embeds every text to the bank's query direction, so routing is about the bank alone."""
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _ in texts]
+
+
+def test_knn_routes_away_from_the_baseline_on_strong_evidence() -> None:
+    # 12 neighbors where haiku always wins and fable always loses: the evidence is as clean as
+    # it gets, and haiku is the cheaper model, so the guard applies the single-z bar.
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    decision = knn_decision(policy, _QUERY)
+    assert decision.model == "haiku-4-5"
+    assert "12 neighbors" in decision.reason
+    assert "delta=+1.000" in decision.reason
+
+
+def test_knn_reverts_when_too_few_neighbors_were_scored_on_both_sides() -> None:
+    # Same unanimous evidence, but only 5 paired neighbors: below min_pairs the guard refuses,
+    # because five agreeing neighbors are how a router talks itself into a confident mistake.
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 5))
+    decision = knn_decision(policy, _QUERY)
+    assert decision.model == "fable-5"
+    assert "5 paired neighbors < 8 required" in decision.reason
+
+
+def test_knn_z_is_the_confidence_knob_on_identical_evidence() -> None:
+    # Noisy evidence: haiku wins 7 of 12 neighbors, loses 5, mean delta +0.083 with a standard
+    # error of 0.149. At z=0.5 the mean clears the bar; at z=1.0 the same evidence does not.
+    rewards = [[0.5, 1.0]] * 7 + [[0.5, 0.0]] * 5
+    assert knn_decision(_knn_policy(_knn_bank(rewards), knn_z=0.5), _QUERY).model == "haiku-4-5"
+    stricter = knn_decision(_knn_policy(_knn_bank(rewards), knn_z=1.0), _QUERY)
+    assert stricter.model == "fable-5"
+    assert "evidence insufficient" in stricter.reason
+
+
+def test_knn_doubles_the_bar_for_a_pricier_pick() -> None:
+    # The economic asymmetry: identical reward evidence, and the only difference is whether the
+    # pick costs more than the baseline. Paying more requires twice the confidence.
+    rewards = [[0.5, 1.0]] * 7 + [[0.5, 0.0]] * 5
+    cheap_pick = knn_decision(_knn_policy(_knn_bank(rewards, costs=[_PRICEY, _CHEAP])), _QUERY)
+    pricey_pick = knn_decision(_knn_policy(_knn_bank(rewards, costs=[_CHEAP, _PRICEY])), _QUERY)
+    assert cheap_pick.model == "haiku-4-5"
+    assert pricey_pick.model == "fable-5"
+    assert "pricier" not in cheap_pick.reason
+    assert "1xSE" in pricey_pick.reason  # z doubled from 0.5
+
+
+def test_knn_se_floor_stops_a_zero_variance_neighborhood_from_looking_significant() -> None:
+    # Nine neighbors that all agree haiku is 0.05 better: the empirical standard error is ZERO,
+    # so an unfloored guard treats a rounding-sized edge as certain. The floor (sqrt(0.25/9))
+    # asks for 0.083 instead, and the edge does not clear it.
+    bank = _knn_bank([[0.5, 0.55]] * 9)
+    assert knn_decision(_knn_policy(bank, se_floor=False), _QUERY).model == "haiku-4-5"
+    assert knn_decision(_knn_policy(bank, se_floor=True), _QUERY).model == "fable-5"
+
+
+def test_knn_keeps_the_baseline_when_it_leads_the_neighborhood() -> None:
+    decision = knn_decision(_knn_policy(_knn_bank([[1.0, 0.0]] * 12)), _QUERY)
+    assert decision.model == "fable-5"
+    assert "leads 12 neighbors" in decision.reason
+
+
+def test_knn_serves_the_baseline_when_neighbors_carry_no_scored_reward() -> None:
+    bank = _knn_bank([[0.4, float("nan")]] * 3 + [[float("nan"), float("nan")]] * 9)
+    # The query's neighbors are the 9 unscored rows only (the scored ones sit far away).
+    bank = KnnBank(
+        embeddings=np.asarray(
+            [[0.2, 0.98] for _ in range(3)] + [[1.0, 0.0] for _ in range(9)], dtype=np.float32
+        ),
+        rewards=bank.rewards,
+        costs=bank.costs,
+        models=bank.models,
+        scenario_ids=bank.scenario_ids,
+    )
+    decision = knn_decision(_knn_policy(bank, rag_num=9), _QUERY)
+    assert decision.model == "fable-5"
+    assert "no scored reward" in decision.reason
+
+
+def test_knn_neighbor_rule_is_relative_not_a_fixed_k() -> None:
+    # rag_num is a budget, not a count: everything within rag_thres of the budget-th best
+    # similarity joins, so a query in a dense region routes on MORE evidence than k. Here 12
+    # rows are equally near, and a budget of 3 keeps all 12.
+    decision = knn_decision(_knn_policy(_knn_bank([[0.0, 1.0]] * 12), rag_num=3), _QUERY)
+    assert "12 neighbors" in decision.reason
+    # Far rows stay out while the budget is covered by near ones, and join once it is not: 10
+    # near rows plus 6 distant ones give 10 neighbors at a budget of 10, all 16 at a budget of 16.
+    mixed = _knn_bank([[0.0, 1.0]] * 10 + [[1.0, 0.0]] * 6, sims=[1.0] * 10 + [0.5] * 6)
+    assert "10 neighbors" in knn_decision(_knn_policy(mixed, rag_num=10), _QUERY).reason
+    assert "16 neighbors" in knn_decision(_knn_policy(mixed, rag_num=16), _QUERY).reason
+
+
+def test_knn_bank_loads_lazily_from_the_sidecar_and_stays_cached(tmp_path: Path) -> None:
+    bank = _knn_bank([[0.0, 1.0]] * 12)
+    bank.save(tmp_path / KNN_BANK_FILENAME)
+    saved = _knn_policy(bank)
+    saved.save(tmp_path / "policy.json")
+
+    loaded = RoutingPolicy.load(tmp_path / "policy.json")
+    assert loaded.bank_path() == tmp_path / KNN_BANK_FILENAME
+    assert select_model(loaded, "anything", embedder=_UnitEmbedder()).model == "haiku-4-5"
+    # Cached after the first decision: the sidecar is read once per policy instance, not per
+    # request (a 3072-dimensional bank is megabytes).
+    (tmp_path / KNN_BANK_FILENAME).unlink()
+    assert select_model(loaded, "anything", embedder=_UnitEmbedder()).model == "haiku-4-5"
+
+
+def test_knn_policy_without_its_sidecar_says_where_the_file_should_be(tmp_path: Path) -> None:
+    _knn_policy(_knn_bank([[0.0, 1.0]] * 12)).save(tmp_path / "policy.json")
+    loaded = RoutingPolicy.load(tmp_path / "policy.json")
+    with pytest.raises(FileNotFoundError, match=KNN_BANK_FILENAME):
+        loaded.knn_bank()
+
+
+def test_knn_kind_requires_a_baseline_that_is_also_the_default() -> None:
+    with pytest.raises(ValueError, match="guard_model"):
+        RoutingPolicy(kind="knn", default_model="fable-5", pool=_pool())
+    with pytest.raises(ValueError, match="one model"):
+        RoutingPolicy(kind="knn", default_model="fable-5", guard_model="haiku-4-5", pool=_pool())
+
+
+def test_knn_kind_rejects_clusters() -> None:
+    with pytest.raises(ValueError, match="knn policy carries no clusters"):
+        RoutingPolicy(
+            kind="knn",
+            default_model="fable-5",
+            guard_model="fable-5",
+            pool=_pool(),
+            embedder=EmbedderSpec(dim=2),
+            clusters=[ClusterRanking(cluster_id=0, centroid=[1.0, 0.0], ranking=["fable-5"])],
+        )
+
+
+def test_knn_bank_must_match_the_policys_embedder_and_pool() -> None:
+    bank = _knn_bank([[0.0, 1.0]] * 12)
+    with pytest.raises(ValueError, match="dimensional"):
+        _knn_policy(bank, embedder=EmbedderSpec(dim=64))
+    stranger = KnnBank(
+        embeddings=bank.embeddings,
+        rewards=bank.rewards,
+        costs=bank.costs,
+        models=["fable-5", "retired-model"],
+        scenario_ids=bank.scenario_ids,
+    )
+    with pytest.raises(ValueError, match="not in the policy pool"):
+        _knn_policy(stranger)
+
+
+def test_knn_bank_must_carry_evidence_for_the_baseline() -> None:
+    # A baseline the fit never measured cannot be compared against, so every request would
+    # revert to it unmeasured: that is a static policy wearing a router's clothes.
+    with pytest.raises(ValueError, match="no scored reward for baseline"):
+        _knn_policy(_knn_bank([[float("nan"), 1.0]] * 12))
+
+
+def test_knn_bank_rejects_misaligned_arrays() -> None:
+    with pytest.raises(ValueError, match="rewards has shape"):
+        KnnBank(
+            embeddings=np.zeros((3, 2), dtype=np.float32),
+            rewards=np.zeros((3, 5), dtype=np.float32),
+            costs=np.zeros((3, 2), dtype=np.float32),
+            models=["fable-5", "haiku-4-5"],
+            scenario_ids=["a", "b", "c"],
+        )
+
+
+def test_knn_bank_round_trips_through_the_sidecar(tmp_path: Path) -> None:
+    bank = _knn_bank([[0.5, 1.0], [float("nan"), 0.0]] * 6)
+    bank.save(tmp_path / KNN_BANK_FILENAME)
+    reloaded = KnnBank.load(tmp_path / KNN_BANK_FILENAME)
+    assert reloaded.models == bank.models
+    assert reloaded.scenario_ids == bank.scenario_ids
+    np.testing.assert_array_equal(reloaded.rewards, bank.rewards)  # NaN cells included
+    np.testing.assert_allclose(reloaded.embeddings, bank.embeddings)

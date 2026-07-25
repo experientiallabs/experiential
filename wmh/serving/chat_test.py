@@ -7,11 +7,19 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from wmh.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
+from wmh.optimize.policy import (
+    KNN_BANK_FILENAME,
+    POLICY_FILENAME,
+    ClusterRanking,
+    EmbedderSpec,
+    KnnBank,
+    RoutingPolicy,
+)
 from wmh.providers.base import (
     Completion,
     Message,
@@ -382,3 +390,58 @@ def test_create_app_with_injected_policies_and_no_artifact_dirs(tmp_path: Path) 
     )
     client = TestClient(app)
     assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["ep"]
+
+
+def _knn_policy(tmp_path: Path) -> RoutingPolicy:
+    """A knn policy written to disk exactly as the fitter emits it: policy.json + npz sidecar.
+
+    Six SQL scenarios where fable-5 wins outright and six prose ones where haiku-4-5 does, with
+    haiku-4-5 as the pinned fallback. Loading it back proves the endpoint serves the artifact
+    pair with no serving-side knowledge of the bank format.
+    """
+    sql = ["SELECT count(*) FROM superheroes", "SELECT name FROM users LIMIT 10"] * 3
+    prose = ["write a friendly email to the team", "draft a thank-you note"] * 3
+    rewards = [[1.0, 0.0]] * len(sql) + [[0.0, 1.0]] * len(prose)
+    bank = KnnBank(
+        embeddings=np.asarray(HashingEmbedder(dim=64).embed(sql + prose), dtype=np.float32),
+        rewards=np.asarray(rewards, dtype=np.float32),
+        costs=np.asarray([[0.01, 0.001]] * len(rewards), dtype=np.float32),
+        models=["fable-5", "haiku-4-5"],
+        scenario_ids=[f"s{index}" for index in range(len(rewards))],
+    )
+    bank.save(tmp_path / KNN_BANK_FILENAME)
+    RoutingPolicy(
+        kind="knn",
+        default_model="haiku-4-5",
+        guard_model="haiku-4-5",
+        pool=_pool(),
+        embedder=EmbedderSpec(dim=64),
+        rag_num=6,
+        knn_min_pairs=4,
+    ).save(tmp_path / POLICY_FILENAME)
+    return RoutingPolicy.load(tmp_path / POLICY_FILENAME)
+
+
+def test_knn_policy_routes_a_request_end_to_end(tmp_path: Path) -> None:
+    client, log_path = _client(tmp_path, policy=_knn_policy(tmp_path))
+    routed = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+        },
+    )
+    # The SQL neighborhood is unanimous, so the guard lets the request leave the fallback.
+    assert routed.headers["x-wmh-routed-model"] == "fable-5"
+    assert routed.json()["choices"][0]["message"]["content"] == "served by fable-5"
+
+    fallback = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "draft a thank-you"}]},
+    )
+    assert fallback.headers["x-wmh-routed-model"] == "haiku-4-5"
+
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [row["model"] for row in rows] == ["fable-5", "haiku-4-5"]
+    assert rows[0]["routing_reason"].startswith("knn: ")
+    assert rows[0]["cluster_id"] is None  # a knn decision cites neighbors, not clusters
