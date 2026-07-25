@@ -38,7 +38,10 @@ whose `FakeTrainingClient` asserts the tokens-in-tokens-out invariant on
 every `forward_backward` batch.
 
 Resume: cadenced `save_state` checkpoints land in the run store's manifest;
-`resume=True` restores the latest checkpoint via `load_state`, continues the
+`resume=True` restores the latest checkpoint via `load_state` as the very
+first call on a freshly created training client (tinker accepts LoadWeights
+only on an uninitialized model, so preflight and the sampler refresh follow
+the restore and validate the RESTORED weights), continues the
 step count from the checkpoint, restores the prior sessions' USD spend from
 the run store's spend ledger (written on every charge, so eval spend between
 metrics rows survives), and reuses recorded baseline evals. A finished warmup
@@ -683,20 +686,34 @@ class SdkTrainingClient:
       re-submitting could accumulate the batch's gradients or apply the Adam
       step twice. Expiry raises cleanly, aborting the step with state intact
       (the loop's save_state cadence bounds what a resume loses).
-    - `save_state`, `load_state`, and `save_weights_for_sampler` ARE safe to
-      retry once: they read or restore state that does not change between
-      the attempts, and each save retry uses a fresh artifact name so a
-      first attempt that completed server-side after being abandoned can
-      never collide.
+    - `save_state` and `save_weights_for_sampler` ARE safe to retry once:
+      they read state that does not change between the attempts, and each
+      save retry uses a fresh artifact name so a first attempt that completed
+      server-side after being abandoned can never collide.
+    - `load_state` is NOT retryable on the same client, and must be its FIRST
+      call: tinker accepts LoadWeights only on an uninitialized model, and an
+      abandoned request keeps running server-side. A live resume proved it,
+      dying with "LoadWeights can only be called on uninitialized models"
+      when the retry followed a restore the client had given up waiting for.
+      Expiry raises, and the retry belongs on a freshly created (still
+      uninitialized) client, which is what `_DistillRun._open_training_client`
+      does. `get_tokenizer` stays legal before a restore: the SDK answers it
+      from a metadata-only GetInfo request that never touches weights.
     """
 
     def __init__(self, client: tinker.TrainingClient) -> None:
         self._client = client
         self._session = uuid4().hex[:8]
         self._save_counter = 0
+        self._initialized = False
+        """Whether a call that initializes the model server-side has been issued."""
 
     def get_tokenizer(self) -> EncodingTokenizer:
-        """The student base model's HF tokenizer (deadline-bounded fetch)."""
+        """The student base model's HF tokenizer (deadline-bounded fetch).
+
+        Metadata only (the SDK resolves it through GetInfo), so it never
+        initializes the model and stays legal before `load_state`.
+        """
         return cast("EncodingTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
 
     def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> TrainStepOutput:
@@ -723,6 +740,7 @@ class SdkTrainingClient:
             if loss_fn == CROSS_ENTROPY_LOSS
             else to_tinker_datums(datums)
         )
+        self._initialized = True
         future = self._client.forward_backward(converted, cast("tinker_types.LossFnType", loss_fn))
         output = wait_with_deadline("forward_backward", future)
         return TrainStepOutput(loss=sdk_metric_value(output.metrics, SDK_LOSS_METRIC_NAMES))
@@ -742,6 +760,7 @@ class SdkTrainingClient:
         """
         from tinker import types
 
+        self._initialized = True
         response = wait_with_deadline(
             "optim_step", self._client.optim_step(types.AdamParams(learning_rate=learning_rate))
         )
@@ -766,19 +785,36 @@ class SdkTrainingClient:
     def _save_state_once(self) -> str:
         name = f"wmh-distill-{self._session}-state-{self._save_counter:04d}"
         self._save_counter += 1
+        self._initialized = True
         return wait_with_deadline("save_state", self._client.save_state(name)).path
 
     def load_state(self, path: str) -> None:
-        """Restore training state from a tinker:// state path.
+        """Restore training state from a tinker:// state path, first of all calls.
 
-        Retried once on a deadline expiry: restoring the same immutable
-        snapshot is idempotent.
+        Never retried on this client: tinker accepts LoadWeights only on an
+        uninitialized model and an abandoned request keeps running
+        server-side, so a second attempt here is the live
+        "LoadWeights can only be called on uninitialized models" failure. The
+        deadline (`WMH_TINKER_DEADLINE_LOAD_STATE`) is the whole budget, and
+        the caller retries on a fresh client.
+
+        Args:
+            path: The tinker:// state path to restore.
+
+        Raises:
+            RuntimeError: If a call that initializes the model already ran on
+                this client, so the service could only reject the restore.
+            TinkerDeadlineError: If the restore blows its deadline.
         """
-        try:
-            wait_with_deadline("load_state", self._client.load_state(path))
-        except TinkerDeadlineError as exc:
-            logger.warning("retrying load_state once with a fresh request: %s", exc)
-            wait_with_deadline("load_state", self._client.load_state(path))
+        if self._initialized:
+            raise RuntimeError(
+                "load_state must be the first call on a tinker training client: the "
+                "service accepts LoadWeights only on an uninitialized model, and this "
+                "client already issued a weights call. Create a fresh training client "
+                f"and restore {path} before anything else touches it"
+            )
+        self._initialized = True
+        wait_with_deadline("load_state", self._client.load_state(path))
 
     def save_weights_for_sampler(self, name: str) -> str:
         """Save sampler weights, returning the tinker:// sampler path.
@@ -795,6 +831,7 @@ class SdkTrainingClient:
             return self._save_weights_once(f"{name}-{self._session}-r1")
 
     def _save_weights_once(self, full_name: str) -> str:
+        self._initialized = True
         future = self._client.save_weights_for_sampler(full_name)
         return wait_with_deadline("save_weights_for_sampler", future).path
 
@@ -1417,11 +1454,14 @@ class _DistillRun:
         raise DistillEmptyBatchError(
             f"aborting after {self._empty_step_streak} consecutive training steps in "
             "which every trial produced zero token spans (0 trainable datums): the "
-            "student provider is producing no completions, so training cannot make "
-            "progress. The likely cause is provider or session failures upstream in "
-            "the rollout trials (see the runner logs for worker completion warnings). "
-            f"Run artifacts were persisted (checkpoint at step {step}), so once the "
-            f"provider is healthy resume with: {command}",
+            "trials are producing no completions, so training cannot make progress. "
+            "Two causes account for nearly all of these: provider or session failures "
+            "upstream in the rollout trials (see the runner logs for worker completion "
+            "warnings), or, with harbor.backend = 'e2b', trials dying at sandbox "
+            "creation because the E2B account is at its concurrent-sandbox cap (run "
+            "`wmh e2b reap` to see what is holding the slots). Run artifacts were "
+            f"persisted (checkpoint at step {step}), so once the cause is fixed resume "
+            f"with: {command}",
             resume_command=command,
             consecutive_steps=self._empty_step_streak,
         )
@@ -2233,6 +2273,50 @@ class _DistillRun:
 
     # -- execution -------------------------------------------------------------------------------
 
+    def _open_training_client(self, restore_path: str | None) -> DistillTrainingClient:
+        """Create the student's training client, restoring state as its first call.
+
+        Tinker accepts LoadWeights only on an uninitialized model, so on
+        resume `load_state` must run before ANYTHING else touches the client:
+        a sampler-weights save, a forward pass, or a preflight sample would
+        make the restore impossible and silently lose every trained step. For
+        the same reason a deadline expiry cannot be retried on the same
+        client, since the abandoned request may have initialized it
+        server-side (a live resume died exactly that way); the retry opens a
+        fresh, still-uninitialized client instead.
+
+        Args:
+            restore_path: The tinker:// state path to restore, or None for a
+                fresh run, which starts from the base model with no restore.
+
+        Returns:
+            The training client, with `restore_path` already loaded when one
+            was given.
+
+        Raises:
+            TinkerDeadlineError: If both restore attempts blow their deadline.
+        """
+        cfg = self._cfg
+        client = self._service.create_lora_training_client(
+            cfg.student.base_model, cfg.student.lora_rank
+        )
+        if restore_path is None:
+            return client
+        try:
+            client.load_state(restore_path)
+        except TinkerDeadlineError as exc:
+            logger.warning(
+                "load_state timed out; retrying on a FRESH training client, because the "
+                "abandoned request may have initialized this one (tinker then refuses "
+                "LoadWeights): %s",
+                exc,
+            )
+            client = self._service.create_lora_training_client(
+                cfg.student.base_model, cfg.student.lora_rank
+            )
+            client.load_state(restore_path)
+        return client
+
     def execute(self, *, resume: bool) -> DistillResult:
         """Run (or resume) the whole distillation to a gate verdict."""
         cfg = self._cfg
@@ -2274,9 +2358,7 @@ class _DistillRun:
         # documented budget-abort recovery is editing budget.max_usd and resuming).
         store.snapshot_config(cfg)
 
-        self._training = self._service.create_lora_training_client(
-            cfg.student.base_model, cfg.student.lora_rank
-        )
+        restore_path: str | None = None
         if latest is not None:
             logger.info(
                 "resuming %s from checkpoint step %d (%s)",
@@ -2284,7 +2366,7 @@ class _DistillRun:
                 latest.step,
                 latest.state_path,
             )
-            self._training.load_state(latest.state_path)
+            restore_path = latest.state_path
         elif warmup_record is not None and warmup_record.state_path is not None:
             # Warmup finished but no OPD step was checkpointed yet: without
             # this restore, a resumed session would start OPD from the COLD
@@ -2294,7 +2376,12 @@ class _DistillRun:
                 self._name,
                 warmup_record.state_path,
             )
-            self._training.load_state(warmup_record.state_path)
+            restore_path = warmup_record.state_path
+        # The restore is part of opening the client because it must be its
+        # FIRST call (see _open_training_client): the teacher client, the
+        # student sampler refresh, and preflight all come after, so preflight
+        # validates the RESTORED weights rather than the bare base model.
+        self._training = self._open_training_client(restore_path)
         self._teacher_client = self._service.create_sampling_client(self._teacher_identity)
         self._teacher = TinkerTeacher(cfg.teacher, sampling_client=self._teacher_client)
         self._sampler = StudentSampler(self._service, self._training, self._name)

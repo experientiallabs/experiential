@@ -156,11 +156,30 @@ def _fake_datum(datum: TrainDatum) -> FakeDatum:
 
 
 class _Training:
-    """`DistillTrainingClient` shim converting loop datums to `FakeDatum`s."""
+    """`DistillTrainingClient` shim converting loop datums to `FakeDatum`s.
 
-    def __init__(self, inner: FakeTrainingClient) -> None:
+    Args:
+        inner: The fake client doing the work; its `calls` list is the
+            per-client ordered call log.
+        events: The owning `_Service`'s cross-client event log, appended to on
+            `load_state` so tests can assert nothing (a sampling client, a
+            second training client) came between creation and the restore.
+        wedge_load_state: Mirror the live pathology: `load_state` reaches the
+            service (initializing the model) and then blows its deadline
+            client-side, so a retry on THIS client can only be rejected.
+    """
+
+    def __init__(
+        self,
+        inner: FakeTrainingClient,
+        events: list[str],
+        *,
+        wedge_load_state: bool = False,
+    ) -> None:
         self.inner = inner
         self.load_state_calls: list[str] = []
+        self._events = events
+        self._wedge_load_state = wedge_load_state
 
     def get_tokenizer(self) -> FakeTokenizer:
         return self.inner.get_tokenizer()
@@ -182,7 +201,10 @@ class _Training:
 
     def load_state(self, path: str) -> None:
         self.load_state_calls.append(path)
+        self._events.append("load_state")
         self.inner.load_state(path)
+        if self._wedge_load_state:
+            raise TinkerDeadlineError("load_state", elapsed_s=600.0, deadline_s=600.0)
 
     def save_weights_for_sampler(self, name: str) -> str:
         return self.inner.save_weights_for_sampler(name)
@@ -191,21 +213,40 @@ class _Training:
 class _Service:
     """`DistillServiceClient` over the fakes.
 
-    The training client is memoized so its saved states and registered
-    sampler paths survive across a budget abort and the resumed session, the
-    way real tinker:// artifacts do.
+    Every call builds a FRESH training client, exactly like the real service
+    (one new server-side model per session): saved states and registered
+    sampler paths live on the shared `FakeServiceClient`, so the artifacts a
+    prior session wrote outlive its client the way real tinker:// paths do,
+    and a resumed session's client starts uninitialized (the only state in
+    which tinker accepts `load_state`).
     """
 
     def __init__(self) -> None:
         self.inner = FakeServiceClient()
-        self.training: _Training | None = None
+        self.trainings: list[_Training] = []
+        self.events: list[str] = []
+        """Ordered log of client creations and restores across every session."""
+
+        self.wedged_load_state_clients = 0
+        """The first N training clients blow their load_state deadline."""
 
     def create_lora_training_client(self, base_model: str, rank: int = 32) -> _Training:
-        if self.training is None:
-            self.training = _Training(self.inner.create_lora_training_client(base_model, rank))
-        return self.training
+        training = _Training(
+            self.inner.create_lora_training_client(base_model, rank),
+            self.events,
+            wedge_load_state=len(self.trainings) < self.wedged_load_state_clients,
+        )
+        self.events.append("create_training_client")
+        self.trainings.append(training)
+        return training
+
+    @property
+    def training(self) -> _Training | None:
+        """The most recently created training client (None before the first)."""
+        return self.trainings[-1] if self.trainings else None
 
     def create_sampling_client(self, model_path: str) -> DistillSamplingClient:
+        self.events.append("create_sampling_client")
         return self.inner.create_sampling_client(model_path)
 
 
@@ -464,9 +505,13 @@ def _eval_run_counts(env: _Env) -> dict[str, int]:
 
 
 def _loss_fns(env: _Env) -> list[str]:
-    training = env.service.training
-    assert training is not None
-    return [loss for _, loss in training.inner.forward_backward_calls]
+    """Every trained batch's loss across every session's training client, in order."""
+    assert env.service.trainings
+    return [
+        loss
+        for training in env.service.trainings
+        for _, loss in training.inner.forward_backward_calls
+    ]
 
 
 def _run(
@@ -1099,10 +1144,9 @@ def test_budget_abort_persists_state_and_the_resume_command(
     latest = store.latest_checkpoint()
     assert latest is not None
     assert latest.step == 0
-    # The checkpointed state is real: the fake training client can restore it.
-    training = env.service.training
-    assert training is not None
-    training.inner.load_state(latest.state_path)
+    # The checkpointed state is real: a fresh training client can restore it
+    # (the only client the live service would accept a restore on).
+    env.service.create_lora_training_client(_STUDENT).load_state(latest.state_path)
     # The run never reached the gate.
     assert not store.gate_path.exists()
 
@@ -1181,6 +1225,9 @@ def test_two_consecutive_all_empty_steps_abort_with_the_resume_command(
     assert expected_command in str(error)
     assert "no completions" in str(error)
     assert "runner logs" in str(error)
+    # Both plausible causes are named, including the E2B concurrency cap that reads as a
+    # model bug when trials silently die at sandbox creation.
+    assert "wmh e2b reap" in str(error)
     # Exactly two empty train batches ran: the abort fired at the second,
     # before a third batch could spend more on span-less rollouts.
     train_steps = [call.step_index for call in env.rollouts.calls if call.run_dir == env.run_dir]
@@ -1261,6 +1308,103 @@ def test_resume_continues_the_step_count_and_reuses_baselines(
     assert result.spend.prior_usd > 0.0
     for row in store.read_metrics()[1:]:
         assert _number(row, "cumulative_usd") > result.spend.prior_usd
+
+
+def test_resume_loads_state_as_the_first_call_on_a_fresh_training_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tinker accepts LoadWeights only on an uninitialized model.
+
+    Anything on the training client before the restore (a sampler-weights
+    save, a forward_backward, a sampling client derived from it) makes the
+    resume impossible: the live service answers "LoadWeights can only be
+    called on uninitialized models" and the run dies having lost every
+    trained step. Preflight therefore runs AFTER the restore, which is also
+    more correct: it validates the resumed weights, not the bare base model.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    with pytest.raises(DistillBudgetError):
+        _run(env, _train_priced_cfg(budget_max=1.0))
+    store = DistillRunStore(env.run_dir)
+    latest = store.latest_checkpoint()
+    assert latest is not None
+    clients_before = len(env.service.trainings)
+    events_before = len(env.service.events)
+    progress_before = len(env.progress)
+
+    result = _run(env, _cfg(), resume=True)
+
+    assert result.steps_completed == 3
+    resumed = env.service.trainings[clients_before]
+    assert resumed.load_state_calls == [latest.state_path]
+    # The restore is the client's FIRST call, and the sampler refresh (the
+    # first weights save, which would have closed the door) comes after it.
+    assert resumed.inner.calls[:2] == ["load_state", "save_weights_for_sampler"]
+    # Nothing went through the SERVICE first either: neither the teacher nor
+    # the student sampling client was created before the restore.
+    assert env.service.events[events_before : events_before + 2] == [
+        "create_training_client",
+        "load_state",
+    ]
+    # Preflight still gated the resumed session before any spend, and it ran
+    # on the restored weights (after load_state, per the call log above).
+    phases = [progress.phase for progress in env.progress[progress_before:]]
+    assert phases[0] == "preflight"
+    assert phases.index("preflight") < phases.index("training")
+
+
+def test_resume_retries_a_timed_out_load_state_on_a_fresh_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restore abandoned at its deadline may have initialized the model.
+
+    That is what killed three live resumes: the adapter re-issued load_state
+    on the same client and the service rejected it. The retry must open a
+    fresh, still-uninitialized client instead.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    with pytest.raises(DistillBudgetError):
+        _run(env, _train_priced_cfg(budget_max=1.0))
+    store = DistillRunStore(env.run_dir)
+    latest = store.latest_checkpoint()
+    assert latest is not None
+    clients_before = len(env.service.trainings)
+    env.service.wedged_load_state_clients = clients_before + 1  # only the next one wedges
+
+    result = _run(env, _cfg(), resume=True)
+
+    assert result.steps_completed == 3
+    wedged, retried = env.service.trainings[clients_before : clients_before + 2]
+    assert wedged.load_state_calls == [latest.state_path]
+    assert retried.load_state_calls == [latest.state_path]
+    assert retried.inner.calls[0] == "load_state"
+    # The wedged client was abandoned, not trained on.
+    assert wedged.inner.forward_backward_calls == []
+    assert retried.inner.forward_backward_calls != []
+
+
+def test_fresh_run_never_loads_state_and_preflights_before_the_first_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fresh path is unchanged: no restore at all, preflight before spend."""
+    env = _setup(tmp_path, monkeypatch)
+
+    result = _run(env, _cfg())
+
+    assert result.steps_completed == 3
+    training = env.service.training
+    assert training is not None
+    assert training.load_state_calls == []
+    assert "load_state" not in training.inner.calls
+    assert "load_state" not in env.service.events
+    assert env.service.events[0] == "create_training_client"
+    # Preflight came first: its progress events precede every baseline and
+    # training event, and its tokenizer fetch precedes the first trained batch.
+    phases = [progress.phase for progress in env.progress]
+    assert phases[0] == "preflight"
+    assert phases.index("preflight") < phases.index("baseline") < phases.index("training")
+    calls = training.inner.calls
+    assert calls.index("get_tokenizer") < calls.index("forward_backward")
 
 
 def test_resume_restores_spend_charged_between_metrics_rows(
@@ -1998,7 +2142,39 @@ class _WedgedOnceTrainingClient:
         return _ReadyFuture(_SavedArtifact(path=f"tinker://fake/sampler/{name}"))
 
 
-def _sdk_training_client(fake: _WedgedOnceTrainingClient) -> SdkTrainingClient:
+class _ReadyStateTrainingClient:
+    """Fake tinker.TrainingClient whose state and weights futures resolve at once.
+
+    The counterpart to `_WedgedOnceTrainingClient`: nothing wedges here, so
+    tests can drive real call SEQUENCES through the adapter.
+    """
+
+    def __init__(self) -> None:
+        self.save_state_names: list[str] = []
+        self.load_state_paths: list[str] = []
+        self.save_weights_names: list[str] = []
+        self.tokenizer_calls = 0
+
+    def get_tokenizer(self) -> FakeTokenizer:
+        self.tokenizer_calls += 1
+        return FakeTokenizer()
+
+    def save_state(self, name: str) -> _ReadyFuture:
+        self.save_state_names.append(name)
+        return _ReadyFuture(_SavedArtifact(path=f"tinker://fake/state/{name}"))
+
+    def load_state(self, path: str) -> _ReadyFuture:
+        self.load_state_paths.append(path)
+        return _ReadyFuture()
+
+    def save_weights_for_sampler(self, name: str) -> _ReadyFuture:
+        self.save_weights_names.append(name)
+        return _ReadyFuture(_SavedArtifact(path=f"tinker://fake/sampler/{name}"))
+
+
+def _sdk_training_client(
+    fake: _WedgedOnceTrainingClient | _ReadyStateTrainingClient,
+) -> SdkTrainingClient:
     return SdkTrainingClient(cast("tinker.TrainingClient", fake))
 
 
@@ -2047,14 +2223,64 @@ def test_save_state_retries_once_with_a_fresh_name(monkeypatch: pytest.MonkeyPat
     assert path == f"tinker://fake/state/{second}"
 
 
-def test_load_state_retries_once(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_state_deadline_aborts_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The live resume blocker: a retried load_state can only be rejected.
+
+    Tinker accepts LoadWeights only on an uninitialized model and the
+    abandoned first request keeps running server-side, so re-issuing it on the
+    same client raised "LoadWeights can only be called on uninitialized
+    models" and killed three resumes. Exactly one call now, and the retry
+    happens on a fresh client (see the _open_training_client tests).
+    """
     _short_deadlines(monkeypatch)
     fake = _WedgedOnceTrainingClient()
     client = _sdk_training_client(fake)
 
+    with pytest.raises(TinkerDeadlineError, match="tinker load_state timed out"):
+        client.load_state("tinker://fake/state/x")
+    assert fake.load_state_paths == ["tinker://fake/state/x"]
+
+
+def test_load_state_after_an_initializing_call_is_refused() -> None:
+    """The adapter fails fast instead of spending a request the service rejects.
+
+    Every call that initializes the model server-side closes the door on
+    LoadWeights, so a sampler save, a state save, or an earlier restore each
+    make the next load_state a local error naming the fix.
+    """
+    after_weights = _ReadyStateTrainingClient()
+    client = _sdk_training_client(after_weights)
+    client.save_weights_for_sampler("s0")
+    with pytest.raises(RuntimeError, match="load_state must be the first call"):
+        client.load_state("tinker://fake/state/x")
+
+    after_save = _ReadyStateTrainingClient()
+    client = _sdk_training_client(after_save)
+    client.save_state()
+    with pytest.raises(RuntimeError, match="load_state must be the first call"):
+        client.load_state("tinker://fake/state/x")
+
+    after_restore = _ReadyStateTrainingClient()
+    client = _sdk_training_client(after_restore)
+    client.load_state("tinker://fake/state/first")
+    with pytest.raises(RuntimeError, match="load_state must be the first call"):
+        client.load_state("tinker://fake/state/x")
+
+    # No refused restore reached the service.
+    assert after_weights.load_state_paths == []
+    assert after_save.load_state_paths == []
+    assert after_restore.load_state_paths == ["tinker://fake/state/first"]
+
+
+def test_get_tokenizer_stays_legal_before_a_restore() -> None:
+    """The tokenizer is metadata (SDK GetInfo), so it never blocks LoadWeights."""
+    fake = _ReadyStateTrainingClient()
+    client = _sdk_training_client(fake)
+
+    client.get_tokenizer()
     client.load_state("tinker://fake/state/x")
 
-    assert fake.load_state_paths == ["tinker://fake/state/x"] * 2
+    assert fake.load_state_paths == ["tinker://fake/state/x"]
 
 
 def _attached_datum() -> TrainDatum:
