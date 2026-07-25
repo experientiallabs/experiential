@@ -89,6 +89,64 @@ class PromptLogprobError(RuntimeError):
     """
 
 
+PLACEHOLDER_ZERO_FRACTION = 0.9
+"""Fraction of exactly-0.0 scored positions above which a row is placeholder junk.
+
+Fireworks' serverless echo has a measured silent-corruption mode: 26 to 38% of
+requests return all-zero `token_logprobs` (with a junk one-entry `top_logprobs`
+of `{"!": 0.0}`) and HTTP 200, and one 12k-token response came back partly real
+and partly placeholder. Nothing in the response marks it, so an unchecked
+consumer trains on zeros: every chunk's teacher sum becomes 0.0 and its
+advantage becomes `-student_logprob`, which is not a KL signal at all.
+
+Real logprobs are never all exactly 0.0 over a long span, though INDIVIDUAL
+positions legitimately are (a near-certain continuation returns -0.0, observed
+on digits inside an equation), so the test is a high fraction rather than any
+occurrence. Pinning `x-session-affinity` is NOT the fix: it locked onto a bad
+replica 16 times out of 16. Detect and retry instead.
+"""
+
+_MIN_POSITIONS_FOR_PLACEHOLDER_CHECK = 8
+"""Below this many scored positions, an all-zero row is not distinguishable
+from a genuinely deterministic short span, so it is allowed through."""
+
+
+class PromptLogprobPlaceholderError(PromptLogprobError):
+    """The endpoint returned a placeholder all-zero row instead of real logprobs.
+
+    Retryable on purpose: the corruption is per-replica, so another attempt
+    usually lands on a healthy one.
+    """
+
+
+def _reject_placeholder_row(row: list[float | None], url: str) -> None:
+    """Raise when a scored row looks like the all-zero placeholder.
+
+    Args:
+        row: The per-position row, position 0 already None.
+        url: Endpoint, for the error message.
+
+    Raises:
+        PromptLogprobPlaceholderError: If nearly every scored position is
+            exactly 0.0.
+    """
+    scored = [value for value in row[1:] if value is not None]
+    if len(scored) < _MIN_POSITIONS_FOR_PLACEHOLDER_CHECK:
+        return
+    zeros = sum(1 for value in scored if value == 0.0)
+    fraction = zeros / len(scored)
+    if fraction < PLACEHOLDER_ZERO_FRACTION:
+        return
+    raise PromptLogprobPlaceholderError(
+        f"teacher scoring from {url} returned {zeros} of {len(scored)} scored positions "
+        f"as exactly 0.0 ({fraction:.0%}), which is the known placeholder response rather "
+        "than real logprobs. This is a per-replica fault that HTTP 200 hides, so it is "
+        "retried; if it persists, the endpoint is serving corrupt echo responses and the "
+        "run must stop rather than train on zeros (do NOT pin session affinity, which "
+        "locks onto the bad replica)"
+    )
+
+
 class PromptLogprobTimeoutError(PromptLogprobError, TimeoutError):
     """A teacher scoring request blew its wall-clock deadline.
 
@@ -278,10 +336,13 @@ class PromptLogprobClient:
         self._max_attempts = max_attempts
         self._sleep = sleep
         self._usage_tokens = 0
+        self._placeholder_responses = 0
         self._usage_lock = threading.Lock()
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        self._headers = headers
+        self._transport = transport
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout_s),
             transport=transport,
@@ -368,15 +429,65 @@ class PromptLogprobClient:
         self.close()
 
     def _score(self, token_ids: list[int], *, count_usage: bool) -> list[float | None]:
+        """Score once, retrying the placeholder-response fault.
+
+        The placeholder check can only run after the body is parsed, so it gets
+        its own attempt loop rather than riding `_post`'s: the request succeeded
+        at the HTTP level and only its CONTENT is unusable.
+        """
         if self._dialect == "echo":
             body = _EchoRequest(model=self._model, prompt=token_ids).model_dump()
         else:
             body = _CompletionsRequest(model=self._model, prompt=token_ids).model_dump()
-        response = self._post(body, token_count=len(token_ids) if count_usage else 0)
-        if self._dialect == "echo":
-            return self._echo_row(response, token_ids)
-        rows = self._prompt_logprob_rows(response, expected=len(token_ids))
-        return self._realized_row(rows, token_ids)
+        last: PromptLogprobPlaceholderError | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            response = self._post(body, token_count=len(token_ids) if count_usage else 0)
+            try:
+                if self._dialect == "echo":
+                    return self._echo_row(response, token_ids)
+                rows = self._prompt_logprob_rows(response, expected=len(token_ids))
+                return self._realized_row(rows, token_ids)
+            except PromptLogprobPlaceholderError as exc:
+                last = exc
+                self._placeholder_responses += 1
+                if attempt < self._max_attempts:
+                    # A pooled keep-alive connection is implicit replica
+                    # affinity: every retry down the same socket reaches the
+                    # same (bad) replica, which is why 4 of 4 attempts came
+                    # back identically corrupt in the first live run. Drop the
+                    # pool so the retry reconnects and can land elsewhere.
+                    self._reconnect()
+                    logger.warning(
+                        "teacher returned a placeholder all-zero row (attempt %d/%d); "
+                        "reconnecting so the retry can reach a different replica",
+                        attempt,
+                        self._max_attempts,
+                    )
+        assert last is not None  # noqa: S101 - only reachable after a placeholder raise
+        raise last
+
+    def _reconnect(self) -> None:
+        """Rebuild the connection pool so the next request opens a fresh socket.
+
+        The transport is preserved when one was injected (tests pass a
+        `MockTransport`), so this is a no-op there beyond the pool swap.
+        """
+        with self._usage_lock:
+            old = self._client
+            self._client = httpx.Client(
+                timeout=httpx.Timeout(self._timeout_s),
+                transport=self._transport,
+                headers=self._headers,
+            )
+        old.close()
+
+    def placeholder_responses(self) -> int:
+        """How many placeholder all-zero rows this client has seen and retried.
+
+        Worth logging per step: a rising rate means the endpoint is degrading,
+        and the measured baseline is 26 to 38% of requests.
+        """
+        return self._placeholder_responses
 
     def _echo_row(self, response: _CompletionsResponse, token_ids: list[int]) -> list[float | None]:
         """Per-position logprobs from the legacy `echo` response shape.
@@ -427,6 +538,7 @@ class PromptLogprobClient:
         row: list[float | None] = list(values)
         # Position 0 has no context; Fireworks reports 0.0 rather than null.
         row[0] = None
+        _reject_placeholder_row(row, self._url)
         return row
 
     def _post(self, body: dict[str, object], *, token_count: int) -> _CompletionsResponse:

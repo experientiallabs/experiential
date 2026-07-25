@@ -284,3 +284,63 @@ def test_endpoint_without_v1_suffix_gets_one() -> None:
 def test_blank_endpoint_is_rejected() -> None:
     with pytest.raises(ValueError, match="endpoint URL"):
         PromptLogprobClient("   ", MODEL)
+
+
+def test_placeholder_all_zero_row_is_retried_then_succeeds() -> None:
+    # Fireworks' measured silent-corruption mode: HTTP 200 with every scored
+    # position exactly 0.0. Training on that would replace the KL signal with
+    # -student_logprob, so it must never reach the caller.
+    ids = list(range(100, 116))
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(200, json=_echo_body(ids, [0.0] * len(ids)))
+        return httpx.Response(200, json=_echo_body(ids, [0.0] + [-1.5] * (len(ids) - 1)))
+
+    with _client(handler, max_attempts=3) as client:
+        row = client.score(ids)
+    assert calls["n"] == 2
+    assert row[1] == pytest.approx(-1.5)
+    assert client.placeholder_responses() == 1
+
+
+def test_persistent_placeholder_rows_raise_rather_than_return_zeros() -> None:
+    ids = list(range(100, 116))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_echo_body(ids, [0.0] * len(ids)))
+
+    with (
+        _client(handler, max_attempts=2) as client,
+        pytest.raises(PromptLogprobError, match="placeholder"),
+    ):
+        client.score(ids)
+
+
+def test_genuinely_deterministic_positions_are_not_flagged() -> None:
+    # A near-certain continuation legitimately returns -0.0 (observed on digits
+    # inside an equation), so isolated zeros must pass.
+    ids = list(range(100, 116))
+    values: list[float | None] = [0.0, -0.0, -0.0, -3.2] + [-1.1] * (len(ids) - 4)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_echo_body(ids, values))
+
+    with _client(handler) as client:
+        row = client.score(ids)
+    assert row[3] == pytest.approx(-3.2)
+    assert client.placeholder_responses() == 0
+
+
+def test_short_spans_are_exempt_from_the_placeholder_check() -> None:
+    # Too few positions to distinguish placeholder from determinism.
+    ids = [1, 2, 3]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_echo_body(ids, [0.0, 0.0, 0.0]))
+
+    with _client(handler) as client:
+        row = client.score(ids)
+    assert row[1] == 0.0

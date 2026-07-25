@@ -1,0 +1,17 @@
+wandb: Detected [openai] in use.
+wandb: Use W&B Weave for improved LLM call tracing. Install Weave with `pip install weave` then add `import weave` to the top of your script.
+wandb: For more information, check out the docs at: https://weave-docs.wandb.ai
+2026-07-24 18:26:11,563 WANDB RUN URL: https://wandb.ai/kfallah/wmh-distill/runs/wbl4ozzv
+Traceback (most recent call last):
+  File "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken/.agents/distill/xtoken_run.py", line 398, in <module>
+    main()
+  File "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken/.agents/distill/xtoken_run.py", line 139, in main
+    cfg = DistillConfig.model_validate(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken/.venv/lib/python3.12/site-packages/pydantic/main.py", line 732, in model_validate
+    return cls.__pydantic_validator__.validate_python(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+pydantic_core._pydantic_core.ValidationError: 1 validation error for DistillConfig
+sampling.max_tokens
+  Input should be greater than or equal to 1 [type=greater_than_equal, input_value=0, input_type=int]
+    For further information visit https://errors.pydantic.dev/2.13/v/greater_than_equal

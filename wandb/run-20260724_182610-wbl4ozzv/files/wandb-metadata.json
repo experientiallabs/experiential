@@ -1,0 +1,31 @@
+{
+  "os":  "macOS-26.5.2-arm64-arm-64bit",
+  "python":  "CPython 3.12.13",
+  "startedAt":  "2026-07-25T01:26:10.829876Z",
+  "args":  [
+    "--steps",
+    "6",
+    "--problems",
+    "4",
+    "--group",
+    "2",
+    "--concurrency",
+    "8",
+    "--out",
+    ".wmh/xtoken-runs/run2",
+    "--wandb-name",
+    "xtoken-glm52-qwen35-9b-run2-fullctx"
+  ],
+  "program":  "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken/.agents/distill/xtoken_run.py",
+  "codePath":  ".agents/distill/xtoken_run.py",
+  "codePathLocal":  ".agents/distill/xtoken_run.py",
+  "git":  {
+    "remote":  "git@github.com:experientiallabs/world-model-harness.git",
+    "commit":  "d4d8fc71cb51f3c38084e187f1d34972c35e9c71"
+  },
+  "email":  "kion@gatech.edu",
+  "root":  "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken",
+  "host":  "Goldenage.local",
+  "executable":  "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken/.venv/bin/python",
+  "writerId":  "zwqpfwq3mults52qkjz2sozwrw6ae5mw"
+}
