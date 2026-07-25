@@ -7,8 +7,8 @@ agree with reality? Rank agreement is the number the routing optimizer depends o
 - Corpus / real env: `packages/environment-capture/bird-sql` (BIRD mini-dev, real SQLite
   databases, deterministic execution-match grader).
 - Simulator: the committed `models/bird-sql` world model (1993 traces / 4168 steps captured from
-  the TRAIN split only). See "Deviations" for why this is used in place of a fresh `--limit 40`
-  build.
+  the TRAIN split only; serve `us.anthropic.claude-opus-4-7` on Bedrock, hashing embedder,
+  top_k 5). See "Deviations" for why this is used in place of a fresh `--limit 40` build.
 - Scenarios: 8 held-out TEST-split tasks, round-robin across the 4 test databases (`superhero`,
   `toxicology`, `student_club`, `california_schools`). Test tasks are new questions on databases
   the world model trained on, so the simulator must generalize, not replay.

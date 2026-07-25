@@ -387,6 +387,56 @@ question across five serving models × four benchmarks under one pinned judge, w
 reports. The archived reference run is rubric-v1 and reference-only; re-run before comparing
 against anything current.
 
+## Measuring the triple: the GEV benchmarks (#254)
+
+The pivot makes the world model do three jobs - GENERATE eval scenarios from traces, EXECUTE
+them closed-loop against a candidate model, VERIFY outcomes - and each job got its own
+empirical benchmark with a hand-labeled leg. These are **measurements of the triple's
+instruments, not fidelity numbers and not product accuracy claims**: none of them is
+`held_out_accuracy` (axis A) and none is verifier-scored task success on held-out scenarios
+(axis B). Detailed scorecards, per-episode rows, and labeling sheets ship with #254.
+
+**GENERATE** (tau-bench, first 100 committed traces, budget 15; facets/naming/synthesis and
+the back-agreement gate on `claude-opus-4-8` Bedrock us-east-1; solvability rollouts on the
+haiku-4.5-served `gev-tau` model, checklist grader opus-4-8; lexical HashingEmbedder):
+9/15 scenarios survived minting, corpus coverage 0.39 at tau 0.7, and **failure pinning
+inverted the corpus** - 14 distinct failure categories competing for 15 slots evicted nearly
+every success medoid, so an 86%-success corpus produced a 100%-failure eval set with two
+mid-size clusters at zero. Verify-time back-agreement is 9/9 but tautological (the build
+already gates on it; the honest number is the 6/15 build-time drop rate). A blind manual
+label over every scenario scored 7/9 precision on faithful+self-contained+judgeable+realistic
+and caught a policy-rule mutation the automated gates passed; `realistic` and `likely` were
+labeled separately, and all three unlikely scenarios were realistic - the rare-but-real tail
+a conflated rubric would have pruned.
+
+**EXECUTE** (bird-sql: real SQLite databases + deterministic execution-match grades; simulator
+= the committed train-split-only bird-sql model, serve `claude-opus-4-7` Bedrock; 8 held-out
+test-split scenarios x candidates {haiku-4.5, opus-4.8} x k=2 x {real, sim} = 64 episodes):
+**the sim picks the same winning candidate as reality** (real 0.81 vs 0.19, sim 0.69 vs 0.13;
+per-scenario rank agreement 0.75) and errs pessimistic (gap -0.06/-0.12), the safe direction.
+Its one systematic defect: the sim under-corrects weak candidates - haiku's submitted SQL
+referenced tables the real database does not have in 50% of sim episodes vs 19% of real ones
+(opus 0/0), because the real environment errors immediately where the simulator plays along.
+
+**VERIFY** (bird-sql, 40 trajectories balanced 20/20 by the deterministic grade, distinct base
+tasks; `GoldJudge` on `us.anthropic.claude-opus-4-8` Bedrock us-east-1, k=3 votes at
+temperature 0.7 - a stated deviation from the production temp-0.0 call, same prompt/parser):
+accuracy 0.80 with symmetric errors (false-pass = false-fail = 0.20). The calibration result
+is the important one: **vote agreement is not confidence** - 3/3-unanimous accuracy 0.806 vs
+2/3-split 0.778, and 6 of the 8 errors were unanimous. Hand attribution of all 8: 5 judge
+(mechanism: a transcript judge cannot execute SQL, so it is confidently blind to result-set
+equivalence), 1 under-specified gold, 1 wrong recorded label (the grader compares columns
+positionally), 1 ambiguous. The EXECUTE run independently reproduced the judge failure at
+scale (its judge leg failed all 64 episodes; root cause a verbatim-echo whitespace mismatch
+that fail-closes `GoldJudge`, compounding the execution blindness). Consequences, in order:
+GoldJudge needs whitespace-tolerant assertion matching (bug); execution-shaped corpora need
+the judge to see reference result rows or an execution tool (prerequisite, not optimization);
+abstention needs a native calibrated confidence field (the layer-5 pattern), not resampling.
+tau-bench is unusable as judge ground truth (986/1033 traces carry empty gold; its reward is
+a DB-state diff invisible to a transcript judge) - which is what customer corpora will look
+like, so mined checklists plus mint-time gates plus a standing manual leg are the production
+verify story.
+
 ## The through-line
 
 Each layer moved the binding constraint one step further out, and they converge on one
@@ -458,4 +508,10 @@ Layer 5  layer-1 ablation with composable modes base+conf, reason+conf, reason+c
 Layer 6  wmh research concurrency <suite> --side both --scenarios 16 --levels 1,2,4,8,16
          --select random --select-seed 1 (trials: tau 3 / terminal 2 / swe 1; swe auto-forces
          --cache-shared); figures via wmh research plot-concurrency-combined
+
+GEV      one shell command per scorecard; the runners (run_gen.sh / run_verify.sh /
+         run_exec.sh) ship with #254 alongside the scorecards, per-episode rows, and
+         labeling sheets. GEN chains wmh scenarios build -> wmh build -> verify -> metrics;
+         VERIFY and EXEC re-materialize the bird-sql databases via fetch_data.py first.
+         Judges: us.anthropic.claude-opus-4-8, Bedrock us-east-1 throughout.
 ```

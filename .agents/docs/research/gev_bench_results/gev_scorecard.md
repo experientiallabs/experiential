@@ -1,5 +1,13 @@
 # GEV benchmark: consolidated scorecard (2026-07-24)
 
+> **What these numbers are (and are not).** Every number here measures one step of the
+> world-model triple - scenario GENERATION quality, closed-loop EXECUTION realism, or
+> outcome-VERIFICATION (judge) quality. None of them is reconstruction fidelity
+> (`held_out_accuracy`, axis A) and none is a product accuracy claim (verifier-scored
+> task success on held-out scenarios, axis B); do not quote them as either. Judges:
+> `us.anthropic.claude-opus-4-8` (Bedrock us-east-1) throughout; per-bench corpora and
+> splits are stated inline and in each per-bench scorecard.
+
 One benchmark per step of the world-model triple, run empirically on real corpora with a
 manual (hand-labeled or hand-attributed) leg each. Design + principles:
 `.agents/docs/research/gev-benchmarks.md`. Per-bench detail: `gen/report.md`,
