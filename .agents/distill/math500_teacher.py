@@ -5,12 +5,17 @@ number has to come from the SAME extraction and normalization as the student's
 or the ratio is meaningless. This imports both from `math500_baseline` rather
 than restating them.
 
-Generation goes through Fireworks chat completions (the teacher only needs to
-generate here; teacher-forced scoring is a different route, see
-`wmh.distill.xtoken.prompt_logprobs`).
+Generation goes through a chat-completions endpoint. The teacher only needs to
+GENERATE here, so evals default to the Azure AI Foundry deployment, which
+proxies the same weights (its responses report
+`accounts/fireworks/models/glm-5p2`) and is a resource we can burn freely.
+Fireworks is reserved for TRAINING tokens, where its unique `echo` prompt-logprob
+surface is required (see `wmh.distill.xtoken.prompt_logprobs`); spending eval
+tokens there would eat the training budget for no benefit.
 
 Usage:
-    uv run python .agents/distill/math500_teacher.py --n 100
+    uv run python .agents/distill/math500_teacher.py --dataset aime --n 0
+    uv run python .agents/distill/math500_teacher.py --provider fireworks --n 10
 """
 
 from __future__ import annotations
@@ -35,12 +40,69 @@ from math500_baseline import (
 logger = logging.getLogger("math500-teacher")
 
 FIREWORKS_CHAT_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
-DEFAULT_MODEL = "accounts/fireworks/models/glm-5p2"
+FIREWORKS_MODEL = "accounts/fireworks/models/glm-5p2"
+
+PROVIDERS = ("azure", "fireworks")
+"""Where eval generation goes. `azure` is the default and is free to burn."""
+
+# Fireworks output price, used only to report what a fireworks-provider run cost
+# against the training budget.
+FIREWORKS_OUTPUT_USD_PER_MTOK = 4.40
+
+
+def resolve_provider(provider: str, model: str | None) -> tuple[str, str, dict[str, str]]:
+    """The (url, model, headers) for one provider, read from the environment.
+
+    Args:
+        provider: One of `PROVIDERS`.
+        model: Explicit model or deployment override; None uses the provider default.
+
+    Returns:
+        The chat-completions URL, the model id to send, and the auth headers.
+
+    Raises:
+        SystemExit: If the provider's credentials are absent, naming the env var.
+    """
+    if provider == "fireworks":
+        key = os.environ.get("FIREWORKS_API_KEY")
+        if not key:
+            raise SystemExit(
+                "FIREWORKS_API_KEY is not set; source platform/.env.local, or use the "
+                "default --provider azure so training budget is not spent on evals"
+            )
+        return (
+            FIREWORKS_CHAT_URL,
+            model or FIREWORKS_MODEL,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        )
+    endpoint = os.environ.get("AZURE_FOUNDRY_ENDPOINT")
+    key = os.environ.get("AZURE_FOUNDRY_API_KEY")
+    deployment = model or os.environ.get("AZURE_FOUNDRY_GLM52_DEPLOYMENT")
+    missing = [
+        name
+        for name, value in (
+            ("AZURE_FOUNDRY_ENDPOINT", endpoint),
+            ("AZURE_FOUNDRY_API_KEY", key),
+            ("AZURE_FOUNDRY_GLM52_DEPLOYMENT", deployment),
+        )
+        if not value
+    ]
+    if missing:
+        raise SystemExit(
+            f"{' and '.join(missing)} not set; source platform/.env.local before running"
+        )
+    assert endpoint is not None and key is not None and deployment is not None  # noqa: S101
+    return (
+        endpoint.rstrip("/") + "/chat/completions",
+        deployment,
+        {"Content-Type": "application/json", "api-key": key, "Authorization": f"Bearer {key}"},
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--provider", default="azure", choices=PROVIDERS)
+    parser.add_argument("--model", default=None, help="model/deployment override")
     parser.add_argument("--dataset", default="math500", choices=DATASETS)
     parser.add_argument("--n", type=int, default=100, help="0 means the whole set")
     parser.add_argument("--max-tokens", type=int, default=8192)
@@ -50,18 +112,15 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    key = os.environ.get("FIREWORKS_API_KEY")
-    if not key:
-        raise SystemExit(
-            "FIREWORKS_API_KEY is not set; source platform/.env.local before running"
-        )
+    url, model_id, headers = resolve_provider(args.provider, args.model)
+    logger.info("provider %s -> %s (model %s)", args.provider, url, model_id)
     problems = load_problems(args.n, args.dataset)
     logger.info("loaded %d %s problems", len(problems), args.dataset)
 
     def run(item: tuple[int, dict[str, str]]) -> dict[str, object]:
         index, row = item
         body = {
-            "model": args.model,
+            "model": model_id,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": row["problem"]},
@@ -70,9 +129,7 @@ def main() -> None:
             "temperature": args.temperature,
         }
         request = urllib.request.Request(
-            FIREWORKS_CHAT_URL,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            url, data=json.dumps(body).encode(), headers=headers
         )
         try:
             with urllib.request.urlopen(request, timeout=600) as response:
@@ -106,13 +163,20 @@ def main() -> None:
     standard_error = (correct / total * (1 - correct / total) / total) ** 0.5
 
     logger.info("")
-    logger.info("model:            %s", args.model)
+    logger.info("provider/model:   %s / %s", args.provider, model_id)
     logger.info("problems:         %d (temperature %.1f)", total, args.temperature)
     logger.info("pass@1:           %.1f%%  (SE %.1fpp)", 100 * correct / total, 100 * standard_error)
     logger.info("truncated:        %d", truncated)
     logger.info("no boxed answer:  %d", no_answer)
     logger.info("request errors:   %d", errors)
-    logger.info("output tokens:    %d  (approx $%.2f at $4.40/Mtok)", out_tokens, out_tokens * 4.4e-6)
+    if args.provider == "fireworks":
+        logger.info(
+            "output tokens:    %d  (approx $%.2f against the TRAINING budget)",
+            out_tokens,
+            out_tokens * FIREWORKS_OUTPUT_USD_PER_MTOK / 1e6,
+        )
+    else:
+        logger.info("output tokens:    %d  (azure, not billed to the training budget)", out_tokens)
 
     if args.out:
         Path(args.out).write_text(json.dumps(results, indent=1), encoding="utf-8")
