@@ -455,7 +455,12 @@ holds:
   judge-noise decomposition (re-judge one stored reply twice, ~450 calls/corpus) gates how much
   of the ceiling is real.
 
-Engineering blocker for this whole direction: `evaluate_choices` types `choose` as
-`Callable[[str], str]` - one model out - so cascades, best-of-n and aggregation cannot be scored
-through the shared evaluator at all until it returns a call SEQUENCE with accumulated cost and
-latency. Master owns that widening.
+The engineering blocker this survey flagged - `evaluate_choices` typing `choose` as
+`Callable[[str], str]`, one model out, so cascades and best-of-n could not be scored through the
+shared evaluator - is CLOSED as of 3a98e3b0: `evaluate_call_sequences` takes a policy over the
+transcript so far and returns either the next model or `Finish(pick=i)`, summing cost across
+calls. The k-th call to a model consumes its k-th stored episode, which is what makes best-of-2
+simulable from a 2-episode matrix. Note its documented information boundary: transcript entries
+expose `reward` and `critique`, so a policy that reads them is an ORACLE simulation (the ceiling
+row), not an achievable one. The free selector above deliberately reads only `stop_reason` and
+`steps`, which is why its numbers are achievable.

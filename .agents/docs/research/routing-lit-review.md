@@ -112,8 +112,10 @@ Silen named several papers from memory (voice-transcribed). Resolutions, with co
   fallback only.
 - Offline feasibility on our data: `ScenarioOutcome.replies` is populated on ~100% of rows
   (10,738/10,791 on ours9; 450/450 per wm corpus) and `critique` on ~90% of wm rows, so
-  the whole family simulates offline at zero API cost. Blocked only on the
-  `evaluate_choices` seam, which returns one model rather than a call sequence.
+  the whole family simulates offline at zero API cost. Score it through
+  `wmh.research.routing_runs.evaluate_call_sequences`, which takes a policy over the
+  transcript so far and sums cost across calls; reading `reward`/`critique` from that
+  transcript makes the run an oracle simulation rather than an achievable one.
 
 ### Reward / judge distillation (added 2026-07-24; untried)
 - Zooter 2311.08692 (149 cites, 15 influential, NAACL 2024, Alibaba Qwen team: Keming Lu,
