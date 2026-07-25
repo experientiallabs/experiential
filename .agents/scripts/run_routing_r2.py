@@ -234,8 +234,6 @@ def _oai_vectors(name: str, matrix: OutcomeMatrix) -> dict[str, np.ndarray] | No
                 continue
             sub = OutcomeMatrix.load(path)
             sids = sub.scenario_ids()
-            if len(sids) < MIN_SCENARIOS:
-                continue
             npy = cache / f"{corpus}-oai3l-tasks.npy"
             if not npy.exists():
                 return None

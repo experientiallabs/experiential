@@ -119,6 +119,57 @@ def _fit_stats(cells: dict) -> tuple[dict, dict]:
     return rewards, costs
 
 
+def _gain_targets(
+    matrix: OutcomeMatrix, fit_ids: list[str], cheap: str, strong: str
+) -> dict[EpisodeKey, float]:
+    """8d target per cheap fit episode: strong cell-mean reward minus this episode's reward."""
+    cells = _cells(matrix, set(fit_ids))
+    strong_mean = {
+        sid: _mean([o.reward for o in cells[(sid, strong)]])
+        for sid in fit_ids
+        if (sid, strong) in cells
+    }
+    out: dict[EpisodeKey, float] = {}
+    for sid in fit_ids:
+        for outcome in cells.get((sid, cheap), []):
+            if sid in strong_mean:
+                out[episode_key(outcome)] = strong_mean[sid] - outcome.reward
+    return out
+
+
+def _oof_gain_scores(
+    matrix: OutcomeMatrix,
+    fit_ids: list[str],
+    embeddings: dict[EpisodeKey, np.ndarray],
+    seed: int,
+    cheap: str,
+    strong: str,
+) -> tuple[dict[EpisodeKey, float], float]:
+    """OOF NEGATED predicted gains for cheap fit episodes + spearman-ish sanity corr."""
+    targets = _gain_targets(matrix, fit_ids, cheap, strong)
+    keyed = [(key, value) for key, value in targets.items() if key in embeddings]
+    scores: dict[EpisodeKey, float] = {}
+    for fold in scenario_folds(fit_ids, FOLDS, seed):
+        fold_set = set(fold)
+        train = [(k, v) for k, v in keyed if k[0] not in fold_set]
+        held = [(k, v) for k, v in keyed if k[0] in fold_set]
+        if not train or not held:
+            continue
+        features = np.asarray([embeddings[k] for k, _v in train])
+        verifier = fit_absolute(
+            features, np.asarray([v for _k, v in train], dtype=float), alpha=ALPHA
+        )
+        held_features = np.asarray([embeddings[k] for k, _v in held])
+        for (key, _v), score in zip(held, verifier.score(held_features), strict=True):
+            scores[key] = -float(score)  # NEGATED: low score = high gain = escalate
+    predicted = np.asarray([-scores[k] for k, _v in keyed if k in scores])
+    actual = np.asarray([v for k, v in keyed if k in scores])
+    corr = 0.0
+    if len(predicted) > 2 and predicted.std() > 0 and actual.std() > 0:
+        corr = float(np.corrcoef(predicted, actual)[0, 1])
+    return scores, corr
+
+
 def _oof_scores(
     matrix: OutcomeMatrix,
     fit_ids: list[str],
@@ -186,8 +237,7 @@ def _select(
 
     rng = np.random.default_rng(0)
     resamples = [
-        [fit_ids[i] for i in rng.integers(0, len(fit_ids), size=len(fit_ids))]
-        for _ in range(200)
+        [fit_ids[i] for i in rng.integers(0, len(fit_ids), size=len(fit_ids))] for _ in range(200)
     ]
 
     best = None
@@ -311,25 +361,36 @@ def run_matrix(name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle_onl
             "1x arm scored via evaluate_choices (order-independence)",
         )
 
-        arms: list[tuple[str, dict[EpisodeKey, float] | None, bool]] = [
-            ("r2-oracle-cascade", None, False)
+        arms: list[tuple[str, dict[EpisodeKey, float] | None, str]] = [
+            ("r2-oracle-cascade", None, "oracle")
         ]
         if not oracle_only:
-            arms.append(("r2-cascade", _oof_scores(matrix, fit_ids, embeddings, seed), False))
+            arms.append(("r2-cascade", _oof_scores(matrix, fit_ids, embeddings, seed), "absolute"))
+            arms.append(("r2-cascade-gain", None, "gain"))  # scorer built after pair known
             if seed == 0:
                 arms.append(
                     (
                         "r2-cascade-shuffled",
                         _oof_scores(matrix, fit_ids, embeddings, seed, shuffle=True),
-                        True,
+                        "shuffled",
                     )
                 )
 
         oracle_pair: tuple[str, str] | None = None
-        for variant, scorer, shuffled in arms:
+        gain_corr = 0.0
+        for variant, scorer, mode in arms:
+            if mode == "gain":
+                if oracle_pair is None:
+                    continue
+                scorer, gain_corr = _oof_gain_scores(
+                    matrix, fit_ids, embeddings, seed, *oracle_pair
+                )
             chosen = _select(
-                matrix, fit_ids, best_name, scorer=scorer,
-                fixed_pair=oracle_pair if scorer is not None else None,
+                matrix,
+                fit_ids,
+                best_name,
+                scorer=scorer,
+                fixed_pair=oracle_pair if mode != "oracle" else None,
             )
             if chosen is None:
                 record(
@@ -340,10 +401,10 @@ def run_matrix(name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle_onl
                 )
                 continue
             cheap, strong, threshold, fit_acc, fit_cost = chosen
-            if scorer is None:
+            if mode == "oracle":
                 oracle_pair = (cheap, strong)  # fit-label pair choice, reused by real arms
 
-            if scorer is None:
+            if mode == "oracle":
 
                 def decide(
                     sid: str,
@@ -361,16 +422,22 @@ def run_matrix(name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle_onl
             else:
                 # Deployable: retrain on the FULL fit split, score the consumed episode.
                 fit_set = set(fit_ids)
-                train = [
-                    o
-                    for o in matrix.outcomes
-                    if o.scenario_id in fit_set
-                    and o.reward is not None
-                    and episode_key(o) in embeddings
-                ]
-                features = np.asarray([embeddings[episode_key(o)] for o in train])
-                labels = np.asarray([o.reward for o in train], dtype=float)
-                if shuffled:
+                if mode == "gain":
+                    targets = _gain_targets(matrix, fit_ids, cheap, strong)
+                    pairs = [(k, -v) for k, v in targets.items() if k in embeddings]
+                    features = np.asarray([embeddings[k] for k, _v in pairs])
+                    labels = np.asarray([v for _k, v in pairs], dtype=float)
+                else:
+                    train = [
+                        o
+                        for o in matrix.outcomes
+                        if o.scenario_id in fit_set
+                        and o.reward is not None
+                        and episode_key(o) in embeddings
+                    ]
+                    features = np.asarray([embeddings[episode_key(o)] for o in train])
+                    labels = np.asarray([o.reward for o in train], dtype=float)
+                if mode == "shuffled":
                     labels = shuffled_rewards(labels, seed)
                 final: ReplyVerifier = fit_absolute(features, labels, alpha=ALPHA)
 
@@ -404,17 +471,12 @@ def run_matrix(name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle_onl
             escalations = mean_result.model_mix.get(strong, 0.0)
             record(
                 variant,
-                {
-                    "family": "cascade",
-                    "verifier": "oracle"
-                    if scorer is None
-                    else ("shuffled" if shuffled else "absolute-a1-fulldim"),
-                    "folds": FOLDS,
-                },
+                {"family": "cascade", "verifier": mode, "folds": FOLDS},
                 mean_result,
                 f"pair={cheap}->{strong} thr={threshold:.4f} esc_rate={escalations:.2f} "
                 f"fit_acc={fit_acc:.4f} fit_cost={fit_cost:.5f} "
-                f"perm_accs={[round(r.accuracy, 4) for r in results]}",
+                + (f"gain_corr={gain_corr:.3f} " if mode == "gain" else "")
+                + f"perm_accs={[round(r.accuracy, 4) for r in results]}",
             )
 
 
