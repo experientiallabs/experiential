@@ -49,6 +49,14 @@ MISSING_HARBOR_EXTRA = (
     "Run `uv sync --extra harbor` (or `pip install 'world-model-harness[harbor]'`) and retry"
 )
 
+E2B_SANDBOXES_PER_TRIAL = 2
+"""Concurrent E2B sandboxes one `harbor.backend = "e2b"` trial holds at once.
+
+`collect_rollouts` selects `task_environment="e2b"` AND `harness_backend="e2b"` together, so a
+running trial occupies harbor's task environment sandbox plus the pooled sandbox hosting the pi
+harness process. Capacity planning (`wmh.cli.harness_distill`) multiplies by this, because a run
+that reserves only one slot per trial starves at exactly half its configured concurrency."""
+
 
 def _recorded_provider_config(config_path: Path) -> JsonObject | None:
     """The provider config a persisted harbor job config ran with, or None.

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -11,7 +11,7 @@ from typing import cast
 import httpx
 import pytest
 from e2b import AsyncSandbox, AsyncTemplate
-from e2b.exceptions import BuildException
+from e2b.exceptions import BuildException, RateLimitException
 from e2b.template.logger import LogEntry
 from e2b.template.types import (
     BuildInfo,
@@ -24,6 +24,9 @@ from harbor.models.trial.paths import TrialPaths
 
 import wmh.evals.harbor.e2b_environment as e2b_environment_module
 from wmh.evals.harbor.e2b_environment import WmhE2BEnvironment
+from wmh.harness.e2b_ledger import SandboxLedger, read_ledger_files
+
+_LEDGER_PID = 424_242
 
 
 @pytest.fixture(autouse=True)
@@ -33,10 +36,20 @@ def _clear_build_registry() -> Iterator[None]:
     e2b_environment_module._SUBMITTED_BUILDS.clear()
 
 
+@pytest.fixture(autouse=True)
+def ledger_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect the reap ledger into the test's tmp dir; real user state is never touched."""
+    directory = tmp_path / "ledger"
+    ledger = SandboxLedger(directory, pid=_LEDGER_PID)
+    monkeypatch.setattr(e2b_environment_module, "default_ledger", lambda: ledger)
+    return directory
+
+
 def _environment(
     tmp_path: Path,
     *,
     task_config: EnvironmentConfig | None = None,
+    session_id: str = "trial__environment",
 ) -> WmhE2BEnvironment:
     environment_dir = tmp_path / "environment"
     if not environment_dir.exists():
@@ -50,7 +63,7 @@ def _environment(
     return WmhE2BEnvironment(
         environment_dir=environment_dir,
         environment_name="task/environment",
-        session_id="trial__environment",
+        session_id=session_id,
         trial_paths=TrialPaths(trial_dir),
         task_env_config=task_config or EnvironmentConfig(cpus=2, memory_mb=2048),
     )
@@ -83,9 +96,18 @@ def _build_status(
 
 
 class _Sandbox:
-    def __init__(self, *, name: str | None, info_errors: list[Exception] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        name: str | None,
+        info_errors: list[Exception] | None = None,
+        sandbox_id: str = "isb-1",
+        kill_error: Exception | None = None,
+    ) -> None:
+        self.sandbox_id = sandbox_id
         self.info = SimpleNamespace(template_id="template-id", name=name)
         self.info_errors = list(info_errors or [])
+        self.kill_error = kill_error
         self.kill_calls = 0
 
     async def get_info(self) -> SimpleNamespace:
@@ -95,6 +117,8 @@ class _Sandbox:
 
     async def kill(self) -> None:
         self.kill_calls += 1
+        if self.kill_error is not None:
+            raise self.kill_error
 
 
 def test_template_alias_matches_the_prebuilt_fleet_derivation(tmp_path: Path) -> None:
@@ -530,3 +554,179 @@ def test_terminal_build_failure_clears_the_registry_so_a_rebuild_can_run(
 
     asyncio.run(environment._ensure_template_built(force_build=False))
     assert submissions == [1, 1]  # the second attempt legitimately resubmits
+
+
+# -- sandbox ledger + 429 create hardening ---------------------------------------------------
+
+
+def _wire_create(
+    monkeypatch: pytest.MonkeyPatch,
+    create: Callable[..., Awaitable[_Sandbox]],
+    *,
+    sleeps: list[float] | None = None,
+) -> None:
+    """Route creates at the fake factory, skipping the rate gate and real sleeps."""
+
+    async def admit() -> None:
+        return None
+
+    async def sleep(seconds: float) -> None:
+        if sleeps is not None:
+            sleeps.append(seconds)
+
+    monkeypatch.setattr(e2b_environment_module, "acquire_e2b_create_slot_async", admit)
+    monkeypatch.setattr(AsyncSandbox, "create", staticmethod(create))
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+
+def test_a_created_sandbox_is_recorded_in_the_reap_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_dir: Path,
+) -> None:
+    # Harbor names an environment session "<trial name>__env"; the ledger records the trial.
+    environment = _environment(tmp_path, session_id="hello-world__bZZeEkw__env")
+    sandbox = _Sandbox(name=environment.template_name, sandbox_id="isb-created")
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        return sandbox
+
+    _wire_create(monkeypatch, create)
+
+    asyncio.run(environment._create_sandbox())
+
+    [ledger_file] = read_ledger_files(ledger_dir)
+    [record] = ledger_file.held
+    assert record.sandbox_id == "isb-created"
+    assert record.template_id == environment.template_name
+    assert record.trial_name == "hello-world__bZZeEkw"
+    assert record.pid == _LEDGER_PID
+    assert ledger_file.owner_pid == _LEDGER_PID
+
+
+def test_an_abandoned_sandbox_is_released_in_the_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_dir: Path,
+) -> None:
+    """A sandbox killed for a template mismatch is recorded AND released: nothing to reap."""
+    environment = _environment(tmp_path)
+    sandbox = _Sandbox(name="some-other-template", sandbox_id="isb-wrong")
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        return sandbox
+
+    _wire_create(monkeypatch, create)
+
+    with pytest.raises(RuntimeError, match="template name mismatch"):
+        asyncio.run(environment._create_sandbox())
+
+    [ledger_file] = read_ledger_files(ledger_dir)
+    assert ledger_file.held == ()
+    assert ledger_file.released_ids == ("isb-wrong",)
+    assert ledger_file.fully_released is True
+
+
+def test_a_kill_that_fails_leaves_the_record_reapable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_dir: Path,
+) -> None:
+    """Fail closed: an unproven kill must stay in the ledger so a reaper retries it by id."""
+    environment = _environment(tmp_path)
+    sandbox = _Sandbox(
+        name="some-other-template",
+        sandbox_id="isb-stuck",
+        kill_error=RuntimeError("503: kill refused"),
+    )
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        return sandbox
+
+    _wire_create(monkeypatch, create)
+
+    with pytest.raises(RuntimeError, match="template name mismatch"):
+        asyncio.run(environment._create_sandbox())
+
+    [ledger_file] = read_ledger_files(ledger_dir)
+    assert [record.sandbox_id for record in ledger_file.held] == ["isb-stuck"]
+
+
+def test_graceful_stop_releases_the_sandbox_in_the_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_dir: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    sandbox = _Sandbox(name=environment.template_name, sandbox_id="isb-stopped")
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        return sandbox
+
+    _wire_create(monkeypatch, create)
+
+    asyncio.run(environment._create_sandbox())
+    asyncio.run(environment.stop(delete=True))
+
+    assert sandbox.kill_calls == 1
+    [ledger_file] = read_ledger_files(ledger_dir)
+    assert ledger_file.held == ()
+    assert ledger_file.released_ids == ("isb-stopped",)
+
+
+def test_a_rate_limited_create_waits_and_then_succeeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_dir: Path,
+) -> None:
+    """A 429 for the account's concurrent-sandbox cap must wait, not fail the trial."""
+    environment = _environment(tmp_path)
+    sandbox = _Sandbox(name=environment.template_name, sandbox_id="isb-late")
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise RateLimitException(
+                "429: You have reached the maximum number of concurrent E2B sandboxes (100)"
+            )
+        return sandbox
+
+    _wire_create(monkeypatch, create, sleeps=sleeps)
+
+    asyncio.run(environment._create_sandbox())
+
+    assert len(attempts) == 3
+    assert sleeps == list(e2b_environment_module._CREATE_RATE_LIMIT_DELAYS_S[:2])
+    assert environment._sandbox is sandbox
+    # Exactly one create succeeded, so exactly one ledger record exists.
+    [ledger_file] = read_ledger_files(ledger_dir)
+    assert [record.sandbox_id for record in ledger_file.held] == ["isb-late"]
+
+
+def test_a_permanently_full_account_still_fails_after_the_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_dir: Path,
+) -> None:
+    environment = _environment(tmp_path)
+    attempts: list[int] = []
+    sleeps: list[float] = []
+
+    async def create(**_kwargs: object) -> _Sandbox:
+        attempts.append(1)
+        raise RateLimitException("429: maximum number of concurrent E2B sandboxes (100)")
+
+    _wire_create(monkeypatch, create, sleeps=sleeps)
+
+    with pytest.raises(RateLimitException, match="concurrent E2B sandboxes"):
+        asyncio.run(environment._create_sandbox())
+
+    delays = list(e2b_environment_module._CREATE_RATE_LIMIT_DELAYS_S)
+    # Every rate-limit wait, then harbor's own two-attempt contract takes over and fails.
+    assert sleeps == [*delays, e2b_environment_module._CREATE_RETRY_DELAY_S]
+    assert len(attempts) == len(delays) + 2
+    assert sum(sleeps) < 600  # the bound stays inside a few minutes
+    assert environment._sandbox is None
+    assert read_ledger_files(ledger_dir) == ()  # nothing was ever created

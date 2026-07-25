@@ -37,6 +37,7 @@ from rich.table import Table
 
 import wmh.providers as providers
 from wmh.cli.agent_session import register as register_agent_session_commands
+from wmh.cli.e2b_cmds import register as register_e2b_commands
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.harness_app import harness_app, optimize_app
 from wmh.cli.ingest_cmd import ingest as _ingest_command
@@ -148,6 +149,7 @@ app.add_typer(optimize_app, name="optimize")
 app.command("ingest")(_ingest_command)
 register_platform_commands(app)
 register_agent_session_commands(app)
+register_e2b_commands(app)
 _console = Console()
 _CHECK = "[green]✓[/green]"
 
