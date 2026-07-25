@@ -233,6 +233,27 @@ def test_precomputed_embeddings_match_spec_path() -> None:
     assert via_spec.references[0].vector == via_pre.references[0].vector
 
 
+def test_distance_floor_abstains_out_of_support_only() -> None:
+    from wmh.optimize.proxrouter import support_floor
+
+    matrix = _matrix()
+    policy = fit_knn_prox(matrix, embedder=EmbedderSpec(dim=256), knn_k=8, tau_inv=5.0)
+    scorer = ProxScorer(policy)
+    floor = support_floor(policy)
+    assert 0.0 < floor < 2.0
+    in_support = scorer.decide(
+        _embed(policy.embedder, "solve the integral of polynomial number 3 dx calculus"),
+        guard_model="beta", guard_z=0.5, min_pairs=2, abstain_distance=floor,
+    )
+    assert in_support.model == "alpha"  # a fit text verbatim: within support, no abstention
+    far = scorer.decide(
+        _embed(policy.embedder, "haiku regarding wistful mountain snowfall zzqx"),
+        guard_model="beta", guard_z=0.5, min_pairs=2, abstain_distance=floor,
+    )
+    assert far.model == "beta"
+    assert "abstained" in far.reason
+
+
 def test_cost_lambda_prefers_cheaper_at_parity() -> None:
     """With rewards tied, any positive lambda must route to the cheaper model."""
     outcomes = []

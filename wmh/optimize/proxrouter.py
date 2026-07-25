@@ -256,8 +256,8 @@ class ProxScorer:
                 self.costs = (counts * local_c + m * global_c[None, :]) / (counts + m)
         self.known = ~np.isnan(self.rewards)  # [R, M]
 
-    def _weights(self, query: np.ndarray) -> tuple[np.ndarray, int]:
-        """Tilted aggregation weights over references for one query, plus the nearest index."""
+    def _weights(self, query: np.ndarray) -> tuple[np.ndarray, np.ndarray, int, float]:
+        """(tilted weights, untilted priors, nearest index, nearest distance) for one query."""
         query = np.asarray(query, dtype=np.float64)
         norm = float(np.linalg.norm(query))
         if norm > 0:
@@ -274,11 +274,11 @@ class ProxScorer:
         # the per-model normalization.
         logits = -self.policy.tau_inv * distance
         tilt = np.exp(logits - logits.max())
-        return priors * tilt, priors, nearest
+        return priors * tilt, priors, nearest, float(distance[nearest])
 
     def estimates(self, query: np.ndarray) -> tuple[dict[str, float], dict[str, float], int]:
         """Per-model (U_hat reward, U_hat cost) plus the nearest reference's index."""
-        weights, _priors, nearest = self._weights(query)
+        weights, _priors, nearest, _near_dist = self._weights(query)
         masked = np.where(self.known, weights[:, None], 0.0)  # [R, M]
         denom = masked.sum(axis=0)  # [M]
         rewards = np.where(denom > 0, np.nansum(self.rewards * masked, axis=0), np.nan)
@@ -307,6 +307,7 @@ class ProxScorer:
         guard_margin: float = 0.0,
         guard_z: float | None = None,
         min_pairs: float = 8.0,
+        abstain_distance: float | None = None,
     ) -> RoutingDecision:
         """Argmax of U_hat = reward - lam * cost / cost_scale, with the baseline guard.
 
@@ -327,7 +328,25 @@ class ProxScorer:
         Guarding at decision time (not fit time) keeps the artifact guard-free, so one fit
         serves any baseline.
         """
-        weights, test_weights, nearest = self._weights(query)
+        weights, test_weights, nearest, near_dist = self._weights(query)
+        if (
+            abstain_distance is not None
+            and guard_model is not None
+            and near_dist > abstain_distance
+        ):
+            # The query sits beyond the fit distribution's support: every reference is an
+            # extrapolation, so the honest answer is the baseline, not a certified-looking
+            # gap measured on irrelevant evidence.
+            ref = self.policy.references[nearest]
+            return RoutingDecision(
+                model=guard_model,
+                cluster_id=nearest,
+                cluster_label=ref.label,
+                reason=(
+                    f"{self.policy.kind}: abstained to baseline "
+                    f"(nearest reference {near_dist:.3f} > floor {abstain_distance:.3f})"
+                ),
+            )
         masked = np.where(self.known, weights[:, None], 0.0)
         denom = masked.sum(axis=0)
         with np.errstate(invalid="ignore"):
@@ -385,6 +404,23 @@ class ProxScorer:
         variance = float((w * (d - gap) ** 2).sum() / sw)
         se = (variance / n_eff) ** 0.5
         return gap > z * se
+
+
+def support_floor(policy: ProxPolicy, *, quantile: float = 0.95) -> float:
+    """Abstention floor from the policy's own reference geometry (no test peeking).
+
+    The `quantile` of each reference's cosine distance to its nearest OTHER reference: a
+    query whose nearest reference is farther than this sits outside the fit distribution's
+    support. Meaningful for knn-prox (references ARE the fit points); for km-prox centroids
+    it under-estimates the support radius, so callers should prefer the knn policy's floor.
+    """
+    vectors = np.asarray([ref.vector for ref in policy.references])
+    if len(vectors) < 2:
+        return float("inf")
+    sims = vectors @ vectors.T
+    np.fill_diagonal(sims, -np.inf)
+    nn_distance = 1.0 - sims.max(axis=1)
+    return float(np.quantile(nn_distance, quantile))
 
 
 def _fit_embeddings(

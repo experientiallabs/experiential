@@ -41,9 +41,16 @@ from pathlib import Path
 import numpy as np
 from sklearn.preprocessing import Normalizer
 
+from wmh.optimize.l2d import fit_l2d
 from wmh.optimize.outcomes import OutcomeMatrix
 from wmh.optimize.policy import EmbedderSpec, rank_decision
-from wmh.optimize.proxrouter import ProxPolicy, ProxScorer, fit_km_prox, fit_knn_prox
+from wmh.optimize.proxrouter import (
+    ProxPolicy,
+    ProxScorer,
+    fit_km_prox,
+    fit_knn_prox,
+    support_floor,
+)
 from wmh.optimize.routing import fit_rank_policy
 from wmh.research.routerbench import best_single_model, oracle, split_scenario_ids
 from wmh.research.routing_ood import split_holdout_clusters, split_holdout_tasks
@@ -359,6 +366,171 @@ def run_cell_exp3(
         )
 
 
+def run_cell_exp4(name: str, matrix: OutcomeMatrix, split_kind: str, seed: int) -> None:
+    """Experiment 4: quantile distance-floor abstention on the round-3 winners.
+
+    floor = p95 of the knn policy's reference self-NN cosine distances (fit-side geometry
+    only, no test peeking). Queries whose nearest reference is beyond the floor abstain to
+    the baseline before any estimate or z-test runs.
+    """
+    cell = _Cell(name, matrix, split_kind, seed)
+    fit_ids, test_ids, spec = cell.fit_ids, cell.test_ids, cell.spec
+    best_name = cell.best_name
+
+    def run_variant(variant, policy, vecs, floor, **guard) -> None:  # noqa: ANN001, ANN003
+        scorer = ProxScorer(policy)
+        picks = {
+            sid: scorer.decide(
+                vecs[row], guard_model=best_name, abstain_distance=floor, **guard
+            ).model
+            for row, sid in enumerate(test_ids)
+        }
+        cell.record(
+            variant,
+            {"kind": policy.kind, "floor": round(floor, 4), **guard},
+            evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+        )
+
+    knn = fit_knn_prox(
+        matrix,
+        fit_ids=fit_ids,
+        embedder=spec,
+        knn_k=KNN_K,
+        tau_inv=TAU_INV,
+        fitted_from=f"{name} {split_kind} s{seed}",
+    )
+    floor = support_floor(knn, quantile=0.95)
+    run_variant("knn-prox-z05-floor", knn, cell.test_vecs, floor, guard_z=0.5, min_pairs=8.0)
+
+    oai = _oai_vectors(name, matrix)
+    if oai is not None:
+        fit_vecs = np.asarray([oai[sid] for sid in fit_ids], dtype=np.float64)
+        test_vecs = Normalizer(norm="l2").transform(
+            np.asarray([oai[sid] for sid in test_ids], dtype=np.float64)
+        )
+        knn_oai = fit_knn_prox(
+            matrix,
+            fit_ids=fit_ids,
+            embedder=spec,
+            knn_k=KNN_K,
+            tau_inv=TAU_INV,
+            fitted_from=f"{name} {split_kind} s{seed} oai3l",
+            precomputed=fit_vecs,
+        )
+        floor_oai = support_floor(knn_oai, quantile=0.95)
+        run_variant(
+            "knn-prox-z05-oai-floor",
+            knn_oai,
+            test_vecs,
+            floor_oai,
+            guard_z=0.5,
+            min_pairs=8.0,
+        )
+        run_variant("knn-prox-oai-floor", knn_oai, test_vecs, floor_oai, guard_margin=GUARD_MARGIN)
+
+
+L2D_MATRICES = ["financebench", "tau-bench", "continual-learning"]  # headroom corpora
+
+
+def run_cell_exp5(
+    name: str, matrix: OutcomeMatrix, split_kind: str, seed: int, *, control: bool = False
+) -> None:
+    """Experiment 5: consistent learning-to-defer rule vs the guard family, paired in-cell.
+
+    Comparators re-run in the SAME cell (identical split + baseline) so every delta is
+    paired: best-single, margin-guard knn-prox, z05 knn-prox, then l2d (hashing and 3-large,
+    lam 0 and 0.1). Headroom corpora only per the master directive.
+    """
+    cell = _Cell(name, matrix, split_kind, seed)
+    fit_ids, test_ids, spec = cell.fit_ids, cell.test_ids, cell.spec
+    best_name = cell.best_name
+    tasks = {o.scenario_id: o.task for o in matrix.outcomes}
+    embedder = HashingEmbedder(dim=DIM)
+    fit_vecs_hash = np.asarray(embedder.embed([tasks[sid] for sid in fit_ids]))
+
+    cell.record("best-single", {"model": best_name}, cell.best_eval)
+
+    knn = fit_knn_prox(
+        matrix,
+        fit_ids=fit_ids,
+        embedder=spec,
+        knn_k=KNN_K,
+        tau_inv=TAU_INV,
+        fitted_from=f"{name} {split_kind} s{seed}",
+    )
+    for variant, guard in (
+        ("knn-prox", {"guard_margin": GUARD_MARGIN}),
+        ("knn-prox-z05", {"guard_z": 0.5, "min_pairs": 8.0}),
+    ):
+        scorer = ProxScorer(knn)
+        picks = {
+            sid: scorer.decide(cell.test_vecs[row], guard_model=best_name, **guard).model
+            for row, sid in enumerate(test_ids)
+        }
+        cell.record(
+            variant,
+            {"kind": "knn-prox", **guard},
+            evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+        )
+
+    def run_l2d(variant, fit_vecs, test_vecs, lam) -> None:  # noqa: ANN001
+        rule = fit_l2d(matrix, fit_ids=fit_ids, embeddings=fit_vecs, baseline=best_name)
+        picks = {sid: rule.decide(test_vecs[row], lam=lam) for row, sid in enumerate(test_ids)}
+        deferred = sum(1 for m in picks.values() if m == best_name) / len(picks)
+        cell.record(
+            variant,
+            {"rule": "l2d-ova-ridge", "lam": lam, "defer_rate": round(deferred, 3)},
+            evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+        )
+
+    run_l2d("l2d", fit_vecs_hash, cell.test_vecs, 0.0)
+    run_l2d("l2d-lam01", fit_vecs_hash, cell.test_vecs, 0.1)
+
+    oai = _oai_vectors(name, matrix)
+    if oai is not None:
+        fit_vecs = np.asarray([oai[sid] for sid in fit_ids], dtype=np.float64)
+        test_vecs = Normalizer(norm="l2").transform(
+            np.asarray([oai[sid] for sid in test_ids], dtype=np.float64)
+        )
+        knn_oai = fit_knn_prox(
+            matrix,
+            fit_ids=fit_ids,
+            embedder=spec,
+            knn_k=KNN_K,
+            tau_inv=TAU_INV,
+            fitted_from=f"{name} {split_kind} s{seed} oai3l",
+            precomputed=fit_vecs,
+        )
+        scorer = ProxScorer(knn_oai)
+        picks = {
+            sid: scorer.decide(
+                test_vecs[row], guard_model=best_name, guard_margin=GUARD_MARGIN
+            ).model
+            for row, sid in enumerate(test_ids)
+        }
+        cell.record(
+            "knn-prox-oai",
+            {"kind": "knn-prox", "embed": "oai3l", "guard_margin": GUARD_MARGIN},
+            evaluate_choices(matrix, test_ids, lambda sid, p=picks: p[sid]),
+        )
+        run_l2d("l2d-oai", fit_vecs, test_vecs, 0.0)
+        run_l2d("l2d-oai-lam01", fit_vecs, test_vecs, 0.1)
+
+    # Control: shuffled labels -> l2d must collapse to ~best-single (new method, new control).
+    if control:
+        shuffled = _shuffled(matrix, seed=0)
+        s_best, _a, _c = best_single_model(shuffled, fit_ids=fit_ids, eval_ids=test_ids)
+        s_best_eval = evaluate_choices(shuffled, test_ids, lambda _sid: s_best)
+        rule = fit_l2d(shuffled, fit_ids=fit_ids, embeddings=fit_vecs_hash, baseline=s_best)
+        picks = {sid: rule.decide(cell.test_vecs[row]) for row, sid in enumerate(test_ids)}
+        cell.record(
+            "l2d-shuffled",
+            {"control": "labels shuffled within model"},
+            evaluate_choices(shuffled, test_ids, lambda sid, p=picks: p[sid]),
+            baseline=s_best_eval,
+        )
+
+
 def run_cell(
     name: str,
     matrix: OutcomeMatrix,
@@ -662,6 +834,8 @@ def main() -> None:
     quick = "--quick" in args
     exp2 = "--exp2" in args
     exp3 = "--exp3" in args
+    exp4 = "--exp4" in args
+    exp5 = "--exp5" in args
 
     for name, matrix in _matrices().items():
         if wanted and name not in wanted:
@@ -671,7 +845,19 @@ def main() -> None:
             if split_kind == "ood-task" and not has_prefixes:
                 continue
             for seed in seeds:
-                if exp3:
+                if exp5:
+                    if name not in L2D_MATRICES:
+                        continue
+                    run_cell_exp5(
+                        name,
+                        matrix,
+                        split_kind,
+                        seed,
+                        control=(name == "tau-bench" and split_kind == "iid" and seed == 0),
+                    )
+                elif exp4:
+                    run_cell_exp4(name, matrix, split_kind, seed)
+                elif exp3:
                     run_cell_exp3(
                         name,
                         matrix,
