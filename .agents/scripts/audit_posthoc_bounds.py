@@ -9,10 +9,10 @@ Reproduces the three results from the drawing-board survey (2026-07-24), from da
       POOLED correlation's sign (prefer fewer steps) is worse than a coin flip - 35-61% correct,
       harvesting -32%..+14%. Inverting it to "prefer the episode that finished, then the one that
       did MORE work" harvests +12%..+53% at 60-79% correct, pooled 67.5% over 440 decisive cells
-      (z=+7.8). No extra call, no added latency, so best-of-n does not need an LLM verifier for a
+      (z=+7.34). No extra call, no added latency, so best-of-n does not need an LLM verifier for a
       first cut. Both components survive their controls (section b2): the finish term at 69.7% on
-      165 cells (z=+5.5), and the effort term at 66.2% on 275 cells where BOTH episodes finished
-      (z=+5.7) - the latter rules out max_steps truncation as the whole explanation. The finish
+      165 cells (z=+5.06), and the effort term at 66.2% on 275 cells where BOTH episodes finished
+      (z=+5.37) - the latter rules out max_steps truncation as the whole explanation. The finish
       term should weaken when the corpora are recaptured at a higher step cap; the effort term is
       cap-independent.
   (c) WHY THE SIGN FLIPS. `stop_reason == max_steps` correlates -0.33..-0.43 with reward pooled

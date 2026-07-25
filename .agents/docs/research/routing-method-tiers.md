@@ -436,7 +436,7 @@ holds:
   three query-only families have produced.
 - **Achievable, free.** A parameter-free selector - prefer the episode that FINISHED, then the
   one that did MORE work - harvests +12%..+53% of that ceiling at 60-79% correct on decisive
-  cells (pooled 67.5% over 440, z=+7.8). Best operating points: financebench opus-4-8 0.527 @
+  cells (pooled 67.5% over 440, z=+7.34). Best operating points: financebench opus-4-8 0.527 @
   $0.0456 vs best-single 0.478 @ $0.0636 (**+4.9pt at 1.4x cheaper**); tau-bench kimi-k2.6 0.544
   @ $0.0487 (parity, 3.6x cheaper). No extra call, no added latency, so best-of-n does not need
   an LLM verifier for a first cut.
@@ -446,10 +446,16 @@ holds:
   BETWEEN-cell difficulty; within a cell the effort sign FLIPS (tau-bench steps +0.310,
   n_replies +0.363). Anyone building a verifier must decompose before choosing a sign.
 - **Controls.** Both components survive: the finish term at 69.7% on 165 decisive cells
-  (z=+5.5), and - critically - the effort term at 66.2% on 275 cells where BOTH episodes
-  finished (z=+5.7), which rules out max_steps truncation as the whole explanation. The finish
+  (z=+5.06), and - critically - the effort term at 66.2% on 275 cells where BOTH episodes
+  finished (z=+5.37), which rules out max_steps truncation as the whole explanation. The finish
   term should weaken at max_steps 16; the effort term is cap-independent. Caveat: the selector
   was picked after trying ~7, so treat exact harvest percentages as directional.
+  (CORRECTED 2026-07-24: these three z values were first published as +7.8 / +5.5 / +5.7, from an
+  ad-hoc script that used the observed-proportion standard error sqrt(p(1-p)/n). The test is
+  against a fixed p=0.5, so the null sqrt(0.25/n) is the correct denominator; the committed
+  `pooled_correct_z` uses it and its values are pinned by the test. Counts and percentages were
+  never affected. This is also the real source of the +5.4-vs-+5.7 gap in master's independent
+  reproduction - a different SE convention, not rounding.)
 - **Open gate.** The ceiling capitalizes on episode reward variance (66% of tau-bench cells
   disagree), and this harness cannot separate rollout variance from JUDGE variance. The
   judge-noise decomposition (re-judge one stored reply twice, ~450 calls/corpus) gates how much

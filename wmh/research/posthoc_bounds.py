@@ -73,11 +73,11 @@ SELECTOR_KEYS: dict[str, Callable[[ScenarioOutcome], tuple[float, ...]]] = {
 }
 
 # The free selector the achievable best-of-n numbers are reported at. Both of its components are
-# separately significant on the wm corpora (pooled over corpora, one-sided vs a coin flip):
-# the finish term at 69.7% correct on 165 decisive cells (z=+5.5), and the effort term at 66.2% on
-# 275 cells where BOTH episodes finished (z=+5.7), the latter being the control that rules out the
-# step cap as the whole explanation. The finish term will weaken as max_steps rises; the effort
-# term is cap-independent.
+# separately significant on the wm corpora (pooled over corpora, vs a coin flip): the finish term
+# at 69.7% correct on 165 decisive cells (z=+5.06), and the effort term at 66.2% on 275 cells where
+# BOTH episodes finished (z=+5.37), the latter being the control that rules out the step cap as the
+# whole explanation. The finish term will weaken as max_steps rises; the effort term is
+# cap-independent. All three z values come from `pooled_correct_z`, i.e. the null standard error.
 DEFAULT_SELECTOR = "finished-then-more-steps"
 
 
@@ -360,6 +360,10 @@ def pooled_correct_z(bounds: Iterable[SelectorBound]) -> tuple[int, int, float]:
 
     Per-corpus decisive counts here are 10-150, too small to read individually; the pooled z is
     what says whether a selector beats chance. Returns z=0.0 when nothing was decisive.
+
+    The standard error is the NULL one, sqrt(0.25 / n), not the observed-proportion
+    sqrt(p(1-p) / n): the test is against a fixed p=0.5, so the null SD is the correct
+    denominator. The observed-proportion form runs ~5-10% larger here and inflates z.
     """
     decisive = 0
     correct = 0

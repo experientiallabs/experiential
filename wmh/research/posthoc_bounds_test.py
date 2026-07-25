@@ -275,7 +275,9 @@ def test_audit_headline_numbers_do_not_drift() -> None:
         for name, matrix in loaded
     )
     assert decisive == 327
-    assert z_forward > 5.0
+    # 231/327 = 70.6% on these five corpora, vs 67.5% pooled over all eight (the two weakest
+    # corpora, crmarena and tau-telecom, are excluded here). Null SE, per `pooled_correct_z`.
+    assert z_forward == pytest.approx(7.47, abs=0.05)
     _, control_decisive, z_control = pooled_correct_z(
         selector_bound(
             matrix, name, "more-replies", SELECTOR_KEYS["more-replies"], cell_filter=all_finished
@@ -283,7 +285,8 @@ def test_audit_headline_numbers_do_not_drift() -> None:
         for name, matrix in loaded
     )
     assert control_decisive == 205
-    assert z_control > 4.0
+    # 145/205 = 70.7% with the step cap held constant, the control that matters most.
+    assert z_control == pytest.approx(5.94, abs=0.05)
 
     # (c) The within-cell sign flip on tau-bench, which is why the naive selector was backwards.
     rows = {
