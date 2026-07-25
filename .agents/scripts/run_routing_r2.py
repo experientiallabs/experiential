@@ -83,12 +83,15 @@ def _matrices() -> dict[str, OutcomeMatrix]:
     for path in sorted((DATA / "matrices").glob("*_matrix.json")):
         name = path.stem.removesuffix("_matrix")
         matrix = OutcomeMatrix.load(path)
-        if len(matrix.scenario_ids()) < MIN_SCENARIOS:
-            logger.info("skipping %s: only %d scenarios", name, len(matrix.scenario_ids()))
-            continue
-        out[name] = matrix
+        # The wm-all POOL takes every non-ours9 corpus regardless of size (master's cohort
+        # ruling 2026-07-25: "wm-all" = the full 10-corpus pool); corpora too small to
+        # split are only skipped as STANDALONE matrices.
         if name != "routerbench-ours9":
             wm_parts.append((name, matrix))
+        if len(matrix.scenario_ids()) < MIN_SCENARIOS:
+            logger.info("standalone skip %s: only %d scenarios", name, len(matrix.scenario_ids()))
+            continue
+        out[name] = matrix
     if len(wm_parts) >= 2:
         combined = [
             outcome.model_copy(update={"scenario_id": f"{corpus}:{outcome.scenario_id}"})
