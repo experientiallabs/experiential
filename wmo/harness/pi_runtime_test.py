@@ -358,6 +358,44 @@ def test_the_node_wall_budget_comes_from_the_configured_episode_timeout(
     assert "timeout 1800 node --experimental-strip-types entry.ts" in commands[0][-1]
 
 
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [(0.5, 1), (1.9, 2), (1800.0, 1800)],
+)
+def test_a_fractional_node_wall_budget_rounds_up_instead_of_truncating(
+    monkeypatch: pytest.MonkeyPatch, budget: float, expected: int
+) -> None:
+    """A fractional budget must never truncate, and never reach `timeout 0`.
+
+    GNU coreutils reads `timeout 0` as "no timeout at all", so truncating a sub-second budget
+    would remove the node wall entirely and leave termination to the outer SSH deadline plus
+    its teardown grace, an order of magnitude past what the caller asked for.
+    """
+    commands: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command: list[str], **kwargs: object) -> _Completed:
+        del kwargs
+        commands.append(command)
+        return _Completed()
+
+    runtime = PiRuntime(
+        cast("Provider", _Provider()),
+        files={"src/agent.ts": "// a"},
+        tools=[SUBMIT],
+        port=8899,
+        episode_timeout_s=budget,
+    )
+    monkeypatch.setattr("wmo.harness.pi_runtime.subprocess.run", fake_run)
+
+    runtime._run_node()  # noqa: SLF001 - the remote command is the contract
+
+    assert f"timeout {expected} node --experimental-strip-types entry.ts" in commands[0][-1]
+
+
 def test_the_shared_termination_policy_is_materialized_next_to_entry_ts() -> None:
     """entry.ts imports ./runner_termination.ts, so the SSH blob must carry it."""
     assert Path(pi_runtime_module._TERMINATION_TS).is_file()  # noqa: SLF001 - deploy contract

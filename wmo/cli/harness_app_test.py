@@ -782,7 +782,7 @@ def test_harbor_resume_accepts_a_restated_episode_timeout_for_an_e2b_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Flag consistency is judged on the EFFECTIVE config: restating --episode-timeout on a
-    resumed e2b run must not trip the local-backend guard via this invocation's defaults."""
+    resumed e2b run must match the recorded budget, not this invocation's flag defaults."""
     _harbor_project(tmp_path, monkeypatch)
     first = _invoke_harbor(
         tmp_path, "--backend", "e2b", "--episode-timeout", "120", "--max-iterations-this-run", "1"
@@ -807,6 +807,80 @@ def test_harbor_resume_accepts_a_restated_episode_timeout_for_an_e2b_run(
     )
     assert resumed.exit_code == 0, resumed.output
     assert "optimized" in resumed.output
+
+
+def test_harbor_local_backend_accepts_a_non_default_episode_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--episode-timeout is a both-backends flag, so a local run may set any positive budget.
+
+    The local SSH pi transport used to hardcode `timeout 300 node` and the CLI refused any
+    other value here; both are fixed, so a local run must accept the flag AND record it.
+    """
+    captured = _harbor_project(tmp_path, monkeypatch)
+
+    result = _invoke_harbor(tmp_path, "--backend", "local", "--episode-timeout", "1800")
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, _HarborRunConfig)
+    assert config.backend == "local"
+    assert config.episode_timeout_s == pytest.approx(1800.0)
+    run_config = json.loads((tmp_path / "run" / "run-config.json").read_text(encoding="utf-8"))
+    assert run_config["episode_timeout_s"] == pytest.approx(1800.0)
+
+
+class _ScorerKwargRecorder:
+    """Stands in for `HarborScorer`: records the kwargs `_build_harbor_scorer` passes."""
+
+    def __init__(self, kwargs: dict[str, object]) -> None:
+        self.kwargs = kwargs
+        self.task_pins: dict[str, str] = {"t1": "path:/tasks/t1"}
+
+    @classmethod
+    async def create(
+        cls, job_template: object, task_ids: Sequence[str], **kwargs: object
+    ) -> _ScorerKwargRecorder:
+        del job_template, task_ids
+        return cls(dict(kwargs))
+
+
+def test_harbor_scorer_receives_the_local_backend_episode_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The configured budget reaches the scorer verbatim on the local backend too.
+
+    The scorer forwards it to the pi runtime as the remote node wall budget, so clamping it
+    back to the default here would silently reinstate the 300s wall the flag exists to lift.
+    """
+    (tmp_path / "job.yaml").write_text(_HARBOR_JOB_YAML, encoding="utf-8")
+    monkeypatch.setattr("wmo.evals.harbor.scorer.HarborScorer", _ScorerKwargRecorder)
+    config = _HarborRunConfig(
+        agent="pi",
+        attempts=1,
+        backend="local",
+        e2b_template=None,
+        episode_timeout_s=1800.0,
+        harbor_job_template=harness_app_module._load_harbor_job_template(tmp_path / "job.yaml"),  # noqa: SLF001 - module-private loader under test
+        harbor_retries=0,
+        iterations=1,
+        proposer_model={},
+        worker_model={},
+        reward_key="reward",
+        reward_mode="positive-binary",
+        seed_version=None,
+        task_ids=("t1",),
+    )
+
+    scorer, _pins = harness_app_module._build_harbor_scorer(  # noqa: SLF001 - module-private builder under test
+        config,
+        run_dir=tmp_path / "run",
+        provider_config=ProviderConfig(kind=ProviderKind.BEDROCK, model="m"),
+    )
+
+    assert isinstance(scorer, _ScorerKwargRecorder)
+    assert scorer.kwargs["harness_backend"] == "local"
+    assert scorer.kwargs["episode_timeout_s"] == pytest.approx(1800.0)
 
 
 # -- the retired distill mode ------------------------------------------------------------------

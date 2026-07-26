@@ -12,6 +12,7 @@ from wmo.providers.base import Provider, ProviderConfig, ProviderKind, VerifyRes
 from wmo.providers.bedrock import BedrockProvider
 from wmo.providers.openai import OpenAIProvider
 from wmo.providers.openai_responses import OpenAIResponsesProvider
+from wmo.providers.openrouter import OpenRouterProvider
 from wmo.providers.tinker import TinkerChatProvider
 
 _BACKENDS = {
@@ -20,6 +21,7 @@ _BACKENDS = {
     ProviderKind.AZURE_OPENAI: AzureOpenAIProvider,
     ProviderKind.OPENAI: OpenAIProvider,
     ProviderKind.OPENAI_RESPONSES: OpenAIResponsesProvider,
+    ProviderKind.OPENROUTER: OpenRouterProvider,
     ProviderKind.TINKER: TinkerChatProvider,
 }
 

@@ -50,6 +50,7 @@ from wmo.config import (
     validate_name,
 )
 from wmo.core.types import Action, ActionKind, Session
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT
 from wmo.engine.play import PlayTurn, parse_action, play_turn
 from wmo.engine.world_model import WorldModel
 from wmo.providers import verify_all, verify_embedder
@@ -133,7 +134,7 @@ class BuildParams(BaseModel):
     judge_model: str | None = None
     region: str | None = None
     fidelity: str = "medium"
-    train_split: float = 0.8
+    train_split: float = DEFAULT_TRAIN_SPLIT
     embed_provider: str = "hashing"
     embed_model: str | None = None
     embed_dim: int = 512

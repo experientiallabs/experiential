@@ -8,12 +8,14 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.config.config import (
+    _DEFAULT_TRAIN_SPLIT,
     PROVIDER_ENV_VARS,
     ArtifactPaths,
     HarnessConfig,
     load_config,
     save_config,
 )
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT
 from wmo.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 
 
@@ -209,8 +211,18 @@ def test_for_build_hashing_embedder_needs_no_embed_provider_config() -> None:
     assert config.embed_provider is EmbedderKind.HASHING
 
 
+def test_config_train_split_default_mirrors_the_canonical_constant() -> None:
+    # `_DEFAULT_TRAIN_SPLIT` is a mirror: the canonical value lives next to the split functions in
+    # `wmo.engine.build`, which this module cannot import (build.py imports it, so the arrow would
+    # cycle). A build config that cuts the hash line somewhere other than where `wmo eval` cuts it
+    # hands GEPA's training traces back as scored "held-out" steps, so pin the mirror here.
+    assert _DEFAULT_TRAIN_SPLIT == DEFAULT_TRAIN_SPLIT
+    assert HarnessConfig().train_split == DEFAULT_TRAIN_SPLIT
+
+
 def test_for_build_threads_train_split() -> None:
-    # train_split defaults to 0.8 but is overridable (so `wmo build --train-split` reaches GEPA).
+    # train_split defaults to DEFAULT_TRAIN_SPLIT but is overridable (so `wmo build --train-split`
+    # reaches GEPA).
     default = HarnessConfig.for_build(
         serve_provider=ProviderKind.BEDROCK,
         serve_model="opus",

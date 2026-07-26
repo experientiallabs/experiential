@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import subprocess
@@ -16,7 +17,10 @@ from typer.testing import CliRunner
 
 from wmo.cli import app
 from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
-from wmo.config import ModelRole, load_config, load_settings, save_settings
+from wmo.config import HarnessConfig, ModelRole, load_config, load_settings, save_settings
+from wmo.core.types import Trace
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
+from wmo.engine.eval_suites import EvalSuiteConfig
 from wmo.providers.base import (
     Completion,
     Message,
@@ -1068,3 +1072,54 @@ def test_parse_model_specs_validates_provider_and_resolves_model() -> None:
     # Malformed entry (wrong arity) still rejected.
     with pytest.raises(typer.BadParameter, match="bad --models entry"):
         _parse_model_specs("Opus:bedrock")
+
+
+def _build_cli_train_split_default() -> float:
+    """The `--train-split` default `wmo build` registers, read off the Typer option itself."""
+    option = inspect.signature(cli_app_module.build).parameters["train_split"].default
+    return cast(float, option.default)
+
+
+def _eval_cli_train_split_default() -> float:
+    """The train split `wmo eval` resolves when the user passes no `--train-split`."""
+    # `_eval_options` is the resolver under test: it is where `wmo eval` turns "no flag given"
+    # into a concrete split, so asserting on its output is asserting on the real default.
+    options = cli_app_module._eval_options(
+        prompt_file=None,
+        train_split=None,
+        embed_dim=None,
+        rag=None,
+        sample_turns=None,
+        seed=None,
+        top_k=None,
+    )
+    return options.train_split
+
+
+def test_build_and_eval_share_one_default_train_split() -> None:
+    # `wmo build` and `wmo eval` cut the SAME deterministic trace-id hash line of the SAME corpus,
+    # so their defaults are not two independent knobs: they are one number. They drifted apart
+    # (build 0.8, eval 0.7), which leaked the [0.7, 0.8) band of GEPA's training traces into every
+    # default eval as "held-out". Both must read `DEFAULT_TRAIN_SPLIT` and nothing else.
+    assert _build_cli_train_split_default() == DEFAULT_TRAIN_SPLIT
+    assert _eval_cli_train_split_default() == DEFAULT_TRAIN_SPLIT
+    # Pinned to each other too, so a future edit to one alone is a failure and not a silent leak.
+    assert _build_cli_train_split_default() == _eval_cli_train_split_default()
+    # Suites and the Python-API config default sit on the same line and must agree as well.
+    assert EvalSuiteConfig().train_split == DEFAULT_TRAIN_SPLIT
+    assert HarnessConfig().train_split == DEFAULT_TRAIN_SPLIT
+
+
+def test_default_eval_holdout_contains_no_build_training_trace() -> None:
+    # The measurement-validity invariant behind the shared constant, checked end to end on the
+    # real split functions: nothing GEPA trained on may be scored as held-out.
+    traces = [Trace(trace_id=f"trace-{i}") for i in range(400)]
+    build_split = _build_cli_train_split_default()
+    # Mirrors `wmo.engine.build.build`: train / val / test on one hash line.
+    gepa_train, _val, _test = split_traces_3way(traces, build_split, (1.0 - build_split) / 2)
+    # Mirrors `wmo.evals.open_loop.evaluate_files` on the ad hoc `wmo eval <file>` path.
+    _eval_train, holdout = split_traces(traces, _eval_cli_train_split_default())
+    assert gepa_train, "sanity: the corpus must actually produce a training split"
+    assert holdout, "sanity: the corpus must actually produce a holdout"
+    leaked = {t.trace_id for t in gepa_train} & {t.trace_id for t in holdout}
+    assert leaked == set(), f"{len(leaked)} GEPA training traces scored as held-out"

@@ -243,7 +243,7 @@ def optimize(
         None,
         "--episode-timeout",
         min=0.001,
-        help="(harbor) Wall seconds per evaluated episode (default 300; needs --backend e2b).",
+        help="(harbor) Wall seconds per evaluated episode, on either backend (default 300).",
     ),
     run_dir: str = typer.Option(
         None,
@@ -681,11 +681,6 @@ def _optimize_harbor(
             seed_version=seed_version,
             task_ids=_load_harbor_task_ids(Path(task_ids_file)),
         )
-    # Validated on the EFFECTIVE (stored-or-CLI) config: a consistent resume of an e2b run may
-    # restate --episode-timeout even though this invocation's --backend default is local.
-    if config.backend == "local" and config.episode_timeout_s != DEFAULT_EVAL_EPISODE_TIMEOUT_S:
-        raise typer.BadParameter("--episode-timeout requires --backend e2b")
-
     _console.print(
         f"harbor population search from [bold]{config.agent}[/bold]: 1 seed + "
         f"{config.iterations} proposal slot(s), {len(config.task_ids)} task(s), "
@@ -995,11 +990,9 @@ def _build_harbor_scorer(
                 harness_backend=config.backend,
                 # "" pins template absence so the scorer cannot re-read a changed environment.
                 e2b_template=(config.e2b_template or "") if config.backend == "e2b" else None,
-                episode_timeout_s=(
-                    config.episode_timeout_s
-                    if config.backend == "e2b"
-                    else DEFAULT_EVAL_EPISODE_TIMEOUT_S
-                ),
+                # Both backends honor the wall budget: the local SSH transport applies it as the
+                # remote node timeout instead of the fixed 300s it used to hardcode.
+                episode_timeout_s=config.episode_timeout_s,
                 harbor_retries=config.harbor_retries,
             )
         )

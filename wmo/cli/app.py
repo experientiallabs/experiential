@@ -75,8 +75,8 @@ from wmo.config import (
 )
 from wmo.config.card import make_build_card, save_card
 from wmo.core.types import JsonObject
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT, ingest, split_traces
 from wmo.engine.build import build as run_build
-from wmo.engine.build import ingest, split_traces
 from wmo.engine.demo import run_demo
 from wmo.engine.eval_suites import (
     discover_eval_suites,
@@ -432,7 +432,10 @@ def build(
         None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."
     ),
     train_split: float = typer.Option(
-        0.8, help="Train/held-out ratio for GEPA's internal split (lower = bigger valset)."
+        DEFAULT_TRAIN_SPLIT,
+        help="Train/held-out ratio for GEPA's internal split (lower = bigger valset). Shares "
+        "`wmo eval`'s default: both cut the same trace-id hash line, so a mismatch leaks train "
+        "traces into the eval holdout.",
     ),
     embed_provider: str = typer.Option(
         "hashing", help="phi embedder: hashing (offline) | bedrock | openai | azure."
@@ -911,7 +914,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."
     ),
     train_split: float | None = typer.Option(
-        None, help="Train/holdout ratio per file (default: 0.7, or suite config)."
+        None,
+        help=f"Train/holdout ratio per file (default: {DEFAULT_TRAIN_SPLIT}, or suite config). "
+        "Must match the ratio the model was built with, or the holdout contains train traces.",
     ),
     val_frac: float | None = typer.Option(
         None,
@@ -1473,7 +1478,7 @@ def _eval_options(
     knowledge: bool | None = None,
     reasoning: bool | None = None,
 ) -> _EvalOptions:
-    split = 0.7 if train_split is None else train_split
+    split = DEFAULT_TRAIN_SPLIT if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
     retrieval = True if rag is None else rag
     turns = "all" if sample_turns is None else sample_turns
