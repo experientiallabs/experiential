@@ -42,7 +42,7 @@ normalizer if present in a span's attributes.
 Live pull: Phoenix's query API/SDK is left as the `BaseTraceAdapter` default (a friendly
 "export to a file" error). Phoenix's recommended export path is a file (or a pandas dataframe dumped
 to JSON), and the SDK surface is version-dependent; we prefer correctness over a guessed endpoint.
-Export from Phoenix to a file and use `from_file` / `wmh ingest run --source phoenix --file ...`.
+Export from Phoenix to a file and use `from_file` / `wmh ingest --source phoenix --file <export>`.
 """
 
 from __future__ import annotations

@@ -188,7 +188,7 @@ def test_dataframe_records_flat_columns_indexed_tool_calls() -> None:
     ]
 
     adapter = PhoenixAdapter()
-    traces = spans_to_traces(adapter._collect_all([records]), source="phoenix:df")
+    traces = spans_to_traces(adapter.collect_all([records]), source="phoenix:df")
 
     assert len(traces) == 1
     assert traces[0].trace_id == "d" * 32

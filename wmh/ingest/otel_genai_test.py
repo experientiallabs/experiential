@@ -42,8 +42,12 @@ def test_from_file_parses_otlp_json_into_one_trace() -> None:
     assert call_step.observation.is_error is False
     # The originating prompt is carried onto every step's `task`.
     assert call_step.task == "What is the weather in Paris?"
-    # Both the LLM span and the tool span are recorded as provenance.
-    assert call_step.raw_span_ids == ["b7ad6b7169203331", "c8be7c8270314442"]
+    # Both the LLM span and the tool span are recorded as provenance. `BaseTraceAdapter` stamps a
+    # global emission-order prefix for cross-payload uniqueness, so match on the source-id suffix.
+    assert [sid.split("-", 1)[1] for sid in call_step.raw_span_ids] == [
+        "b7ad6b7169203331",
+        "c8be7c8270314442",
+    ]
 
     final_step = trace.steps[1]
     assert final_step.action.kind == ActionKind.MESSAGE

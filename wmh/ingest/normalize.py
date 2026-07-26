@@ -26,7 +26,17 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, Field, JsonValue
 
-from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step, Trace
+from wmh.core.types import (
+    Action,
+    ActionKind,
+    EnvState,
+    ErrorClass,
+    JsonObject,
+    Observation,
+    Step,
+    StepAttribution,
+    Trace,
+)
 
 # --- attribute vocabularies (GenAI semconv first, OpenInference fallback) ---------------------
 
@@ -76,6 +86,28 @@ _LLM_PRESENCE_KEYS = (
 _STATE_STRUCTURED_KEY = "wmh.state.structured"
 _STATE_SCRATCHPAD_KEY = "wmh.state.scratchpad"
 _TRACE_METADATA_KEY = "wmh.trace.metadata"
+_ATTRIBUTION_KEY = "wmh.attribution"
+
+# Per-step attribution vocabularies (GenAI semconv first, OpenInference fallback). The response
+# model is preferred over the request model: with provider-side routing/fallback they differ, and
+# attribution wants the model that actually answered.
+_MODEL_KEYS = ("gen_ai.response.model", "gen_ai.request.model", "llm.model_name")
+_PROVIDER_KEYS = ("gen_ai.system", "gen_ai.provider.name", "llm.provider")
+_INPUT_TOKEN_KEYS = (
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.prompt_tokens",
+    "llm.token_count.prompt",
+)
+_OUTPUT_TOKEN_KEYS = (
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.completion_tokens",
+    "llm.token_count.completion",
+)
+_COST_KEYS = ("gen_ai.usage.cost", "llm.usage.total_cost")
+# `gen_ai.request.*` keys that are NOT sampling/config knobs: the model has its own field, and
+# "arguments" is a legacy tool-args location (see _TOOL_ARG_KEYS), not an LLM parameter.
+_NON_CONFIG_REQUEST_KEYS = frozenset({"gen_ai.request.model", "gen_ai.request.arguments"})
+_REQUEST_PREFIX = "gen_ai.request."
 
 
 class SpanRecord(BaseModel):
@@ -463,16 +495,102 @@ def _trace_metadata(spans: list[SpanRecord]) -> JsonObject:
     return {}
 
 
+def _opt_int(value: JsonValue) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, str)):
+        coerced = to_int(value)
+        return coerced if coerced or value in (0, "0", 0.0) else None
+    return None
+
+
+def _opt_float(value: JsonValue) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _opt_str(value: JsonValue) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+# `start_nano` scale sniffing for latency: adapters put three kinds of value in start/end:
+# real OTLP epoch NANOseconds (~2e18 today), `iso_to_ordinal` epoch MICROseconds (~2e15 today),
+# and synthetic ordinals (list indexes, the writer's i*10 stamps: tiny). Only the first two are
+# real clocks a latency can be derived from; synthetic ordinals must not masquerade as durations.
+_EPOCH_NANO_FLOOR = 10**17  # ≥ 1973 when read as ns
+_EPOCH_MICRO_FLOOR = 10**14  # ≥ 1973 when read as µs
+
+
+def _span_latency_ms(start: int, end: int) -> float | None:
+    if start >= _EPOCH_NANO_FLOOR:
+        return (end - start) / 1_000_000
+    if start >= _EPOCH_MICRO_FLOOR:
+        return (end - start) / 1_000
+    return None
+
+
+def _attribution(
+    action_span: SpanRecord | None, tool_span: SpanRecord | None
+) -> StepAttribution | None:
+    """Best-effort per-step attribution from the action span's attributes.
+
+    An explicit `wmh.attribution` JSON attribute (what `otel_writer` emits, and what a capture
+    system can stamp directly) round-trips verbatim. Otherwise the fields are derived from the
+    GenAI/OpenInference vocabularies plus span timing/status. Returns None when nothing is known,
+    so sources without attribution stay clean rather than carrying an all-empty object.
+    """
+    attrs = action_span.attributes if action_span is not None else {}
+    explicit = attrs.get(_ATTRIBUTION_KEY)
+    if isinstance(explicit, str) and explicit:
+        try:
+            return StepAttribution.model_validate_json(explicit)
+        except ValueError:
+            pass
+    error_class: ErrorClass | None = None
+    if action_span is not None and action_span.status_error:
+        error_class = ErrorClass.CONTROLLABLE
+    elif tool_span is not None and tool_span.status_error:
+        error_class = ErrorClass.ENVIRONMENTAL
+    latency_ms: float | None = None
+    if action_span is not None and 0 < action_span.start_nano < action_span.end_nano:
+        latency_ms = _span_latency_ms(action_span.start_nano, action_span.end_nano)
+    config = {
+        key[len(_REQUEST_PREFIX) :]: value
+        for key, value in attrs.items()
+        if key.startswith(_REQUEST_PREFIX) and key not in _NON_CONFIG_REQUEST_KEYS
+    }
+    attribution = StepAttribution(
+        model=_opt_str(_first(attrs, _MODEL_KEYS)),
+        provider=_opt_str(_first(attrs, _PROVIDER_KEYS)),
+        config=config,
+        input_tokens=_opt_int(_first(attrs, _INPUT_TOKEN_KEYS)),
+        output_tokens=_opt_int(_first(attrs, _OUTPUT_TOKEN_KEYS)),
+        cost_usd=_opt_float(_first(attrs, _COST_KEYS)),
+        latency_ms=latency_ms,
+        error_class=error_class,
+    )
+    # exclude_defaults so an empty config dict does not make an otherwise-unknown step
+    # carry an all-empty attribution object.
+    return attribution if attribution.model_dump(exclude_defaults=True) else None
+
+
 def _build_steps(spans: list[SpanRecord]) -> list[Step]:
     """Pair ordered Action spans with their following Observation spans into Steps."""
     task = _trace_task(spans)
     steps: list[Step] = []
     pending: Action | None = None
+    pending_span: SpanRecord | None = None
     pending_ids: list[str] = []
     pending_state = EnvState()
 
     def flush(
-        action: Action, observation: Observation, span_ids: list[str], state: EnvState
+        action: Action,
+        observation: Observation,
+        span_ids: list[str],
+        state: EnvState,
+        action_span: SpanRecord | None,
+        tool_span: SpanRecord | None,
     ) -> None:
         steps.append(
             Step(
@@ -481,6 +599,7 @@ def _build_steps(spans: list[SpanRecord]) -> list[Step]:
                 state_before=state,
                 task=task,
                 raw_span_ids=span_ids,
+                attribution=_attribution(action_span, tool_span),
             )
         )
 
@@ -489,7 +608,7 @@ def _build_steps(spans: list[SpanRecord]) -> list[Step]:
             observation = observation_from_tool_span(span)
             if pending is None:
                 action = tool_call_action_from_tool_span(span)
-                flush(action, observation, [span.span_id], _state_before(span))
+                flush(action, observation, [span.span_id], _state_before(span), None, span)
             else:
                 # The LLM span usually carries the call's name/args; backfill from the tool span
                 # only when it didn't. Derive the tool-span action once to avoid re-parsing.
@@ -501,18 +620,55 @@ def _build_steps(spans: list[SpanRecord]) -> list[Step]:
                         pending.arguments = from_tool.arguments
                     if pending.name is None:
                         pending.name = from_tool.name
-                flush(pending, observation, [*pending_ids, span.span_id], pending_state)
-            pending, pending_ids, pending_state = None, [], EnvState()
+                flush(
+                    pending,
+                    observation,
+                    [*pending_ids, span.span_id],
+                    pending_state,
+                    pending_span,
+                    span,
+                )
+            pending, pending_span, pending_ids, pending_state = None, None, [], EnvState()
         elif is_llm_span(span):
             if pending is not None:
-                flush(pending, Observation(content=""), pending_ids, pending_state)
-            pending, pending_ids = action_from_llm_span(span), [span.span_id]
+                flush(
+                    pending, Observation(content=""), pending_ids, pending_state, pending_span, None
+                )
+            pending, pending_span, pending_ids = action_from_llm_span(span), span, [span.span_id]
             pending_state = _state_before(span)
         # Non-agent spans are ignored.
 
     if pending is not None:
-        flush(pending, Observation(content=""), pending_ids, pending_state)
+        flush(pending, Observation(content=""), pending_ids, pending_state, pending_span, None)
     return steps
+
+
+def group_spans(spans: list[SpanRecord]) -> list[list[SpanRecord]]:
+    """Group spans by trace id and order: spans within a group by start time, groups likewise.
+
+    Splitting this from `trace_from_group` lets the streaming ingest count traces up front
+    (the `detected` event) and normalize group-by-group (the `progress` events).
+    """
+    by_trace: dict[str, list[SpanRecord]] = {}
+    for span in spans:
+        by_trace.setdefault(span.trace_id, []).append(span)
+    # Sorting each group by (start_nano, span_id) leaves group[0] as that trace's earliest span, so
+    # we reuse it as the inter-trace sort key rather than re-scanning.
+    groups = list(by_trace.values())
+    for group in groups:
+        group.sort(key=lambda s: (s.start_nano, s.span_id))
+    groups.sort(key=lambda group: group[0].start_nano)
+    return groups
+
+
+def trace_from_group(group: list[SpanRecord], *, source: str) -> Trace:
+    """Build one `Trace` from one already-ordered same-trace-id span group."""
+    return Trace(
+        trace_id=group[0].trace_id,
+        steps=_build_steps(group),
+        source=source,
+        metadata=_trace_metadata(group),
+    )
 
 
 def spans_to_traces(spans: list[SpanRecord], *, source: str) -> list[Trace]:
@@ -520,20 +676,4 @@ def spans_to_traces(spans: list[SpanRecord], *, source: str) -> list[Trace]:
 
     This is the shared tail every span-based adapter calls after producing `SpanRecord`s.
     """
-    by_trace: dict[str, list[SpanRecord]] = {}
-    for span in spans:
-        by_trace.setdefault(span.trace_id, []).append(span)
-    # Sorting each group by (start_nano, span_id) leaves group[0] as that trace's earliest span, so
-    # we reuse it as the inter-trace sort key rather than re-scanning.
-    ordered: list[tuple[int, Trace]] = []
-    for group in by_trace.values():
-        group.sort(key=lambda s: (s.start_nano, s.span_id))
-        trace = Trace(
-            trace_id=group[0].trace_id,
-            steps=_build_steps(group),
-            source=source,
-            metadata=_trace_metadata(group),
-        )
-        ordered.append((group[0].start_nano, trace))
-    ordered.sort(key=lambda pair: pair[0])
-    return [trace for _, trace in ordered]
+    return [trace_from_group(group, source=source) for group in group_spans(spans)]

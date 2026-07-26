@@ -596,6 +596,12 @@ class TinkerChatProvider:
             from the base model name and the sampling client's tokenizer.
         recorder: Optional per-episode span recorder; when present, every
             successful completion records exactly one `TokenSpan`.
+        api_key: Accepted for `get_provider`'s explicit-credential channel and
+            REJECTED when set. Tinker authenticates through the process-wide
+            shared `ServiceClient` (`TINKER_API_KEY`), which is cached per
+            process rather than per credential, so a per-entry key cannot be
+            honored here. Failing loudly beats silently sampling on a
+            different account than the pool entry named.
     """
 
     def __init__(
@@ -605,7 +611,15 @@ class TinkerChatProvider:
         sampling_client: TinkerSampler | None = None,
         renderer: ChatRendering | None = None,
         recorder: TokenRecorder | None = None,
+        api_key: str | None = None,
     ) -> None:
+        if api_key is not None:
+            raise ValueError(
+                "the tinker provider does not accept an explicit api_key: it authenticates "
+                f"through the process-wide shared service client, which reads {TINKER_API_KEY_ENV} "
+                "from the environment; drop api_key_env from the pool entry and export "
+                f"{TINKER_API_KEY_ENV} instead"
+            )
         self.config = config
         self._sampler = sampling_client
         # Only a client the provider built itself may be dropped and rebuilt

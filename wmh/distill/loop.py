@@ -1458,7 +1458,7 @@ def resume_command(name: str, run_dir: Path) -> str:
     @ref included) or the printed command trips the CLI resume conflict
     check.
     """
-    return f"wmh optimize {name} harbor --mode distill --run-dir {run_dir} --resume"
+    return f"wmh optimize harness {name} harbor --mode distill --run-dir {run_dir} --resume"
 
 
 def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:

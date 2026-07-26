@@ -2,7 +2,8 @@
 
 A harness is the scaffold an agent runs with: prompt surfaces, a tool policy, loop parameters, and
 skills, stored as immutable numbered versions with movable aliases (`champion` is what runs by
-default). `init` writes the baseline as v1; `list`/`show` inspect what exists; `wmh optimize`
+default). `init` writes the baseline as v1; `list`/`show` inspect what exists;
+`wmh optimize harness`
 searches for a better harness by **inverting the world model**. Delta variants are scored
 closed-loop against it and gated on non-regression, so the environment model the traces built now
 steers what the agent's scaffold should be. Run one closed-loop with
@@ -58,7 +59,7 @@ from wmh.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmh.providers.base import Provider, ProviderConfig, ToolCallingProvider
 from wmh.providers.registry import get_provider
 
-# The default agent seed's literal CLI name: `wmh optimize pi harbor ...` starts from the
+# The default agent seed's literal CLI name: `wmh optimize harness pi harbor ...` starts from the
 # built-in pi agent and publishes new versions under the store name "pi".
 DEFAULT_SEED_AGENT = "pi"
 _DEFAULT_HARBOR_ITERATIONS = 10
@@ -129,6 +130,20 @@ def show_harness(
         _console.print(surface.content)
 
 
+optimize_app = typer.Typer(
+    help="Optimizers behind one switch: harness (agent-scaffold search) today; route "
+    "(learned inference policy) and training-type optimizers join as subcommands.",
+    no_args_is_help=True,
+)
+
+# Local import placement: route_app imports the optimize package; registering here keeps the
+# whole optimizer family visible in one place.
+from wmh.cli.route_app import route_app  # noqa: E402
+
+optimize_app.add_typer(route_app, name="route")
+
+
+@optimize_app.command("harness")
 def optimize(
     ctx: typer.Context,
     name: str = typer.Argument(
@@ -308,7 +323,7 @@ def optimize(
     elif model != _HARBOR_ENVIRONMENT:
         raise typer.BadParameter(
             "--mode distill requires the harbor environment: "
-            "`wmh optimize <agent> harbor --mode distill ...`; a world-model distill "
+            "`wmh optimize harness <agent> harbor --mode distill ...`; a world-model distill "
             "backend is a documented follow-on and is not available yet"
         )
     if model == _HARBOR_ENVIRONMENT:
@@ -328,7 +343,7 @@ def optimize(
         if world_model_only:
             raise typer.BadParameter(
                 f"{', '.join(world_model_only)} apply only to a world-model environment; "
-                "drop them for `wmh optimize <agent> harbor ...`"
+                "drop them for `wmh optimize harness <agent> harbor ...`"
             )
         # Shared by both modes: 'harbor' must unambiguously mean the benchmark
         # environment, never a stored world model that happens to carry the name.
@@ -413,7 +428,7 @@ def optimize(
     if harbor_only:
         raise typer.BadParameter(
             f"{', '.join(harbor_only)} apply only to the harbor environment; "
-            "use `wmh optimize <agent> harbor ...`"
+            "use `wmh optimize harness <agent> harbor ...`"
         )
     if iterations == 0:
         raise typer.BadParameter(
@@ -684,7 +699,7 @@ def _optimize_harbor(
     if name is None:
         raise typer.BadParameter(
             "provide the seed agent NAME (the literal 'pi' is the built-in default agent): "
-            "`wmh optimize pi harbor --harbor-config ... --task-ids ... --run-dir ...`"
+            "`wmh optimize harness pi harbor --harbor-config ... --task-ids ... --run-dir ...`"
         )
     if backend not in ("local", "e2b"):
         raise typer.BadParameter(f"unknown --backend {backend!r}; choose local or e2b")
@@ -805,7 +820,7 @@ def _optimize_harbor(
     if not result.completed:
         _console.print(
             f"[yellow]checkpointed[/yellow] {len(result.outcomes)}/{config.iterations + 1} "
-            f"boundaries; continue with: [bold]wmh optimize {config.agent} harbor --resume "
+            f"boundaries; continue with: [bold]wmh optimize harness {config.agent} harbor --resume "
             f"--run-dir {run_dir}[/bold]"
         )
         return
@@ -1119,7 +1134,7 @@ def init_harness(
         if store.exists(name):
             raise typer.BadParameter(
                 f"harness {name!r} already exists; new versions are appended by "
-                "`wmh optimize`, and aliases move with `set_alias`"
+                "`wmh optimize harness`, and aliases move with `set_alias`"
             )
         doc = store.save_version(HarnessDoc.baseline(name), alias=CHAMPION_ALIAS)
     except ValueError as exc:  # invalid name -> usage error, not a traceback

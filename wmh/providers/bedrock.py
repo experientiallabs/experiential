@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from wmh.core.types import JsonValue
 from wmh.providers._bedrock_chat import converse_request, converse_response
@@ -14,6 +14,7 @@ from wmh.providers.base import (
     Completion,
     Message,
     ProviderConfig,
+    StreamChunk,
     TokenUsage,
     VerifyResult,
     normalize_chat_temperature,
@@ -21,6 +22,8 @@ from wmh.providers.base import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from botocore.client import BaseClient
 
 # Bedrock speaks the same Anthropic Messages schema as the direct API, pinned by this version tag.
@@ -38,6 +41,7 @@ class _ContentBlock(TypedDict):
 class _Usage(TypedDict):
     input_tokens: int
     output_tokens: int
+    cache_read_input_tokens: NotRequired[int]
 
 
 class _BedrockResponse(TypedDict):
@@ -79,7 +83,14 @@ def _is_nova(model_id: str) -> bool:
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
 
-    def __init__(self, config: ProviderConfig) -> None:
+    def __init__(self, config: ProviderConfig, *, api_key: str | None = None) -> None:
+        if api_key is not None:
+            # Keeps the backend union uniformly constructible from get_provider while failing
+            # loudly: Bedrock has no API-key auth to send the credential to.
+            raise ValueError(
+                "Bedrock authenticates with AWS credentials (profile/role), not an API key; "
+                "drop api_key/api_key_env for this provider"
+            )
         self.config = config
         self._client: BaseClient | None = None
         # Model capability lives in WMH's canonical catalog. Subclasses may
@@ -148,9 +159,13 @@ class BedrockProvider:
         raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
         data = cast("_BedrockResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
+        # Anthropic-native semantics: cache reads reported BESIDE input_tokens; normalize to
+        # TokenUsage's cached-as-subset contract by summing.
+        cache_read = data["usage"].get("cache_read_input_tokens", 0)
         usage = TokenUsage(
-            input_tokens=data["usage"]["input_tokens"],
+            input_tokens=data["usage"]["input_tokens"] + cache_read,
             output_tokens=data["usage"]["output_tokens"],
+            cached_input_tokens=cache_read,
         )
         return Completion(text=text, usage=usage)
 
@@ -162,6 +177,56 @@ class BedrockProvider:
         )
         raw = self._get_client().converse(**converse_request(normalized, self.config.model))
         return converse_response(raw, self.config.model)
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Iterator[StreamChunk]:
+        """Stream a completion via ConverseStream (model-agnostic, Claude included).
+
+        Temperature is forwarded only when the model catalog says the model samples (Claude 4.8+
+        rejects sampling params), matching the non-streaming paths.
+        """
+        inference_config: dict[str, JsonValue] = {"maxTokens": max_tokens}
+        if self._forward_temperature:
+            inference_config["temperature"] = temperature
+        kwargs: dict[str, JsonValue] = {
+            "modelId": self.config.model,
+            "messages": [{"role": m.role, "content": [{"text": m.content}]} for m in messages],
+            "inferenceConfig": inference_config,
+        }
+        if system:
+            kwargs["system"] = [{"text": system}]
+        response = self._get_client().converse_stream(**kwargs)
+        usage = TokenUsage()
+        stream = response["stream"]
+        try:
+            for event in stream:
+                if "contentBlockDelta" in event:
+                    text = event["contentBlockDelta"]["delta"].get("text", "")
+                    if text:
+                        yield StreamChunk(delta=text)
+                elif "metadata" in event:
+                    event_usage = event["metadata"].get("usage")
+                    if event_usage is not None:
+                        # Converse reports cacheReadInputTokens beside inputTokens; normalize
+                        # to the cached-as-subset contract.
+                        cache_read = int(event_usage.get("cacheReadInputTokens", 0) or 0)
+                        usage = TokenUsage(
+                            input_tokens=int(event_usage["inputTokens"]) + cache_read,
+                            output_tokens=int(event_usage["outputTokens"]),
+                            cached_input_tokens=cache_read,
+                        )
+        finally:
+            # botocore's EventStream pins the HTTP connection until closed.
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+        yield StreamChunk(done=True, usage=usage)
 
     def _complete_converse(
         self,
@@ -186,9 +251,11 @@ class BedrockProvider:
         response = self._get_client().converse(**kwargs)
         blocks = response["output"]["message"]["content"]
         text = "".join(block["text"] for block in blocks if "text" in block)
+        cache_read = int(response["usage"].get("cacheReadInputTokens", 0) or 0)
         usage = TokenUsage(
-            input_tokens=int(response["usage"]["inputTokens"]),
+            input_tokens=int(response["usage"]["inputTokens"]) + cache_read,
             output_tokens=int(response["usage"]["outputTokens"]),
+            cached_input_tokens=cache_read,
         )
         return Completion(text=text, usage=usage)
 

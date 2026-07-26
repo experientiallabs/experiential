@@ -1209,3 +1209,12 @@ def test_a_successful_call_resets_the_expiry_streak(monkeypatch: pytest.MonkeyPa
         provider.note_healthy_call()
 
     assert rebuilds == [], "a reset streak must never escalate"
+
+
+def test_an_explicit_api_key_is_rejected_rather_than_silently_ignored() -> None:
+    """`get_provider(..., api_key=...)` promises the backend authenticates with exactly
+    that key. Tinker cannot: its `ServiceClient` is cached per PROCESS off
+    `TINKER_API_KEY`, not per credential, so honoring the argument silently would sample
+    on whichever account the environment names."""
+    with pytest.raises(ValueError, match="does not accept an explicit api_key"):
+        get_provider(_config(), api_key="sk-pool-entry")

@@ -1,0 +1,26 @@
+{
+  "n": 40,
+  "accuracy": 0.8,
+  "recorded_pass": 20,
+  "recorded_fail": 20,
+  "confusion": {
+    "tp": 16,
+    "tn": 16,
+    "false_pass": 4,
+    "false_fail": 4
+  },
+  "false_pass_rate": 0.2,
+  "false_fail_rate": 0.2,
+  "calibration": {
+    "unanimous_3of3": {
+      "n": 31,
+      "correct": 25,
+      "accuracy": 0.8064516129032258
+    },
+    "split_2of3": {
+      "n": 9,
+      "correct": 7,
+      "accuracy": 0.7777777777777778
+    }
+  }
+}

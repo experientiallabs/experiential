@@ -1,4 +1,4 @@
-# Distill mode (`wmh optimize <agent> harbor --mode distill`)
+# Distill mode (`wmh optimize harness <agent> harbor --mode distill`)
 
 The other optimizer modes edit the agent's *harness*; distill mode trains the agent's *model*.
 It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
@@ -141,7 +141,7 @@ unpriced meters and no `budget.max_usd` refuses to start non-interactively.
 ## Running it
 
 ```bash
-wmh optimize pi harbor --mode distill \
+wmh optimize harness pi harbor --mode distill \
   --distill-config run.toml \
   --task-ids train-task-ids.json \
   --holdout-task-ids holdout-task-ids.json \
@@ -286,7 +286,7 @@ run hits `budget.max_usd`, it saves what it can and exits with the exact resume 
 the cap in the config and rerun with:
 
 ```bash
-wmh optimize pi harbor --mode distill --run-dir runs/distill-01 --resume
+wmh optimize harness pi harbor --mode distill --run-dir runs/distill-01 --resume
 ```
 
 A resume needs only `--run-dir`: the CLI reloads the pinned splits, backend, and seed harness

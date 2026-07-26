@@ -65,7 +65,7 @@ uv run pytest -q
 
 ## Harness optimization
 
-- `wmh optimize <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
+- `wmh optimize harness <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
   harness-creation workflow. Keep CLI wiring in `wmh/cli/harness_app.py` and search behavior in
   `wmh/harness/create.py` (world-model delta search) or `wmh/harness/population.py` plus
   `wmh/harness/project_proposer.py` (the `harbor` environment's complete-source population
@@ -83,8 +83,8 @@ uv run pytest -q
 - Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
   deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
   promotion or rollback.
-- `wmh optimize <agent> harbor --mode distill` is the third optimization surface: instead of
-  editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
+- `wmh optimize harness <agent> harbor --mode distill` is the third optimization surface: instead
+  of editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
   student from rollouts of harbor's OWN `terminus_2` agent on harbor tasks (measured: our pi
   scaffold needed 2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59%
   harness loss, and this mode measures model quality, not scaffold quality). Terminus-2 samples
@@ -103,7 +103,7 @@ uv run pytest -q
   student's own sampled tokens for the collapse a KL curve hides; their thresholds are fractions
   of a baseline each run measures at its first training step and persists in its run manifest,
   never absolute nats or token counts. See `docs/reference/distill.md` for the user-facing how-to.
-- `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize --tasks` currently
+- `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize harness --tasks` currently
   requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
 - Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,
   `proposer_test.py`, and the scenario builder or verification tests as applicable.

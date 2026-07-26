@@ -24,6 +24,7 @@ from wmh.ingest import mastra as mastra  # noqa: F401
 from wmh.ingest import messages as messages  # noqa: F401
 from wmh.ingest import otel_genai as otel_genai  # noqa: F401
 from wmh.ingest import phoenix as phoenix  # noqa: F401
+from wmh.ingest import postgres as postgres  # noqa: F401
 from wmh.ingest import posthog as posthog  # noqa: F401
 from wmh.ingest.adapter import (
     TraceAdapter,

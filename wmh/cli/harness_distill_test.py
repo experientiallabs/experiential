@@ -1,4 +1,4 @@
-"""CLI tests for `wmh optimize <agent> harbor --mode distill`, driven via CliRunner.
+"""CLI tests for `wmh optimize harness <agent> harbor --mode distill`, driven via CliRunner.
 
 `run_distillation` is monkeypatched to a recorder (no real tinker or harbor):
 these tests pin the CLI lifecycle around it: input loading and pinning, the
@@ -178,6 +178,7 @@ def _invoke(tmp_path: Path, *extra: str, agent: str = "pi", input: str | None = 
         app,
         [
             "optimize",
+            "harness",
             agent,
             "harbor",
             "--mode",
@@ -306,7 +307,8 @@ def test_distill_budget_abort_prints_the_resume_command(
     _write_inputs(tmp_path)
     error = DistillBudgetError(
         "budget exhausted: $51.00 spent against the $50.00 cap",
-        resume_command=f"wmh optimize pi harbor --mode distill --run-dir {tmp_path / 'run'} "
+        resume_command=f"wmh optimize harness pi harbor --mode distill "
+        f"--run-dir {tmp_path / 'run'} "
         "--resume",
         spent_usd=51.0,
         max_usd=50.0,
@@ -428,6 +430,7 @@ def test_distill_requires_its_input_flags_to_start(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",
@@ -454,6 +457,7 @@ def test_distill_requires_a_run_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",
@@ -591,6 +595,7 @@ def test_distill_resume_reuses_the_pinned_splits(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",

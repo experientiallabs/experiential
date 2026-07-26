@@ -53,6 +53,35 @@ class EnvState(BaseModel):
     scratchpad: str = ""
 
 
+class ErrorClass(StrEnum):
+    """Who owns a step's failure: the model (retrainable) or the environment (not)."""
+
+    CONTROLLABLE = "controllable"  # the LLM call itself failed (refusal, bad call, provider error)
+    ENVIRONMENTAL = "environmental"  # the tool/environment failed executing a well-formed action
+
+
+class StepAttribution(BaseModel):
+    """Per-step provenance of the LLM call behind an action.
+
+    These fields are what make an ingested corpus policy-trainable: a routing optimizer clusters
+    and prices steps by which model produced them, at what token/dollar/latency cost, and whether
+    failures were the model's fault. All fields are optional; adapters populate them best-effort
+    from whatever the source recorded, and a step with nothing known carries no attribution at all.
+    """
+
+    model: str | None = None  # the serving model id (response model preferred over request)
+    provider: str | None = None  # the model provider/system (e.g. "anthropic", "openai")
+    config: JsonObject = Field(
+        default_factory=dict
+    )  # request params (temperature, max_tokens, ...)
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cost_usd: float | None = None
+    latency_ms: float | None = None
+    error_class: ErrorClass | None = None
+    provenance: str | None = None  # versioned capture-system marker, when the source carries one
+
+
 class Step(BaseModel):
     """One (state, action) -> observation transition. The unit of retrieval and scoring."""
 
@@ -61,6 +90,7 @@ class Step(BaseModel):
     state_before: EnvState = Field(default_factory=EnvState)
     task: str | None = None  # originating instruction (tau in DreamGym Eq. 4)
     raw_span_ids: list[str] = Field(default_factory=list)
+    attribution: StepAttribution | None = None
 
 
 class Trace(BaseModel):

@@ -94,3 +94,21 @@ def test_get_embedder_missing_provider_config_raises() -> None:
     config = HarnessConfig(embed_provider=EmbedderKind.OPENAI)
     with pytest.raises(ValueError, match="no provider config for openai"):
         get_embedder(config)
+
+
+def test_batched_embedder_chunks_requests() -> None:
+    from wmh.retrieval.embedders import BatchedEmbedder
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            self.calls.append(len(texts))
+            return [[float(len(t))] for t in texts]
+
+    recorder = _Recorder()
+    batched = BatchedEmbedder(recorder, batch=2)
+    vectors = batched.embed(["a", "bb", "ccc", "dddd", "eeeee"])
+    assert recorder.calls == [2, 2, 1]
+    assert vectors == [[1.0], [2.0], [3.0], [4.0], [5.0]]

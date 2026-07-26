@@ -41,6 +41,8 @@ def _action_attrs(
         attrs.append(_attr("wmh.state.structured", json.dumps(step.state_before.structured)))
     if step.state_before.scratchpad:
         attrs.append(_attr("wmh.state.scratchpad", step.state_before.scratchpad))
+    if step.attribution is not None:
+        attrs.append(_attr("wmh.attribution", step.attribution.model_dump_json(exclude_none=True)))
     return attrs
 
 

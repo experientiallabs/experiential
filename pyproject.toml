@@ -15,6 +15,9 @@ dependencies = [
     "uvicorn>=0.38",
     "pydantic>=2.6",
     "numpy>=1.26",
+    # The routing optimizer's clustering stack (KMeans + Normalizer), matching the Avengers
+    # reference implementation it replicates; serving only reads fitted centroids (numpy).
+    "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
     # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
@@ -55,6 +58,9 @@ harbor = ["harbor==0.20.0"]
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
 # lazily (wmh.connect.notion), same contract as the e2b extra above.
 connectors = ["mcp>=1.27"]
+# The Postgres trace source (`wmh ingest --source postgres`): the driver is imported lazily
+# inside the adapter's pull path, same contract as the vendor-SDK extras.
+postgres = ["psycopg[binary]>=3.1"]
 # On-policy distillation (`wmh.distill` + the tinker provider): trains a LoRA student on
 # Tinker from harbor rollouts. Imported lazily, same contract as the e2b extra. The cookbook
 # pin tracks the 0.4.x renderer surface this integration was verified against; Tinker's model
@@ -68,7 +74,7 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,e2b,connectors,harbor,distill]",
+    "world-model-harness[otel,viz,e2b,connectors,harbor,postgres,distill]",
 ]
 
 [dependency-groups]
