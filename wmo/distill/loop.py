@@ -86,7 +86,7 @@ from llm_waterfall.types import ChatMessage
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
-from wmo.distill.config import DistillConfig, PricingConfig
+from wmo.distill.config import DistillConfig, PricingConfig, TeacherConfig
 from wmo.distill.cost import (
     METER_NAMES,
     BudgetExhausted,
@@ -1734,6 +1734,43 @@ class _RunBudget:
         return self._meter.lines()
 
 
+UNWIRED_TEACHER_BACKEND = (
+    'teacher.backend = "openai_compat" (chunk alignment) validates but is not wired up on '
+    "this build: the byte-aligned chunk scorer in wmh.distill.xtoken has no caller yet, so "
+    "the loop would score this teacher through Tinker with same-tokenizer alignment and "
+    'ignore teacher.endpoint entirely. Set teacher.backend = "tinker" with a '
+    "Tinker-lineup teacher that shares the student's tokenizer (dropping teacher.endpoint, "
+    "teacher.tokenizer, and teacher.alignment), or wait for the cross-tokenizer change that "
+    "activates the openai_compat path."
+)
+"""Why a schema-valid `openai_compat` teacher still cannot run (see `_require_wired_teacher`)."""
+
+
+def _require_wired_teacher(teacher: TeacherConfig) -> None:
+    """Refuse a teacher backend this build validates but cannot execute.
+
+    `TeacherConfig` deliberately still accepts `openai_compat` plus chunk
+    alignment, so the cross-tokenizer change can land against an unchanged
+    schema. Nothing consumes it yet, and the failure it would otherwise
+    produce is silent rather than loud: `TinkerTeacher` never reads
+    `backend`, so a config naming a vLLM endpoint would be served from Tinker
+    under the wrong alignment and the resulting logprobs would be garbage
+    against tokens they do not correspond to. This is the fence that turns
+    that into an error at run start, before any rollout is paid for.
+
+    Args:
+        teacher: The run's validated teacher section.
+
+    Raises:
+        NotImplementedError: If `teacher.backend` is not `tinker`.
+    """
+    match teacher.backend:
+        case "tinker":
+            return
+        case "openai_compat":
+            raise NotImplementedError(UNWIRED_TEACHER_BACKEND)
+
+
 class _DistillRun:
     """One orchestrated distillation run; `run_distillation` drives it."""
 
@@ -1768,6 +1805,9 @@ class _DistillRun:
         self._live_trial_preflight = live_trial_preflight
         self._tracker = tracker
         self._store = DistillRunStore(run_dir)
+        # Before the run dir, the service client, or any rollout: a teacher backend
+        # this build cannot serve must fail at run start, not after paid rollouts.
+        _require_wired_teacher(cfg.teacher)
         self._teacher_identity = cfg.teacher.checkpoint or cfg.teacher.model
         # Set by _preflight (the renderer needs the training client's tokenizer);
         # kept for sample-rollout logging across every later batch.
@@ -3445,6 +3485,9 @@ def run_distillation(
             wandb tracking enabled without credentials.
         RuntimeError: On preflight failures (each message says what to fix),
             or resume with nothing to resume.
+        NotImplementedError: If `cfg.teacher.backend` is a backend this build
+            validates but cannot serve (see `_require_wired_teacher`); raised
+            at run start, before any rollout is paid for.
         ImportError: If no service client is injected and the tinker SDK is
             not installed, or wandb tracking is enabled without the wandb SDK.
         DistillBudgetError: When `budget.max_usd` is exhausted; state is

@@ -2578,6 +2578,58 @@ def test_overlapping_splits_are_rejected(tmp_path: Path) -> None:
         )
 
 
+def _openai_compat_cfg() -> DistillConfig:
+    """A config the schema accepts but this build cannot serve."""
+    return _cfg().model_copy(
+        update={
+            "teacher": TeacherConfig(
+                backend="openai_compat",
+                model="zai-org/GLM-5.2",
+                endpoint="http://127.0.0.1:8000/v1",
+                tokenizer="zai-org/GLM-5.2",
+                alignment="chunk",
+            )
+        }
+    )
+
+
+def test_openai_compat_teacher_config_still_validates() -> None:
+    """The schema deliberately keeps accepting the cross-tokenizer combination,
+    so the change that activates it lands against an unchanged validator. The
+    fence is at runtime, not here."""
+    cfg = _openai_compat_cfg()
+    assert cfg.teacher.backend == "openai_compat"
+    assert cfg.teacher.alignment == "chunk"
+
+
+def test_unwired_teacher_backend_raises_at_run_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An openai_compat teacher fails before the run spends anything.
+
+    Nothing consumes chunk alignment on this build and `TinkerTeacher` never
+    reads `backend`, so without this fence the run would serve the teacher
+    from Tinker under same-tokenizer alignment, silently ignore
+    `teacher.endpoint`, and bill a full training run for logprobs taken
+    against the wrong vocabulary. Failing at construction is what makes that
+    unpayable: no rollout, no run dir, no adapter.
+    """
+    env = _setup(tmp_path, monkeypatch)
+
+    with pytest.raises(NotImplementedError, match="not wired up on this build") as excinfo:
+        _run(env, _openai_compat_cfg())
+
+    message = str(excinfo.value)
+    # The message has to name the way out, not just the refusal.
+    assert 'teacher.backend = "tinker"' in message
+    assert "teacher.endpoint" in message
+    # Nothing was started: no rollouts, no training client, no run artifacts.
+    assert env.rollouts.calls == []
+    assert env.service.trainings == []
+    assert not env.run_dir.exists()
+    assert env.progress == []
+
+
 def test_tinker_provider_config_is_the_one_shape_every_rollout_samples_through() -> None:
     """The student sampler's provider config IS the shared helper's output.
 
