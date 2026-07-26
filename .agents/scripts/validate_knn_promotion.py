@@ -36,6 +36,8 @@ from wmh.optimize.policy import KNN_BANK_FILENAME, EmbedderSpec, select_model
 from wmh.optimize.routing import evaluate_policy
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+FAILURES: list[str] = []
+
 logger = logging.getLogger("validate-knn")
 
 DATA = Path("~/Desktop/Projects/wmh-routing-data").expanduser()
@@ -209,14 +211,16 @@ def ours9_gate(*, se_floor: bool) -> None:
         statistics.mean(cost_ratios) * 100,
         CHAMPION_DELTA,
     )
-    verdict = "PASS" if abs(mean_delta - CHAMPION_DELTA) <= DELTA_TOLERANCE and wins == 5 else "FAIL"
+    passed = abs(mean_delta - CHAMPION_DELTA) <= DELTA_TOLERANCE and wins == 5
     logger.info(
         "GATE se_floor=%s: %s (needs |delta - %.4f| <= %.3f and 5/5 wins)",
         se_floor,
-        verdict,
+        "PASS" if passed else "FAIL",
         CHAMPION_DELTA,
         DELTA_TOLERANCE,
     )
+    if not passed:
+        FAILURES.append(f"ours9 gate se_floor={se_floor}")
 
 
 def confidence_curve(matrix_name: str, cache_name: str, *, rag_num: int, fallback: str) -> None:
@@ -292,3 +296,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    if FAILURES:
+        logger.error("VALIDATION FAILED: %s", ", ".join(FAILURES))
+        sys.exit(1)

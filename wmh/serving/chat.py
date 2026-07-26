@@ -260,10 +260,14 @@ class EndpointRuntime:
     def _embedder(self) -> Embedder | None:
         """Build the policy's embedder once per runtime, not once per request.
 
+        Static policies never embed, so their (possibly unbuildable-in-this-environment)
+        embedder spec must not be constructed at all: a static route has to keep serving
+        even when an azure spec's credentials are absent here.
+
         An azure spec otherwise constructs a fresh SDK client (TLS handshake and all) inside
         every request's latency budget. Double-checked locking mirrors provider_for.
         """
-        if self.policy.embedder is None:
+        if self.policy.kind == "static" or self.policy.embedder is None:
             return None
         with self._lock:
             embedder = self._policy_embedder

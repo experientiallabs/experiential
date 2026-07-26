@@ -468,3 +468,33 @@ def test_runtime_builds_the_policy_embedder_once(
             json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
         )
     assert builds["n"] == 1
+
+
+def test_static_policy_never_builds_its_embedder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A static route must keep serving even when the embedder spec cannot initialize here.
+    from wmh.optimize.policy import EmbedderSpec
+
+    def exploding_build(self: EmbedderSpec) -> object:
+        raise RuntimeError("no credentials in this environment")
+
+    monkeypatch.setattr(EmbedderSpec, "build", exploding_build)
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(
+            kind="static",
+            default_model="haiku-4-5",
+            pool=_pool(),
+            embedder=EmbedderSpec(dim=64),
+        ),
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 200
