@@ -1,8 +1,8 @@
 # World Model Optimizer
 
-`wmo` is an open-source project for running and building continuously improving agents. It
-includes a flexible agent runtime, a world model that simulates tool calls, and an optimizer that
-builds task-specific harnesses for stronger performance at lower cost.
+`wmo` is an open-source project for running and building continuously improving agents. Register the
+models you already pay for, and it gives you one OpenAI-compatible endpoint that routes each request
+to the cheapest one that can handle it, measured on your own traces rather than assumed.
 
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
@@ -14,27 +14,50 @@ builds task-specific harnesses for stronger performance at lower cost.
 
 ## Getting started
 
-### Local setup
-
-Install WMO, choose the model provider for the built-in runtime agent, and start a local run:
+**1. Register your models.** Pick a provider, verify the credential, and choose which of its models
+the router may use. Re-run it per provider to build the pool up, say five over OpenRouter and five
+over Azure:
 
 ```bash
 pip install world-model-optimizer
 wmo providers set
-wmo run --task "Inspect this repository and explain it"
 ```
 
-Build a named world model from collected traces:
+**2. Tune a router on your traces.** The sweep measures every registered model against tasks drawn
+from your own corpus; the fit turns that into a routing policy:
 
 ```bash
-wmo build --file traces.jsonl --name my-environment
+wmo build --file traces.jsonl --name my-endpoint
+
+wmo optimize route sweep my-endpoint --pool .wmo/pool.toml \
+  --traces traces.otel.jsonl --out matrix.json
+wmo optimize route fit matrix.json --kind knn --fallback gpt-5.5 \
+  --out .wmo/models/my-endpoint/policy.json
 ```
 
-Then optimize an agent harness against that model and a set of tasks:
+`sweep` runs real episodes against every candidate, so it estimates the cost and confirms before
+spending. `--fallback` is served whenever the evidence is too thin to justify anything cheaper.
+`fit --out` must be the path `serve` reads.
+
+**3. Serve it.**
 
 ```bash
-wmo optimize harness my-agent my-environment --tasks tasks.jsonl
+wmo serve --name my-endpoint
 ```
+
+Point your agent's base URL at it. Chat and tool calling are forwarded; `n > 1`, `response_format`
+and `logprobs` are rejected with a 400 rather than silently dropped.
+
+Check what you bought, against the model you were using before:
+
+```bash
+wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
+  --baseline gpt-5.5
+```
+
+Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md), serve
+a single model with no routing via `wmo optimize route pin`, or optimize the agent scaffold with
+`wmo optimize harness`.
 
 ### Hosted platform
 
