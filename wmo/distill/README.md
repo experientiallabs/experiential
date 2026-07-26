@@ -20,15 +20,9 @@ teacher-minus-student gap as a per-token advantage on realized tokens; `topk_ce`
 cross-entropy over the teacher's top-k candidates, which also supervises tokens the student never
 sampled, at k times the training-token bill.
 
-### Measured: Qwen3.5-9B student, Qwen3.6-27B teacher, TerminalBench-2
-
-17 held-out tasks, 3 attempts each, 51 trials per arm. No trial is missing from any denominator.
-
-| arm | solve rate | turns / episode |
-| --- | --- | --- |
-| teacher (27B) | 49.0% (25/51) | 28.5 |
-| student before | 21.6% (11/51) | 53.6 |
-| student after | 27.5% (14/51) | 29.4 |
+Run so far: Qwen3.5-9B student distilled from a Qwen3.6-27B teacher on 17 held-out
+TerminalBench-2 tasks, 51 trials per arm. Solve rate went 21.6% to 27.5% against the teacher's
+49.0%, and turns per episode went 53.6 to 29.4 against the teacher's 28.5.
 
 ## 2. Off-policy
 
@@ -54,6 +48,33 @@ chunk rather than per token.
 **Not runnable on this build.** `wmo/distill/xtoken/` is present but inert (no importers), and the
 runtime rejects `teacher.backend = "openai_compat"` even though the config schema validates it.
 PR #258 activates the path.
+
+## Configs
+
+A run is defined by one TOML passed as `--config`. There is no generator and no default file: you
+copy the closest checked-in example and edit it. They live in `.agents/distill/`:
+
+| file | what it is |
+| --- | --- |
+| `distill-smoke-dev.toml` | cheapest same-family pair, `backend = "local"`, 3 steps. Start here. |
+| `distill-headline.toml` | a full-size run |
+| `distill-super-anchor.toml` | `importance_sampling` arm of the objective comparison |
+| `distill-super-topk.toml` | `topk_ce` arm of the same comparison |
+
+Three sections are required and have no defaults: `[student]`, `[teacher]`, `[harbor]`. Everything
+else defaults: `[rollout]`, `[train]`, `[sampling]`, `[warmup]`, `[eval]`, `[gate]`, `[pricing]`,
+`[budget]`, `[tripwire]`, `[wandb]`. The schema is `DistillConfig` in
+[`config.py`](config.py), and it is `extra="forbid"`, so a typo in a key is an error at load
+rather than a silently ignored setting.
+
+Two that are easy to miss. `[harbor] job_template` points at a YAML defining the task environment,
+and `[rollout.renderers]` maps each model name to a renderer: the stock reasoning renderers hand
+harbor's parser a list and kill the trial, so reasoning models need the `wmo/*_verbatim` wrappers in
+[`renderers.py`](renderers.py). Both checked-in smoke configs show the shape.
+
+`--config` is required to start a run and optional to resume: the run store snapshots the exact
+config to `<run-dir>/config.toml`, and a bare `--resume` reloads that. Passing `--config` on a
+resume is how you raise `budget.max_usd` on a run that hit its cap.
 
 ## What a run produces
 
