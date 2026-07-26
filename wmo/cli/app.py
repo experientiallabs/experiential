@@ -301,6 +301,13 @@ def providers_set(
     """
     if tier is not None and tier not in pool_registry.TIERS:
         raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")
+    if (input_per_mtok is None) != (output_per_mtok is None):
+        # A pool entry takes both prices or neither, so half a pair would be silently dropped
+        # (interactively) or rejected as an invalid entry (with --pool-model).
+        raise typer.BadParameter(
+            "set both --input-per-mtok and --output-per-mtok, or neither; a pool entry prices "
+            "prompt and completion tokens together"
+        )
     existing = load_settings(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:

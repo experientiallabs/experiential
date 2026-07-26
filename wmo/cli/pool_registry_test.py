@@ -9,6 +9,7 @@ reaches the network.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 
@@ -27,9 +28,10 @@ from wmo.cli.pool_registry import (
     run_pool_registry,
 )
 from wmo.config import PROVIDER_ENV_VARS
-from wmo.providers.base import ProviderKind
+from wmo.providers.base import ProviderKind, VerifyResult
 from wmo.providers.catalog import list_provider_models
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.providers.pool import PoolEntry
 from wmo.tracking.pricing import ModelPrice
 
 _SONNET = "anthropic/claude-sonnet-4.5"
@@ -85,12 +87,18 @@ def _catalog_and_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
             monkeypatch.setenv(var, "test-value")
 
 
+def _ok(entry: PoolEntry) -> VerifyResult:
+    """A live ping that succeeds. Every test injects one; nothing here reaches a backend."""
+    return VerifyResult(ok=True, kind=entry.kind, model=entry.model)
+
+
 def _drive(
     pool: Path,
     lines: list[str],
     *,
     kind: ProviderKind = ProviderKind.OPENROUTER,
     options: EntryOptions | None = None,
+    verify: Callable[[PoolEntry], VerifyResult] = _ok,
 ) -> tuple[int, str, _Script]:
     """Run the registry against `pool` with `lines` as the user's answers."""
     console = Console(file=StringIO(), width=120, no_color=True, highlight=False)
@@ -102,6 +110,7 @@ def _drive(
         pool_path=pool,
         default_kind=kind,
         options=options or EntryOptions(),
+        verify=verify,
     )
     assert isinstance(console.file, StringIO)
     return written, console.file.getvalue(), script
@@ -532,6 +541,153 @@ def test_register_model_ids_resolves_a_bedrock_id_from_the_built_in_registry(
     assert entry.model == "us.anthropic.claude-opus-4-8"
     assert entry.model_type == "claude-opus-4-8"
     assert entry.region == "us-east-1"
+
+
+def test_every_pass_is_live_verified_including_a_switched_backend(tmp_path: Path) -> None:
+    # Presence of an environment variable is not proof it holds a working key. A backend the
+    # command never verified must not silently contribute candidates that 401 at sweep time,
+    # after the sweep has paid for every candidate ahead of them.
+    pool = tmp_path / "pool.toml"
+    seen: list[PoolEntry] = []
+
+    def record(entry: PoolEntry) -> VerifyResult:
+        seen.append(entry)
+        return _ok(entry)
+
+    _drive(
+        pool,
+        [
+            "y",
+            "openrouter",
+            *_openrouter_pass(_SONNET),
+            "y",
+            "azure",
+            "gpt-5.4",
+            "",
+            "frontier",
+            "",
+            "prod-gpt54",
+            "2025-01-01-preview",
+            "",
+            "n",
+        ],
+        verify=record,
+    )
+
+    assert [(entry.kind, entry.model) for entry in seen] == [
+        (ProviderKind.OPENROUTER, _SONNET),
+        (ProviderKind.AZURE_OPENAI, "gpt-5.4"),
+    ]
+    # The ping goes out with the connection details the entry will be written with.
+    assert seen[1].deployment == "prod-gpt54"
+    assert seen[1].api_version == "2025-01-01-preview"
+
+
+def test_one_ping_covers_a_whole_pass(tmp_path: Path) -> None:
+    # The ping costs real money, so it proves the credential once per pass rather than once per
+    # candidate; `wmo providers verify` is what bills a call per model.
+    pool = tmp_path / "pool.toml"
+    calls = 0
+
+    def count(entry: PoolEntry) -> VerifyResult:
+        nonlocal calls
+        calls += 1
+        return _ok(entry)
+
+    written, _, _ = _drive(
+        pool,
+        ["y", "openrouter", *_openrouter_pass(_SONNET, _DEEPSEEK), "n"],
+        verify=count,
+    )
+
+    assert written == 2
+    assert calls == 1
+
+
+def test_a_failed_ping_registers_nothing_unless_it_is_overridden(tmp_path: Path) -> None:
+    pool = tmp_path / "pool.toml"
+
+    def refuse(entry: PoolEntry) -> VerifyResult:
+        return VerifyResult(ok=False, kind=entry.kind, model=entry.model, detail="401 bad key")
+
+    written, output, _ = _drive(
+        pool,
+        ["y", "openrouter", _SONNET, "", "frontier", "", "n", "n"],
+        verify=refuse,
+    )
+
+    assert written == 0
+    assert not pool.exists()
+    assert "401 bad key" in output
+
+
+def test_a_failed_ping_can_be_overridden_for_a_machine_without_the_key(tmp_path: Path) -> None:
+    # A roster is legitimately built where the credential is not, so the failure is reported and
+    # the choice is the user's rather than a silent discard of everything they just picked.
+    pool = tmp_path / "pool.toml"
+
+    def refuse(entry: PoolEntry) -> VerifyResult:
+        return VerifyResult(ok=False, kind=entry.kind, model=entry.model, detail="offline")
+
+    written, _, _ = _drive(
+        pool,
+        ["y", "openrouter", _SONNET, "", "frontier", "", "y", "", "n"],
+        verify=refuse,
+    )
+
+    assert written == 1
+    assert read_pool_entries(pool)[0].model == _SONNET
+
+
+def test_half_a_price_pair_still_prompts_for_both(tmp_path: Path) -> None:
+    # `PoolEntry` takes both prices or neither, so treating a supplied input price as "already
+    # priced" would skip the model with a validation error instead of asking for the other half.
+    pool = tmp_path / "pool.toml"
+    written, _, _ = _drive(
+        pool,
+        ["y", "openai", "self-hosted", "y", "", "open", "", "0.2", "0.8", "", "n"],
+        options=EntryOptions(input_per_mtok=0.1),
+    )
+
+    assert written == 1
+    entry = read_pool_entries(pool)[0]
+    assert (entry.input_per_mtok, entry.output_per_mtok) == (0.2, 0.8)
+
+
+def test_one_azure_deployment_cannot_describe_several_pool_models(tmp_path: Path) -> None:
+    # Azure sends the deployment as the request's model id, so reusing one deployment across
+    # several ids registers several candidates that all call the same deployment.
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+
+    with pytest.raises(typer.BadParameter, match="once per deployment"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.AZURE_OPENAI,
+            model_ids=["gpt-5.4", "gpt-5.5"],
+            options=EntryOptions(deployment="prod"),
+        )
+    assert not pool.exists()
+
+
+def test_several_azure_pool_models_default_to_their_own_deployment_names(tmp_path: Path) -> None:
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+
+    register_model_ids(
+        console,
+        pool_path=pool,
+        kind=ProviderKind.AZURE_OPENAI,
+        model_ids=["gpt-5.4", "gpt-5.5"],
+        options=EntryOptions(),
+    )
+
+    entries = read_pool_entries(pool)
+    assert [(entry.name, entry.deployment) for entry in entries] == [
+        ("gpt-5.4", "gpt-5.4"),
+        ("gpt-5.5", "gpt-5.5"),
+    ]
 
 
 @pytest.mark.parametrize("kind", list(ProviderKind))

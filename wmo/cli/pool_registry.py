@@ -27,6 +27,7 @@ Design rules this module holds to:
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import typer
@@ -38,7 +39,7 @@ from rich.table import Table
 from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION
 from wmo.cli.ui import PromptReader, creds_note, ensure_credentials, has_credentials, select_option
 from wmo.config import PROVIDER_ENV_VARS
-from wmo.providers.base import ProviderKind
+from wmo.providers.base import ProviderKind, VerifyResult
 from wmo.providers.catalog import CatalogModel, CatalogSource, ProviderCatalog, list_provider_models
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.pool import (
@@ -46,12 +47,17 @@ from wmo.providers.pool import (
     PoolLockTimeout,
     Tier,
     load_pool,
+    pool_provider,
     static_requirements,
     upsert_pool_entry,
 )
 from wmo.tracking.pricing import price_for
 
 logger = logging.getLogger(__name__)
+
+# The live provider ping, as a seam: one cheap completion against a built candidate. Injected
+# so tests never reach a backend, mirroring `run_build_wizard`'s `verify` parameter.
+ProviderCheck = Callable[[PoolEntry], VerifyResult]
 
 POOL_FILENAME = "pool.toml"
 """The roster's name inside a project root, so `--root <dir>` keeps settings and pool together."""
@@ -140,6 +146,7 @@ def run_pool_registry(
     pool_path: Path,
     default_kind: ProviderKind,
     options: EntryOptions,
+    verify: ProviderCheck | None = None,
 ) -> int:
     """Offer to register routing candidates, one provider at a time, until the user is done.
 
@@ -156,6 +163,7 @@ def run_pool_registry(
         pool_path: The roster TOML to write.
         default_kind: The provider just configured; the suggested backend for the first pass.
         options: Backend knobs from the command's own flags, applied to the first pass.
+        verify: The live provider ping, one per pass; None uses the real one.
 
     Returns:
         How many entries were written across every pass.
@@ -178,7 +186,7 @@ def run_pool_registry(
             pass_options = EntryOptions()
             ensure_credentials(console, ask_secret, kind.value)
         written += register_from_provider(
-            console, ask, pool_path=pool_path, kind=kind, options=pass_options
+            console, ask, pool_path=pool_path, kind=kind, options=pass_options, verify=verify
         )
         if not _ask_yes_no(console, ask, "Register models from another provider?", default=False):
             break
@@ -194,8 +202,17 @@ def register_from_provider(
     pool_path: Path,
     kind: ProviderKind,
     options: EntryOptions,
+    verify: ProviderCheck | None = None,
 ) -> int:
-    """One pass: choose `kind`'s models, answer its requirements, write them. Returns the count."""
+    """One pass: choose `kind`'s models, answer its requirements, write them. Returns the count.
+
+    Every requirement is collected before anything is verified or written, so the one live ping
+    this pass pays for goes out with the connection details the first entry will actually carry
+    (an Azure deployment is asked for per model, and pinging the base model id instead would
+    verify a route no entry uses).
+
+    `verify` is that ping; None uses the real one.
+    """
     catalog = list_provider_models(kind)
     _describe_catalog(console, catalog)
     chosen = choose_models(console, ask, catalog, read_pool_entries(pool_path))
@@ -203,11 +220,75 @@ def register_from_provider(
         console.print("[dim]nothing selected[/dim]")
         return 0
     shared = _ask_shared_options(console, ask, kind, options)
+    drafts = [
+        (model, _ask_per_model_options(console, ask, kind, model, shared)) for model in chosen
+    ]
+    if not _verify_pass(console, ask, kind=kind, draft=drafts[0], verify=verify):
+        return 0
     written = 0
-    for model in chosen:
-        if _register_one(console, ask, pool_path=pool_path, kind=kind, model=model, options=shared):
+    for model, per_model in drafts:
+        if _register_one(
+            console, ask, pool_path=pool_path, kind=kind, model=model, options=per_model
+        ):
             written += 1
     return written
+
+
+def _verify_pass(
+    console: Console,
+    ask: PromptReader,
+    *,
+    kind: ProviderKind,
+    draft: tuple[CatalogModel, EntryOptions],
+    verify: ProviderCheck | None,
+) -> bool:
+    """Ping this pass's backend once, and say whether to go on registering its candidates.
+
+    `wmo providers set` already bills exactly one ping to prove the WORKER provider works, and
+    the roster is the one artifact where a silently broken candidate is expensive: `wmo optimize
+    route sweep` pays for every candidate ahead of it before reaching the one that 401s. So a
+    pass pays the same single cheap ping for the backend it is about to register, whether or not
+    it is the backend the command just set (the pool models are different models from the
+    worker's, and a switched backend was never checked beyond its environment variables).
+
+    A failure does not discard the selection silently: it is reported and the user decides,
+    because a roster is legitimately built on a machine that does not hold the key.
+    """
+    model, options = draft
+    try:
+        # The candidate itself, so the ping travels the exact route the roster will: this
+        # entry's endpoint, deployment, region, and its own `api_key_env` account.
+        entry = build_pool_entry(name="probe", kind=kind, model=model, options=options)
+    except (ValidationError, ValueError):
+        # Not a valid candidate at all. `_register_one` reports that per model, with the failing
+        # model named; pre-empting it here would blame the whole pass for one bad row.
+        return True
+    console.print(f"verifying {kind.value} ({escape(model.id)})...")
+    result = (verify or verify_pool_entry)(entry)
+    if result.ok:
+        console.print(f"  {_CHECK} {kind.value} ({escape(model.id)}) reachable")
+        return True
+    console.print(
+        f"  [red]x {kind.value} ({escape(model.id)}) failed[/red]: "
+        f"{escape(result.detail or 'unknown error')}"
+    )
+    return _ask_yes_no(console, ask, "Register these candidates anyway?", default=False)
+
+
+def verify_pool_entry(entry: PoolEntry) -> VerifyResult:
+    """One cheap live completion against a candidate exactly as the router would call it.
+
+    Goes through `pool_provider` rather than `verify_all` so the entry's own `api_key_env`
+    account is the one proved: a multi-account roster that verified the default credential
+    would have proved nothing about the key the candidate will actually send.
+
+    Never raises: a backend that refuses to be built at all (an unset `api_key_env`, Bedrock
+    handed a key) comes back as a failure with its own message, like any other.
+    """
+    try:
+        return pool_provider(entry).verify()
+    except ValueError as exc:
+        return VerifyResult(ok=False, kind=entry.kind, model=entry.model, detail=str(exc))
 
 
 def register_model_ids(
@@ -225,10 +306,21 @@ def register_model_ids(
     does not list is registered verbatim, exactly as a typed id is.
 
     Raises:
-        typer.BadParameter: An entry cannot be built (a missing price, an Azure deployment) or
-            the roster refuses it. Non-interactively there is nobody to ask, so this fails loudly
-            rather than writing a candidate that cannot be called.
+        typer.BadParameter: An entry cannot be built (a missing price, an Azure deployment), the
+            roster refuses it, or one explicit Azure deployment was given for several models.
+            Non-interactively there is nobody to ask, so this fails loudly rather than writing a
+            candidate that cannot be called.
     """
+    if kind is ProviderKind.AZURE_OPENAI and options.deployment is not None and len(model_ids) > 1:
+        # On the wire Azure's model IS the deployment name, so one deployment applied to several
+        # models would register several candidates that all call the same deployment while
+        # advertising models it does not serve. Unlike a shared endpoint or price, a shared
+        # deployment name is never a coherent answer.
+        raise typer.BadParameter(
+            "one --deployment cannot describe several --pool-model ids on azure: the deployment "
+            "name IS the model on the wire, so run this once per deployment, or drop --deployment "
+            "to name each deployment after its own model id"
+        )
     catalog = list_provider_models(kind)
     written = 0
     for model_id in model_ids:
@@ -376,12 +468,16 @@ def _register_one(
     model: CatalogModel,
     options: EntryOptions,
 ) -> bool:
-    """Ask what this one model still needs, then write it. False when it was skipped."""
+    """Name one already-resolved candidate and write it. False when it was skipped.
+
+    `options` is this model's own resolved settings (`_ask_per_model_options` has already run for
+    it), because the pass verifies the first candidate's real connection details before writing
+    any of them.
+    """
     entries = read_pool_entries(pool_path)
     taken = {entry.name: entry for entry in entries}
-    per_model = _ask_per_model_options(console, ask, kind, model, options)
-    known = _existing_handle(entries, kind, model, per_model)
-    default_name = known or _unique_handle(_handle_base(kind, model, per_model), set(taken))
+    known = _existing_handle(entries, kind, model, options)
+    default_name = known or _unique_handle(_handle_base(kind, model, options), set(taken))
     while True:
         name = _ask_text(console, ask, f"Handle for {model.id}", default_name)
         clash = taken.get(name)
@@ -395,7 +491,7 @@ def _register_one(
         if _ask_yes_no(console, ask, f"Replace '{name}'?", default=False):
             break
     try:
-        entry = build_pool_entry(name=name, kind=kind, model=model, options=per_model)
+        entry = build_pool_entry(name=name, kind=kind, model=model, options=options)
     except (ValidationError, ValueError) as exc:
         console.print(f"  [red]skipped {escape(model.id)}[/red]: {escape(str(exc))}")
         return False
@@ -556,7 +652,11 @@ def _ask_per_model_options(
         updates["api_version"] = _ask_text(
             console, ask, "Azure api-version", options.api_version or DEFAULT_AZURE_API_VERSION
         )
-    if options.input_per_mtok is None and needs_price(kind, model):
+    # Either side missing, not just the input side: `PoolEntry` refuses a half pair outright, so
+    # suppressing the prompts on a half-supplied price would skip the model instead of asking
+    # for the number it is missing.
+    priced_by_flags = options.input_per_mtok is not None and options.output_per_mtok is not None
+    if not priced_by_flags and needs_price(kind, model):
         console.print(
             f"  [yellow]{escape(model.id)} has no published or built-in price[/yellow]"
             "[dim]; an unpriced candidate reports $0 and a cost-aware policy routes"

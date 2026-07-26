@@ -716,6 +716,38 @@ def test_providers_set_rejects_an_unknown_tier(
     assert "frontier, open" in result.output
 
 
+def test_providers_set_rejects_half_a_price_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A pool entry prices both token tiers or neither. Half a pair would be dropped silently in
+    # the interactive flow and rejected as an invalid entry with --pool-model, so it is refused
+    # up front, where the message can name the flag.
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--pool-model",
+            "qwen3-32b",
+            "--input-per-mtok",
+            "0.1",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "both --input-per-mtok and --output-per-mtok" in result.output
+    assert not (root / "pool.toml").exists()
+
+
 def test_providers_set_without_pool_flags_leaves_scripted_runs_untouched(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
