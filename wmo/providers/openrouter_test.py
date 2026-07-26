@@ -10,6 +10,7 @@ from wmo.config.config import PROVIDER_ENV_VARS
 from wmo.providers.base import (
     ChatRequest,
     Message,
+    PreparableProvider,
     ProviderConfig,
     ProviderKind,
 )
@@ -293,3 +294,34 @@ def test_complete_chat_preserves_tools_and_uses_max_tokens(
 def test_embed_explains_that_openrouter_has_no_embeddings_api() -> None:
     with pytest.raises(ValueError, match="no embeddings API"):
         OpenRouterProvider(_config()).embed(["hi"])
+
+
+def test_prepare_refuses_locally_when_no_credential_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep pre-flight can rule an OpenRouter candidate out before it spends anything.
+
+    Building the client resolves the key and opens no connection, so this costs nothing and needs
+    no network: without it an unset credential lands at that candidate's first paid cell.
+    """
+    monkeypatch.delenv(OPENROUTER_API_KEY_ENV, raising=False)
+    provider = OpenRouterProvider(
+        ProviderConfig(kind=ProviderKind.OPENROUTER, model="z-ai/glm-4.6")
+    )
+
+    assert isinstance(provider, PreparableProvider)
+    with pytest.raises(ValueError, match=OPENROUTER_API_KEY_ENV):
+        provider.prepare()
+
+
+def test_prepare_builds_the_client_when_the_credential_is_there(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(OPENROUTER_API_KEY_ENV, "sk-or-test")
+    provider = OpenRouterProvider(
+        ProviderConfig(kind=ProviderKind.OPENROUTER, model="z-ai/glm-4.6")
+    )
+
+    provider.prepare()  # no request, no exception
+
+    assert str(provider._get_client().base_url).startswith("https://openrouter.ai")

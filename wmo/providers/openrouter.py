@@ -132,6 +132,20 @@ class OpenRouterProvider:
             )
         return self._client
 
+    def prepare(self) -> None:
+        """Resolve the credential and build the client, with no request sent.
+
+        Satisfies `wmo.providers.base.PreparableProvider`, so `prepare_pool_provider` can rule
+        this candidate in or out BEFORE a sweep spends anything. Building the client is the whole
+        check: `_resolved_key` refuses when neither the entry's `api_key_env` nor
+        `OPENROUTER_API_KEY` resolves, and the SDK opens no connection at construction, so the
+        answer is free. The cached client is the one later calls use.
+
+        Raises:
+            ValueError: No OpenRouter credential resolved for this configuration.
+        """
+        self._get_client()
+
     def complete(
         self,
         system: str,

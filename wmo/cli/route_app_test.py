@@ -41,6 +41,7 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
+from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.providers.registry import get_provider as registry_get_provider
 from wmo.serving.traces_source import TRACES_FILENAME
@@ -1719,6 +1720,64 @@ def test_route_sweep_builds_every_lazy_client_before_it_spends(
     assert "OPENAI_API_KEY" in flat  # the SDK's own advice survives into the message
     assert "USD(est)" not in flat
     assert seams.world_model.tasks == []
+    assert not out.exists()
+
+
+def test_route_sweep_rejects_an_openrouter_candidate_with_no_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # OpenRouter joined the pre-flight late: it shipped with no `prepare` seam, so
+    # `prepare_pool_provider` skipped it and an unset key landed at that candidate's FIRST CELL,
+    # after `cheap` had run every scenario and been paid for. Unlike bedrock's credential this one
+    # IS locally knowable: `OpenRouterProvider._get_client` resolves the key itself and refuses,
+    # opening no connection, so no request is made either way.
+    seams = _patch_seams(monkeypatch, real_kinds=frozenset({ProviderKind.OPENROUTER}))
+    monkeypatch.delenv(OPENROUTER_API_KEY_ENV, raising=False)
+    root = _project(tmp_path, traces=_corpus())
+    pool = tmp_path / "pool.toml"
+    pool.write_text(
+        "[[model]]\n"
+        'name = "cheap"\n'
+        'kind = "openai"\n'
+        'model = "cheap-1"\n'
+        "input_per_mtok = 1.0\n"
+        "output_per_mtok = 2.0\n"
+        "\n"
+        "[[model]]\n"
+        'name = "router"\n'
+        'kind = "openrouter"\n'
+        'model = "z-ai/glm-4.6"\n'
+        "input_per_mtok = 0.1\n"
+        "output_per_mtok = 0.2\n",
+        encoding="utf-8",
+    )
+
+    out = tmp_path / "matrix.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "support",
+            "--root",
+            str(root),
+            "--pool",
+            str(pool),
+            "--out",
+            str(out),
+            "--scenarios",
+            "2",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)  # no traceback
+    flat = _flat(result.output)
+    assert "'router'" in flat and "kind=openrouter" in flat
+    assert "USD(est)" not in flat  # refused before the cost confirmation
+    assert seams.world_model.tasks == []  # zero cells ran, so `cheap` was never paid for
     assert not out.exists()
 
 

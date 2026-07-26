@@ -347,10 +347,6 @@ _DEFERRED_RISK: dict[ProviderKind, str] = {
         "the Tinker service being reachable and serving this model (constructing the client "
         "connects and pins a server-side session for the whole process)"
     ),
-    ProviderKind.OPENROUTER: (
-        "the OpenRouter credential, because that backend has no `prepare` seam for the pre-flight "
-        "to force its lazy client through yet"
-    ),
 }
 
 
