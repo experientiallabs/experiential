@@ -32,6 +32,7 @@ Usage:
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import logging
@@ -72,8 +73,13 @@ COST_TOLERANCE = 2.0  # percentage points of the cost ratio
 FAILURES: list[str] = []
 
 
+@functools.cache
 def _promotion_gate() -> object:
-    """Load the sibling gate as a module (its split, cache reader, and record loaders)."""
+    """Load the sibling gate as a module (its split, cache reader, and record loaders).
+
+    Cached: the module is loaded once per process, so the per-variant record reads below do
+    not re-execute it.
+    """
     spec = importlib.util.spec_from_file_location("validate_knn_promotion", PROMOTION_GATE)
     if spec is None or spec.loader is None:
         raise SystemExit(f"cannot import the promotion gate from {PROMOTION_GATE}")
