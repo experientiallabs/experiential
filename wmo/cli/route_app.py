@@ -1185,25 +1185,26 @@ def tune(
         raise typer.BadParameter(f"no policy file at {path}")
     policy = RoutingPolicy.load(path)
     base_path = path.with_name(f"{path.stem}.base{path.suffix}")
-    base = policy
-    if base_path.is_file():
-        base = RoutingPolicy.load(base_path)
-        if (base.kind, fit_provenance(base)) != (policy.kind, fit_provenance(policy)):
-            # `fit` overwrites the policy without touching this snapshot, so a refit leaves one
-            # behind that describes a policy that no longer exists. Dialing it would report
-            # success while replacing the new fit with a slid copy of the superseded one.
-            raise typer.BadParameter(
-                f"{base_path} is the as-fitted snapshot of a different fit than {path}: the "
-                f"snapshot holds kind='{base.kind}' from '{fit_provenance(base)}', the policy "
-                f"holds kind='{policy.kind}' from '{fit_provenance(policy)}'. Tuning it would "
-                f"overwrite the current fit with a dialed copy of the old one. Delete "
-                f"{base_path} to re-baseline the dial on the fit that is on disk now."
-            )
+    as_fitted = RoutingPolicy.load(base_path) if base_path.is_file() else None
+    if as_fitted is not None and (as_fitted.kind, fit_provenance(as_fitted)) != (
+        policy.kind,
+        fit_provenance(policy),
+    ):
+        # `fit` overwrites the policy without touching this snapshot, so a refit leaves one
+        # behind that describes a policy that no longer exists. Dialing it would report success
+        # while replacing the new fit with a slid copy of the superseded one.
+        raise typer.BadParameter(
+            f"{base_path} is the as-fitted snapshot of a different fit than {path}: the "
+            f"snapshot holds kind='{as_fitted.kind}' from '{fit_provenance(as_fitted)}', the "
+            f"policy holds kind='{policy.kind}' from '{fit_provenance(policy)}'. Tuning it "
+            f"would overwrite the current fit with a dialed copy of the old one. Delete "
+            f"{base_path} to re-baseline the dial on the fit that is on disk now."
+        )
     try:
-        tuned = apply_cost_quality(base, cost_quality)
+        tuned = apply_cost_quality(policy if as_fitted is None else as_fitted, cost_quality)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if not base_path.is_file():
+    if as_fitted is None:
         # Preserve the artifact as fitted, so `tune` is always re-appliable from the fit and
         # never from an already-slid copy of itself. Written only now that the dial has applied:
         # a snapshot left behind by a FAILED tune would poison the path for the next fit.
