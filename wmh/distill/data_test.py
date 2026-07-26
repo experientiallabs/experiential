@@ -348,6 +348,7 @@ def test_attach_advantages_empty_batch_reports_no_distribution() -> None:
     attached, stats = attach_advantages([], [], _cfg())
     assert attached == []
     assert stats.loss_tokens == 0
+    assert stats.context_tokens == 0
     assert stats.clipped_tokens == 0
     assert stats.advantage_mean is None
     assert stats.advantage_std is None
@@ -367,8 +368,10 @@ def test_attach_advantages_length_mismatch_drops_loudly(
     assert stats.mismatch_drops == 1
     assert stats.datums == 1
     assert len(attached) == 1
-    # Token counters cover only the kept datum, never the dropped one.
+    # Token counters cover only the kept datum, never the dropped one: both
+    # datums carry 3 loss + 2 context tokens, so a pre-drop count would read 6/4.
     assert stats.loss_tokens == 3
+    assert stats.context_tokens == 2
     assert "task-a__x1" in caplog.text
     assert "3 logprob(s) for 5 token(s)" in caplog.text
 
@@ -403,6 +406,7 @@ def test_dropped_datum_clips_are_not_counted(caplog: pytest.LogCaptureFixture) -
     assert stats.mismatch_drops == 1
     assert stats.clipped_tokens == 0
     assert stats.loss_tokens == 3
+    assert stats.context_tokens == 2
 
 
 def test_attach_advantages_rejects_wrong_batch_shape() -> None:
@@ -1426,7 +1430,11 @@ def test_build_topk_ce_datums_rank_aligned_replication_math() -> None:
     replicas, stats = build_topk_ce_datums([datum], [row], k)
 
     assert stats == TopkCeStats(
-        source_datums=1, datums=k, mismatch_drops=0, loss_tokens=datum.loss_token_count
+        source_datums=1,
+        datums=k,
+        mismatch_drops=0,
+        loss_tokens=datum.loss_token_count,
+        context_tokens=len(datum.model_input_tokens) - datum.loss_token_count,
     )
     assert len(replicas) == k
     n = len(datum.model_input_tokens)
@@ -1518,6 +1526,10 @@ def test_build_topk_ce_datums_drops_misaligned_and_unscoreable_rows(
     assert stats.mismatch_drops == 2
     assert stats.source_datums == 1
     assert len(replicas) == 2  # only the aligned source, k replicas
+    # Per-copy token counts cover the surviving source alone (3 loss, 2
+    # context), not the three sources the teacher was asked to score.
+    assert stats.loss_tokens == 3
+    assert stats.context_tokens == 2
     assert "one entry per position" in caplog.text
     assert "no candidates at loss position 2" in caplog.text
 

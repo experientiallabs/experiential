@@ -45,13 +45,18 @@ from wmh.distill.tokens import TrialRecord
 logger = logging.getLogger(__name__)
 
 
-def _write_text_atomic(path: Path, text: str) -> None:
+def write_text_atomic(path: Path, text: str) -> None:
     """Write `text` to `path` via a same-directory tmp file plus atomic replace.
 
-    Every durable manifest in the run dir goes through this: a torn write to
-    checkpoints.json (or the config snapshot, warmup record, gate verdict)
-    would otherwise corrupt the resume path exactly when a crash made resume
-    necessary.
+    Every durable file in the run dir goes through this, including the ones
+    other modules own (`wmh.distill.tracking`'s wandb run record): a torn
+    write to checkpoints.json (or the config snapshot, warmup record, gate
+    verdict, wandb run id) would otherwise corrupt the resume path exactly
+    when a crash made resume necessary.
+
+    Args:
+        path: The destination file; its parent directory must exist.
+        text: The complete file contents, written as UTF-8.
     """
     tmp_path = path.with_name(path.name + ".tmp")
     tmp_path.write_text(text, encoding="utf-8")
@@ -254,7 +259,7 @@ class DistillRunStore:
     def snapshot_config(self, cfg: DistillConfig) -> Path:
         """Write the exact config the run started with to `config.toml`."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.config_path, snapshot_toml(cfg))
+        write_text_atomic(self.config_path, snapshot_toml(cfg))
         return self.config_path
 
     def load_config(self) -> DistillConfig:
@@ -372,7 +377,7 @@ class DistillRunStore:
         payload = SpendLedger(total_usd=total_usd).model_dump_json(indent=2)
         # The ledger is rewritten on every charge, and a torn write would
         # block the next resume with a corrupt-ledger error.
-        _write_text_atomic(self.spend_path, payload)
+        write_text_atomic(self.spend_path, payload)
 
     def read_spend(self) -> float | None:
         """The ledger's cumulative spend, or None when no ledger exists yet.
@@ -413,7 +418,7 @@ class DistillRunStore:
             The written path.
         """
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.warmup_path, record.model_dump_json(indent=2))
+        write_text_atomic(self.warmup_path, record.model_dump_json(indent=2))
         return self.warmup_path
 
     def read_warmup(self) -> WarmupRecord | None:
@@ -450,7 +455,7 @@ class DistillRunStore:
             The written path.
         """
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.warmup_trials_path, manifest.model_dump_json(indent=2))
+        write_text_atomic(self.warmup_trials_path, manifest.model_dump_json(indent=2))
         return self.warmup_trials_path
 
     def read_warmup_trials(self) -> WarmupTrialsManifest | None:
@@ -488,7 +493,7 @@ class DistillRunStore:
         """
         self.evals_dir.mkdir(parents=True, exist_ok=True)
         path = self.evals_dir / f"{validate_name(name)}.json"
-        _write_text_atomic(path, payload.model_dump_json(indent=2))
+        write_text_atomic(path, payload.model_dump_json(indent=2))
         return path
 
     # -- sample rollouts -------------------------------------------------------------------------
@@ -510,7 +515,7 @@ class DistillRunStore:
         """
         self.samples_dir.mkdir(parents=True, exist_ok=True)
         path = self.samples_dir / f"{validate_name(name)}.md"
-        _write_text_atomic(path, text)
+        write_text_atomic(path, text)
         return path
 
     # -- checkpoints -----------------------------------------------------------------------------
@@ -534,7 +539,7 @@ class DistillRunStore:
         manifest.checkpoints = [c for c in manifest.checkpoints if c.step != step]
         manifest.checkpoints.append(record)
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.checkpoints_path, manifest.model_dump_json(indent=2))
+        write_text_atomic(self.checkpoints_path, manifest.model_dump_json(indent=2))
         return record
 
     def checkpoints(self) -> list[CheckpointRecord]:
@@ -565,13 +570,13 @@ class DistillRunStore:
     def write_gate(self, record: DistillGateRecord) -> Path:
         """Persist the promotion verdict to `gate.json`."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.gate_path, record.model_dump_json(indent=2))
+        write_text_atomic(self.gate_path, record.model_dump_json(indent=2))
         return self.gate_path
 
     def write_model_card(self, card: DistillModelCard) -> Path:
         """Persist the run's model card to `model_card.json`."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.model_card_path, card.model_dump_json(indent=2))
+        write_text_atomic(self.model_card_path, card.model_dump_json(indent=2))
         return self.model_card_path
 
     def write_handoff(self, toml_text: str) -> Path:
@@ -595,7 +600,7 @@ class DistillRunStore:
                 "build_handoff_toml so it pastes cleanly into a settings file"
             ) from exc
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        _write_text_atomic(self.handoff_path, toml_text)
+        write_text_atomic(self.handoff_path, toml_text)
         return self.handoff_path
 
 
@@ -655,7 +660,7 @@ class AdapterStore:
         current = self.aliases(name)
         current[alias] = version
         path = self.dir_for(name) / _ALIASES_FILE
-        _write_text_atomic(path, tomli_w.dumps({"aliases": current}))
+        write_text_atomic(path, tomli_w.dumps({"aliases": current}))
 
     # -- load / save -----------------------------------------------------------------------------
 
@@ -726,7 +731,7 @@ class AdapterStore:
         stamped = card.model_copy(update={"name": name, "version": version})
         directory = self.dir_for(name) / f"v{version}"
         directory.mkdir(parents=True, exist_ok=False)  # append-only: collision is a bug
-        _write_text_atomic(directory / _CARD_FILE, stamped.model_dump_json(indent=2))
+        write_text_atomic(directory / _CARD_FILE, stamped.model_dump_json(indent=2))
         if alias is not None:
             self.set_alias(name, alias, version)
         return version

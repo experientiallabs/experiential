@@ -211,6 +211,14 @@ class AdvantageStats(BaseModel):
     loss_tokens: int = Field(ge=0)
     """Loss tokens across the attached datums (the clip-fraction denominator)."""
 
+    context_tokens: int = Field(ge=0)
+    """Non-loss (mask 0.0) tokens across the attached datums.
+
+    Reported beside `loss_tokens` so a caller can describe the TRAINED batch's
+    token volume without falling back to the pre-drop `DatumStats`, whose
+    counts include datums this call dropped.
+    """
+
     advantage_mean: float | None
     """Mean advantage over the attached datums' loss tokens, after clipping and
     any centering (so ~0.0 under `train.center_advantages`); None when no loss
@@ -409,7 +417,8 @@ def attach_advantages(
         New datums with advantages attached (drops removed, order preserved)
         and the stats, including the trained advantage distribution (mean and
         population std over the attached datums' loss tokens) and the kept
-        clip/loss token counts the loop derives `clip_fraction` from.
+        clip/loss/context token counts the loop derives `clip_fraction` and
+        its per-step token totals from.
 
     Raises:
         ValueError: If `teacher_logprobs` does not have one entry per datum;
@@ -513,6 +522,7 @@ def attach_advantages(
         mismatch_drops=mismatch_drops,
         clipped_tokens=clipped_tokens,
         loss_tokens=len(loss_values),
+        context_tokens=sum(len(datum.model_input_tokens) for datum in attached) - len(loss_values),
         advantage_mean=advantage_mean,
         advantage_std=advantage_std,
     )
@@ -540,6 +550,13 @@ class TopkCeStats(BaseModel):
 
     loss_tokens: int = Field(ge=0)
     """Loss positions across the kept source datums (per copy, not x k)."""
+
+    context_tokens: int = Field(ge=0)
+    """Non-loss positions across the kept source datums (per copy, not x k).
+
+    Same role as `AdvantageStats.context_tokens`: the TRAINED batch's context
+    volume, so the loop never has to reach back to the pre-drop `DatumStats`.
+    """
 
 
 def _renormalized_probs(candidates: TopkCandidates) -> list[float]:
@@ -620,6 +637,7 @@ def build_topk_ce_datums(
     mismatch_drops = 0
     kept_sources = 0
     loss_tokens = 0
+    context_tokens = 0
     for datum, row in zip(datums, topk_rows, strict=True):
         n = len(datum.model_input_tokens)
         if len(row) != n:
@@ -680,6 +698,7 @@ def build_topk_ce_datums(
             )
         kept_sources += 1
         loss_tokens += datum.loss_token_count
+        context_tokens += n - datum.loss_token_count
         for rank in range(k):
             replicas.append(
                 TrainDatum(
@@ -697,6 +716,7 @@ def build_topk_ce_datums(
         datums=len(replicas),
         mismatch_drops=mismatch_drops,
         loss_tokens=loss_tokens,
+        context_tokens=context_tokens,
     )
     return replicas, stats
 
