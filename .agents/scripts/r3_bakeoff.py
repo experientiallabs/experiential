@@ -126,7 +126,10 @@ def record_run(
 
 
 def svm_pwin(
-    ctx: object, fit_ids: list[str], test_ids: list[str], best_name: str,
+    ctx,  # noqa: ANN001 - r1's MatrixContext, a dynamically imported type
+    fit_ids: list[str],
+    test_ids: list[str],
+    best_name: str,
     names: list[str],
 ) -> np.ndarray:
     """Per-model win-vs-baseline probability on the test side (decisive fit cells only)."""
