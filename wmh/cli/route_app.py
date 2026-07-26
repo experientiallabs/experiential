@@ -1,10 +1,11 @@
-"""`wmh optimize route`: fit and report learned inference policies from outcome matrices.
+"""`wmh optimize route`: fit, tune, and report learned inference policies from outcome matrices.
 
 The routing optimizer's CLI face, sitting beside `wmh optimize harness` in the optimizer
 family. Consumes a persisted `OutcomeMatrix` (produced by closed-loop pool evaluation or a
 research adapter such as RouterBench) and emits the policy artifact serving loads, plus the
-improvement report the endpoint cites. Vocabulary note: "route" is developer-facing CLI only;
-customer copy never says router.
+improvement report the endpoint cites. `tune` is the one post-fit control: it moves a fitted
+policy's cost/quality dial without refitting. Vocabulary note: "route" is developer-facing CLI
+only; customer copy never says router.
 """
 
 from __future__ import annotations
@@ -15,7 +16,13 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
-from wmh.optimize.knn import fit_knn_policy
+from wmh.optimize.knn import (
+    COST_QUALITY_ANCHORS,
+    apply_cost_quality,
+    cost_quality_knobs,
+    cost_quality_named_point,
+    fit_knn_policy,
+)
 from wmh.optimize.outcomes import OutcomeMatrix
 from wmh.optimize.policy import (
     KNN_BANK_FILENAME,
@@ -131,7 +138,8 @@ def fit(
         if cost_weight > 0.0:
             raise typer.BadParameter(
                 "--cost-weight re-ranks cluster evidence and applies to --kind rank only; a knn "
-                "policy trades cost through --z (a pricier pick must clear twice the bar)"
+                "policy trades cost through its dial instead: fit it, then "
+                "`wmh optimize route tune <policy.json> --cost-quality <0..1>`"
             )
         # The sidecar goes beside the policy file: that is where serving resolves it from.
         policy = fit_knn_policy(
@@ -179,6 +187,62 @@ def fit(
         f"{result.scenarios} scenarios -> {out}\n"
         f"  fit-set accuracy {result.accuracy:.4f}, cost/scenario ${result.cost_per_scenario:.5f}"
     )
+
+
+@route_app.command("tune")
+def tune(
+    policy_file: str = typer.Argument(POLICY_FILENAME, help="Fitted knn policy JSON to re-tune."),
+    cost_quality: float = typer.Option(
+        ...,
+        "--cost-quality",
+        min=0.0,
+        max=1.0,
+        help="The endpoint's one dial: 0.0 = max quality, 1.0 = max savings. 0.25 is the "
+        "shipped default. See the anchor table this command prints for what each end measured.",
+    ),
+) -> None:
+    """Set a fitted policy's cost/quality dial in place, without refitting anything.
+
+    The dial maps to the policy's knobs along the measured frontier (see
+    `wmh.optimize.knn.apply_cost_quality`). The first run copies the un-tuned artifact to
+    `policy.base.json` and every later run re-reads THAT, so the dial is always applied to the
+    policy as fitted and sliding twice never compounds:
+
+        wmh optimize route tune models/support/policy.json --cost-quality 0.6
+
+    The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
+    touching files at all: `PUT /v1/endpoints/{name}/config`.
+    """
+    path = Path(policy_file)
+    if not path.is_file():
+        raise typer.BadParameter(f"no policy file at {path}")
+    base_path = path.with_name(f"{path.stem}.base{path.suffix}")
+    if not base_path.is_file():
+        # Preserve the artifact as fitted the first time, so `tune` is always re-appliable from
+        # the fit and never from an already-slid copy of itself.
+        base_path.write_bytes(path.read_bytes())
+    base = RoutingPolicy.load(base_path)
+    try:
+        tuned = apply_cost_quality(base, cost_quality)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    tuned.save(path)
+    knobs = cost_quality_knobs(cost_quality)
+    _console.print(
+        f"[green]✓[/green] cost_quality={cost_quality:g} "
+        f"({cost_quality_named_point(cost_quality)}) -> {path}\n"
+        f"  knobs: floor_q={knobs.floor_q:g}, cost knob lam={knobs.pick_lam:g}, "
+        f"guard={knobs.guard_mode}, z={knobs.knn_z:g}\n"
+        f"  as fitted: {base_path}\n"
+        f"  measured on routerbench-ours9 (5 held-out splits, vs the best single model):"
+    )
+    for anchor in COST_QUALITY_ANCHORS:
+        marker = "->" if anchor.cost_quality == cost_quality else "  "
+        _console.print(
+            f"  {marker} {anchor.cost_quality:<5g} {anchor.quality_delta_points:+.2f}pt "
+            f"@ {anchor.cost_delta_percent:+.1f}% cost"
+            + (f"  [dim]{anchor.named_point}[/dim]" if anchor.named_point != "custom" else "")
+        )
 
 
 @route_app.command("report")

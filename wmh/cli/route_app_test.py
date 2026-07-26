@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from wmh.cli.app import app
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmh.optimize.policy import KNN_BANK_FILENAME, RoutingPolicy
+from wmh.optimize.policy import KNN_BANK_FILENAME, POLICY_FILENAME, RoutingPolicy
 from wmh.optimize.routing import evaluate_policy
 from wmh.providers.base import ProviderKind
 from wmh.providers.pool import PoolEntry
@@ -205,7 +205,8 @@ def test_route_fit_knn_rejects_the_rank_only_cost_knob(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code != 0
-    assert "--z" in result.output
+    # The message points at the knn cost control that does exist, not just at what is wrong.
+    assert "--cost-quality" in result.output
 
 
 def test_route_fit_rejects_unknown_kind(tmp_path: Path) -> None:
@@ -214,3 +215,105 @@ def test_route_fit_rejects_unknown_kind(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "knn or rank" in result.output
+
+
+def _fitted_knn_policy(tmp_path: Path) -> Path:
+    policy_file = tmp_path / POLICY_FILENAME
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_knn_matrix_file(tmp_path)),
+            "--kind",
+            "knn",
+            "--fallback",
+            "a",
+            "--rag-num",
+            "3",
+            "--min-pairs",
+            "2",
+            "--out",
+            str(policy_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return policy_file
+
+
+def test_route_tune_sets_the_dial_and_keeps_the_policy_as_fitted(tmp_path: Path) -> None:
+    policy_file = _fitted_knn_policy(tmp_path)
+    fitted = RoutingPolicy.load(policy_file)
+    result = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.6"]
+    )
+    assert result.exit_code == 0, result.output
+    tuned = RoutingPolicy.load(policy_file)
+    assert tuned.cost_quality == 0.6
+    assert tuned.pick_lam > 0.0
+    assert tuned.guard_mode == "asymmetric"
+    # The un-tuned artifact is preserved, so the dial is always re-appliable from the fit.
+    base = RoutingPolicy.load(tmp_path / "policy.base.json")
+    assert base.model_dump() == fitted.model_dump()
+    # The printed anchor table is how an operator learns what the position measured.
+    assert "cost_quality=0.6" in result.output
+    assert "-46.2%" in result.output
+
+
+def test_route_tune_twice_equals_tuning_once_from_the_base(tmp_path: Path) -> None:
+    policy_file = _fitted_knn_policy(tmp_path)
+    runner.invoke(app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "1.0"])
+    once = RoutingPolicy.load(policy_file).model_dump()
+    for _ in range(2):
+        result = runner.invoke(
+            app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "1.0"]
+        )
+        assert result.exit_code == 0, result.output
+    assert RoutingPolicy.load(policy_file).model_dump() == once
+    # Sliding back down lands exactly where a first-time slide to that position would.
+    runner.invoke(app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.25"])
+    balanced = RoutingPolicy.load(policy_file)
+    assert balanced.cost_quality == 0.25
+    assert (balanced.pick_lam, balanced.guard_mode) == (0.0, "symmetric")
+
+
+def test_route_tune_still_routes_after_the_dial_moves(tmp_path: Path) -> None:
+    # The dial must leave a servable policy: same bank, same baseline, still routing.
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = _fitted_knn_policy(tmp_path)
+    runner.invoke(app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "1.0"])
+    tuned = RoutingPolicy.load(policy_file)
+    matrix = OutcomeMatrix.load(matrix_file)
+    prose_ids = [sid for sid in matrix.scenario_ids() if sid.startswith("prose:")]
+    assert evaluate_policy(tuned, matrix, prose_ids).model_mix == {"b": 1.0}
+
+
+def test_route_tune_rejects_a_policy_kind_without_a_dial(tmp_path: Path) -> None:
+    policy_file = tmp_path / POLICY_FILENAME
+    fit = runner.invoke(
+        app,
+        ["optimize", "route", "fit", str(_matrix_file(tmp_path)), "--out", str(policy_file)],
+    )
+    assert fit.exit_code == 0, fit.output
+    result = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.5"]
+    )
+    assert result.exit_code != 0
+    assert "kind='rank'" in result.output
+
+
+def test_route_tune_rejects_a_missing_policy_file(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["optimize", "route", "tune", str(tmp_path / "nope.json"), "--cost-quality", "0.5"]
+    )
+    assert result.exit_code != 0
+    assert "no policy file" in result.output
+
+
+def test_route_tune_rejects_a_dial_outside_the_range(tmp_path: Path) -> None:
+    policy_file = _fitted_knn_policy(tmp_path)
+    result = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "2"]
+    )
+    assert result.exit_code != 0
