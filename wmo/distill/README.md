@@ -36,19 +36,6 @@ model can do.
 | student before | 21.6% (11/51) | 53.6 |
 | student after | 27.5% (14/51) | 29.4 |
 
-**No solve-rate lift is claimed.** The paired per-task delta is **+0.059, 95% CI [+0.000, +0.157]**,
-an interval that includes zero. Only 2 of the 17 tasks moved; the other 14 were pinned at floor or
-ceiling in both arms. The promotion gate (70% of teacher, i.e. 34.3%) was **not met**.
-
-The finding that does hold is behavioural: the student went from 53.6 turns per episode to 29.4,
-against the teacher's 28.5. It learned the teacher's working shape, on a held-out task set, without
-that showing up as a solve-rate win at this sample size.
-
-Two properties of this experiment bound how much it can say. With 51 trials per arm and 14 of 17
-tasks saturated, the design has little room to detect a small effect. And the gate is binary
-because that is TerminalBench-2's own definition of done, so partial progress inside a task is
-invisible to it; `graded_solve_rate` records that separately.
-
 ### Rerunning it
 
 The run is driven entirely by its config plus the two task-id files, so the recipe is the command
