@@ -46,11 +46,15 @@ class UsageEvent(BaseModel):
 
 
 class UsageTotals(BaseModel):
-    """Rolled-up usage: tokens, cost, and call count."""
+    """Rolled-up usage: tokens (with the cache subsets), cost, and call count."""
 
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    # Cache subsets of input_tokens (same subset contract as TokenUsage), kept so persisted
+    # RunRecords can reconstruct cache behavior; old records load with these defaulted to 0.
+    cached_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
     cost_usd: float = 0.0
 
     @property
@@ -61,6 +65,8 @@ class UsageTotals(BaseModel):
         self.calls += 1
         self.input_tokens += event.usage.input_tokens
         self.output_tokens += event.usage.output_tokens
+        self.cached_input_tokens += event.usage.cached_input_tokens
+        self.cache_write_input_tokens += event.usage.cache_write_input_tokens
         self.cost_usd += event.cost_usd
 
 

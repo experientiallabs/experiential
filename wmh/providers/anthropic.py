@@ -64,13 +64,15 @@ class AnthropicProvider:
             max_tokens=max_tokens,
         )
         text = "".join(block.text for block in response.content if block.type == "text")
-        # Anthropic reports cache reads BESIDE input_tokens (input_tokens excludes them);
-        # TokenUsage's contract is cached-as-subset, so normalize by summing.
+        # Anthropic reports cache reads and writes BESIDE input_tokens (input_tokens excludes
+        # them); TokenUsage's contract is cached-as-subset, so normalize by summing.
         cache_read = getattr(response.usage, "cache_read_input_tokens", None) or 0
+        cache_write = getattr(response.usage, "cache_creation_input_tokens", None) or 0
         usage = TokenUsage(
-            input_tokens=response.usage.input_tokens + cache_read,
+            input_tokens=response.usage.input_tokens + cache_read + cache_write,
             output_tokens=response.usage.output_tokens,
             cached_input_tokens=cache_read,
+            cache_write_input_tokens=cache_write,
         )
         return Completion(text=text, usage=usage)
 
@@ -105,9 +107,12 @@ class AnthropicProvider:
                 kind = getattr(event, "type", "")
                 if kind == "message_start":
                     # Same sibling-to-subset normalization as complete().
-                    cache_read = getattr(event.message.usage, "cache_read_input_tokens", None) or 0
-                    usage.input_tokens = event.message.usage.input_tokens + cache_read
+                    start_usage = event.message.usage
+                    cache_read = getattr(start_usage, "cache_read_input_tokens", None) or 0
+                    cache_write = getattr(start_usage, "cache_creation_input_tokens", None) or 0
+                    usage.input_tokens = start_usage.input_tokens + cache_read + cache_write
                     usage.cached_input_tokens = cache_read
+                    usage.cache_write_input_tokens = cache_write
                 elif kind == "content_block_delta":
                     delta = event.delta
                     if getattr(delta, "type", "") == "text_delta" and delta.text:

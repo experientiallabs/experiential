@@ -13,7 +13,8 @@ choose which env var gets read or where its value gets sent.
 Pricing: entries for models in the built-in `wmh.tracking.pricing` table need no price fields;
 anything else must declare `input_per_mtok`/`output_per_mtok` so downstream cost numbers stay
 honest (an unpriced candidate would silently report $0). `cached_input_per_mtok` is the provider
-cache-READ price, carried for cache-aware routing costs.
+cache-READ price and `cache_write_per_mtok` the cache-WRITE price, carried for cache-aware
+routing and compression costs.
 """
 
 from __future__ import annotations
@@ -57,6 +58,7 @@ class PoolEntry(BaseModel):
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     cached_input_per_mtok: float | None = None  # provider cache-read price, USD per 1M tokens
+    cache_write_per_mtok: float | None = None  # provider cache-write price, USD per 1M tokens
 
     @model_validator(mode="after")
     def _validate_price(self) -> PoolEntry:
@@ -92,22 +94,35 @@ class PoolEntry(BaseModel):
     def cost_usd(self, usage: TokenUsage) -> float:
         """Effective USD cost of `usage` priced by THIS entry's row (overrides included).
 
-        Cache-adjusted: cached prompt tokens (`usage.cached_input_tokens`) bill at
-        `cached_input_per_mtok` when the entry carries a cache-read price, and at the full
-        input rate otherwise (never silently free). The global `wmh.tracking.pricing.cost_usd`
-        only knows the built-in table; pool entries with explicit prices must be costed here
-        or they would silently read $0.
+        Cache-adjusted on both tiers: cache-read tokens (`usage.cached_input_tokens`) bill at
+        `cached_input_per_mtok` and cache-write tokens (`usage.cache_write_input_tokens`) at
+        `cache_write_per_mtok`; each tier falls back to the built-in price row's rate when the
+        entry carries no override, and to the full input rate when the row has no tier either
+        (never silently free). The global `wmh.tracking.pricing.cost_usd` only knows the
+        built-in table; pool entries with explicit prices must be costed here or they would
+        silently read $0.
         """
         price = self.price()
-        cached = min(usage.cached_input_tokens, usage.input_tokens)
-        cached_rate = (
-            self.cached_input_per_mtok
-            if self.cached_input_per_mtok is not None
-            else price.input_per_mtok
-        )
+        read = min(usage.cached_input_tokens, usage.input_tokens)
+        write = min(usage.cache_write_input_tokens, usage.input_tokens - read)
+        read_rate = self.cached_input_per_mtok
+        if read_rate is None:
+            read_rate = (
+                price.cache_read_per_mtok
+                if price.cache_read_per_mtok is not None
+                else price.input_per_mtok
+            )
+        write_rate = self.cache_write_per_mtok
+        if write_rate is None:
+            write_rate = (
+                price.cache_write_per_mtok
+                if price.cache_write_per_mtok is not None
+                else price.input_per_mtok
+            )
         return (
-            (usage.input_tokens - cached) * price.input_per_mtok
-            + cached * cached_rate
+            (usage.input_tokens - read - write) * price.input_per_mtok
+            + read * read_rate
+            + write * write_rate
             + usage.output_tokens * price.output_per_mtok
         ) / 1_000_000
 

@@ -25,6 +25,7 @@ tier = "open"
 input_per_mtok = 1.2
 output_per_mtok = 4.8
 cached_input_per_mtok = 0.12
+cache_write_per_mtok = 1.5
 
 [[model]]
 name = "gpt-5.5"
@@ -56,6 +57,7 @@ def test_load_pool_parses_entries(tmp_path: Path) -> None:
     assert deepseek.tier == "open"
     assert deepseek.api_key_env == "AZURE_SILEN_RESOURCE_API_KEY"
     assert deepseek.cached_input_per_mtok == 0.12
+    assert deepseek.cache_write_per_mtok == 1.5
     # Entries default to the frontier tier (the D-REPORT ModelRef vocabulary).
     assert pool.entry("fable").tier == "frontier"
 
@@ -183,6 +185,35 @@ def test_cost_usd_without_cache_price_bills_cached_tokens_at_full_rate() -> None
     )
     usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cached_input_tokens=400_000)
     assert entry.cost_usd(usage) == pytest.approx(10.0)  # honest fallback, never free
+
+
+def test_cost_usd_bills_cache_writes_at_entry_override() -> None:
+    entry = PoolEntry(
+        name="write-priced",
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        deployment="gpt-5.5",
+        input_per_mtok=10.0,
+        output_per_mtok=20.0,
+        cache_write_per_mtok=12.5,
+    )
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cache_write_input_tokens=400_000)
+    # 600k fresh @ $10/M + 400k written @ $12.5/M = 6.0 + 5.0 = $11.00.
+    assert entry.cost_usd(usage) == pytest.approx(11.0)
+
+
+def test_cost_usd_falls_back_to_builtin_cache_tiers() -> None:
+    # An entry with NO explicit prices uses the built-in table, including its cache tiers
+    # (fable: reads 0.1x -> $1/M, writes 1.25x -> $12.5/M on a $10/M input rate).
+    entry = PoolEntry(name="fable", kind=ProviderKind.ANTHROPIC, model="claude-fable-5")
+    usage = TokenUsage(
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cached_input_tokens=300_000,
+        cache_write_input_tokens=200_000,
+    )
+    # 500k fresh @ $10 + 300k read @ $1 + 200k write @ $12.5 = 5.0 + 0.3 + 2.5 = $7.80.
+    assert entry.cost_usd(usage) == pytest.approx(7.8)
 
 
 def test_bedrock_entry_pins_region() -> None:

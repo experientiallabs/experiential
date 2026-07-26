@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from wmh.providers.base import TokenUsage
-from wmh.tracking.pricing import cost_usd, price_for
+from wmh.tracking.pricing import _PRICES, cost_usd, price_for
 
 
 def test_opus_4_8_cost_is_5_in_25_out_per_mtok() -> None:
@@ -58,3 +58,61 @@ def test_partial_usage_is_prorated() -> None:
     # 500k input + 200k output on Opus 4.8 = 0.5*5 + 0.2*25 = 2.5 + 5.0 = 7.5.
     cost = cost_usd("claude-opus-4-8", TokenUsage(input_tokens=500_000, output_tokens=200_000))
     assert cost == pytest.approx(7.5)
+
+
+def test_no_cache_traffic_costs_are_bit_identical_to_the_two_term_formula() -> None:
+    # The D-COMPRESS item-0 regression guarantee: adding cache tiers must not move any cost
+    # number when there is no cache traffic. Exact equality (==) on every table row, not approx:
+    # the formula must REDUCE to the pre-change arithmetic, not merely land close to it.
+    usage = TokenUsage(input_tokens=123_457, output_tokens=76_543)
+    for model, price in _PRICES.items():
+        expected = (
+            usage.input_tokens * price.input_per_mtok + usage.output_tokens * price.output_per_mtok
+        ) / 1_000_000
+        assert cost_usd(model, usage) == expected, model
+
+
+def test_claude_cache_reads_bill_at_one_tenth_input_rate() -> None:
+    # 1M input, all served from cache, on fable ($10/M input): 0.1x -> $1.00.
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cached_input_tokens=1_000_000)
+    assert cost_usd("claude-fable-5", usage) == pytest.approx(1.0)
+
+
+def test_claude_cache_writes_bill_at_premium() -> None:
+    # 1M input, all written to cache, on fable ($10/M input): 1.25x (5m TTL) -> $12.50.
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cache_write_input_tokens=1_000_000)
+    assert cost_usd("claude-fable-5", usage) == pytest.approx(12.5)
+
+
+def test_mixed_cache_tiers_split_the_input() -> None:
+    # 1M input on opus-4-8 ($5/M): 500k fresh @ $5 + 300k read @ $0.5 + 200k write @ $6.25
+    # = 2.5 + 0.15 + 1.25 = $3.90.
+    usage = TokenUsage(
+        input_tokens=1_000_000,
+        output_tokens=0,
+        cached_input_tokens=300_000,
+        cache_write_input_tokens=200_000,
+    )
+    assert cost_usd("claude-opus-4-8", usage) == pytest.approx(3.9)
+
+
+def test_missing_cache_tier_bills_at_full_input_rate() -> None:
+    # Embedding rows carry no cache tiers; cache traffic on them bills at the input rate,
+    # never silently free.
+    usage = TokenUsage(
+        input_tokens=1_000_000, cached_input_tokens=600_000, cache_write_input_tokens=400_000
+    )
+    assert cost_usd("text-embedding-3-large", usage) == pytest.approx(0.13)
+
+
+def test_cache_subsets_are_clamped_to_input() -> None:
+    # Malformed usage claiming more cache traffic than input must not go negative: the read
+    # subset clamps to input and the write subset to what remains.
+    usage = TokenUsage(
+        input_tokens=100_000,
+        output_tokens=0,
+        cached_input_tokens=80_000,
+        cache_write_input_tokens=80_000,
+    )
+    # fable: 80k read @ $1/M-effective (0.1*10) + 20k write @ $12.5/M, 0 fresh.
+    assert cost_usd("claude-fable-5", usage) == pytest.approx(0.08 + 0.25)
