@@ -44,6 +44,7 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("r3b")
 
 DATA = Path.home() / "Desktop/Projects/wmh-routing-data"
+TRAIN_FRAC = 0.7
 RUNS = DATA / "runs/r3.jsonl"
 SPLIT_SEEDS = [0, 1, 2, 3, 4]
 ABS_FLOORS = [0.50, 0.55, 0.60, 0.65]
@@ -76,7 +77,7 @@ def make_split(
     kind: str, matrix: OutcomeMatrix, seed: int
 ) -> tuple[list[str], list[str]]:
     if kind == "iid":
-        return split_scenario_ids(matrix, train_fraction=0.7, seed=seed)
+        return split_scenario_ids(matrix, train_fraction=TRAIN_FRAC, seed=seed)
     if kind == "ood-cluster":
         return OOD.split_holdout_clusters(
             matrix, embedder=EmbedderSpec(dim=1024), test_fraction=0.3, seed=seed
@@ -171,8 +172,20 @@ def z_certify(
     return se > 0 and float(arr.mean()) / se >= z_need
 
 
+def adaptive_champ_params(bank: int, **extra: object) -> object:
+    """r1's promoted adapt3 config: adaptive rag + min_pairs + small-sample SE floor."""
+    import math
+
+    rag = min(50, max(4, math.ceil(bank / 2)))
+    min_pairs = min(8, max(3, rag // 2))
+    return R1.RetrievalParams(
+        second_route=False, guard="stat", z=0.5, rag_num=rag, min_pairs=min_pairs,
+        se_floor=True, **extra,
+    )
+
+
 def run_bakeoff(args: argparse.Namespace) -> None:
-    name = "routerbench-ours9"
+    name = args.matrix
     matrix = OutcomeMatrix.load(DATA / "matrices" / f"{name}_matrix.json")
     ctx = R1.MatrixContext(matrix, name, embed="openai", embed_replies=False)
     names = matrix.model_names()
@@ -211,8 +224,10 @@ def run_bakeoff(args: argparse.Namespace) -> None:
                     best_name=best_name,
                 )
 
-            # ---- champion picks once, then the gating arms -------------------
-            champ = R3X.champion_picks(R1, ctx, fit_ids, test_ids, best_name)
+            # ---- champion picks once (promoted adapt3 config), then the arms ----
+            champ = R1.route(
+                ctx, adaptive_champ_params(len(fit_ids)), fit_ids, test_ids, best_name
+            )
 
             picks_hsvm = {}
             for t, sid in enumerate(test_ids):
@@ -248,22 +263,41 @@ def run_bakeoff(args: argparse.Namespace) -> None:
                     best_name=best_name,
                 )
 
-            # ---- layered: hybrid-svm + r1's bank-quantile novelty floor ------
+            # ---- bank self-NN sims (shared by floorq + layered arms) ---------
             self_nn = []
             for row in range(len(fit_ids)):
                 sims = fit_m @ fit_m[row]
                 sims[row] = -1.0
                 self_nn.append(float(np.max(sims)))
-            for q in [0.05, 0.5] if "layered" in arms else []:
+
+            def floor_picks(
+                base_picks: dict[str, str], q: float,
+                self_nn: list[float] = self_nn, test_ids: list[str] = test_ids,
+                best_name: str = best_name, fit_m: np.ndarray = fit_m,
+            ) -> dict[str, str]:
+                if q <= 0:
+                    return dict(base_picks)
                 thresh = float(np.quantile(self_nn, q))
-                picks_l = {}
+                out = {}
                 for sid in test_ids:
-                    pick = picks_hsvm[sid]
+                    pick = base_picks[sid]
                     if pick != best_name and float(
                         np.max(fit_m @ ctx.task_vecs[sid])
                     ) < thresh:
                         pick = best_name
-                    picks_l[sid] = pick
+                    out[sid] = pick
+                return out
+
+            for q in [0.0, 0.05, 0.5] if "floorq" in arms else []:
+                record_run(
+                    matrix_name=name, matrix=matrix, variant=f"r3b-floorq{q}",
+                    params={"floor_q": q, "guard": "stat_adapt3", "z": 0.5,
+                            "embed": "oai3l", "split": kind},
+                    seed=seed, fit_ids=fit_ids, test_ids=test_ids,
+                    picks=floor_picks(champ, q), best_name=best_name,
+                )
+            for q in [0.05, 0.5] if "layered" in arms else []:
+                picks_l = floor_picks(picks_hsvm, q)
                 record_run(
                     matrix_name=name, matrix=matrix, variant=f"r3b-hybrid-svm-q{q}",
                     params={"gate": "svm_pwin>0.5", "floor_q": q, "embed": "oai3l",
@@ -294,7 +328,11 @@ def main() -> None:
     parser.add_argument(
         "--arms", nargs="*", default=["svmz", "hybrid", "layered", "absfloor"]
     )
+    parser.add_argument("--matrix", default="routerbench-ours9")
+    parser.add_argument("--train-frac", type=float, default=0.7)
     args = parser.parse_args()
+    global TRAIN_FRAC  # noqa: PLW0603 - one-shot CLI configuration
+    TRAIN_FRAC = args.train_frac
     run_bakeoff(args)
     logger.info("runs -> %s", RUNS)
 
