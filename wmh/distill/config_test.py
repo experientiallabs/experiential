@@ -7,6 +7,8 @@ import pytest
 from pydantic import ValidationError
 
 from wmh.distill.config import (
+    PROBE_BASELINE_ENTROPY_NATS,
+    PROBE_BASELINE_EPISODE_TOKENS,
     DistillConfig,
     EvalConfig,
     HarborConfig,
@@ -14,6 +16,7 @@ from wmh.distill.config import (
     StudentConfig,
     TeacherConfig,
     TrainConfig,
+    TripwireConfig,
     WandbConfig,
     WarmupConfig,
     load_distill_config,
@@ -54,15 +57,23 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.teacher.checkpoint is None
     assert cfg.harbor.backend == "local"
     assert cfg.harbor.reward_key == "reward"
-    assert cfg.rollout.max_turns == 20
+    # 100, not 20: at 20 the cap fired mid-tool-call on 45% of Ultra TerminalBench-2 trials and
+    # scored every one of them 0, and the reference terminus-2 agent is effectively unbounded.
+    assert cfg.rollout.max_turns == 100
+    # 1800s, not the 300s evaluation default every rollout used to inherit silently (which ended
+    # 31% of Super trials on the wall clock).
+    assert cfg.rollout.episode_timeout_s == pytest.approx(1800.0)
     assert cfg.rollout.context_budget_tokens == 65536
     assert cfg.rollout.compaction is False
     assert cfg.train.steps == 40
     assert cfg.train.tasks_per_batch == 8
     assert cfg.train.group_size == 4
     assert cfg.train.learning_rate == pytest.approx(1e-4)
-    assert cfg.train.advantage_clip == pytest.approx(4.0)
-    assert cfg.train.center_advantages is True
+    # The default objective is the OpenClaw-RL / Slime form: the RAW per-token
+    # teacher-minus-student gap, unclipped and uncentered, regularized by the
+    # loss's own ratio clipping rather than by reshaping the advantage.
+    assert cfg.train.advantage_clip is None
+    assert cfg.train.center_advantages is False
     assert cfg.train.max_datum_tokens == 65536
     assert cfg.train.sampler_refresh_every == 1
     assert cfg.train.save_state_every == 8
@@ -85,6 +96,16 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.gate.require_no_regression is True
     assert cfg.pricing.student_prefill is None
     assert cfg.budget.max_usd is None
+    # Degeneration tripwires are ON by default and every bound is a FRACTION of
+    # the baseline the run measures itself. Absolutes are the trap: our healthy
+    # untrained entropy is 0.181 nats/token, under the sibling lane's absolute
+    # 0.2 "collapse" floor, so an absolute rule would fire at step 0.
+    assert cfg.tripwire.enabled is True
+    assert cfg.tripwire.entropy_warn_frac == pytest.approx(0.5)
+    assert cfg.tripwire.entropy_kill_frac == pytest.approx(0.3)
+    assert cfg.tripwire.length_warn_frac == pytest.approx(0.5)
+    assert cfg.tripwire.length_kill_frac == pytest.approx(0.25)
+    assert cfg.tripwire.kill_consecutive_steps == 2
     assert cfg.wandb.enabled is False
     assert cfg.wandb.project == "wmh-distill"
     assert cfg.wandb.entity is None
@@ -171,6 +192,7 @@ tags = ["smoke", "tb2"]
     assert cfg.harbor.backend == "e2b"
     assert cfg.harbor.reward_key == "score"
     assert cfg.rollout.max_turns == 5
+    assert cfg.train.advantage_clip == pytest.approx(2.0)
     assert cfg.train.center_advantages is False
     assert cfg.sampling.temperature == 0.0
     assert cfg.warmup.steps == 2
@@ -229,8 +251,8 @@ def test_train_loss_defaults_to_importance_sampling(tmp_path: Path) -> None:
     assert cfg.train.topk == 8
 
 
-@pytest.mark.parametrize("loss", ["importance_sampling", "topk_ce"])
-def test_train_loss_accepts_both_modes(tmp_path: Path, loss: str) -> None:
+@pytest.mark.parametrize("loss", ["importance_sampling", "ppo", "topk_ce"])
+def test_train_loss_accepts_every_mode(tmp_path: Path, loss: str) -> None:
     text = MINIMAL_TOML + f"\n[train]\nloss = '{loss}'\n"
     cfg = load_distill_config(_write(tmp_path, text))
     assert cfg.train.loss == loss
@@ -240,6 +262,80 @@ def test_train_loss_rejects_unknown_value(tmp_path: Path) -> None:
     text = MINIMAL_TOML + "\n[train]\nloss = 'forward_kl'\n"
     with pytest.raises(ValueError, match="train.loss"):
         load_distill_config(_write(tmp_path, text))
+
+
+def test_ppo_is_a_loss_the_installed_tinker_sdk_accepts() -> None:
+    """The `ppo` mode is only legal because the pinned SDK lists it.
+
+    `train.loss = "ppo"` becomes the wire `loss_fn`, which the service
+    validates against `tinker.types.LossFnType`. Pinning the membership here
+    means an SDK bump that drops or renames the value fails offline instead of
+    mid-run, the same discipline the loss_fn_inputs keysets get in
+    `data_test.py`.
+    """
+    pytest.importorskip("tinker")
+    from typing import get_args
+
+    from tinker.types import LossFnType
+
+    assert "ppo" in get_args(LossFnType)
+    assert "importance_sampling" in get_args(LossFnType)
+    assert "cross_entropy" in get_args(LossFnType)
+
+
+def test_advantage_clip_can_be_switched_off_by_omission(tmp_path: Path) -> None:
+    """No clipping is the default, and a positive bound is still accepted.
+
+    TOML has no null, so "no clipping" is expressed by leaving the key out;
+    that is why the field defaults to None rather than to a number.
+    """
+    off = load_distill_config(_write(tmp_path, MINIMAL_TOML + "\n[train]\nloss = 'ppo'\n"))
+    assert off.train.advantage_clip is None
+    assert off.train.center_advantages is False
+    on = load_distill_config(_write(tmp_path, MINIMAL_TOML + "\n[train]\nadvantage_clip = 2.5\n"))
+    assert on.train.advantage_clip == pytest.approx(2.5)
+
+
+def test_centering_can_be_switched_back_on(tmp_path: Path) -> None:
+    cfg = load_distill_config(
+        _write(tmp_path, MINIMAL_TOML + "\n[train]\ncenter_advantages = true")
+    )
+    assert cfg.train.center_advantages is True
+
+
+@pytest.mark.parametrize("clip", ["0.0", "-1.0"])
+def test_advantage_clip_still_rejects_non_positive_bounds(tmp_path: Path, clip: str) -> None:
+    """Optional does not mean lax: a set bound must be > 0 (0 is not "off")."""
+    with pytest.raises(ValueError, match="advantage_clip"):
+        load_distill_config(
+            _write(tmp_path, MINIMAL_TOML + f"\n[train]\nadvantage_clip = {clip}\n")
+        )
+
+
+def test_snapshot_round_trips_the_ppo_raw_gap_objective(tmp_path: Path) -> None:
+    """The snapshot a run dir keeps must reproduce the objective exactly.
+
+    `snapshot_toml` drops None fields, so an unset `advantage_clip` survives
+    the round trip only because "unset" and "no clipping" are the same state.
+    """
+    text = MINIMAL_TOML + "\n[train]\nloss = 'ppo'\ncenter_advantages = false\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    snapshot = snapshot_toml(cfg)
+    assert "advantage_clip" not in snapshot
+    restored = load_distill_config(_write(tmp_path, snapshot))
+    assert restored == cfg
+    assert restored.train.loss == "ppo"
+    assert restored.train.advantage_clip is None
+    assert restored.train.center_advantages is False
+
+
+def test_snapshot_round_trips_an_explicit_clip_and_centering(tmp_path: Path) -> None:
+    text = MINIMAL_TOML + "\n[train]\nadvantage_clip = 4.0\ncenter_advantages = true\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    restored = load_distill_config(_write(tmp_path, snapshot_toml(cfg)))
+    assert restored == cfg
+    assert restored.train.advantage_clip == pytest.approx(4.0)
+    assert restored.train.center_advantages is True
 
 
 @pytest.mark.parametrize("topk", [1, 8, 64])
@@ -424,6 +520,75 @@ def test_snapshot_round_trips_the_eval_section(tmp_path: Path) -> None:
         assert load_distill_config(snap_path) == cfg
 
 
+def test_snapshot_round_trips_the_tripwire_section(tmp_path: Path) -> None:
+    # Both shapes must survive snapshot -> parse: the all-defaults section and a
+    # deliberately loosened one (a run may widen the bounds; it may not turn them
+    # into absolute nats or token counts, which the schema makes impossible).
+    for tripwire in (
+        TripwireConfig(),
+        TripwireConfig(
+            enabled=False,
+            entropy_warn_frac=0.4,
+            entropy_kill_frac=0.2,
+            length_warn_frac=0.35,
+            length_kill_frac=0.1,
+            kill_consecutive_steps=3,
+        ),
+    ):
+        cfg = _minimal_config().model_copy(update={"tripwire": tripwire}, deep=True)
+        snap_path = tmp_path / "snapshot.toml"
+        snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+        assert load_distill_config(snap_path) == cfg
+
+
+def test_tripwire_section_loads_from_toml(tmp_path: Path) -> None:
+    text = MINIMAL_TOML + "\n[tripwire]\nentropy_warn_frac = 0.6\nkill_consecutive_steps = 3\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.tripwire.entropy_warn_frac == pytest.approx(0.6)
+    assert cfg.tripwire.kill_consecutive_steps == 3
+    assert cfg.tripwire.entropy_kill_frac == pytest.approx(0.3)  # untouched default
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        "[tripwire]\nentropy_warn_frac = 0.0\n",
+        "[tripwire]\nentropy_warn_frac = 1.5\n",
+        "[tripwire]\nlength_kill_frac = -0.1\n",
+        "[tripwire]\nkill_consecutive_steps = 0\n",
+    ],
+)
+def test_tripwire_bad_ranges_rejected(tmp_path: Path, snippet: str) -> None:
+    """A fraction must stay a fraction of the measured baseline: 0 would disarm
+    the bound silently and anything above 1.0 would fire on a healthy step."""
+    with pytest.raises(ValueError, match="tripwire"):
+        load_distill_config(_write(tmp_path, MINIMAL_TOML + "\n" + snippet))
+
+
+def test_a_kill_fraction_above_its_warn_fraction_is_rejected(tmp_path: Path) -> None:
+    """An abort that was never warned about first is a configuration mistake."""
+    text = MINIMAL_TOML + "\n[tripwire]\nentropy_warn_frac = 0.3\nentropy_kill_frac = 0.5\n"
+    with pytest.raises(ValueError, match="entropy_kill_frac"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def test_tripwire_unknown_key_rejected(tmp_path: Path) -> None:
+    """No absolute threshold can be smuggled in under a new key."""
+    text = MINIMAL_TOML + "\n[tripwire]\nentropy_min_nats = 0.2\n"
+    with pytest.raises(ValueError, match="tripwire.entropy_min_nats"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def test_the_recorded_probe_baseline_is_under_the_sibling_absolute_floor() -> None:
+    """The documented reason the thresholds are relative, pinned as a test: a
+    healthy, untrained Super-120B on TB2 measures 0.181 nats/token, so the
+    sibling lane's absolute "entropy < 0.2 means collapse" rule would have fired
+    on this project's step 0."""
+    assert PROBE_BASELINE_ENTROPY_NATS == pytest.approx(0.181)
+    assert PROBE_BASELINE_ENTROPY_NATS < 0.2
+    assert PROBE_BASELINE_EPISODE_TOKENS == 7577
+
+
 def test_wandb_unknown_key_rejected(tmp_path: Path) -> None:
     text = MINIMAL_TOML + "\n[wandb]\nteam = 'nope'\n"
     with pytest.raises(ValueError, match="wandb.team"):
@@ -501,11 +666,138 @@ def test_train_max_datum_tokens_must_be_positive(value: int) -> None:
         TrainConfig.model_validate({"max_datum_tokens": value})
 
 
+XTOKEN_TOML = """
+[student]
+base_model = "Qwen/Qwen3-8B"
+
+[teacher]
+backend = "openai_compat"
+model = "nvidia/GLM-5.2-NVFP4"
+tokenizer = "zai-org/GLM-5.2"
+alignment = "chunk"
+endpoint = "http://127.0.0.1:8000/v1"
+
+[harbor]
+job_template = "jobs/tb2.yaml"
+"""
+
+
+def test_teacher_defaults_to_tinker_with_same_tokenizer() -> None:
+    teacher = TeacherConfig(model="Qwen/Qwen3-235B-A22B-Instruct-2507")
+    assert teacher.backend == "tinker"
+    assert teacher.alignment == "same_tokenizer"
+    assert teacher.endpoint is None
+    assert teacher.tokenizer is None
+
+
+def test_load_cross_tokenizer_teacher(tmp_path: Path) -> None:
+    cfg = load_distill_config(_write(tmp_path, XTOKEN_TOML))
+    assert cfg.teacher.backend == "openai_compat"
+    assert cfg.teacher.model == "nvidia/GLM-5.2-NVFP4"
+    assert cfg.teacher.tokenizer == "zai-org/GLM-5.2"
+    assert cfg.teacher.alignment == "chunk"
+    assert cfg.teacher.endpoint == "http://127.0.0.1:8000/v1"
+    # importance_sampling (the default) is the only loss the chunk path supports.
+    assert cfg.train.loss == "importance_sampling"
+
+
+def test_openai_compat_teacher_requires_endpoint() -> None:
+    # Without a URL there is nothing to score against, and the failure has to name
+    # the missing key rather than surface as a connection error mid-run.
+    with pytest.raises(ValidationError, match="teacher.endpoint"):
+        TeacherConfig.model_validate(
+            {
+                "backend": "openai_compat",
+                "model": "nvidia/GLM-5.2-NVFP4",
+                "tokenizer": "zai-org/GLM-5.2",
+                "alignment": "chunk",
+            }
+        )
+
+
+def test_openai_compat_teacher_requires_tokenizer() -> None:
+    with pytest.raises(ValidationError, match="teacher.tokenizer"):
+        TeacherConfig.model_validate(
+            {
+                "backend": "openai_compat",
+                "model": "nvidia/GLM-5.2-NVFP4",
+                "alignment": "chunk",
+                "endpoint": "http://127.0.0.1:8000/v1",
+            }
+        )
+
+
+def test_openai_compat_teacher_requires_chunk_alignment() -> None:
+    # A self-hosted teacher never shares the student's vocabulary, so leaving the
+    # default same_tokenizer alignment in place would score the wrong token ids.
+    with pytest.raises(ValidationError, match='alignment = "chunk"'):
+        TeacherConfig.model_validate(
+            {
+                "backend": "openai_compat",
+                "model": "nvidia/GLM-5.2-NVFP4",
+                "tokenizer": "zai-org/GLM-5.2",
+                "endpoint": "http://127.0.0.1:8000/v1",
+            }
+        )
+
+
+def test_openai_compat_teacher_rejects_tinker_checkpoint() -> None:
+    with pytest.raises(ValidationError, match="teacher.checkpoint"):
+        TeacherConfig.model_validate(
+            {
+                "backend": "openai_compat",
+                "model": "nvidia/GLM-5.2-NVFP4",
+                "tokenizer": "zai-org/GLM-5.2",
+                "alignment": "chunk",
+                "endpoint": "http://127.0.0.1:8000/v1",
+                "checkpoint": "tinker://run/weights/7",
+            }
+        )
+
+
+def test_tinker_teacher_rejects_endpoint() -> None:
+    with pytest.raises(ValidationError, match="teacher.endpoint is only for"):
+        TeacherConfig.model_validate(
+            {"model": "big-teacher", "endpoint": "http://127.0.0.1:8000/v1"}
+        )
+
+
+def test_chunk_alignment_requires_openai_compat_backend() -> None:
+    # Chunk alignment is implemented only against the self-hosted backend; asking a
+    # Tinker teacher for it would silently score same-vocabulary ids twice over.
+    with pytest.raises(ValidationError, match='alignment = "same_tokenizer"'):
+        TeacherConfig.model_validate({"model": "big-teacher", "alignment": "chunk"})
+
+
+def test_chunk_alignment_rejects_topk_ce_loss(tmp_path: Path) -> None:
+    # topk_ce would feed teacher-vocabulary candidate ids to the student as targets.
+    text = XTOKEN_TOML + '\n[train]\nloss = "topk_ce"\n'
+    with pytest.raises(ValueError, match="topk_ce"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def test_same_tokenizer_alignment_still_accepts_topk_ce_loss(tmp_path: Path) -> None:
+    text = MINIMAL_TOML + '\n[train]\nloss = "topk_ce"\n'
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.train.loss == "topk_ce"
+    assert cfg.teacher.alignment == "same_tokenizer"
+
+
+def test_snapshot_round_trips_the_cross_tokenizer_teacher(tmp_path: Path) -> None:
+    cfg = load_distill_config(_write(tmp_path, XTOKEN_TOML))
+    snap_path = tmp_path / "snapshot.toml"
+    snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+    assert load_distill_config(snap_path) == cfg
+
+
 def test_checked_in_run_configs_resolve_cookbook_renderers() -> None:
-    # The smoke configs pin real Tinker lineup names; the cookbook must know a renderer
+    # The configs pin real Tinker lineup names; the cookbook must know a renderer
     # for each or the very first rollout completion of that run fails in build_renderer
     # (regression: the Nemotron smoke config once carried lineup names absent from the
-    # cookbook 0.4.x catalog).
+    # cookbook 0.4.x catalog). The student always trains on Tinker, so it always needs
+    # a renderer. An openai_compat teacher is a self-hosted HF repo id the cookbook has
+    # never heard of (zai-org/GLM-* is absent from the 0.4.3 catalog); what it must
+    # carry instead is the endpoint serving it and its own tokenizer.
     pytest.importorskip("tinker_cookbook")
     from tinker_cookbook.model_info import get_recommended_renderer_name
 
@@ -515,5 +807,109 @@ def test_checked_in_run_configs_resolve_cookbook_renderers() -> None:
         pytest.skip("no checked-in distill run configs in this tree")
     for path in paths:
         cfg = load_distill_config(path)
-        for model in (cfg.student.base_model, cfg.teacher.model):
+        models = [cfg.student.base_model]
+        if cfg.teacher.backend == "tinker":
+            models.append(cfg.teacher.model)
+        else:
+            assert cfg.teacher.endpoint, f"{path.name}: openai_compat teacher needs endpoint"
+            assert cfg.teacher.tokenizer, f"{path.name}: openai_compat teacher needs tokenizer"
+        for model in models:
             assert get_recommended_renderer_name(model), f"{path.name}: {model}"
+
+
+def test_checked_in_run_configs_name_a_verbatim_renderer_for_every_tinker_model() -> None:
+    """Every model a run SAMPLES needs an explicit renderer, and it must be a wmh one.
+
+    The auto-discovered reasoning renderer of every model in this lineup kills the
+    trial before it grades anything (harbor's terminus-2 parsers are handed a list),
+    so a config that leaves `[rollout.renderers]` unset for a sampled model does not
+    run at all. The value check lives in the validator; this pins that the checked-in
+    configs actually carry the entries.
+    """
+    pytest.importorskip("tinker_cookbook")
+    from wmh.distill.renderers import VERBATIM_RENDERERS
+
+    config_dir = Path(__file__).resolve().parents[2] / ".agents" / "distill"
+    paths = sorted(config_dir.glob("*.toml"))
+    if not paths:
+        pytest.skip("no checked-in distill run configs in this tree")
+    for path in paths:
+        cfg = load_distill_config(path)
+        # An openai_compat teacher is served outside Tinker and renders with its own
+        # template, so it never reaches terminus-2's renderer.
+        sampled = [cfg.student.base_model]
+        if cfg.teacher.backend == "tinker":
+            sampled.append(cfg.teacher.model)
+        for model in sampled:
+            renderer = cfg.rollout.renderers.get(model)
+            assert renderer is not None, f"{path.name}: no rollout.renderers entry for {model}"
+            assert renderer in VERBATIM_RENDERERS, f"{path.name}: {model} = {renderer}"
+
+
+def test_a_renderer_name_the_cookbook_cannot_build_is_rejected_at_load(tmp_path: Path) -> None:
+    """A typo must fail here, not on the first (paid) rollout of the run."""
+    pytest.importorskip("tinker_cookbook")
+    text = MINIMAL_TOML + (
+        '\n[rollout.renderers]\n"Qwen/Qwen3-8B" = "wmh/qwen3_5_verbatm"\n'  # codespell:ignore
+    )
+    with pytest.raises(ValueError, match="tinker-cookbook cannot build"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def test_the_wmh_verbatim_and_builtin_renderer_names_load(tmp_path: Path) -> None:
+    pytest.importorskip("tinker_cookbook")
+    text = MINIMAL_TOML + (
+        "\n[rollout.renderers]\n"
+        '"Qwen/Qwen3-8B" = "wmh/qwen3_verbatim"\n'
+        '"Qwen/Qwen3-235B-A22B-Instruct-2507" = "qwen3_disable_thinking"\n'
+    )
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.rollout.renderers["Qwen/Qwen3-8B"] == "wmh/qwen3_verbatim"
+
+
+def test_a_renderer_key_naming_a_model_the_run_never_samples_is_rejected(tmp_path: Path) -> None:
+    """The more dangerous typo: an unmatched key is silently ignored everywhere else."""
+    pytest.importorskip("tinker_cookbook")
+    text = MINIMAL_TOML + '\n[rollout.renderers]\n"Qwen/Qwen3-9B" = "wmh/qwen3_verbatim"\n'
+    with pytest.raises(ValueError, match="never samples"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def _checked_in_config(name: str) -> DistillConfig:
+    path = Path(__file__).resolve().parents[2] / ".agents" / "distill" / name
+    if not path.exists():
+        pytest.skip(f"{name} is not in this tree")
+    return load_distill_config(path)
+
+
+def test_anchor_config_trains_the_raw_gap_under_ppo() -> None:
+    """The anchor run's objective is pinned: raw gap, ppo, no SFT warmup.
+
+    This is the config real money runs against, and each of the three
+    settings is a decision rather than a default: `ppo` so the ratio clip is
+    the regularizer, no `advantage_clip` and no centering so the advantage is
+    exactly the teacher-minus-student gap, `warmup.steps = 0` because the run
+    is on-policy from step 1. The file is `distill-nano-anchor.toml`; the
+    older `distill-super-anchor.toml` beside it is the Super-student sweep's
+    importance_sampling source run and is deliberately not pinned here.
+    """
+    cfg = _checked_in_config("distill-nano-anchor.toml")
+    assert cfg.train.loss == "ppo"
+    assert cfg.train.advantage_clip is None
+    assert cfg.train.center_advantages is False
+    assert cfg.warmup.steps == 0
+
+
+@pytest.mark.parametrize("name", ["distill-super-topk.toml", "distill-super-aggressive.toml"])
+def test_super_topk_configs_pin_clip_and_centering_explicitly(name: str) -> None:
+    """The top-k siblings must not drift when the shared defaults move.
+
+    They predate the raw-gap default, so they carry the old values inline;
+    inheriting the new defaults would silently redefine what those runs mean
+    if either ever switched off topk_ce.
+    """
+    cfg = _checked_in_config(name)
+    assert cfg.train.loss == "topk_ce"
+    assert cfg.train.advantage_clip == pytest.approx(4.0)
+    assert cfg.train.center_advantages is True
+    assert cfg.warmup.steps == 0

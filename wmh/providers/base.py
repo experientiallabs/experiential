@@ -229,6 +229,31 @@ class ToolCallingProvider(Protocol):
         ...
 
 
+UNPARSED_TOOL_CALLS_KEY = "wmh_unparsed_tool_calls"
+"""Extra `ChatChoice` key: parse errors for tool calls the provider could not decode.
+
+A provider whose wire format is raw sampled text (the Tinker student, decoded through a chat
+template renderer) can emit a turn whose tool call is malformed or was cut off at the output cap.
+Dropping it silently makes the turn look like plain prose, which is how a truncated `write_file`
+became a "submitted" episode with reward 0. Providers set this list so the pi runner can feed the
+parser's complaint back to the model instead of ending the episode; `ChatChoice` allows extras, so
+it rides `wire_payload()` to the runner untouched."""
+
+
+@runtime_checkable
+class ContextWindowProvider(Protocol):
+    """Provider capability for reporting the context window its model is actually served with.
+
+    Kept separate from :class:`Provider` because most backends have no single answer (an API key
+    fronts many models). Implement it where the served window is a property of the deployment, so
+    the pi runner can calibrate its context guard to the real number instead of a guess.
+    """
+
+    def context_window(self) -> int | None:
+        """The served context window in tokens, or None when it cannot be determined."""
+        ...
+
+
 # One read-only instance reused across every verify() ping (complete() never mutates messages).
 _PING_MESSAGES: list[Message] = [Message(role="user", content="ping")]
 

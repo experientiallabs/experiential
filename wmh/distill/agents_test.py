@@ -170,3 +170,30 @@ def test_run_drives_the_runtime_with_the_recording_provider(
     assert observed["closed"] is True
     trace = json.loads((_logs_dir(tmp_path) / "wmh-run.json").read_text(encoding="utf-8"))
     assert trace["stop_reason"] == "submitted"
+
+
+def test_accepts_every_keyword_its_base_harbor_agent_accepts() -> None:
+    """The distill agent must not silently drop a kwarg harbor forwards to its base class.
+
+    Harbor's `AgentFactory` calls `agent_class(logs_dir=..., model_name=..., **kwargs)`, so a
+    keyword the base `WmhHarborAgent` grew but this subclass never declared raises `TypeError`
+    inside trial construction — every trial dies at `_init_agent`, and the batch reports that as
+    infra failure rather than as a code defect. That is how `context_window` (added when the
+    served window stopped being hardcoded) killed a whole 48-episode probe wave while the test
+    suite stayed green.
+    """
+    import inspect
+
+    from wmh.evals.harbor.agent import WmhHarborAgent
+
+    def keywords(cls: type) -> set[str]:
+        return {
+            name
+            for name, p in inspect.signature(cls.__init__).parameters.items()
+            if p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD) and name != "self"
+        }
+
+    missing = keywords(WmhHarborAgent) - keywords(WmhDistillHarborAgent)
+    assert not missing, (
+        f"distill agent drops base-class keywords harbor forwards: {sorted(missing)}"
+    )

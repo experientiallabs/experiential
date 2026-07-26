@@ -9,9 +9,35 @@ deadline. Expiry raises `TinkerDeadlineError`, whose message deliberately
 reads as a timeout so llm-waterfall classifies it as a capacity (transient)
 error: callers retry with a fresh session instead of hanging.
 
-Defaults carry generous headroom over measured live latencies (sample mean
-2.8s / p95 7.7s / max 10.2s; compute_logprobs max 1.5s; forward_backward
-~1.5s; optim_step ~0.5s; save_state ~2.4s; save_weights_for_sampler mean
+Deadlines must scale with MODEL SIZE and TOKEN VOLUME, not just with call
+kind. The original defaults were derived from small students on short
+contexts (sample mean 2.8s / p95 7.7s / max 10.2s; compute_logprobs max
+1.5s; forward_backward ~1.5s), and every one of them proved too tight once a
+120B student ran a 240k-token context budget: `forward_backward` needed 900s
+under Super plus top-k, and a 48-episode probe wave produced 10 `sample`
+expiries against the old 120s. A sample that legitimately needs 150s gets
+killed, retried on a fresh session, killed again, and finally surfaces as
+`provider_error` — i.e. OUR timeout is recorded as a scaffold loss and
+pollutes the very metric that is supposed to measure the agent loop. The
+current values are therefore sized so the EPISODE wall (`episode_timeout_s`,
+1800s) is what cuts a slow episode, never a single call's deadline, while a
+genuinely wedged session still cannot hang forever.
+
+`optim_step` and `save_state` were the SECOND lesson, and they killed a live
+run: they scale with the number of DATUMS in the batch, which is a function of
+the LOSS, not of the model. `topk_ce` replicates every datum k times, so the
+same 64-episode batch became **512 datums against `importance_sampling`'s 62**,
+and the optimizer step blew the old 120s while the reverse-KL arm — 8x lighter
+on the identical batch — sailed through. Anything sized from small-model
+timings (the "~0.5-3s" below) is therefore a floor, not a guide.
+
+Remaining follow-up: make the sample/compute_logprobs deadlines a function of
+`(prompt_tokens + max_tokens)`, and optim_step/save_state a function of datum
+count, rather than flat constants, so a 4B student on 8k contexts is not
+waiting 300s to discover a wedged session.
+
+Historical measurements for the smaller-model regime (optim_step ~0.5s;
+save_state ~2.4s; save_weights_for_sampler mean
 4.4s / max 18s with one observed 80s outlier). `load_state` gets the same
 600s as save_weights_for_sampler for a different reason: restoring a large
 student's weights plus optimizer state exceeded 120s on a live 120B resume,
@@ -20,11 +46,11 @@ once anything initialized the model, see `SdkTrainingClient`), so its deadline
 is the whole budget rather than the first of two attempts. Each default is
 overridable via one env var per kind, `WMH_TINKER_DEADLINE_<KIND>` in seconds:
 
-- sample: 120s (WMH_TINKER_DEADLINE_SAMPLE)
-- compute_logprobs: 60s (WMH_TINKER_DEADLINE_COMPUTE_LOGPROBS)
-- forward_backward: 120s (WMH_TINKER_DEADLINE_FORWARD_BACKWARD)
-- optim_step: 120s (WMH_TINKER_DEADLINE_OPTIM_STEP)
-- save_state: 120s (WMH_TINKER_DEADLINE_SAVE_STATE)
+- sample: 300s (WMH_TINKER_DEADLINE_SAMPLE)
+- compute_logprobs: 300s (WMH_TINKER_DEADLINE_COMPUTE_LOGPROBS)
+- forward_backward: 900s (WMH_TINKER_DEADLINE_FORWARD_BACKWARD)
+- optim_step: 600s (WMH_TINKER_DEADLINE_OPTIM_STEP)
+- save_state: 600s (WMH_TINKER_DEADLINE_SAVE_STATE)
 - load_state: 600s (WMH_TINKER_DEADLINE_LOAD_STATE)
 - save_weights_for_sampler: 600s (WMH_TINKER_DEADLINE_SAVE_WEIGHTS_FOR_SAMPLER)
 - connect: 60s (WMH_TINKER_DEADLINE_CONNECT)
@@ -73,11 +99,11 @@ TinkerCallKind = Literal[
 DEADLINE_ENV_PREFIX = "WMH_TINKER_DEADLINE_"
 
 DEFAULT_DEADLINES_S: dict[TinkerCallKind, float] = {
-    "sample": 120.0,
-    "compute_logprobs": 60.0,
-    "forward_backward": 120.0,
-    "optim_step": 120.0,
-    "save_state": 120.0,
+    "sample": 300.0,
+    "compute_logprobs": 300.0,
+    "forward_backward": 900.0,
+    "optim_step": 600.0,
+    "save_state": 600.0,
     "load_state": 600.0,
     "save_weights_for_sampler": 600.0,
     "connect": 60.0,

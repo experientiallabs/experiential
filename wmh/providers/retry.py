@@ -20,6 +20,7 @@ from wmh.providers.base import (
     ChatRequest,
     ChatResponse,
     Completion,
+    ContextWindowProvider,
     Message,
     Provider,
     ProviderConfig,
@@ -75,6 +76,17 @@ class RetryingProvider:
 
     def verify(self) -> VerifyResult:
         return self._provider.verify()
+
+    def context_window(self) -> int | None:
+        """Forward the wrapped provider's served context window (None when it has none).
+
+        Retries must not hide a capability: the pi runner resolves its context guard through
+        `ContextWindowProvider`, and a wrapper that swallowed the method would silently send the
+        runner back to its fallback window.
+        """
+        if not isinstance(self._provider, ContextWindowProvider):
+            return None
+        return self._provider.context_window()
 
     def _retry(self, call: Callable[[], _T]) -> _T:
         total = len(self._delays)

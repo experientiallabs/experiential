@@ -36,10 +36,17 @@ from wmh.providers.tinker import TokenSpan
 def _cfg(
     *,
     max_datum_tokens: int = 65536,
-    advantage_clip: float = 4.0,
+    advantage_clip: float | None = 4.0,
     center_advantages: bool = True,
     context_budget_tokens: int = 65536,
 ) -> DistillConfig:
+    """A config for the datum builders.
+
+    The clip/centering defaults here are the pre-ppo pair on purpose, so the
+    tests that exercise clipping and centering keep saying what they said; the
+    raw-gap default that `TrainConfig` now ships is asserted against
+    `TrainConfig()` directly (see the raw-gap tests below).
+    """
     return DistillConfig(
         student=StudentConfig(base_model="Qwen/Qwen3-8B"),
         teacher=TeacherConfig(model="Qwen/Qwen3-32B"),
@@ -325,6 +332,70 @@ def test_attach_advantages_clips_both_directions() -> None:
     assert stats.clipped_tokens / stats.loss_tokens == pytest.approx(2 / 3)
 
 
+def test_attach_advantages_trains_the_raw_gap_when_clipping_is_off() -> None:
+    """advantage_clip = None: the advantage IS teacher_lp - sampled_lp.
+
+    The OpenClaw-RL / Slime objective. Nothing bounds a token's magnitude
+    (+9.5 rides through untouched), nothing counts as clipped, so the loop's
+    clip_fraction is 0, and advantage_mean is the mean gap: the read of how
+    far the student still is from the teacher.
+    """
+    datum = _one_datum(sampled_logprobs=[-1.0, -2.0, -3.0])
+    # teacher - sampled per loss position: +9.5, -0.5, -8.0 (the same row the
+    # clipping test above squeezes into [-2, +2]).
+    teacher: list[float | None] = [None, -0.1, 8.5, -2.5, -11.0]
+    attached, stats = attach_advantages(
+        [datum], [teacher], _cfg(advantage_clip=None, center_advantages=False)
+    )
+    assert attached[0].advantages == pytest.approx([0.0, 0.0, 9.5, -0.5, -8.0])
+    assert stats.clipped_tokens == 0
+    assert stats.loss_tokens == 3
+    raw_mean = (9.5 - 0.5 - 8.0) / 3
+    assert stats.advantage_mean == pytest.approx(raw_mean)
+    assert stats.advantage_mean != 0.0
+    expected_std = math.sqrt(
+        ((9.5 - raw_mean) ** 2 + (-0.5 - raw_mean) ** 2 + (-8.0 - raw_mean) ** 2) / 3
+    )
+    assert stats.advantage_std == pytest.approx(expected_std)
+
+
+def test_attach_advantages_config_defaults_are_the_raw_gap() -> None:
+    """The shipped defaults, not just an explicit pair, train the raw gap.
+
+    `TrainConfig()` as written in config.py is what a TOML that omits both
+    keys gets, and the metrics read of the objective depends on this being the
+    uncentered gap rather than a trivial 0 mean.
+    """
+    cfg = DistillConfig(
+        student=StudentConfig(base_model="Qwen/Qwen3-8B"),
+        teacher=TeacherConfig(model="Qwen/Qwen3-32B"),
+        harbor=HarborConfig(job_template="job.yaml"),
+        train=TrainConfig(),
+    )
+    assert cfg.train.advantage_clip is None
+    assert cfg.train.center_advantages is False
+    datum = _one_datum(sampled_logprobs=[-1.0, -2.0, -3.0])
+    teacher: list[float | None] = [None, -0.1, 8.5, -2.5, -11.0]
+    attached, stats = attach_advantages([datum], [teacher], cfg)
+    assert attached[0].advantages == pytest.approx([0.0, 0.0, 9.5, -0.5, -8.0])
+    assert stats.clipped_tokens == 0
+    assert stats.advantage_mean == pytest.approx((9.5 - 0.5 - 8.0) / 3)
+
+
+def test_attach_advantages_centering_applies_to_unclipped_gaps() -> None:
+    """The two knobs are independent: centering off clipping is still centering."""
+    datum = _one_datum(sampled_logprobs=[-1.0, -2.0, -3.0])
+    teacher: list[float | None] = [None, -0.1, 8.5, -2.5, -11.0]  # raw: +9.5, -0.5, -8.0
+    attached, stats = attach_advantages(
+        [datum], [teacher], _cfg(advantage_clip=None, center_advantages=True)
+    )
+    mean = (9.5 - 0.5 - 8.0) / 3
+    assert attached[0].advantages == pytest.approx([0.0, 0.0, 9.5 - mean, -0.5 - mean, -8.0 - mean])
+    assert stats.clipped_tokens == 0
+    # Centered: the mean is 0 by construction and reads nothing about the run.
+    assert stats.advantage_mean == pytest.approx(0.0)
+
+
 def test_attach_advantages_batch_mean_centering() -> None:
     datum = _one_datum(sampled_logprobs=[-1.0, -1.0, -1.0])
     teacher: list[float | None] = [None, -0.1, -2.0, -1.0, 0.5]  # raw: -1.0, 0.0, +1.5
@@ -519,6 +590,69 @@ def test_to_tinker_datums_tito_round_trip_through_the_fake_training_client() -> 
     )
     with pytest.raises(AssertionError, match="TITO violation"):
         training.forward_backward([corrupted], "importance_sampling")
+
+
+def test_to_tinker_datums_ppo_keyset_is_the_same_pinned_wire_contract() -> None:
+    """`ppo` rides the identical datum, and the keyset is pinned the same way.
+
+    Pinned against the installed SDK (tinker 0.23.3): "ppo" is a value of
+    `tinker.types.LossFnType`, `forward_backward(data, loss_fn,
+    loss_fn_config)` takes the same `Datum` list for either loss, and the
+    cookbook's RL path (`tinker_cookbook/rl/train.py:train_step`) submits
+    exactly {target_tokens, logprobs, advantages} - it strips "mask" - for
+    both `"importance_sampling"` and `"ppo"`. The live service rejected an
+    unexpected "mask" key once, so this is asserted rather than assumed. Any
+    extra key here would be a new server-side rejection mid-run.
+    """
+    pytest.importorskip("tinker")
+    from typing import get_args
+
+    from tinker.types import LossFnType
+
+    assert "ppo" in get_args(LossFnType)
+
+    training, spans = _sampled_episode()
+    datums, _ = build_datums([_record(spans)], _cfg())
+    tokens = datums[0].model_input_tokens
+    teacher: list[float | None] = [None, *(-0.25 for _ in tokens[1:])]
+    # The ppo objective's own advantage shaping: raw gap, uncentered.
+    attached, stats = attach_advantages(
+        [datums[0]], [teacher], _cfg(advantage_clip=None, center_advantages=False)
+    )
+    assert stats.clipped_tokens == 0
+
+    (td,) = to_tinker_datums(attached)
+    assert set(td.loss_fn_inputs) == {"target_tokens", "logprobs", "advantages"}
+    assert td.loss_fn_inputs["target_tokens"].dtype == "int64"
+    assert td.loss_fn_inputs["logprobs"].dtype == "float32"
+    assert td.loss_fn_inputs["advantages"].dtype == "float32"
+
+    # Token-in-token-out still holds under the ppo loss: the fake training
+    # client checks every loss-weighted target run against the spans its
+    # linked sampler issued before it records the call.
+    mask = attached[0].loss_mask[1:]
+    fake = FakeDatum(
+        model_input_tokens=td.model_input.to_ints(),
+        target_tokens=[int(t) for t in td.loss_fn_inputs["target_tokens"].data],
+        weights=mask,
+        advantages=[float(v) for v in td.loss_fn_inputs["advantages"].data],
+        logprobs=[float(v) for v in td.loss_fn_inputs["logprobs"].data],
+    )
+    training.forward_backward([fake], "ppo")
+    assert [loss for _, loss in training.forward_backward_calls] == ["ppo"]
+
+    # Negative control: one fabricated sampled token still trips the invariant.
+    corrupted_targets = list(fake.target_tokens)
+    corrupted_targets[mask.index(1.0)] += 1
+    corrupted = FakeDatum(
+        model_input_tokens=fake.model_input_tokens,
+        target_tokens=corrupted_targets,
+        weights=mask,
+        advantages=fake.advantages,
+        logprobs=fake.logprobs,
+    )
+    with pytest.raises(AssertionError, match="TITO violation"):
+        training.forward_backward([corrupted], "ppo")
 
 
 # --- to_tinker_sft_datums (the warmup cross_entropy converter) --------------------------------

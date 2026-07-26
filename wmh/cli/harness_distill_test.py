@@ -307,9 +307,9 @@ def test_distill_budget_abort_prints_the_resume_command(
     _write_inputs(tmp_path)
     error = DistillBudgetError(
         "budget exhausted: $51.00 spent against the $50.00 cap",
-        resume_command=(
-            f"wmh optimize harness pi harbor --mode distill --run-dir {tmp_path / 'run'} --resume"
-        ),
+        resume_command=f"wmh optimize harness pi harbor --mode distill "
+        f"--run-dir {tmp_path / 'run'} "
+        "--resume",
         spent_usd=51.0,
         max_usd=50.0,
     )
@@ -748,16 +748,16 @@ def test_e2b_preflight_passes_when_enough_slots_are_free(
     _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 12\n{_BUDGET_TOML}")
     recorder = _RunRecorder()
     _patch_run(monkeypatch, recorder)
-    asked = _patch_capacity(monkeypatch, _capacity(alive_before=40, alive=40, required=24))
+    asked = _patch_capacity(monkeypatch, _capacity(alive_before=40, alive=40, required=12))
 
     result = _invoke(tmp_path, "--yes", "--backend", "e2b")
 
     assert result.exit_code == 0, result.output
-    # A trial holds TWO sandboxes at once: harbor's task environment plus the pi worker.
+    # One sandbox per trial: harbor's task environment. Terminus-2 runs in this process.
     assert asked == [12 * E2B_SANDBOXES_PER_TRIAL]
     flat = _flat(result)
-    assert "e2b capacity ok: 40/100 sandbox(es) in use, 60 free, 24 needed" in flat
-    assert "(2 per trial x train.trial_concurrency=12)" in flat
+    assert "e2b capacity ok: 40/100 sandbox(es) in use, 60 free, 12 needed" in flat
+    assert "(1 per trial x train.trial_concurrency=12)" in flat
     assert len(recorder.calls) == 1
 
 
@@ -767,7 +767,7 @@ def test_e2b_preflight_reaps_dead_owner_orphans_and_then_proceeds(
     _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 8\n{_BUDGET_TOML}")
     recorder = _RunRecorder()
     _patch_run(monkeypatch, recorder)
-    _patch_capacity(monkeypatch, _capacity(alive_before=97, alive=84, required=16, freed=13))
+    _patch_capacity(monkeypatch, _capacity(alive_before=97, alive=84, required=8, freed=13))
 
     result = _invoke(tmp_path, "--yes", "--backend", "e2b")
 
@@ -787,18 +787,18 @@ def test_e2b_preflight_fails_fast_when_slots_stay_short(
     _write_inputs(tmp_path, extra_toml=f"trial_concurrency = 12\n{_BUDGET_TOML}")
     recorder = _RunRecorder()
     _patch_run(monkeypatch, recorder)
-    _patch_capacity(monkeypatch, _capacity(alive_before=98, alive=95, required=24, freed=3))
+    _patch_capacity(monkeypatch, _capacity(alive_before=98, alive=95, required=12, freed=3))
 
     result = _invoke(tmp_path, "--yes", "--backend", "e2b")
 
     assert result.exit_code != 0
     flat = _flat(result)
     assert "not enough free E2B sandbox slots: 95 of 100 concurrent sandboxes are in use" in flat
-    assert "leaving 5 free, but this run needs 24 (2 per trial x train.trial_concurrency=12" in flat
-    assert "harbor's task environment plus the pi worker)" in flat
+    assert "leaving 5 free, but this run needs 12 (1 per trial x train.trial_concurrency=12" in flat
+    assert "harbor's task environment)" in flat
     assert "freed 3 slot(s) and was not enough" in flat
     assert "wmh e2b reap --stale-minutes 60 --yes" in flat
-    assert "lower train.trial_concurrency to at most 2" in flat  # 5 free // 2 per trial
+    assert "lower train.trial_concurrency to at most 5" in flat  # 5 free // 1 per trial
     assert "WMH_E2B_SANDBOX_CAP" in flat
     assert recorder.calls == []  # nothing was spent
 

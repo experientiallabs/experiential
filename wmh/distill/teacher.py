@@ -403,7 +403,7 @@ class TinkerTeacher:
                 "topk_prompt_logprobs surface, so it cannot serve the topk_ce "
                 "loss; inject a client with the prefill top-k call (the SDK "
                 "adapters and the fakes both have it) or use "
-                'train.loss = "importance_sampling"'
+                'train.loss = "importance_sampling" or "ppo"'
             )
         workers = min(_SCORE_CONCURRENCY, len(datum_list))
         try:

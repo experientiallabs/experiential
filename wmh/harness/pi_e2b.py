@@ -98,7 +98,8 @@ _PACKAGE_JSON = '{"name": "pi-run", "private": true, "type": "module"}\n'
 _PI_ENTRY_DIR = os.path.join(os.path.dirname(__file__), "pi_entry")
 # runner_stdio.ts is the entrypoint; runner_frames.ts rides along so the two runner transports
 # stay deployed together (spec §4) even though the stdio runner is self-contained.
-_RUNNER_FILES = ("runner_stdio.ts", "runner_frames.ts")
+# runner_termination.ts is a hard dependency of runner_stdio.ts (the classify + nudge policy).
+_RUNNER_FILES = ("runner_stdio.ts", "runner_frames.ts", "runner_termination.ts")
 
 _STDERR_LINES = 50  # bounded diagnostics buffer: enough for a stack trace, never unbounded
 _IDLE_RECONNECT_DELAYS_S = (0.0, 0.25, 1.0)
@@ -1424,6 +1425,7 @@ class E2BPiRuntime:
         temperature: float = 0.7,
         skills: SkillLibrary | None = None,
         episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+        context_window: int | None = None,
         transport_retries: int = 1,
         should_cancel: Callable[[], bool] | None = None,
     ) -> None:
@@ -1450,6 +1452,7 @@ class E2BPiRuntime:
         self._temperature = temperature
         self._skills = skills if skills is not None else SkillLibrary()
         self._episode_timeout_s = episode_timeout_s
+        self._context_window = context_window
         self._transport_retries = transport_retries
         self._should_cancel = should_cancel
         self._aborted = threading.Event()
@@ -1511,6 +1514,7 @@ class E2BPiRuntime:
                 temperature=self._temperature,
                 skills=self._skills,
                 episode_timeout_s=self._episode_timeout_s,
+                context_window=self._context_window,
                 should_cancel=self._cancel_requested,
             )
             result = link.run(task_id, instruction, environment)

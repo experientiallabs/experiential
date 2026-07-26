@@ -1,0 +1,105 @@
+# Qwen 27B baseline run: Qwen3.6-27B on the full TB2 split with the headline
+# OpenClaw-RL / Slime objective: the RAW per-token teacher-minus-student logprob
+# gap as the advantage (no clipping, no centering) trained under Tinker's ppo
+# loss, so regularization comes from PPO ratio clipping inside the loss instead
+# of from reshaping the advantage.
+#
+# The Qwen lane exists to check the result is not a Nemotron artifact, so the
+# objective, split, and schedule are held identical to distill-super-anchor and
+# only the model axis moves. Teacher and student must share a tokenizer or the
+# run aborts at tokenizer_fingerprint_check, which is why this lane stays inside
+# the Qwen3.5/3.6 family (they share a tokenizer and a renderer). Model names are
+# the tinker-cookbook catalog names (pinned by
+# test_checked_in_run_configs_resolve_cookbook_renderers).
+#
+# TODO(before running): the teacher here is the student's own base model, so the
+# advantage is ~0 at step 0 and this config trains nothing. Repoint teacher.model
+# at a larger same-tokenizer Qwen (Qwen/Qwen3.5-397B-A17B is the only catalog
+# entry above 27B) and add its [rollout.renderers] entry, or treat this file as
+# the 27B student-before / teacher baseline measurement only.
+[student]
+base_model = "Qwen/Qwen3.6-27B"
+lora_rank = 32
+
+[teacher]
+backend = "tinker"
+model = "Qwen/Qwen3.6-27B"
+
+[harbor]
+job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+backend = "local"
+reward_key = "reward"
+
+[rollout]
+max_turns = 100
+# 2700s: the 300s default every rollout silently inherited ended 31% of trials on the
+# wall clock, and it stays inside the E2B sandbox lease ceiling.
+episode_timeout_s = 2700.0
+# Leaves sampling.max_tokens of room under the served window (49152 + 16384 < 65536).
+context_budget_tokens = 49152
+compaction = false
+
+# Terminus-2 cannot use the stock reasoning renderers: they hand harbor's response
+# parser a LIST and kill the trial, and they strip thinking from history, which
+# fragments the episode into one datum per turn. The wmh verbatim wrappers keep the
+# reasoning in the token stream and the episode a single datum (wmh/distill/renderers.py).
+# Both Qwen3.5 and Qwen3.6 render through the qwen3_5 family.
+[rollout.renderers]
+"Qwen/Qwen3.6-27B" = "wmh/qwen3_5_verbatim"
+
+[train]
+# ppo: same datums as importance_sampling (target_tokens, logprobs,
+# advantages), but the service clips the policy ratio instead of relying on a
+# bounded advantage (its default epsilon, reported symmetric 0.2; no
+# loss_fn_config is sent).
+loss = "ppo"
+steps = 45
+tasks_per_batch = 17
+group_size = 3
+learning_rate = 5e-5
+# advantage_clip deliberately UNSET and centering off: the advantage is the
+# raw teacher-minus-student gap. Caveat to watch: with one optimizer step per
+# batch and sampler_refresh_every = 1 the policy ratio is ~1, so the ppo clip
+# almost never binds and nothing bounds a single token's magnitude. Read
+# train/advantage_std and train/grad_norm on the dashboard; if either spikes,
+# set a bound here (start around 8 to 10) rather than restarting blind.
+center_advantages = false
+max_datum_tokens = 65536
+sampler_refresh_every = 1
+save_state_every = 4
+trial_concurrency = 51
+
+# temperature 1.0 keeps issued sampler logprobs comparable to the untempered
+# teacher logprobs (unbiased reverse-KL advantages).
+[sampling]
+temperature = 1.0
+max_tokens = 16384
+
+# On-policy from step 1, same as the Nemotron anchor.
+[warmup]
+steps = 0
+
+[eval]
+every = 10
+tasks = 12
+k = 1
+# No teacher_baseline_from: every measured baseline in this tree was produced by a
+# Nemotron teacher, and importing one here would gate a Qwen run against another
+# model's solve rate. This run measures its own.
+
+[gate]
+k = 3
+min_teacher_fraction = 0.7
+require_no_regression = true
+
+[pricing]
+# Fill from the live Tinker models page at run time; unset forces interactive confirm.
+# The Nemotron Super/Ultra rates this file was copied from do NOT apply to the Qwen lineup.
+
+[budget]
+max_usd = 900.0
+
+[wandb]
+enabled = true
+project = "wmh-distill"
+run_name = "distill-qwen27b-baseline"

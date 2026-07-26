@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.scoring import (
+    GradedTests,
     RewardMode,
     ScoreCell,
     ScoreReport,
@@ -83,6 +84,36 @@ def test_cells_canonicalize_and_reject_invalid_rewards() -> None:
         _cell("a", 1, float("nan"))
     with pytest.raises(ValidationError, match="not boolean"):
         ScoreCell(task_id="a", attempt=1, reward=True, passed=True)  # type: ignore[arg-type]
+
+
+def test_graded_tests_score_over_resolved_tests_only() -> None:
+    assert GradedTests(passed=1, resolved=2).score == 0.5
+    assert GradedTests(passed=6, resolved=6).score == 1.0
+    assert GradedTests(passed=0, resolved=1).score == 0.0
+    # Unresolved tests (skipped/pending/other) are carried, never put in the denominator: a suite
+    # that passes everything it ran scores 1.0, matching the binary verdict it earned.
+    assert GradedTests(passed=2, resolved=2, unresolved=3).score == 1.0
+    with pytest.raises(ValidationError, match="cannot exceed resolved"):
+        GradedTests(passed=3, resolved=2)
+    with pytest.raises(ValidationError):
+        GradedTests(passed=0, resolved=0)  # no verdict is no score, not a 0.0
+
+
+def test_a_cell_without_a_test_report_has_no_graded_score() -> None:
+    # The default, and what every cell deserialized from an artifact written before this field
+    # carries: a graded rate must exclude it rather than average in a fabricated 0.0.
+    cell = _cell("a", 1, 0.0)
+    assert cell.tests is None
+    assert cell.graded_score is None
+    restored = ScoreCell.model_validate_json(
+        '{"task_id": "a", "attempt": 1, "reward": 0.0, "passed": false, '
+        '"artifact_dir": "/jobs/a__x1", "note": "completed", "infra_failed": false}'
+    )
+    assert restored.graded_score is None
+
+    graded = cell.model_copy(update={"tests": GradedTests(passed=1, resolved=2)})
+    assert graded.graded_score == 0.5
+    assert graded.reward == 0.0  # the binary reward is untouched beside it
 
 
 def test_request_rejects_empty_duplicate_and_boolean_inputs() -> None:

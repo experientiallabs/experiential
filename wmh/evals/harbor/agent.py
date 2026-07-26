@@ -205,6 +205,7 @@ class WmhHarborAgent(BaseAgent):
         e2b_template: str | None = None,
         episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         episode_workers: int = DEFAULT_EPISODE_WORKERS,
+        context_window: int | None = None,
     ) -> None:
         if extra_env:
             raise ValueError("WMH Harbor evaluation does not inject agent environment variables")
@@ -224,11 +225,12 @@ class WmhHarborAgent(BaseAgent):
             self._episode_timeout_sec = validate_episode_timeout_s(episode_timeout_sec)
         except ValueError as error:
             raise ValueError("episode_timeout_sec must be a finite positive number") from error
-        if (
-            harness_backend == "local"
-            and self._episode_timeout_sec != DEFAULT_EVAL_EPISODE_TIMEOUT_S
+        if context_window is not None and (
+            isinstance(context_window, bool) or not isinstance(context_window, int)
         ):
-            raise ValueError("episode_timeout_sec requires harness_backend='e2b'")
+            raise ValueError("context_window must be an integer number of tokens")
+        if context_window is not None and context_window < 1024:
+            raise ValueError("context_window must be at least 1024 tokens")
         if isinstance(episode_workers, bool) or not isinstance(episode_workers, int):
             raise ValueError("episode_workers must be a positive integer")
         if episode_workers < 1:
@@ -245,6 +247,27 @@ class WmhHarborAgent(BaseAgent):
         self._harness_backend = harness_backend
         self._e2b_template = e2b_template
         self._episode_workers = episode_workers
+        self._context_window = context_window
+
+    def _build_provider(self, config: ProviderConfig) -> Provider:
+        """Construct the worker provider; the one seam subclasses may override.
+
+        Called exactly once, from ``__init__``, after ``BaseAgent`` has set
+        ``self.logs_dir`` and the validated provider config and model identity are in
+        place, so an override can key per-trial state (e.g. a token sink named after
+        the harbor trial) off the logs directory.
+
+        Args:
+            config: The validated worker provider config.
+
+        Returns:
+            The provider the episode runtime will drive. Overrides must keep the
+            retry contract by wrapping their provider with
+            ``wrap_provider_with_retries``.
+        """
+        # Retry-wrap the worker provider: Bedrock disables botocore's own retries, so one
+        # unwrapped ThrottlingException would otherwise kill a whole trial.
+        return wrap_provider_with_retries(get_provider(config))
 
     def _build_provider(self, config: ProviderConfig) -> Provider:
         """Construct the worker provider; the one seam subclasses may override.
@@ -293,9 +316,10 @@ class WmhHarborAgent(BaseAgent):
             self._provider,
             backend=self._harness_backend,
             e2b_template=self._e2b_template,
-            episode_timeout_s=(
-                self._episode_timeout_sec if self._harness_backend == "e2b" else None
-            ),
+            # The wall budget applies to every backend: the local SSH transport used to hardcode
+            # `timeout 300 node`, so a configured budget was silently ignored there.
+            episode_timeout_s=self._episode_timeout_sec,
+            context_window=self._context_window,
             # A real task environment is mutable, so an E2B transport failure must not replay
             # the whole episode against already-mutated state. Local Pi has no replay wrapper.
             transport_retries=0 if self._harness_backend == "e2b" else None,
@@ -483,21 +507,43 @@ def _invalid_arguments(tool: str, message: str) -> Observation:
 
 
 # A real task environment can emit observations no model context can use (a rendered 52 MiB
-# image via read_file, verified live): an unbounded observation travels the whole worker
-# transport as one frame and kills the runner channel mid-episode. Head+tail keeps both the
-# format signature and any trailing summary a command prints.
-MAX_OBSERVATION_CHARS = 262_144
+# image via read_file, verified live). Two separate hazards, one cap:
+#   - transport: an unbounded observation travels the whole worker transport as one frame and
+#     kills the runner channel mid-episode,
+#   - context: the cap must be small against the MODEL's window, not just the wire. The former
+#     262,144 chars is roughly 75,000 tokens, so ONE observation could exceed a whole 65,536-token
+#     serving window by itself; `gcode-to-text` died at step 1 in every attempt of every model
+#     because its first natural move returns 262,227 chars.
+# 10,000 is parity with the reference terminus-2 agent's own single-observation cap
+# (`_limit_output_length(..., max_bytes=10000)`), which is the scaffold the published numbers were
+# measured with. Truncation keeps the MIDDLE out and both ends in: head carries the format
+# signature, tail carries any summary a command prints last, and the explicit marker tells the
+# model to narrow its command rather than leaving it to infer a silent cut.
+MAX_OBSERVATION_CHARS = 10_000
+
+
+def _elision_marker(omitted: int) -> str:
+    """The explicit middle-elision notice, which also tells the model what to do about it."""
+    return (
+        f"\n... [{omitted} characters truncated from the middle; command output exceeded "
+        f"{MAX_OBSERVATION_CHARS} characters, so narrow the command or page through the "
+        "output] ...\n"
+    )
 
 
 def _bounded_observation_text(content: str) -> str:
+    """One observation clipped to MAX_OBSERVATION_CHARS, eliding the middle with a marker.
+
+    The marker itself is inside the budget: its length is reserved using `len(content)` as an upper
+    bound on the omitted count, so its digit count can never grow past the reservation and push the
+    result over the cap.
+    """
     if len(content) <= MAX_OBSERVATION_CHARS:
         return content
-    half = MAX_OBSERVATION_CHARS // 2
-    omitted = len(content) - MAX_OBSERVATION_CHARS
-    return (
-        content[:half] + f"\n... [{omitted} characters truncated; command output exceeded "
-        f"{MAX_OBSERVATION_CHARS} characters] ...\n" + content[-half:]
-    )
+    keep = max(MAX_OBSERVATION_CHARS - len(_elision_marker(len(content))), 2)
+    head = keep - keep // 2
+    tail = keep // 2
+    return content[:head] + _elision_marker(len(content) - head - tail) + content[-tail:]
 
 
 def _command_observation(result: ExecResult) -> Observation:

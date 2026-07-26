@@ -496,8 +496,8 @@ class FakeTrainingClient:
 
         Args:
             datums: The batch to train on.
-            loss_fn: Loss function name (e.g. "importance_sampling" or
-                "cross_entropy"); recorded but not interpreted beyond the
+            loss_fn: Loss function name (e.g. "importance_sampling", "ppo",
+                or "cross_entropy"); recorded but not interpreted beyond the
                 topk-replica pin above.
 
         Returns:

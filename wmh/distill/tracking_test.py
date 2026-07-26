@@ -15,6 +15,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
+from typing import Literal
 
 import pytest
 
@@ -135,11 +136,22 @@ def _metrics(
     reverse_kl: float | None = -0.25,
     pg_loss: float | None = 1.5,
     grad_norm: float | None = 2.25,
+    loss: Literal["importance_sampling", "ppo", "topk_ce"] = "ppo",
+    entropy: float | None = 0.181,
+    generation_tokens: float | None = 7577.0,
 ) -> StepMetrics:
     return StepMetrics(
+        loss=loss,
         tasks=2,
         trials=4,
         solve_rate=0.5,
+        graded_solve_rate=0.625,
+        graded_trials=2,
+        raw_solve_rate=0.25,
+        executed_trials=2,
+        infra_failed_trials=2,
+        scaffold_loss_rate=0.5,
+        stop_reason_counts={"no_tool_call": 1, "submitted": 1, "unknown": 2},
         empty_span_trials=0,
         datums=4,
         fragments=0,
@@ -151,6 +163,12 @@ def _metrics(
         loss_tokens=40,
         context_tokens=200,
         reverse_kl_per_token=reverse_kl,
+        entropy_per_token=entropy,
+        mean_generation_tokens=generation_tokens,
+        entropy_baseline=0.2,
+        entropy_ratio=None if entropy is None else entropy / 0.2,
+        generation_tokens_baseline=8000.0,
+        generation_tokens_ratio=None if generation_tokens is None else generation_tokens / 8000.0,
         reward_mean=0.5,
         advantage_mean=0.05,
         advantage_std=1.2,
@@ -432,7 +450,21 @@ def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Pat
         "train/tasks": 2,
         "train/trials": 4,
         "train/solve_rate": 0.5,
+        # The graded companion charts beside the binary rate, with its own denominator: a graded
+        # rate over zero graded trials is a null measurement, not a 0.0 datapoint.
+        "train/graded_solve_rate": 0.625,
+        "train/graded_trials": 2,
+        "train/raw_solve_rate": 0.25,
+        "train/executed_trials": 2,
+        "train/infra_failed_trials": 2,
+        # The audit headline gets its own chartable key, plus one series per stop reason, so a
+        # harness-induced floor can never sit at 88.8% unnoticed again.
+        "train/scaffold_loss_rate": 0.5,
+        "stop/no_tool_call": 1,
+        "stop/submitted": 1,
+        "stop/unknown": 2,
         "train/empty_span_trials": 0,
+        "train/truncated_spans": 0,
         "train/datums": 4,
         "train/fragments": 0,
         "train/fragmentation_rate": 0.0,
@@ -443,7 +475,18 @@ def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Pat
         "train/loss_tokens": 40,
         "train/context_tokens": 200,
         "train/reverse_kl_per_token": -0.25,
+        # The degeneration pair, each with the baseline it is judged against and
+        # the ratio the tripwire actually bounds (the cross-run comparable one).
+        "train/entropy_per_token": 0.181,
+        "train/mean_generation_tokens": 7577.0,
+        "train/entropy_baseline": 0.2,
+        "train/entropy_ratio": 0.181 / 0.2,
+        "train/generation_tokens_baseline": 8000.0,
+        "train/generation_tokens_ratio": 7577.0 / 8000.0,
         "train/reward_mean": 0.5,
+        # The one string key kept: advantage_mean and clip_fraction mean
+        # different things per objective, so the row says which one ran.
+        "train/loss": "ppo",
         "train/advantage_mean": 0.05,
         "train/advantage_std": 1.2,
         "train/clip_fraction": 0.075,
@@ -463,6 +506,23 @@ def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Pat
     assert not any("sampler" in key for key in payload)
 
 
+@pytest.mark.parametrize("loss", ["importance_sampling", "ppo", "topk_ce"])
+def test_log_step_distinguishes_every_objective(
+    fake_wandb: _FakeWandb, tmp_path: Path, loss: Literal["importance_sampling", "ppo", "topk_ce"]
+) -> None:
+    """Each of the three modes is identifiable from its own dashboard row.
+
+    Without this, `train/advantage_mean` and `train/clip_fraction` would be
+    unreadable across runs: the same key means the centered near-zero baseline
+    under one objective, the raw teacher-minus-student gap under another, and
+    nothing at all under topk_ce.
+    """
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_step(0, _metrics(loss=loss))
+    (payload, _) = fake_wandb.log_calls[-1]
+    assert payload["train/loss"] == loss
+
+
 def test_log_step_carries_both_cost_keys(fake_wandb: _FakeWandb, tmp_path: Path) -> None:
     """The per-row delta AND the all-session cumulative total chart together."""
     tracker = _tracker(fake_wandb, tmp_path / "run")
@@ -477,6 +537,24 @@ def test_log_step_drops_an_unscored_reverse_kl(fake_wandb: _FakeWandb, tmp_path:
     tracker.log_step(0, _metrics(reverse_kl=None))
     (payload, _) = fake_wandb.log_calls[-1]
     assert "train/reverse_kl_per_token" not in payload
+
+
+def test_log_step_drops_unmeasured_degeneration_metrics(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    """A batch that sampled nothing charts no entropy or length point: a zero
+    there would read as total collapse on the dashboard."""
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_step(0, _metrics(entropy=None, generation_tokens=None))
+    (payload, _) = fake_wandb.log_calls[-1]
+    assert "train/entropy_per_token" not in payload
+    assert "train/mean_generation_tokens" not in payload
+    assert "train/entropy_ratio" not in payload
+    assert "train/generation_tokens_ratio" not in payload
+    # The baselines still chart: they are the run's fixed reference, not a
+    # measurement of this step.
+    assert payload["train/entropy_baseline"] == 0.2
+    assert payload["train/generation_tokens_baseline"] == 8000.0
 
 
 def test_log_step_omits_backend_metrics_the_sdk_never_reported(
@@ -537,6 +615,20 @@ def test_log_eval_uses_the_eval_namespace_and_step(fake_wandb: _FakeWandb, tmp_p
     assert fake_wandb.log_calls == [
         ({"eval/baseline-teacher": 0.5}, 0),  # pre-training evals chart at step 0
         ({"eval/step-0001": 0.75}, 1),
+    ]
+
+
+def test_log_eval_charts_the_graded_companion_only_when_one_was_measured(
+    fake_wandb: _FakeWandb, tmp_path: Path
+) -> None:
+    tracker = _tracker(fake_wandb, tmp_path / "run")
+    tracker.log_eval("student-after", 0.5, 2, graded_solve_rate=0.75)
+    # No graded measurement (no readable test report, or an imported older baseline): the binary
+    # rate still charts, and the graded series gets a gap instead of a fabricated 0.0.
+    tracker.log_eval("baseline-teacher", 0.5, None, graded_solve_rate=None)
+    assert fake_wandb.log_calls == [
+        ({"eval/student-after": 0.5, "eval/student-after-graded": 0.75}, 2),
+        ({"eval/baseline-teacher": 0.5}, 0),
     ]
 
 

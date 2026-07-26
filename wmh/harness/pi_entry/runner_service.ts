@@ -26,12 +26,24 @@ import type { Model } from "@earendil-works/pi-ai";
 import { Agent as StaticAgent } from "./src/agent.ts";
 import type { AgentTool, AgentToolResult } from "./src/types.ts";
 import { FrameConn, type Frame } from "./runner_frames.ts";
+import {
+	classifyEnd,
+	newTurnSignal,
+	nudgeFor,
+	observeCompletion,
+	shouldNudge,
+	type DoneReason,
+	type TurnSignal,
+} from "./runner_termination.ts";
 
 const [HOST, PORT] = (process.env.PI_LINK_ADDR ?? "127.0.0.1:8900").split(":");
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
 const configuredMaxTurns = Number(process.env.PI_MAX_TURNS ?? "20");
 const DEFAULT_MAX_TURNS =
 	Number.isInteger(configuredMaxTurns) && configuredMaxTurns >= 1 ? configuredMaxTurns : 20;
+// Last-resort model context window when episode_start carries none. The host resolves the REAL
+// served window (provider/SDK model info) and sends it as context_window; never assume a size here.
+const DEFAULT_CONTEXT_WINDOW = 128000;
 
 function assistantText(msg: any): string {
 	if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) return "";
@@ -49,7 +61,7 @@ interface Bridge {
 
 /** Localhost HTTP endpoint pi's openai-completions transport POSTs to; frames each request to the
  *  host and streams the returned completion object back as the SSE pi's parser expects. */
-function startLlmBridge(conn: FrameConn): Promise<Bridge> {
+function startLlmBridge(conn: FrameConn, signal: TurnSignal): Promise<Bridge> {
 	return new Promise((resolve) => {
 		const server = http.createServer((req, res) => {
 			const chunks: Buffer[] = [];
@@ -59,6 +71,7 @@ function startLlmBridge(conn: FrameConn): Promise<Bridge> {
 				try {
 					const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 					const reply = await conn.request("llm_request", { openai_body: body });
+					observeCompletion(signal, reply);
 					if (reply.error) {
 						res.end(`data: ${JSON.stringify({ error: { message: reply.error } })}\n\ndata: [DONE]\n\n`);
 						return;
@@ -120,7 +133,8 @@ async function loadAgent(start: Frame): Promise<[any, () => void]> {
 }
 
 async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
-	const bridge = await startLlmBridge(conn);
+	const signal = newTurnSignal();
+	const bridge = await startLlmBridge(conn, signal);
 	const [AgentCtor, cleanupSrc] = await loadAgent(start);
 	const episodeId = start.episode_id;
 	const maxTurns =
@@ -131,6 +145,10 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		Number.isInteger(start.max_output_tokens) && start.max_output_tokens >= 1
 			? start.max_output_tokens
 			: 4096;
+	const contextWindow =
+		Number.isInteger(start.context_window) && start.context_window >= 1024
+			? start.context_window
+			: DEFAULT_CONTEXT_WINDOW;
 	let doneSent = false;
 	let lastAssistantText = "";
 
@@ -143,7 +161,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		reasoning: false,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 128000,
+		contextWindow,
 		maxTokens: maxOutputTokens,
 	};
 
@@ -172,7 +190,12 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		parameters: { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
 		execute: async (_id, params: { answer: string }): Promise<AgentToolResult<any>> => {
 			doneSent = true;
-			conn.send({ type: "done", episode_id: episodeId, answer: params.answer ?? "" });
+			conn.send({
+				type: "done",
+				episode_id: episodeId,
+				reason: "submit",
+				answer: params.answer ?? "",
+			});
 			return { content: [{ type: "text", text: "submitted" }], details: {}, terminate: true };
 		},
 	};
@@ -182,6 +205,7 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		getApiKey: () => "x",
 	});
 	let turns = 0;
+	let hitTurnCap = false;
 	agent.subscribe((event: any) => {
 		if (event.type === "turn_end" || event.type === "message_end") {
 			const t = assistantText(event.message);
@@ -189,13 +213,34 @@ async function runEpisode(conn: FrameConn, start: Frame): Promise<void> {
 		}
 		if (event.type === "turn_end") {
 			turns += 1;
-			if (turns >= maxTurns) agent.abort();
+			if (turns >= maxTurns) {
+				hitTurnCap = true;
+				agent.abort();
+			}
 		}
 	});
 
 	try {
+		// A turn without tool calls is NOT a completion: nudge (bounded) before reporting done, and
+		// always report WHY. See runner_termination.ts.
 		await agent.prompt(start.instruction);
-		if (!doneSent) conn.send({ type: "done", episode_id: episodeId, answer: lastAssistantText });
+		let reason: DoneReason = classifyEnd(signal, {
+			hitTurnCap,
+			agentError: String(agent.state?.errorMessage ?? ""),
+		});
+		let consecutiveNonAction = 1;
+		while (!doneSent && shouldNudge(reason, consecutiveNonAction, turns, maxTurns)) {
+			const before = signal.toolCallTurns;
+			await agent.prompt(nudgeFor(reason, signal, maxOutputTokens));
+			consecutiveNonAction = signal.toolCallTurns > before ? 1 : consecutiveNonAction + 1;
+			reason = classifyEnd(signal, {
+				hitTurnCap,
+				agentError: String(agent.state?.errorMessage ?? ""),
+			});
+		}
+		if (!doneSent) {
+			conn.send({ type: "done", episode_id: episodeId, reason, answer: lastAssistantText });
+		}
 	} catch (e) {
 		if (!doneSent) conn.send({ type: "episode_error", episode_id: episodeId, note: String(e) });
 	} finally {

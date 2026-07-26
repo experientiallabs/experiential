@@ -23,6 +23,7 @@ from llm_waterfall.types import (
 from wmh.distill.rendering import (
     build_renderer,
     renderer_messages_from_chat,
+    salvage_truncated_tool_call,
     tool_specs_from_chat,
 )
 
@@ -307,7 +308,7 @@ def test_render_suffix_qwen3_5_frames_delta_like_the_live_template() -> None:
     # Qwen3.5 is the live smoke's renderer: the generation header prefills
     # <think>\n and the tool-response glue must match the live sink's delta.
     pytest.importorskip("tinker_cookbook")
-    tokenizer = _CharTokenizer()
+    tokenizer = _Qwen35Tokenizer()
     rendering = build_renderer("Qwen/Qwen3.5-4B", tokenizer)
     history = [
         ChatMessage(role="system", content="s"),
@@ -357,3 +358,118 @@ def test_build_renderer_missing_extra_names_the_extra(
     monkeypatch.setitem(sys.modules, "tinker_cookbook", None)
     with pytest.raises(ImportError, match="uv sync --extra distill"):
         build_renderer("Qwen/Qwen3-8B", _CharTokenizer())
+
+
+class _Qwen35Tokenizer(_CharTokenizer):
+    """`_CharTokenizer` plus single-id think markers, which the qwen3_5 renderer requires.
+
+    `Qwen3_5Renderer._normalize_response_tokens` asserts `</think>` encodes to exactly one id (it
+    restores the prefilled `<think>\n` before parsing), so the char-level fake needs both markers
+    listed as specials.
+    """
+
+    _SPECIALS = {
+        **_CharTokenizer._SPECIALS,
+        "<think>\n": 300010,
+        "</think>": 300011,
+    }
+
+
+# --- truncated / unparseable tool calls (the pi scaffold audit's defect 1) ----------------------
+#
+# A tool call cut off at the output-token cap has no closing tags, so every parser reads the turn
+# as plain prose and the scaffold used to end the episode as a completion with reward 0. 21.6% of
+# Nano trials and 11.2% of Super trials ended on exactly such a turn.
+_TRUNCATED_WRITE = (
+    "<think>plan</think>\n"
+    "<tool_call>\n"
+    "<function=write_file>\n"
+    "<parameter=path>\n"
+    "/app/vm.js\n"
+    "</parameter>\n"
+    "<parameter=content>\n"
+    "const fs = require('fs');\n"
+    "process.exit"
+)
+
+# The verbatim shape of a genuine format error from the audit: `</think>` where the closers belong,
+# then a SECOND <function= block inside the same <tool_call>. Only 657 ids, so not a cap issue.
+_MALFORMED_DOUBLE_FUNCTION = (
+    "<tool_call>\n"
+    "<function=submit>\n"
+    "<parameter=answer>\n"
+    "The file eval.scm has been written\n"
+    "</think>\n"
+    "<function=write_file>\n"
+    "<parameter=path>\n"
+    "/home/mluser/eval.scm\n"
+)
+
+
+def test_salvage_closes_an_unterminated_tool_call_block() -> None:
+    repaired = salvage_truncated_tool_call(_TRUNCATED_WRITE)
+    assert repaired is not None
+    assert repaired.endswith("</parameter>\n</function>\n</tool_call>")
+    # Nothing before the block is rewritten.
+    assert repaired.startswith("<think>plan</think>\n<tool_call>")
+
+
+def test_salvage_declines_what_it_cannot_repair() -> None:
+    # No tool-call block at all.
+    assert salvage_truncated_tool_call("just prose, no action") is None
+    # The last block is already closed, so there is nothing unterminated.
+    assert (
+        salvage_truncated_tool_call("<tool_call>\n<function=ls>\n</function>\n</tool_call>") is None
+    )
+    # Opened the block but never named a function: nothing to recover.
+    assert salvage_truncated_tool_call("<tool_call>\n<fun") is None
+
+
+def test_truncated_tool_call_is_salvaged_instead_of_read_as_prose() -> None:
+    pytest.importorskip("tinker_cookbook")
+    rendering = build_renderer("Qwen/Qwen3.5-4B", _Qwen35Tokenizer())
+
+    parsed = rendering.parse_response(_Qwen35Tokenizer().encode(_TRUNCATED_WRITE))
+
+    # The action survives the truncation, so the episode continues instead of ending at reward 0.
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].function.name == "write_file"
+    assert json.loads(parsed.tool_calls[0].function.arguments)["path"] == "/app/vm.js"
+    assert parsed.salvaged_tool_calls == 1
+    assert parsed.unparsed_errors == []
+    # Still a truncation: the caller must keep reporting finish_reason "length" upstream.
+    assert parsed.stopped is False
+
+
+def test_an_unrepairable_tool_call_surfaces_the_parser_complaint() -> None:
+    """When salvage cannot recover an action, the error is DATA, not a swallowed log line.
+
+    The scaffold feeds `unparsed_errors` back to the model as an observation; dropping them is what
+    made a format error indistinguishable from prose.
+    """
+    pytest.importorskip("tinker_cookbook")
+    rendering = build_renderer("Qwen/Qwen3.5-4B", _Qwen35Tokenizer())
+
+    parsed = rendering.parse_response(_Qwen35Tokenizer().encode(_MALFORMED_DOUBLE_FUNCTION))
+
+    assert parsed.tool_calls == []
+    assert parsed.unparsed_errors
+    assert parsed.salvaged_tool_calls == 0
+
+
+def test_a_clean_tool_call_never_goes_near_the_salvage_path() -> None:
+    pytest.importorskip("tinker_cookbook")
+    tokenizer = _Qwen35Tokenizer()
+    rendering = build_renderer("Qwen/Qwen3.5-4B", tokenizer)
+
+    parsed = rendering.parse_response(
+        tokenizer.encode(
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls /app\n"
+            "</parameter>\n</function>\n</tool_call><|im_end|>"
+        )
+    )
+
+    assert len(parsed.tool_calls) == 1
+    assert parsed.salvaged_tool_calls == 0
+    assert parsed.unparsed_errors == []
+    assert parsed.stopped is True

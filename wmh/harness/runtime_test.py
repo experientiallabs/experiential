@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from wmh.core.types import Action, Observation
-from wmh.harness.runtime import AgentRuntime, StopReason
+from wmh.harness.runtime import (
+    DEFAULT_SYSTEM_PROMPT,
+    JSON_PROTOCOL_CLAUSE,
+    MAX_NONACTION_TURNS,
+    SCAFFOLD_LOSS_STOP_REASONS,
+    AgentRuntime,
+    StopReason,
+    strip_json_protocol_clause,
+)
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 
@@ -140,3 +148,46 @@ def test_transcript_shows_actions_and_observations() -> None:
     transcript = result.transcript()
     assert "bash" in transcript
     assert "ran bash" in transcript
+
+
+# --- the stop-reason taxonomy (audit defect 1) ---------------------------------------------------
+def test_only_submitted_reads_as_a_self_declared_completion() -> None:
+    """`SCAFFOLD_LOSS_STOP_REASONS` must be exactly the complement of SUBMITTED.
+
+    Spelled out so a new member cannot silently join the "looks like a completion" side: the whole
+    pi/Nemotron-3 failure was four different terminations sharing one stop reason.
+    """
+    assert StopReason.SUBMITTED not in SCAFFOLD_LOSS_STOP_REASONS
+    assert set(StopReason) - {StopReason.SUBMITTED} == set(SCAFFOLD_LOSS_STOP_REASONS)
+
+
+def test_the_four_pi_terminations_are_distinguishable() -> None:
+    """A real submit, prose, a cap truncation, and a dropped tool call are four events."""
+    reasons = {
+        StopReason.SUBMITTED,
+        StopReason.NO_TOOL_CALL,
+        StopReason.OUTPUT_TRUNCATED,
+        StopReason.UNPARSED_TOOL_CALL,
+    }
+    assert len({reason.value for reason in reasons}) == 4
+
+
+def test_the_nudge_budget_is_bounded_and_allows_recovery() -> None:
+    """Unbounded would let a silent model burn the wall budget; 1 would forbid any recovery."""
+    assert 2 <= MAX_NONACTION_TURNS <= 5
+
+
+def test_strip_json_protocol_clause_removes_only_the_protocol_paragraph() -> None:
+    stripped = strip_json_protocol_clause(DEFAULT_SYSTEM_PROMPT)
+    assert JSON_PROTOCOL_CLAUSE not in stripped
+    assert "capable command-line agent" in stripped
+    assert "Prefer composing small bash commands" in stripped
+    assert "\n\n\n" not in stripped
+    # Idempotent, and a no-op on a prompt that never carried it.
+    assert strip_json_protocol_clause(stripped) == stripped
+    assert strip_json_protocol_clause("plain prompt") == "plain prompt"
+
+
+def test_the_json_runtimes_still_state_their_protocol() -> None:
+    """AgentRuntime really parses JSON replies, so its prompt must keep the clause."""
+    assert JSON_PROTOCOL_CLAUSE in DEFAULT_SYSTEM_PROMPT

@@ -42,12 +42,57 @@ from wmh.harness.runtime import (
 )
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import READ_SKILL, ToolSpec
-from wmh.providers.base import ToolCallingProvider
+from wmh.providers.base import ContextWindowProvider, ToolCallingProvider
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_ENV_ACTIONS = 40
 DEFAULT_CANCEL_POLL_INTERVAL_S = 0.5
+
+DONE_REASON_STOP_REASONS: dict[str, StopReason] = {
+    "submit": StopReason.SUBMITTED,
+    "no_tool_call": StopReason.NO_TOOL_CALL,
+    "output_truncated": StopReason.OUTPUT_TRUNCATED,
+    "unparsed_tool_call": StopReason.UNPARSED_TOOL_CALL,
+    "provider_error": StopReason.PROVIDER_ERROR,
+    "max_turns": StopReason.MAX_TURNS,
+}
+"""The `done` frame's `reason` vocabulary (pi_entry/runner_termination.ts) mapped onto stop reasons.
+
+Before this existed, every `done` frame became `SUBMITTED`, so a genuine `submit`, a prose-only
+turn, a turn truncated at the output cap, and a dropped tool call were indistinguishable and all
+scored reward 0 as clean completions."""
+
+
+def stop_reason_for_done(reason: object) -> StopReason:
+    """The stop reason one `done` frame's `reason` field means.
+
+    Args:
+        reason: The frame's `reason` value, if any.
+
+    Returns:
+        The mapped stop reason. A missing or unrecognized value becomes `UNKNOWN_DONE_REASON`,
+        which is a SCAFFOLD LOSS, not a completion.
+
+        Failing toward "completion" here is the same defect this mapping exists to remove, one
+        level up: a stale runner (its `.ts` older than the host) sends the pre-`reason` `done`
+        frame, every episode reads as a clean submit, `scaffold_loss_rate` reads ~0, and a probe
+        whose entire job is to count scaffold losses PASSES. Reward-0 corpses then enter the
+        solve-rate denominator as completed-but-failed attempts, which is exactly how a 7.8%
+        submit rate coexisted with "every trial that finished, passed". A warning is not enough
+        protection: it scrolls past in a 24-hour run. So the unknown case is counted as a loss,
+        where it is loud and forces a look.
+    """
+    if isinstance(reason, str) and reason in DONE_REASON_STOP_REASONS:
+        return DONE_REASON_STOP_REASONS[reason]
+    logger.warning(
+        "runner sent a done frame with reason=%r, so this runner predates termination reporting; "
+        "the episode is recorded as a scaffold loss (unknown_done_reason) rather than a "
+        "completion. Redeploy the pi runner files",
+        reason,
+    )
+    return StopReason.UNKNOWN_DONE_REASON
+
 
 _WORKER_ERROR_LOG_CHARS = 500
 """Warning-level cap on a worker exception message (full detail at debug)."""
@@ -158,6 +203,35 @@ def active_channel() -> Channel | None:
     return _ACTIVE_CHANNEL
 
 
+def provider_context_window(provider: object) -> int | None:
+    """The served context window a provider reports, or None when it cannot say.
+
+    Providers whose served window is a property of the deployment (the Tinker student, whose
+    catalog name pins a context tier) implement `ContextWindowProvider`; everything else returns
+    None and the runner keeps its documented fallback. A probe that fails must never break an
+    episode, so any error degrades to None with a warning.
+
+    Args:
+        provider: The worker provider, or None.
+
+    Returns:
+        The served window in tokens, or None when unknown.
+    """
+    if not isinstance(provider, ContextWindowProvider):
+        return None
+    try:
+        window = provider.context_window()
+    except Exception as exc:  # noqa: BLE001 - a capability probe never fails an episode
+        logger.warning(
+            "could not resolve the served context window from %s (%s); the pi runner falls back "
+            "to its default window, so context-overflow trimming may be miscalibrated",
+            type(provider).__name__,
+            _bounded_error_text(exc),
+        )
+        return None
+    return window
+
+
 def params_schema(tool: ToolSpec) -> JsonObject:
     """A JSON-schema `parameters` object for a tool, as the model's function-calling API expects."""
     props: JsonObject = {
@@ -245,6 +319,7 @@ class RunnerLink:
         temperature: float = 0.7,
         skills: SkillLibrary | None = None,
         episode_timeout_s: float | None = None,
+        context_window: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
         cancel_poll_interval_s: float = DEFAULT_CANCEL_POLL_INTERVAL_S,
     ) -> None:
@@ -277,10 +352,21 @@ class RunnerLink:
             raise ValueError("episode_timeout_s must be positive when set")
         if cancel_poll_interval_s <= 0:
             raise ValueError("cancel_poll_interval_s must be positive")
+        if context_window is not None and (
+            isinstance(context_window, bool) or not isinstance(context_window, int)
+        ):
+            raise ValueError("context_window must be an integer number of tokens when set")
+        if context_window is not None and context_window < 1024:
+            raise ValueError("context_window must be at least 1024 tokens when set")
         self._max_turns = max_turns
         self._max_output_tokens = max_output_tokens
         self._temperature = temperature
         self._episode_timeout_s = episode_timeout_s
+        # The runner clamps pi's output budget and trims against this number, so a wrong value is
+        # worse than none: 128k assumed against a 64k server let every context-overflow 400 through.
+        self._context_window = (
+            context_window if context_window is not None else provider_context_window(provider)
+        )
         self._should_cancel = should_cancel
         self._cancel_poll_interval_s = cancel_poll_interval_s
 
@@ -338,6 +424,7 @@ class RunnerLink:
                 "max_output_tokens": self._max_output_tokens,
                 "temperature": self._temperature,
                 "episode_timeout_s": self._episode_timeout_s,
+                "context_window": self._context_window,
             }
         )
         if stopped is not None:
@@ -409,10 +496,19 @@ class RunnerLink:
             elif kind == "done":
                 answer = frame.get("answer")
                 episode.answer = answer if isinstance(answer, str) else ""
+                stop_reason = stop_reason_for_done(frame.get("reason"))
+                if stop_reason is not StopReason.SUBMITTED:
+                    logger.info(
+                        "episode %s for task %s ended without an explicit submit (%s); recording "
+                        "it as a scaffold loss, not a task failure",
+                        episode_id,
+                        task_id,
+                        stop_reason.value,
+                    )
                 return RunResult(
                     task_id=task_id,
                     steps=episode.steps,
-                    stop_reason=StopReason.SUBMITTED,
+                    stop_reason=stop_reason,
                     answer=episode.answer,
                     turns=len(episode.steps),
                     worker_usage=usage if usage.calls else None,

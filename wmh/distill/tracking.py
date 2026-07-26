@@ -64,8 +64,20 @@ class DistillTracker(Protocol):
         """Record one warmup step's metrics row (keys under `warmup/`)."""
         ...
 
-    def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
-        """Record one eval batch's solve rate (None step means pre-training)."""
+    def log_eval(
+        self,
+        name: str,
+        solve_rate: float,
+        step: int | None,
+        *,
+        graded_solve_rate: float | None = None,
+    ) -> None:
+        """Record one eval batch's solve rate (None step means pre-training).
+
+        `graded_solve_rate` is the graded test-pass companion, and None means the batch measured
+        none (no readable test report, or a baseline imported from a run predating the metric):
+        nothing is charted rather than a fabricated 0.0.
+        """
         ...
 
     def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
@@ -100,7 +112,14 @@ class NullTracker:
     def log_warmup_step(self, warmup_step: int, metrics: WarmupMetrics) -> None:
         """No-op."""
 
-    def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
+    def log_eval(
+        self,
+        name: str,
+        solve_rate: float,
+        step: int | None,
+        *,
+        graded_solve_rate: float | None = None,
+    ) -> None:
         """No-op."""
 
     def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
@@ -261,15 +280,35 @@ def _read_wandb_run_id(path: Path) -> str | None:
         return None
 
 
-def _flatten_step_metrics(metrics: StepMetrics) -> dict[str, float | int]:
-    """One step's metrics row as flat, namespaced numeric wandb keys.
+def _flatten_step_metrics(metrics: StepMetrics) -> dict[str, float | int | str]:
+    """One step's metrics row as flat, namespaced wandb keys.
 
     Per-meter token counts land under `tokens/`, the step's priced spend
     under `cost/usd` (with the run's all-session total as `cost/usd_cum`),
-    and every other number under `train/`. Non-numeric fields (the sampler
-    path) and unreported values (`reverse_kl_per_token`, `reward_mean`, the
+    the per-stop-reason trial counts under `stop/<reason>`, and every other
+    number under `train/`. The one non-numeric key kept is the objective
+    (`train/loss`, e.g. `"ppo"`), because a chart of `train/advantage_mean`
+    or `train/clip_fraction` means different things per mode and the row must
+    say which one produced it. Other non-numeric fields (the sampler path)
+    and unreported values (`reverse_kl_per_token`, `reward_mean`, the
     advantage stats, `pg_loss`, and `grad_norm` when None) are dropped:
     wandb charts numbers, and absent backend metrics are never fabricated.
+
+    `train/scaffold_loss_rate` plus the `stop/` series is the pair that makes a
+    harness-induced floor visible on the dashboard: the pi/Nemotron-3 runs sat
+    at 88.8% scaffold loss with nothing to chart it against.
+
+    `train/solve_rate` and `train/graded_solve_rate` are charted side by side:
+    binary is the benchmark's own verdict and the gate's number, graded is the
+    same trials at test resolution and the series with enough resolution to move
+    on a 12-task batch. Read `train/graded_trials` beside it, since a graded rate
+    over zero graded trials is a null measurement carrying 0.0.
+
+    `train/entropy_per_token` and `train/mean_generation_tokens`, beside their
+    `train/*_baseline` and `train/*_ratio` companions, are the degeneration
+    pair: the ratio series is the one to chart, since only it is comparable
+    across runs (each run measures its own baseline). A step that sampled
+    nothing charts no entropy or length point rather than a fabricated zero.
     """
     explicit = {
         "student_prefill_tokens": "tokens/student_prefill",
@@ -282,8 +321,21 @@ def _flatten_step_metrics(metrics: StepMetrics) -> dict[str, float | int]:
         "usd": "cost/usd",
         "cumulative_usd": "cost/usd_cum",
     }
-    payload: dict[str, float | int] = {}
+    payload: dict[str, float | int | str] = {}
     for key, value in metrics.model_dump(mode="json").items():
+        if key == "loss" and isinstance(value, str):
+            payload["train/loss"] = value
+            continue
+        if key == "stop_reason_counts":
+            if isinstance(value, dict):
+                payload.update(
+                    {
+                        f"stop/{reason}": count
+                        for reason, count in value.items()
+                        if isinstance(count, int)
+                    }
+                )
+            continue
         if not isinstance(value, int | float) or isinstance(value, bool):
             continue
         payload[explicit.get(key, f"train/{key}")] = value
@@ -403,10 +455,25 @@ class WandbTracker:
             payload[f"warmup/{key}"] = value
         self._guarded(lambda: self._wandb.log(cast("Mapping[str, JsonValue]", payload), step=0))
 
-    def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
-        """Log one eval batch's solve rate under `eval/<name>`."""
+    def log_eval(
+        self,
+        name: str,
+        solve_rate: float,
+        step: int | None,
+        *,
+        graded_solve_rate: float | None = None,
+    ) -> None:
+        """Log one eval batch's solve rate under `eval/<name>`, graded under `eval/<name>-graded`.
+
+        The binary rate is always charted (it is the benchmark's own verdict and what the promotion
+        gate reads); the graded companion is charted only when the batch measured one, so a batch
+        with no readable test report leaves a gap in that series instead of a 0.0 point.
+        """
         at_step = step if step is not None else 0
-        self._guarded(lambda: self._wandb.log({f"eval/{name}": solve_rate}, step=at_step))
+        payload: dict[str, JsonValue] = {f"eval/{name}": solve_rate}
+        if graded_solve_rate is not None:
+            payload[f"eval/{name}-graded"] = graded_solve_rate
+        self._guarded(lambda: self._wandb.log(payload, step=at_step))
 
     def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
         """Log one batch's rendered rollouts as a fresh wandb Table per call.
