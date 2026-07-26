@@ -23,12 +23,13 @@ import argparse
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 
 import numpy as np
 from scipy.stats import kendalltau, spearmanr
 
-from wmh.optimize.outcomes import OutcomeMatrix
+from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("r3.gap")
@@ -241,13 +242,188 @@ def cmd_cells(args: argparse.Namespace) -> None:
     logger.info("wrote %d cell dumps -> %s", len(cells), OUT)
 
 
+
+BARE_CALL = re.compile(r"^\s*\w+\(\s*\{")
+FUSED_CALL = re.compile(r"[a-z_]\w*\(\{\"")
+CONV_MARKERS = ("insist", "adamant", "meant to test")
+
+
+def episode_broken(o: ScenarioOutcome) -> str | None:
+    """Harness-defect signature: 'empty' (kimi bug) or 'parse' (glm bare/fused call)."""
+    if any(not r.strip() for r in o.replies):
+        return "empty"
+    if o.replies:
+        last = o.replies[-1]
+        if '"done"' not in last and (BARE_CALL.search(last) or FUSED_CALL.search(last)):
+            return "parse"
+    return None
+
+
+def task_conv_gated(task: str) -> bool:
+    low = task.lower()
+    return any(m in low for m in CONV_MARKERS)
+
+
+def fixed_cell_means(
+    matrix: OutcomeMatrix,
+    name: str,
+    ids: set[str],
+    *,
+    drop_conv: bool = False,
+    drop_broken: bool = False,
+    binarize: float | None = None,
+) -> dict[tuple[str, str], tuple[float, int]]:
+    domains = scenario_domains(matrix, name)
+    acc: dict[tuple[str, str], list[float]] = {}
+    for o in matrix.outcomes:
+        if o.reward is None or o.scenario_id not in ids:
+            continue
+        if drop_conv and task_conv_gated(o.task):
+            continue
+        if drop_broken and episode_broken(o):
+            continue
+        r = o.reward
+        if binarize is not None:
+            r = 1.0 if r >= binarize else 0.0
+        acc.setdefault((o.model, domains[o.scenario_id]), []).append(r)
+    return {k: (float(np.mean(v)), len(v)) for k, v in acc.items()}
+
+
+FIXES = {
+    "base": {},
+    "F1-conv": {"drop_conv": True},
+    "F2-broken": {"drop_broken": True},
+    "F1+F2": {"drop_conv": True, "drop_broken": True},
+}
+TAUS = [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+
+
+def run_fixes(split: str, taus: bool = True) -> dict:
+    registry = json.loads((OUT / "split_registry.json").read_text())
+    real = load(REAL)
+    models = real.model_names()
+    r_ids = set(registry[f"real_{split}" if split == "dev" else "real_holdout"]["ids"])
+    r_cells = cell_means(real, REAL, r_ids)
+    domains = sorted({d for _m, d in r_cells})
+    out = {}
+    for cohort in SIM_COHORTS:
+        sim = load(cohort)
+        key = f"{cohort}_dev" if split == "dev" else f"{cohort}_holdout"
+        s_ids = set(registry[key]["ids"])
+        for fname, kw in FIXES.items():
+            s_cells = fixed_cell_means(sim, cohort, s_ids, **kw)
+            out[f"{cohort}/{fname}"] = gap_metrics(r_cells, s_cells, models, domains)
+        if taus:
+            for tau in TAUS:
+                s_cells = fixed_cell_means(
+                    sim, cohort, s_ids, drop_conv=True, drop_broken=True, binarize=tau
+                )
+                out[f"{cohort}/F1+F2+F3(t{tau})"] = gap_metrics(
+                    r_cells, s_cells, models, domains
+                )
+    return out
+
+
+def fit_affine(
+    r_cells: dict,
+    s_cells: dict,
+    models: list[str],
+    domains: list[str],
+    *,
+    offset_only: bool = False,
+) -> dict[str, tuple[float, float]]:
+    """Per-domain sim->real map fitted across models (dev only).
+
+    offset_only keeps slope 1 (level repair without touching cross-model spread);
+    full affine also rescales, which erases sim's cross-model variance where it is
+    noise (the dev sweep showed slope ~0.24-0.30 on airline: MAE improves, spread dies).
+    """
+    coefs = {}
+    for d in domains:
+        xs = [s_cells[(m, d)][0] for m in models if (m, d) in s_cells and (m, d) in r_cells]
+        ys = [r_cells[(m, d)][0] for m in models if (m, d) in s_cells and (m, d) in r_cells]
+        if offset_only:
+            coefs[d] = (1.0, float(np.mean(ys) - np.mean(xs)))
+        else:
+            a, b = np.polyfit(xs, ys, 1)
+            coefs[d] = (float(a), float(b))
+    return coefs
+
+
+def apply_affine(s_cells: dict, coefs: dict[str, tuple[float, float]]) -> dict:
+    out = {}
+    for (m, d), (v, n) in s_cells.items():
+        a, b = coefs.get(d, (1.0, 0.0))
+        out[(m, d)] = (float(np.clip(a * v + b, 0.0, 1.0)), n)
+    return out
+
+
+def cmd_confirm(args: argparse.Namespace) -> None:
+    """The ONE holdout confirmation: F2 + dev-fitted per-domain OFFSET calibration."""
+    registry = json.loads((OUT / "split_registry.json").read_text())
+    real = load(REAL)
+    models = real.model_names()
+    results = {}
+    for cohort in SIM_COHORTS:
+        sim = load(cohort)
+        r_dev = cell_means(real, REAL, set(registry["real_dev"]["ids"]))
+        domains = sorted({d for _m, d in r_dev})
+        s_dev = fixed_cell_means(
+            sim, cohort, set(registry[f"{cohort}_dev"]["ids"]), drop_broken=True
+        )
+        coefs = fit_affine(r_dev, s_dev, models, domains, offset_only=True)
+        r_hold = cell_means(real, REAL, set(registry["real_holdout"]["ids"]))
+        s_hold_base = cell_means(sim, cohort, set(registry[f"{cohort}_holdout"]["ids"]))
+        s_hold_fix = apply_affine(
+            fixed_cell_means(
+                sim, cohort, set(registry[f"{cohort}_holdout"]["ids"]), drop_broken=True
+            ),
+            coefs,
+        )
+        base = gap_metrics(r_hold, s_hold_base, models, domains)
+        fixed = gap_metrics(r_hold, s_hold_fix, models, domains)
+        results[f"{cohort}/holdout-base"] = base
+        results[f"{cohort}/holdout-F2+F4"] = fixed
+        results[f"{cohort}/affine_coefs"] = {
+            d: [round(a, 3), round(b, 3)] for d, (a, b) in coefs.items()
+        }
+        for tag, m in [("base", base), ("F2+F4", fixed)]:
+            logger.info(
+                "%s/holdout %-6s MAE=%.4f glmMAE=%.4f rho=%.3f ktau=%.3f spread=%.3f",
+                cohort, tag, m["mae_overall"],
+                m["mae_per_model"].get("glm-5.2", float("nan")),
+                m["spearman"], m["kendall"], m["spread_ratio"],
+            )
+    (OUT / "holdout_confirmation.json").write_text(json.dumps(results, indent=1))
+
+
+def cmd_interventions(args: argparse.Namespace) -> None:
+    out = run_fixes(args.split, taus=True)
+    (OUT / f"interventions_{args.split}.json").write_text(json.dumps(out, indent=1))
+    for k, m in out.items():
+        logger.info(
+            "%-34s MAE=%.4f glmMAE=%.4f rho=%.3f tau=%.3f spread=%.3f",
+            k, m["mae_overall"], m["mae_per_model"].get("glm-5.2", float("nan")),
+            m["spearman"], m["kendall"], m["spread_ratio"],
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["benchmark", "cells"])
+    parser.add_argument(
+        "command", choices=["benchmark", "cells", "interventions", "confirm"]
+    )
+    parser.add_argument("--split", default="dev")
     parser.add_argument("--cohort", default="tau-bench-s80")
     parser.add_argument("--top", type=int, default=15)
     args = parser.parse_args()
-    {"benchmark": cmd_benchmark, "cells": cmd_cells}[args.command](args)
+    commands = {
+        "benchmark": cmd_benchmark,
+        "cells": cmd_cells,
+        "interventions": cmd_interventions,
+        "confirm": cmd_confirm,
+    }
+    commands[args.command](args)
 
 
 if __name__ == "__main__":
