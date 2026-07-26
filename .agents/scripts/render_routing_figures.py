@@ -15,6 +15,7 @@ Figures (into .agents/docs/research/figures/):
   routing_confidence_curve.png  the "route only when confident" dial (numbers from PR #259)
   routing_signal_map.png      where signal lives vs how big the test set is
   routing_pareto_niches.png   per-niche frontiers: the pool, the niche champion, the ceiling
+  routing_operating_points.png the dialable cost/quality/latency frontier on ours9
 
 Two deliberate deviations from the brief, both to avoid a misleading chart:
 
@@ -763,6 +764,313 @@ def fig_niches(groups: list[dict], plt: ModuleType) -> Path:
     return save(fig, "routing_pareto_niches.png")
 
 
+def fig_operating_points(groups: list[dict], plt: ModuleType) -> Path:
+    """Figure 6: the whole dialable tradeoff space on our one full-power cohort.
+
+    Three series, each a coherent single-variant sweep of ONE knob so the line means "turn this
+    dial", not "compare these methods": the shipped config's novelty floor (floor_q), the
+    confidence bar (z), and the cost knob (lam). Latency rides along as marker size on the left
+    panel and gets its own panel on the right, because the claim "cheaper is also faster" should
+    be shown rather than asserted.
+    """
+    rows = [g for g in groups if g["m"] == HEADLINE_MATRIX]
+    anchor = next(g for g in rows if g["v"] == "best-single")
+    fable_cost = statistics.median([g["pmc"]["fable-5"] for g in rows if "fable-5" in g["pmc"]])
+    fable_p50 = statistics.median([g["pml"]["fable-5"] for g in rows if "fable-5" in g["pml"]])
+
+    def sweep(prefix: str, exact: set[str] | None = None) -> list[dict]:
+        picked = [
+            g
+            for g in rows
+            if (g["v"] in exact if exact else g["v"].startswith(prefix)) and g["s"] >= 3
+        ]
+        return sorted(picked, key=lambda g: g["cost"])
+
+    series = [
+        (sweep("r1-knn-adapt-floor-q"), TEAL, "novelty floor (floor_q), shipped config"),
+        (
+            sweep("", {"r1-knn-statz0", "r1-knn-statz05", "r1-knn-statz1"}),
+            PURPLE,
+            "confidence bar (z)",
+        ),
+        (sweep("", {"r3-knn-frontier"}), AMBER, "cost knob (lam)"),
+    ]
+    shipped = next(g for g in rows if g["v"] == "r1-knn-adapt3-oai")
+    lam = sweep("", {"r3-knn-frontier"})
+    floors = sweep("r1-knn-adapt-floor-q")
+    quality_max = max(floors, key=lambda g: g["d"])
+    aggressive = min(lam, key=lambda g: abs(100 * (g["cost"] / anchor["cost"] - 1) + 74))
+    example = min(
+        lam,
+        key=lambda g: (
+            (abs(100 * g["d"] + 5.0) / 5.0) ** 2
+            + (abs(100 * (g["cost"] / anchor["cost"] - 1) + 70) / 70.0) ** 2
+        ),
+    )
+
+    fig, (left, right) = plt.subplots(1, 2, figsize=(13.4, 5.8), dpi=200, width_ratios=[1.45, 1])
+    fig.patch.set_facecolor("white")
+    for ax in (left, right):
+        ax.set_facecolor("white")
+
+    def pct(g: dict) -> str:
+        return f"{g['cost'] / anchor['cost'] - 1:+.0%}"
+
+    for points, colour, label in series:
+        if not points:
+            continue
+        left.plot(
+            [g["cost"] for g in points],
+            [g["acc"] for g in points],
+            "-",
+            color=colour,
+            linewidth=1.9,
+            alpha=0.6,
+            zorder=3,
+            label=label,
+        )
+        left.scatter(
+            [g["cost"] for g in points],
+            [g["acc"] for g in points],
+            s=[20 + 40 * (g["p50"] or 0) for g in points],
+            facecolor="white",
+            edgecolor=colour,
+            linewidth=1.7,
+            zorder=4,
+        )
+        right.plot(
+            [g["cost"] for g in points],
+            [g["p50"] for g in points],
+            "-o",
+            color=colour,
+            linewidth=1.9,
+            markersize=5,
+            markerfacecolor="white",
+            markeredgecolor=colour,
+            markeredgewidth=1.6,
+            alpha=0.9,
+            zorder=3,
+        )
+
+    for ax, yval in ((left, "acc"), (right, "p50")):
+        ax.plot(
+            [anchor["cost"]],
+            [anchor[yval]],
+            "D",
+            color=INK,
+            markersize=9,
+            markeredgecolor="white",
+            markeredgewidth=1.4,
+            zorder=7,
+        )
+    left.annotate(
+        f"best single (gpt-5.5)\n{anchor['acc']:.1%}",
+        xy=(anchor["cost"], anchor["acc"]),
+        xytext=(11, -2),
+        textcoords="offset points",
+        fontsize=9,
+        color=INK,
+        ha="left",
+        va="center",
+        fontweight="bold",
+    )
+    left.plot(
+        [fable_cost],
+        [FABLE_ALONE_ACC],
+        "X",
+        color=RED,
+        markersize=9,
+        markeredgecolor="white",
+        markeredgewidth=1.2,
+        zorder=7,
+    )
+    left.annotate(
+        f"fable-5 alone {FABLE_ALONE_ACC:.1%}",
+        xy=(fable_cost, FABLE_ALONE_ACC),
+        xytext=(11, 0),
+        textcoords="offset points",
+        fontsize=9,
+        color=RED,
+        ha="left",
+        va="center",
+    )
+    right.plot(
+        [fable_cost],
+        [fable_p50],
+        "X",
+        color=RED,
+        markersize=9,
+        markeredgecolor="white",
+        markeredgewidth=1.2,
+        zorder=7,
+    )
+
+    callouts = [
+        (
+            quality_max,
+            f"quality-max (floor_q={quality_max['kn'].get('floor_q')})",
+            (-16, 12),
+            "right",
+        ),
+        (shipped, "balanced: shipped default (z=0.5)", (-22, -24), "right"),
+        (aggressive, "cost-aggressive (lam)", (12, 4), "left"),
+        (example, "example: trade quality for savings", (14, -12), "left"),
+    ]
+    for g, name, offset, ha in callouts:
+        left.annotate(
+            f"{name}\n{100 * g['d']:+.2f}pt at {pct(g)} cost, p50 {g['p50']:.2f}s",
+            xy=(g["cost"], g["acc"]),
+            xytext=offset,
+            textcoords="offset points",
+            fontsize=8.5,
+            color=INK,
+            ha=ha,
+            fontweight="bold",
+        )
+        left.scatter(
+            [g["cost"]],
+            [g["acc"]],
+            s=150,
+            facecolor="none",
+            edgecolor=INK,
+            linewidth=1.1,
+            zorder=6,
+        )
+
+    from matplotlib.ticker import FixedFormatter, FixedLocator
+
+    ticks = [3e-4, 6e-4, 1.2e-3, 2.4e-3, 4.8e-3]
+    for ax in (left, right):
+        ax.set_xscale("log")
+        ax.xaxis.set_major_locator(FixedLocator(ticks))
+        ax.xaxis.set_major_formatter(FixedFormatter([f"${t:.4f}" for t in ticks]))
+        ax.xaxis.set_minor_locator(FixedLocator([]))
+        ax.set_xlim(1.7e-4, 9.5e-3)
+    left.set_xlabel("cost per call, USD (log)", fontsize=10.5, color=INK)
+    left.set_ylabel("accuracy", fontsize=10.5, color=INK)
+    # Headroom so the top callout sits inside the axes instead of on the subtitle.
+    left.set_ylim(0.884, 0.982)
+    left.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+    titled(
+        left,
+        "Operating points: the dial, not a single answer",
+        f"routerbench-ours9 · {round(anchor['nt'])} held-out scenarios/seed · 5 seeds · "
+        "marker size = p50 latency",
+    )
+    style_axes(left)
+    leg = left.legend(frameon=False, fontsize=9, loc="lower right")
+    for text in leg.get_texts():
+        text.set_color(INK)
+
+    right.set_xlabel("cost per call, USD (log)", fontsize=10.5, color=INK)
+    right.set_ylabel("p50 latency of the routed calls (s)", fontsize=10.5, color=INK)
+    titled(right, "Speed comes along for free", "the same runs: cheaper mixes are faster mixes")
+    style_axes(right)
+
+    fig.text(
+        0.5,
+        0.015,
+        textwrap.fill(
+            "Every line is one knob being turned on one configuration, so a line means "
+            "\u201cturn this dial\u201d rather than \u201ccompare these methods\u201d. The "
+            "right panel is why cost and latency move together: across the pool, per-call cost "
+            "and per-call p50 correlate at r = 0.69, because the cheap models are mostly the "
+            "fast ones (kimi-k2.6 is the exception: dear AND slow).",
+            120,
+        ),
+        fontsize=8.5,
+        color=MUTED,
+        ha="center",
+        va="bottom",
+    )
+    fig.tight_layout(rect=(0, 0.11, 1, 1))
+    return save(fig, "routing_operating_points.png")
+
+
+# Rows of the production results table, in reading order. The label carries the row's job.
+TABLE_ROWS = [
+    ("routerbench-ours9", "**ours9** (real benchmark, full power)"),
+    ("financebench-s80", "financebench-s80 (scaled niche)"),
+    ("tau-bench-s80", "tau-bench-s80 (scaled niche)"),
+    ("tau-bench-real", "**tau-bench-real** (sim-to-real transfer)"),
+    ("tau-bench", "tau-bench (25-scen wm)"),
+    ("bird-sql", "bird-sql (25-scen wm)"),
+    ("continual-learning", "continual-learning (25-scen wm)"),
+    ("crmarena", "crmarena (25-scen wm)"),
+    ("dabstep", "dabstep (25-scen wm)"),
+    ("financebench", "financebench (25-scen wm)"),
+    ("terminal-tasks", "terminal-tasks (25-scen wm)"),
+    ("swe-bench", "swe-bench (25-scen wm)"),
+    ("wm-gaia2", "wm-gaia2 (25-scen wm)"),
+    ("wm-tau-telecom", "wm-tau-telecom (25-scen wm)"),
+    ("wm-all", "**wm-all** (SAFETY row, never an optimization target)"),
+]
+# Which config counts as "the production champion" on a cohort, best match first. The shipped
+# contract is adaptive neighbourhood + novelty floor + stat guard at z=0.5, so a floor-enabled
+# row is a closer match to production than the same config with the floor disabled.
+CHAMPION_PRIORITY = [
+    "r1-knn-adapt3-oai",
+    "r3b-real-champ-floor",
+    "r3b-floorq0.5",
+    "r1-knn-adapt-oai",
+    "r1-knn-statz05-oai",
+    "r1-knn-statz05",
+    "r3b-floorq0.0",
+]
+VERDICT_TEXT = {
+    "beats": "**BEATS**",
+    "promising": "promising (small test set)",
+    "ties": "ties",
+    "identical": "abstains (= baseline)",
+    "mixed": "mixed seeds",
+    "unfavourable": "**loses** (small test set)",
+    "worse": "**WORSE**",
+    "underpowered": "underpowered",
+}
+
+
+def results_table(groups: list[dict]) -> str:
+    """The production config, cohort by cohort, as a markdown table for the PR body."""
+    head = (
+        "| niche | discovered best-single | baseline acc | champion acc +- sd | dAcc (paired) "
+        "| dcost | dp50 | seeds | n/seed | verdict | config row used |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|"
+    )
+    lines = [head]
+    for cohort, label in TABLE_ROWS:
+        rows = [g for g in groups if g["m"] == cohort and g["tier"] != "anchor"]
+        pick = next(
+            (g for name in CHAMPION_PRIORITY for g in rows if g["v"] == name),
+            None,
+        )
+        if pick is None:
+            lines.append(
+                f"| {label} | - | - | no champion-config row on this cohort " + "| - " * 7 + "|"
+            )
+            continue
+        base = pick["b"]
+        d_cost = f"{pick['cost'] / base['cost'] - 1:+.0%}" if base["cost"] else "-"
+        d_p50 = (
+            f"{pick['p50'] - base['p50']:+.2f}s"
+            if pick["p50"] is not None and base["p50"] is not None
+            else "-"
+        )
+        if pick["tier"] == "identical":
+            delta = "abstains (= baseline)"
+        else:
+            # Bold any negative delta: the rows where the champion does not help are the
+            # ones a reader most needs to notice.
+            body = f"{100 * pick['d']:+.2f}pt +- {100 * pick['dsd']:.2f}"
+            delta = f"**{body}**" if pick["d"] < 0 else body
+        lines.append(
+            f"| {label} | {'/'.join(base['models']) or '-'} | {base['acc']:.4f} "
+            f"| {pick['acc']:.4f} +- {pick['sd']:.4f} | {delta} | {d_cost} | {d_p50} "
+            f"| {pick['s']} | {pick['ntmed']:.0f} | {VERDICT_TEXT.get(pick['tier'], pick['tier'])} "
+            f"| `{pick['v']}` |"
+        )
+    return "\n".join(lines)
+
+
 def main() -> None:
     import matplotlib
 
@@ -776,7 +1084,9 @@ def main() -> None:
     written.append(fig_confidence(plt))
     written.append(fig_signal_map(groups, plt))
     written.append(fig_niches(groups, plt))
+    written.append(fig_operating_points(groups, plt))
 
+    sys.stderr.write("\n" + results_table(groups) + "\n\n")
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     sys.stderr.write(
         f"snapshot {stamp}: {total_runs} runs -> "
