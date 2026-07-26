@@ -45,11 +45,6 @@ from wmo.tracking import RunRecord
 runner = CliRunner()
 
 
-def _flat(output: str) -> str:
-    """CLI errors render inside a wrapped rich panel; flatten one so a phrase matches."""
-    return " ".join(output.replace("│", " ").split())
-
-
 def _matrix_file(tmp_path: Path) -> Path:
     pool = [
         PoolEntry(
@@ -409,8 +404,8 @@ def test_route_tune_refuses_a_base_snapshot_from_a_superseded_fit(tmp_path: Path
         app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.3"]
     )
     assert stale.exit_code != 0
-    assert "as-fitted snapshot of a different fit" in _flat(stale.output)
-    assert "policy.base.json" in _flat(stale.output)  # names the file to delete
+    assert _says(stale.output, "as-fitted snapshot of a different fit")
+    assert _says(stale.output, "policy.base.json")  # names the file to delete
     # The refit survives untouched rather than being replaced by a dialed copy of the old fit.
     after = RoutingPolicy.load(policy_file)
     assert after.default_model == "b"
@@ -440,7 +435,7 @@ def test_route_tune_refuses_a_snapshot_after_the_matrix_was_rebuilt_in_place(
         app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.3"]
     )
     assert stale.exit_code != 0
-    assert "as-fitted snapshot of a different fit" in _flat(stale.output)
+    assert _says(stale.output, "as-fitted snapshot of a different fit")
     assert RoutingPolicy.load(policy_file).cost_quality is None  # the refit is untouched
 
 
@@ -470,7 +465,7 @@ def test_route_tune_survives_a_matrix_path_that_looks_like_a_dial_suffix(tmp_pat
         app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.3"]
     )
     assert stale.exit_code != 0
-    assert "as-fitted snapshot of a different fit" in _flat(stale.output)
+    assert _says(stale.output, "as-fitted snapshot of a different fit")
     after = RoutingPolicy.load(policy_file)
     assert after.default_model == "b"  # the refit survives, not a dialed copy of the old fit
     assert after.cost_quality is None
