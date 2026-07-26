@@ -307,9 +307,7 @@ def test_pre_compression_policy_json_loads_with_compression_off(tmp_path: Path) 
     raw = policy.model_dump_json(indent=2)
     assert '"compression"' in raw  # sanity: the field serializes
     stripped = {
-        key: value
-        for key, value in policy.model_dump(mode="json").items()
-        if key != "compression"
+        key: value for key, value in policy.model_dump(mode="json").items() if key != "compression"
     }
     stripped["clusters"] = [
         {k: v for k, v in cluster.items() if k != "compression"} for cluster in stripped["clusters"]

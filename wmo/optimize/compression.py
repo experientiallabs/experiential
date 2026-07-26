@@ -67,6 +67,23 @@ class CompressionResult(BaseModel):
     cost_usd: float = 0.0
 
 
+class CompressionStats(BaseModel):
+    """Request-level accounting of one applied compression stage (D-SERVING-LOG / eval shape).
+
+    `compressor_version` is the version that actually RAN (the config's copy is fit-time
+    provenance). Token counts are whole-request `estimate_tokens` totals: what the input would
+    have measured raw vs what was sent, so on-vs-off savings read straight off the record.
+    """
+
+    compressor_id: str
+    compressor_version: str
+    aggressiveness: float
+    tokens_in_raw: int
+    tokens_in_compressed: int
+    latency_s: float
+    cost_usd: float = 0.0
+
+
 @runtime_checkable
 class Compressor(Protocol):
     """The pluggable compressor seam. Implementations must be deterministic and 0.0-safe."""
