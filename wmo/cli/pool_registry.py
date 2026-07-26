@@ -278,12 +278,20 @@ def register_model_ids(
     kind: ProviderKind,
     model_ids: list[str],
     options: EntryOptions,
+    verify: ProviderCheck | None = None,
 ) -> int:
     """Register `model_ids` with no prompts, for `--pool-model` and scripts. Returns the count.
 
     Every id is resolved against `kind`'s catalog first, so a scripted registration picks up the
     same canonical model type and published price an interactive one would; an id the catalog
     does not list is registered verbatim, exactly as a typed id is.
+
+    Every candidate is then live-pinged over its own route, exactly as the interactive flow does.
+    A `--pool-model` can differ from the verified worker in model, deployment, endpoint, and
+    credential, so the worker's ping proves nothing about it, and a script is precisely where
+    nobody is watching for the 401 that would otherwise surface inside a paid `route sweep`. The
+    whole batch is built and proved BEFORE anything is written, so a bad third id cannot leave
+    half a roster behind.
 
     Azure is the one backend this cannot do in bulk. On the wire its deployment name IS the
     model, deployment names are chosen by whoever created them, and nothing in a catalog can
@@ -292,20 +300,23 @@ def register_model_ids(
     So a scripted Azure registration is one explicitly named deployment per invocation.
 
     Raises:
-        typer.BadParameter: An entry cannot be built (a missing price, an Azure deployment), the
-            roster refuses it, or Azure was given no deployment or several models for one.
-            Non-interactively there is nobody to ask, so this fails loudly rather than writing a
-            candidate that cannot be called.
+        typer.BadParameter: An entry cannot be built (a missing price, an Azure deployment), it
+            cannot be called, the roster refuses it, or Azure was given no deployment or several
+            models for one. Non-interactively there is nobody to ask, so this fails loudly rather
+            than writing a candidate that does not work.
     """
     _check_azure_deployment(kind, model_ids, options)
     catalog = list_provider_models(kind)
-    written = 0
+    check = verify or verify_pool_entry
+    existing = read_pool_entries(pool_path)
+    taken = {entry.name for entry in existing}
+    planned: list[PoolEntry] = []
     for model_id in model_ids:
         model = catalog.find(model_id) or CatalogModel(id=model_id)
-        entries = read_pool_entries(pool_path)
-        name = _existing_handle(entries, kind, model, options) or _unique_handle(
-            _handle_base(kind, model, options), {entry.name for entry in entries}
+        name = _existing_handle(existing, kind, model, options) or _unique_handle(
+            _handle_base(kind, model, options), taken
         )
+        taken.add(name)
         try:
             entry = build_pool_entry(name=name, kind=kind, model=model, options=options)
         except (ValidationError, ValueError) as exc:
@@ -317,9 +328,16 @@ def register_model_ids(
             raise typer.BadParameter(
                 f"cannot register '{model.id}' from {kind.value}: {'; '.join(problems)}"
             )
-        if _write(console, entry, pool_path):
-            written += 1
-    return written
+        result = check(entry)
+        if not result.ok:
+            raise typer.BadParameter(
+                f"'{model.id}' from {kind.value} is not callable "
+                f"({result.detail or 'unknown error'}); fix the credential, endpoint, or id, or "
+                "leave --pool-model off and register it from the interactive picker, which lets "
+                "you keep an unreachable candidate deliberately"
+            )
+        planned.append(entry)
+    return sum(1 for entry in planned if _write(console, entry, pool_path))
 
 
 def _check_azure_deployment(

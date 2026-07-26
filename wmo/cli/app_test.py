@@ -16,7 +16,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from wmo.cli import app
+from wmo.cli import app, pool_registry
 from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmo.cli.pool_registry import read_pool_entries
 from wmo.config import HarnessConfig, ModelRole, load_config, load_settings, save_settings
@@ -531,13 +531,22 @@ def test_providers_set_verifies_and_saves_local_worker(monkeypatch, tmp_path) ->
 
 
 def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub the live provider ping so `providers set` reaches the pool-registration step."""
+    """Stub both live pings so `providers set` reaches, and gets through, pool registration.
+
+    Two seams, because the command proves two different things: `verify_all` proves the worker
+    provider, and `verify_pool_entry` proves each routing candidate over its own route.
+    """
     monkeypatch.setattr(
         cli_app_module,
         "verify_all",
         lambda configs: [
             VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs
         ],
+    )
+    monkeypatch.setattr(
+        pool_registry,
+        "verify_pool_entry",
+        lambda entry: VerifyResult(ok=True, kind=entry.kind, model=entry.model),
     )
 
 
@@ -779,6 +788,43 @@ def test_providers_set_registers_a_named_azure_deployment(
     entry = read_pool_entries(root / "pool.toml")[0]
     assert (entry.name, entry.model, entry.deployment) == ("chat-prod", "gpt-5.5", "chat-prod")
     assert entry.api_version == "2025-01-01-preview"
+
+
+def test_providers_set_refuses_a_pool_model_that_cannot_be_called(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A --pool-model can differ from the verified worker in model, endpoint, deployment and
+    # credential, so the worker's ping proves nothing about it. Registering it unproved would
+    # surface as a 401 inside a paid `route sweep`, after the candidates ahead of it were billed.
+    _accept_every_provider(monkeypatch)
+    monkeypatch.setattr(
+        pool_registry,
+        "verify_pool_entry",
+        lambda entry: VerifyResult(
+            ok=False, kind=entry.kind, model=entry.model, detail="401 unauthorized"
+        ),
+    )
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4-mini",
+            "--pool-model",
+            "gpt-5.4",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "not callable" in result.output
+    assert not (root / "pool.toml").exists()
 
 
 def test_providers_set_rejects_half_a_price_pair(

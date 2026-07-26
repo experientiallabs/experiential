@@ -18,6 +18,7 @@ import typer
 from pydantic import ValidationError
 from rich.console import Console
 
+from wmo.cli import pool_registry
 from wmo.cli.pool_registry import (
     EntryOptions,
     build_pool_entry,
@@ -72,11 +73,13 @@ class _Script:
 
 @pytest.fixture(autouse=True)
 def _catalog_and_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Seed the OpenRouter cache and every provider credential the flow may check.
+    """Seed the OpenRouter cache, fake every credential, and cut the live ping off the network.
 
     Credentials matter because picking a backend other than the one just configured runs the
     wizard's credential prompt, which would otherwise consume script lines and write a `.env`
-    into the working directory.
+    into the working directory. Replacing `verify_pool_entry` is the same rule `wmo/conftest.py`
+    applies to the price catalog: a test that forgets to inject a ping must fail loudly rather
+    than quietly calling openrouter.ai. Tests that want a ping to FAIL pass their own.
     """
     cache = tmp_path / "openrouter-prices.json"
     catalog = PriceCatalog(fetched_at=time.time(), source="test fixture", prices=_fake_prices())
@@ -85,6 +88,12 @@ def _catalog_and_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     for env_vars in PROVIDER_ENV_VARS.values():
         for var in env_vars:
             monkeypatch.setenv(var, "test-value")
+    monkeypatch.setattr(pool_registry, "verify_pool_entry", _refuse_network)
+
+
+def _refuse_network(entry: PoolEntry) -> VerifyResult:
+    """Stand-in for the live ping: the suite never calls a provider."""
+    raise AssertionError(f"the test suite does not ping providers (tried {entry.model})")
 
 
 def _ok(entry: PoolEntry) -> VerifyResult:
@@ -472,6 +481,7 @@ def test_register_model_ids_writes_without_prompting(tmp_path: Path) -> None:
         kind=ProviderKind.OPENROUTER,
         model_ids=[_SONNET, _DEEPSEEK],
         options=EntryOptions(tier="open"),
+        verify=_ok,
     )
 
     assert written == 2
@@ -489,6 +499,7 @@ def test_register_model_ids_is_idempotent(tmp_path: Path) -> None:
         kind=ProviderKind.OPENROUTER,
         model_ids=[_SONNET],
         options=EntryOptions(),
+        verify=_ok,
     )
     before = pool.read_text(encoding="utf-8")
 
@@ -498,10 +509,60 @@ def test_register_model_ids_is_idempotent(tmp_path: Path) -> None:
         kind=ProviderKind.OPENROUTER,
         model_ids=[_SONNET],
         options=EntryOptions(),
+        verify=_ok,
     )
 
     assert written == 0
     assert pool.read_text(encoding="utf-8") == before
+
+
+def test_register_model_ids_pings_every_candidate_on_its_own_route(tmp_path: Path) -> None:
+    # A --pool-model can differ from the verified worker in model, endpoint, deployment and
+    # credential, so the worker's ping proves nothing about it, and a script is exactly where
+    # nobody is watching for the 401 that would otherwise surface inside a paid sweep.
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    pinged: list[str] = []
+
+    def record(entry: PoolEntry) -> VerifyResult:
+        pinged.append(entry.model)
+        return _ok(entry)
+
+    register_model_ids(
+        console,
+        pool_path=pool,
+        kind=ProviderKind.OPENROUTER,
+        model_ids=[_SONNET, _DEEPSEEK],
+        options=EntryOptions(),
+        verify=record,
+    )
+
+    assert pinged == [_SONNET, _DEEPSEEK]
+
+
+def test_register_model_ids_writes_nothing_when_a_candidate_is_not_callable(
+    tmp_path: Path,
+) -> None:
+    # Built and proved before anything is written, so a bad second id cannot leave half a roster
+    # behind for a script that then reports failure.
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+
+    def refuse_second(entry: PoolEntry) -> VerifyResult:
+        if entry.model == _DEEPSEEK:
+            return VerifyResult(ok=False, kind=entry.kind, model=entry.model, detail="401")
+        return _ok(entry)
+
+    with pytest.raises(typer.BadParameter, match="is not callable"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.OPENROUTER,
+            model_ids=[_SONNET, _DEEPSEEK],
+            options=EntryOptions(),
+            verify=refuse_second,
+        )
+    assert not pool.exists()
 
 
 def test_register_model_ids_refuses_a_model_it_cannot_price(tmp_path: Path) -> None:
@@ -534,6 +595,7 @@ def test_register_model_ids_resolves_a_bedrock_id_from_the_built_in_registry(
         kind=ProviderKind.BEDROCK,
         model_ids=["claude-opus-4-8"],
         options=EntryOptions(region="us-east-1"),
+        verify=_ok,
     )
 
     entry = read_pool_entries(pool)[0]
@@ -734,6 +796,7 @@ def test_one_azure_deployment_registers_cleanly(tmp_path: Path) -> None:
         kind=ProviderKind.AZURE_OPENAI,
         model_ids=["gpt-5.4"],
         options=EntryOptions(deployment="chat-prod", api_version="2025-01-01-preview"),
+        verify=_ok,
     )
 
     entry = read_pool_entries(pool)[0]
