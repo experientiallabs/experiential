@@ -251,7 +251,7 @@ def collect_rollouts(
     scorer = asyncio.run(
         HarborScorer.create(
             template,
-            list(task_ids),
+            task_ids,
             provider_config=provider_config,
             reward_key=cfg.harbor.reward_key,
             attempts=cfg.train.group_size,
@@ -272,7 +272,7 @@ def collect_rollouts(
     logger.info(
         "collecting rollouts for %s: %d task(s) x %d attempt(s), backend %s -> %s",
         step_name,
-        len(list(task_ids)),
+        len(task_ids),
         cfg.train.group_size,
         backend,
         jobs_dir,
