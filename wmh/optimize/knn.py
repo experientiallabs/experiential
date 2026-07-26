@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from wmh.optimize.policy import (
     DEFAULT_KNN_MIN_PAIRS,
@@ -291,28 +291,29 @@ class CostQualityAnchor(BaseModel):
 
     Quality and cost are both stated against the best single pool model on the same held-out
     split, which is the bar an operator would otherwise be paying for.
+
+    The serialized field names (`s`, `label`, `quality_delta_pt`, `cost_delta_pct`) are the
+    platform's contract for the endpoint config response: these rows are the ONLY deltas that
+    surface, and a client interpolates between them itself rather than asking for an
+    interpolated delta at an arbitrary dial position, which would read as a measurement.
     """
 
-    cost_quality: float
-    named_point: CostQualityPointName
-    knobs: CostQualityKnobs
-    quality_delta_points: float  # accuracy points vs the best single model, mean of 5 seeds
-    cost_delta_percent: float  # cost per call vs the same, mean of 5 seeds
-    measured_as: str  # the run-record variant behind the row
+    cost_quality: float = Field(serialization_alias="s")
+    named_point: CostQualityPointName = Field(serialization_alias="label")
+    quality_delta_points: float = Field(serialization_alias="quality_delta_pt")
+    cost_delta_percent: float = Field(serialization_alias="cost_delta_pct")
 
 
 # Every anchor was measured on routerbench-ours9 (1199 scenarios, 9 models, 70/30 stratified
 # splits, 5 seeds, text-embedding-3-large queries) THROUGH THIS CODE by
-# `.agents/scripts/validate_cost_quality.py`, which is also the gate that keeps them true: the
-# quality-end rows additionally match R1's independently measured ablation variants
-# (`r1-knn-adapt-floor-q0.5` and `r1-knn-adapt-floor-q0.05`) to the digit.
+# `.agents/scripts/validate_cost_quality.py`, which is also the gate that keeps them true.
 _MEASURED = (
-    # dial, quality points vs best single, cost percent vs best single, provenance
-    (0.0, 1.14, -13.9, "r1-knn-adapt-floor-q0.5"),
-    (0.25, 0.99, -24.7, "r1-knn-adapt-floor-q0.05 (the shipped default)"),
-    (0.5, 0.87, -40.8, "validate_cost_quality.py"),
-    (0.75, 0.20, -43.6, "validate_cost_quality.py"),
-    (1.0, -0.54, -46.2, "validate_cost_quality.py"),
+    # dial, quality points vs best single, cost percent vs best single
+    (0.0, 1.14, -13.9),  # matches R1's r1-knn-adapt-floor-q0.5 to the digit
+    (0.25, 0.99, -24.7),  # matches R1's r1-knn-adapt-floor-q0.05; the shipped default
+    (0.5, 0.87, -40.8),
+    (0.75, 0.20, -43.6),
+    (1.0, -0.54, -46.2),
 )
 
 
@@ -340,7 +341,12 @@ def cost_quality_knobs(cost_quality: float) -> CostQualityKnobs:
 
 
 def cost_quality_named_point(cost_quality: float) -> CostQualityPointName:
-    """The name of a dial position when it lands on a named one, else "custom"."""
+    """The label for a dial position: an anchor's name only when it sits EXACTLY on that anchor.
+
+    Every other position is "Custom". A position between two measured anchors must never borrow
+    the nearer one's name: the label is what a UI shows next to that anchor's measured quality
+    and cost numbers, so claiming it for an unmeasured position claims the numbers too.
+    """
     for position, name in (
         (0.0, "quality-max"),
         (COST_QUALITY_BALANCED, "balanced"),
@@ -348,22 +354,21 @@ def cost_quality_named_point(cost_quality: float) -> CostQualityPointName:
     ):
         if math.isclose(cost_quality, position, abs_tol=1e-9):
             return name
-    return "custom"
+    return "Custom"
 
 
 # Built through the mapping, so the table an operator reads and the knobs the endpoint serves
-# can never be two different sliders. `.agents/scripts/validate_cost_quality.py` regates the
+# can never be two different sliders, and sorted by dial position because a frontier read out of
+# order is a frontier nobody trusts. `.agents/scripts/validate_cost_quality.py` regates the
 # measured columns.
 COST_QUALITY_ANCHORS: tuple[CostQualityAnchor, ...] = tuple(
     CostQualityAnchor(
         cost_quality=dial,
         named_point=cost_quality_named_point(dial),
-        knobs=cost_quality_knobs(dial),
         quality_delta_points=quality,
         cost_delta_percent=cost,
-        measured_as=source,
     )
-    for dial, quality, cost, source in _MEASURED
+    for dial, quality, cost in sorted(_MEASURED)
 )
 
 

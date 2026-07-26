@@ -396,23 +396,36 @@ def test_the_dial_is_monotone_in_both_knobs() -> None:
     assert cost_quality_named_point(0.0) == "quality-max"
     assert cost_quality_named_point(COST_QUALITY_BALANCED) == "balanced"
     assert cost_quality_named_point(1.0) == "savings-max"
-    assert cost_quality_named_point(0.4) == "custom"
+    # A position next to an anchor is "Custom", never the anchor's name: the label travels with
+    # that anchor's measured quality and cost, so borrowing it borrows the numbers.
+    assert cost_quality_named_point(0.4) == "Custom"
+    assert cost_quality_named_point(COST_QUALITY_BALANCED + 1e-6) == "Custom"
 
 
-def test_the_anchor_table_covers_the_dial_and_reads_off_the_mapping() -> None:
-    # The table is what the endpoint hands the platform UI and what the docstring promises. Its
-    # knobs come from the mapping itself, so the only thing to pin is that the measured
-    # positions still span the dial and that cost falls across them as advertised.
+def test_the_anchor_table_covers_the_dial_and_is_sorted() -> None:
+    # The table is what the endpoint hands the platform UI and what the docstring promises: the
+    # measured positions span the dial, in order, and cost falls across them as advertised.
     dials = [anchor.cost_quality for anchor in COST_QUALITY_ANCHORS]
     assert dials == sorted(dials)
     assert (dials[0], dials[-1]) == (0.0, 1.0)
     assert COST_QUALITY_BALANCED in dials
     for anchor in COST_QUALITY_ANCHORS:
-        assert anchor.knobs == cost_quality_knobs(anchor.cost_quality)
         assert anchor.named_point == cost_quality_named_point(anchor.cost_quality)
     costs = [anchor.cost_delta_percent for anchor in COST_QUALITY_ANCHORS]
     assert costs == sorted(costs, reverse=True)  # every step up the dial measured cheaper
     assert all(cost < 0.0 for cost in costs)  # and every anchor beats the best single model
+
+
+def test_the_anchor_table_serializes_under_the_platform_field_names() -> None:
+    # The wire contract the platform card is built against: four fields per anchor, no knobs and
+    # no provenance, so nothing on it can be mistaken for a measurement of another position.
+    row = COST_QUALITY_ANCHORS[1].model_dump(by_alias=True)
+    assert row == {
+        "s": 0.25,
+        "label": "balanced",
+        "quality_delta_pt": 0.99,
+        "cost_delta_pct": -24.7,
+    }
 
 
 def test_the_dial_rejects_settings_outside_its_range(tmp_path: Path) -> None:

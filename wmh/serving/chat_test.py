@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -33,6 +34,7 @@ from wmh.retrieval.embedders import HashingEmbedder
 from wmh.serving.chat import (
     EndpointRuntime,
     RequestLog,
+    RequestLogRecord,
     create_chat_router,
     install_openai_error_shapes,
 )
@@ -536,18 +538,25 @@ def test_config_reports_an_as_fitted_endpoint_with_the_measured_anchors(tmp_path
     # Nobody has set the dial, and mounting did not set one for them.
     assert body["cost_quality"] is None
     assert body["named_point"] == "as-fitted"
-    # The anchors are what a slider labels itself with: measured quality and cost per position.
-    assert [anchor["cost_quality"] for anchor in body["anchors"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
-    balanced = next(a for a in body["anchors"] if a["cost_quality"] == 0.25)
-    assert balanced["named_point"] == "balanced"
-    assert balanced["quality_delta_points"] == 0.99
-    assert balanced["cost_delta_percent"] == -24.7
-    assert balanced["knobs"] == {
-        "knn_z": 0.5,
-        "floor_q": 0.05,
-        "pick_lam": 0.0,
-        "guard_mode": "symmetric",
+    # The anchors are what a slider labels itself with: measured quality and cost per position,
+    # sorted, and carrying nothing else. A client interpolates between them itself, so the
+    # response must never hand it a delta for a position nobody measured.
+    assert [anchor["s"] for anchor in body["anchors"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    balanced = next(anchor for anchor in body["anchors"] if anchor["s"] == 0.25)
+    assert balanced == {
+        "s": 0.25,
+        "label": "balanced",
+        "quality_delta_pt": 0.99,
+        "cost_delta_pct": -24.7,
     }
+
+
+def test_a_dial_between_anchors_is_labelled_custom(tmp_path: Path) -> None:
+    # Never borrow the nearer anchor's name: its label sits next to its measured numbers.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.26}).json()
+    assert body["named_point"] == "Custom"
+    assert body["cost_quality"] == 0.26
 
 
 def test_put_moves_the_dial_on_the_live_endpoint(tmp_path: Path) -> None:
@@ -664,3 +673,154 @@ def test_the_openai_surface_is_untouched_by_the_dial_routes(tmp_path: Path) -> N
     assert completion.status_code == 200
     assert completion.json()["model"] == "tau-bench"
     assert "cost_quality" not in completion.text
+
+
+def test_put_rejects_non_finite_dial_values(tmp_path: Path) -> None:
+    # A slider bug that sends NaN must be a readable 400: NaN fails every comparison the guard
+    # makes, so accepting it would quietly stop the endpoint from routing at all.
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    for payload in ('{"cost_quality": NaN}', '{"cost_quality": Infinity}'):
+        response = client.put(
+            "/v1/endpoints/tau-bench/config",
+            content=payload,
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 400, payload
+        assert response.json()["error"]["code"] == "invalid_request"
+    assert runtime.cost_quality is None
+
+
+# --- the savings card: GET /v1/endpoints/{name}/savings --------------------------------------
+
+
+def _served_request(client: TestClient, content: str) -> None:
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": content}]},
+    )
+    assert response.status_code == 200
+
+
+def test_savings_start_at_the_empty_state(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 0
+    assert body["cost_saved_usd"] == 0.0
+    assert body["cost_saved_pct"] == 0.0
+    assert body["time_saved_s_estimate"] == 0.0
+    assert body["expected_quality_delta_pt"] == 0.0
+    assert body["window"] == "all_time"
+    assert body["estimate_basis"]  # never empty: the card explains the zero
+
+
+def test_savings_accrue_as_the_endpoint_serves(tmp_path: Path) -> None:
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "SELECT count(*) FROM superheroes")  # routes to fable-5
+    _served_request(client, "draft a thank-you")  # stays on the haiku-4-5 fallback
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 2
+    # fable-5 is the pricier model here, so routing away from the cheap fallback COSTS money and
+    # the card says so with a negative saving rather than hiding it.
+    assert body["actual_cost_usd"] > body["baseline_cost_estimate_usd"]
+    assert body["cost_saved_usd"] < 0.0
+    assert any("haiku-4-5" in basis for basis in body["estimate_basis"])
+
+
+def test_savings_window_parameter_selects_the_period(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    assert client.get("/v1/endpoints/tau-bench/savings?window=7d").json()["window"] == "7d"
+    bad = client.get("/v1/endpoints/tau-bench/savings?window=forever")
+    assert bad.status_code == 400
+    assert bad.json()["error"]["code"] == "invalid_request"
+
+
+def test_savings_survive_a_restart_by_reading_the_log(tmp_path: Path) -> None:
+    # The persisted JSONL is the source, so a customer's savings are not reset by a deploy.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "SELECT count(*) FROM superheroes")
+    restarted, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = restarted.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 1
+
+
+def test_savings_ignore_other_endpoints_rows(tmp_path: Path) -> None:
+    log = RequestLog(tmp_path / "requests.jsonl")
+    log.append(
+        RequestLogRecord(
+            id="other",
+            ts=datetime.now(UTC).isoformat(),
+            endpoint="somebody-else",
+            model="haiku-4-5",
+            provider_model="claude-haiku-4-5",
+            routing_reason="test",
+            input_tokens=1000,
+            output_tokens=1000,
+            cost_usd=1.0,
+        )
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=log,
+    )
+    assert runtime.savings().requests_served == 0
+
+
+def test_savings_skip_an_unreadable_log_row(tmp_path: Path) -> None:
+    # A line truncated by a hard kill must not take the whole card down.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "SELECT count(*) FROM superheroes")
+    with (tmp_path / "requests.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write('{"id": "truncated"\n')
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 1
+
+
+def test_savings_are_available_for_a_static_endpoint(tmp_path: Path) -> None:
+    static = RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())
+    client, _ = _dial_client(tmp_path, static)
+    _served_request(client, "hi")
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["requests_served"] == 1
+    assert body["cost_saved_usd"] == 0.0  # nothing to save against itself
+    assert body["expected_quality_delta_pt"] == 0.0
+
+
+def test_savings_404_for_an_unknown_endpoint(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    missing = client.get("/v1/endpoints/nope/savings")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "model_not_found"
+
+
+def test_moving_the_dial_refreshes_the_quality_expectation(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "draft a thank-you")
+    client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.0})
+    body = client.get("/v1/endpoints/tau-bench/savings").json()
+    assert body["expected_quality_delta_pt"] == -0.54  # the savings-max anchor, not a stale 0.0
+
+
+def test_savings_are_recomputed_when_the_log_grows_not_on_a_timer(tmp_path: Path) -> None:
+    # Cached between requests (a polling dashboard must not re-read the JSONL every paint), and
+    # invalidated by the request that changes the total, so the card is never stale.
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    reads = {"n": 0}
+    original = RequestLog.replay
+
+    def counting_replay(self: RequestLog, endpoint: str) -> list[RequestLogRecord]:
+        reads["n"] += 1
+        return original(self, endpoint)
+
+    RequestLog.replay = counting_replay
+    try:
+        client.get("/v1/endpoints/tau-bench/savings")
+        client.get("/v1/endpoints/tau-bench/savings")
+        assert reads["n"] == 1  # the second read came from the cache
+        _served_request(client, "draft a thank-you")
+        assert client.get("/v1/endpoints/tau-bench/savings").json()["requests_served"] == 1
+        assert reads["n"] == 2
+    finally:
+        RequestLog.replay = original
+    assert runtime.savings().requests_served == 1
