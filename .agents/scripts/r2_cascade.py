@@ -761,6 +761,222 @@ def run_round9(name: str, matrix: OutcomeMatrix, seeds: list[int]) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Round 10: self-consistency cascade (gate PASSED; pre-registered 2026-07-25).
+# Two cheap calls; keep the within-cell verifier pick; escalate iff the two cheap
+# replies DISAGREE (low cosine) AND the kNN strong-success filter is confident.
+# ---------------------------------------------------------------------------
+
+
+def _consistency(
+    eps: list[ScenarioOutcome], embeddings: dict[EpisodeKey, np.ndarray]
+) -> float | None:
+    if len(eps) < 2:
+        return None
+    v0, v1 = embeddings.get(episode_key(eps[0])), embeddings.get(episode_key(eps[1]))
+    if v0 is None or v1 is None:
+        return None
+    return float(v0 @ v1 / (np.linalg.norm(v0) * np.linalg.norm(v1)))
+
+
+def _select10(
+    matrix: OutcomeMatrix,
+    fit_ids: list[str],
+    best_name: str,
+    pair: tuple[str, str],
+    embeddings: dict[EpisodeKey, np.ndarray],
+    oof: dict[EpisodeKey, float],
+    strong_est: dict[str, float],
+    *,
+    shuffle_seed: int | None = None,
+) -> tuple[float, float, float, float] | None:
+    """(consistency threshold c, strong bar b, fit acc, fit cost) under the cost rule.
+
+    Fit value per scenario: two cheap episodes; kept reward = the OOF-verifier-picked
+    episode's reward; escalate (consistency < c AND strong_est >= b) -> strong cell mean;
+    cost = both cheap episodes + escalation. `shuffle_seed` permutes the episode->embedding
+    map for the consistency signal (the control: must kill the gate signal).
+    """
+    cheap, strong = pair
+    cells = _cells(matrix, set(fit_ids))
+    rewards, costs = _fit_stats(cells)
+    cap = CAP_FACTOR * _mean(
+        [costs[(sid, best_name)] for sid in fit_ids if (sid, best_name) in costs]
+    )
+    emb = embeddings
+    if shuffle_seed is not None:
+        keys = [k for k in embeddings if k[1] == cheap]
+        perm = list(keys)
+        np.random.default_rng(shuffle_seed).shuffle(perm)
+        emb = dict(embeddings)
+        for old, new in zip(keys, perm, strict=True):
+            emb[old] = embeddings[new]
+
+    per: dict[str, tuple[float | None, float, float, float, float]] = {}
+    for sid in fit_ids:
+        eps = cells.get((sid, cheap), [])
+        if not eps or (sid, strong) not in rewards:
+            continue
+        cons = _consistency(eps, emb)
+        scored = [(oof.get(episode_key(o), 0.0), o.reward) for o in eps]
+        kept = max(scored, key=lambda sr: sr[0])[1]
+        cheap_cost = sum(o.cost_usd for o in eps[:2])
+        per[sid] = (cons, kept, rewards[(sid, strong)], cheap_cost, costs[(sid, strong)])
+    if not per:
+        return None
+    known = sorted(v[0] for v in per.values() if v[0] is not None)
+    if not known:
+        return None
+    c_grid = sorted({float(q) for q in np.quantile(known, np.arange(0.1, 1.0, 0.1))})
+    s_known = [strong_est[sid] for sid in per if sid in strong_est]
+    b_grid = sorted({float(q) for q in np.quantile(s_known, np.arange(0.1, 1.0, 0.1))})
+    rng = np.random.default_rng(0)
+    sids = list(per)
+    resamples = [[sids[i] for i in rng.integers(0, len(sids), size=len(sids))] for _ in range(200)]
+    best = None
+    for c_thr in c_grid:
+        for b in b_grid:
+            acc_map, cost_map = {}, {}
+            for sid, (cons, kept, strong_r, cheap_cost, strong_cost) in per.items():
+                weak = cons is None or cons < c_thr
+                escalate = weak and strong_est.get(sid, -np.inf) >= b
+                acc_map[sid] = strong_r if escalate else kept
+                cost_map[sid] = cheap_cost + (strong_cost if escalate else 0.0)
+            acc = _mean(list(acc_map.values()))
+            boot = sorted(_mean([cost_map[s] for s in sample]) for sample in resamples)
+            if boot[int(0.8 * len(boot))] <= cap and (best is None or acc > best[2]):
+                best = (c_thr, b, acc, _mean(list(cost_map.values())))
+    return best
+
+
+def run_round10(name: str, matrix: OutcomeMatrix, seeds: list[int]) -> None:
+    drv = _driver()
+    embeddings = load_embeddings(matrix)
+    task_vecs = _task_vectors(name, matrix)
+    ts = datetime.now(tz=UTC).isoformat()
+    for seed in seeds:
+        fit_ids, test_ids = drv.split_scenario_ids(matrix, train_fraction=0.7, seed=seed)
+        best_name, _a, _c = drv.best_single_model(matrix, fit_ids=fit_ids, eval_ids=test_ids)
+        best_eval = evaluate_choices(matrix, test_ids, lambda _sid, b=best_name: b)
+        cells = _cells(matrix, set(fit_ids))
+        rewards, costs = _fit_stats(cells)
+        model_cost = {
+            m.name: _mean([costs[(sid, m.name)] for sid in fit_ids if (sid, m.name) in costs])
+            for m in matrix.pool
+        }
+        oof = _oof_scores(matrix, fit_ids, embeddings, seed)
+
+        # Pair: fit-label rule with the TWO-call cheap cost; enumerate, keep best fit value.
+        chosen_pair, chosen_cfg = None, None
+        for cheap in model_cost:
+            for strong in model_cost:
+                if cheap == strong:
+                    continue
+                if 2 * model_cost[cheap] > CHEAP_RATIO * model_cost[strong]:
+                    continue
+                strong_means = {
+                    sid: rewards[(sid, strong)] for sid in fit_ids if (sid, strong) in rewards
+                }
+                if len(strong_means) < len(fit_ids) * 0.5:
+                    continue
+                est_fit = _strong_estimates(fit_ids, fit_ids, task_vecs, strong_means, loo=True)
+                cfg = _select10(
+                    matrix, fit_ids, best_name, (cheap, strong), embeddings, oof, est_fit
+                )
+                if cfg and (chosen_cfg is None or cfg[2] > chosen_cfg[2]):
+                    chosen_pair, chosen_cfg = (cheap, strong), cfg
+        if chosen_pair is None:
+            logger.info("%s/s%d round10: declined (no pair under cap)", name, seed)
+            continue
+        cheap, strong = chosen_pair
+        c_thr, b, fit_acc, fit_cost = chosen_cfg
+        strong_means = {sid: rewards[(sid, strong)] for sid in fit_ids if (sid, strong) in rewards}
+        est_test = _strong_estimates(fit_ids, test_ids, task_vecs, strong_means, loo=False)
+
+        train = [
+            o
+            for o in matrix.outcomes
+            if o.scenario_id in set(fit_ids)
+            and o.reward is not None
+            and episode_key(o) in embeddings
+        ]
+        final = fit_absolute(
+            np.asarray([embeddings[episode_key(o)] for o in train]),
+            np.asarray([o.reward for o in train], dtype=float),
+            alpha=ALPHA,
+        )
+
+        def decide(
+            sid: str,
+            transcript: list,
+            cheap: str = cheap,
+            strong: str = strong,
+            c_thr: float = c_thr,
+            b: float = b,
+            final: ReplyVerifier = final,
+            est_test: dict = est_test,
+        ) -> str | Finish:
+            if len(transcript) < 2:
+                return cheap
+            if len(transcript) == 2:
+                cons = _consistency(list(transcript), embeddings)
+                weak = cons is None or cons < c_thr
+                if weak and est_test.get(sid, -np.inf) >= b:
+                    return strong
+                picks = []
+                for index, outcome in enumerate(transcript):
+                    vector = embeddings.get(episode_key(outcome))
+                    picks.append(
+                        (float(final.score(vector)[0]) if vector is not None else -1e9, index)
+                    )
+                return Finish(pick=max(picks)[1])
+            return Finish(pick=2)
+
+        results = [
+            evaluate_call_sequences(m2, test_ids, decide, max_calls=3)
+            for m2 in (matrix, _swap_episodes(matrix))
+        ]
+        mean_result = results[0].model_copy(
+            update={
+                "accuracy": _mean([r.accuracy for r in results]),
+                "cost_per_call": _mean([r.cost_per_call for r in results]),
+            }
+        )
+        append_run(
+            RunRecord(
+                run_id=f"r2-{name}-iid-s{seed}-r2-cascade3-{uuid.uuid4().hex[:8]}",
+                ts=ts,
+                matrix=name,
+                variant="r2-cascade3",
+                params={"family": "cascade3", "knn": KNN_NEIGHBORS, "split": "iid"},
+                split_seed=seed,
+                fit_scenarios=len(fit_ids),
+                test_scenarios=len(test_ids),
+                result=mean_result,
+                baselines={"best_single": best_eval},
+                notes=(
+                    f"pair={cheap}->{strong} c={c_thr:.4f} b={b:.4f} "
+                    f"esc_rate={mean_result.model_mix.get(strong, 0.0):.2f} "
+                    f"fit_acc={fit_acc:.4f} fit_cost={fit_cost:.5f} "
+                    f"perm_accs={[round(r.accuracy, 4) for r in results]}"
+                ),
+            ),
+            RUNS,
+        )
+        logger.info(
+            "%s/s%d r2-cascade3: acc=%.4f cost=$%.5f (best %.4f/$%.5f) pair=%s->%s c=%.3f",
+            name,
+            seed,
+            mean_result.accuracy,
+            mean_result.cost_per_call,
+            best_eval.accuracy,
+            best_eval.cost_per_call,
+            cheap,
+            strong,
+            c_thr,
+        )
+
+
 def main() -> None:
     args = sys.argv[1:]
     wanted = [a for a in args if not a.startswith("--")] or ["wm-all"]
@@ -770,10 +986,13 @@ def main() -> None:
             seeds = [int(s) for s in arg.split("=", 1)[1].split(",")]
     oracle_only = "--oracle-only" in args
     round9 = "--round9" in args
+    round10 = "--round10" in args
     drv = _driver()
     matrices = drv._matrices()
     for name in wanted:
-        if round9:
+        if round10:
+            run_round10(name, matrices[name], seeds)
+        elif round9:
             run_round9(name, matrices[name], seeds)
         else:
             run_matrix(name, matrices[name], seeds, oracle_only=oracle_only)

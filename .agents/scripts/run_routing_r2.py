@@ -83,10 +83,10 @@ def _matrices() -> dict[str, OutcomeMatrix]:
     for path in sorted((DATA / "matrices").glob("*_matrix.json")):
         name = path.stem.removesuffix("_matrix")
         matrix = OutcomeMatrix.load(path)
-        # The wm-all POOL takes every non-ours9 corpus regardless of size (master's cohort
-        # ruling 2026-07-25: "wm-all" = the full 10-corpus pool); corpora too small to
-        # split are only skipped as STANDALONE matrices.
-        if name != "routerbench-ours9":
+        # The wm-all POOL takes every non-ours9 25-scenario-era corpus (master's cohort
+        # ruling 2026-07-25: "wm-all" = the 10-corpus pool; s80/real captures are SEPARATE
+        # cohorts, NEVER pooled). Corpora too small to split are only skipped as STANDALONE.
+        if name != "routerbench-ours9" and "-s80" not in name and "-real" not in name:
             wm_parts.append((name, matrix))
         if len(matrix.scenario_ids()) < MIN_SCENARIOS:
             logger.info("standalone skip %s: only %d scenarios", name, len(matrix.scenario_ids()))
@@ -230,8 +230,8 @@ def _oai_vectors(name: str, matrix: OutcomeMatrix) -> dict[str, np.ndarray] | No
         out: dict[str, np.ndarray] = {}
         for path in sorted((DATA / "matrices").glob("*_matrix.json")):
             corpus = path.stem.removesuffix("_matrix")
-            if corpus == "routerbench-ours9":
-                continue
+            if corpus == "routerbench-ours9" or "-s80" in corpus or "-real" in corpus:
+                continue  # separate cohorts never join the wm-all pool
             sub = OutcomeMatrix.load(path)
             sids = sub.scenario_ids()
             npy = cache / f"{corpus}-oai3l-tasks.npy"
