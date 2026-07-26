@@ -13,13 +13,30 @@ from pydantic import BaseModel
 from wmh.core.types import Trace
 
 
+class SourceCredentialError(PermissionError):
+    """A source rejected the supplied credentials (API key, DSN password).
+
+    Adapters raise this instead of bare `PermissionError` so the streaming ingest can map it
+    to the `bad_credentials` wire code without misclassifying OS-level permission failures
+    (e.g. an unreadable local file) as credential problems. Subclassing `PermissionError`
+    keeps it a stdlib type: callers never need a driver import to catch it.
+    """
+
+
 class VendorPull(BaseModel):
-    """Parameters for pulling traces from an observability vendor's API."""
+    """Parameters for pulling traces from an observability vendor's API or a database."""
 
     api_key: str | None = None  # falls back to the vendor's env var when None
     project: str | None = None  # vendor project / workspace to pull from
     since: str | None = None  # ISO-8601 lower bound on trace start time
     limit: int | None = None  # max traces to pull
+
+    # Database-source transport params (the `postgres` adapter); API-vendor adapters ignore them.
+    dsn: str | None = None  # connection string; falls back to $WMH_POSTGRES_DSN
+    table: str | None = None  # table holding the trace rows
+    trace_id_column: str | None = None  # override; default "trace_id" (absent -> row-per-trace)
+    payload_column: str | None = None  # override; default "payload"
+    order_column: str | None = None  # override; default "created_at" when the table has it
 
 
 @runtime_checkable

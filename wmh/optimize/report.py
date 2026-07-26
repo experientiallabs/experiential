@@ -150,7 +150,7 @@ def build_report(
 
     # One embedder for the whole report: an azure spec builds an HTTP client per `build()`, and
     # a report routes every held-out scenario.
-    embedder = policy.embedder.build() if policy.kind == "rank" else None
+    embedder = policy.embedder.build() if policy.kind != "static" else None
 
     routed_rows: dict[str, list[ScenarioOutcome]] = {}
     baseline_rows: dict[str, list[ScenarioOutcome]] = {}

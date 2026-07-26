@@ -17,8 +17,10 @@ human-readable label (majority scenario-id prefix) for the request log; the refe
 labels. Cost plays NO part in fitting, exactly like the reference; the cost-aware variant
 (Avengers-Pro's alpha) is the first planned variation AFTER replication is validated.
 
-`evaluate_policy` replays a policy over a matrix through the same `rank_decision` scoring code
-serving uses, so benchmark numbers measure the deployed selection path, not a reimplementation.
+`evaluate_policy` replays a policy of ANY kind (static, rank, knn) over a matrix through the same
+decision code serving uses, so benchmark numbers measure the deployed selection path, not a
+reimplementation. The kNN family's fit lives in `wmh.optimize.knn`, which explains why it is a
+separate module rather than another mode here.
 """
 
 from __future__ import annotations
@@ -40,11 +42,13 @@ from wmh.optimize.policy import (
     EmbedderSpec,
     RoutingDecision,
     RoutingPolicy,
+    knn_decision,
     rank_decision,
 )
 
 if TYPE_CHECKING:
     from wmh.optimize.outcomes import OutcomeMatrix
+    from wmh.providers.base import Embedder
 
 logger = logging.getLogger(__name__)
 
@@ -302,11 +306,21 @@ class PolicyEval(BaseModel):
     unscored_scenarios: int  # scenario/model pairs the routed choice had no scored row for
 
 
-def evaluate_policy(policy: RoutingPolicy, matrix: OutcomeMatrix, ids: list[str]) -> PolicyEval:
+def evaluate_policy(
+    policy: RoutingPolicy,
+    matrix: OutcomeMatrix,
+    ids: list[str],
+    *,
+    embedder: Embedder | None = None,
+) -> PolicyEval:
     """Replay `policy` over the scenarios in `ids`, scoring via each routed model's rows.
 
-    Selection runs through the SAME `rank_decision` code serving uses (queries are batch
-    embedded once for speed; the scoring math is shared, not reimplemented).
+    Selection runs through the SAME decision code serving uses (`rank_decision` or
+    `knn_decision`; queries are batch embedded once for speed, and both normalize internally, so
+    the scoring math is shared rather than reimplemented).
+
+    `embedder` overrides the function built from `policy.embedder`, exactly as in `select_model`:
+    one client for the whole replay, or cached vectors in research code.
     """
     scenario_tasks: dict[str, str] = {}
     for outcome in matrix.outcomes:
@@ -322,13 +336,10 @@ def evaluate_policy(policy: RoutingPolicy, matrix: OutcomeMatrix, ids: list[str]
             for sid in wanted
         }
     else:
-        embeddings = np.asarray(
-            policy.embedder.build().embed([scenario_tasks[sid] for sid in wanted])
-        )
-        embeddings = Normalizer(norm="l2").transform(embeddings)
-        decisions = {
-            sid: rank_decision(policy, embeddings[index]) for index, sid in enumerate(wanted)
-        }
+        decide = knn_decision if policy.kind == "knn" else rank_decision
+        built = embedder or policy.embedder.build()
+        embeddings = np.asarray(built.embed([scenario_tasks[sid] for sid in wanted]))
+        decisions = {sid: decide(policy, embeddings[index]) for index, sid in enumerate(wanted)}
 
     by_scenario_model: dict[tuple[str, str], list[float]] = {}
     costs: dict[tuple[str, str], list[float]] = {}

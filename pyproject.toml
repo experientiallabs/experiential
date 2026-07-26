@@ -58,13 +58,16 @@ harbor = ["harbor==0.20.0"]
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
 # lazily (wmh.connect.notion), same contract as the e2b extra above.
 connectors = ["mcp>=1.27"]
+# The Postgres trace source (`wmh ingest --source postgres`): the driver is imported lazily
+# inside the adapter's pull path, same contract as the vendor-SDK extras.
+postgres = ["psycopg[binary]>=3.1"]
 # dev pulls in every backend SDK so `ty check` and the full test suite resolve over the whole
 # project (the providers import anthropic/openai/boto3 lazily, but type-checking needs them present).
 dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,e2b,connectors,harbor]",
+    "world-model-harness[otel,viz,e2b,connectors,harbor,postgres]",
 ]
 
 [dependency-groups]

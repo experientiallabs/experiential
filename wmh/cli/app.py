@@ -39,6 +39,7 @@ import wmh.providers as providers
 from wmh.cli.agent_session import register as register_agent_session_commands
 from wmh.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmh.cli.harness_app import harness_app, optimize_app
+from wmh.cli.ingest_cmd import ingest as _ingest_command
 from wmh.cli.platform_cmds import register as register_platform_commands
 from wmh.cli.ui import (
     BuildParams,
@@ -144,6 +145,7 @@ app.add_typer(research_app, name="research")
 app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
 app.add_typer(optimize_app, name="optimize")
+app.command("ingest")(_ingest_command)
 register_platform_commands(app)
 register_agent_session_commands(app)
 _console = Console()
