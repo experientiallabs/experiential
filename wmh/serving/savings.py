@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
-from wmh.optimize.knn import COST_QUALITY_ANCHORS
+from wmh.optimize.knn import COST_QUALITY_ANCHORS, COST_QUALITY_BALANCED, cost_quality_knobs
 from wmh.providers.base import TokenUsage
 
 if TYPE_CHECKING:
@@ -61,8 +61,17 @@ BASIS_QUALITY_INTERPOLATED = (
     "as a direction rather than a precise value."
 )
 BASIS_QUALITY_AS_FITTED = (
-    "No quality figure is shown: this endpoint is serving the settings it was optimized with and "
-    "the cost and quality control has not been moved."
+    "This endpoint is serving the settings it was optimized with, which are our balanced "
+    "setting, so the quality figure is that setting's fitted expectation from offline "
+    "evaluation rather than a live measurement of your traffic."
+)
+BASIS_QUALITY_UNKNOWN = (
+    "No quality figure is shown: this endpoint was tuned by hand to settings we have not "
+    "evaluated, so there is no fitted expectation to quote for it."
+)
+BASIS_QUALITY_NO_DIAL = (
+    "No quality figure is shown: this endpoint sends every request to one model, so there is no "
+    "cost and quality setting to compare against."
 )
 BASIS_BILLING = "Your invoices remain the record of what you were charged."
 
@@ -104,16 +113,34 @@ def _in_window(record: RequestLogRecord, *, window: SavingsWindow, now: datetime
     return stamped >= now - timedelta(days=WINDOW_DAYS)
 
 
-def _expected_quality(policy: RoutingPolicy) -> tuple[float, str | None]:
+def _expected_quality(policy: RoutingPolicy) -> tuple[float, str]:
     """The fitted quality expectation for the endpoint's dial position, and its basis.
 
     Exactly on an anchor: that anchor's measured delta. Between two anchors: a linear
-    interpolation, labeled as one. Dial never set: no figure, because the offline measurement
-    describes dial positions and this endpoint is not on one.
+    interpolation, labeled as one. Dial never set: the balanced anchor, because a policy fitted
+    with the shipped defaults IS the balanced setting (same confidence bar, no cost pressure,
+    strict guard), which is checked here rather than assumed. A policy fitted to knobs off the
+    dial gets no figure at all: quoting the balanced number for an endpoint someone deliberately
+    tuned elsewhere would be a claim about an evaluation that never ran.
     """
     dial = policy.cost_quality
-    if policy.kind != "knn" or dial is None:
-        return 0.0, None
+    balanced = next(
+        anchor
+        for anchor in COST_QUALITY_ANCHORS
+        if abs(anchor.cost_quality - COST_QUALITY_BALANCED) < 1e-9
+    )
+    if policy.kind != "knn":
+        return 0.0, BASIS_QUALITY_NO_DIAL
+    if dial is None:
+        default_knobs = cost_quality_knobs(COST_QUALITY_BALANCED)
+        as_fitted_is_balanced = (
+            policy.knn_z == default_knobs.knn_z
+            and policy.pick_lam == default_knobs.pick_lam
+            and policy.guard_mode == default_knobs.guard_mode
+        )
+        if as_fitted_is_balanced:
+            return balanced.quality_delta_points, BASIS_QUALITY_AS_FITTED
+        return 0.0, BASIS_QUALITY_UNKNOWN
     anchors = sorted(COST_QUALITY_ANCHORS, key=lambda anchor: anchor.cost_quality)
     for anchor in anchors:
         if abs(anchor.cost_quality - dial) < 1e-9:
@@ -121,7 +148,9 @@ def _expected_quality(policy: RoutingPolicy) -> tuple[float, str | None]:
     below = [anchor for anchor in anchors if anchor.cost_quality < dial]
     above = [anchor for anchor in anchors if anchor.cost_quality > dial]
     if not below or not above:
-        return 0.0, None
+        # Unreachable while the anchors span the full dial (a test pins that they do); if that
+        # ever changes, say nothing rather than extrapolate off the end of the measurement.
+        return 0.0, BASIS_QUALITY_UNKNOWN
     low, high = below[-1], above[0]
     span = high.cost_quality - low.cost_quality
     weight = (dial - low.cost_quality) / span
@@ -199,7 +228,7 @@ def compute_savings(
         basis.append(BASIS_LATENCY_NO_BASELINE.format(fallback=fallback))
 
     quality, quality_basis = _expected_quality(policy)
-    basis.append(quality_basis or BASIS_QUALITY_AS_FITTED)
+    basis.append(quality_basis)
     basis.append(BASIS_BILLING)
     return EndpointSavings(
         requests_served=len(served),

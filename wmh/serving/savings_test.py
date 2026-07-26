@@ -18,6 +18,8 @@ from wmh.serving.savings import (
     BASIS_QUALITY_ANCHOR,
     BASIS_QUALITY_AS_FITTED,
     BASIS_QUALITY_INTERPOLATED,
+    BASIS_QUALITY_NO_DIAL,
+    BASIS_QUALITY_UNKNOWN,
     compute_savings,
 )
 
@@ -175,11 +177,21 @@ def test_a_dial_between_anchors_interpolates_and_says_so() -> None:
     assert BASIS_QUALITY_ANCHOR not in savings.estimate_basis
 
 
-def test_an_untouched_dial_quotes_no_quality_figure() -> None:
-    # The offline measurement describes dial positions; an endpoint nobody dialed is not on one.
+def test_an_untouched_dial_reports_the_balanced_expectation() -> None:
+    # A policy fitted with the shipped defaults IS the balanced setting, so that anchor's number
+    # is the right expectation for an endpoint nobody has dialed.
     savings = compute_savings([_row("haiku")], _policy(cost_quality=None))
-    assert savings.expected_quality_delta_pt == 0.0
+    assert savings.expected_quality_delta_pt == pytest.approx(0.99)
     assert BASIS_QUALITY_AS_FITTED in savings.estimate_basis
+
+
+def test_a_hand_tuned_policy_off_the_dial_quotes_nothing() -> None:
+    # Someone who fitted a deliberately stricter confidence bar is not on the balanced setting,
+    # and quoting its number would be a claim about an evaluation that never ran.
+    hand_tuned = _policy(cost_quality=None).model_copy(update={"knn_z": 2.0})
+    savings = compute_savings([_row("haiku")], hand_tuned)
+    assert savings.expected_quality_delta_pt == 0.0
+    assert BASIS_QUALITY_UNKNOWN in savings.estimate_basis
 
 
 def test_a_static_endpoint_reports_honestly_instead_of_erroring() -> None:
@@ -187,6 +199,7 @@ def test_a_static_endpoint_reports_honestly_instead_of_erroring() -> None:
     assert savings.requests_served == 1
     assert savings.cost_saved_usd == pytest.approx(0.0)
     assert savings.expected_quality_delta_pt == 0.0
+    assert BASIS_QUALITY_NO_DIAL in savings.estimate_basis
 
 
 def test_the_seven_day_window_excludes_older_traffic() -> None:
