@@ -229,6 +229,17 @@ def _tool_choice_demands_a_call(tool_choice: JsonValue) -> bool:
     return tool_choice is not None and tool_choice not in ("auto", "none")
 
 
+def _is_function_choice_shape(tool_choice: JsonValue) -> bool:
+    """Whether `tool_choice` uses OpenAI's `{"type": "function", ...}` object shape.
+
+    Separate from `_named_tool_choice` because the two answer different questions: this one says
+    the client MEANT to name a single tool, that one says whether a name can actually be read out.
+    A choice that is this shape but yields no name is malformed rather than permissive, and the
+    difference decides whether it is refused or forwarded.
+    """
+    return isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
+
+
 def _named_tool_choice(tool_choice: JsonValue) -> str | None:
     """The function name an OpenAI `{"type": "function", ...}` tool_choice names.
 
@@ -350,6 +361,18 @@ class ChatCompletionRequest(BaseModel):
             )
         named = _named_tool_choice(self.tool_choice)
         if named is None:
+            if _is_function_choice_shape(self.tool_choice):
+                # Function-SHAPED but nameless: `{"type": "function", "function": {}}` or an empty
+                # name. It demands a call and identifies nothing to call, so no provider can honor
+                # it. Forwarding it reaches an OpenAI-compatible backend as a malformed request,
+                # which this endpoint surfaces as a 502 blaming the model, while Bedrock discards
+                # the requirement and can answer in prose to a client that requires a call.
+                return (
+                    "tool_choice is a function choice with no usable `function.name`; give the "
+                    'name of the tool it must call, or use "auto" or "required"'
+                )
+            # Not this shape at all: an unrecognized future vocabulary word. Forward it rather
+            # than rewrite it, which is the same call `_tool_choice_demands_a_call` documents.
             return ""
         declared = [tool.function.name for tool in self.tools]
         if named in declared:

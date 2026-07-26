@@ -952,11 +952,15 @@ def test_the_seven_day_savings_window_is_never_served_from_cache(tmp_path: Path)
 
 _TOOL_ARGUMENTS = '{"table": "superheroes", "limit": 10}'
 
+# The one tool name `_TOOLS` declares, named so a tool_choice can reference it without indexing
+# into loosely typed wire JSON.
+_TOOL_NAME = "lookup"
+
 _TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "lookup",
+            "name": _TOOL_NAME,
             "description": "read rows from a table",
             "parameters": {
                 "type": "object",
@@ -1487,6 +1491,76 @@ def test_tool_choice_without_tools_is_a_400(tmp_path: Path) -> None:
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_tool_choice"
     assert "declare the tool definitions" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        {"type": "function", "function": {}},
+        {"type": "function", "function": {"name": ""}},
+        {"type": "function"},
+        {"type": "function", "function": {"name": None}},
+    ],
+)
+def test_a_function_tool_choice_with_no_usable_name_is_a_400(
+    tmp_path: Path, tool_choice: dict[str, object]
+) -> None:
+    """A function-shaped choice that names nothing demands a call it cannot identify.
+
+    Forwarded, it reaches an OpenAI-compatible backend as a malformed request that this endpoint
+    reports as a 502 blaming the model, while Bedrock discards the requirement and can answer in
+    prose to a client that requires a call. Refuse it at the door instead.
+    """
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+            "tool_choice": tool_choice,
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_tool_choice"
+    assert "no usable `function.name`" in response.json()["error"]["message"]
+
+
+def test_a_function_tool_choice_naming_a_declared_tool_still_serves(tmp_path: Path) -> None:
+    """The guard must not start refusing the well-formed named choice it sits next to."""
+    client, _, provider = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": _TOOL_NAME},
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_an_unrecognized_tool_choice_word_is_still_forwarded(tmp_path: Path) -> None:
+    """An unknown future vocabulary word is not function-shaped, so it is forwarded, not refused.
+
+    OpenAI's own vocabulary has grown (`required` postdates `auto`); rewriting or refusing a word
+    this build has not heard of would break a client the provider could have served.
+    """
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+            "tool_choice": "some_future_mode",
+        },
+    )
+    assert response.status_code == 200, response.text
 
 
 def test_a_tool_call_streams_from_a_provider_with_no_streaming_backend(tmp_path: Path) -> None:
