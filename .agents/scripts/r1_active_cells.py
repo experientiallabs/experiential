@@ -72,9 +72,7 @@ class Replay:
         # Per-replay shuffle of each cell's episode order: a real capture draws from the
         # episode distribution, it does not replay the stored file order (without this, a
         # strategy that covers every cell exactly once is deterministic across replays).
-        self.cells = {
-            key: self.rng.sample(values, len(values)) for key, values in cells.items()
-        }
+        self.cells = {key: self.rng.sample(values, len(values)) for key, values in cells.items()}
         self.n_models = n_models
         self.drawn: dict[tuple[int, int], int] = defaultdict(int)
         self.sums = np.zeros(n_models)
@@ -153,6 +151,57 @@ def run_strategy(
             bonus = np.sqrt((a * budget / n_models) / np.maximum(replay.counts, 1))
             model = int(np.argmax(means + bonus))
             replay.buy(scenario_order[step % n_scenarios], model)
+    elif name == "pilot":
+        # Pilot-then-commit (round-1 protocol recommendation, now measured): spend ~10% as
+        # a uniform grid, test the top-2 gap against its SE, then commit the remainder to
+        # sequential halving when the gap is clear and to the grid when it is not. Pilot
+        # evidence carries into the committed phase (same replay object).
+        pilot = min(budget, max(n_models * 4, int(0.1 * 720)))
+        spent = 0
+        while spent < pilot:
+            for scenario in scenario_order:
+                for model in range(n_models):
+                    if spent >= pilot:
+                        break
+                    replay.buy(scenario, model)
+                    spent += 1
+                if spent >= pilot:
+                    break
+        means = replay.means()
+        order = np.argsort(means)
+        top, second = int(order[-1]), int(order[-2])
+        per_model = max(1, pilot // n_models)
+        # Binary-ish rewards: bound each mean's variance by p(1-p)/n, gap SE by the sum.
+        gap = float(means[top] - means[second])
+        se_gap = float(
+            np.sqrt(sum(max(m * (1 - m), 0.05) / per_model for m in (means[top], means[second])))
+        )
+        remainder = budget - spent
+        if gap > 2.0 * se_gap:
+            alive = list(range(n_models))
+            rounds = max(1, math.ceil(math.log2(n_models)))
+            per_round = remainder // rounds if remainder else 0
+            cursor = 0
+            for _ in range(rounds):
+                if len(alive) == 1 or per_round == 0:
+                    break
+                pulls = max(1, per_round // len(alive))
+                for model in alive:
+                    for _ in range(pulls):
+                        replay.buy(scenario_order[cursor % n_scenarios], model)
+                        cursor += 1
+                current = replay.means()
+                alive = sorted(alive, key=lambda m: -current[m])[: max(1, len(alive) // 2)]
+        else:
+            while spent < budget:
+                for scenario in scenario_order:
+                    for model in range(n_models):
+                        if spent >= budget:
+                            break
+                        replay.buy(scenario, model)
+                        spent += 1
+                    if spent >= budget:
+                        break
     else:
         raise ValueError(name)
     return int(np.argmax(replay.means()))
@@ -176,13 +225,14 @@ def main() -> None:
         true_means[best] - float(np.sort(true_means)[-2]),
     )
 
+    strategies = ("uniform", "grid", "sh", "ucbe", "pilot")
     header = f"{'budget':>7s} ({'%full':>5s})"
-    for name in ("uniform", "grid", "sh", "ucbe"):
+    for name in strategies:
         header += f" | {name}: P(best) regret safe2pt"
     logger.info(header)
     for budget in BUDGETS:
         line = f"{budget:7d} ({budget / 720:5.0%})"
-        for name in ("uniform", "grid", "sh", "ucbe"):
+        for name in strategies:
             hits = 0
             safe = 0
             regrets = []
