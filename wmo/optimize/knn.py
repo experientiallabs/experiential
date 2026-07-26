@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.policy import (
     DEFAULT_KNN_MIN_PAIRS,
     DEFAULT_KNN_Z,
@@ -292,6 +293,7 @@ def fit_knn_artifact(
     min_pairs: int = DEFAULT_KNN_MIN_PAIRS,
     se_floor: bool = True,
     floor_q: float = 0.05,
+    compression: CompressionConfig | None = None,
 ) -> KnnFitOutcome:
     """Fit a knn policy, write it and its bank sidecar, and replay it over the fit matrix.
 
@@ -332,6 +334,11 @@ def fit_knn_artifact(
             f"{embed_tag}"
         ),
     )
+    if compression is not None:
+        # Stamped BEFORE the save, because the artifact on disk is what serving mounts and what
+        # the mount gate compares. `model_copy` skips validators, so the caller has already
+        # resolved the compressor id (an unknown one must fail before anything is written).
+        policy = policy.model_copy(update={"compression": compression})
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     return KnnFitOutcome(

@@ -40,6 +40,7 @@ from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_en
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
+from wmo.optimize.compression import CompressionConfig, get_compressor
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     DialResult,
@@ -791,6 +792,20 @@ def fit(
     api_key_env: str = typer.Option(
         None, "--api-key-env", help="(azure) env var holding the account key."
     ),
+    compressor: str = typer.Option(
+        None,
+        "--compressor",
+        help="D-COMPRESS: compressor id the endpoint applies before routing (identity | "
+        "truncate). Default: compression off.",
+    ),
+    aggressiveness: float = typer.Option(
+        0.0,
+        "--aggressiveness",
+        min=0.0,
+        max=1.0,
+        help="Fraction of compressible content the compressor may remove, in [0, 1]. "
+        "Only meaningful with --compressor.",
+    ),
 ) -> None:
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
@@ -817,6 +832,15 @@ def fit(
         probe_embedder(spec)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if compressor is None and aggressiveness > 0.0:
+        raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
+    compression = None
+    if compressor is not None:
+        try:
+            get_compressor(compressor)  # model_copy below skips validators; check here
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -836,6 +860,7 @@ def fit(
             min_pairs=min_pairs,
             se_floor=se_floor,
             floor_q=floor_q,
+            compression=compression,
         )
         print_knn_fit(_console, fitted, out=out, z=z)
         return
@@ -854,6 +879,10 @@ def fit(
     )
     if cost_weight > 0.0:
         policy = rerank_policy(policy, cost_weight=cost_weight)
+    if compression is not None:
+        # Validated above (unknown ids fail before anything is written). The knn path stamps
+        # inside `fit_knn_artifact`, which saves its own artifact and returns before this line.
+        policy = policy.model_copy(update={"compression": compression})
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     _console.print(
