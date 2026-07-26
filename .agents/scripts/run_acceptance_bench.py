@@ -279,9 +279,20 @@ def dry_run(models: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def live_run(models: list[str], cap_usd: float, control_aggressiveness: float) -> None:
+def live_run(
+    models: list[str],
+    cap_usd: float,
+    control_aggressiveness: float,
+    arm_filter: str | None = None,
+) -> None:
     register_arms()
     arms = build_arms(control_aggressiveness)
+    if arm_filter:
+        wanted = arm_filter.split(",")
+        unknown = [a for a in wanted if a not in arms]
+        if unknown:
+            raise SystemExit(f"unknown arms {unknown}; known: {sorted(arms)}")
+        arms = {name: arms[name] for name in wanted}
     cohort_ids = {e["scenario_id"] for e in json.loads(COHORT_MATRIX.read_text())["outcomes"]}
     traces = get_adapter("otel-genai").from_file(str(BUNDLE / "traces.otel.jsonl"))
     scenarios = [s for s in scenarios_from_traces(traces) if scenario_id(s) in cohort_ids]
@@ -359,6 +370,12 @@ def main() -> None:
     ap.add_argument("--models", default=DEFAULT_MODELS)
     ap.add_argument("--cap-usd", type=float, default=None, help="master-approved candidate-side cap")
     ap.add_argument("--control-aggressiveness", type=float, default=0.4)
+    ap.add_argument(
+        "--arms",
+        default=None,
+        help="comma list to run a subset (e.g. the matched-ratio round 1: "
+        "off,llmlingua2-fixed-threshold,truncate-protect-task,control-random,control-truncate)",
+    )
     args = ap.parse_args()
     models = args.models.split(",")
     if args.dry_run:
@@ -366,7 +383,7 @@ def main() -> None:
         return
     if args.cap_usd is None:
         raise SystemExit("live runs need --cap-usd (the master-approved cap); or use --dry-run")
-    live_run(models, args.cap_usd, args.control_aggressiveness)
+    live_run(models, args.cap_usd, args.control_aggressiveness, arm_filter=args.arms)
 
 
 if __name__ == "__main__":
