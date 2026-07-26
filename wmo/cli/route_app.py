@@ -759,16 +759,27 @@ def _confirm_cost(*, yes: bool) -> None:
 _MATRIX_DIGEST_CHARS = 16
 
 
-def _matrix_provenance(matrix_file: str) -> str:
-    """`<path> sha256=<digest>`: the source half of a fitted policy's `fitted_from`.
+def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
+    """The outcome matrix and its `<path> sha256=<digest>` provenance, from ONE read of the file.
 
     The digest is what makes `fitted_from` an identity rather than a label. `tune` compares it
     against the as-fitted snapshot beside a policy, and two fits of the same path with different
     contents (or the same contents at two paths) have to come out different for that check to
     protect anything.
+
+    Both come out of the same bytes on purpose. Digesting a SECOND read would let a corpus
+    rebuilt in place between the two describe the fit as having seen bytes it never saw: the
+    policy would be fitted from the old matrix and stamped with the new one's digest, so the
+    next fit of that new matrix would match its provenance and `tune` would accept the
+    superseded snapshot -- the exact failure the digest exists to catch, reintroduced by
+    reading twice.
     """
-    digest = hashlib.sha256(Path(matrix_file).read_bytes()).hexdigest()
-    return f"{matrix_file} sha256={digest[:_MATRIX_DIGEST_CHARS]}"
+    payload = Path(matrix_file).read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    return (
+        OutcomeMatrix.model_validate_json(payload),
+        f"{matrix_file} sha256={digest[:_MATRIX_DIGEST_CHARS]}",
+    )
 
 
 def _embedder_provenance(spec: EmbedderSpec) -> str:
@@ -1024,7 +1035,7 @@ def fit(
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
-    matrix = OutcomeMatrix.load(Path(matrix_file))
+    matrix, source = _load_matrix(matrix_file)
     if embedder not in ("hashing", "azure"):
         raise typer.BadParameter(f"unknown embedder '{embedder}'; use hashing or azure")
     spec = (
@@ -1044,7 +1055,6 @@ def fit(
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
-    source = _matrix_provenance(matrix_file)
     embed_tag = _embedder_provenance(spec)
     if kind == "knn":
         if cost_weight > 0.0:

@@ -412,6 +412,43 @@ def test_route_tune_refuses_a_base_snapshot_from_a_superseded_fit(tmp_path: Path
     assert after.cost_quality is None
 
 
+def test_route_fit_digests_the_bytes_it_actually_fitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The recorded digest must describe the matrix the fit SAW, not a later read of the path.
+
+    Regression: `fit` parsed the matrix and then re-read the file to digest it. A corpus rebuilt
+    in place between the two stamped the old fit with the new file's digest, so the next fit of
+    that new matrix matched its provenance and `tune` accepted the superseded snapshot -- the
+    very failure the digest exists to catch. The two now come out of one read.
+    """
+    matrix_file = _knn_matrix_file(tmp_path)
+    fitted_bytes = matrix_file.read_bytes()
+    real = {name: getattr(Path, name) for name in ("read_bytes", "read_text")}
+
+    def _rebuilding(name: str):  # noqa: ANN202 - the wrapped reader's own signature
+        def _read(self: Path, *args: object, **kwargs: object):  # noqa: ANN202
+            payload = real[name](self, *args, **kwargs)
+            if self == matrix_file:  # swap the corpus the instant the fit has read it
+                monkeypatch.undo()  # ...once, whichever reader the fit happens to use
+                _knn_matrix_file(tmp_path, flip=True)
+            return payload
+
+        return _read
+
+    for name in real:
+        monkeypatch.setattr(Path, name, _rebuilding(name))
+    policy_file = tmp_path / POLICY_FILENAME
+    assert _fit_knn(matrix_file, policy_file).exit_code == 0
+    assert matrix_file.read_bytes() != fitted_bytes  # the file on disk did change under the fit
+
+    # The digest is of the bytes that were fitted, so a later fit of the REPLACEMENT differs.
+    fitted_from = RoutingPolicy.load(policy_file).fitted_from or ""
+    other = tmp_path / "other.json"
+    assert _fit_knn(matrix_file, other).exit_code == 0
+    assert fitted_from != (RoutingPolicy.load(other).fitted_from or "")
+
+
 def test_route_tune_refuses_a_snapshot_after_the_matrix_was_rebuilt_in_place(
     tmp_path: Path,
 ) -> None:
