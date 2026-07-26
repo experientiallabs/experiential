@@ -1,10 +1,13 @@
 """Validation gate for the cost/quality dial: measure the slider through the production path.
 
-Three claims are checked, all on routerbench-ours9 with R1's cached text-embedding-3-large
+Four claims are checked, all on routerbench-ours9 with R1's cached text-embedding-3-large
 vectors and R1's exact 70/30 stratified splits (5 seeds), through
 `wmh.optimize.knn.fit_knn_policy` -> `apply_cost_quality` -> `evaluate_policy`, which is the
 same `knn_decision` call serving makes:
 
+0. The cost knob reproduces R1's own `r1-knn3-asym*` rows knob for knob (same family, same
+   guard, same lam, novelty floor off). Different implementation, same numbers: that is what
+   makes the port faithful rather than merely plausible.
 1. Every anchor in `COST_QUALITY_ANCHORS` still delivers the quality and cost it advertises.
    The docstring an operator reads is a set of measurements, so it needs a gate.
 2. The dial's quality end also matches R1's independently measured ablation rows: dial 0.0
@@ -169,7 +172,72 @@ def measure() -> dict[float, tuple[float, float, float]]:
     }
 
 
+def reference_rows() -> None:
+    """Reproduce R1's cost-knob ablation rows through the production knobs, row by row.
+
+    The strongest faithfulness check available for the port: `r1-knn3-asym*` is the same policy
+    family under the same guard, measured by the research script, so the production knobs set to
+    that configuration (floor off, asymmetric guard, the same lam) must land on the same numbers.
+    This is the knob-level check; `measure()` covers the operator-facing dial built on top.
+    """
+    gate = _promotion_gate()
+    matrix = OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json")
+    embedder = gate.CachedEmbedder(matrix, DATA / "cache" / "routerbench-ours9-oai3l-tasks.npy")  # ty: ignore[unresolved-attribute]
+    spec = EmbedderSpec(
+        kind="azure", dim=embedder.dim, deployment="text-embedding-3-large", endpoint="https://x"
+    )
+    rows = {"r1-knn3-asym": 0.0, "r1-knn3-asym-lam002": 0.02, "r1-knn3-asym-lam005": 0.05}
+    deltas: dict[str, list[float]] = {variant: [] for variant in rows}
+    costs: dict[str, list[float]] = {variant: [] for variant in rows}
+    for seed in SEEDS:
+        fit_ids, test_ids = gate.stratified_split(matrix, seed=seed)  # ty: ignore[unresolved-attribute]
+        baseline = best_single_on_fit(matrix, fit_ids)
+        base_accuracy, base_cost = gate.baseline_on_test(matrix, baseline, test_ids)  # ty: ignore[unresolved-attribute]
+        with tempfile.TemporaryDirectory() as directory:
+            fitted = fit_knn_policy(
+                matrix,
+                bank_path=Path(directory) / KNN_BANK_FILENAME,
+                fit_ids=fit_ids,
+                embedder=spec,
+                embed_with=embedder,
+                fitted_from=f"routerbench-ours9 seed={seed}",
+            )
+            for variant, lam in rows.items():
+                # R1's configuration exactly: no novelty floor, asymmetric guard, that lam.
+                policy = fitted.model_copy(
+                    update={"guard_mode": "asymmetric", "pick_lam": lam, "floor_sim": None}
+                )
+                policy.attach_bank(fitted.knn_bank())
+                result = evaluate_policy(policy, matrix, test_ids, embedder=embedder)
+                deltas[variant].append((result.accuracy - base_accuracy) * 100)
+                costs[variant].append((result.cost_per_scenario / base_cost - 1.0) * 100)
+
+    logger.info("=== the cost knob reproduces R1's own ablation rows, knob for knob ===")
+    for variant, lam in rows.items():
+        recorded_delta, recorded_cost, seeds = recorded_iid(variant)
+        delta = statistics.mean(deltas[variant])
+        cost = statistics.mean(costs[variant])
+        ok = (
+            abs(delta - recorded_delta) <= DELTA_TOLERANCE
+            and abs(cost - recorded_cost) <= COST_TOLERANCE
+        )
+        logger.info(
+            "lam=%-5g vs %-20s recorded %+.2fpt/%+.1f%% (%d seeds), measured %+.2fpt/%+.1f%%: %s",
+            lam,
+            variant,
+            recorded_delta,
+            recorded_cost,
+            seeds,
+            delta,
+            cost,
+            "PASS" if ok else "FAIL",
+        )
+        if not ok:
+            FAILURES.append(f"the cost knob does not reproduce {variant}")
+
+
 def main() -> None:
+    reference_rows()
     measured = measure()
     logger.info("=== cost/quality dial on routerbench-ours9, 5 seeds, fit once per seed ===")
     logger.info(
@@ -266,7 +334,9 @@ def main() -> None:
     logger.info("a DIFFERENT family: kNN-P probabilities + fixed-margin guard, hashing embeddings")
     for lam in (0.0, 0.03, 0.05, 0.08):
         delta, cost, seeds = recorded_iid("r3-knn-frontier", params_filter=f'"lam": {lam}')
-        logger.info("  r3-knn-frontier lam=%-6g %+.2fpt %+.1f%% (%d seeds)", lam, delta, cost, seeds)
+        logger.info(
+            "  r3-knn-frontier lam=%-6g %+.2fpt %+.1f%% (%d seeds)", lam, delta, cost, seeds
+        )
 
 
 if __name__ == "__main__":
