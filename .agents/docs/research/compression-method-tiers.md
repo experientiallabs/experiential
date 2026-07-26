@@ -146,6 +146,37 @@ swe-25, Q-C reuse stored s80 matrices as the aggressiveness-0 arm gated on a
 10-scenario recapture probe, Q-D derive the break-even rule now vs after C3) are in
 findings/c2.md with recommendations and steelmen.
 
+### C2 round 0 results (2026-07-26, offline legs, ~$3 embeddings, no wm serve spend)
+
+Q4 CACHE BREAK-EVEN (replay of C1's 120 audit conversations through a prefix-cache
+cost model, C1's measured ratio/churn per method, C3's tiers): within-conversation
+prefix share on OUR transcripts is 0.72-0.87 (first first-party number); full
+recompression with any churny method is a measured NET LOSS on cached providers (17
+of 25 cells above 1.0x, up to 2.65x the input cost of not compressing, every cell
+consistent with the bound churn < (c_r/(c_w-c_r))(1/r - 1)); turn-local commit heals
+all of them below 1.0x; append-stable compression multiplies both cache tiers by r,
+so the literature's compress-OR-cache dichotomy dissolves for stable compressors.
+SERVING RULE proposed: scope by measured append churn, never by conversation state;
+churn-zero methods compress everything, churn>0 methods compress turn-local only.
+The pre-registered candidate rule (cold-vs-incumbent) is BEATEN and retired.
+
+Q2 ORDERING round 0 (churn of the served #259 champion under compressed queries,
+5 seeds; ours9 full power, s80 rows candidates): 20-30% of ours9 decisions change at
+mid aggressiveness, and the mechanism is ABSTENTION, not misrouting: the novelty
+floor (calibrated on raw self-similarities) trips 10-13x more often and route-away
+collapses (0.58 -> 0.18-0.48; tau 0.41 -> 0.00 at high), so naive compress-then-route
+silently turns routing off and pays +11-41% routing-channel cost at flat-to-negative
+accuracy (matrix-lookup value; execution channel awaits the live grid). Refitting
+bank + floor on the SAME compressed representation restores floor trips and cost with
+accuracy within noise at low/mid aggressiveness (exception, full power: selective-
+context-absolute loses 0/5 on ours9 even refit). Random removal churns like the
+learned methods at matched ratio. Verdict: the ordering question's real content is
+REPRESENTATION CONSISTENCY: the compression config becomes part of the routing
+artifact's version (bank fitted under (X, a) serves only behind (X, a)); D-COMPRESS
+seam requirement proposed to master. Full detail: findings/c2.md; 781 run records in
+runs/c2.jsonl; scripts c2_churn_variants.py / c2_churn_measure.py /
+c2_cache_breakeven.py on this branch.
+
 ## Verdicts
 
 ### Round 0: the append-stability audit (C1, 2026-07-25, $0, no API calls)
