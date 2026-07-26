@@ -46,6 +46,18 @@ class ScenarioOutcome(BaseModel):
     # fitting). Reasoning models that emit thought before the JSON action keep it here.
     replies: list[str] = []
     error: str | None = None
+    # D-COMPRESS fields, additive with defaults so pre-compression matrices load unchanged;
+    # 0/"" = the episode ran uncompressed. Token counts are the compressor's deterministic
+    # proxy totals summed over the episode's calls (wmo.optimize.compression); billable truth
+    # stays in `usage`/`cost_usd`. Latency and cost are the compressor's OWN, which sit inside
+    # effective cost per the compression track's accounting rules.
+    tokens_in_raw: int = 0
+    tokens_in_compressed: int = 0
+    compressor_id: str = ""
+    compressor_version: str = ""
+    aggressiveness: float = 0.0
+    compressor_latency_s: float = 0.0
+    compressor_cost_usd: float = 0.0
 
     @property
     def scored(self) -> bool:

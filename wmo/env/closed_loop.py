@@ -31,6 +31,7 @@ from wmo.env.base import Env
 from wmo.env.episode import run_episode
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS, LLMAgent
 from wmo.env.scenarios import Scenario
+from wmo.optimize.compression import CompressionConfig, estimate_tokens, get_compressor
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
 from wmo.providers.base import (
@@ -81,9 +82,66 @@ class _TimedProvider:
             input_tokens=self.usage.input_tokens + completion.usage.input_tokens,
             cached_input_tokens=self.usage.cached_input_tokens
             + completion.usage.cached_input_tokens,
+            cache_write_input_tokens=self.usage.cache_write_input_tokens
+            + completion.usage.cache_write_input_tokens,
             output_tokens=self.usage.output_tokens + completion.usage.output_tokens,
         )
         return completion
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._provider.embed(texts)
+
+    def verify(self) -> VerifyResult:
+        return self._provider.verify()
+
+
+class _CompressingProvider:
+    """Applies the D-COMPRESS stage to the candidate's calls, so eval measures through it.
+
+    Sits ABOVE `_TimedProvider` (agent -> compressing -> timed -> real): the timed layer then
+    records the latency and provider-reported usage of the ACTUAL, compressed call. Mirrors
+    the serving rule exactly: only user-role message content is compressed; the system prompt
+    and the model's own prior replies pass through verbatim. Determinism keeps the growing
+    transcript append-stable across the episode's calls, exactly as serving's affinity-miss
+    path reproduces bytes. Accumulates the compressor's own accounting per episode.
+    """
+
+    def __init__(self, provider: Provider, config: CompressionConfig) -> None:
+        self._provider = provider
+        self._config = config
+        self.compressor = get_compressor(config.compressor_id)
+        self.tokens_in_raw = 0
+        self.tokens_in_compressed = 0
+        self.latency_s = 0.0
+        self.cost_usd = 0.0
+
+    @property
+    def config(self) -> ProviderConfig:
+        return self._provider.config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Completion:
+        started = time.monotonic()
+        user_segments = [m.content for m in messages if m.role == "user"]
+        result = self.compressor.compress(user_segments, self._config)
+        replacements = iter(result.segments)
+        compressed = [
+            Message(role="user", content=next(replacements)) if m.role == "user" else m
+            for m in messages
+        ]
+        self.tokens_in_raw += sum(estimate_tokens(m.content) for m in messages)
+        self.tokens_in_compressed += sum(estimate_tokens(m.content) for m in compressed)
+        self.cost_usd += result.cost_usd
+        self.latency_s += time.monotonic() - started
+        return self._provider.complete(
+            system, compressed, temperature=temperature, max_tokens=max_tokens
+        )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return self._provider.embed(texts)
@@ -159,6 +217,7 @@ def evaluate_pool(
     history_chars: int = DEFAULT_HISTORY_CHARS,
     provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
     on_outcome: Callable[[ScenarioOutcome], None] | None = None,
+    compression: CompressionConfig | None = None,
 ) -> OutcomeMatrix:
     """Run every pool candidate over `scenarios`, one fresh env per episode.
 
@@ -174,6 +233,10 @@ def evaluate_pool(
     default was raised to 2000 after 500 truncated tau-bench payloads into verbatim re-fetch
     loops, and a corpus with larger observations needs more still. It changes what the candidates
     are measured on, so it is part of a matrix's capture cohort.
+
+    `compression` applies the D-COMPRESS stage to every candidate call, measured through the
+    same wrapper stack production serves through; each outcome then carries the compressor's
+    per-episode accounting fields. None (the default) = uncompressed, today's rows exactly.
     """
     outcomes: list[ScenarioOutcome] = []
     for entry in pool.models:
@@ -181,8 +244,11 @@ def evaluate_pool(
             sid = scenario_id(scenario)
             for episode in range(episodes_per_scenario):
                 timed = _TimedProvider(provider_factory(entry))
+                compressing = (
+                    _CompressingProvider(timed, compression) if compression is not None else None
+                )
                 agent = LLMAgent(
-                    timed,
+                    compressing if compressing is not None else timed,
                     temperature=agent_temperature,
                     tools_hint=tools_hint,
                     history_chars=history_chars,
@@ -216,6 +282,13 @@ def evaluate_pool(
                     call_seconds=timed.call_seconds,
                     replies=timed.replies,
                     error=error,
+                    tokens_in_raw=compressing.tokens_in_raw if compressing else 0,
+                    tokens_in_compressed=compressing.tokens_in_compressed if compressing else 0,
+                    compressor_id=compressing.compressor.id if compressing else "",
+                    compressor_version=compressing.compressor.version if compressing else "",
+                    aggressiveness=compression.aggressiveness if compression else 0.0,
+                    compressor_latency_s=compressing.latency_s if compressing else 0.0,
+                    compressor_cost_usd=compressing.cost_usd if compressing else 0.0,
                 )
                 outcomes.append(outcome)
                 if on_outcome is not None:
