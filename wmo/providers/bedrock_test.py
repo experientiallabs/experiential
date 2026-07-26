@@ -142,3 +142,59 @@ def test_structured_chat_preserves_temperature_for_supported_model() -> None:
     )
 
     assert stub.requests[0]["inferenceConfig"] == {"maxTokens": 64, "temperature": 0.3}
+
+
+def test_claude_invoke_normalizes_cache_read_and_write_to_subsets() -> None:
+    # Bedrock's Anthropic body reports cache reads/writes BESIDE input_tokens; TokenUsage's
+    # contract is subsets of input_tokens, so the provider must sum at the boundary.
+    provider = BedrockProvider(
+        ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")
+    )
+    stub = _StubClient(
+        {
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "cache_read_input_tokens": 40,
+                "cache_creation_input_tokens": 50,
+            },
+        }
+    )
+    provider._client = cast("BaseClient", stub)
+
+    completion = provider.complete("sys", [Message(role="user", content="hi")])
+
+    assert completion.usage.input_tokens == 100  # 10 fresh + 40 read + 50 written
+    assert completion.usage.cached_input_tokens == 40
+    assert completion.usage.cache_write_input_tokens == 50
+
+
+class _StubCacheConverseClient:
+    """Converse stub whose usage carries both cache tiers."""
+
+    def converse(self, **kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+            "stopReason": "end_turn",
+            "usage": {
+                "inputTokens": 7,
+                "outputTokens": 2,
+                "cacheReadInputTokens": 20,
+                "cacheWriteInputTokens": 30,
+            },
+        }
+
+
+def test_converse_normalizes_cache_read_and_write_to_subsets() -> None:
+    provider = BedrockProvider(
+        ProviderConfig(kind=ProviderKind.BEDROCK, model="us.moonshotai.kimi-k2-6")
+    )
+    provider._client = cast("BaseClient", _StubCacheConverseClient())
+
+    completion = provider.complete("sys", [Message(role="user", content="hi")])
+
+    assert completion.usage.input_tokens == 57  # 7 fresh + 20 read + 30 written
+    assert completion.usage.cached_input_tokens == 20
+    assert completion.usage.cache_write_input_tokens == 30

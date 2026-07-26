@@ -42,6 +42,7 @@ class _Usage(TypedDict):
     input_tokens: int
     output_tokens: int
     cache_read_input_tokens: NotRequired[int]
+    cache_creation_input_tokens: NotRequired[int]
 
 
 class _BedrockResponse(TypedDict):
@@ -159,13 +160,15 @@ class BedrockProvider:
         raw = self._get_client().invoke_model(modelId=self.config.model, body=json.dumps(body))
         data = cast("_BedrockResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
-        # Anthropic-native semantics: cache reads reported BESIDE input_tokens; normalize to
-        # TokenUsage's cached-as-subset contract by summing.
+        # Anthropic-native semantics: cache reads and writes reported BESIDE input_tokens;
+        # normalize to TokenUsage's cached-as-subset contract by summing.
         cache_read = data["usage"].get("cache_read_input_tokens", 0)
+        cache_write = data["usage"].get("cache_creation_input_tokens", 0)
         usage = TokenUsage(
-            input_tokens=data["usage"]["input_tokens"] + cache_read,
+            input_tokens=data["usage"]["input_tokens"] + cache_read + cache_write,
             output_tokens=data["usage"]["output_tokens"],
             cached_input_tokens=cache_read,
+            cache_write_input_tokens=cache_write,
         )
         return Completion(text=text, usage=usage)
 
@@ -213,13 +216,15 @@ class BedrockProvider:
                 elif "metadata" in event:
                     event_usage = event["metadata"].get("usage")
                     if event_usage is not None:
-                        # Converse reports cacheReadInputTokens beside inputTokens; normalize
-                        # to the cached-as-subset contract.
+                        # Converse reports cacheReadInputTokens / cacheWriteInputTokens beside
+                        # inputTokens; normalize to the cached-as-subset contract.
                         cache_read = int(event_usage.get("cacheReadInputTokens", 0) or 0)
+                        cache_write = int(event_usage.get("cacheWriteInputTokens", 0) or 0)
                         usage = TokenUsage(
-                            input_tokens=int(event_usage["inputTokens"]) + cache_read,
+                            input_tokens=int(event_usage["inputTokens"]) + cache_read + cache_write,
                             output_tokens=int(event_usage["outputTokens"]),
                             cached_input_tokens=cache_read,
+                            cache_write_input_tokens=cache_write,
                         )
         finally:
             # botocore's EventStream pins the HTTP connection until closed.
@@ -252,10 +257,12 @@ class BedrockProvider:
         blocks = response["output"]["message"]["content"]
         text = "".join(block["text"] for block in blocks if "text" in block)
         cache_read = int(response["usage"].get("cacheReadInputTokens", 0) or 0)
+        cache_write = int(response["usage"].get("cacheWriteInputTokens", 0) or 0)
         usage = TokenUsage(
-            input_tokens=int(response["usage"]["inputTokens"]) + cache_read,
+            input_tokens=int(response["usage"]["inputTokens"]) + cache_read + cache_write,
             output_tokens=int(response["usage"]["outputTokens"]),
             cached_input_tokens=cache_read,
+            cache_write_input_tokens=cache_write,
         )
         return Completion(text=text, usage=usage)
 

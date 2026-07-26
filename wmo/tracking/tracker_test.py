@@ -35,6 +35,24 @@ def test_totals_sum_tokens_and_cost_across_events() -> None:
     assert total.cost_usd == pytest.approx(0.015)
 
 
+def test_totals_carry_cache_subsets() -> None:
+    tracker = RunTracker(run_id="r", kind="serve")
+    tracker.record(
+        Phase.SERVE,
+        "claude-opus-4-8",
+        TokenUsage(input_tokens=1000, cached_input_tokens=600, cache_write_input_tokens=100),
+    )
+    tracker.record(
+        Phase.SERVE,
+        "claude-opus-4-8",
+        TokenUsage(input_tokens=500, cached_input_tokens=200),
+    )
+
+    total = tracker.totals()
+    assert total.cached_input_tokens == 800
+    assert total.cache_write_input_tokens == 100
+
+
 def test_by_phase_buckets_events() -> None:
     tracker = RunTracker(run_id="r", kind="build")
     tracker.record(Phase.GEPA, "claude-opus-4-8", TokenUsage(input_tokens=1000, output_tokens=0))

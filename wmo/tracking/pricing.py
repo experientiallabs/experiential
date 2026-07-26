@@ -21,10 +21,46 @@ _BEDROCK_SUFFIX = re.compile(r"(-\d{8})?(-v\d+)?(:\d+)?$")
 
 
 class ModelPrice(BaseModel):
-    """USD per 1,000,000 tokens, split by input/output."""
+    """USD per 1,000,000 tokens, split by input/output plus optional prompt-cache tiers.
+
+    `cache_read_per_mtok` prices prompt tokens served from the provider cache;
+    `cache_write_per_mtok` prices tokens written to it (a premium on Anthropic). None means
+    "no known cache rate": `cost_usd` then bills that tier at the full input rate, never $0.
+    """
 
     input_per_mtok: float
     output_per_mtok: float
+    cache_read_per_mtok: float | None = None
+    cache_write_per_mtok: float | None = None
+
+
+def _claude_price(input_per_mtok: float, output_per_mtok: float) -> ModelPrice:
+    """A Claude row with Anthropic's published cache multipliers applied.
+
+    Cache reads bill at 0.1x the base input rate; cache writes at 1.25x for the default
+    5-minute TTL (the 1h TTL bills 2x; nothing in the harness requests it, and a pool entry
+    can override per model if that changes).
+    """
+    return ModelPrice(
+        input_per_mtok=input_per_mtok,
+        output_per_mtok=output_per_mtok,
+        cache_read_per_mtok=input_per_mtok * 0.1,
+        cache_write_per_mtok=input_per_mtok * 1.25,
+    )
+
+
+def _openai_price(input_per_mtok: float, output_per_mtok: float) -> ModelPrice:
+    """A GPT-5.x row with OpenAI's published cached-input discount applied.
+
+    Cached input bills at 0.1x the base input rate (the gpt-5 family's 90% discount).
+    OpenAI charges no cache-write premium and reports no write tokens, so the write tier
+    stays None (moot in practice: cache_write_input_tokens is always 0 on OpenAI usage).
+    """
+    return ModelPrice(
+        input_per_mtok=input_per_mtok,
+        output_per_mtok=output_per_mtok,
+        cache_read_per_mtok=input_per_mtok * 0.1,
+    )
 
 
 # Keyed by normalized model id (see `_normalize`). USD per 1M tokens.
@@ -32,26 +68,29 @@ class ModelPrice(BaseModel):
 # Completion prices verified 2026-06-25 against the live vendor pricing pages:
 #   - Claude: platform.claude.com/docs/en/about-claude/models/overview
 #   - OpenAI GPT-5.x: developers.openai.com/api/docs/pricing (Standard tier, short context)
+# Cache tiers (added 2026-07-25) are the vendors' published multipliers on those verified base
+# rates, not independently re-fetched per model: Anthropic reads 0.1x / writes 1.25x (5m TTL),
+# OpenAI cached input 0.1x with no write charge. Re-verify per model if cache cost is headline.
 # Embedding prices are long-stable list prices NOT re-fetched in that pass (the OpenAI pricing
 # page no longer surfaces them); treat as approximate and re-verify if embed cost matters.
 _PRICES: dict[str, ModelPrice] = {
     # --- Anthropic / Bedrock (Claude) ---
-    "claude-fable-5": ModelPrice(input_per_mtok=10.0, output_per_mtok=50.0),
-    "claude-mythos-5": ModelPrice(input_per_mtok=10.0, output_per_mtok=50.0),
-    "claude-opus-4-8": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-7": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-6": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-5": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-1": ModelPrice(input_per_mtok=15.0, output_per_mtok=75.0),
-    "claude-sonnet-5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
-    "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
-    "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
+    "claude-fable-5": _claude_price(input_per_mtok=10.0, output_per_mtok=50.0),
+    "claude-mythos-5": _claude_price(input_per_mtok=10.0, output_per_mtok=50.0),
+    "claude-opus-4-8": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
+    "claude-opus-4-7": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
+    "claude-opus-4-6": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
+    "claude-opus-4-5": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
+    "claude-opus-4-1": _claude_price(input_per_mtok=15.0, output_per_mtok=75.0),
+    "claude-sonnet-5": _claude_price(input_per_mtok=3.0, output_per_mtok=15.0),
+    "claude-sonnet-4-6": _claude_price(input_per_mtok=3.0, output_per_mtok=15.0),
+    "claude-haiku-4-5": _claude_price(input_per_mtok=1.0, output_per_mtok=5.0),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
-    "gpt-5.5": ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0),
-    "gpt-5.5-pro": ModelPrice(input_per_mtok=30.0, output_per_mtok=180.0),
-    "gpt-5.4": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0),
-    "gpt-5.4-mini": ModelPrice(input_per_mtok=0.75, output_per_mtok=4.5),
-    "gpt-5.4-nano": ModelPrice(input_per_mtok=0.2, output_per_mtok=1.25),
+    "gpt-5.5": _openai_price(input_per_mtok=5.0, output_per_mtok=30.0),
+    "gpt-5.5-pro": _openai_price(input_per_mtok=30.0, output_per_mtok=180.0),
+    "gpt-5.4": _openai_price(input_per_mtok=2.5, output_per_mtok=15.0),
+    "gpt-5.4-mini": _openai_price(input_per_mtok=0.75, output_per_mtok=4.5),
+    "gpt-5.4-nano": _openai_price(input_per_mtok=0.2, output_per_mtok=1.25),
     # Self-hosted models (vLLM on our own GPUs) intentionally have NO row: their cost is amortized
     # GPU time, not a per-token API price. `price_for` returns None for them, which the eval grid
     # renders as "no cost"; a 0.0 ModelPrice would instead report a misleading $0.00.
@@ -90,10 +129,28 @@ def price_for(model: str) -> ModelPrice | None:
 
 
 def cost_usd(model: str, usage: TokenUsage) -> float:
-    """USD cost of `usage` on `model`. Unknown models cost 0.0 (see `price_for` to detect that)."""
+    """USD cost of `usage` on `model`. Unknown models cost 0.0 (see `price_for` to detect that).
+
+    Cache-adjusted: cache-read and cache-write subsets of `input_tokens` bill at their tier
+    rates when the price row carries them, and at the full input rate otherwise (never $0).
+    With no cache traffic this reduces exactly to input*input_rate + output*output_rate.
+    """
     price = price_for(model)
     if price is None:
         return 0.0
+    read = min(usage.cached_input_tokens, usage.input_tokens)
+    write = min(usage.cache_write_input_tokens, usage.input_tokens - read)
+    read_rate = (
+        price.cache_read_per_mtok if price.cache_read_per_mtok is not None else price.input_per_mtok
+    )
+    write_rate = (
+        price.cache_write_per_mtok
+        if price.cache_write_per_mtok is not None
+        else price.input_per_mtok
+    )
     return (
-        usage.input_tokens * price.input_per_mtok + usage.output_tokens * price.output_per_mtok
+        (usage.input_tokens - read - write) * price.input_per_mtok
+        + read * read_rate
+        + write * write_rate
+        + usage.output_tokens * price.output_per_mtok
     ) / 1_000_000

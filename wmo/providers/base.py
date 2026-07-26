@@ -56,9 +56,14 @@ class TokenUsage(BaseModel):
     # cache usage leave it 0, which prices the whole prompt at the full input rate.
     # Providers whose APIs report cache reads BESIDE the input count (Anthropic Messages,
     # Bedrock Converse) normalize at the construction site: input_tokens = fresh + cache_read.
-    # Cache WRITES (billed at a premium) are not captured yet; nothing sends cache_control
-    # today, and the field lands with the cache-aware routing work.
     cached_input_tokens: int = 0
+    # Prompt tokens WRITTEN to the provider's cache this call (Anthropic
+    # cache_creation_input_tokens / Bedrock cacheWriteInputTokens). Same subset contract as
+    # cached_input_tokens: a subset of input_tokens, disjoint from the read subset, normalized
+    # at the construction site (input_tokens = fresh + cache_read + cache_write). Writes bill
+    # at a PREMIUM (Anthropic 5m TTL: 1.25x input), so cache-adjusted cost needs this split
+    # too; providers that don't report writes (OpenAI charges no write premium) leave it 0.
+    cache_write_input_tokens: int = 0
 
 
 class Completion(BaseModel):
