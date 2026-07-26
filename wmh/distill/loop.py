@@ -75,6 +75,7 @@ import hashlib
 import logging
 import math
 import random
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -273,6 +274,18 @@ class DistillBudgetError(RuntimeError):
         self.spent_usd = spent_usd
         self.max_usd = max_usd
 
+
+_DEFERRED_BASELINE_WAIT_S = 1800.0
+"""How long finalize waits for a concurrent run to write a deferred baseline.
+
+30 minutes covers a baseline arm that is merely slow (a retry, a long tail of
+holdout trials) without letting a producer that DIED hang a finished training
+run indefinitely. The trained weights are saved before the wait begins, so a
+timeout costs a resume rather than the training."""
+
+_DEFERRED_BASELINE_POLL_S = 15.0
+"""Poll interval while waiting; the file appears atomically, so this only sets
+how quickly the wait notices."""
 
 MAX_CONSECUTIVE_EMPTY_STEPS = 2
 """Consecutive all-empty training steps tolerated before the run aborts.
@@ -2323,6 +2336,58 @@ class _DistillRun:
             completed_step=completed_step,
         )
 
+    def _await_deferred_baselines(self) -> None:
+        """Block until every configured deferred baseline file exists, or time out.
+
+        `eval.defer_baselines` exists so training can start immediately while a
+        SEPARATE process measures the gate references, and the two are only
+        joined here. Nothing sequences them, so "training finished first" is a
+        real outcome rather than a theoretical one: a short training run, or a
+        baseline arm that hit a retry, and the import would fail a run that had
+        already paid for every step.
+
+        Waiting is the right response because the producer is expected to
+        finish and the file is the only thing missing. The wait is bounded so a
+        producer that DIED cannot hang the run forever, and the caller's import
+        then raises its usual message naming the config field. The trained
+        weights are already saved by this point either way, so the worst case
+        is a resume rather than lost training.
+        """
+        pending = {
+            field: Path(value)
+            for field, value in (
+                ("eval.teacher_baseline_from", self._cfg.eval.teacher_baseline_from),
+                ("eval.student_baseline_from", self._cfg.eval.student_baseline_from),
+            )
+            if value is not None
+        }
+        missing = {field: path for field, path in pending.items() if not path.is_file()}
+        if not missing:
+            return
+        deadline = time.monotonic() + _DEFERRED_BASELINE_WAIT_S
+        for field, path in missing.items():
+            logger.warning(
+                "deferred baseline %s (%s) is not written yet; waiting up to %.0f min for the "
+                "concurrent baseline run. The final sampler and state are already saved, so a "
+                "timeout costs a resume and not the training.",
+                field,
+                path,
+                _DEFERRED_BASELINE_WAIT_S / 60,
+            )
+        while time.monotonic() < deadline:
+            still_missing = [path for path in missing.values() if not path.is_file()]
+            if not still_missing:
+                logger.info("every deferred baseline landed; importing them now")
+                return
+            time.sleep(_DEFERRED_BASELINE_POLL_S)
+        # Fall through: the caller's import raises the message that names the config field
+        # and the fix, which is more useful than a generic timeout error here.
+        logger.error(
+            "deferred baseline(s) still missing after %.0f min: %s",
+            _DEFERRED_BASELINE_WAIT_S / 60,
+            ", ".join(str(path) for path in missing.values() if not path.is_file()),
+        )
+
     def _import_baseline(
         self,
         key: str,
@@ -3186,12 +3251,24 @@ class _DistillRun:
         before_report: DistillEvalReport | None,
     ) -> DistillResult:
         cfg = self._cfg
+        # Save the trained weights BEFORE anything that can fail on an external dependency.
+        # Deferred baselines import a file a CONCURRENT process writes, and that import used to
+        # run first: if the producer had not finished, the run raised having already paid for
+        # every training step, and the final sampler and state were never written. Ordering the
+        # save first means the worst case costs a resume, not the training.
+        self._emit("finalize", "saving final training state and sampler weights")
+        final_sampler = self._sampler.refresh(cfg.train.steps)
+        final_state = self._training.save_state()
+        final_step = max(cfg.train.steps - 1, 0)
+        self._store.record_checkpoint(final_step, final_state, final_sampler)
+
         if teacher_report is None or before_report is None:
-            # Deferred: measure (or import) the gate references now that training is done. By
-            # this point the concurrent baseline process has long since written its reports, so
+            # Deferred: measure (or import) the gate references now that training is done. The
+            # concurrent baseline process has usually written its reports long before this, so
             # `eval.teacher_baseline_from` / `student_baseline_from` normally import rather than
             # re-measure, and no second harbor job ever runs beside the training one.
             self._emit("baseline", "measuring deferred gate baselines after training")
+            self._await_deferred_baselines()
             teacher_report = self._eval_or_load(
                 TEACHER_BASELINE_EVAL,
                 self._holdout_ids,
@@ -3215,12 +3292,6 @@ class _DistillRun:
                 baseline_from=cfg.eval.student_baseline_from,
                 baseline_from_field="eval.student_baseline_from",
             )
-        self._emit("finalize", "saving final training state and sampler weights")
-        final_sampler = self._sampler.refresh(cfg.train.steps)
-        final_state = self._training.save_state()
-        final_step = max(cfg.train.steps - 1, 0)
-        self._store.record_checkpoint(final_step, final_state, final_sampler)
-
         # Reuse a recorded student-after report on resume: a budget abort inside
         # a prior session's finalize already paid for it, and the resumed weights
         # restore the same final checkpoint it measured.

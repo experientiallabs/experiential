@@ -3554,3 +3554,35 @@ def test_a_teacher_that_cannot_report_cache_hits_bills_everything_uncached(
     assert scoring_only, "no scoring-only row to check"
     assert all(row["teacher_prefill_tokens"] > 0 for row in scoring_only)
     assert all(row["teacher_cached_prefill_tokens"] == 0 for row in scoring_only)
+
+
+def test_a_missing_deferred_baseline_does_not_cost_the_trained_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`eval.defer_baselines` joins two processes that nothing sequences.
+
+    Training can finish before the concurrent baseline arm writes its report, and the
+    import used to run BEFORE the final save: the run raised having paid for every
+    training step, with no final sampler or state written. The weights must be durable
+    first, so the worst case is a resume rather than lost training.
+    """
+    monkeypatch.setattr(loop_module, "_DEFERRED_BASELINE_WAIT_S", 0.0)
+    env = _setup(tmp_path, monkeypatch)
+    base = _cfg()
+    cfg = base.model_copy(
+        update={
+            "train": base.train.model_copy(update={"steps": 1}),
+            "eval": base.eval.model_copy(
+                update={
+                    "defer_baselines": True,
+                    "student_baseline_from": str(tmp_path / "never-written.json"),
+                }
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="student_baseline_from"):
+        _run(env, cfg)
+
+    checkpoints = json.loads((env.run_dir / "checkpoints.json").read_text())["checkpoints"]
+    assert checkpoints, "the trained weights must be saved before the baseline import can fail"
