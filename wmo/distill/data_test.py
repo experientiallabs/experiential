@@ -26,7 +26,6 @@ from wmo.distill.data import (
     build_topk_ce_datums,
     to_tinker_datums,
     to_tinker_sft_datums,
-    to_tinker_topk_ce_datums,
 )
 from wmo.distill.fake_tinker import FakeDatum, FakeServiceClient, FakeTrainingClient
 from wmo.distill.tokens import TrialRecord
@@ -1726,54 +1725,3 @@ def test_train_datum_validates_topk_replica_fields() -> None:
             target_tokens=[1, 9],
             target_weights=[0.5, 0.5],
         )
-
-
-def test_to_tinker_topk_ce_datums_keyset_and_shift_layout() -> None:
-    """Topk replicas ride the pinned cross_entropy wire format: exactly
-    {target_tokens, weights}, shifted, sharing the source's model input."""
-    pytest.importorskip("tinker")
-    datum = _one_datum()
-    k = 2
-    row = _topk_row_for(datum, k)
-
-    wire = to_tinker_topk_ce_datums([datum], [row], k)
-
-    replicas, _ = build_topk_ce_datums([datum], [row], k)
-    tokens = datum.model_input_tokens
-    assert len(wire) == k
-    for td, replica in zip(wire, replicas, strict=True):
-        assert td.model_input.to_ints() == tokens[:-1]  # shared model input
-        assert set(td.loss_fn_inputs) == {"target_tokens", "weights"}
-        assert [int(t) for t in td.loss_fn_inputs["target_tokens"].data] == (
-            replica.target_tokens[1:]
-        )
-        assert td.loss_fn_inputs["target_tokens"].dtype == "int64"
-        assert [float(w) for w in td.loss_fn_inputs["weights"].data] == pytest.approx(
-            replica.target_weights[1:]
-        )
-        assert td.loss_fn_inputs["weights"].dtype == "float32"
-
-
-def test_to_tinker_topk_ce_datums_tito_round_trip_through_the_fake() -> None:
-    """Wire replicas built from sampled spans pass the fake's input-side TITO
-    check even though their targets are teacher candidates nobody issued."""
-    pytest.importorskip("tinker")
-    training, spans = _sampled_episode()
-
-    datums, stats = build_datums([_record(spans)], _cfg())
-    assert stats.datums == 1
-    k = 2
-    row = _topk_row_for(datums[0], k)
-    wire = to_tinker_topk_ce_datums(datums, [row], k)
-
-    fakes = [
-        FakeDatum(
-            model_input_tokens=td.model_input.to_ints(),
-            target_tokens=[int(t) for t in td.loss_fn_inputs["target_tokens"].data],
-            weights=[float(w) for w in td.loss_fn_inputs["weights"].data],
-            topk=True,
-        )
-        for td in wire
-    ]
-    training.forward_backward(fakes, "cross_entropy")
-    assert training.forward_backward_calls[-1][1] == "cross_entropy"

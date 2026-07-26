@@ -77,19 +77,6 @@ class ParsedAssistantMessage(BaseModel):
     salvaged_tool_calls: int = 0
     """How many of `tool_calls` were recovered from a truncated/unterminated emission."""
 
-    def to_chat_message(self) -> ChatMessage:
-        """This turn as an llm_waterfall assistant message.
-
-        The single place a parsed sample becomes a canonical `ChatMessage`, so
-        the response the agent sees and the assistant turn a conversation
-        replay reconstructs (`wmo.distill.tokens.reconstruct_conversation`)
-        cannot drift apart. Empty text and an empty tool-call list collapse to
-        None, matching the OpenAI-shaped messages the agent sends back.
-        """
-        return ChatMessage(
-            role="assistant", content=self.text or None, tool_calls=self.tool_calls or None
-        )
-
 
 class ChatRendering(Protocol):
     """What the Tinker provider needs from a chat renderer."""

@@ -127,10 +127,6 @@ class CostEstimate(BaseModel):
         """Meters with no `[pricing]` entry, for the CLI's warning."""
         return [line.meter for line in self.lines if line.usd is None]
 
-    def is_fully_priced(self) -> bool:
-        """Whether every meter carries a price, so `priced_usd` is the whole run."""
-        return not self.unpriced_meters
-
 
 def _meter_price(pricing: PricingConfig, meter: MeterName) -> float | None:
     if meter == "student_prefill":

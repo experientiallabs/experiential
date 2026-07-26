@@ -92,11 +92,6 @@ class ChunkSpan(BaseModel):
         """How many student tokens this chunk covers."""
         return self.student_end - self.student_start
 
-    @property
-    def teacher_len(self) -> int:
-        """How many teacher tokens this chunk covers."""
-        return self.teacher_end - self.teacher_start
-
 
 class ChunkPlan(BaseModel):
     """The chunk alignment for one datum, plus the teacher sequence it scores against."""

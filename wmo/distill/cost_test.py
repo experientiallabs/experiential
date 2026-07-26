@@ -217,7 +217,6 @@ def test_estimate_hand_computed_usd() -> None:
     assert usd["teacher_cached_prefill"] == pytest.approx(6 * 2944 / 1e6 * 2.0)
     assert usd["teacher_sample"] == pytest.approx(6 * 256 / 1e6 * 25.0)
     assert estimate.priced_usd == pytest.approx(1.2186624)
-    assert estimate.is_fully_priced()
     assert estimate.unpriced_meters == []
 
 
@@ -236,7 +235,6 @@ def test_estimate_unpriced_meters_surface_as_none_lines() -> None:
     ):
         assert by_meter[meter].usd is None
         assert by_meter[meter].price_per_mtok is None
-    assert not estimate.is_fully_priced()
     assert set(estimate.unpriced_meters) == {
         "student_prefill",
         "student_cached_prefill",

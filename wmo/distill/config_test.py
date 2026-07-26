@@ -203,7 +203,10 @@ tags = ["smoke", "tb2"]
     assert cfg.eval.teacher_baseline_from == "runs/prior/evals/baseline-teacher.json"
     assert cfg.eval.student_baseline_from == "runs/prior/evals/baseline-student-before.json"
     assert cfg.gate.min_teacher_fraction == 1.0
-    assert cfg.pricing.is_complete()
+    assert cfg.pricing.student_prefill == pytest.approx(0.1)
+    assert cfg.pricing.student_sample == pytest.approx(0.4)
+    assert cfg.pricing.student_train == pytest.approx(0.6)
+    assert cfg.pricing.teacher_prefill == pytest.approx(1.2)
     # Explicit cached rates win over the 20%-of-prefill derivation.
     assert cfg.pricing.effective_student_cached_prefill == pytest.approx(0.03)
     assert cfg.pricing.effective_teacher_cached_prefill == pytest.approx(0.3)
@@ -633,28 +636,6 @@ def test_wandb_unknown_key_rejected(tmp_path: Path) -> None:
     text = MINIMAL_TOML + "\n[wandb]\nteam = 'nope'\n"
     with pytest.raises(ValueError, match="wandb.team"):
         load_distill_config(_write(tmp_path, text))
-
-
-def test_pricing_is_complete() -> None:
-    assert not PricingConfig().is_complete()
-    partial = PricingConfig(student_prefill=0.1, student_sample=0.2)
-    assert not partial.is_complete()
-    # The four full prices alone are not complete: teacher-in-harness episodes
-    # bill teacher_sample, so it must be priced too.
-    no_teacher_sample = PricingConfig(
-        student_prefill=0.1, student_sample=0.2, student_train=0.3, teacher_prefill=0.4
-    )
-    assert not no_teacher_sample.is_complete()
-    # The cached rates never block completeness: their 20% defaults derive
-    # from the full prefill prices.
-    full = PricingConfig(
-        student_prefill=0.1,
-        student_sample=0.2,
-        student_train=0.3,
-        teacher_prefill=0.4,
-        teacher_sample=1.0,
-    )
-    assert full.is_complete()
 
 
 def test_pricing_cached_defaults_derive_20_percent_of_prefill() -> None:

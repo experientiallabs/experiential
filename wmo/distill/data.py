@@ -24,8 +24,8 @@ cross_entropy sibling for the supervised warmup phase (teacher-sampled
 trajectories need no advantages, only the loss-mask weights). For the
 `topk_ce` loss, `build_topk_ce_datums` turns teacher top-k candidate rows
 into rank-aligned replica datums (see its docstring for why replication is
-per RANK, not per position) and `to_tinker_topk_ce_datums` is its one-call
-wire conversion through the same pinned cross_entropy keyset. The tinker SDK
+per RANK, not per position), and those replicas ride the same pinned
+cross_entropy keyset through `to_tinker_sft_datums`. The tinker SDK
 is an optional extra and is imported lazily inside those converters only,
 mirroring the provider's contract; everything else here runs without it.
 """
@@ -886,36 +886,3 @@ def to_tinker_sft_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datu
             )
         )
     return out
-
-
-def to_tinker_topk_ce_datums(
-    train_datums: Sequence[TrainDatum],
-    topk_scores: Sequence[Sequence[TopkCandidates | None]],
-    k: int,
-) -> list[tinker.Datum]:
-    """Convert source datums plus teacher top-k rows to cross_entropy wire datums.
-
-    The one-call conversion for the `topk_ce` loss: `build_topk_ce_datums`
-    does the rank-aligned replication and weight renormalization (see its
-    docstring for the objective-equivalence argument), then the replicas ride
-    the pinned cross_entropy wire format (`to_tinker_sft_datums`: exactly
-    {"target_tokens", "weights"}). Misaligned rows drop their source datum
-    with a warning, mirroring the loop's own two-step path.
-
-    Args:
-        train_datums: Datums from `build_datums`.
-        topk_scores: One per-position top-k row per datum
-            (`TeacherClient.score_topk`).
-        k: The replica count (`train.topk`).
-
-    Returns:
-        `k` `tinker.Datum`s per kept source datum, source order then rank
-        order, sharing each source's model input.
-
-    Raises:
-        ImportError: If the tinker SDK is not installed (distill extra).
-        ValueError: On caller bugs (`build_topk_ce_datums`) or datums too
-            short for the shift (`to_tinker_sft_datums`).
-    """
-    replicas, _ = build_topk_ce_datums(train_datums, topk_scores, k)
-    return to_tinker_sft_datums(replicas)

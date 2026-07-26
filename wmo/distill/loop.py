@@ -2336,6 +2336,50 @@ class _DistillRun:
             completed_step=completed_step,
         )
 
+    def _gate_baselines(self, *, reuse: bool) -> tuple[DistillEvalReport, DistillEvalReport]:
+        """The gate's two reference reports: teacher-in-harness and student-before.
+
+        Both the up-front path in `execute` and the deferred path in `_finalize`
+        need exactly this pair, measured over the holdout at `gate.k` with the
+        same metering and import fields, so they share one definition rather
+        than two copies that can drift apart. Only `reuse` differs between the
+        callers: up front it tracks whether this session is a resume, while the
+        deferred path always reuses, because reaching `_finalize` means the
+        training this session would otherwise redo is already paid for.
+
+        Args:
+            reuse: Whether a report already recorded under this run's `evals/`
+                satisfies the request without re-importing or re-measuring.
+
+        Returns:
+            The teacher baseline report and the student-before report.
+        """
+        cfg = self._cfg
+        teacher_report = self._eval_or_load(
+            TEACHER_BASELINE_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._teacher_provider(),
+            phase="baseline",
+            teacher_metered=True,
+            reuse=reuse,
+            pin_provider=True,
+            baseline_from=cfg.eval.teacher_baseline_from,
+            baseline_from_field="eval.teacher_baseline_from",
+        )
+        before_report = self._eval_or_load(
+            STUDENT_BEFORE_EVAL,
+            self._holdout_ids,
+            cfg.gate.k,
+            self._student_provider(),
+            phase="baseline",
+            teacher_metered=False,
+            reuse=reuse,
+            baseline_from=cfg.eval.student_baseline_from,
+            baseline_from_field="eval.student_baseline_from",
+        )
+        return teacher_report, before_report
+
     def _await_deferred_baselines(self) -> None:
         """Block until every configured deferred baseline file exists, or time out.
 
@@ -3194,29 +3238,7 @@ class _DistillRun:
                 self._train_step(step)
             return self._finalize(None, None)
 
-        teacher_report = self._eval_or_load(
-            TEACHER_BASELINE_EVAL,
-            self._holdout_ids,
-            cfg.gate.k,
-            self._teacher_provider(),
-            phase="baseline",
-            teacher_metered=True,
-            reuse=resume,
-            pin_provider=True,
-            baseline_from=cfg.eval.teacher_baseline_from,
-            baseline_from_field="eval.teacher_baseline_from",
-        )
-        before_report = self._eval_or_load(
-            STUDENT_BEFORE_EVAL,
-            self._holdout_ids,
-            cfg.gate.k,
-            self._student_provider(),
-            phase="baseline",
-            teacher_metered=False,
-            reuse=resume,
-            baseline_from=cfg.eval.student_baseline_from,
-            baseline_from_field="eval.student_baseline_from",
-        )
+        teacher_report, before_report = self._gate_baselines(reuse=resume)
 
         if cfg.warmup.steps > 0:
             if warmup_record is not None:
@@ -3269,29 +3291,7 @@ class _DistillRun:
             # re-measure, and no second harbor job ever runs beside the training one.
             self._emit("baseline", "measuring deferred gate baselines after training")
             self._await_deferred_baselines()
-            teacher_report = self._eval_or_load(
-                TEACHER_BASELINE_EVAL,
-                self._holdout_ids,
-                cfg.gate.k,
-                self._teacher_provider(),
-                phase="baseline",
-                teacher_metered=True,
-                reuse=True,
-                pin_provider=True,
-                baseline_from=cfg.eval.teacher_baseline_from,
-                baseline_from_field="eval.teacher_baseline_from",
-            )
-            before_report = self._eval_or_load(
-                STUDENT_BEFORE_EVAL,
-                self._holdout_ids,
-                cfg.gate.k,
-                self._student_provider(),
-                phase="baseline",
-                teacher_metered=False,
-                reuse=True,
-                baseline_from=cfg.eval.student_baseline_from,
-                baseline_from_field="eval.student_baseline_from",
-            )
+            teacher_report, before_report = self._gate_baselines(reuse=True)
         # Reuse a recorded student-after report on resume: a budget abort inside
         # a prior session's finalize already paid for it, and the resumed weights
         # restore the same final checkpoint it measured.

@@ -653,22 +653,6 @@ class PricingConfig(BaseModel):
         """The teacher cached-prefill price actually charged (see class docstring)."""
         return _effective_cached(self.teacher_cached_prefill, self.teacher_prefill)
 
-    def is_complete(self) -> bool:
-        """Whether every meter has a price, so run cost can be fully accounted.
-
-        The cached-prefill meters count as priced through their derived 20%
-        defaults whenever the corresponding full prefill price is set (which
-        this requires), so completeness needs exactly the four full prices
-        plus `teacher_sample`.
-        """
-        return (
-            self.student_prefill is not None
-            and self.student_sample is not None
-            and self.student_train is not None
-            and self.teacher_prefill is not None
-            and self.teacher_sample is not None
-        )
-
 
 class BudgetConfig(BaseModel):
     """Optional hard USD budget for the whole run."""
