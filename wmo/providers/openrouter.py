@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+from llm_waterfall import ChatMaxTokensField
 from openai import OpenAI
 
 from wmo.providers import _openai_common
@@ -66,7 +67,7 @@ DEFAULT_TITLE = "world-model-optimizer"
 
 # OpenRouter's documented output-budget field. Sending OpenAI's `max_completion_tokens` instead
 # would leave the request with no cap at all on providers that ignore unknown fields.
-_MAX_TOKENS_FIELD = "max_tokens"
+_MAX_TOKENS_FIELD: ChatMaxTokensField = "max_tokens"
 
 # Bound every request the way the other OpenAI-shaped backends do: an upstream provider behind
 # OpenRouter can hold a connection open with no output, and an unbounded stall turns an eval
@@ -115,7 +116,12 @@ class OpenRouterProvider:
         return key
 
     def _get_client(self) -> OpenAI:
-        """Construct the client on first use (never at import, never without a key)."""
+        """Construct the client on first use (never at import, never without a key).
+
+        The SDK import is at module scope rather than deferred here: `openai` is a core
+        dependency that `_openai_common` already imports eagerly, so a local import would buy
+        nothing and only hide the dependency (AGENTS.md rule 8).
+        """
         if self._client is None:
             self._client = OpenAI(
                 base_url=self.config.endpoint or OPENROUTER_BASE_URL,
