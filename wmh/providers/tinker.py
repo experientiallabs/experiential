@@ -14,6 +14,14 @@ never re-encoded, and a sample without per-token logprobs fails loudly.
 identity); `config.model` carries either a `tinker://` sampler-weights path or
 a base model name for an untrained student. The tinker SDK is an optional
 extra imported lazily (`uv sync --extra distill`), same contract as e2b.
+
+Every SDK call is deadline-bounded (`wmh.distill.deadlines`): a wedged Tinker
+session blocks forever inside the SDK's own retry loop, so client construction
+and tokenizer fetches run under the `connect` deadline and the sample future
+under the `sample` deadline. An expiry raises the retryable
+`TinkerDeadlineError` and drops the provider-owned sampling client, so the
+retry wrapper's next attempt builds a fresh session instead of inheriting the
+wedge.
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from llm_waterfall.types import ChatChoice, ChatMessage, ChatTool, ChatUsage
 from pydantic import BaseModel, model_validator
 
+from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmh.distill.rendering import (
     ChatRendering,
     ParsedAssistantMessage,
@@ -177,23 +186,32 @@ class SdkSampler:
         temperature: float,
         stop: list[str] | list[int] | None = None,
     ) -> SampledSequenceLike:
-        """Run one synchronous sample and return the single sampled sequence."""
+        """Run one deadline-bounded sample and return the single sampled sequence.
+
+        Raises:
+            TinkerDeadlineError: If the `sample` deadline expires (the session
+                is likely wedged; the caller should retry with a fresh one).
+        """
         import tinker
 
-        response = self._client.sample(
+        future = self._client.sample(
             prompt=tinker.ModelInput.from_ints(prompt_token_ids),
             num_samples=1,
             sampling_params=tinker.SamplingParams(
                 max_tokens=max_tokens, temperature=temperature, stop=stop
             ),
-        ).result()
-        return response.sequences[0]
+        )
+        return wait_with_deadline("sample", future).sequences[0]
 
     def get_tokenizer(self) -> RendererTokenizer:
-        """The HF tokenizer for the client's base model."""
+        """The HF tokenizer for the client's base model (deadline-bounded fetch).
+
+        Raises:
+            TinkerDeadlineError: If the `connect` deadline expires.
+        """
         # HF stubs type decode as `str | list[str]` depending on the input
         # shape; for the list[int] calls renderers make it is always str.
-        return cast("RendererTokenizer", self._client.get_tokenizer())
+        return cast("RendererTokenizer", call_with_deadline("connect", self._client.get_tokenizer))
 
 
 class _SampledTurn(BaseModel):
@@ -231,6 +249,9 @@ class TinkerChatProvider:
     ) -> None:
         self.config = config
         self._sampler = sampling_client
+        # Only a client the provider built itself may be dropped and rebuilt
+        # after a deadline expiry; an injected one cannot be reconstructed.
+        self._owns_sampler = sampling_client is None
         self._rendering = renderer
         self._recorder = recorder
 
@@ -251,6 +272,15 @@ class TinkerChatProvider:
         return base
 
     def _get_sampler(self) -> TinkerSampler:
+        """The sampling client, built on first use and rebuilt after a wedge.
+
+        Raises:
+            ImportError: If the tinker SDK is not installed (the distill extra).
+            RuntimeError: If TINKER_API_KEY is missing from the environment.
+            TinkerDeadlineError: If service-client construction or sampling-client
+                creation exceeds the `connect` deadline. Neither is cached in that
+                case, so the next attempt starts from a fresh session.
+        """
         # Lazy: don't import the SDK or read the key env var until first use.
         if self._sampler is None:
             try:
@@ -262,13 +292,35 @@ class TinkerChatProvider:
                     f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
                     "your Tinker API key to use the tinker provider"
                 )
-            service = tinker.ServiceClient()
-            if self.config.model.startswith("tinker://"):
-                client = service.create_sampling_client(model_path=self.config.model)
-            else:
-                client = service.create_sampling_client(base_model=self.config.model)
-            self._sampler = SdkSampler(client)
+            # Both SDK calls are fully blocking with no timeout parameter, so they run
+            # under the "connect" deadline on a daemon thread rather than forever.
+            service = call_with_deadline("connect", tinker.ServiceClient)
+            model = self.config.model
+
+            def build() -> tinker.SamplingClient:
+                if model.startswith("tinker://"):
+                    return service.create_sampling_client(model_path=model)
+                return service.create_sampling_client(base_model=model)
+
+            self._sampler = SdkSampler(call_with_deadline("connect", build))
         return self._sampler
+
+    def _drop_wedged_sampler(self) -> None:
+        """Forget a sampling client that blew its deadline, so the next attempt rebuilds.
+
+        A wedged session keeps timing out while a freshly built one succeeds, so
+        holding the cached client would turn one expiry into an endless run of
+        them. Dropping it makes the next `_get_sampler` construct a new
+        `ServiceClient` and a new `SamplingClient` (each construction is itself
+        `connect`-bounded). An injected client is never dropped: the provider
+        cannot rebuild what it did not build.
+        """
+        if self._owns_sampler and self._sampler is not None:
+            logger.warning(
+                "dropping the tinker sampling client after a deadline expiry; "
+                "the next attempt builds a fresh session"
+            )
+            self._sampler = None
 
     def _get_rendering(self) -> ChatRendering:
         if self._rendering is None:
@@ -292,14 +344,21 @@ class TinkerChatProvider:
         max_tokens: int,
     ) -> _SampledTurn:
         """Render, sample, parse, and (on success) record exactly one span."""
-        rendering = self._get_rendering()
-        prompt_ids = rendering.build_generation_prompt(messages, tools)
-        sequence = self._get_sampler().sample(
-            prompt_ids,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stop=rendering.stop_sequences,
-        )
+        try:
+            rendering = self._get_rendering()
+            prompt_ids = rendering.build_generation_prompt(messages, tools)
+            sequence = self._get_sampler().sample(
+                prompt_ids,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=rendering.stop_sequences,
+            )
+        except TinkerDeadlineError:
+            # The session is likely wedged; drop it so the retry wrapper's next
+            # attempt rebuilds fresh. No span was recorded (recording happens
+            # only after the whole completion succeeds, below).
+            self._drop_wedged_sampler()
+            raise
         sampled_ids = list(sequence.tokens)
         logprobs = sequence.logprobs
         if logprobs is None or len(logprobs) != len(sampled_ids):
@@ -412,8 +471,14 @@ class TinkerChatProvider:
         return verify_via_ping(self, ping=self._ping)
 
     def _ping(self) -> None:
-        rendering = self._get_rendering()
-        prompt_ids = rendering.build_generation_prompt([ChatMessage(role="user", content="ping")])
-        self._get_sampler().sample(
-            prompt_ids, max_tokens=1, temperature=0.0, stop=rendering.stop_sequences
-        )
+        try:
+            rendering = self._get_rendering()
+            prompt_ids = rendering.build_generation_prompt(
+                [ChatMessage(role="user", content="ping")]
+            )
+            self._get_sampler().sample(
+                prompt_ids, max_tokens=1, temperature=0.0, stop=rendering.stop_sequences
+            )
+        except TinkerDeadlineError:
+            self._drop_wedged_sampler()
+            raise

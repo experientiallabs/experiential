@@ -7,13 +7,27 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from wmh.config.config import ArtifactPaths, HarnessConfig, load_config, save_config
+from wmh.config.config import (
+    PROVIDER_ENV_VARS,
+    ArtifactPaths,
+    HarnessConfig,
+    load_config,
+    save_config,
+)
 from wmh.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 
 
 def test_gepa_budget_default_is_modest() -> None:
     # 10 iterations ~= 700 metric calls with the capped valset; 50 was ~3.4k calls (hours).
     assert HarnessConfig().gepa_budget == 10
+
+
+@pytest.mark.parametrize("kind", list(ProviderKind))
+def test_every_provider_kind_declares_its_credential_env_vars(kind: ProviderKind) -> None:
+    # A missing kind is silent: the CLI's credential prompt, the picker's "creds set"
+    # annotation, and the `providers verify` failure hint all degrade to "no credentials
+    # known" rather than erroring, so only this exhaustiveness check catches the gap.
+    assert PROVIDER_ENV_VARS.get(kind), f"{kind.value} has no PROVIDER_ENV_VARS entry"
 
 
 def test_save_then_load_round_trips(tmp_path: Path) -> None:

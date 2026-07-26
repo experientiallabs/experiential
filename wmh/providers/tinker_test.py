@@ -1,8 +1,10 @@
-"""Tests for the Tinker provider: span recording, response shape, lazy imports.
+"""Tests for the Tinker provider: span recording, response shape, lazy imports, deadlines.
 
 Everything runs against the deterministic fakes in `wmh.distill.fake_tinker`
 plus a minimal char-level `ChatRendering`; the real tinker SDK is never
-touched (several tests pin that by poisoning `sys.modules`).
+touched (several tests pin that by poisoning `sys.modules`). The deadline
+tests substitute a stub `tinker` module whose calls never come back, which is
+the wedged-session failure mode the deadlines exist for.
 """
 
 from __future__ import annotations
@@ -10,7 +12,12 @@ from __future__ import annotations
 import ast
 import json
 import sys
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
 from llm_waterfall.types import (
@@ -25,6 +32,8 @@ from pydantic import JsonValue, ValidationError
 
 import wmh.distill.rendering as rendering_module
 import wmh.providers.tinker as tinker_module
+from wmh.config import PROVIDER_ENV_VARS
+from wmh.distill.deadlines import TinkerDeadlineError, env_var_for
 from wmh.distill.fake_tinker import FakeSampledSequence, FakeSamplingClient, FakeTokenizer
 from wmh.distill.rendering import ParsedAssistantMessage
 from wmh.providers.base import (
@@ -35,7 +44,16 @@ from wmh.providers.base import (
     ToolCallingProvider,
 )
 from wmh.providers.registry import get_provider
-from wmh.providers.tinker import TinkerChatProvider, TokenRecorder, TokenSpan
+from wmh.providers.tinker import (
+    TINKER_API_KEY_ENV,
+    SdkSampler,
+    TinkerChatProvider,
+    TokenRecorder,
+    TokenSpan,
+)
+
+if TYPE_CHECKING:
+    import tinker
 
 
 class _MiniRendering:
@@ -103,6 +121,158 @@ class _FlakySampler:
         return self._inner.sample(
             prompt_token_ids, max_tokens=max_tokens, temperature=temperature, stop=stop
         )
+
+
+class _DeadlineSampler:
+    """A sampler whose every sample expires, as a wedged session's would."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def sample(
+        self,
+        prompt_token_ids: list[int],
+        *,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> NoReturn:
+        del prompt_token_ids, max_tokens, temperature, stop
+        self.calls += 1
+        raise TinkerDeadlineError("sample", elapsed_s=0.05, deadline_s=0.05)
+
+
+class _StubModelInput:
+    """Stands in for `tinker.ModelInput`; the provider only builds one from ids."""
+
+    def __init__(self, token_ids: list[int]) -> None:
+        self.token_ids = token_ids
+
+    @classmethod
+    def from_ints(cls, tokens: list[int]) -> _StubModelInput:
+        return cls(list(tokens))
+
+
+class _StubSamplingParams:
+    """Stands in for `tinker.SamplingParams`."""
+
+    def __init__(
+        self,
+        *,
+        max_tokens: int,
+        temperature: float,
+        stop: list[str] | list[int] | None = None,
+    ) -> None:
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.stop = stop
+
+
+class _NeverFuture:
+    """A sample future that never resolves; `result(timeout)` honors the timeout.
+
+    Mirrors the real `APIFuture.result(timeout)` contract, which is what makes
+    the difference between a bounded wait and the original 33-minute hang.
+    """
+
+    def result(self, timeout: float | None = None) -> NoReturn:
+        threading.Event().wait(timeout)
+        raise TimeoutError(f"stub future gave up after {timeout}s")
+
+
+class _ReadyFuture:
+    """A sample future that resolves at once, recording the timeout it was handed."""
+
+    def __init__(self, sequence: FakeSampledSequence) -> None:
+        self._sequence = sequence
+        self.timeouts: list[float | None] = []
+
+    def result(self, timeout: float | None = None) -> SimpleNamespace:
+        self.timeouts.append(timeout)
+        return SimpleNamespace(sequences=[self._sequence])
+
+
+class _StubSdkClient:
+    """The `tinker.SamplingClient` surface `SdkSampler` wraps (sample + get_tokenizer).
+
+    Args:
+        future: The future `sample()` hands back; defaults to one that never
+            resolves, which is how a wedged session actually presents (the SDK
+            returns the future promptly and the wait is what hangs).
+        wedged_tokenizer: When True, `get_tokenizer()` blocks forever.
+    """
+
+    def __init__(
+        self,
+        *,
+        future: _NeverFuture | _ReadyFuture | None = None,
+        wedged_tokenizer: bool = False,
+    ) -> None:
+        self._future: _NeverFuture | _ReadyFuture = future or _NeverFuture()
+        self._wedged_tokenizer = wedged_tokenizer
+        self.samples = 0
+
+    def sample(
+        self,
+        *,
+        prompt: _StubModelInput,
+        num_samples: int,
+        sampling_params: _StubSamplingParams,
+    ) -> _NeverFuture | _ReadyFuture:
+        del prompt, num_samples, sampling_params
+        self.samples += 1
+        return self._future
+
+    def get_tokenizer(self) -> FakeTokenizer:
+        if self._wedged_tokenizer:
+            _block_forever()
+        return FakeTokenizer()
+
+
+class _StubService:
+    """The `tinker.ServiceClient` surface the lazy build path touches."""
+
+    def __init__(self, *, wedged_create: bool = False) -> None:
+        self.created: list[str] = []
+        self.clients: list[_StubSdkClient] = []
+        self._wedged_create = wedged_create
+
+    def create_sampling_client(
+        self, *, model_path: str | None = None, base_model: str | None = None
+    ) -> _StubSdkClient:
+        self.created.append(model_path or base_model or "")
+        if self._wedged_create:
+            _block_forever()
+        client = _StubSdkClient()  # every sample() on it wedges
+        self.clients.append(client)
+        return client
+
+
+def _sdk_sampler(client: _StubSdkClient) -> SdkSampler:
+    """Wrap a stub client in `SdkSampler`, whose seam is typed to the real SDK class."""
+    return SdkSampler(cast("tinker.SamplingClient", client))
+
+
+def _block_forever() -> NoReturn:
+    """Park on an event nobody sets: the SDK call that neither returns nor raises."""
+    threading.Event().wait()
+    raise AssertionError("unreachable: the deadline abandons this daemon thread")
+
+
+def _install_stub_tinker(
+    monkeypatch: pytest.MonkeyPatch, service_factory: Callable[[], _StubService]
+) -> None:
+    """Put a stub `tinker` module in `sys.modules` and set the API key."""
+    monkeypatch.setenv(TINKER_API_KEY_ENV, "test-key")
+    monkeypatch.setitem(
+        sys.modules,
+        "tinker",
+        SimpleNamespace(
+            ModelInput=_StubModelInput,
+            SamplingParams=_StubSamplingParams,
+            ServiceClient=service_factory,
+        ),
+    )
 
 
 def _config() -> ProviderConfig:
@@ -390,6 +560,142 @@ def test_injected_sampler_without_tokenizer_requires_renderer() -> None:
     provider = TinkerChatProvider(_config(), sampling_client=FakeSamplingClient(seed="s"))
     with pytest.raises(RuntimeError, match="renderer="):
         provider.complete_chat(_request())
+
+
+def test_provider_env_vars_names_the_key_the_provider_actually_reads() -> None:
+    # Without the entry the `providers verify` hint drops the "(TINKER_API_KEY)" clue and
+    # the CLI never prompts for the key; the equality pins the literal in config.py to the
+    # name the provider reads, so the two cannot drift.
+    assert PROVIDER_ENV_VARS[ProviderKind.TINKER] == [TINKER_API_KEY_ENV]
+
+
+def test_sample_is_bounded_by_the_sample_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The live failure: a wedged session's future never resolves, and an unbounded
+    # `.result()` hung one run for 33 minutes.
+    monkeypatch.setenv(env_var_for("sample"), "0.05")
+    monkeypatch.setitem(
+        sys.modules,
+        "tinker",
+        SimpleNamespace(ModelInput=_StubModelInput, SamplingParams=_StubSamplingParams),
+    )
+    sampler = _sdk_sampler(_StubSdkClient(future=_NeverFuture()))
+    started = time.monotonic()
+    with pytest.raises(TinkerDeadlineError) as info:
+        sampler.sample([1, 2, 3], max_tokens=4, temperature=0.0)
+    assert time.monotonic() - started < 5.0
+    assert info.value.kind == "sample"
+
+
+def test_sample_hands_the_future_its_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The happy path must go through the deadline too: a `result()` called with no
+    # timeout is exactly the unbounded wait this fix removes.
+    monkeypatch.setenv(env_var_for("sample"), "7.5")
+    monkeypatch.setitem(
+        sys.modules,
+        "tinker",
+        SimpleNamespace(ModelInput=_StubModelInput, SamplingParams=_StubSamplingParams),
+    )
+    expected = FakeSampledSequence(tokens=[65, 66], logprobs=[-0.1, -0.2], stop_reason="length")
+    future = _ReadyFuture(expected)
+    sampler = _sdk_sampler(_StubSdkClient(future=future))
+    assert sampler.sample([1, 2], max_tokens=2, temperature=0.0) is expected
+    assert future.timeouts == [7.5]
+
+
+def test_get_tokenizer_is_bounded_by_the_connect_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(env_var_for("connect"), "0.05")
+    sampler = _sdk_sampler(_StubSdkClient(wedged_tokenizer=True))
+    started = time.monotonic()
+    with pytest.raises(TinkerDeadlineError) as info:
+        sampler.get_tokenizer()
+    assert time.monotonic() - started < 5.0
+    assert info.value.kind == "connect"
+
+
+def test_service_client_construction_is_bounded_by_the_connect_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(env_var_for("connect"), "0.05")
+    _install_stub_tinker(monkeypatch, _block_forever)
+    provider = TinkerChatProvider(_config(), renderer=_MiniRendering())
+    started = time.monotonic()
+    with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
+        provider.complete_chat(_request())
+    assert time.monotonic() - started < 5.0
+
+
+def test_sampling_client_creation_is_bounded_by_the_connect_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(env_var_for("connect"), "0.05")
+    service = _StubService(wedged_create=True)
+    _install_stub_tinker(monkeypatch, lambda: service)
+    provider = TinkerChatProvider(_config(), renderer=_MiniRendering())
+    started = time.monotonic()
+    with pytest.raises(TinkerDeadlineError, match="tinker connect timed out"):
+        provider.complete_chat(_request())
+    assert time.monotonic() - started < 5.0
+    assert service.created == ["tinker://run/weights/0"]
+
+
+def test_expired_sample_drops_the_owned_client_so_the_next_attempt_rebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A wedged client keeps expiring; caching it would turn one expiry into an endless
+    # run of them, so the retry wrapper's next attempt must get a fresh session.
+    monkeypatch.setenv(env_var_for("sample"), "0.05")
+    services: list[_StubService] = []
+
+    def factory() -> _StubService:
+        service = _StubService()
+        services.append(service)
+        return service
+
+    _install_stub_tinker(monkeypatch, factory)
+    provider = TinkerChatProvider(_config(), renderer=_MiniRendering())
+    for _ in range(2):
+        with pytest.raises(TinkerDeadlineError, match="tinker sample timed out"):
+            provider.complete_chat(_request())
+    assert [service.created for service in services] == [
+        ["tinker://run/weights/0"],
+        ["tinker://run/weights/0"],
+    ]
+    # Each wedged client was used exactly once and then dropped, never reused.
+    assert [client.samples for service in services for client in service.clients] == [1, 1]
+
+
+def test_expired_ping_drops_the_owned_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `verify()` runs the same render+sample path, so it must heal the same way.
+    monkeypatch.setenv(env_var_for("sample"), "0.05")
+    services: list[_StubService] = []
+
+    def factory() -> _StubService:
+        service = _StubService()
+        services.append(service)
+        return service
+
+    _install_stub_tinker(monkeypatch, factory)
+    provider = TinkerChatProvider(_config(), renderer=_MiniRendering())
+    for _ in range(2):
+        result = provider.verify()
+        assert result.ok is False
+        assert "timed out" in (result.detail or "")
+    assert len(services) == 2
+
+
+def test_injected_client_is_never_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The provider cannot rebuild a client it did not build, so an expiry must leave the
+    # injected sampler in place. Poisoning the SDK proves no rebuild is attempted: a drop
+    # would surface as ImportError on the second call instead of another expiry.
+    monkeypatch.setitem(sys.modules, "tinker", None)
+    sampler = _DeadlineSampler()
+    provider = TinkerChatProvider(_config(), sampling_client=sampler, renderer=_MiniRendering())
+    for _ in range(2):
+        with pytest.raises(TinkerDeadlineError):
+            provider.complete_chat(_request())
+    assert sampler.calls == 2
 
 
 def _module_scope_import_roots(path: Path) -> set[str]:
