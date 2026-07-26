@@ -323,7 +323,7 @@ def optimize(
     elif model != _HARBOR_ENVIRONMENT:
         raise typer.BadParameter(
             "--mode distill requires the harbor environment: "
-            "`wmh optimize <agent> harbor --mode distill ...`; a world-model distill "
+            "`wmh optimize harness <agent> harbor --mode distill ...`; a world-model distill "
             "backend is a documented follow-on and is not available yet"
         )
     if model == _HARBOR_ENVIRONMENT:
