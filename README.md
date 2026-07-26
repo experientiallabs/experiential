@@ -26,15 +26,11 @@ wmo providers set
 ```bash
 wmo build --file traces.jsonl --name my-endpoint
 
-# Score every registered model on held-out tasks from your traces. One full episode per
-# (model, task), 20 tasks by default, so it costs real API calls: it estimates and confirms
-# first. --traces is needed again because the build does not keep the corpus it read.
+# Score every registered model on held-out tasks from your traces
 wmo optimize route sweep my-endpoint --pool .wmo/pool.toml \
-  --traces traces.otel.jsonl --out matrix.json --scenarios 20
+  --traces traces.otel.jsonl --out matrix.json
 
-# Turn those measurements into a policy. --kind knn is the validated one; the flag still
-# defaults to rank. --fallback is what a request gets unless the evidence says a cheaper
-# model handles it. --out must be the path serve reads, or you get a server with no routing.
+# Turn those measurements into a routing policy
 wmo optimize route fit matrix.json --kind knn --fallback gpt-5.5 \
   --out .wmo/models/my-endpoint/policy.json
 ```
@@ -52,10 +48,9 @@ wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
   --baseline gpt-5.5
 ```
 
-Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md), serve
-a single model with no routing via `wmo optimize route pin`, or build an optimized harness for your
-agent with
-`wmo optimize harness`.
+Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md),
+serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
+for your agent with `wmo optimize harness`.
 
 ### Hosted platform
 
