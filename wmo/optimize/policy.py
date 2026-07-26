@@ -38,6 +38,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
@@ -91,11 +92,21 @@ def write_artifact_atomically(path: Path, payload: bytes) -> None:
     policy.json is a mount failure rather than a slightly stale endpoint. It is also what lets
     a command that writes several artifacts promise that a failure leaves the old ones intact.
     `KnnBank.save` stages the same way for the sidecar it streams through numpy.
+
+    The staging name is unique PER CALL. `replace` is atomic, but a staging path shared between
+    two concurrent writers is not: they would interleave on one file, so one could publish the
+    other's bytes under its own name and the loser would fail on a file already renamed away.
+    It is also hidden and cleaned up on failure, so an interrupted write cannot leave litter in
+    an artifact directory that serving and the fitter both scan.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.with_name(f"{path.name}.partial")
-    staging.write_bytes(payload)
-    staging.replace(path)
+    staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
+    try:
+        staging.write_bytes(payload)
+        staging.replace(path)
+    except BaseException:
+        staging.unlink(missing_ok=True)
+        raise
 
 
 def knn_bank_path_for(policy_path: Path) -> Path:

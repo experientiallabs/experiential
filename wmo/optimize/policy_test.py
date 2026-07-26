@@ -20,6 +20,7 @@ from wmo.optimize.policy import (
     knn_decision,
     rank_decision,
     select_model,
+    write_artifact_atomically,
 )
 from wmo.providers.base import ProviderKind
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
@@ -225,6 +226,38 @@ def test_a_failed_policy_save_leaves_the_previous_artifact_intact(
     with pytest.raises(OSError, match="disk full"):
         _static().save(path)
     assert RoutingPolicy.load(path) == served  # the staged write never replaced it
+    assert [entry.name for entry in tmp_path.iterdir()] == ["policy.json"]  # no staging litter
+
+
+def test_interleaved_artifact_writes_do_not_share_a_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two writers mid-flight on one path must not stage through the same file.
+
+    Regression: the staging name was a fixed `<name>.partial`, so a second writer overwrote the
+    first's staged bytes before the first renamed. One save then published the OTHER's payload
+    under its own success message, and the loser failed on a file already renamed away.
+
+    The second write is driven to completion inside the first one's `replace`, which is the
+    interleaving that breaks a shared staging path, without depending on thread timing.
+    """
+    path = tmp_path / "policy.json"
+    staged: list[Path] = []
+    real_replace = Path.replace
+
+    def _replace(self: Path, target: Path) -> Path:
+        staged.append(self)
+        if len(staged) == 1:  # the first writer is mid-flight: run the second start to finish
+            write_artifact_atomically(path, b'{"second": true}')
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", _replace)
+    write_artifact_atomically(path, b'{"first": true}')
+
+    assert len({entry.name for entry in staged}) == 2  # two writers, two staging files
+    # The first writer renamed last, so its own bytes are what landed -- not the second's.
+    assert path.read_bytes() == b'{"first": true}'
+    assert [entry.name for entry in tmp_path.iterdir()] == ["policy.json"]
 
 
 def test_azure_embedder_spec_requires_backend_fields() -> None:
