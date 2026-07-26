@@ -1,4 +1,4 @@
-"""`wmh optimize <agent> harbor --mode distill`: the CLI face of on-policy distillation.
+"""`wmh optimize harness <agent> harbor --mode distill`: the CLI face of on-policy distillation.
 
 Kept out of `harness_app.py` the way eval's closed-loop half lives in
 `eval_closed_loop.py`: `optimize()` validates the flag surface and routes here
@@ -142,7 +142,7 @@ def run_distill(
         raise typer.BadParameter(
             "provide the agent NAME whose harness the pi trials run (the literal "
             f"{DEFAULT_SEED_AGENT!r} is the built-in default agent): "
-            "`wmh optimize pi harbor --mode distill --distill-config run.toml "
+            "`wmh optimize harness pi harbor --mode distill --distill-config run.toml "
             "--task-ids train.json --holdout-task-ids holdout.json --run-dir <dir>`"
         )
     backend_override: Literal["local", "e2b"] | None

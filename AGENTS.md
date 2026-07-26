@@ -83,7 +83,7 @@ uv run pytest -q
 - Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
   deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
   promotion or rollback.
-- `wmh optimize <agent> harbor --mode distill` is the third optimization surface: instead of
+- `wmh optimize harness <agent> harbor --mode distill` is the third optimization surface: instead of
   editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
   student from pi-agent rollouts on harbor tasks (the harness stays pinned for the run). The
   loss is per-token reverse KL against the teacher's logprobs on the student's own sampled

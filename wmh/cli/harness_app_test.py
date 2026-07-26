@@ -826,7 +826,16 @@ class _DistillRecorder:
 def test_optimize_rejects_an_unknown_mode(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["optimize", "pi", "harbor", "--mode", "banana", "--root", str(tmp_path / ".wmh")],
+        [
+            "optimize",
+            "harness",
+            "pi",
+            "harbor",
+            "--mode",
+            "banana",
+            "--root",
+            str(tmp_path / ".wmh"),
+        ],
     )
     assert result.exit_code == 2
     assert "choose search or distill" in " ".join(result.output.split())
@@ -837,6 +846,7 @@ def test_search_mode_rejects_distill_only_flags(tmp_path: Path) -> None:
         app,
         [
             "optimize",
+            "harness",
             "made",
             "--tasks",
             _tasks_file(tmp_path),
@@ -859,6 +869,7 @@ def test_distill_mode_requires_the_harbor_environment(tmp_path: Path) -> None:
         app,
         [
             "optimize",
+            "harness",
             "made",
             "--mode",
             "distill",
@@ -879,6 +890,7 @@ def test_harbor_distill_rejects_search_only_flags(tmp_path: Path) -> None:
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",
@@ -933,6 +945,7 @@ def test_distill_mode_rejects_a_world_model_named_harbor(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",
@@ -962,6 +975,7 @@ def test_harbor_distill_routes_to_run_distill_with_the_flag_wiring(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",
@@ -1006,6 +1020,7 @@ def test_harbor_distill_passes_an_explicit_backend_through(
         app,
         [
             "optimize",
+            "harness",
             "pi",
             "harbor",
             "--mode",
