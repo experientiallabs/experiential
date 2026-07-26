@@ -19,6 +19,7 @@ comparison rows are r1's (cited, not recomputed). $0 API (all embeddings cached)
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import logging
 import sys
@@ -72,6 +73,9 @@ class _CachedEmbedder:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bank-cohort", default="tau-bench")
+    args = parser.parse_args()
     real = OutcomeMatrix.load(DATA / "matrices" / "tau-bench-real_matrix.json")
     real_ctx = R1.MatrixContext(real, "tau-bench-real", embed="openai", embed_replies=False)
     real_ids = real.scenario_ids()
@@ -79,8 +83,10 @@ def main() -> None:
     ts = datetime.now(tz=UTC).isoformat()
     fable_eval = evaluate_choices(real, real_ids, lambda _s: FALLBACK)
 
-    wm = OutcomeMatrix.load(DATA / "matrices" / "tau-bench_matrix.json")
-    wm_ctx = R1.MatrixContext(wm, "wm-tau-bench", embed="openai", embed_replies=False)
+    cohort = args.bank_cohort
+    wm = OutcomeMatrix.load(DATA / "matrices" / f"{cohort}_matrix.json")
+    wm_name = f"wm-{cohort}" if cohort == "tau-bench" else cohort
+    wm_ctx = R1.MatrixContext(wm, wm_name, embed="openai", embed_replies=False)
     text_to_vec = {wm_ctx.tasks[sid]: wm_ctx.task_vecs[sid] for sid in wm_ctx.scenario_ids}
     embedder = _CachedEmbedder(text_to_vec)
 
@@ -162,9 +168,18 @@ def main() -> None:
                     blocked += 1
                 gated[sid] = pick
             routed = sum(1 for p in gated.values() if p != FALLBACK)
+            routed_pre = sum(1 for p in champ.values() if p != FALLBACK)
+            record(
+                "r3b-real-champ" + ("-floor" if floor_q else ""),
+                {"bank_cohort": cohort, "floor_q": floor_q, "bank_seed": bank_seed},
+                champ,
+                f"; PRE-GATE champion (r1 protocol replication, for pairing; r1's own "
+                f"rows canonical when present); bank_n={len(fit_ids)} "
+                f"routed_away={routed_pre}/{len(real_ids)}",
+            )
             record(
                 "r3b-real-hybrid-svm" + ("-floor" if floor_q else ""),
-                {"bank_cohort": "tau-bench", "floor_q": floor_q, "bank_seed": bank_seed},
+                {"bank_cohort": cohort, "floor_q": floor_q, "bank_seed": bank_seed},
                 gated,
                 f"; bank_n={len(fit_ids)} svm_trainable={len(trainable)} "
                 f"blocked={blocked} routed_away={routed}/{len(real_ids)}",
