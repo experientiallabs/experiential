@@ -15,6 +15,12 @@ anything else must declare `input_per_mtok`/`output_per_mtok` so downstream cost
 honest (an unpriced candidate would silently report $0). `cached_input_per_mtok` is the provider
 cache-READ price and `cache_write_per_mtok` the cache-WRITE price, carried for cache-aware
 routing and compression costs.
+
+`kind = "openrouter"` entries are the one exception, because OpenRouter publishes prices for
+every model it fronts: an entry that declares none resolves them from that catalog at load
+(`wmo.providers.openrouter_pricing`) and keeps them, so a pool entry needs only a model id and
+downstream artifacts still record exact numbers. Offline with nothing cached, the entry falls
+back to the same "declare the prices" error, with the catalog failure named.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmo.providers.base import Provider, ProviderConfig, ProviderKind, TokenUsage
+from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.registry import get_provider
 from wmo.tracking.pricing import ModelPrice, price_for
 
@@ -66,10 +73,13 @@ class PoolEntry(BaseModel):
             raise ValueError(
                 f"pool model '{self.name}': set both input_per_mtok and output_per_mtok, or neither"
             )
+        catalog_note = ""
+        if self.input_per_mtok is None and self.kind is ProviderKind.OPENROUTER:
+            catalog_note = self._resolve_openrouter_price()
         if self.input_per_mtok is None and price_for(self.model) is None:
             raise ValueError(
-                f"pool model '{self.name}': '{self.model}' has no built-in price; add "
-                "input_per_mtok and output_per_mtok (USD per 1M tokens) to its pool entry"
+                f"pool model '{self.name}': '{self.model}' has no built-in price;{catalog_note} "
+                "add input_per_mtok and output_per_mtok (USD per 1M tokens) to its pool entry"
             )
         if self.kind is ProviderKind.AZURE_OPENAI and self.deployment is None:
             # Without this the entry loads fine and the first request routed to it 500s
@@ -79,6 +89,37 @@ class PoolEntry(BaseModel):
                 "deployment name to call)"
             )
         return self
+
+    def _resolve_openrouter_price(self) -> str:
+        """Stamp this entry with OpenRouter's published price, returning "" or why it could not.
+
+        Reached only from `_validate_price`, and only for an OpenRouter entry that declared no
+        price: no other provider's config validation touches the catalog, and nothing fetches
+        at import time.
+
+        Stamping (rather than looking the price up per call) is what makes a fitted policy
+        stable. `RoutingPolicy.pool` and `OutcomeMatrix.pool` serialize these entries verbatim,
+        so the numbers a policy was fitted under travel with it and re-validating that artifact
+        finds the prices already set, which short-circuits this method entirely. A later vendor
+        price change cannot silently re-price a policy already in production; refitting or a
+        fresh `load_pool` is what picks it up.
+
+        Returns:
+            An empty string on success, else a clause naming the catalog failure, ready to be
+            spliced into the caller's "declare the prices explicitly" error.
+        """
+        resolution = resolve_openrouter_price(self.model)
+        if resolution.price is None:
+            return f" {resolution.detail};"
+        self.input_per_mtok = resolution.price.input_per_mtok
+        self.output_per_mtok = resolution.price.output_per_mtok
+        # Cache tiers are published per model too, but an explicit entry value stays the
+        # operator's (a negotiated rate must not be overwritten by the public list price).
+        if self.cached_input_per_mtok is None:
+            self.cached_input_per_mtok = resolution.price.cache_read_per_mtok
+        if self.cache_write_per_mtok is None:
+            self.cache_write_per_mtok = resolution.price.cache_write_per_mtok
+        return ""
 
     def price(self) -> ModelPrice:
         """This entry's price row: the explicit override, else the built-in pricing table."""
