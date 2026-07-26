@@ -11,6 +11,16 @@ forfeits warm cache reads. The runtime fingerprints each finished exchange (full
 including the assistant reply) and, when the next request arrives with that transcript as its
 prefix, `select_model` sees the incumbent and sticks to it by default.
 
+Compression stage (D-COMPRESS): when the policy carries a compression config, the pipeline is
+request -> [compress] -> [route] -> provider call. Only user-message content is compressed;
+system prompts and the model's own prior replies pass through verbatim. The affinity state
+decides segment boundaries: an incumbent conversation's compressed prefix is stored alongside
+its fingerprint and REUSED, never recompressed, so the provider-visible prefix stays
+byte-identical across turns (the prompt cache survives by construction). Routing embeds the
+compressed text (the router sees what the model sees) while stickiness keys on the raw
+transcript the client resends. Compression fields go to the request log only, never response
+bodies or headers.
+
 Request log: one JSONL row per call with the D-SERVING-LOG fields (id, ts, endpoint, routed
 model, cluster, tokens incl. cached, cache-adjusted cost, latency, ttfb, status, reason).
 Provider cache CONTROLS (breakpoint placement, TTL) are not exposed yet; they land with the
@@ -36,6 +46,12 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, JsonValue, field_validator
 from starlette.background import BackgroundTask
 
+from wmh.optimize.compression import (
+    CompressionStats,
+    Compressor,
+    estimate_tokens,
+    get_compressor,
+)
 from wmh.optimize.policy import Embedder, RoutingDecision, RoutingPolicy, select_model
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -201,6 +217,15 @@ class RequestLogRecord(BaseModel):
     cached_tokens: int = 0  # cache-read prompt tokens (subset of input_tokens)
     cost_usd: float = 0.0  # effective cost: cached tokens billed at the cache-read rate
     router_cost_usd: float = 0.0  # the routing decision's own inference cost, passed through
+    # D-COMPRESS fields: stored and OPAQUE like the routing fields above (log only, never in
+    # response bodies or headers). 0/"" defaults = the request served uncompressed. Token
+    # counts are the compressor's deterministic proxy totals (see wmh.optimize.compression);
+    # billable truth stays in input_tokens/cost_usd from the provider-reported usage.
+    tokens_in_raw: int = 0
+    tokens_in_compressed: int = 0
+    compressor_id: str = ""
+    compressor_version: str = ""
+    aggressiveness: float = 0.0
     latency_ms: float = 0.0
     ttfb_ms: float | None = None
     status: Literal["ok", "error"] = "ok"
@@ -247,15 +272,79 @@ class EndpointRuntime:
         self._providers: dict[str, Provider] = {}
         self._policy_embedder: Embedder | None = None
         self._affinity: OrderedDict[str, str] = OrderedDict()
+        # Compressed provider-visible transcripts, keyed by the SAME raw-transcript fingerprint
+        # as _affinity: the affinity state decides compression segment boundaries. Only
+        # populated when the policy carries a compression config.
+        self._compressed: OrderedDict[str, list[ChatMessage]] = OrderedDict()
+        # Resolved once at mount (policy validation already proved the id is known), mirroring
+        # the embedder-once pattern: no per-request registry lookups.
+        self._compressor: Compressor | None = (
+            get_compressor(policy.compression.compressor_id)
+            if policy.compression is not None
+            else None
+        )
         self._lock = threading.Lock()
 
-    def decide(self, messages: list[ChatMessage]) -> RoutingDecision:
+    def decide(
+        self, messages: list[ChatMessage], *, route_text: str | None = None
+    ) -> RoutingDecision:
+        """Route the request. Stickiness keys on the RAW transcript the client resends;
+        `route_text` (the compressed routable text when compression is on) is what gets
+        embedded, so the router scores exactly what the model will see."""
         incumbent = None
         if len(messages) > 1:
             with self._lock:
                 incumbent = self._affinity.get(_fingerprint(messages[:-1]))
-        text = _routable_text(messages)
+        text = route_text if route_text is not None else _routable_text(messages)
         return select_model(self.policy, text, incumbent=incumbent, embedder=self._embedder())
+
+    def compress(
+        self, messages: list[ChatMessage]
+    ) -> tuple[list[ChatMessage], CompressionStats | None]:
+        """The [compress] stage: raw request messages -> provider-visible messages + stats.
+
+        Cache safety by construction: when the conversation's previous exchange is known
+        (affinity hit on the raw prefix), the stored compressed prefix is returned verbatim
+        and only the new final user message passes through the compressor. On a miss (new
+        conversation, or affinity evicted) every user message is compressed fresh; per-segment
+        determinism makes that reproduce the same bytes, so the provider-visible prefix stays
+        append-only either way. Returns the input list untouched when compression is off.
+        """
+        config = self.policy.compression
+        if config is None or self._compressor is None:
+            return messages, None
+        started = time.monotonic()
+        cost_usd = 0.0
+        prefix: list[ChatMessage] | None = None
+        if len(messages) > 1:
+            with self._lock:
+                prefix = self._compressed.get(_fingerprint(messages[:-1]))
+        if prefix is not None:
+            last = messages[-1]
+            if last.role == "user":
+                result = self._compressor.compress([last.content], config)
+                cost_usd = result.cost_usd
+                last = ChatMessage(role="user", content=result.segments[0])
+            compressed = [*prefix, last]
+        else:
+            user_segments = [m.content for m in messages if m.role == "user"]
+            result = self._compressor.compress(user_segments, config)
+            cost_usd = result.cost_usd
+            replacements = iter(result.segments)
+            compressed = [
+                ChatMessage(role="user", content=next(replacements)) if m.role == "user" else m
+                for m in messages
+            ]
+        stats = CompressionStats(
+            compressor_id=self._compressor.id,
+            compressor_version=self._compressor.version,
+            aggressiveness=config.aggressiveness,
+            tokens_in_raw=sum(estimate_tokens(m.content) for m in messages),
+            tokens_in_compressed=sum(estimate_tokens(m.content) for m in compressed),
+            latency_s=time.monotonic() - started,
+            cost_usd=cost_usd,
+        )
+        return compressed, stats
 
     def _embedder(self) -> Embedder | None:
         """Build the policy's embedder once per runtime, not once per request.
@@ -279,8 +368,21 @@ class EndpointRuntime:
                 embedder = self._policy_embedder
         return embedder
 
-    def remember(self, messages: list[ChatMessage], assistant_text: str, model: str) -> None:
-        """Record the finished exchange so the conversation's next request finds its incumbent."""
+    def remember(
+        self,
+        messages: list[ChatMessage],
+        assistant_text: str,
+        model: str,
+        *,
+        compressed: list[ChatMessage] | None = None,
+    ) -> None:
+        """Record the finished exchange so the conversation's next request finds its incumbent.
+
+        `messages` must be the RAW request messages (the client resends that transcript, so
+        the fingerprint must match it). `compressed` is the provider-visible transcript when
+        compression ran; stored under the same key so the next turn reuses the exact bytes
+        the provider's prompt cache was written with.
+        """
         transcript = [*messages, ChatMessage(role="assistant", content=assistant_text)]
         key = _fingerprint(transcript)
         with self._lock:
@@ -288,6 +390,12 @@ class EndpointRuntime:
             self._affinity.move_to_end(key)
             while len(self._affinity) > _AFFINITY_CAPACITY:
                 self._affinity.popitem(last=False)
+            if compressed is not None:
+                reply = ChatMessage(role="assistant", content=assistant_text)
+                self._compressed[key] = [*compressed, reply]
+                self._compressed.move_to_end(key)
+                while len(self._compressed) > _AFFINITY_CAPACITY:
+                    self._compressed.popitem(last=False)
 
     def provider_for(self, pool_name: str) -> tuple[PoolEntry, Provider]:
         entry = next(e for e in self.policy.pool if e.name == pool_name)
@@ -400,7 +508,11 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 code="invalid_messages",
             )
         try:
-            decision = runtime.decide(request.messages)
+            # request -> [compress] -> [route]: the router embeds the compressed text below.
+            provider_messages, compression = runtime.compress(request.messages)
+            decision = runtime.decide(
+                request.messages, route_text=_routable_text(provider_messages)
+            )
             entry, provider = runtime.provider_for(decision.model)
         except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502 + log row
             # The likeliest production failure: an unset api_key_env or a failing embed call.
@@ -424,7 +536,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 err_type="api_error",
                 code="routing_error",
             )
-        system, turns = _split_for_provider(request.messages)
+        system, turns = _split_for_provider(provider_messages)
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         started = time.monotonic()
@@ -450,6 +562,11 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     output_tokens=usage.output_tokens,
                     cached_tokens=usage.cached_input_tokens,
                     cost_usd=entry.cost_usd(usage),
+                    tokens_in_raw=compression.tokens_in_raw if compression else 0,
+                    tokens_in_compressed=compression.tokens_in_compressed if compression else 0,
+                    compressor_id=compression.compressor_id if compression else "",
+                    compressor_version=compression.compressor_version if compression else "",
+                    aggressiveness=compression.aggressiveness if compression else 0.0,
                     latency_ms=(time.monotonic() - started) * 1000,
                     ttfb_ms=ttfb_ms,
                     status=status,
@@ -478,7 +595,12 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     err_type="api_error",
                     code="upstream_error",
                 )
-            runtime.remember(request.messages, completion.text, decision.model)
+            runtime.remember(
+                request.messages,
+                completion.text,
+                decision.model,
+                compressed=provider_messages if compression else None,
+            )
             _record(completion.usage, ttfb_ms=None)
             return Response(
                 content=json.dumps(
@@ -590,7 +712,12 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     }
                 )
             yield "data: [DONE]\n\n"
-            runtime.remember(request.messages, "".join(parts), decision.model)
+            runtime.remember(
+                request.messages,
+                "".join(parts),
+                decision.model,
+                compressed=provider_messages if compression else None,
+            )
             stream_state["recorded"] = True
             _record(usage, ttfb_ms=ttfb_ms)
 

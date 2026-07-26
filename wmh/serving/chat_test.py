@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from wmh.optimize.compression import CompressionConfig, CompressionResult, Compressor
 from wmh.optimize.policy import (
     KNN_BANK_FILENAME,
     POLICY_FILENAME,
@@ -498,3 +499,286 @@ def test_static_policy_never_builds_its_embedder(
         json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
+
+
+# --- D-COMPRESS: the serving compression stage ---
+
+
+class _CapturingProvider(_EchoProvider):
+    """Echo provider that also records every (system, messages) it was asked to serve."""
+
+    def __init__(self, entry: PoolEntry) -> None:
+        super().__init__(entry)
+        self.seen: list[tuple[str, list[Message]]] = []
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        self.seen.append((system, list(messages)))
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Iterator[StreamChunk]:
+        self.seen.append((system, list(messages)))
+        yield from super().stream(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def _compressed_runtime(
+    tmp_path: Path, compression: CompressionConfig | None
+) -> tuple[TestClient, Path, EndpointRuntime, dict[str, _CapturingProvider]]:
+    providers: dict[str, _CapturingProvider] = {}
+
+    def factory(entry: PoolEntry) -> _CapturingProvider:
+        provider = _CapturingProvider(entry)
+        providers[entry.name] = provider
+        return provider
+
+    log_path = tmp_path / "requests.jsonl"
+    policy = RoutingPolicy(
+        kind="static", default_model="haiku-4-5", pool=_pool(), compression=compression
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=factory, log=RequestLog(log_path)
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    return TestClient(app), log_path, runtime, providers
+
+
+def _last_log_row(log_path: Path) -> dict[str, object]:
+    return json.loads(log_path.read_text().splitlines()[-1])
+
+
+def test_identity_compression_serves_bit_for_bit(tmp_path: Path) -> None:
+    # The seam's do-no-harm proof: identity compression and no compression hand the provider
+    # byte-identical (system, turns), and the log accounts raw == compressed.
+    body = {
+        "model": "tau-bench",
+        "messages": [
+            {"role": "system", "content": "be  terse\twith   spacing"},
+            {"role": "user", "content": "  what is 2+2?  keep my  spacing "},
+        ],
+    }
+    _, _, runtime_off, providers_off = _compressed_runtime(tmp_path / "off", None)
+    client_off = TestClient(_app_for(runtime_off))
+    client_off.post("/v1/chat/completions", json=body)
+    identity = CompressionConfig(compressor_id="identity", aggressiveness=1.0)
+    client_on, log_path, _, providers_on = _compressed_runtime(tmp_path / "on", identity)
+    response = client_on.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200
+    assert providers_on["haiku-4-5"].seen == providers_off["haiku-4-5"].seen
+    row = _last_log_row(log_path)
+    assert row["compressor_id"] == "identity"
+    assert row["tokens_in_raw"] == row["tokens_in_compressed"]
+    assert cast("int", row["tokens_in_raw"]) > 0
+
+
+def _app_for(runtime: EndpointRuntime) -> FastAPI:
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    return app
+
+
+def test_truncate_compresses_what_the_provider_sees(tmp_path: Path) -> None:
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, log_path, _, providers = _compressed_runtime(tmp_path, config)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "system", "content": "system prompts are never compressed"},
+                {"role": "user", "content": "one two three four five six seven eight"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    system, turns = providers["haiku-4-5"].seen[0]
+    assert system == "system prompts are never compressed"  # verbatim
+    assert turns[0].content == "one two three four"  # trailing half dropped
+    row = _last_log_row(log_path)
+    assert row["compressor_id"] == "truncate"
+    assert row["compressor_version"] == "1"
+    assert row["aggressiveness"] == 0.5
+    assert cast("int", row["tokens_in_compressed"]) < cast("int", row["tokens_in_raw"])
+    # OPAQUE: compression never surfaces in the response body or headers.
+    assert "compress" not in response.text
+    assert not any("compress" in key.lower() for key in response.headers)
+
+
+def test_incumbent_prefix_is_reused_not_recompressed(tmp_path: Path) -> None:
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, _, runtime, providers = _compressed_runtime(tmp_path, config)
+
+    class _SpyCompressor:
+        """Delegates to the real compressor, recording which segments it was handed."""
+
+        def __init__(self, inner: Compressor) -> None:
+            self.inner = inner
+            self.id = inner.id
+            self.version = inner.version
+            self.calls: list[list[str]] = []
+
+        def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+            self.calls.append(list(segments))
+            return self.inner.compress(segments, config)
+
+    spy = _SpyCompressor(cast("Compressor", runtime._compressor))
+    runtime._compressor = spy
+
+    first_user = "alpha beta gamma delta epsilon zeta"
+    first = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": first_user}]},
+    )
+    reply = first.json()["choices"][0]["message"]["content"]
+    turn_one = list(providers["haiku-4-5"].seen[0][1])
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": first_user},
+                {"role": "assistant", "content": reply},
+                {"role": "user", "content": "eta theta iota kappa"},
+            ],
+        },
+    )
+
+    assert second.status_code == 200
+    # The compressor only ever saw the turn-local segment on turn two: the cached prefix was
+    # RETRIEVED from the affinity state, not recompressed.
+    assert spy.calls == [[first_user], ["eta theta iota kappa"]]
+    # And the provider-visible prefix is byte-identical across turns (prompt cache survives).
+    second_turns = providers["haiku-4-5"].seen[1][1]
+    assert [(m.role, m.content) for m in second_turns[: len(turn_one)]] == [
+        (m.role, m.content) for m in turn_one
+    ]
+    assert second_turns[0].content == "alpha beta gamma"  # compressed once, reused verbatim
+    assert second_turns[1].content == reply  # the model's own reply is never compressed
+    assert second_turns[2].content == "eta theta"
+
+
+def test_lost_affinity_recompression_is_byte_identical(tmp_path: Path) -> None:
+    # Affinity eviction must not break the provider-visible prefix: per-segment determinism
+    # reproduces the same bytes when the whole transcript is recompressed from scratch.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, _, runtime, providers = _compressed_runtime(tmp_path, config)
+    first_user = "alpha beta gamma delta epsilon zeta"
+    first = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": first_user}]},
+    )
+    reply = first.json()["choices"][0]["message"]["content"]
+    turn_one = providers["haiku-4-5"].seen[0][1]
+
+    with runtime._lock:
+        runtime._affinity.clear()
+        runtime._compressed.clear()
+
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": first_user},
+                {"role": "assistant", "content": reply},
+                {"role": "user", "content": "eta theta iota kappa"},
+            ],
+        },
+    )
+    assert second.status_code == 200
+    second_turns = providers["haiku-4-5"].seen[1][1]
+    assert [(m.role, m.content) for m in second_turns[: len(turn_one) + 1]] == [
+        *[(m.role, m.content) for m in turn_one],
+        ("assistant", reply),
+    ]
+
+
+def test_compression_fields_populate_on_stream_path(tmp_path: Path) -> None:
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, log_path, _, providers = _compressed_runtime(tmp_path, config)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "stream": True,
+            "messages": [{"role": "user", "content": "one two three four five six"}],
+        },
+    ) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+    assert "[DONE]" in body
+    assert "compress" not in body  # opaque on the stream too
+    system, turns = providers["haiku-4-5"].seen[0]
+    assert turns[0].content == "one two three"
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(rows) == 1  # one record per request, stream included
+    assert rows[0]["compressor_id"] == "truncate"
+    assert cast("int", rows[0]["tokens_in_compressed"]) < cast("int", rows[0]["tokens_in_raw"])
+
+
+def test_compression_fields_populate_on_error_path(tmp_path: Path) -> None:
+    class _FailingProvider(_EchoProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Completion:
+            raise RuntimeError("upstream on fire")
+
+    log_path = tmp_path / "requests.jsonl"
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=_FailingProvider, log=RequestLog(log_path)
+    )
+    response = TestClient(_app_for(runtime)).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "one two three four five six"}],
+        },
+    )
+    assert response.status_code == 502
+    rows = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert len(rows) == 1  # one record per request, error included
+    assert rows[0]["status"] == "error"
+    assert rows[0]["compressor_id"] == "truncate"
+    assert cast("int", rows[0]["tokens_in_compressed"]) < cast("int", rows[0]["tokens_in_raw"])
+
+
+def test_uncompressed_rows_keep_default_compression_fields(tmp_path: Path) -> None:
+    client, log_path = _client(tmp_path)
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    row = _last_log_row(log_path)
+    assert row["compressor_id"] == ""
+    assert row["compressor_version"] == ""
+    assert row["tokens_in_raw"] == 0
+    assert row["tokens_in_compressed"] == 0
+    assert row["aggressiveness"] == 0.0
