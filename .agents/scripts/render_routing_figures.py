@@ -69,6 +69,12 @@ CONFIDENCE_ROUTED_AWAY = [69.1, 68.0, 64.9, 48.0, 30.9]
 CONFIDENCE_ACC = [0.9607, 0.9607, 0.9607, 0.9635, 0.9579]
 
 HEADLINE_MATRIX = "routerbench-ours9"
+# The PROMOTED champion, pinned by name rather than picked by best delta. Unguarded kNN
+# variants score higher here (r1-knn-noguard-oai reaches +1.33pt) but are not deployable: the
+# guard is what keeps the router from dipping below baseline under distribution shift, which
+# is exactly the weakness PR #259 found and fixed. Labelling the ungated variant "champion"
+# would advertise a configuration we deliberately did not ship.
+CHAMPION_VARIANT = "r1-knn-statz05-oai"  # kNN + relative threshold + stat guard, z=0.5
 
 
 def load_groups() -> tuple[list[dict], int]:
@@ -159,8 +165,8 @@ def fig_pareto(groups: list[dict], plt: ModuleType) -> Path:
 
     anchor = next(g for g in rows if g["v"] == "best-single")
     champion = max(
-        (g for g in rows if g["fam"] == "knn" and g["tier"] == "beats"),
-        key=lambda g: g["d"] or 0.0,
+        (g for g in rows if g["v"] == CHAMPION_VARIANT and g["tier"] == "beats"),
+        key=lambda g: (g["s"], g["d"] or 0.0),
     )
     fable_cost = statistics.median([g["pmc"]["fable-5"] for g in rows if "fable-5" in g["pmc"]])
 
@@ -216,7 +222,8 @@ def fig_pareto(groups: list[dict], plt: ModuleType) -> Path:
         fmt="none",
     )
     ax.annotate(
-        f"kNN champion {champion['acc']:.1%}\n{100 * champion['d']:+.1f}pt vs best single, "
+        f"kNN champion (guarded) {champion['acc']:.1%}\n"
+        f"{100 * champion['d']:+.2f}pt vs best single, "
         f"{champion['w']}/{champion['s']} seeds, "
         f"{1 - champion['cost'] / anchor['cost']:.0%} cheaper",
         xy=(champion["cost"], champion["acc"]),
