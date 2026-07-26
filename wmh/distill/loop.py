@@ -2950,19 +2950,23 @@ class _DistillRun:
             finally:
                 # Same contract as the topk_ce branch above.
                 self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
-            logger.info(
-                "step %d chunk scoring: %d/%d datum(s) scored, coverage %.1f%% "
-                "(dropped: %d no-span-map, %d no-replay, %d no-islands, %d no-chunks, "
-                "%d scoring-failed)",
-                step,
-                chunk_stats.scored,
-                len(datums),
-                100 * chunk_stats.coverage,
-                chunk_stats.no_span_map,
-                chunk_stats.no_replay,
-                chunk_stats.no_islands,
-                chunk_stats.no_chunks,
-                chunk_stats.scoring_failed,
+            # Emitted, not logged: coverage is the headline diagnostic for the
+            # cross-tokenizer path, since a collapse means the step trains on almost
+            # nothing, and the CLI installs a WARNING-level handler — so a logger.info
+            # record reaches no console and no file, and the number is computed and
+            # then discarded. _emit still logs at info level, so nothing is dropped.
+            # Step is reported 1-based like the rollouts event: two different numbers
+            # for one step reads as a contradiction in the log.
+            self._emit(
+                "training",
+                f"step {step + 1}/{cfg.train.steps} chunk scoring: "
+                f"{chunk_stats.scored}/{len(datums)} "
+                f"datum(s) scored, coverage {100 * chunk_stats.coverage:.1f}% "
+                f"(dropped: {chunk_stats.no_span_map} no-span-map, "
+                f"{chunk_stats.no_replay} no-replay, {chunk_stats.no_islands} no-islands, "
+                f"{chunk_stats.no_chunks} no-chunks, "
+                f"{chunk_stats.scoring_failed} scoring-failed)",
+                step=step,
             )
             if not scored:
                 raise RuntimeError(
