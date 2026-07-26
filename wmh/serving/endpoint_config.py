@@ -20,7 +20,7 @@ import tomllib
 from pathlib import Path
 
 import tomli_w
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 ENDPOINT_CONFIG_FILENAME = "endpoint.toml"
 
@@ -31,7 +31,13 @@ class EndpointConfig(BaseModel):
     `cost_quality` is the one dial (0.0 = max quality, 1.0 = max savings; see
     `wmh.optimize.knn.apply_cost_quality`). None means "serve the policy as fitted", which is
     also what an absent file means.
+
+    `extra="forbid"` for the same reason `PoolEntry` forbids it: a typo like `cost_qualty` must
+    fail at load with the key named, not be silently ignored and leave an operator staring at an
+    endpoint that ignored the dial they set.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     cost_quality: float | None = Field(default=None, ge=0.0, le=1.0)
 
@@ -45,7 +51,7 @@ class EndpointConfig(BaseModel):
         except tomllib.TOMLDecodeError as error:
             raise ValueError(
                 f"invalid endpoint config at {path}: {error}. Expected TOML with at most a "
-                "`cost_quality` key between 0.0 and 1.0"
+                "`cost_quality` key between 0.0 and 1.0, and no other keys"
             ) from error
         return cls.model_validate(data)
 

@@ -452,3 +452,15 @@ def test_an_unservable_dial_setting_fails_the_mount_by_name(tmp_path: Path) -> N
     priceless = policy.model_copy(update={"cost_scale": 0.0})
     with pytest.raises(ValueError, match=ENDPOINT_CONFIG_FILENAME):
         _endpoint_runtimes({"support": priceless}, {"support": model_dir}, RequestLog(None))
+
+
+def test_a_malformed_endpoint_toml_names_the_endpoint_and_the_file(tmp_path: Path) -> None:
+    # The read is inside the fail-fast guard, so a typo or a broken file says WHICH endpoint and
+    # WHICH path, not just that some TOML somewhere would not parse.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    (model_dir / ENDPOINT_CONFIG_FILENAME).write_text("cost_qualty = 0.6\n", encoding="utf-8")
+    with pytest.raises(ValueError) as error:
+        _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    assert "support" in str(error.value)
+    assert ENDPOINT_CONFIG_FILENAME in str(error.value)
+    assert "cost_qualty" in str(error.value)

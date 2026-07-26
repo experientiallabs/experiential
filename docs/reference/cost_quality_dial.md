@@ -6,8 +6,11 @@ support. The dial is the one number an operator turns afterwards to say how that
 spend: `cost_quality` in `[0, 1]`, where **0.0 spends for quality** and **1.0 spends as little as
 this policy family can**. Nothing is refitted when it moves, so it is a live control.
 
-`0.25` is the balanced position and is exactly what a fresh fit serves, so an endpoint nobody
-dials and an endpoint set to 0.25 behave identically.
+`0.25` is the balanced position, and a fit left at the CLI defaults serves exactly those knobs, so
+an endpoint nobody dials and an endpoint set to 0.25 behave identically. A fit given different
+knobs (a stricter confidence bar, another novelty floor) is a different operating point: the dial
+has not been set on it, the endpoint reports the coverage setting it was actually fitted with, and
+no measured quality figure is quoted for it until someone dials it onto the frontier.
 
 ## What the dial actually changes
 
@@ -116,10 +119,12 @@ curl -s -X PUT localhost:8000/v1/endpoints/support/config \
 ```
 
 `GET` returns the current position, its label (one per measured position, per the table above,
-with `Custom` for anything in between and `as-fitted` when no dial has been set), the knobs
-actually being served, and the anchor table. `PUT` re-applies the mapping to the live runtime with no
-restart and persists the setting to `endpoint.toml`, so it survives one. In-flight requests keep
-the position they started on.
+with `Custom` for anything in between and `as-fitted` when no dial has been set), the knobs the
+endpoint is actually serving, and the anchor table. Those knobs are read off the policy, so an
+as-fitted endpoint reports the settings its own fit used; `floor_q` comes back `null` for a policy
+fitted before that quantile was recorded, rather than a `0.0` that would read as "no floor". `PUT`
+re-applies the mapping to the live runtime with no restart and persists the setting to
+`endpoint.toml`, so it survives one. In-flight requests keep the position they started on.
 
 `PUT` answers `409` when the policy has no dial (a `static` or `rank` endpoint) or when a
 position past 0.25 is asked of a policy fitted without cost evidence, since there would be no

@@ -239,6 +239,7 @@ def fit_knn_policy(
         knn_min_pairs=min_pairs,
         se_floor=se_floor,
         floor_sim=bank_floor_sim(bank, floor_q),
+        floor_q=floor_q,  # kept beside the threshold: see RoutingPolicy.floor_q
         pick_lam=pick_lam,
         # Persisted at fit time so serving never recomputes it: the cost knob's denominator is
         # a property of the fit evidence, and a serve-time recompute would make the same dial
@@ -451,6 +452,7 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
         update={
             "knn_z": knobs.knn_z,
             "floor_sim": bank_floor_sim(bank, knobs.floor_q),
+            "floor_q": knobs.floor_q,
             "pick_lam": knobs.pick_lam,
             "guard_mode": knobs.guard_mode,
             "cost_quality": cost_quality,

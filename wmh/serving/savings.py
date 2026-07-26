@@ -40,7 +40,9 @@ WINDOW_DAYS = 7
 # The sentences the response ships. Written as customer copy on purpose (see module docstring).
 BASIS_COUNTERFACTUAL = (
     "Savings compare what you were billed against what the same requests would have cost on "
-    "{fallback} alone, priced on the same number of tokens each request actually used."
+    "{fallback} alone, priced on the same number of tokens each request actually used, including "
+    "crediting {fallback} with the cached reads the model that served earned. Both assumptions "
+    "understate the saving rather than inflate it."
 )
 BASIS_NO_TRAFFIC = "This endpoint has not served any requests yet, so there is nothing to compare."
 BASIS_LATENCY_SELF = (
@@ -118,10 +120,13 @@ def _expected_quality(policy: RoutingPolicy) -> tuple[float, str]:
 
     Exactly on an anchor: that anchor's measured delta. Between two anchors: a linear
     interpolation, labeled as one. Dial never set: the balanced anchor, because a policy fitted
-    with the shipped defaults IS the balanced setting (same confidence bar, no cost pressure,
-    strict guard), which is checked here rather than assumed. A policy fitted to knobs off the
-    dial gets no figure at all: quoting the balanced number for an endpoint someone deliberately
-    tuned elsewhere would be a claim about an evaluation that never ran.
+    with the shipped defaults IS the balanced setting, which is checked against ALL FOUR knobs
+    the dial controls rather than assumed. The coverage knob matters most here: `floor_q` is the
+    only thing separating the balanced setting from the quality-max one, so a fit that set it
+    differently is a different operating point no matter how the other three read. A policy off
+    the dial, or one whose `floor_q` was never recorded, gets no figure at all: quoting the
+    balanced number for an endpoint someone tuned elsewhere would be a claim about an evaluation
+    that never ran.
     """
     dial = policy.cost_quality
     balanced = next(
@@ -134,7 +139,9 @@ def _expected_quality(policy: RoutingPolicy) -> tuple[float, str]:
     if dial is None:
         default_knobs = cost_quality_knobs(COST_QUALITY_BALANCED)
         as_fitted_is_balanced = (
-            policy.knn_z == default_knobs.knn_z
+            policy.floor_q is not None
+            and abs(policy.floor_q - default_knobs.floor_q) < 1e-9
+            and policy.knn_z == default_knobs.knn_z
             and policy.pick_lam == default_knobs.pick_lam
             and policy.guard_mode == default_knobs.guard_mode
         )

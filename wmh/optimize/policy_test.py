@@ -575,3 +575,38 @@ def test_knn_bank_round_trips_through_the_sidecar(tmp_path: Path) -> None:
     assert reloaded.scenario_ids == bank.scenario_ids
     np.testing.assert_array_equal(reloaded.rewards, bank.rewards)  # NaN cells included
     np.testing.assert_allclose(reloaded.embeddings, bank.embeddings)
+
+
+def test_the_asymmetric_bar_does_not_claim_to_have_doubled_z() -> None:
+    # Cheap baseline, pricey challenger with evidence that clears the bar. The symmetric bar
+    # doubles z for the pricier pick and says so; the asymmetric one holds it at z, so claiming
+    # a doubling would misreport which bar the request was actually held to.
+    strong = _knn_bank([[0.0, 1.0]] * 12, costs=[_CHEAP, _PRICEY])
+    symmetric = knn_decision(_knn_policy(strong), _QUERY)
+    asymmetric = knn_decision(_knn_policy(strong, guard_mode="asymmetric"), _QUERY)
+    assert symmetric.model == asymmetric.model == "haiku-4-5"
+    assert "(pricier, doubled z)" in symmetric.reason
+    assert "1xSE" in symmetric.reason  # z doubled from 0.5
+    assert "(pricier)" in asymmetric.reason
+    assert "doubled" not in asymmetric.reason
+    assert "0.5xSE" in asymmetric.reason
+
+
+def test_a_cost_demoted_leader_is_named_in_the_reason() -> None:
+    # The savings leg's dominant decision: haiku led the neighborhood on reward, the cost knob
+    # priced it out, and the baseline serves. The log must not call that "baseline leads".
+    bank = _knn_bank([[0.5, 0.55]] * 12, costs=[_CHEAP, _PRICEY])
+    decision = knn_decision(_knn_policy(bank, pick_lam=0.5, guard_mode="asymmetric"), _QUERY)
+    assert decision.model == "fable-5"
+    assert "cost knob (lam=0.5)" in decision.reason
+    assert "haiku-4-5 led" in decision.reason
+    assert "not on price" in decision.reason
+    assert "leads 12 neighbors" not in decision.reason
+
+
+def test_a_genuine_baseline_win_still_says_the_baseline_led() -> None:
+    # The other way into the same branch: no cost pressure, the baseline simply scored best.
+    decision = knn_decision(_knn_policy(_knn_bank([[1.0, 0.0]] * 12)), _QUERY)
+    assert decision.model == "fable-5"
+    assert "leads 12 neighbors" in decision.reason
+    assert "cost knob" not in decision.reason

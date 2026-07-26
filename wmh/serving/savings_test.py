@@ -40,8 +40,18 @@ _HAIKU = PoolEntry(
 )
 
 
-def _policy(*, cost_quality: float | None = None, kind: str = "knn") -> RoutingPolicy:
-    """A policy with opus as the pinned fallback, i.e. the counterfactual every row prices."""
+def _policy(
+    *,
+    cost_quality: float | None = None,
+    kind: str = "knn",
+    floor_q: float | None = 0.05,
+) -> RoutingPolicy:
+    """A policy with opus as the pinned fallback, i.e. the counterfactual every row prices.
+
+    `floor_q` defaults to the shipped fit default (0.05), which is also the balanced dial's
+    coverage setting, so the default fixture is a genuinely as-fitted-balanced endpoint. Pass
+    another value (or None) to build one that is off the dial.
+    """
     if kind == "static":
         return RoutingPolicy(kind="static", default_model="opus", pool=[_OPUS, _HAIKU])
     return RoutingPolicy(
@@ -51,6 +61,7 @@ def _policy(*, cost_quality: float | None = None, kind: str = "knn") -> RoutingP
         pool=[_OPUS, _HAIKU],
         cost_scale=0.0055,
         cost_quality=cost_quality,
+        floor_q=floor_q,
     )
 
 
@@ -178,20 +189,34 @@ def test_a_dial_between_anchors_interpolates_and_says_so() -> None:
 
 
 def test_an_untouched_dial_reports_the_balanced_expectation() -> None:
-    # A policy fitted with the shipped defaults IS the balanced setting, so that anchor's number
-    # is the right expectation for an endpoint nobody has dialed.
-    savings = compute_savings([_row("haiku")], _policy(cost_quality=None))
+    # A policy fitted with the shipped defaults IS the balanced setting on all four knobs the
+    # dial controls, so that anchor's number is the right expectation for an undialed endpoint.
+    as_fitted = _policy(cost_quality=None, floor_q=0.05)
+    assert (as_fitted.knn_z, as_fitted.pick_lam, as_fitted.guard_mode) == (0.5, 0.0, "symmetric")
+    savings = compute_savings([_row("haiku")], as_fitted)
     assert savings.expected_quality_delta_pt == pytest.approx(0.99)
     assert BASIS_QUALITY_AS_FITTED in savings.estimate_basis
 
 
-def test_a_hand_tuned_policy_off_the_dial_quotes_nothing() -> None:
-    # Someone who fitted a deliberately stricter confidence bar is not on the balanced setting,
-    # and quoting its number would be a claim about an evaluation that never ran.
-    hand_tuned = _policy(cost_quality=None).model_copy(update={"knn_z": 2.0})
-    savings = compute_savings([_row("haiku")], hand_tuned)
-    assert savings.expected_quality_delta_pt == 0.0
-    assert BASIS_QUALITY_UNKNOWN in savings.estimate_basis
+@pytest.mark.parametrize(
+    ("update", "why"),
+    [
+        ({"floor_q": 0.5}, "the quality-max coverage setting, not the balanced one"),
+        ({"floor_q": 0.0}, "no novelty floor at all"),
+        ({"floor_q": None}, "a fit that never recorded its coverage setting"),
+        ({"knn_z": 2.0}, "a deliberately stricter confidence bar"),
+        ({"pick_lam": 0.01, "guard_mode": "asymmetric"}, "cost pressure nobody dialed in"),
+    ],
+)
+def test_a_policy_off_the_dial_quotes_nothing(update: dict[str, object], why: str) -> None:
+    # Every knob the dial controls is a discriminator. floor_q matters most: it is the ONLY
+    # difference between the quality-max and balanced settings, so a fit that set it elsewhere
+    # must not be handed the balanced number.
+    off_dial = _policy(cost_quality=None).model_copy(update=update)
+    savings = compute_savings([_row("haiku")], off_dial)
+    assert savings.expected_quality_delta_pt == 0.0, why
+    assert BASIS_QUALITY_UNKNOWN in savings.estimate_basis, why
+    assert BASIS_QUALITY_AS_FITTED not in savings.estimate_basis, why
 
 
 def test_a_static_endpoint_reports_honestly_instead_of_erroring() -> None:
@@ -225,3 +250,21 @@ def test_every_estimate_names_its_basis_in_customer_language() -> None:
     # Customer copy: none of the knob or artifact vocabulary leaks into it.
     for jargon in ("pick_lam", "guard_mode", "floor_q", "policy", "kNN", "knn", "bank"):
         assert jargon not in joined
+
+
+def test_rows_age_out_of_the_seven_day_window() -> None:
+    # The bounded window's answer moves with the clock, not only with the log: a row one second
+    # inside the boundary counts, the same row one second outside it does not.
+    inside = _row("haiku", ts=datetime.now(UTC) - timedelta(days=7) + timedelta(seconds=1))
+    outside = _row("haiku", ts=datetime.now(UTC) - timedelta(days=7) - timedelta(seconds=1))
+    assert compute_savings([inside], _policy(), window="7d").requests_served == 1
+    assert compute_savings([outside], _policy(), window="7d").requests_served == 0
+    assert compute_savings([inside, outside], _policy(), window="all_time").requests_served == 2
+
+
+def test_the_counterfactual_states_both_of_its_assumptions() -> None:
+    savings = compute_savings([_row("haiku")], _policy(cost_quality=1.0))
+    counterfactual = next(line for line in savings.estimate_basis if line.startswith("Savings"))
+    assert "same number of tokens" in counterfactual  # the token assumption
+    assert "cached reads" in counterfactual  # the cache assumption
+    assert "understate" in counterfactual  # and which way both of them lean

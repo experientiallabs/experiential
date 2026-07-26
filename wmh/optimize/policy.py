@@ -283,6 +283,12 @@ class RoutingPolicy(BaseModel):
     # (None = off). Set at fit time from the floor_q quantile of bank self-NN similarities;
     # the serving-side coverage/robustness knob for task drift.
     floor_sim: float | None = None
+    # The QUANTILE `floor_sim` came from. Kept alongside it because the threshold alone cannot be
+    # read back: 0.4 similarity is a strict floor on one bank and a loose one on another, so
+    # nothing downstream can tell which coverage setting a policy is on (which dial position it
+    # matches, what to report on the config endpoint) from `floor_sim`. None means unknown: a
+    # policy written before this field existed, or one whose threshold was set by hand.
+    floor_q: float | None = Field(default=None, ge=0.0, le=1.0)
     # The cost knob (R1 `pick_lam`): the raw pick maximizes
     # `profile[m] - pick_lam * mean_cost[m] / cost_scale` instead of the profile alone, so
     # pick_lam is "reward points paid per average-call-cost unit". The guard runs AFTER, on the
@@ -603,6 +609,22 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         candidates, key=lambda item: (profile[item[0]] - tilt[item[0]], -pool_order[item[1]])
     )
     if pick == baseline:
+        # Two different decisions land here, and the log has to tell them apart: the baseline
+        # genuinely led on reward, or the cost knob demoted a leader that priced badly. The
+        # second is the dominant case on the savings leg of the dial, so naming it (and the model
+        # it outbid) is what makes that leg debuggable from the request log at all.
+        leader_index, leader = max(
+            candidates, key=lambda item: (profile[item[0]], -pool_order[item[1]])
+        )
+        if leader != baseline:
+            return RoutingDecision(
+                model=baseline,
+                reason=(
+                    f"knn cost knob (lam={policy.pick_lam:g}): {baseline} serves; {leader} led "
+                    f"{rows.size} neighbors on evidence (profile {profile[leader_index]:.3f} vs "
+                    f"{profile[pick_index]:.3f}) but not on price"
+                ),
+            )
         return RoutingDecision(
             model=baseline,
             reason=f"knn: baseline {baseline} leads {rows.size} neighbors "
@@ -636,8 +658,12 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
         )
     knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
+    # Only the symmetric bar doubles z for a pricier pick; the asymmetric one holds it at z.
+    price_note = ""
+    if pricier:
+        price_note = " (pricier)" if policy.guard_mode == "asymmetric" else " (pricier, doubled z)"
     return RoutingDecision(
         model=pick,
         reason=f"knn: {rows.size} neighbors, delta={mean_diff:+.3f} > {z_effective:g}xSE"
-        f"={needed:.3f}{' (pricier, doubled z)' if pricier else ''}{knob}",
+        f"={needed:.3f}{price_note}{knob}",
     )

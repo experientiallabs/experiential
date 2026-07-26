@@ -241,7 +241,7 @@ def tune(
         _console.print(
             f"  {marker} {anchor.cost_quality:<5g} {anchor.quality_delta_points:+.2f}pt "
             f"@ {anchor.cost_delta_percent:+.1f}% cost"
-            + (f"  [dim]{anchor.named_point}[/dim]" if anchor.named_point != "custom" else "")
+            + (f"  [dim]{anchor.named_point}[/dim]" if anchor.named_point != "Custom" else "")
         )
 
 

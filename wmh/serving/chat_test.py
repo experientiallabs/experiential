@@ -892,3 +892,45 @@ def test_slow_savings_computation_cannot_resurrect_the_old_dial(
     fresh = runtime.savings()  # must recompute against the 1.0 policy, not read a stale cache
     assert fresh.expected_quality_delta_pt != stale.expected_quality_delta_pt
     assert fresh.expected_quality_delta_pt == pytest.approx(-0.54, abs=0.01)
+
+
+def test_config_reports_the_coverage_setting_the_policy_was_fitted_with(tmp_path: Path) -> None:
+    # An as-fitted endpoint's knobs must describe THAT fit, not the dial's default: a policy
+    # fitted at the quality-max coverage setting reports 0.5, and one whose fit never recorded a
+    # coverage setting reports null rather than a 0.0 that reads as "no floor".
+    fitted_wide = _knn_policy(tmp_path).model_copy(update={"floor_q": 0.5})
+    client, _ = _dial_client(tmp_path, fitted_wide)
+    assert client.get("/v1/endpoints/tau-bench/config").json()["knobs"]["floor_q"] == 0.5
+
+    unrecorded = _knn_policy(tmp_path).model_copy(update={"floor_q": None})
+    older, _ = _dial_client(tmp_path, unrecorded)
+    body = older.get("/v1/endpoints/tau-bench/config").json()
+    assert body["knobs"]["floor_q"] is None
+    assert body["knobs"]["knn_z"] == 0.5  # the rest of the knobs still report
+    # Dialing it fixes the gap: the mapping records the quantile it applied.
+    dialed = older.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.0}).json()
+    assert dialed["knobs"]["floor_q"] == 0.5
+
+
+def test_the_seven_day_savings_window_is_never_served_from_cache(tmp_path: Path) -> None:
+    # A bounded window ages with the clock, so an idle endpoint must not keep serving the answer
+    # it computed an hour ago; the all-time card is still cached between requests.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    _served_request(client, "draft a thank-you")
+    reads = {"n": 0}
+    original = RequestLog.replay
+
+    def counting_replay(self: RequestLog, endpoint: str) -> list[RequestLogRecord]:
+        reads["n"] += 1
+        return original(self, endpoint)
+
+    RequestLog.replay = counting_replay
+    try:
+        client.get("/v1/endpoints/tau-bench/savings?window=7d")
+        client.get("/v1/endpoints/tau-bench/savings?window=7d")
+        assert reads["n"] == 2  # recomputed every read
+        client.get("/v1/endpoints/tau-bench/savings")
+        client.get("/v1/endpoints/tau-bench/savings")
+        assert reads["n"] == 3  # all_time cached after the first
+    finally:
+        RequestLog.replay = original

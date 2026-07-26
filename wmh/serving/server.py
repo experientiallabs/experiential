@@ -201,8 +201,19 @@ def _endpoint_runtimes(
     for name, policy in policies.items():
         model_dir = model_dirs.get(name)
         config_path = model_dir / ENDPOINT_CONFIG_FILENAME if model_dir is not None else None
-        settings = EndpointConfig.load(config_path) if config_path is not None else EndpointConfig()
+        settings = EndpointConfig()
         try:
+            # Reading the file is inside the guard too: a malformed or misspelled endpoint.toml
+            # must fail with the endpoint AND the path named, not with a bare parse error that
+            # leaves an operator hunting for which model directory it came from.
+            if config_path is not None:
+                settings = EndpointConfig.load(config_path)
+            # A dial setting resolves the novelty floor against the evidence bank, so an endpoint
+            # WITH a dial file loads its `.npz` sidecar here at mount instead of lazily on the
+            # first request. That is the better trade for a served endpoint (the cost lands before
+            # traffic rather than inside someone's first request latency), and it is why a broken
+            # sidecar surfaces at startup for a dialed endpoint and on first use for an as-fitted
+            # one.
             runtimes[name] = EndpointRuntime(
                 name,
                 policy,
@@ -214,8 +225,7 @@ def _endpoint_runtimes(
             # Fail fast and name the file: a dial the policy cannot honor (a savings position on
             # a policy fitted without costs) must not degrade silently to the fitted knobs.
             raise ValueError(
-                f"{config_path} sets cost_quality={settings.cost_quality} for endpoint "
-                f"{name!r}, which its policy cannot serve: {exc}"
+                f"{config_path} for endpoint {name!r} cannot be served: {exc}"
             ) from exc
     return runtimes
 

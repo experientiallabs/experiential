@@ -519,3 +519,29 @@ def test_the_novelty_floor_helper_reads_the_bank_not_the_policy(tmp_path: Path) 
     tight, loose = bank_floor_sim(bank, 0.5), bank_floor_sim(bank, 0.05)
     assert tight is not None and loose is not None
     assert tight > loose  # a higher quantile abstains more often
+
+
+def test_fit_records_the_coverage_quantile_beside_its_threshold(tmp_path: Path) -> None:
+    # The threshold alone cannot be read back (0.4 similarity is strict on one bank and loose on
+    # another), so the quantile that produced it travels with it.
+    wide = fit_knn_policy(
+        _matrix(),
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        embedder=EmbedderSpec(dim=256),
+        guard_model="cheap",
+        rag_num=5,
+        min_pairs=3,
+        floor_q=0.5,
+    )
+    assert wide.floor_q == 0.5
+    assert wide.floor_sim is not None
+    off = _fit(tmp_path)  # the function default leaves the floor off
+    assert (off.floor_q, off.floor_sim) == (0.0, None)
+
+
+def test_the_dial_records_the_coverage_quantile_it_applied(tmp_path: Path) -> None:
+    fitted = _fit(tmp_path)
+    for dial in (0.0, COST_QUALITY_BALANCED, 1.0):
+        slid = apply_cost_quality(fitted, dial)
+        assert slid.floor_q == pytest.approx(cost_quality_knobs(dial).floor_q)
+        assert (slid.floor_sim is None) == (slid.floor_q == 0.0)

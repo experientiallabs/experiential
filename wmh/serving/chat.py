@@ -45,9 +45,7 @@ from starlette.background import BackgroundTask
 from wmh.optimize.knn import (
     COST_QUALITY_ANCHORS,
     CostQualityAnchor,
-    CostQualityKnobs,
     apply_cost_quality,
-    cost_quality_knobs,
     cost_quality_named_point,
 )
 from wmh.optimize.policy import Embedder, RoutingDecision, RoutingPolicy, select_model
@@ -348,24 +346,31 @@ class EndpointRuntime:
     def savings(self, window: SavingsWindow = "all_time") -> EndpointSavings:
         """What this endpoint has saved so far (see `wmh.serving.savings`).
 
-        Recomputed from the persisted log, then cached until the log grows or the dial moves. A
-        dashboard polling this must not re-read the whole JSONL on every paint, and keying the
-        cache on the log's revision rather than on a clock means the answer is never stale: the
-        request that changed the total is the thing that invalidates it.
+        The all-time total is cached until the log grows or the dial moves, so a dashboard
+        polling it does not re-read the whole JSONL on every paint, and the request that changes
+        the total is the thing that invalidates it.
+
+        A BOUNDED window is recomputed on every read and never cached, because its answer moves
+        with the clock and not only with the log: rows age out of a 7-day window while nothing
+        appends, so an idle endpoint would otherwise keep serving week-old traffic as this
+        week's. Replay is a single sequential read of an append-only file, which is the cheap
+        part of this call; the common case (the all-time card) still pays it once per new request.
         """
         revision = self.log.revision
+        cacheable = window == "all_time"
         with self._lock:
-            cached = self._savings.get(window)
+            cached = self._savings.get(window) if cacheable else None
             if cached is not None and cached[0] == revision:
                 return cached[1]
             policy = self.policy
         computed = compute_savings(self.log.replay(self.name), policy, window=window)
-        with self._lock:
-            if self.policy is policy:
-                # Store only if the dial has not moved since we captured the policy: a slow
-                # computation racing a dial swap must not resurrect the OLD dial's quality
-                # expectation under a revision the new dial also answers to.
-                self._savings[window] = (revision, computed)
+        if cacheable:
+            with self._lock:
+                if self.policy is policy:
+                    # Store only if the dial has not moved since we captured the policy: a slow
+                    # computation racing a dial swap must not resurrect the OLD dial's quality
+                    # expectation under a revision the new dial also answers to.
+                    self._savings[window] = (revision, computed)
         return computed
 
     def decide(self, messages: list[ChatMessage]) -> RoutingDecision:
@@ -472,6 +477,22 @@ def _chunk_payload(
     }
 
 
+class ServedKnobs(BaseModel):
+    """The knobs an endpoint is ACTUALLY serving, read off its policy.
+
+    Same field names as the mapping's `CostQualityKnobs`, but `floor_q` is nullable: a policy can
+    carry a novelty threshold whose quantile was never recorded (fitted before the field existed,
+    or set by hand), and the honest answer there is null rather than a 0.0 that reads as "no
+    floor". The threshold itself is not reported: it is a similarity number that means different
+    things on different evidence banks, so it would tell a reader nothing they could act on.
+    """
+
+    knn_z: float
+    floor_q: float | None
+    pick_lam: float
+    guard_mode: Literal["symmetric", "asymmetric"]
+
+
 class EndpointConfigResponse(BaseModel):
     """The endpoint's cost/quality dial, everything needed to render it, and where it stands.
 
@@ -495,7 +516,7 @@ class EndpointConfigResponse(BaseModel):
     dialable: bool
     cost_quality: float | None
     named_point: str
-    knobs: CostQualityKnobs | None
+    knobs: ServedKnobs | None
     anchors: list[CostQualityAnchor]
 
 
@@ -519,11 +540,12 @@ def _config_response(runtime: EndpointRuntime) -> EndpointConfigResponse:
         cost_quality=dial,
         named_point=cost_quality_named_point(dial) if dial is not None else "as-fitted",
         knobs=(
-            CostQualityKnobs(
+            ServedKnobs(
                 knn_z=runtime.policy.knn_z,
-                # The served floor is a similarity threshold; the dial's floor_q is the quantile
-                # it came from, and only the mapping knows which quantile that was.
-                floor_q=cost_quality_knobs(dial).floor_q if dial is not None else 0.0,
+                # Straight off the policy, which records the quantile its threshold came from, so
+                # an as-fitted endpoint reports the coverage setting it was FITTED with instead of
+                # the dial's default. Null when that policy never recorded one.
+                floor_q=runtime.policy.floor_q,
                 pick_lam=runtime.policy.pick_lam,
                 guard_mode=runtime.policy.guard_mode,
             )

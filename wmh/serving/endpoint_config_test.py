@@ -48,3 +48,18 @@ def test_a_dial_outside_the_range_is_rejected_at_load(tmp_path: Path) -> None:
     path.write_text("cost_quality = 1.5", encoding="utf-8")
     with pytest.raises(ValidationError, match="less than or equal to 1"):
         EndpointConfig.load(path)
+
+
+def test_an_unknown_key_fails_at_load_instead_of_being_ignored(tmp_path: Path) -> None:
+    # A typo must not leave an operator staring at an endpoint that silently ignored their dial.
+    path = tmp_path / ENDPOINT_CONFIG_FILENAME
+    path.write_text("cost_qualty = 0.6\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match="cost_qualty"):
+        EndpointConfig.load(path)
+
+
+def test_the_parse_error_says_what_shape_was_expected(tmp_path: Path) -> None:
+    path = tmp_path / ENDPOINT_CONFIG_FILENAME
+    path.write_text("cost_quality = ", encoding="utf-8")
+    with pytest.raises(ValueError, match="no other keys"):
+        EndpointConfig.load(path)
