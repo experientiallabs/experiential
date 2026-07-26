@@ -67,6 +67,20 @@ HARBOR_TRAJECTORY_FILENAME = "trajectory.json"
 TERMINUS_COMPLETE_TOOL = "mark_task_complete"
 """The ATIF tool call terminus-2 records when it declares the task finished."""
 
+TERMINUS_STOP_REASON_METADATA_KEY = "wmh_stop_reason"
+"""`agent_result.metadata` key carrying the agent's OWN declared `StopReason`.
+
+Terminus-2's per-run metadata is the only channel a wmh agent subclass has into a
+trial's `result.json` that survives without an exception, so a subclass that ends an
+episode deliberately writes its reason here (`wmh.distill.terminus.CleanStopTerminus2`
+on a context stop). Namespaced because harbor owns the rest of that dict
+(`n_episodes`, `api_request_times_msec`, `summarization_count`, `all_messages`).
+
+`read_terminus_stop_reason` honors it FIRST, ahead of the trial's exception and the
+episode count, because it is the only first-hand account: the exception belongs to
+whatever failed AFTER the agent returned (a verifier timeout, say), and a deliberate
+stop on the last allowed turn would otherwise be misread as the turn cap."""
+
 StopReasonReader = Callable[[Path], str | None]
 """Reads one trial's stop reason from its artifact dir; None when unknown."""
 
@@ -745,7 +759,43 @@ _TERMINUS_EXCEPTION_STOP_REASONS = {
     # the next prompt outgrew `rollout.context_budget_tokens` and nothing was sampled from it.
     "ContextLengthExceededError": StopReason.PROVIDER_ERROR,
 }
-"""Terminus-2 trial exceptions that name their own stop reason; anything else is `ERROR`."""
+"""Terminus-2 trial exceptions that name their own stop reason; anything else is `ERROR`.
+
+`ContextLengthExceededError` reaching here at all means the rollout agent let it
+propagate, which kills the trial before verification; under
+`wmh.distill.terminus.CleanStopTerminus2` the same overflow arrives as a
+`CONTEXT_EXHAUSTED` metadata marker on a trial that WAS graded."""
+
+
+_STOP_REASON_VALUES = frozenset(reason.value for reason in StopReason)
+"""The `StopReason` vocabulary, for validating a value read back out of JSON."""
+
+
+def _declared_stop_reason(metadata: JsonObject | None, *, trial_name: str) -> str | None:
+    """The stop reason the agent recorded for itself, when it recorded a known one.
+
+    Args:
+        metadata: The trial's `agent_result.metadata`, or None when absent.
+        trial_name: Trial directory name, for the unknown-value warning.
+
+    Returns:
+        The `StopReason` value, or None when the agent declared nothing (the
+        ordinary case: harbor's stock terminus-2 never writes this key) or wrote
+        something outside the vocabulary, which is warned about and then ignored
+        so the remaining evidence still gets its say.
+    """
+    declared = metadata.get(TERMINUS_STOP_REASON_METADATA_KEY) if metadata is not None else None
+    if declared is None:
+        return None
+    if isinstance(declared, str) and declared in _STOP_REASON_VALUES:
+        return declared
+    logger.warning(
+        "harbor trial %s declared stop reason %r, which is not a wmh StopReason; falling back "
+        "to the trial's exception and episode count",
+        trial_name,
+        declared,
+    )
+    return None
 
 
 def _terminus_declared_complete(artifact_dir: Path) -> bool:
@@ -777,21 +827,28 @@ def read_terminus_stop_reason(artifact_dir: Path, *, max_turns: int) -> str | No
     """Why one terminus-2 episode ended, in WMH's `StopReason` vocabulary.
 
     Terminus-2 writes no WMH run trace, so the reason is reconstructed from
-    the three artifacts harbor and the agent do leave behind, in the order
+    the four artifacts harbor and the agent do leave behind, in the order
     that makes each one decisive:
 
-    1. the trial's recorded exception (`AgentTimeoutError` is the wall clock,
+    1. the agent's OWN declared reason in
+       `agent_result.metadata[TERMINUS_STOP_REASON_METADATA_KEY]`, written only
+       by a wmh subclass that ended the episode deliberately
+       (`wmh.distill.terminus.CleanStopTerminus2`);
+    2. the trial's recorded exception (`AgentTimeoutError` is the wall clock,
        `ContextLengthExceededError` is the context budget, anything else is a
        harness/runtime error);
-    2. the episode count terminus-2 records in
+    3. the episode count terminus-2 records in
        `agent_result.metadata.n_episodes`: reaching `max_turns` means the loop
        was cut off by the cap;
-    3. the ATIF trajectory's final `mark_task_complete`, terminus-2's own
+    4. the ATIF trajectory's final `mark_task_complete`, terminus-2's own
        completion claim.
 
     Deliberately conservative at the boundary: an episode that declared
     completion on exactly its last allowed turn reads as `max_turns`, i.e. as
     a scaffold loss, rather than as a submission the cap happened to permit.
+    The agent's own account outranks the cap the other way round, because a
+    deliberate stop on the last allowed turn was caused by the thing the agent
+    named, not by the cap it happened to coincide with.
 
     Args:
         artifact_dir: The harbor trial directory (one cell's `artifact_dir`).
@@ -805,14 +862,18 @@ def read_terminus_stop_reason(artifact_dir: Path, *, max_turns: int) -> str | No
     payload = _read_json_object(artifact_dir / HARBOR_TRIAL_RESULT_FILENAME)
     if payload is None:
         return None
+    agent_result = payload.get("agent_result")
+    metadata = agent_result.get("metadata") if isinstance(agent_result, dict) else None
+    metadata = metadata if isinstance(metadata, dict) else None
+    declared = _declared_stop_reason(metadata, trial_name=artifact_dir.name)
+    if declared is not None:
+        return declared
     exception = payload.get("exception_info")
     if isinstance(exception, dict):
         raised = exception.get("exception_type")
         if isinstance(raised, str):
             return _TERMINUS_EXCEPTION_STOP_REASONS.get(raised, StopReason.ERROR).value
-    agent_result = payload.get("agent_result")
-    metadata = agent_result.get("metadata") if isinstance(agent_result, dict) else None
-    episodes = metadata.get("n_episodes") if isinstance(metadata, dict) else None
+    episodes = metadata.get("n_episodes") if metadata is not None else None
     if isinstance(episodes, bool) or not isinstance(episodes, int):
         return None
     if episodes >= max_turns:

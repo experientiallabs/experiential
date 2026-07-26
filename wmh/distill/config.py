@@ -187,7 +187,32 @@ class RolloutConfig(BaseModel):
     `TinkerLLM(context_limit=...)`), so the agent measures its own prompts against the real
     serving limit instead of harbor's 32,000 default. Keep it at least `sampling.max_tokens`
     below the served window, or a full-budget prompt plus its output cap exceeds the window and
-    the sampling call 400s."""
+    the sampling call 400s.
+
+    That check is also where an episode ENDS: `TinkerLLM` measures the rendered prompt against
+    this value and raises before it samples anything, and the rollout agent
+    (`wmh.distill.terminus.CleanStopTerminus2`) turns that into a clean end of episode
+    (`StopReason.CONTEXT_EXHAUSTED`) rather than a dead trial. So the turns already sampled are
+    all in budget and all trainable, which is why the drop rule above almost never fires here:
+    it catches spans read back under a LOWER cap than the one they sampled under.
+
+    THIS value is therefore the binding ceiling, not the model's. An episode that ends at
+    65,024 was stopped by this setting; Tinker's own limit was never reached and is not the
+    reason. Do not raise it toward the model's advertised window on the assumption that the
+    headroom is real, because two measurements about that window contradict each other and the
+    interaction is NOT understood:
+
+    - a pi-scaffold run was rejected with "Prompt length plus max_tokens exceeds the model's
+      context window: 231109 prompt tokens + 16384 max_tokens > 65536", so at least one path
+      enforces prompt PLUS `sampling.max_tokens` against the window;
+    - yet prompts of 64,888 have sampled fine here at `sampling.max_tokens = 16384`, where that
+      same sum is far over the window.
+
+    Both cannot be simple, so something is clamping `max_tokens` to the remaining window on the
+    successful path, and nobody has confirmed what or when. Until that is known, treat neither
+    65,536 nor the 65,530 a rejected 65,534-token sample implied as usable headroom. The margin
+    at stake is about 2 episodes per 64 (~3%), and a provider rejection costs far more than
+    that, so the conservative value stands until the clamp is explained."""
 
     observation_clip_tokens: int = Field(default=2000, ge=0)
     """Per-command terminal-output clip, in tokens; 0 disables it.
@@ -313,8 +338,9 @@ class RolloutConfig(BaseModel):
                 "chat history mid-episode from state no artifact records, so sampled "
                 "spans stop appearing verbatim in the episode tokens and cannot be "
                 "attributed to the conversation that produced them; set "
-                "compaction = false (episodes that outgrow context_budget_tokens are "
-                "dropped whole from training instead)"
+                "compaction = false (an episode whose next prompt would outgrow "
+                "context_budget_tokens ENDS there instead, keeping every turn it already "
+                "sampled, and is graded on the work it left behind)"
             )
         return value
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -890,6 +891,46 @@ def test_read_terminus_stop_reason_prefers_the_turn_cap_at_the_boundary(tmp_path
         json.dumps(_trajectory(complete=True)), encoding="utf-8"
     )
     assert read_terminus_stop_reason(trial, max_turns=10) == "max_turns"
+
+
+def test_read_terminus_stop_reason_prefers_the_agents_own_account(tmp_path: Path) -> None:
+    """A deliberate stop outranks whatever failed after it and whatever the count implies.
+
+    Both other sources would misattribute this trial: the exception belongs to a
+    VERIFIER that timed out on the work the agent left behind, and the episode count
+    reaches a cap the agent never actually ran into.
+    """
+    trial = tmp_path / "task-a__s1"
+    _write_result(
+        trial,
+        {
+            "exception_info": {"exception_type": "VerifierTimeoutError"},
+            "agent_result": {
+                "metadata": {"n_episodes": 10, "wmh_stop_reason": "context_exhausted"}
+            },
+        },
+    )
+
+    assert read_terminus_stop_reason(trial, max_turns=10) == "context_exhausted"
+
+
+def test_read_terminus_stop_reason_ignores_a_reason_outside_the_vocabulary(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unrecognized marker is warned about and dropped, never counted as its own bucket."""
+    trial = tmp_path / "task-a__s1"
+    _write_result(
+        trial,
+        {
+            "exception_info": {"exception_type": "AgentTimeoutError"},
+            "agent_result": {"metadata": {"n_episodes": 4, "wmh_stop_reason": "vibes"}},
+        },
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert read_terminus_stop_reason(trial, max_turns=100) == "budget"
+
+    assert "'vibes'" in caplog.text
 
 
 def test_read_terminus_stop_reason_is_none_without_readable_evidence(tmp_path: Path) -> None:

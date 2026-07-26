@@ -369,6 +369,13 @@ def build_datums(
     overlong_drops = 0
     context_budget = cfg.rollout.context_budget_tokens
     for record in records:
+        # Deliberately NOT `StopReason.CONTEXT_EXHAUSTED`, and that omission is the point: a
+        # terminus-2 episode stopped at the budget never SAMPLED the overflowing turn (harbor
+        # raises before the request), so every span it recorded is an in-budget, on-policy turn
+        # whose logprobs match the context it was sampled under. This drop exists for runtimes
+        # that RESHAPE a final turn at the budget, which is what makes that turn untrainable.
+        # Adding `context_exhausted` here would re-cost exactly the rollouts the clean stop
+        # (`wmh.distill.terminus`) exists to save.
         if record.stop_reason == CONTEXT_OVERFLOW_STOP_REASON:
             overflow_drops += 1
             logger.warning(

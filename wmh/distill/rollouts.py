@@ -76,8 +76,16 @@ MISSING_HARBOR_EXTRA = (
     "Run `uv sync --extra harbor` (or `pip install 'world-model-harness[harbor]'`) and retry"
 )
 
-HARBOR_TERMINUS_2_AGENT_IMPORT_PATH = "harbor.agents.terminus_2.terminus_2:Terminus2"
-"""Harbor's own terminus-2 agent, the rollout agent for distillation.
+TERMINUS_2_AGENT_IMPORT_PATH = "wmh.distill.terminus:CleanStopTerminus2"
+"""The rollout agent for distillation: harbor's terminus-2 with a clean context stop.
+
+Harbor's `Terminus2` verbatim except for one thing it cannot do for us: with
+`enable_summarize=False` an overflowed prompt PROPAGATES out of the agent, and for a
+single-step task that skips harbor's verifier entirely, so the trial produces no reward
+and leaves the solve rate as an infrastructure failure. `wmh.distill.terminus` catches
+that one exception, records `StopReason.CONTEXT_EXHAUSTED`, and returns, which puts the
+episode on the same graded footing as one that hit the turn cap. A subclass and not a
+patch because harbor is a pinned wheel that `uv sync` restores.
 
 Imported by string through harbor's agent factory (never at module scope here), so
 `import wmh.distill.rollouts` keeps working without the harbor extra."""
@@ -175,9 +183,11 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
       details incomplete, and which would leave recorded spans that cannot be
       attributed to the conversation that produced them (the same reason
       `rollout.compaction` is rejected outright). With it off, a context
-      overflow raises instead, ending the episode on a recorded
-      `ContextLengthExceededError` - the failure the ephemeral-reasoning
-      history and `rollout.observation_clip_tokens` exist to keep away from.
+      overflow raises instead, which `TERMINUS_2_AGENT_IMPORT_PATH`'s agent
+      turns into a clean end of episode (`StopReason.CONTEXT_EXHAUSTED`) so the
+      trial is still verified. Reaching that point still costs the episode its
+      remaining turns, which is what the ephemeral-reasoning history and
+      `rollout.observation_clip_tokens` exist to keep away from.
     - `store_all_messages=True` persists the agent's own chat history into
       `agent_result.metadata["all_messages"]`, the CANONICAL (tokenizer-independent)
       view of the same turns. A cross-tokenizer teacher re-renders that message
@@ -375,8 +385,10 @@ class RolloutStats(BaseModel):
     """How many trials ended on each recorded stop reason (`"unknown"` when no trace was readable).
 
     The per-reason breakdown behind `scaffold_loss_rate`: `max_turns` (turn cap), `budget` (wall
-    clock), `no_tool_call`, `output_truncated`, `unparsed_tool_call`, `provider_error`, and
-    `submitted`."""
+    clock), `context_exhausted` (the next prompt no longer fit, so the agent stopped and the
+    trial was still graded), `no_tool_call`, `output_truncated`, `unparsed_tool_call`,
+    `provider_error` (the same overflow PROPAGATING, which kills the trial before verification
+    and shows up in `infra_failed_trials` too), and `submitted`."""
 
     scaffold_loss_rate: float = Field(ge=0.0, le=1.0)
     """Share of trials WITH A READABLE STOP REASON that never reached an explicit `submit`.
@@ -619,7 +631,7 @@ def collect_rollouts(
             # e2b parallelizes up to the configured trial concurrency.
             agent_concurrency=1 if backend == "local" else cfg.train.trial_concurrency,
             harbor_retries=cfg.harbor.retries,
-            agent_import_path=HARBOR_TERMINUS_2_AGENT_IMPORT_PATH,
+            agent_import_path=TERMINUS_2_AGENT_IMPORT_PATH,
             extra_agent_kwargs=terminus_2_agent_kwargs(cfg, provider_config),
             # TinkerLLM reads the base model, not the checkpoint, to pick its renderer and
             # tokenizer; the checkpoint travels as llm_kwargs.model_path.

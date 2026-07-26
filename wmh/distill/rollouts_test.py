@@ -22,7 +22,7 @@ from wmh.distill.config import (
     TrainConfig,
 )
 from wmh.distill.rollouts import (
-    HARBOR_TERMINUS_2_AGENT_IMPORT_PATH,
+    TERMINUS_2_AGENT_IMPORT_PATH,
     collect_rollouts,
     rollout_stats,
     terminus_2_agent_kwargs,
@@ -249,7 +249,7 @@ def test_collect_rollouts_wires_terminus_2_and_joins_harbor_rollout_details(
     assert template.jobs_dir == run_dir / "harbor" / "step-0004"
     assert capture.task_ids == [list(_TASK_IDS)]
     [kwargs] = capture.kwargs
-    assert kwargs["agent_import_path"] == HARBOR_TERMINUS_2_AGENT_IMPORT_PATH
+    assert kwargs["agent_import_path"] == TERMINUS_2_AGENT_IMPORT_PATH
     # The base model names the renderer/tokenizer; the sampler path is the checkpoint.
     assert kwargs["agent_model_name"] == "Qwen/Qwen3-8B"
     assert kwargs["extra_agent_kwargs"] == {

@@ -166,6 +166,13 @@ class StopReason(StrEnum):
     prose-only turn, a turn truncated at the output-token cap, and a tool call the renderer could
     not parse. Anything other than `SUBMITTED` is a SCAFFOLD loss, not a measured task failure
     (see `wmh.distill.rollouts.RolloutStats.scaffold_loss_rate`).
+
+    `CONTEXT_EXHAUSTED` and `PROVIDER_ERROR` both describe an episode whose next prompt did not
+    fit, and the difference between them is the whole point of the split: `PROVIDER_ERROR` means
+    the overflow PROPAGATED and killed the trial before it was ever graded, so the episode leaves
+    no verifier evidence and drops out of every solve rate; `CONTEXT_EXHAUSTED` means the agent
+    stopped on its own at that point (`wmh.distill.terminus.CleanStopTerminus2`) and the trial ran
+    through verification like any other, so it stays in the denominator.
     """
 
     SUBMITTED = "submitted"  # the agent called submit
@@ -177,6 +184,7 @@ class StopReason(StrEnum):
     OUTPUT_TRUNCATED = "output_truncated"  # last turn was cut at the output-token cap
     UNPARSED_TOOL_CALL = "unparsed_tool_call"  # the renderer could not parse the emitted call
     PROVIDER_ERROR = "provider_error"  # the worker LLM call kept failing (e.g. context overflow)
+    CONTEXT_EXHAUSTED = "context_exhausted"  # the next prompt would not fit; stopped, not crashed
     UNKNOWN_DONE_REASON = "unknown_done_reason"  # a `done` frame carried no reason we recognize
 
 
@@ -190,6 +198,7 @@ SCAFFOLD_LOSS_STOP_REASONS = frozenset(
         StopReason.OUTPUT_TRUNCATED,
         StopReason.UNPARSED_TOOL_CALL,
         StopReason.PROVIDER_ERROR,
+        StopReason.CONTEXT_EXHAUSTED,
         StopReason.UNKNOWN_DONE_REASON,
     }
 )
