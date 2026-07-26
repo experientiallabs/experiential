@@ -43,6 +43,7 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from wmo.optimize.compression import CompressionConfig, get_compressor
 from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
@@ -285,6 +286,10 @@ class ClusterRanking(BaseModel):
     # so `rerank_policy` can re-apply the identical check without the outcome matrix.
     support: dict[str, int] = Field(default_factory=dict)
     total: int = 0  # fit scenarios that landed in this cluster
+    # D-COMPRESS: this cluster's compression choice, fitted jointly with the model ranking.
+    # None (the default) = no cluster-level choice; consumers fall back to the policy-level
+    # `compression`. Additive: pre-compression artifacts load unchanged.
+    compression: CompressionConfig | None = None
 
 
 # How a non-baseline candidate fared, as `RoutingEvidence.gate` records it. "passed" and
@@ -379,6 +384,11 @@ class RoutingPolicy(BaseModel):
     min_support: int | None = None  # scored episodes a challenger needs to lead its cluster
     guard_margin: float | None = None  # reward the challenger must beat the guard by
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
+    # D-COMPRESS: the endpoint-level compression choice, applied by the serving compress stage
+    # BEFORE routing (the router embeds what the model will see), so it cannot vary by cluster
+    # at serve time; per-cluster overrides live on ClusterRanking for the joint fit and eval
+    # grids. None (the default) = compression off, today's behavior exactly.
+    compression: CompressionConfig | None = None
 
     # kNN policies only (see module docstring and `wmo.optimize.knn`). The fitter records the
     # bank it actually wrote (`knn_bank_path_for(<policy path>)`), so serving resolves the
@@ -448,6 +458,11 @@ class RoutingPolicy(BaseModel):
                 f"guard_model '{self.guard_model}' is not in the policy pool "
                 f"(available: {sorted(names)})"
             )
+        if self.compression is not None:
+            get_compressor(self.compression.compressor_id)  # raises naming the known ids
+        for cluster in self.clusters:
+            if cluster.compression is not None:
+                get_compressor(cluster.compression.compressor_id)
         if self.kind != "rank" and self.clusters:
             raise ValueError(f"a {self.kind} policy carries no clusters; use kind='rank'")
         if self.kind == "knn":
