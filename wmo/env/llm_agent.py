@@ -66,9 +66,18 @@ class LLMAgent:
             except ValidationError:
                 reply = None
             if reply is not None:
-                if reply.done or reply.tool is None:
+                if reply.done:
                     return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL)
-                return Action(kind=ActionKind.TOOL_CALL, name=reply.tool, arguments=reply.arguments)
+                if reply.tool is not None:
+                    return Action(
+                        kind=ActionKind.TOOL_CALL, name=reply.tool, arguments=reply.arguments
+                    )
+                # A JSON object with neither `done` nor `tool` is NOT a finish signal: models
+                # that write prose-style calls (`get_user(...)` around a bare argument object)
+                # land here, and treating it as done ended their episodes unexecuted at step 1
+                # and scored them 0 (measured: 34% of glm-5.2 wm episodes, 0% for other pool
+                # models). Fall through to the message path so the env can answer and the
+                # episode recovers.
         # Unparseable reply: surface it as a message action; the env will answer and the episode
         # continues rather than crashing the batch.
         return Action(kind=ActionKind.MESSAGE, content=completion.text.strip()[:_MAX_HISTORY_CHARS])

@@ -98,3 +98,22 @@ def test_tools_hint_lands_in_the_system_prompt() -> None:
     assert "run_sql(query)" in provider.system
     bare = LLMAgent(_CaptureProvider())
     assert bare is not None  # no hint -> unchanged system (covered by existing tests)
+
+
+def test_prose_tool_call_is_not_a_finish_signal() -> None:
+    # glm-5.2 sometimes writes `get_user_details({"user_id": "x"})`: extract_json_object
+    # grabs the bare ARGUMENT object, which validates with tool=None and done unset. That
+    # must fall through to a message action (the env answers, the episode recovers) - the
+    # old `tool is None -> DONE` read ended 34% of glm's episodes unexecuted at step 1.
+    agent = LLMAgent(FakeProvider('get_user_details({"user_id": "chen_silva_2201"})'))
+    action = agent.act("task", EnvState(), [])
+    assert action.kind is ActionKind.MESSAGE
+    assert action.content is not None
+    assert action.content != DONE_SIGNAL
+    assert "chen_silva_2201" in action.content
+
+
+def test_explicit_done_still_terminates() -> None:
+    agent = LLMAgent(FakeProvider('{"done": true}'))
+    action = agent.act("task", EnvState(), [])
+    assert action.content == DONE_SIGNAL
