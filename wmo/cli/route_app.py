@@ -771,6 +771,20 @@ def _matrix_provenance(matrix_file: str) -> str:
     return f"{matrix_file} sha256={digest[:_MATRIX_DIGEST_CHARS]}"
 
 
+def _embedder_provenance(spec: EmbedderSpec) -> str:
+    """The embedding-function half of `fitted_from`, taken from the spec serving rebuilds.
+
+    Derived from `EmbedderSpec` rather than from the flags, so it cannot describe an embedder
+    different from the one recorded in the artifact. The azure RESOURCE is part of the identity
+    and not just the deployment name: two accounts routinely hold a deployment of the same name
+    and dimension, their embeddings are not interchangeable, and a refit that only repointed
+    `--endpoint` therefore has to read as a different fit. The credential variable is left out
+    on purpose -- renaming it does not move a single vector.
+    """
+    tag = f"{spec.kind}-{spec.dim}"
+    return tag if spec.kind == "hashing" else f"{tag}/{spec.deployment}@{spec.endpoint}"
+
+
 @route_app.command("student")
 def student(
     card_dir: str = typer.Argument(
@@ -1031,7 +1045,7 @@ def fit(
         raise typer.BadParameter("--rag-thres must be greater than 0")
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
     source = _matrix_provenance(matrix_file)
-    embed_tag = f"{embedder}-{dim}" + (f"/{deployment}" if embedder == "azure" else "")
+    embed_tag = _embedder_provenance(spec)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
