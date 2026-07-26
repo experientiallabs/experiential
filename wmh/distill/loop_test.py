@@ -41,7 +41,7 @@ from wmh.distill.config import (
     TrainConfig,
     WarmupConfig,
 )
-from wmh.distill.data import TrainDatum
+from wmh.distill.data import AdvantageStats, TrainDatum, attach_advantages
 from wmh.distill.deadlines import TinkerDeadlineError
 from wmh.distill.fake_tinker import (
     FakeDatum,
@@ -729,6 +729,91 @@ def test_three_step_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     # The spend ledger tracked every charge, including the finalize eval that
     # no metrics row ever carries.
     assert store.read_spend() == pytest.approx(result.spend.total_usd)
+
+
+def _token_totals(datums: Sequence[TrainDatum]) -> tuple[int, int]:
+    """A datum list's (loss, context) token totals."""
+    loss = sum(datum.loss_token_count for datum in datums)
+    return loss, sum(len(datum.model_input_tokens) for datum in datums) - loss
+
+
+class _DroppingTeacherRows:
+    """`attach_advantages` under a teacher that misaligns one row per step.
+
+    Blanks the first datum's teacher logprobs, which is exactly what a
+    wrong-length compute_logprobs response looks like by the time it reaches
+    the datum builder, then delegates to the REAL `attach_advantages` so the
+    drop and its post-drop stats are the production ones. Both the pre-drop
+    and the trained token totals are recorded per step for the assertions.
+    """
+
+    def __init__(self) -> None:
+        self.built: list[tuple[int, int]] = []
+        """Per step, the (loss, context) totals of the batch the teacher scored."""
+
+        self.trained: list[tuple[int, int]] = []
+        """Per step, the (loss, context) totals of the batch that trained."""
+
+    def __call__(
+        self,
+        datums: Sequence[TrainDatum],
+        teacher_logprobs: Sequence[Sequence[float | None]],
+        cfg: DistillConfig,
+    ) -> tuple[list[TrainDatum], AdvantageStats]:
+        rows: list[Sequence[float | None]] = [
+            [] if index == 0 else row for index, row in enumerate(teacher_logprobs)
+        ]
+        trained, stats = attach_advantages(datums, rows, cfg)
+        self.built.append(_token_totals(datums))
+        self.trained.append(_token_totals(trained))
+        return trained, stats
+
+
+def test_metrics_row_describes_the_post_teacher_drop_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-step token counts are the TRAINED batch's, never the pre-drop one.
+
+    Regression for a row that mixed the two accounting stages: `loss_tokens`
+    and `context_tokens` came from `build_datums` (before the teacher's
+    misaligned rows were dropped) while `clipped_tokens` and `clip_fraction`
+    came from `attach_advantages` (after), so the step read bigger than it
+    trained and `clipped_tokens / loss_tokens` disagreed with the reported
+    `clip_fraction`.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    dropping = _DroppingTeacherRows()
+    monkeypatch.setattr(loop_module, "attach_advantages", dropping)
+    base = _cfg()
+    # A clip bound this tight clips every trained loss token, pinning
+    # clip_fraction at exactly 1.0: only the post-drop denominator reproduces
+    # it, so the ratio check below is a real check.
+    cfg = base.model_copy(update={"train": base.train.model_copy(update={"advantage_clip": 1e-9})})
+
+    _run(env, cfg)
+
+    rows = [row for row in DistillRunStore(env.run_dir).read_metrics() if "phase" not in row]
+    assert len(rows) == 3
+    assert len(dropping.trained) == len(rows)
+    for row, trained, built in zip(rows, dropping.trained, dropping.built, strict=True):
+        loss_tokens, context_tokens = trained
+        # The teacher really dropped a datum, and it really carried tokens.
+        assert row["mismatch_drops"] == 1
+        assert row["datums"] == 3  # 4 built, 1 dropped
+        assert built[0] > loss_tokens and built[1] > context_tokens
+        # The row reports the batch that trained, not the batch that was scored.
+        assert _number(row, "loss_tokens") == loss_tokens
+        assert _number(row, "context_tokens") == context_tokens
+        assert _number(row, "student_train_tokens") == loss_tokens + context_tokens
+        # ... so the clip counters share the row's own denominator.
+        assert _number(row, "clipped_tokens") == loss_tokens
+        assert _number(row, "clip_fraction") == 1.0
+        assert _number(row, "clipped_tokens") / _number(row, "loss_tokens") == pytest.approx(
+            _number(row, "clip_fraction")
+        )
+        # The build-stage counters keep describing the build stage.
+        assert _number(row, "overflow_drops") == 0
+        assert _number(row, "overlong_drops") == 0
 
 
 def test_tracker_sees_every_step_eval_summary_and_finish(

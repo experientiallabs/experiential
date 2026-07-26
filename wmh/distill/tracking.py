@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from wmh.core.types import JsonObject, JsonValue
 from wmh.distill.config import DistillConfig
 from wmh.distill.samples import SampleRollout
+from wmh.distill.store import write_text_atomic
 
 if TYPE_CHECKING:
     from wmh.distill.loop import StepMetrics, WarmupMetrics
@@ -344,8 +345,12 @@ class WandbTracker:
             id=persisted_id,
             resume="allow" if persisted_id is not None else None,
         )
-        run_record_path.write_text(
-            WandbRunRecord(run_id=self._run.id).model_dump_json(indent=2), encoding="utf-8"
+        # Atomic like every other durable run-dir file: a crash between
+        # wandb.init() and a torn write would leave the id absent or partial,
+        # and the resumed session would silently start a SECOND dashboard run
+        # instead of continuing this one.
+        write_text_atomic(
+            run_record_path, WandbRunRecord(run_id=self._run.id).model_dump_json(indent=2)
         )
         self._dead = False
         if persisted_id is not None:

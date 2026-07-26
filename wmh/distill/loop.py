@@ -283,7 +283,21 @@ class DistillEvalReport(BaseModel):
 
 
 class StepMetrics(BaseModel):
-    """One training step's metrics row (the store adds the `step` key)."""
+    """One training step's metrics row (the store adds the `step` key).
+
+    The row reports two accounting stages, and mixing them in a ratio is a
+    measurement bug. `fragments`, `fragmentation_rate`, `overflow_drops`, and
+    `overlong_drops` describe the BUILD stage: rollouts merged into datums,
+    before the teacher scored anything. Every other datum or token count
+    (`datums`, `mismatch_drops`, `clipped_tokens`, `loss_tokens`,
+    `context_tokens`, `clip_fraction`, the advantage stats, `pg_loss`,
+    `grad_norm`) describes the TRAINED batch, after the teacher's misaligned
+    rows were dropped, so `clipped_tokens / loss_tokens` equals
+    `clip_fraction` and the token counts are what forward_backward consumed.
+    The pre-drop volume is not duplicated here: the teacher scored every built
+    datum, so `teacher_prefill_tokens` already carries it, and
+    `mismatch_drops` says how many datums the gap cost.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -292,16 +306,31 @@ class StepMetrics(BaseModel):
     solve_rate: float = Field(ge=0.0, le=1.0)
     empty_span_trials: int = Field(ge=0)
     datums: int = Field(ge=0)
+    """Datums the optimizer step trained on; under `train.loss = "topk_ce"`
+    these are the rank replicas, so k x the surviving source datums."""
+
     fragments: int = Field(ge=0)
     fragmentation_rate: float = Field(ge=0.0, le=1.0)
     overflow_drops: int = Field(ge=0)
     overlong_drops: int = Field(ge=0)
     mismatch_drops: int = Field(ge=0)
     clipped_tokens: int = Field(ge=0)
+    """Trained loss tokens whose raw advantage hit the clip bound (0 under
+    `topk_ce`, which clips nothing)."""
+
     loss_tokens: int = Field(ge=0)
+    """Sampled (mask 1.0) tokens in the trained batch, counted once per SOURCE
+    datum: under `topk_ce` the k rank replicas share one source's tokens, so
+    `student_train_tokens` is k x (`loss_tokens` + `context_tokens`)."""
+
     context_tokens: int = Field(ge=0)
+    """Non-loss tokens in the trained batch, on `loss_tokens`' convention."""
+
     reverse_kl_per_token: float | None
-    """mean(sampled_lp - teacher_lp) over scored loss tokens; None when none."""
+    """mean(sampled_lp - teacher_lp) over every SCORED loss token; None when
+    none. This is the teacher-scoring stage's measurement, not the trained
+    batch's: a datum the teacher scored but the alignment check later dropped
+    still contributed the positions that did come back."""
 
     reward_mean: float | None
     """Mean verifier reward over the step's trials; None when no trial ran.
@@ -2136,7 +2165,14 @@ class _DistillRun:
         advantage_mean: float | None = None
         advantage_std: float | None = None
         clipped_tokens = 0
-        adv_loss_tokens = 0
+        # Token counts of the batch that actually trains, per source datum.
+        # `datum_stats` counts what the teacher was ASKED to score, which is
+        # larger whenever a misaligned teacher row drops a datum; reporting
+        # that as the step's volume would overstate the batch and break
+        # `clipped_tokens / loss_tokens == clip_fraction` (both clip counters
+        # are post-drop). See `StepMetrics` for the two-stage contract.
+        trained_loss_tokens = 0
+        trained_context_tokens = 0
         if cfg.train.loss == "topk_ce":
             # One prefill-only teacher request per datum yields the top-k
             # candidate rows AND the realized logprobs, so the reverse-KL
@@ -2152,6 +2188,8 @@ class _DistillRun:
             trained, topk_stats = build_topk_ce_datums(datums, scores.topk, cfg.train.topk)
             loss_fn = CROSS_ENTROPY_LOSS
             mismatch_drops = topk_stats.mismatch_drops
+            trained_loss_tokens = topk_stats.loss_tokens
+            trained_context_tokens = topk_stats.context_tokens
         else:
             try:
                 rows, reverse_kl = _teacher_rows(self._teacher, datums)
@@ -2164,7 +2202,8 @@ class _DistillRun:
             advantage_mean = adv_stats.advantage_mean
             advantage_std = adv_stats.advantage_std
             clipped_tokens = adv_stats.clipped_tokens
-            adv_loss_tokens = adv_stats.loss_tokens
+            trained_loss_tokens = adv_stats.loss_tokens
+            trained_context_tokens = adv_stats.context_tokens
 
         # In topk_ce mode this is k x the source CE volume (the k rank
         # replicas each carry the full sequence), which is exactly what
@@ -2204,15 +2243,15 @@ class _DistillRun:
             overlong_drops=datum_stats.overlong_drops,
             mismatch_drops=mismatch_drops,
             clipped_tokens=clipped_tokens,
-            loss_tokens=datum_stats.loss_tokens,
-            context_tokens=datum_stats.context_tokens,
+            loss_tokens=trained_loss_tokens,
+            context_tokens=trained_context_tokens,
             reverse_kl_per_token=reverse_kl,
             reward_mean=(
                 sum(record.reward for record in records) / len(records) if records else None
             ),
             advantage_mean=advantage_mean,
             advantage_std=advantage_std,
-            clip_fraction=(clipped_tokens / adv_loss_tokens if adv_loss_tokens else 0.0),
+            clip_fraction=(clipped_tokens / trained_loss_tokens if trained_loss_tokens else 0.0),
             pg_loss=pg_loss,
             grad_norm=grad_norm,
             sampler_path=sampler_path,
