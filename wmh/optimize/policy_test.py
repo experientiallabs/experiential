@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from wmh.optimize.compression import CompressionConfig
 from wmh.optimize.policy import (
     KNN_BANK_FILENAME,
     ClusterRanking,
@@ -161,6 +163,53 @@ def test_policy_round_trips_through_json(tmp_path: Path) -> None:
     path = tmp_path / "policy.json"
     policy.save(path)
     assert RoutingPolicy.load(path) == policy
+
+
+def test_pre_compression_policy_json_loads_with_compression_off(tmp_path: Path) -> None:
+    # The #259 additive-fields guarantee, pinned for D-COMPRESS: a policy.json written before
+    # the compression fields existed must load with compression defaulted to off everywhere.
+    policy = _rank_policy()
+    path = tmp_path / "policy.json"
+    raw = policy.model_dump_json(indent=2)
+    assert '"compression"' in raw  # sanity: the field serializes
+    stripped = {
+        key: value
+        for key, value in policy.model_dump(mode="json").items()
+        if key != "compression"
+    }
+    stripped["clusters"] = [
+        {k: v for k, v in cluster.items() if k != "compression"} for cluster in stripped["clusters"]
+    ]
+    path.write_text(json.dumps(stripped), encoding="utf-8")
+    loaded = RoutingPolicy.load(path)
+    assert loaded.compression is None
+    assert all(cluster.compression is None for cluster in loaded.clusters)
+
+
+def test_policy_with_compression_round_trips(tmp_path: Path) -> None:
+    policy = _rank_policy()
+    policy = policy.model_copy(
+        update={
+            "compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+        }
+    )
+    path = tmp_path / "policy.json"
+    policy.save(path)
+    loaded = RoutingPolicy.load(path)
+    assert loaded.compression is not None
+    assert loaded.compression.compressor_id == "truncate"
+    assert loaded.compression.aggressiveness == 0.5
+
+
+def test_policy_rejects_unknown_compressor_at_load() -> None:
+    # Fail at mount, not on the first request mid-conversation.
+    with pytest.raises(ValidationError, match="unknown compressor 'nope'"):
+        RoutingPolicy(
+            kind="static",
+            default_model="haiku-4-5",
+            pool=_pool(),
+            compression=CompressionConfig(compressor_id="nope"),
+        )
 
 
 def test_azure_embedder_spec_requires_backend_fields() -> None:
