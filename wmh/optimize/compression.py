@@ -147,6 +147,24 @@ _COMPRESSORS: dict[str, Compressor] = {
 }
 
 
+def register_compressor(compressor: Compressor) -> None:
+    """Register a compressor implementation under its `id` (research-track entry point).
+
+    The module docstring's contract: real compressors are chosen by the research track and
+    register here. Registration is idempotent for the same object and refuses to silently
+    replace a DIFFERENT implementation under an existing id, because a policy artifact
+    referencing that id must always resolve to the bytes it was fitted against.
+    """
+    existing = _COMPRESSORS.get(compressor.id)
+    if existing is not None and existing is not compressor:
+        raise ValueError(
+            f"compressor id '{compressor.id}' is already registered by "
+            f"{type(existing).__name__}; ids are stable policy references and cannot be "
+            "silently rebound"
+        )
+    _COMPRESSORS[compressor.id] = compressor
+
+
 def get_compressor(compressor_id: str) -> Compressor:
     """Resolve a compressor by id, or raise naming the known ids (fail at mount, not mid-call)."""
     compressor = _COMPRESSORS.get(compressor_id)
