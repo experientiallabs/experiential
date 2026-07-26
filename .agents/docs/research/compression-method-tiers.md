@@ -58,6 +58,15 @@ prefix-cached). The field has never run a ratio-matched random-removal control i
 LLMLingua line, never published an append-stability test, and never evaluated agentic
 tool-output workloads rigorously - those three gaps are exactly rounds 0-1 of C1.
 
+Source-strength caveat on the headline (from the review's own cross-check): the two
+billed-cost studies are SPECULATIVE-tier (0 cites; one has a stated conflict of
+interest), and the traffic-redundancy numbers (Preble's 85-97% prefix sharing,
+TraceLab's ~19% new tokens) come from sources that are not methodologically independent
+of each other, with TraceLab itself speculative. The scoping rule therefore rests on
+provider PRICING ARITHMETIC (0.1x cache reads, which is not in dispute) plus directional
+evidence - and Q2 (measure prefix-sharing on OUR traffic) exists precisely so no design
+decision rests on those third-party redundancy figures.
+
 Track prerequisite discovered: the tracker-side cost path (wmh/tracking/pricing.py) has
 no cache tiers and cache writes are captured nowhere (the pool/serving path is correct).
 C3 item 0; no savings number ships before it lands.
