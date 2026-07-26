@@ -98,3 +98,102 @@ def test_tools_hint_lands_in_the_system_prompt() -> None:
     assert "run_sql(query)" in provider.system
     bare = LLMAgent(_CaptureProvider())
     assert bare is not None  # no hint -> unchanged system (covered by existing tests)
+
+
+class SequenceProvider(FakeProvider):
+    """FakeProvider returning a fixed sequence of replies (for the empty-retry tests)."""
+
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__(replies[-1])
+        self._replies = list(replies)
+        self.calls = 0
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        self.last_user = messages[0].content
+        reply = self._replies[min(self.calls, len(self._replies) - 1)]
+        self.calls += 1
+        return Completion(text=reply)
+
+
+def test_agent_parses_bare_function_call_syntax() -> None:
+    agent = LLMAgent(FakeProvider('get_user_details({"user_id": "ivan_johnson_7409"})'))
+    action = agent.act("look up user", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "get_user_details"
+    assert action.arguments == {"user_id": "ivan_johnson_7409"}
+
+
+def test_agent_parses_prose_fused_call() -> None:
+    reply = (
+        "I need to check the recent orders to find the camera. Let me get the details."
+        'get_order_details({"order_id": "#W6798117"})'
+    )
+    agent = LLMAgent(FakeProvider(reply))
+    action = agent.act("exchange the camera", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "get_order_details"
+    assert action.arguments == {"order_id": "#W6798117"}
+
+
+def test_agent_takes_first_of_stacked_calls() -> None:
+    reply = 'a_tool({"k": 1})\nb_tool({"k": 2})'
+    agent = LLMAgent(FakeProvider(reply))
+    action = agent.act("do things", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "a_tool"
+    assert action.arguments == {"k": 1}
+
+
+def test_bare_call_is_not_misread_as_done() -> None:
+    # Regression: extract_json_object grabs the inner {...} of function-call syntax; a
+    # bare arguments object must not validate as an envelope reply with tool=None (done).
+    agent = LLMAgent(FakeProvider('search({"q": "boots"})'))
+    action = agent.act("find boots", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "search"
+
+
+def test_arguments_object_alone_is_a_message_not_done() -> None:
+    agent = LLMAgent(FakeProvider('{"user_id": "ivan_johnson_7409"}'))
+    action = agent.act("look up user", EnvState(), [])
+    assert action.kind is ActionKind.MESSAGE
+    assert action.content != DONE_SIGNAL
+
+
+def test_agent_retries_empty_completions() -> None:
+    provider = SequenceProvider(["", "  ", '{"tool": "search", "arguments": {}}'])
+    agent = LLMAgent(provider)
+    action = agent.act("find x", EnvState(), [])
+    assert provider.calls == 3
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "search"
+
+
+def test_agent_gives_up_after_empty_retries() -> None:
+    provider = SequenceProvider(["", "", ""])
+    agent = LLMAgent(provider)
+    action = agent.act("find x", EnvState(), [])
+    assert provider.calls == 3
+    assert action.kind is ActionKind.MESSAGE
+    assert action.content == ""
+
+
+def test_history_chars_controls_observation_truncation() -> None:
+    provider = FakeProvider('{"done": true}')
+    history = [
+        Step(
+            action=Action(kind=ActionKind.TOOL_CALL, name="t", arguments={}),
+            observation=Observation(content="x" * 5000),
+        )
+    ]
+    LLMAgent(provider, history_chars=3000).act("task", EnvState(), history)
+    assert provider.last_user is not None
+    assert "x" * 3000 in provider.last_user
+    assert "x" * 3001 not in provider.last_user
