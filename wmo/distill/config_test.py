@@ -822,10 +822,8 @@ def test_checked_in_run_configs_resolve_cookbook_renderers() -> None:
     pytest.importorskip("tinker_cookbook")
     from tinker_cookbook.model_info import get_recommended_renderer_name
 
-    config_dir = Path(__file__).resolve().parents[2] / ".agents" / "distill"
-    paths = sorted(config_dir.glob("*.toml"))
-    if not paths:
-        pytest.skip("no checked-in distill run configs in this tree")
+    paths = sorted((Path(__file__).parent / "configs").glob("*.toml"))
+    assert paths, "the reference configs that ship with the package are missing"
     for path in paths:
         cfg = load_distill_config(path)
         models = [cfg.student.base_model]
@@ -850,10 +848,8 @@ def test_checked_in_run_configs_name_a_verbatim_renderer_for_every_tinker_model(
     pytest.importorskip("tinker_cookbook")
     from wmo.distill.renderers import WMO_RENDERERS
 
-    config_dir = Path(__file__).resolve().parents[2] / ".agents" / "distill"
-    paths = sorted(config_dir.glob("*.toml"))
-    if not paths:
-        pytest.skip("no checked-in distill run configs in this tree")
+    paths = sorted((Path(__file__).parent / "configs").glob("*.toml"))
+    assert paths, "the reference configs that ship with the package are missing"
     for path in paths:
         cfg = load_distill_config(path)
         # An openai_compat teacher is served outside Tinker and renders with its own
@@ -921,10 +917,13 @@ def test_a_renderer_key_naming_a_model_the_run_never_samples_is_rejected(tmp_pat
 
 
 def _checked_in_config(name: str) -> DistillConfig:
-    path = Path(__file__).resolve().parents[2] / ".agents" / "distill" / name
-    if not path.exists():
-        pytest.skip(f"{name} is not in this tree")
-    return load_distill_config(path)
+    """Load one of the reference configs that ship beside this module.
+
+    They live in the package rather than in `.agents/` so they reach users of the
+    wheel, which is the point of a reference config. No skip guard: these are
+    shipped files, so an absent one is a packaging regression and should fail.
+    """
+    return load_distill_config(Path(__file__).parent / "configs" / name)
 
 
 @pytest.mark.parametrize("name", ["distill-super-topk.toml", "distill-super-aggressive.toml"])

@@ -1,8 +1,9 @@
-# Super top-k run: Nemotron-3 Super distilled from Ultra with the topk_ce
-# loss (weighted CE over the teacher's top-8 candidates per position) at the
-# anchor's schedule, so anchor vs topk isolates the loss. Reuses the anchor
-# run's warmup collection (warmup.trajectories_from) and pre-training student
-# baseline (eval.student_baseline_from); run the anchor first under
+# Super aggressive run: Nemotron-3 Super distilled from Ultra with the
+# topk_ce loss on a hotter schedule — 3x the anchor's LR and 2x its group
+# size over fewer (24) steps — to probe how hard the dense top-k supervision
+# can be pushed. Reuses the anchor run's warmup collection
+# (warmup.trajectories_from) and pre-training student baseline
+# (eval.student_baseline_from); run the anchor first under
 # .wmo/distill-runs/super-anchor. Model names are the tinker-cookbook catalog
 # names (pinned by test_checked_in_run_configs_resolve_cookbook_renderers).
 [student]
@@ -14,7 +15,7 @@ backend = "tinker"
 model = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 
 [harbor]
-job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+job_template = "wmo/distill/configs/tb2-harbor-job-template.yaml"
 backend = "local"
 reward_key = "reward"
 
@@ -34,10 +35,10 @@ compaction = false
 [train]
 loss = "topk_ce"
 topk = 8
-steps = 40
+steps = 24
 tasks_per_batch = 8
-group_size = 4
-learning_rate = 5e-5
+group_size = 8
+learning_rate = 1e-4
 advantage_clip = 4.0
 center_advantages = true
 max_datum_tokens = 64000
@@ -85,4 +86,4 @@ max_usd = 500.0
 [wandb]
 enabled = true
 project = "wmo-distill"
-run_name = "distill-super-topk"
+run_name = "distill-super-aggressive"

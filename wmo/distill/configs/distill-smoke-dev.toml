@@ -1,5 +1,3 @@
-# Fragmentation validation: one training step; pass = train/fragmentation_rate ~0
-# with the incremental per-episode prompt construction (goal milestone 2).
 # Dev smoke: cheapest same-family pair to shake out the pipeline end to end.
 # Re-verify model names against the live Tinker lineup before running (lineup churns).
 [student]
@@ -11,7 +9,7 @@ backend = "tinker"
 model = "Qwen/Qwen3.5-9B"
 
 [harbor]
-job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+job_template = "wmo/distill/configs/tb2-harbor-job-template.yaml"
 backend = "local"
 reward_key = "reward"
 
@@ -29,7 +27,7 @@ compaction = false
 "Qwen/Qwen3.5-9B" = "wmo/qwen3_5_verbatim"
 
 [train]
-steps = 1
+steps = 3
 tasks_per_batch = 4
 group_size = 2
 learning_rate = 1e-4
@@ -37,7 +35,7 @@ advantage_clip = 4.0
 center_advantages = true
 max_datum_tokens = 65536
 sampler_refresh_every = 1
-save_state_every = 1
+save_state_every = 2
 trial_concurrency = 1
 
 # temperature 1.0 keeps issued sampler logprobs comparable to the untempered
@@ -55,7 +53,7 @@ tasks = 4
 k = 1
 
 [gate]
-k = 1
+k = 2
 min_teacher_fraction = 0.7
 require_no_regression = true
 
@@ -63,7 +61,7 @@ require_no_regression = true
 # Fill from the live Tinker models page at run time; unset forces interactive confirm.
 
 [budget]
-max_usd = 8.0
+max_usd = 15.0
 
 # Optional Weights & Biases tracking; needs `uv sync --extra distill` plus
 # WANDB_API_KEY (or a prior `wandb login`). Uncomment to enable.

@@ -31,10 +31,11 @@ datum pipeline: `build_datums` is provenance-agnostic, so teacher rollouts feed 
 objective is plain cross-entropy over the teacher's tokens.
 
 On main this exists as the `[warmup]` phase: a one-shot, full-batch pass over a teacher-trajectory
-corpus, collected by `_collect_warmup_trials` or reloaded across runs via `warmup.trajectories_from`.
+corpus, collected by `_collect_warmup_trials` or reloaded across runs via
+`warmup.trajectories_from`.
 
-PR #268 promotes it to a first-class `[offpolicy]` section with epochs, minibatching and a resumable
-datum cursor, and collapses `[warmup]` onto the same executor.
+A first-class `[offpolicy]` section with epochs, minibatching and a resumable datum cursor is in
+progress; it collapses `[warmup]` onto the same executor.
 
 Teacher must share the student's tokenizer. `tokenizer_fingerprint_check` enforces this.
 
@@ -47,12 +48,12 @@ chunk rather than per token.
 
 **Not runnable on this build.** `wmo/distill/xtoken/` is present but inert (no importers), and the
 runtime rejects `teacher.backend = "openai_compat"` even though the config schema validates it.
-PR #258 activates the path.
 
 ## Configs
 
 A run is defined by one TOML passed as `--config`. There is no generator and no default file: you
-copy the closest checked-in example and edit it. They live in `.agents/distill/`:
+copy the closest reference config and edit it. They ship in the package, in
+[`configs/`](configs):
 
 | file | what it is |
 | --- | --- |
@@ -76,23 +77,11 @@ harbor's parser a list and kill the trial, so reasoning models need the `wmo/*_v
 config to `<run-dir>/config.toml`, and a bare `--resume` reloads that. Passing `--config` on a
 resume is how you raise `budget.max_usd` on a run that hit its cap.
 
-## What a run produces
-
-Everything durable lands under `--run-dir`: `config.toml`, `metrics.jsonl` (one row per step),
-`spend.json`, `checkpoints.json`, `evals/`, `gate.json`, `model_card.json`, and `handoff.toml` with
-the serving snippet. Resume with `--run-dir <same> --resume`; splits, backend and prior spend all
-reload from the run dir.
-
-Read `scaffold_loss_rate` before any solve rate. It is the share of episodes that never reached an
-explicit `submit`, so those episodes measure where the harness cut them off rather than what the
-model can do. `graded_solve_rate` sits beside every solve rate and reads the same trials at test
-resolution, so partial progress inside a task is visible even though the gate stays binary.
-
 ## Before you spend
 
-Run the sub-cent gsm8k probe (`.agents/distill/tinker_probe_gsm8k.py`). It exercises sample, score,
-`forward_backward` and `optim_step` end to end against Tinker for a fraction of a cent, and catches
-the failures that otherwise surface forty minutes into a paid run.
+Run the sub-cent gsm8k probe (`.agents/distill/tinker_probe_gsm8k.py`, operator scratch). It
+exercises sample, score, `forward_backward` and `optim_step` end to end against Tinker for a
+fraction of a cent, and catches the failures that otherwise surface forty minutes into a paid run.
 
 Set `TINKER_API_KEY`, `E2B_API_KEY` and `WANDB_API_KEY`. Runs charge real money and abort on the cap
 in `[budget]`. Teacher scoring bills prefill at the cached rate where Tinker reports a cache hit, so

@@ -13,7 +13,7 @@ backend = "tinker"
 model = "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16"
 
 [harbor]
-job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+job_template = "wmo/distill/configs/tb2-harbor-job-template.yaml"
 backend = "local"
 reward_key = "reward"
 
