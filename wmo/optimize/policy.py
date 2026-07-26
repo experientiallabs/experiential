@@ -60,9 +60,12 @@ DEFAULT_RANK = 999
 # (+1.0 accuracy point over the best single model at -27% cost, 5/5 split seeds).
 KNN_BANK_FILENAME = "policy_knn_bank.npz"
 # The sidecar suffix a fit DERIVES from its policy path, so two policies fitted into one
-# directory own two banks (`support.json` -> `support.bank.npz`) instead of racing for one
-# shared name. `KNN_BANK_FILENAME` above stays the resolution fallback for artifacts that
-# record no path of their own; see `RoutingPolicy.knn_bank_path`.
+# directory own two banks instead of racing for one shared name. APPENDED rather than
+# substituted for the policy's extension (`support.json` -> `support.json.bank.npz`): appending
+# is injective on filenames, while replacing the extension would map `support.json` and
+# `support.yaml` onto one bank and reintroduce the collision. `KNN_BANK_FILENAME` above stays
+# the resolution fallback for artifacts that record no path of their own; see
+# `RoutingPolicy.knn_bank_path`.
 KNN_BANK_SUFFIX = ".bank.npz"
 DEFAULT_RAG_NUM = 50
 DEFAULT_RAG_THRES = 0.95
@@ -81,14 +84,29 @@ SE_FLOOR_MAX_PAIRS = 30
 _BANK_LOAD_LOCK = threading.Lock()
 
 
+def write_artifact_atomically(path: Path, payload: bytes) -> None:
+    """Write `payload` to `path` through a staging file, replacing it in one step.
+
+    Serving reads an artifact directory while the optimizer writes it, and a half-written
+    policy.json is a mount failure rather than a slightly stale endpoint. It is also what lets
+    a command that writes several artifacts promise that a failure leaves the old ones intact.
+    `KnnBank.save` stages the same way for the sidecar it streams through numpy.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staging = path.with_name(f"{path.name}.partial")
+    staging.write_bytes(payload)
+    staging.replace(path)
+
+
 def knn_bank_path_for(policy_path: Path) -> Path:
     """The evidence sidecar that belongs to one policy file.
 
-    `models/support.json` -> `models/support.bank.npz`. One owner for the derivation so the
-    fitter, the CLI's console line, and any tooling that cleans an artifact directory cannot
+    `models/support.json` -> `models/support.json.bank.npz`. Distinct policy filenames always
+    give distinct bank filenames (see `KNN_BANK_SUFFIX`), and one owner for the derivation means
+    the fitter, the CLI's console line, and any tooling that cleans an artifact directory cannot
     disagree about which `.npz` belongs to which policy.
     """
-    return policy_path.with_suffix(KNN_BANK_SUFFIX)
+    return policy_path.with_name(f"{policy_path.name}{KNN_BANK_SUFFIX}")
 
 
 class EmbedderSpec(BaseModel):
@@ -383,8 +401,8 @@ class RoutingPolicy(BaseModel):
         return self
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        """Write the policy artifact atomically (a torn policy.json must not be loadable)."""
+        write_artifact_atomically(path, self.model_dump_json(indent=2).encode("utf-8"))
         self._source_dir = path.parent
 
     @classmethod

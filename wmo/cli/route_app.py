@@ -20,6 +20,7 @@ customer copy never says router.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import os
 from collections import Counter
@@ -58,6 +59,7 @@ from wmo.optimize.policy import (
     EmbedderSpec,
     RoutingPolicy,
     knn_bank_path_for,
+    write_artifact_atomically,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
@@ -751,6 +753,24 @@ def _confirm_cost(*, yes: bool) -> None:
         raise typer.Exit(0)
 
 
+# Provenance carries a digest of the matrix, not just its path: a corpus is routinely rebuilt in
+# place under the same filename, and a fit is identified by the data it saw. 16 hex characters
+# is 64 bits, far past collision risk for the handful of matrices one artifact directory sees.
+_MATRIX_DIGEST_CHARS = 16
+
+
+def _matrix_provenance(matrix_file: str) -> str:
+    """`<path> sha256=<digest>`: the source half of a fitted policy's `fitted_from`.
+
+    The digest is what makes `fitted_from` an identity rather than a label. `tune` compares it
+    against the as-fitted snapshot beside a policy, and two fits of the same path with different
+    contents (or the same contents at two paths) have to come out different for that check to
+    protect anything.
+    """
+    digest = hashlib.sha256(Path(matrix_file).read_bytes()).hexdigest()
+    return f"{matrix_file} sha256={digest[:_MATRIX_DIGEST_CHARS]}"
+
+
 @route_app.command("student")
 def student(
     card_dir: str = typer.Argument(
@@ -1010,6 +1030,8 @@ def fit(
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
+    source = _matrix_provenance(matrix_file)
+    embed_tag = f"{embedder}-{dim}" + (f"/{deployment}" if embedder == "azure" else "")
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -1032,7 +1054,11 @@ def fit(
             min_pairs=min_pairs,
             se_floor=se_floor,
             floor_q=floor_q,
-            fitted_from=f"{matrix_file} knn z={z} k={rag_num} q={floor_q} {embedder}-{dim}",
+            fitted_from=(
+                f"{source} knn fallback={fallback or 'auto'} z={z:g} k={rag_num} "
+                f"thres={rag_thres:g} pairs={min_pairs} se_floor={se_floor} q={floor_q:g} "
+                f"{embed_tag}"
+            ),
         )
     else:
         policy = fit_rank_policy(
@@ -1042,7 +1068,10 @@ def fit(
             seed=seed,
             top_k_clusters=top_k_clusters,
             beta=beta,
-            fitted_from=f"{matrix_file} seed={seed} k={clusters} {embedder}-{dim}",
+            fitted_from=(
+                f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
+                f"cost_weight={cost_weight:g} {embed_tag}"
+            ),
         )
         if cost_weight > 0.0:
             policy = rerank_policy(policy, cost_weight=cost_weight)
@@ -1175,7 +1204,8 @@ def tune(
 
     That snapshot is only a valid baseline for the fit it came from, so this command refuses to
     run when the two disagree (refit the policy and the stale snapshot must be deleted, not
-    silently dialed back over the new fit). A tune that fails writes nothing at all.
+    silently dialed back over the new fit). A tune that is rejected writes nothing at all, and
+    every write it does make is atomic.
 
     The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
     touching files at all: `PUT /v1/endpoints/{name}/config`.
@@ -1207,8 +1237,11 @@ def tune(
     if as_fitted is None:
         # Preserve the artifact as fitted, so `tune` is always re-appliable from the fit and
         # never from an already-slid copy of itself. Written only now that the dial has applied:
-        # a snapshot left behind by a FAILED tune would poison the path for the next fit.
-        base_path.write_bytes(path.read_bytes())
+        # a snapshot left behind by a REJECTED tune would poison the path for the next fit.
+        # Both writes are atomic, so the only interruption that leaves a snapshot behind is one
+        # where the policy is still the as-fitted bytes the snapshot copied, which is consistent
+        # rather than stale.
+        write_artifact_atomically(base_path, path.read_bytes())
     tuned.save(path)
     knobs = cost_quality_knobs(cost_quality)
     _console.print(
