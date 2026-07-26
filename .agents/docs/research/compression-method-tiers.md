@@ -131,7 +131,31 @@ Corrections and caveats carried forward:
 - Learned-method latency (4.5-6 s/10k tokens) is local-CPU-fp32 and provisional; the
   H100 leg (realistic batch, hosting amortized) gates kill bar 3, not this round.
 
-### Acceptance benchmark (C1's second deliverable, seam agreed, implementation next)
+### Round 1a: the H100 latency leg (C1, 2026-07-26). Kill bar 3 PASSES.
+
+Both surviving scored methods, end to end on the round 0 transcripts, one H100 NVL
+(request batch 1/4/16, fp32 + fp16; evidence compression_round0/gpu-bench.json; GPU
+rows device-tagged in the results JSON, CPU rows untouched):
+
+- llmlingua2-fixed-threshold fp32: 0.20-0.23 s/10k tokens (45-51k tok/s), +17ms p50
+  per request at batch 1, ~$0.0006 per 10k tokens amortized per GPU at retail. Against
+  savings on non-cacheable segments at its achieved ratio, the margin is 5x at the
+  cheapest pool tier (gpt-5.4-mini) and 20-33x at mid/frontier. The 4.5s CPU number is
+  obsolete: the learned family is servable.
+- selective-context-absolute fp32: 0.51 s/10k, ~$0.0014/10k, margins 4x-16x.
+- SERVING RULE ADOPTED: fp32 only. fp32 outputs are batch-invariant (identical hashes
+  at batch 1/4/16); fp16 outputs change with batch composition (measured), which
+  breaks byte-determinism in serving where batch-mates are traffic-dependent.
+
+### Acceptance benchmark (C1's second deliverable, BUILT on the C3 seam)
+
+Branch compress/c1-bench, pinned base compress/c3 @ 3bd8efc7 (the #259 lesson:
+accuracy numbers reproduce through the served path). register_compressor() added as
+the public research entry point; round 0 survivors implemented against the Compressor
+protocol (deterministic, 0.0 no-op, segment-preserving, append-stable; tested);
+runner with dry-run projection + capped/metered/resumable live mode. First grid
+(financebench-s80, matched-ratio arms + controls) awaits the master-approved cost
+projection in the track data root findings/c1.md.
 
 A cell = (compressor config, model) evaluated closed-loop on held-out wm scenarios by
 `evaluate_pool(..., provider_factory=...)` (wmh/env/closed_loop.py) with a
