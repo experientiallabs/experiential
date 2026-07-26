@@ -30,7 +30,7 @@ Usage (from the distill worktree root; venv has tinker + tinker_cookbook):
 TINKER_API_KEY is taken from the environment. If it is unset, the script reads
 it from an env file (never printed): ``$WMO_ENV_FILE`` when set, otherwise
 ``<repo>/.env.local`` and then ``<repo>/../platform/.env.local``. A missing env
-file is only a warning; the hard failure is the key itself being unavailable.
+file is only a warning; the hard failure is the key still being unavailable.
 
 Server ops (box h100-dev-box-6, azureuser@40.80.93.150):
   start:  tmux new-session -d -s nemotron-serve \
@@ -76,24 +76,28 @@ def _env_file_candidates() -> list[Path]:
 
 
 def _ensure_tinker_api_key() -> None:
-    """Put TINKER_API_KEY in the environment, reading an env file only as a fallback."""
+    """Put TINKER_API_KEY in the environment, reading an env file only as a fallback.
+
+    An env file that is absent or silent about the key is a warning naming that file, not a
+    failure: the only hard requirement is that the key ends up in the environment somehow.
+    """
     if os.environ.get("TINKER_API_KEY"):
         return
-    candidates = _env_file_candidates()
-    for path in candidates:
+    problems: list[str] = []
+    for path in _env_file_candidates():
         if not path.exists():
-            print(f"note: no env file at {path}")
+            problems.append(f"{path} (no such file)")
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
             m = re.match(r"^(?:export\s+)?TINKER_API_KEY=(.*)$", line.strip())
             if m:
                 os.environ["TINKER_API_KEY"] = m.group(1).strip().strip("'\"")
                 return
-        print(f"note: {path} exists but has no TINKER_API_KEY line")
-    searched = ", ".join(str(path) for path in candidates)
+        problems.append(f"{path} (no TINKER_API_KEY line)")
+    print("warning: no env file supplied TINKER_API_KEY: " + "; ".join(problems))
     sys.exit(
-        "TINKER_API_KEY is not set. Export it, add a TINKER_API_KEY=... line to one of "
-        f"{searched}, or point {ENV_FILE_VAR} at an env file that has one."
+        "TINKER_API_KEY is not set. Export it, add a TINKER_API_KEY=... line to one of the "
+        f"files above, or point {ENV_FILE_VAR} at an env file that has one."
     )
 
 
