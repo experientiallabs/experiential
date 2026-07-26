@@ -95,7 +95,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["wmo", "packages/llm-waterfall/llm_waterfall"]
-exclude = ["**/*_test.py"]
+# Test-only code is named for pytest discovery (`*_test.py`), and these two are the exceptions
+# that the glob therefore misses: `fake_tinker` is the deterministic Tinker double the distill
+# tests run the whole loop against, and `wmo/conftest.py` is a pytest fixture module. Both are
+# imported only by tests, so neither belongs in the published wheel. `fake_tinker` stays where
+# it is rather than moving under a test path: five test modules import it by that name.
+exclude = ["**/*_test.py", "wmo/distill/fake_tinker.py", "wmo/conftest.py"]
 force-include = { "packages/llm-waterfall/LICENSE" = "llm_waterfall/LICENSE" }
 
 [tool.hatch.build.targets.sdist]
