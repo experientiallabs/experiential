@@ -41,6 +41,28 @@ gets summarized here. GPU resources: h100-dev-box-6 and h100-dev-box-3 (2x H100 
 running), a100-backup-1 (1x A100, running); h100-dev-box is OCCUPIED (vllm work), do not
 touch.
 
+## Lit review verdict (citation-screened, 2026-07-25; full doc in the track data root)
+
+The reframing finding: CACHING BEATS COMPRESSION on any reusable prefix (reads bill ~0.1x
+on 100% of tokens; a 5x compressor bills survivors at 1.0x = 0.2x), so the track's scope
+is COMPRESS WHAT IS NOT CACHEABLE. The only two end-to-end billed-cost studies disagree in
+sign (one measured +6.8% cost from a 38% token reduction because it broke caching and
+verbatim edit anchors; the only tau-bench study found query-agnostic + cache-control wins
+while query-aware compression cost +40% for identical quality) - both are 0-cite 2026
+preprints, cited as directions only, and both support the same reconciling rule above.
+Prefix stability is the field-wide failure: every major method selects against a
+per-input percentile, so compressed prefixes churn every turn; absolute budgets are
+append-only, ratio budgets never are. The soft-prompt/latent family (Gist, AutoCompressor,
+ICAE, xRAG) is dead for us on serving-contract grounds (needs model internals; cannot be
+prefix-cached). The field has never run a ratio-matched random-removal control in the
+LLMLingua line, never published an append-stability test, and never evaluated agentic
+tool-output workloads rigorously - those three gaps are exactly rounds 0-1 of C1.
+
+Track prerequisite discovered: the tracker-side cost path (wmh/tracking/pricing.py) has
+no cache tiers and cache writes are captured nowhere (the pool/serving path is correct).
+C3 item 0; no savings number ships before it lands.
+
 ## Verdicts
 
-(none yet - the table fills as children report and master verifies)
+(the table fills as children report and master verifies; round 0 = append-stability
+audit across all slate methods + hosted arms, $0, before any live accuracy spend)
