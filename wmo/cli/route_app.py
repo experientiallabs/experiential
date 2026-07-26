@@ -50,13 +50,14 @@ from wmo.optimize.knn import (
     cost_quality_knobs,
     cost_quality_named_point,
     fit_knn_policy,
+    fit_provenance,
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import (
-    KNN_BANK_FILENAME,
     POLICY_FILENAME,
     EmbedderSpec,
     RoutingPolicy,
+    knn_bank_path_for,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
@@ -1016,10 +1017,12 @@ def fit(
                 "policy trades cost through its dial instead: fit it, then "
                 "`wmo optimize route tune <policy.json> --cost-quality <0..1>`"
             )
-        # The sidecar goes beside the policy file: that is where serving resolves it from.
+        # The sidecar is named after --out and beside it, and the fit records that name in the
+        # policy JSON: serving then resolves THIS policy's evidence explicitly, so a second knn
+        # fit into the same directory gets its own bank instead of overwriting this one's.
         policy = fit_knn_policy(
             matrix,
-            bank_path=out_path.parent / KNN_BANK_FILENAME,
+            bank_path=knn_bank_path_for(out_path),
             embedder=spec,
             embed_with=built,
             guard_model=fallback,
@@ -1049,8 +1052,7 @@ def fit(
         routed = 1.0 - result.model_mix.get(policy.default_model, 0.0)
         _console.print(
             f"[green]✓[/green] fitted knn policy over {result.scenarios} scenarios -> {out}\n"
-            f"  bank {out_path.parent / KNN_BANK_FILENAME}, fallback {policy.default_model}, "
-            f"z={z}\n"
+            f"  bank {policy.bank_path()}, fallback {policy.default_model}, z={z}\n"
             f"  routed away from the fallback {routed:.1%} of the time; cost/scenario "
             f"${result.cost_per_scenario:.5f}\n"
             f"  fit-set accuracy {result.accuracy:.4f} is IN-SAMPLE (every request retrieves its "
@@ -1165,11 +1167,15 @@ def tune(
     """Set a fitted policy's cost/quality dial in place, without refitting anything.
 
     The dial maps to the policy's knobs along the measured frontier (see
-    `wmo.optimize.knn.apply_cost_quality`). The first run copies the un-tuned artifact to
-    `policy.base.json` and every later run re-reads THAT, so the dial is always applied to the
+    `wmo.optimize.knn.apply_cost_quality`). The first successful run copies the un-tuned artifact
+    to `policy.base.json` and every later run re-reads THAT, so the dial is always applied to the
     policy as fitted and sliding twice never compounds:
 
         wmo optimize route tune models/support/policy.json --cost-quality 0.6
+
+    That snapshot is only a valid baseline for the fit it came from, so this command refuses to
+    run when the two disagree (refit the policy and the stale snapshot must be deleted, not
+    silently dialed back over the new fit). A tune that fails writes nothing at all.
 
     The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
     touching files at all: `PUT /v1/endpoints/{name}/config`.
@@ -1177,16 +1183,31 @@ def tune(
     path = Path(policy_file)
     if not path.is_file():
         raise typer.BadParameter(f"no policy file at {path}")
+    policy = RoutingPolicy.load(path)
     base_path = path.with_name(f"{path.stem}.base{path.suffix}")
-    if not base_path.is_file():
-        # Preserve the artifact as fitted the first time, so `tune` is always re-appliable from
-        # the fit and never from an already-slid copy of itself.
-        base_path.write_bytes(path.read_bytes())
-    base = RoutingPolicy.load(base_path)
+    base = policy
+    if base_path.is_file():
+        base = RoutingPolicy.load(base_path)
+        if (base.kind, fit_provenance(base)) != (policy.kind, fit_provenance(policy)):
+            # `fit` overwrites the policy without touching this snapshot, so a refit leaves one
+            # behind that describes a policy that no longer exists. Dialing it would report
+            # success while replacing the new fit with a slid copy of the superseded one.
+            raise typer.BadParameter(
+                f"{base_path} is the as-fitted snapshot of a different fit than {path}: the "
+                f"snapshot holds kind='{base.kind}' from '{fit_provenance(base)}', the policy "
+                f"holds kind='{policy.kind}' from '{fit_provenance(policy)}'. Tuning it would "
+                f"overwrite the current fit with a dialed copy of the old one. Delete "
+                f"{base_path} to re-baseline the dial on the fit that is on disk now."
+            )
     try:
         tuned = apply_cost_quality(base, cost_quality)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    if not base_path.is_file():
+        # Preserve the artifact as fitted, so `tune` is always re-appliable from the fit and
+        # never from an already-slid copy of itself. Written only now that the dial has applied:
+        # a snapshot left behind by a FAILED tune would poison the path for the next fit.
+        base_path.write_bytes(path.read_bytes())
     tuned.save(path)
     knobs = cost_quality_knobs(cost_quality)
     _console.print(

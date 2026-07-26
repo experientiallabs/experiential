@@ -23,12 +23,7 @@ from wmo.distill.store import DistillModelCard
 from wmo.engine.world_model import WorldModel
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.optimize.policy import (
-    KNN_BANK_FILENAME,
-    POLICY_FILENAME,
-    RoutingPolicy,
-    select_model,
-)
+from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing import evaluate_policy
 from wmo.providers import pool as pool_module
@@ -47,6 +42,11 @@ from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import RunRecord
 
 runner = CliRunner()
+
+
+def _flat(output: str) -> str:
+    """CLI errors render inside a wrapped rich panel; flatten one so a phrase matches."""
+    return " ".join(output.replace("│", " ").split())
 
 
 def _matrix_file(tmp_path: Path) -> Path:
@@ -138,8 +138,13 @@ def test_route_fit_rejects_unknown_embedder(tmp_path: Path) -> None:
     assert "hashing or azure" in result.output
 
 
-def _knn_matrix_file(tmp_path: Path) -> Path:
-    """Twelve scenarios: enough neighbors per query for a guarded fit to route at all."""
+def _knn_matrix_file(tmp_path: Path, *, flip: bool = False, name: str = "knn_matrix.json") -> Path:
+    """Twelve scenarios: enough neighbors per query for a guarded fit to route at all.
+
+    `flip` swaps which model wins each half, so two matrices built here disagree on every cell.
+    That is what makes an artifact mix-up observable: a policy fitted on one and served the
+    other's evidence routes every request the wrong way.
+    """
     pool = [
         PoolEntry(
             name="a", kind=ProviderKind.OPENAI, model="a", input_per_mtok=1.0, output_per_mtok=1.0
@@ -168,7 +173,7 @@ def _knn_matrix_file(tmp_path: Path) -> Path:
     for group, tasks in (("sql", sql), ("prose", prose)):
         for index, task in enumerate(tasks):
             for model in ("a", "b"):
-                wins = (model == "a") == (group == "sql")
+                wins = ((model == "a") == (group == "sql")) != flip
                 outcomes.append(
                     ScenarioOutcome(
                         scenario_id=f"{group}:{index}",
@@ -179,7 +184,7 @@ def _knn_matrix_file(tmp_path: Path) -> Path:
                         cost_usd=0.001,
                     )
                 )
-    path = tmp_path / "knn_matrix.json"
+    path = tmp_path / name
     OutcomeMatrix(pool=pool, outcomes=outcomes).save(path)
     return path
 
@@ -212,7 +217,10 @@ def test_route_fit_knn_writes_policy_and_sidecar(tmp_path: Path) -> None:
     policy = RoutingPolicy.load(policy_file)
     assert policy.kind == "knn"
     assert policy.default_model == "a" == policy.guard_model  # the pinned fallback
-    assert (tmp_path / KNN_BANK_FILENAME).is_file()  # sidecar beside the policy
+    # The sidecar is named after --out and recorded in the policy, not resolved by convention.
+    assert policy.knn_bank_path == "policy.bank.npz"
+    assert policy.bank_path() == tmp_path / "policy.bank.npz"
+    assert policy.bank_path().is_file()  # sidecar beside the policy
     assert len(policy.knn_bank().scenario_ids) == 12
     assert "routed away from the fallback" in result.output
     # The prose neighborhoods carry unanimous evidence for b, so that traffic leaves the
@@ -333,6 +341,148 @@ def test_route_tune_rejects_a_policy_kind_without_a_dial(tmp_path: Path) -> None
     )
     assert result.exit_code != 0
     assert "kind='rank'" in result.output
+
+
+def test_route_fit_knn_gives_each_policy_its_own_evidence_bank(tmp_path: Path) -> None:
+    """Two knn fits into one directory must not share (and overwrite) one sidecar.
+
+    Regression: the bank name used to be hard-coded, so the second fit clobbered the first
+    policy's evidence and both policies recorded the same relative path. Policy A then served
+    matrix B's rewards, which inverts every routing decision on this pair of matrices.
+    """
+    a_matrix = _knn_matrix_file(tmp_path, name="matrix_a.json")
+    _knn_matrix_file(tmp_path, flip=True, name="matrix_b.json")
+    for name, matrix, fallback in (
+        ("policy_a.json", "matrix_a.json", "a"),
+        ("policy_b.json", "matrix_b.json", "b"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "optimize",
+                "route",
+                "fit",
+                str(tmp_path / matrix),
+                "--kind",
+                "knn",
+                "--fallback",
+                fallback,
+                "--rag-num",
+                "3",
+                "--min-pairs",
+                "2",
+                "--out",
+                str(tmp_path / name),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    policy_a = RoutingPolicy.load(tmp_path / "policy_a.json")
+    policy_b = RoutingPolicy.load(tmp_path / "policy_b.json")
+    assert (policy_a.knn_bank_path, policy_b.knn_bank_path) == (
+        "policy_a.bank.npz",
+        "policy_b.bank.npz",
+    )
+    assert policy_a.bank_path().is_file() and policy_b.bank_path().is_file()
+    # Policy A still routes on ITS evidence: prose is b's half of matrix_a, and matrix_b says
+    # the opposite, so this is 1.0 only if the second fit left A's bank alone.
+    matrix = OutcomeMatrix.load(a_matrix)
+    prose_ids = [sid for sid in matrix.scenario_ids() if sid.startswith("prose:")]
+    assert evaluate_policy(policy_a, matrix, prose_ids).model_mix == {"b": 1.0}
+
+
+def test_route_tune_refuses_a_base_snapshot_from_a_superseded_fit(tmp_path: Path) -> None:
+    """fit -> tune -> refit -> tune must not silently dial the pre-refit artifact.
+
+    Regression: `tune` always re-read `<stem>.base.json`, which `fit` never invalidates, so the
+    second tune reported success while overwriting the new fit with a dialed copy of the old one.
+    """
+    policy_file = _fitted_knn_policy(tmp_path)
+    tuned = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.6"]
+    )
+    assert tuned.exit_code == 0, tuned.output
+
+    refit = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_knn_matrix_file(tmp_path, flip=True, name="refit_matrix.json")),
+            "--kind",
+            "knn",
+            "--fallback",
+            "b",
+            "--rag-num",
+            "3",
+            "--min-pairs",
+            "2",
+            "--out",
+            str(policy_file),
+        ],
+    )
+    assert refit.exit_code == 0, refit.output
+    assert RoutingPolicy.load(policy_file).default_model == "b"
+
+    stale = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.3"]
+    )
+    assert stale.exit_code != 0
+    assert "as-fitted snapshot of a different fit" in _flat(stale.output)
+    assert "policy.base.json" in _flat(stale.output)  # names the file to delete
+    # The refit survives untouched rather than being replaced by a dialed copy of the old fit.
+    after = RoutingPolicy.load(policy_file)
+    assert after.default_model == "b"
+    assert after.cost_quality is None
+
+
+def test_route_tune_that_fails_leaves_no_base_snapshot_behind(tmp_path: Path) -> None:
+    """A rejected tune must not poison the path for the next fit.
+
+    Regression: the base snapshot was copied before validation, so a failed tune left a stray
+    `policy.base.json`. A later `fit --kind knn` into the same path could never be tuned: the
+    error reported kind='rank' while the policy on disk was demonstrably kind='knn'.
+    """
+    policy_file = tmp_path / POLICY_FILENAME
+    fit = runner.invoke(
+        app,
+        ["optimize", "route", "fit", str(_matrix_file(tmp_path)), "--out", str(policy_file)],
+    )
+    assert fit.exit_code == 0, fit.output
+    rejected = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.5"]
+    )
+    assert rejected.exit_code != 0
+    assert "kind='rank'" in rejected.output
+    assert not (tmp_path / "policy.base.json").exists()
+
+    # The path is still tunable once a knn policy is fitted into it.
+    refit = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_knn_matrix_file(tmp_path)),
+            "--kind",
+            "knn",
+            "--fallback",
+            "a",
+            "--rag-num",
+            "3",
+            "--min-pairs",
+            "2",
+            "--out",
+            str(policy_file),
+        ],
+    )
+    assert refit.exit_code == 0, refit.output
+    tuned = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.5"]
+    )
+    assert tuned.exit_code == 0, tuned.output
+    assert RoutingPolicy.load(policy_file).cost_quality == 0.5
 
 
 def test_route_tune_rejects_a_missing_policy_file(tmp_path: Path) -> None:

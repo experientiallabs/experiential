@@ -93,9 +93,12 @@ already-dialed policy lands on the same artifact instead of compounding.
 uv run wmo optimize route tune models/support/policy.json --cost-quality 0.6
 ```
 
-The first run copies the artifact to `policy.base.json` and every later run re-reads *that*, so
-the dial is always applied to the policy as fitted. Tuning twice equals tuning once, and sliding
-back down lands exactly where a first-time slide would.
+The first successful run copies the artifact to `policy.base.json` and every later run re-reads
+*that*, so the dial is always applied to the policy as fitted. Tuning twice equals tuning once,
+and sliding back down lands exactly where a first-time slide would. A tune that is rejected
+writes nothing, and a snapshot left over from a superseded fit is refused rather than dialed
+back over the current one: refit the policy and the command tells you to delete
+`policy.base.json` first.
 
 **Per served endpoint**, without touching the policy file, via `endpoint.toml` beside
 `policy.json` in the model's directory:

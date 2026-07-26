@@ -275,7 +275,22 @@ COST_QUALITY_DEFAULT_FLOOR_Q = 0.05  # the shipped novelty floor
 # ran past the turn would sell an operator a worse policy on both axes.
 COST_QUALITY_MAX_LAM = 0.03
 
+# What `apply_cost_quality` appends to `fitted_from` to record the dial position. Sliding is
+# absolute, so the suffix is rewritten (never stacked) and `fit_provenance` strips it back off.
+COST_QUALITY_PROVENANCE_MARK = " | cost_quality="
+
 CostQualityPointName = str
+
+
+def fit_provenance(policy: RoutingPolicy) -> str:
+    """The fit a policy came from, with any dial suffix stripped off.
+
+    `fitted_from` records the outcome matrix and fit parameters, and `apply_cost_quality`
+    appends the dial position to it. This returns the fit half alone, which is the identity two
+    artifacts must share to be the same fit at different dial positions: a tuned policy and the
+    as-fitted snapshot it was dialed from agree here, a refit does not.
+    """
+    return (policy.fitted_from or "unknown").split(COST_QUALITY_PROVENANCE_MARK)[0]
 
 
 class CostQualityKnobs(BaseModel):
@@ -447,7 +462,7 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
     bank = policy.knn_bank()
     # Absolute, not relative: the knobs come from the dial alone, so re-applying any setting to
     # an already-slid policy lands on the same artifact instead of compounding.
-    provenance = (policy.fitted_from or "unknown").split(" | cost_quality=")[0]
+    provenance = fit_provenance(policy)
     adjusted = policy.model_copy(
         update={
             "knn_z": knobs.knn_z,
@@ -457,7 +472,7 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
             "guard_mode": knobs.guard_mode,
             "cost_quality": cost_quality,
             "fitted_from": (
-                f"{provenance} | cost_quality={cost_quality:g} "
+                f"{provenance}{COST_QUALITY_PROVENANCE_MARK}{cost_quality:g} "
                 f"(floor_q={knobs.floor_q:g}, lam={knobs.pick_lam:g}, guard={knobs.guard_mode})"
             ),
         }

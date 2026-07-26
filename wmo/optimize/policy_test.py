@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 from typing import Literal
@@ -550,6 +551,23 @@ def test_knn_bank_loads_lazily_from_the_sidecar_and_stays_cached(tmp_path: Path)
     # Cached after the first decision: the sidecar is read once per policy instance, not per
     # request (a 3072-dimensional bank is megabytes).
     (tmp_path / KNN_BANK_FILENAME).unlink()
+    assert select_model(loaded, "anything", embedder=_UnitEmbedder()).model == "haiku-4-5"
+
+
+def test_knn_bank_path_falls_back_to_the_legacy_sidecar_name(tmp_path: Path) -> None:
+    """A policy artifact that records no bank path still resolves the conventional sidecar.
+
+    Backward compatibility: policies fitted before the bank name was derived from the policy
+    file live beside `policy_knn_bank.npz`, and hand-built artifacts may omit the field.
+    """
+    bank = _knn_bank([[0.0, 1.0]] * 12)
+    bank.save(tmp_path / KNN_BANK_FILENAME)
+    document = _knn_policy(bank).model_dump(mode="json")
+    document.pop("knn_bank_path")
+    (tmp_path / "policy.json").write_text(json.dumps(document), encoding="utf-8")
+
+    loaded = RoutingPolicy.load(tmp_path / "policy.json")
+    assert loaded.bank_path() == tmp_path / KNN_BANK_FILENAME
     assert select_model(loaded, "anything", embedder=_UnitEmbedder()).model == "haiku-4-5"
 
 

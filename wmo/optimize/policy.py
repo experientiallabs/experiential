@@ -59,6 +59,11 @@ DEFAULT_RANK = 999
 # kNN champion defaults: the exact configuration validated on routerbench-ours9
 # (+1.0 accuracy point over the best single model at -27% cost, 5/5 split seeds).
 KNN_BANK_FILENAME = "policy_knn_bank.npz"
+# The sidecar suffix a fit DERIVES from its policy path, so two policies fitted into one
+# directory own two banks (`support.json` -> `support.bank.npz`) instead of racing for one
+# shared name. `KNN_BANK_FILENAME` above stays the resolution fallback for artifacts that
+# record no path of their own; see `RoutingPolicy.knn_bank_path`.
+KNN_BANK_SUFFIX = ".bank.npz"
 DEFAULT_RAG_NUM = 50
 DEFAULT_RAG_THRES = 0.95
 DEFAULT_KNN_Z = 0.5
@@ -74,6 +79,16 @@ SE_FLOOR_MAX_PAIRS = 30
 # policy no per-instance state (a lock stored on the model would make two otherwise identical
 # policies compare unequal).
 _BANK_LOAD_LOCK = threading.Lock()
+
+
+def knn_bank_path_for(policy_path: Path) -> Path:
+    """The evidence sidecar that belongs to one policy file.
+
+    `models/support.json` -> `models/support.bank.npz`. One owner for the derivation so the
+    fitter, the CLI's console line, and any tooling that cleans an artifact directory cannot
+    disagree about which `.npz` belongs to which policy.
+    """
+    return policy_path.with_suffix(KNN_BANK_SUFFIX)
 
 
 class EmbedderSpec(BaseModel):
@@ -256,9 +271,13 @@ class RoutingPolicy(BaseModel):
     guard_margin: float | None = None  # reward the challenger must beat the guard by
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
 
-    # kNN policies only (see module docstring and `wmo.optimize.knn`). The bank path is a bare
-    # FILENAME resolved next to policy.json, so a model directory stays portable; an absolute
-    # path is honored as given (research code and tests point at banks elsewhere).
+    # kNN policies only (see module docstring and `wmo.optimize.knn`). The fitter records the
+    # bank it actually wrote (`knn_bank_path_for(<policy path>)`), so serving resolves the
+    # sidecar EXPLICITLY instead of by convention and two policies can share a directory. The
+    # value is a bare FILENAME resolved next to policy.json, so a model directory stays
+    # portable; an absolute path is honored as given (research code and tests point at banks
+    # elsewhere). The default is the legacy conventional name, which is what an artifact
+    # written before the fitter recorded a derived name resolves to.
     knn_bank_path: str = KNN_BANK_FILENAME
     rag_num: int = Field(default=DEFAULT_RAG_NUM, ge=1)  # neighbor budget
     # A neighbor is a fit scenario with similarity above `rag_thres` times the `rag_num`-th best
