@@ -101,7 +101,7 @@ def _fit(
 
     The budget has to be a small fraction of the bank, and min_pairs below it: at the production
     default (50) every row is a neighbor of every query (see
-    test_a_budget_as_large_as_the_bank_collapses_to_the_fallback).
+    test_the_adaptive_cap_prevents_the_whole_bank_neighborhood_collapse).
     """
     return fit_knn_policy(
         _matrix(),
@@ -289,3 +289,26 @@ def test_novelty_floor_abstains_on_far_queries(tmp_path: Path) -> None:
 def test_floor_off_by_default(tmp_path: Path) -> None:
     policy = _fit(tmp_path)
     assert policy.floor_sim is None
+
+
+def test_operator_min_pairs_passes_through_when_the_bank_does_not_cap(tmp_path: Path) -> None:
+    # An explicit tightening on a bank the budget does not swallow must arrive verbatim:
+    # min_pairs > rag_num is legitimate because the relative rule can keep more neighbors
+    # than the budget.
+    policy = _fit(tmp_path, rag_num=5, min_pairs=8)
+    assert policy.rag_num == 5
+    assert policy.knn_min_pairs == 8
+
+
+def test_floor_q_on_a_single_row_bank_stays_off(tmp_path: Path) -> None:
+    matrix = _matrix()
+    only = matrix.scenario_ids()[:1]
+    policy = fit_knn_policy(
+        matrix,
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        fit_ids=only,
+        embedder=EmbedderSpec(dim=256),
+        guard_model="cheap",
+        floor_q=0.5,
+    )
+    assert policy.floor_sim is None  # never NaN: a 1-row bank has no self-NN distribution

@@ -74,6 +74,8 @@ def fit(
     floor_q: float = typer.Option(
         0.05,
         "--floor-q",
+        min=0.0,
+        max=1.0,
         help="Novelty floor quantile: abstain to the fallback when a query's best bank "
         "similarity is below this quantile of the bank's own nearest-neighbor sims "
         "(coverage/robustness knob for task drift; 0 = off, the exact validated champion).",
@@ -120,6 +122,11 @@ def fit(
         )
     )
     out_path = Path(out)
+    if rag_thres <= 0.0:
+        # typer's min is inclusive but the artifact field requires > 0; fail before the fit
+        # writes a sidecar it will then abandon.
+        raise typer.BadParameter("--rag-thres must be greater than 0")
+    built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -131,6 +138,7 @@ def fit(
             matrix,
             bank_path=out_path.parent / KNN_BANK_FILENAME,
             embedder=spec,
+            embed_with=built,
             guard_model=fallback,
             rag_num=rag_num,
             rag_thres=rag_thres,
@@ -153,7 +161,7 @@ def fit(
         if cost_weight > 0.0:
             policy = rerank_policy(policy, cost_weight=cost_weight)
     policy.save(out_path)
-    result = evaluate_policy(policy, matrix, matrix.scenario_ids())
+    result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     if kind == "knn":
         routed = 1.0 - result.model_mix.get(policy.default_model, 0.0)
         _console.print(

@@ -169,14 +169,19 @@ def fit_knn_policy(
     # (which turns the profile into a global mean and routing to 0%). min() against the
     # caller's values keeps banks >= 2x the budget BIT-IDENTICAL to the validated champion.
     n_bank = len(bank.scenario_ids)
-    rag_num = min(rag_num, max(4, -(-n_bank // 2)))
-    min_pairs = min(min_pairs, max(3, rag_num // 2))
+    rag_cap = max(4, -(-n_bank // 2))
+    if rag_num > rag_cap:
+        # Only a bank-imposed cap adjusts min_pairs: an operator's explicit tightening on a
+        # large bank passes through untouched (the relative rule can return more neighbors
+        # than rag_num, so min_pairs > rag_num is a legitimate setting).
+        rag_num = rag_cap
+        min_pairs = min(min_pairs, max(3, rag_num // 2))
     # Novelty floor (R1 promotion-hardening H2): abstain to the baseline when a query's best
     # similarity falls below the floor_q quantile of the bank's own nearest-neighbor
     # similarities. iid wins hold at every q; under task drift coverage degrades gracefully
     # toward all-baseline. 0.0 = off (the exact validated champion).
     floor_sim: float | None = None
-    if floor_q > 0.0:
+    if floor_q > 0.0 and len(bank.scenario_ids) > 1:
         gram = bank.embeddings @ bank.embeddings.T
         np.fill_diagonal(gram, -np.inf)
         self_nn = gram.max(axis=1)

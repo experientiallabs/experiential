@@ -288,8 +288,8 @@ def main() -> None:
     confidence_curve(
         "routerbench-ours9", "routerbench-ours9-oai3l-tasks.npy", rag_num=50, fallback="fable-5"
     )
-    # tau-bench is 25 scenarios, so the production budget (50) covers the whole 17-row fit bank:
-    # every query's neighborhood is the entire bank. Both budgets are reported to show it.
+    # tau-bench is 25 scenarios; the adaptive rule caps the default budget at ceil(17/2) = 9
+    # there, so the two curves below contrast the capped default against an explicit rag=5.
     confidence_curve("tau-bench", "wm-tau-bench-oai3l-tasks.npy", rag_num=50, fallback="fable-5")
     confidence_curve("tau-bench", "wm-tau-bench-oai3l-tasks.npy", rag_num=5, fallback="fable-5")
 
