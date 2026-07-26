@@ -53,7 +53,8 @@ wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
 ```
 
 Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md), serve
-a single model with no routing via `wmo optimize route pin`, or build an optimized harness for your agent with
+a single model with no routing via `wmo optimize route pin`, or build an optimized harness for your
+agent with
 `wmo optimize harness`.
 
 ### Hosted platform
@@ -84,7 +85,8 @@ wmo optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
 
 ## Use a world model as an API
 
-`world-model-optimizer` includes world models that can be used to simulate your agent environment for testing and optimization.
+`world-model-optimizer` includes world models that can be used to simulate your agent environment
+for testing and optimization.
 
 ```python
 from wmo import Action, ActionKind
@@ -100,7 +102,8 @@ obs = wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="add_to_cart",
 print(obs.content)
 ```
 
-Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST /world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
+Or over HTTP (same code path), namespaced by model name: `GET /world_models`, then `POST
+/world_models/{name}/sessions` and `POST /world_models/{name}/sessions/{id}/step`.
 
 ## Run after platform login
 
@@ -154,7 +157,8 @@ uv run pytest -q         # tests
 ## Usage telemetry
 
 `wmo` uses anonymous usage telemetry to track the volume of usage.
-Telemetry is strictly metadata. It never includes prompts, traces, actions, observations, file paths,
+Telemetry is strictly metadata. It never includes prompts, traces, actions, observations, file
+paths,
 model names, provider credentials, or raw user content.
 
 Telemetry is enabled by default. To opt out for a project:
