@@ -1544,11 +1544,19 @@ def test_a_function_tool_choice_naming_a_declared_tool_still_serves(tmp_path: Pa
     assert response.status_code == 200, response.text
 
 
-def test_an_unrecognized_tool_choice_word_is_still_forwarded(tmp_path: Path) -> None:
-    """An unknown future vocabulary word is not function-shaped, so it is forwarded, not refused.
+@pytest.mark.parametrize("tool_choice", ["bogus", "", False, 42, 0, [], {"type": "retrieval"}])
+def test_an_unroutable_tool_choice_is_a_400(tmp_path: Path, tool_choice: object) -> None:
+    """REVERSED from an earlier revision of this branch, which forwarded unrecognized values.
 
-    OpenAI's own vocabulary has grown (`required` postdates `auto`); rewriting or refusing a word
-    this build has not heard of would break a client the provider could have served.
+    That was justified as forward-compatibility with OpenAI's growing vocabulary (`required`
+    postdates `auto`), but no backend this endpoint routes to can honor a word it does not know:
+    OpenAI-compatible servers reject it, which this endpoint reports as a 502 blaming the model for
+    a client mistake, and Bedrock drops the field and can answer in prose to a client that required
+    a call. Forwarding only converted a clear 400 into one of those two, so the accepted set is now
+    closed and a new OpenAI word is a one-line addition to `_TOOL_CHOICE_WORDS`.
+
+    `False`/`0` are in here on purpose: `True == 1` compares equal to neither string, so a
+    membership-only test would let booleans and numbers through.
     """
     client, _, _ = _tool_client(tmp_path)
     response = client.post(
@@ -1557,7 +1565,41 @@ def test_an_unrecognized_tool_choice_word_is_still_forwarded(tmp_path: Path) -> 
             "model": "tau-bench",
             "messages": [{"role": "user", "content": "hi"}],
             "tools": _TOOLS,
-            "tool_choice": "some_future_mode",
+            "tool_choice": tool_choice,
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_tool_choice"
+    assert "this endpoint can route" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize("tool_choice", ["none", "auto", "required"])
+def test_every_tool_choice_word_openai_defines_still_serves(
+    tmp_path: Path, tool_choice: str
+) -> None:
+    """Closing the accepted set must not refuse any value OpenAI actually defines."""
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+            "tool_choice": tool_choice,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_omitting_tool_choice_entirely_still_serves(tmp_path: Path) -> None:
+    """Absent is not unrecognized: the overwhelmingly common case must not start failing."""
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
         },
     )
     assert response.status_code == 200, response.text

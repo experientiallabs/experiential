@@ -209,15 +209,35 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+# Every `tool_choice` string OpenAI defines. A value outside this set, and outside the
+# `{"type": "function", ...}` object shape, is refused rather than forwarded: no backend this
+# endpoint routes to can honor one. OpenAI-compatible servers reject it, which surfaces as a 502
+# that blames the model for a client mistake, and Bedrock drops the field and can answer in prose
+# to a client that required a call. Forwarding an unrecognized word to stay
+# forward-compatible sounds generous and in practice only converts a clear 400 into one of those
+# two. When OpenAI adds a word, it is added here.
+_TOOL_CHOICE_WORDS = ("none", "auto", "required")
+
+
+def _tool_choice_is_recognized(tool_choice: JsonValue) -> bool:
+    """Whether `tool_choice` is a value this endpoint can actually route (see `_TOOL_CHOICE_WORDS`).
+
+    Note `tool_choice in _TOOL_CHOICE_WORDS` is deliberately not the whole test: `True` compares
+    equal to `1` but not to any of these strings, so booleans and numbers fall through to False as
+    they should.
+    """
+    return tool_choice in _TOOL_CHOICE_WORDS or _is_function_choice_shape(tool_choice)
+
+
 def _tool_choice_demands_a_call(tool_choice: JsonValue) -> bool:
     """Whether a `tool_choice` can only be honored by actually calling a tool.
 
     `"none"` and `"auto"` are both satisfied by not calling one, so neither demands anything: an
     empty tool registry (the `tools: []` this endpoint normalizes away) is served as plain chat
     rather than refused, and `"none"` (literally "do not call tools") is never refused for having
-    none. `"required"` and a named `{"type": "function", ...}` cannot be honored with nothing to
-    choose from, and anything unrecognized is treated the same way: a client that must get a call
-    back would otherwise read a prose answer as the model's own choice.
+    none. `"required"` and a `{"type": "function", ...}` object cannot be honored with nothing to
+    choose from. Unrecognized values never reach here: they are refused up front by
+    `_tool_choice_is_recognized`.
 
     Args:
         tool_choice: The request's `tool_choice` exactly as the client sent it, or None when it
@@ -352,6 +372,12 @@ class ChatCompletionRequest(BaseModel):
             A message naming what went wrong and what to send instead, or '' when the choice is
             serveable (including every non-demanding choice, see `_tool_choice_demands_a_call`).
         """
+        if self.tool_choice is not None and not _tool_choice_is_recognized(self.tool_choice):
+            words = ", ".join(f'"{word}"' for word in _TOOL_CHOICE_WORDS)
+            return (
+                f"tool_choice {self.tool_choice!r} is not a value this endpoint can route; use "
+                f'{words}, or {{"type": "function", "function": {{"name": "<tool>"}}}}'
+            )
         if not _tool_choice_demands_a_call(self.tool_choice):
             return ""
         if self.tools is None:
