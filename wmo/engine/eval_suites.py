@@ -16,6 +16,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT
+
 logger = logging.getLogger(__name__)
 
 SampleTurns = Literal["all", "sampled"]
@@ -30,7 +32,8 @@ class EvalSuiteConfig(BaseModel):
     description: str | None = None
     files: list[str] = Field(default_factory=lambda: ["../traces.otel.jsonl"])
     prompt: str | None = None
-    train_split: float = Field(default=0.7, gt=0.0, lt=1.0)
+    # Same cut as `wmo build`: a suite that lowers this scores traces GEPA trained on.
+    train_split: float = Field(default=DEFAULT_TRAIN_SPLIT, gt=0.0, lt=1.0)
     top_k: int = Field(default=5, ge=0)
     sample_turns: SampleTurns = "all"
     seed: int = 0

@@ -24,10 +24,14 @@ examples/
 title = "Tau Bench default replay"
 description = "Open-loop reconstruction fidelity over the bundled tau-bench trace corpus."
 files = ["../traces.otel.jsonl"]   # resolved relative to this file
-train_split = 0.7
 sample_turns = "all"
 seed = 0
 ```
+
+`train_split` is omitted on purpose. It defaults to the same `DEFAULT_TRAIN_SPLIT` (0.8) that
+`wmo build` cuts, and both cut the SAME deterministic `trace_id` hash line, so a suite that pins a
+lower value scores traces GEPA trained on and reports an inflated fidelity. Pin it only when the
+model under test was genuinely built with a different ratio.
 
 There is no judge knob: every suite is scored by the single `RubricJudge`. A pre-overhaul
 `judge = "..."` line makes the suite fail validation: loading the file directly (`wmo eval

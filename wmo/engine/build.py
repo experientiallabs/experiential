@@ -30,6 +30,15 @@ from wmo.providers import get_provider
 from wmo.providers.base import Embedder, Provider
 from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 
+# The single cut point on the `_trace_fraction` hash line that every train/held-out default reads.
+# `wmo build` trains GEPA on `[0, DEFAULT_TRAIN_SPLIT)` and `wmo eval` scores from
+# `DEFAULT_TRAIN_SPLIT` up, over the SAME corpus and the SAME deterministic line, so the two must
+# be one number. They were not: build defaulted to 0.8 and eval to 0.7, which handed eval the
+# `[0.7, 0.8)` band (about 10% of any corpus) as "held-out" when GEPA had trained on it, inflating
+# every reconstruction-fidelity number produced on the documented happy path by an unknown amount.
+# `wmo/cli/app_test.py` pins both CLI paths here so they cannot drift apart again.
+DEFAULT_TRAIN_SPLIT = 0.8
+
 
 def _count_steps(traces: list[Trace]) -> int:
     return sum(len(trace.steps) for trace in traces)
@@ -57,7 +66,9 @@ def split_traces(traces: list[Trace], train_split: float) -> tuple[list[Trace], 
     """Deterministic train/held-out split for GEPA (held-out is never seen during evolution).
 
     Assignment is by a stable hash of `trace_id`, so the same corpus always splits the same way
-    regardless of order and rebuilds are reproducible. `train_split` is the target train fraction.
+    regardless of order and rebuilds are reproducible. `train_split` is the target train fraction,
+    and callers that have no reason to pick their own should pass `DEFAULT_TRAIN_SPLIT`: a build
+    and an eval that cut this line at different points overlap, and the overlap is a leak.
     """
     train: list[Trace] = []
     test: list[Trace] = []
