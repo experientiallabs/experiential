@@ -9,6 +9,7 @@ import pytest
 from wmh.core.types import Action, EnvState, Observation
 from wmh.env.closed_loop import evaluate_pool
 from wmh.env.scenarios import Scenario
+from wmh.optimize.compression import CompressionConfig
 from wmh.optimize.outcomes import ScenarioOutcome
 from wmh.optimize.reward import EpisodeScore
 from wmh.providers.base import (
@@ -263,3 +264,100 @@ def test_wrong_typed_score_yields_unscored_row_with_reason() -> None:
     outcome = matrix.outcomes[0]
     assert outcome.reward is None
     assert outcome.error is not None and "not EpisodeScore" in outcome.error
+
+
+class _RecordingProvider(_ScriptedProvider):
+    """Scripted provider that also records the messages each completion was asked with."""
+
+    def __init__(self, entry: PoolEntry) -> None:
+        super().__init__(entry)
+        self.seen: list[list[Message]] = []
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        self.seen.append(list(messages))
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def test_evaluate_pool_threads_compression_through_the_measured_path() -> None:
+    providers: list[_RecordingProvider] = []
+
+    def factory(entry: PoolEntry) -> _RecordingProvider:
+        provider = _RecordingProvider(entry)
+        providers.append(provider)
+        return provider
+
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=factory,
+        max_steps=5,
+        compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+    )
+
+    outcome = matrix.outcomes[0]
+    # The compressor's per-episode accounting landed on the row...
+    assert outcome.compressor_id == "truncate"
+    assert outcome.compressor_version == "1"
+    assert outcome.aggressiveness == 0.5
+    assert outcome.tokens_in_compressed < outcome.tokens_in_raw
+    assert outcome.compressor_latency_s >= 0.0
+    assert outcome.compressor_cost_usd == 0.0  # truncate has no inference cost
+    # ...and the provider genuinely received compressed input (measured path, not
+    # bookkeeping): the user content the model saw is strictly shorter than what an
+    # uncompressed control run sends, and non-user content is untouched.
+    control: list[_RecordingProvider] = []
+
+    def control_factory(entry: PoolEntry) -> _RecordingProvider:
+        provider = _RecordingProvider(entry)
+        control.append(provider)
+        return provider
+
+    evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=control_factory,
+        max_steps=5,
+    )
+    compressed_users = [m.content for m in providers[0].seen[0] if m.role == "user"]
+    raw_users = [m.content for m in control[0].seen[0] if m.role == "user"]
+    assert len(compressed_users) == len(raw_users)
+    assert all(len(c) < len(r) for c, r in zip(compressed_users, raw_users, strict=True))
+
+
+def test_uncompressed_rows_keep_default_compression_fields() -> None:
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=_ScriptedProvider,
+        max_steps=5,
+    )
+    outcome = matrix.outcomes[0]
+    assert outcome.compressor_id == ""
+    assert outcome.tokens_in_raw == 0
+    assert outcome.tokens_in_compressed == 0
+    assert outcome.aggressiveness == 0.0
+
+
+def test_pre_compression_outcome_json_loads_with_defaults() -> None:
+    # Additive-fields guarantee for the matrix: rows serialized before the D-COMPRESS fields
+    # existed must load with them defaulted.
+    row = ScenarioOutcome(scenario_id="s", task="t", model="candidate-a")
+    dumped = {
+        key: value
+        for key, value in row.model_dump(mode="json").items()
+        if not key.startswith(("tokens_in_", "compressor_")) and key != "aggressiveness"
+    }
+    loaded = ScenarioOutcome.model_validate(dumped)
+    assert loaded.compressor_id == ""
+    assert loaded.tokens_in_raw == 0
+    assert loaded.compressor_cost_usd == 0.0
