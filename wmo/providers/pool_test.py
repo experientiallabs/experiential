@@ -371,9 +371,11 @@ def test_openrouter_pool_entry_resolves_to_the_openrouter_provider(
 ) -> None:
     _catalog(tmp_path, monkeypatch)
     monkeypatch.setenv("OPENROUTER_ACCOUNT_B_KEY", "sk-or-account-b")
-    pool = load_pool(
-        _write_pool(tmp_path, _OPENROUTER_POOL + '\napi_key_env = "OPENROUTER_ACCOUNT_B_KEY"\n')
+    per_account = (
+        '[[model]]\nname = "or-glm-free"\nkind = "openrouter"\nmodel = "z-ai/glm-4.6:free"\n'
+        'api_key_env = "OPENROUTER_ACCOUNT_B_KEY"\n'
     )
+    pool = load_pool(_write_pool(tmp_path, per_account))
 
     provider = pool_provider(pool.entry("or-glm-free"))
 

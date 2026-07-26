@@ -249,7 +249,8 @@ def test_complete_sends_max_tokens_not_max_completion_tokens(
 def test_stream_yields_deltas_then_a_usage_bearing_terminal_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider, completions = _faked(monkeypatch, _FakeStream(["he", "llo"], _FakeUsage(3, 2)))
+    upstream = _FakeStream(["he", "llo"], _FakeUsage(3, 2))
+    provider, completions = _faked(monkeypatch, upstream)
 
     chunks = list(provider.stream("", [Message(role="user", content="yo")], max_tokens=64))
 
@@ -259,6 +260,8 @@ def test_stream_yields_deltas_then_a_usage_bearing_terminal_chunk(
     assert chunks[-1].usage.output_tokens == 2
     assert completions.last_kwargs["max_tokens"] == 64
     assert completions.last_kwargs["stream_options"] == {"include_usage": True}
+    # The SDK stream holds an httpx response; an abandoned one must not wait for the collector.
+    assert upstream.closed is True
 
 
 def test_complete_chat_preserves_tools_and_uses_max_tokens(

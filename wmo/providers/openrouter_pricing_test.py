@@ -144,7 +144,8 @@ def test_resolve_price_fetches_once_and_caches_the_result(
     assert PriceCatalog.model_validate_json(path.read_text(encoding="utf-8")).prices[_SONNET]
 
 
-def test_resolve_price_offline_says_so_instead_of_raising(tmp_path: Path) -> None:
+def test_resolve_price_offline_says_so_instead_of_raising() -> None:
+    # The conftest fixture is the offline machine: no cache file, and a fetch that refuses.
     resolution = resolve_price(_SONNET)
     assert resolution.price is None
     assert "unreachable" in resolution.detail

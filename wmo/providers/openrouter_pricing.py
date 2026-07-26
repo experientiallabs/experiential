@@ -52,7 +52,8 @@ FETCH_TIMEOUT_SECONDS = 10.0
 """A price lookup is a validation step, not a request. It fails fast rather than blocking."""
 
 # Set to the reason the last fetch failed, so the rest of the process degrades immediately
-# instead of paying the timeout once per unpriced entry. Reset per test by the autouse fixture
+# instead of paying the timeout once per unpriced entry. Deliberately unlocked: the worst a race
+# can do is a second redundant fetch, never a wrong price. Reset per test by the autouse fixture
 # in `wmo/conftest.py`.
 _FETCH_ERROR: str | None = None
 
