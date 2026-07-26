@@ -36,6 +36,39 @@ Then optimize an agent harness against that model and a set of tasks:
 wmo optimize harness my-agent my-environment --tasks tasks.jsonl
 ```
 
+### Route to a cheaper model
+
+Optimizing the harness makes one model better at a task. Routing picks a *different* model per
+request, so the cheap one handles what it can and a frontier model handles the rest.
+
+Three steps, starting from a world model you have already built. First measure every candidate in
+your pool against your tasks. This is the only thing that produces an outcome matrix, and it costs
+real API calls, so it prints an estimate and asks before it spends:
+
+```bash
+wmo optimize route sweep my-environment --pool .wmo/pool.toml --out matrix.json
+```
+
+Fit a policy on that matrix. `--fallback` is the model served whenever the evidence is too thin to
+justify anything cheaper, so make it one you trust. Write it into the model's artifact dir, which is
+where `serve` looks:
+
+```bash
+wmo optimize route fit matrix.json --kind knn --fallback gpt-5.5 \
+  --out .wmo/models/my-environment/policy.json
+```
+
+Then serve it. Any model directory holding a `policy.json` also answers as an OpenAI-compatible
+endpoint, so point your agent's base URL at it and change nothing else:
+
+```bash
+wmo serve --name my-environment
+```
+
+`wmo optimize route report matrix.json .wmo/models/my-environment/policy.json` prints what the
+policy buys you against the single best model: accuracy, cost per run, and which models it actually
+picked. Read it before you believe the endpoint is cheaper.
+
 ### Hosted platform
 
 Create an account at [platform.experientiallabs.ai](https://platform.experientiallabs.ai), then
