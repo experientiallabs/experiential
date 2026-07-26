@@ -569,6 +569,22 @@ def test_provider_env_vars_names_the_key_the_provider_actually_reads() -> None:
     assert PROVIDER_ENV_VARS[ProviderKind.TINKER] == [TINKER_API_KEY_ENV]
 
 
+def test_get_provider_can_construct_tinker_without_an_explicit_key() -> None:
+    # Registering ProviderKind.TINKER puts this provider on get_provider's trusted-credential
+    # path, which calls backend(config, api_key=api_key) for EVERY kind. Before __init__ grew
+    # the parameter this was an unconditional TypeError the type checker caught and no test did.
+    assert isinstance(get_provider(_config()), TinkerChatProvider)
+
+
+def test_an_explicit_api_key_is_refused_rather_than_silently_ignored() -> None:
+    # The SDK reads TINKER_API_KEY from the process environment, so a pool entry's own key
+    # cannot be honored. get_provider promises the backend authenticates with exactly the key
+    # it was handed; sampling on a different account than the entry named would break that
+    # quietly, and the operator would only find out on the invoice.
+    with pytest.raises(ValueError, match=TINKER_API_KEY_ENV):
+        get_provider(_config(), api_key="sk-some-other-account")
+
+
 def test_sample_is_bounded_by_the_sample_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     # The live failure: a wedged session's future never resolves, and an unbounded
     # `.result()` hung one run for 33 minutes.
