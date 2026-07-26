@@ -214,3 +214,72 @@ def test_route_fit_rejects_unknown_kind(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "knn or rank" in result.output
+
+
+def test_route_fit_writes_compression_config(tmp_path: Path) -> None:
+    matrix_file = _matrix_file(tmp_path)
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--kind",
+            "rank",
+            "--out",
+            str(policy_file),
+            "--clusters",
+            "2",
+            "--dim",
+            "64",
+            "--compressor",
+            "truncate",
+            "--aggressiveness",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    policy = RoutingPolicy.load(policy_file)
+    assert policy.compression is not None
+    assert policy.compression.compressor_id == "truncate"
+    assert policy.compression.aggressiveness == 0.5
+
+
+def test_route_fit_rejects_unknown_compressor(tmp_path: Path) -> None:
+    matrix_file = _matrix_file(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--out",
+            str(tmp_path / "policy.json"),
+            "--compressor",
+            "llmzip",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "unknown compressor" in result.output
+
+
+def test_route_fit_rejects_orphan_aggressiveness(tmp_path: Path) -> None:
+    matrix_file = _matrix_file(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--out",
+            str(tmp_path / "policy.json"),
+            "--aggressiveness",
+            "0.5",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--compressor" in result.output

@@ -15,6 +15,7 @@ from pathlib import Path
 import typer
 from rich.console import Console
 
+from wmh.optimize.compression import CompressionConfig, get_compressor
 from wmh.optimize.knn import fit_knn_policy
 from wmh.optimize.outcomes import OutcomeMatrix
 from wmh.optimize.policy import (
@@ -103,6 +104,20 @@ def fit(
     api_key_env: str = typer.Option(
         None, "--api-key-env", help="(azure) env var holding the account key."
     ),
+    compressor: str = typer.Option(
+        None,
+        "--compressor",
+        help="D-COMPRESS: compressor id the endpoint applies before routing (identity | "
+        "truncate). Default: compression off.",
+    ),
+    aggressiveness: float = typer.Option(
+        0.0,
+        "--aggressiveness",
+        min=0.0,
+        max=1.0,
+        help="Fraction of compressible content the compressor may remove, in [0, 1]. "
+        "Only meaningful with --compressor.",
+    ),
 ) -> None:
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
@@ -126,6 +141,15 @@ def fit(
         # typer's min is inclusive but the artifact field requires > 0; fail before the fit
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
+    if compressor is None and aggressiveness > 0.0:
+        raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
+    compression = None
+    if compressor is not None:
+        try:
+            get_compressor(compressor)  # model_copy below skips validators; check here
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
     if kind == "knn":
         if cost_weight > 0.0:
@@ -160,6 +184,9 @@ def fit(
         )
         if cost_weight > 0.0:
             policy = rerank_policy(policy, cost_weight=cost_weight)
+    if compression is not None:
+        # Validated by the artifact (unknown ids fail here, before anything is written).
+        policy = policy.model_copy(update={"compression": compression})
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     if kind == "knn":
