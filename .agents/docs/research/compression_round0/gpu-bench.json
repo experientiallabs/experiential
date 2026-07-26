@@ -1,0 +1,158 @@
+[
+  {
+    "method": "llmlingua2-fixed-threshold-fp32",
+    "batch_size": 1,
+    "wall_s": 2.671,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.1966,
+    "request_latency_p50_s": 0.0173,
+    "throughput_tok_s": 50867,
+    "usd_per_10k_tok_fullbox": 0.001067,
+    "usd_per_10k_tok_per_gpu": 0.000534,
+    "outputs_sha": "b8352b90a0f3"
+  },
+  {
+    "method": "selective-context-absolute-fp32",
+    "batch_size": 1,
+    "wall_s": 7.113,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.5236,
+    "request_latency_p50_s": 0.0313,
+    "throughput_tok_s": 19100,
+    "usd_per_10k_tok_fullbox": 0.002842,
+    "usd_per_10k_tok_per_gpu": 0.001421,
+    "outputs_sha": "0e0cf334c694"
+  },
+  {
+    "method": "llmlingua2-fixed-threshold-fp32",
+    "batch_size": 4,
+    "wall_s": 3.017,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.2221,
+    "request_latency_p50_s": 0.1012,
+    "throughput_tok_s": 45025,
+    "usd_per_10k_tok_fullbox": 0.001206,
+    "usd_per_10k_tok_per_gpu": 0.000603,
+    "outputs_sha": "b8352b90a0f3"
+  },
+  {
+    "method": "selective-context-absolute-fp32",
+    "batch_size": 4,
+    "wall_s": 6.941,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.5109,
+    "request_latency_p50_s": 0.1549,
+    "throughput_tok_s": 19572,
+    "usd_per_10k_tok_fullbox": 0.002774,
+    "usd_per_10k_tok_per_gpu": 0.001387,
+    "outputs_sha": "0e0cf334c694"
+  },
+  {
+    "method": "llmlingua2-fixed-threshold-fp32",
+    "batch_size": 16,
+    "wall_s": 3.062,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.2254,
+    "request_latency_p50_s": 0.3661,
+    "throughput_tok_s": 44374,
+    "usd_per_10k_tok_fullbox": 0.001223,
+    "usd_per_10k_tok_per_gpu": 0.000612,
+    "outputs_sha": "b8352b90a0f3"
+  },
+  {
+    "method": "selective-context-absolute-fp32",
+    "batch_size": 16,
+    "wall_s": 6.896,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.5076,
+    "request_latency_p50_s": 0.5275,
+    "throughput_tok_s": 19700,
+    "usd_per_10k_tok_fullbox": 0.002756,
+    "usd_per_10k_tok_per_gpu": 0.001378,
+    "outputs_sha": "0e0cf334c694"
+  },
+  {
+    "method": "llmlingua2-fixed-threshold-fp16",
+    "batch_size": 1,
+    "wall_s": 6.082,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.4476,
+    "request_latency_p50_s": 0.0423,
+    "throughput_tok_s": 22339,
+    "usd_per_10k_tok_fullbox": 0.00243,
+    "usd_per_10k_tok_per_gpu": 0.001215,
+    "outputs_sha": "9fbdfac03f1c"
+  },
+  {
+    "method": "selective-context-absolute-fp16",
+    "batch_size": 1,
+    "wall_s": 14.095,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 1.0374,
+    "request_latency_p50_s": 0.0862,
+    "throughput_tok_s": 9639,
+    "usd_per_10k_tok_fullbox": 0.005632,
+    "usd_per_10k_tok_per_gpu": 0.002816,
+    "outputs_sha": "0e0cf334c694"
+  },
+  {
+    "method": "llmlingua2-fixed-threshold-fp16",
+    "batch_size": 4,
+    "wall_s": 1.871,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.1377,
+    "request_latency_p50_s": 0.06,
+    "throughput_tok_s": 72608,
+    "usd_per_10k_tok_fullbox": 0.000748,
+    "usd_per_10k_tok_per_gpu": 0.000374,
+    "outputs_sha": "9fbdfac03f1c"
+  },
+  {
+    "method": "selective-context-absolute-fp16",
+    "batch_size": 4,
+    "wall_s": 7.248,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.5335,
+    "request_latency_p50_s": 0.1484,
+    "throughput_tok_s": 18744,
+    "usd_per_10k_tok_fullbox": 0.002896,
+    "usd_per_10k_tok_per_gpu": 0.001448,
+    "outputs_sha": "b7abe51ef427"
+  },
+  {
+    "method": "llmlingua2-fixed-threshold-fp16",
+    "batch_size": 16,
+    "wall_s": 1.211,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.0891,
+    "request_latency_p50_s": 0.1528,
+    "throughput_tok_s": 112189,
+    "usd_per_10k_tok_fullbox": 0.000484,
+    "usd_per_10k_tok_per_gpu": 0.000242,
+    "outputs_sha": "9fbdfac03f1c"
+  },
+  {
+    "method": "selective-context-absolute-fp16",
+    "batch_size": 16,
+    "wall_s": 6.445,
+    "raw_tokens": 135859,
+    "s_per_10k_tok": 0.4744,
+    "request_latency_p50_s": 0.4317,
+    "throughput_tok_s": 21080,
+    "usd_per_10k_tok_fullbox": 0.002575,
+    "usd_per_10k_tok_per_gpu": 0.001288,
+    "outputs_sha": "0e0cf334c694"
+  },
+  {
+    "check": "gpu-determinism-llmlingua2-fp32",
+    "identical": true
+  },
+  {
+    "check": "gpu-determinism-llmlingua2-fp16",
+    "identical": true
+  },
+  {
+    "check": "fp16-vs-fp32-llmlingua2",
+    "identical_outputs": "15/16"
+  }
+]

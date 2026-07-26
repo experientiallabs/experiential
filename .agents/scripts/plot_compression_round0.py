@@ -65,7 +65,10 @@ def style(ax: plt.Axes) -> None:
 
 
 def main() -> None:
-    rows = json.loads(DATA.read_text())
+    all_rows = json.loads(DATA.read_text())
+    # CPU audit rows carry no device field; the H100 latency-leg rows are device-tagged
+    # and aggregate separately (fig 2 annotation), never into the CPU means.
+    rows = [r for r in all_rows if not r.get("device")]
     per_method: dict[str, dict[str, float]] = {}
     for name in META:
         mine = [r for r in rows if r["method"] == name]
@@ -75,6 +78,14 @@ def main() -> None:
             "latency": st.mean(r["latency_s_per_10k_tok_p50"] for r in mine),
             "append_only": all(r["append_only"] for r in mine),
         }
+    # Best fp32 s/10k per method on the H100 (fp32 is the serving-safe mode: fp16 output
+    # varies with batch composition, measured in the latency leg).
+    gpu_latency: dict[str, float] = {}
+    for r in all_rows:
+        if r.get("device") == "h100-fp32":
+            gpu_latency[r["method"]] = min(
+                gpu_latency.get(r["method"], float("inf")), r["latency_s_per_10k_tok_p50"]
+            )
     OUT.mkdir(parents=True, exist_ok=True)
 
     # Fig 1: churn per method, colored by selection-rule class.
@@ -154,9 +165,32 @@ def main() -> None:
             color=INK,
             ha=ha,
         )
+    # H100 fp32 points for the scored methods (the latency leg's answer to the CPU
+    # servability question): same ratio, GPU latency, connected by a dashed guide.
+    for name, gpu_s in gpu_latency.items():
+        if name not in per_method:
+            continue
+        stats = per_method[name]
+        color = FAMILY_COLOR[META[name][1]]
+        ax.scatter(
+            gpu_s, stats["ratio"], s=90, marker="D", facecolors=color,
+            edgecolors=color, linewidths=1.6, zorder=3,
+        )
+        ax.plot(
+            [gpu_s, stats["latency"]], [stats["ratio"]] * 2,
+            color=color, linewidth=0.9, linestyle=(0, (3, 3)), zorder=2, alpha=0.6,
+        )
+        ax.annotate(
+            "H100 fp32", (gpu_s, stats["ratio"]), textcoords="offset points",
+            xytext=(-6, -14), fontsize=7.4, color=MUTED, ha="left",
+        )
     ax.set_xscale("log")
     ax.set_xlim(right=40)
-    ax.set_xlabel("compressor latency, seconds per 10k input tokens (CPU, log scale)", fontsize=9, color=MUTED)
+    ax.set_xlabel(
+        "compressor latency, seconds per 10k input tokens (circles CPU, diamonds H100 fp32; log scale)",
+        fontsize=9,
+        color=MUTED,
+    )
     ax.set_ylabel("token ratio (kept / raw; lower = smaller prompt)", fontsize=9, color=MUTED)
     ax.grid(axis="y", color=GRID, linewidth=0.8)
     style(ax)
