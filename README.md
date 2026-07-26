@@ -21,6 +21,11 @@ pip install world-model-optimizer
 wmo providers set
 ```
 
+That verifies the provider and then offers to register its models as routing candidates in
+`.wmo/pool.toml`, the roster everything below chooses from. It searches the provider's own
+catalog (OpenRouter's 338 published models included) and asks only for what that backend needs.
+Re-run it to add another provider's models beside the ones already registered.
+
 **2. Tune a router on your OTel traces.**
 
 ```bash

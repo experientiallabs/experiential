@@ -238,10 +238,10 @@ def select_provider_and_model(
     (provider, model, region).
     """
     providers = list(_PROVIDER_MODELS)
-    with_creds = [p for p in providers if _has_credentials(p)]
+    with_creds = [p for p in providers if has_credentials(p)]
     # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
     # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
-    notes = {p: _creds_note(p) for p in with_creds}
+    notes = {p: creds_note(p) for p in with_creds}
     provider_default = default_provider or (with_creds[0] if with_creds else None)
     while True:
         provider = _select(
@@ -253,7 +253,7 @@ def select_provider_and_model(
             interactive=interactive,
             notes=notes,
         )
-        _ensure_credentials(console, ask_secret, provider)
+        ensure_credentials(console, ask_secret, provider)
         model = _select(
             console,
             ask,
@@ -455,7 +455,7 @@ def run_build_wizard(
         if embed_models is None:
             break  # offline hashing embedder: nothing to verify
         if embed_provider != provider:
-            _ensure_credentials(console, ask_secret, embed_provider)
+            ensure_credentials(console, ask_secret, embed_provider)
         embed_model = _select(
             console,
             ask,
@@ -692,19 +692,19 @@ def _provider_env_vars(provider: str) -> list[str]:
         return []
 
 
-def _creds_note(provider: str) -> str:
+def creds_note(provider: str) -> str:
     """Picker annotation for a provider whose credentials are present, naming what was found."""
     env_vars = _provider_env_vars(provider)
     return f"{env_vars[0]} set" if len(env_vars) == 1 else "creds set"
 
 
-def _has_credentials(provider: str) -> bool:
+def has_credentials(provider: str) -> bool:
     """Offline presence check: every credential env var for `provider` is set (not validated)."""
     env_vars = _provider_env_vars(provider)
     return bool(env_vars) and all(os.environ.get(var) for var in env_vars)
 
 
-def _ensure_credentials(console: Console, ask_secret: PromptReader, provider: str) -> None:
+def ensure_credentials(console: Console, ask_secret: PromptReader, provider: str) -> None:
     """Prompt for any missing credential env vars and persist entered values to `.env`.
 
     Presence only — the live ping that confirms the creds actually work happens once before
@@ -736,11 +736,16 @@ def select_option(
     options: list[str],
     *,
     notes: dict[str, str] | None = None,
+    default: str | None = None,
     reader: PromptReader | None = None,
 ) -> str:
-    """Pick one of `options` (arrow-key picker on a TTY, numbered prompt otherwise)."""
+    """Pick one of `options` (arrow-key picker on a TTY, numbered prompt otherwise).
+
+    `default` is the Enter-default; None keeps the historic behavior of requiring an explicit
+    pick. `notes` annotates an option with a dim suffix (e.g. which credential was found).
+    """
     ask = reader if reader is not None else (lambda text: console.input(text))
-    return _select(console, ask, label, options, None, interactive=True, notes=notes)
+    return _select(console, ask, label, options, default, interactive=True, notes=notes)
 
 
 def select_model(

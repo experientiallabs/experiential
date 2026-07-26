@@ -244,6 +244,20 @@ def _catalog() -> tuple[PriceCatalog | None, str]:
     )
 
 
+def price_table() -> tuple[PriceCatalog | None, str]:
+    """The whole published table, or None and the reason there is none. Never raises.
+
+    `resolve_price` answers one id; this exposes the same cached table to a caller that needs to
+    ENUMERATE it (the pool registry's model picker: OpenRouter is the one backend that publishes
+    a complete, priced catalog, and a picker over 338 models must not fetch it a second time).
+    Identical caching, identical one-fetch-per-process bound, identical degradation.
+
+    Returns:
+        The table and an empty string, or None and a clause naming the catalog failure.
+    """
+    return _catalog()
+
+
 def resolve_price(model: str) -> PriceResolution:
     """Look up `model`'s published price. Never raises, never blocks past one fetch.
 

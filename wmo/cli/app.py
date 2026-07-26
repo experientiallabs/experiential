@@ -18,6 +18,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 from uuid import uuid4
 
 import typer
@@ -35,6 +36,7 @@ from rich.panel import Panel
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn
 from rich.table import Table
 
+import wmo.cli.pool_registry as pool_registry
 import wmo.providers as providers
 from wmo.cli.agent_session import register as register_agent_session_commands
 from wmo.cli.e2b_cmds import register as register_e2b_commands
@@ -97,6 +99,7 @@ from wmo.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmo.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
 from wmo.providers.base import Embedder, EmbedderKind, Provider
 from wmo.providers.models import resolve_provider_model
+from wmo.providers.pool import Tier
 from wmo.providers.retry import wrap_provider_with_retries
 from wmo.research import Side, run_concurrency_scaling
 from wmo.research.concurrency_run import build_real_runner, build_world_runner
@@ -185,6 +188,12 @@ _CONCURRENCY_ISOLATION_FLAGS: dict[str, tuple[str, ...]] = {
 _DOWNLOAD_BENCHMARKS = typer.Argument(
     None, help="Benchmark bundles to download, or 'all'. Omit for a picker."
 )
+# Repeatable option default hoisted out of the signature (ruff B008 forbids the call inline).
+_POOL_MODEL_OPTION = typer.Option(
+    None,
+    "--pool-model",
+    help="Register this model id as a routing candidate, with no prompts; repeat for several.",
+)
 
 
 @dataclass(frozen=True)
@@ -250,9 +259,48 @@ def providers_set(
     endpoint: str = typer.Option(None, "--endpoint", help="OpenAI-compatible API endpoint."),
     deployment: str = typer.Option(None, "--deployment", help="Azure deployment name."),
     api_version: str = typer.Option(None, "--api-version", help="Azure API version."),
+    pool: str = typer.Option(
+        None,
+        "--pool",
+        help="Candidate pool TOML the router picks from (default: <root>/pool.toml).",
+    ),
+    pool_model: list[str] | None = _POOL_MODEL_OPTION,
+    api_key_env: str = typer.Option(
+        None, "--api-key-env", help="Env var holding the pool entries' API key (multi-account)."
+    ),
+    tier: str = typer.Option(
+        None, "--tier", help=f"Pool entry tier: {' | '.join(pool_registry.TIERS)}."
+    ),
+    input_per_mtok: float = typer.Option(
+        None,
+        "--input-per-mtok",
+        min=0.0,
+        help="Prompt-token price of every --pool-model, USD per 1M tokens.",
+    ),
+    output_per_mtok: float = typer.Option(
+        None,
+        "--output-per-mtok",
+        min=0.0,
+        help="Completion-token price of every --pool-model, USD per 1M tokens.",
+    ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding local settings."),
 ) -> None:
-    """Choose and verify the model provider used by local worker-agent runs."""
+    """Choose the local worker's provider, and register the models the router can choose from.
+
+    Two things a project needs, in one command. The worker provider lands in
+    `<root>/settings.toml` as `[models.worker]`, exactly as before. Then, on a terminal, this
+    offers to register models as ROUTING CANDIDATES in `<root>/pool.toml`, the roster
+    `wmo optimize route` selects over: pick a backend, search its catalog, and answer only what
+    that backend needs (an Azure deployment; a price for a model with no published one, never
+    for OpenRouter, which self-prices). Re-run it to add another provider's models beside the
+    ones already registered.
+
+    Scripts keep the old contract: with `--provider` and `--model` both given, nothing is
+    prompted. Registering non-interactively is `--pool-model <id>`, repeated per model, with
+    `--input-per-mtok`/`--output-per-mtok` when the model has no published price.
+    """
+    if tier is not None and tier not in pool_registry.TIERS:
+        raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")
     existing = load_settings(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:
@@ -309,6 +357,55 @@ def providers_set(
     _console.print(
         f"[green]set[/green] local worker provider to {config.kind.value} "
         f"({config.model_type or model}) in {settings_path(root)}"
+    )
+    _register_pool_models(
+        pool_path=pool_registry.pool_path_for(root, pool),
+        kind=config.kind,
+        pool_model=list(pool_model or []),
+        options=pool_registry.EntryOptions(
+            endpoint=config.endpoint,
+            region=config.region,
+            deployment=config.deployment,
+            api_version=config.api_version,
+            api_key_env=api_key_env,
+            tier=cast("Tier", tier) if tier is not None else "frontier",
+            input_per_mtok=input_per_mtok,
+            output_per_mtok=output_per_mtok,
+        ),
+        interactive=used_picker,
+    )
+
+
+def _register_pool_models(
+    *,
+    pool_path: Path,
+    kind: ProviderKind,
+    pool_model: list[str],
+    options: pool_registry.EntryOptions,
+    interactive: bool,
+) -> None:
+    """Register routing candidates after the worker provider is saved.
+
+    Explicit `--pool-model` ids win and register with no prompts, so a script gets the same
+    roster a person would build by hand. Otherwise the registry is OFFERED only on the run that
+    already prompted (a bare `wmo providers set` at a terminal): a scripted
+    `--provider ... --model ...` invocation keeps its exact pre-existing behavior and asks
+    nothing.
+    """
+    if pool_model:
+        pool_registry.register_model_ids(
+            _console, pool_path=pool_path, kind=kind, model_ids=pool_model, options=options
+        )
+        return
+    if not interactive:
+        return
+    pool_registry.run_pool_registry(
+        _console,
+        lambda text: _console.input(text),
+        lambda text: _console.input(text, password=True),
+        pool_path=pool_path,
+        default_kind=kind,
+        options=options,
     )
 
 

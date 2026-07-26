@@ -12,9 +12,10 @@ from wmo.providers.registry import get_provider
 
 OptInModelRole = Literal["agent", "meta"]
 
-# Azure OpenAI chat completions need an API version on every call. When an opt-in role does not
-# pin one in settings, this shared default API version applies.
-_DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
+# Azure OpenAI chat completions need an API version on every call. When an opt-in role (or a
+# pool entry, or the local worker role) does not pin one, this shared default applies. Imported
+# by `wmo.cli.app` and `wmo.cli.pool_registry` so the three surfaces cannot drift apart.
+DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
 
 
 def resolve_opt_in_model_provider(
@@ -69,7 +70,7 @@ def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderCon
         ) from None
     api_version = configured.api_version
     if api_version is None and kind is ProviderKind.AZURE_OPENAI:
-        api_version = _DEFAULT_AZURE_API_VERSION
+        api_version = DEFAULT_AZURE_API_VERSION
     config = ProviderConfig(
         kind=kind,
         model=configured.model,
