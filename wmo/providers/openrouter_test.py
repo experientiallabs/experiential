@@ -324,4 +324,6 @@ def test_prepare_builds_the_client_when_the_credential_is_there(
 
     provider.prepare()  # no request, no exception
 
-    assert str(provider._get_client().base_url).startswith("https://openrouter.ai")
+    # Exact, not a prefix: a startswith check on a URL is both weaker than it looks (CodeQL
+    # flags it as incomplete sanitization) and looser than the sibling assertion above.
+    assert str(provider._get_client().base_url).rstrip("/") == OPENROUTER_BASE_URL
