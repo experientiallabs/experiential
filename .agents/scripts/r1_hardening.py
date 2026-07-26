@@ -309,15 +309,23 @@ def cmd_crc_floor(seeds: list[int]) -> None:
 
 
 def cmd_adaptive(seeds: list[int]) -> None:
-    """H1: the adaptive neighborhood rule across ours9 + wm corpora + wm-all + monopolies."""
-    jobs: list[tuple[str, OutcomeMatrix]] = [
-        (
-            "routerbench-ours9",
-            OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json"),
-        ),
-        ("wm-all", _wm_all()),
-    ]
-    jobs += [(f"wm-{corpus}", _wm_matrix(corpus)) for corpus in WM_CORPORA]
+    """H1: the adaptive neighborhood rule across ours9 + wm corpora + wm-all + monopolies.
+
+    `--matrices a,b` restricts to explicit cohorts by file stem (s80 reruns: each is its own
+    cohort, matrix name == file stem, never merged with 25-scenario rows).
+    """
+    if "--matrices" in sys.argv:
+        stems = sys.argv[sys.argv.index("--matrices") + 1].split(",")
+        jobs: list[tuple[str, OutcomeMatrix]] = [(stem, _wm_matrix(stem)) for stem in stems]
+    else:
+        jobs = [
+            (
+                "routerbench-ours9",
+                OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json"),
+            ),
+            ("wm-all", _wm_all()),
+        ]
+        jobs += [(f"wm-{corpus}", _wm_matrix(corpus)) for corpus in WM_CORPORA]
     for name, matrix in jobs:
         ctx = MatrixContext(matrix, name, embed="openai", embed_replies=False)
         for seed in seeds:
