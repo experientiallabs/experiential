@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import itertools
 import os
+from collections import Counter
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 import typer
@@ -50,8 +52,13 @@ from wmo.optimize.policy import (
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
-from wmo.providers.base import TokenUsage
-from wmo.providers.pool import DEFAULT_POOL_PATH, ModelPool, load_pool, pool_provider
+from wmo.providers.base import ProviderKind, TokenUsage
+from wmo.providers.pool import (
+    DEFAULT_POOL_PATH,
+    ModelPool,
+    load_pool,
+    prepare_pool_provider,
+)
 from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
 
 route_app = typer.Typer(
@@ -116,9 +123,10 @@ def sweep(
     allow_uneven_coverage: bool = typer.Option(
         False,
         "--allow-uneven-coverage",
-        help="Hand the matrix to `fit` even when candidates were scored on DIFFERENT scenarios. "
-        "The ranking is then biased (both fitters skip unscored rows); the coverage table prints "
-        "either way.",
+        help="Hand the matrix to `fit` even when the candidates were not scored on the same "
+        "evidence: different scenarios, or different numbers of surviving episodes on the same "
+        "scenarios. The fit is then biased (both fitters skip unscored rows and weigh the rest per "
+        "episode); the coverage table prints either way.",
     ),
 ) -> None:
     """Measure every pool candidate closed-loop and write the outcome matrix `fit` consumes.
@@ -145,27 +153,37 @@ def sweep(
     Spend is confirmed before the first episode runs (`--yes` skips, as in
     `wmo optimize harness --mode distill`). What that estimate multiplies is ASSUMED tokens per
     policy call by the real cell and call counts, so it is a projection, never a measurement;
-    the measured candidate spend is printed when the sweep finishes. Every candidate's provider is
-    CONSTRUCTED before that question is asked, so a backend that cannot be built at all is a usage
-    error rather than a mid-sweep abort with earlier candidates already paid for.
+    the measured candidate spend is printed when the sweep finishes. Before that question is asked,
+    every candidate's backend is resolved as far as it goes without a request: its kind's static
+    requirements from the entry alone, then its lazy SDK client forced to BUILD, which imports the
+    SDK and resolves credentials locally. So a candidate that could never be called is a usage
+    error at the boundary, not a mid-sweep abort with earlier candidates already paid for. Two
+    things stay first-cell failures because seeing them needs a request (bedrock AWS credentials,
+    tinker service reachability); the pre-flight names them per entry when the pool has one.
 
     Fit-readiness is a coverage contract, not a nonzero count. A cell goes unscored when its
-    episode errored (provider throttle, agent crash, judge failure) and both fitters SKIP unscored
-    rows, so a matrix where candidate A was scored on 20 scenarios and B on 11 ranks the two on
-    DIFFERENT task sets. That is not a comparison: the policy it fits is biased by whichever
-    scenarios each candidate happened to lose. So per-candidate scored counts ALWAYS print, and
-    when candidates lost different scenarios the command still writes the matrix (those cells were
-    paid for, and their `error` fields are the diagnosis) but WITHHOLDS the `fit` handoff and exits
-    non-zero, naming each candidate and the scenarios it has no scored episode for.
+    episode errored (provider throttle, agent crash, judge failure), both fitters SKIP unscored
+    rows, and what they do with the rest is episode-weighted, so the contract is that every
+    candidate has the same number of scored episodes on the same scenarios. Two ways to break it,
+    both blocked: a matrix where candidate A was scored on 20 scenarios and B on 11 ranks them on
+    DIFFERENT task sets, and a matrix where both cover all 20 but A kept 3 episodes on a scenario
+    where B kept 1 weighs that scenario three times as heavily for A, because `--kind rank`
+    averages every surviving episode into its cluster mean and both kinds pick their
+    default/fallback model off episode-weighted means (`routing._overall_best`,
+    `knn.best_single_on_fit`). A knn BANK cell is that pair's own mean, so the bank is milder, but
+    milder is not unbiased and it is the same matrix either way. Either break leaves the policy
+    decided by whichever cells each candidate happened to lose. So per-candidate scored counts
+    ALWAYS print, and when the evidence differs the command still writes the matrix (those cells
+    were paid for, and their `error` fields are the diagnosis) but WITHHOLDS the `fit` handoff and
+    exits non-zero, naming each candidate, the scenarios it has no scored episode for, and the
+    scenarios where it kept fewer episodes than the best-covered candidate.
     `--allow-uneven-coverage` is the opt-out for an operator who knows the bias and wants the
     partial data anyway (one candidate's backend down for the whole sweep, say): it prints the same
-    coverage table and stops treating the difference as fatal. Losing the SAME scenarios for every
-    candidate is not uneven, since the comparison stays like-for-like on fewer scenarios and the
-    counts show the loss. Differing episode counts within a commonly scored scenario change that
-    cell's noise, not which scenarios a candidate was ranked on, so they show in the Unscored
-    column without blocking.
+    coverage table and stops treating the difference as fatal. Losing the SAME cells for every
+    candidate is not uneven, since the comparison stays like-for-like on less data and the counts
+    show the loss.
 
-    Exit code 1 when the matrix is not fit-ready: no cell scored at all, or unequal scored coverage
+    Exit code 1 when the matrix is not fit-ready: no cell scored at all, or unequal scored evidence
     without `--allow-uneven-coverage`. `sweep && fit` in a script then stops instead of fitting on
     it, and the matrix is written either way.
     """
@@ -285,14 +303,9 @@ def sweep(
             "fitting will fail; read the `error` field of a row to see what broke"
         )
         raise typer.Exit(1)
-    if _uneven_coverage(coverage):
-        counts = ", ".join(f"{escape(row.candidate)} {row.scored}" for row in coverage)
-        _console.print(
-            "[yellow]warning[/yellow] candidates were scored on DIFFERENT scenarios (scored cells: "
-            f"{counts}), so `fit` would rank them on different task sets: it skips unscored rows, "
-            "and the policy that comes out is biased by which scenarios each candidate lost. The "
-            "paid cells are on disk and their `error` field says what broke."
-        )
+    warning = _uneven_warning(coverage)
+    if warning is not None:
+        _console.print(warning)
         if not allow_uneven_coverage:
             _console.print(
                 "  fix the lost cells and sweep again, drop the candidate that lost them, or "
@@ -307,27 +320,42 @@ def sweep(
     )
 
 
+# What each kind still cannot know before its first cell, and why. Both are measured properties
+# of the backend (see `BedrockProvider.prepare` and `TinkerChatProvider.prepare`), not caution: a
+# pre-flight that resolved them would have to make a request, which is the one thing it may not do.
+_DEFERRED_RISK: dict[ProviderKind, str] = {
+    ProviderKind.BEDROCK: (
+        "AWS credentials (boto3 resolves them by walking a chain that can reach the "
+        "instance-metadata endpoint over the network, and it builds a client with no credentials "
+        "at all)"
+    ),
+    ProviderKind.TINKER: (
+        "the Tinker service being reachable and serving this model (constructing the client "
+        "connects and pins a server-side session for the whole process)"
+    ),
+}
+
+
 def _check_pool_backends(pool: ModelPool) -> None:
-    """Construct every candidate's provider BEFORE the sweep spends anything.
+    """Resolve every candidate's backend as far as it goes locally, BEFORE anything is spent.
 
-    `evaluate_pool` builds a candidate's provider lazily, at that candidate's FIRST CELL, so any
-    reason a backend cannot be built (an unset `api_key_env`, a kind that refuses the explicit key
-    the entry names, a config its backend rejects) used to abort the run as a raw traceback after
-    every earlier candidate had been fully paid for, with no matrix written. Building all of them
-    here turns that into a usage error at the boundary, before the cost question.
+    `evaluate_pool` builds a candidate's provider lazily at that candidate's FIRST CELL, and every
+    backend then builds its SDK client lazily inside that first call, so any reason a candidate
+    cannot be used (an unset `api_key_env`, a kind that refuses the explicit key the entry names,
+    a missing SDK extra, an Azure config with no api_version, a Bedrock entry whose region
+    resolves nowhere) used to abort the run as a raw traceback after every earlier candidate had
+    been fully paid for, with no matrix written. `prepare_pool_provider` closes that: it checks the
+    kind's static requirements from the entry alone, then forces the lazy client to be BUILT, which
+    imports the SDK and resolves credentials from the environment and local credential files.
 
-    Construction only, never a request. Every backend in `wmo.providers.registry` only stores its
-    config in `__init__` and defers the SDK import, the credential read, and the client itself to
-    `_get_client()`, so building the whole pool costs nothing and touches no network. Verifying a
-    candidate over the wire is deliberately NOT done here: `wmo providers verify` bills a real call
-    per model, which would spend money inside a pre-flight whose whole job is to run before any
-    spend is authorized, and would make the cost estimate printed next understate what the command
-    had already spent. The residual gap is worth stating plainly: whatever a backend resolves
-    lazily (a Bedrock region and AWS credentials, an optional SDK extra, an Azure api-version)
-    still surfaces at that candidate's first cell, because seeing it earlier needs either a request
-    or a copy of each backend's lazy resolution that would drift from it.
+    No request, ever. Every `prepare` is documented network-free, and verifying a candidate over
+    the wire is deliberately NOT done here: `wmo providers verify` bills a real call per model,
+    which would spend money inside a pre-flight whose whole job is to run before any spend is
+    authorized, and would make the cost estimate printed next understate what the command had
+    already spent. Two backends therefore keep a residual gap (`_DEFERRED_RISK`), and this prints
+    it per entry rather than leaving the operator to discover it mid-sweep.
 
-    Every constructed provider is discarded: `evaluate_pool` still builds its own per cell, so
+    Every prepared provider is discarded: `evaluate_pool` still builds its own per cell, so
     per-cell provider state (the tinker provider's per-episode prompt history) is unchanged.
 
     Reports EVERY unusable candidate, not just the first: a pool is edited as a file, so an
@@ -339,10 +367,11 @@ def _check_pool_backends(pool: ModelPool) -> None:
     problems: list[str] = []
     for entry in pool.models:
         try:
-            pool_provider(entry)
+            prepare_pool_provider(entry)
         except Exception as exc:  # noqa: BLE001 - anything here is a usage error, never a spend
-            # `pool_provider` already prefixes its own failures with the entry name and kind; a
-            # surprise from deeper down gets the same identification so the file is editable.
+            # `prepare_pool_provider` already prefixes its own failures with the entry name and
+            # kind; a surprise from deeper down gets the same identification so the file is
+            # editable from the message.
             detail = str(exc)
             problems.append(
                 detail
@@ -355,22 +384,49 @@ def _check_pool_backends(pool: ModelPool) -> None:
             + ". Fix or remove those entries in the pool file, then re-run (checked all "
             + f"{len(pool.models)} candidate(s) before spending anything)"
         )
+    deferred = [entry for entry in pool.models if entry.kind in _DEFERRED_RISK]
+    if deferred:
+        _console.print(
+            "[yellow]note[/yellow] the pre-flight makes no request, so one thing per candidate "
+            "below can still fail at its first cell (the matrix records it as that cell's `error`):"
+        )
+        for entry in deferred:
+            _console.print(
+                f"  {escape(entry.name)} (kind={entry.kind.value}): {_DEFERRED_RISK[entry.kind]}"
+            )
 
 
 class _CandidateCoverage(BaseModel):
-    """One candidate's scored coverage: what a fitter would actually rank it on."""
+    """One candidate's scored coverage: what a fitter would actually weigh it on."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     candidate: str
     scored: int  # cells with a verified reward
     unscored: int  # cells whose episode or scoring failed (skipped by both fitters)
-    lost_scenarios: tuple[str, ...]  # scenarios with NO scored episode for this candidate
+    # Scored EPISODE COUNT per swept scenario, in sweep order. Counts, not presence: both fitters
+    # weigh episodes, not scenarios (see `_unevenness`), so `X: 3` and `X: 1` are different
+    # evidence even though both "cover" X.
+    scored_episodes: tuple[tuple[str, int], ...]
+    first_error: str | None  # first error text among this candidate's unscored cells, if any
+
+    @property
+    def lost_scenarios(self) -> tuple[str, ...]:
+        """Swept scenarios this candidate has NO scored episode for."""
+        return tuple(sid for sid, count in self.scored_episodes if count == 0)
 
 
-# Lost scenario ids shown per candidate before the column summarizes the rest: enough to see the
-# pattern in a table an operator reads, without a 20-id line per row.
+# Scenario ids shown per candidate before the column summarizes the rest: enough to see the pattern
+# in a table an operator reads, without a 20-id line per row.
 _LOST_SHOWN = 5
+
+
+class _Unevenness(StrEnum):
+    """How the candidates' scored evidence differs, when it does."""
+
+    EVEN = "even"
+    SCENARIOS = "scenarios"  # candidates were scored on different scenario SETS
+    EPISODES = "episodes"  # same scenarios, different numbers of scored episodes
 
 
 def _coverage(matrix: OutcomeMatrix) -> list[_CandidateCoverage]:
@@ -379,41 +435,99 @@ def _coverage(matrix: OutcomeMatrix) -> list[_CandidateCoverage]:
     rows: list[_CandidateCoverage] = []
     for name in matrix.model_names():
         cells = [outcome for outcome in matrix.outcomes if outcome.model == name]
-        has_reward = {cell.scenario_id for cell in cells if cell.scored}
+        per_scenario: Counter[str] = Counter(cell.scenario_id for cell in cells if cell.scored)
+        errors = [cell.error for cell in cells if not cell.scored and cell.error]
         rows.append(
             _CandidateCoverage(
                 candidate=name,
                 scored=sum(1 for cell in cells if cell.scored),
                 unscored=sum(1 for cell in cells if not cell.scored),
-                lost_scenarios=tuple(sid for sid in swept if sid not in has_reward),
+                scored_episodes=tuple((sid, per_scenario[sid]) for sid in swept),
+                first_error=errors[0] if errors else None,
             )
         )
     return rows
 
 
-def _uneven_coverage(coverage: list[_CandidateCoverage]) -> bool:
-    """Whether the candidates were scored on DIFFERENT scenarios, which is not a comparison.
+def _unevenness(coverage: list[_CandidateCoverage]) -> _Unevenness:
+    """Whether the candidates were scored on the same evidence, and if not, how it differs.
 
-    Compared as SETS of lost scenarios, not counts: two candidates can lose the same number of
-    scenarios and still have been ranked on disjoint task subsets. A scenario every candidate lost
-    is even (the comparison is like-for-like on what is left), and an episode-count difference
-    inside a commonly scored scenario is noise on that cell rather than a different task set, so
-    neither blocks (see `sweep`).
+    Compared as per-(candidate, scenario) scored EPISODE COUNTS, because that is what the fitters
+    weigh. Presence is not enough: `fit_rank_policy` averages every surviving EPISODE
+    independently, so a candidate that kept 3 episodes on a scenario and one that kept 1 carry
+    different effective scenario weights into the same cluster mean, and the models chosen as
+    `default_model` (`routing.py:_overall_best`) and as the knn fallback/guard
+    (`knn.py:best_single_on_fit`) are picked off those same episode-weighted means. The knn BANK is
+    milder, since its cells are per-scenario means, but "milder" is not "unbiased", and it is the
+    same matrix either way.
+
+    Losing the same episodes of the same scenarios for EVERY candidate is even: the comparison
+    stays like-for-like on less data, and the counts show the loss.
     """
-    return len({row.lost_scenarios for row in coverage}) > 1
+    if len({row.scored_episodes for row in coverage}) <= 1:
+        return _Unevenness.EVEN
+    if len({row.lost_scenarios for row in coverage}) > 1:
+        return _Unevenness.SCENARIOS
+    return _Unevenness.EPISODES
+
+
+def _uneven_warning(coverage: list[_CandidateCoverage]) -> str | None:
+    """The warning for coverage that is not a comparison, or None when it is one.
+
+    Two different failures, so two different messages: candidates ranked on different scenario
+    SETS, and candidates ranked on the same scenarios with different numbers of surviving EPISODES.
+    Both bias a fit; naming which one happened is what makes the message actionable.
+    """
+    counts = ", ".join(f"{escape(row.candidate)} {row.scored}" for row in coverage)
+    match _unevenness(coverage):
+        case _Unevenness.EVEN:
+            return None
+        case _Unevenness.SCENARIOS:
+            return (
+                "[yellow]warning[/yellow] candidates were scored on DIFFERENT scenarios (scored "
+                f"cells: {counts}), so `fit` would rank them on different task sets: it skips "
+                "unscored rows, and the policy that comes out is biased by which scenarios each "
+                "candidate lost. The paid cells are on disk and their `error` field says what "
+                "broke."
+            )
+        case _Unevenness.EPISODES:
+            return (
+                "[yellow]warning[/yellow] candidates cover the same scenarios but kept DIFFERENT "
+                f"numbers of scored episodes on them (scored cells: {counts}; the table above "
+                "says which scenarios were thinned, as kept/most). Both fitters weigh EPISODES: "
+                "--kind rank averages every surviving episode into its cluster mean, so a "
+                "scenario one candidate kept 1 of 3 episodes on counts a third as much for it, "
+                "and both kinds pick their default/fallback model off the same episode-weighted "
+                "means. What comes out then turns on which episodes happened to fail."
+            )
 
 
 def _print_coverage(coverage: list[_CandidateCoverage]) -> None:
-    """Show what each candidate would be ranked on: its scored cells and the scenarios it lost."""
+    """Show what each candidate would be weighed on: its scored cells, and what it lost.
+
+    The last column names every scenario where this candidate holds less evidence than the
+    best-covered candidate does: a bare id is a scenario with no scored episode at all, and
+    `id 1/3` is a scenario where it kept 1 of the 3 episodes another candidate kept. Both change
+    what a fitter weighs, so both are per candidate here rather than summed into Unscored.
+    """
+    most: Counter[str] = Counter()
+    for row in coverage:
+        for sid, count in row.scored_episodes:
+            most[sid] = max(most[sid], count)
     table = Table(title="Scored coverage per candidate (`fit` SKIPS unscored cells)")
     table.add_column("Candidate", no_wrap=True)
     table.add_column("Scored", justify="right")
     table.add_column("Unscored", justify="right")
-    table.add_column("Scenarios with no scored episode")
+    table.add_column("Scenarios lost, or thinned (kept/most)")
     for row in coverage:
-        lost = ", ".join(row.lost_scenarios[:_LOST_SHOWN])
-        if len(row.lost_scenarios) > _LOST_SHOWN:
-            lost += f" (+{len(row.lost_scenarios) - _LOST_SHOWN} more)"
+        gaps = [
+            sid if count == 0 else f"{sid} {count}/{most[sid]}"
+            for sid, count in row.scored_episodes
+            if count == 0 or count < most[sid]
+        ]
+        lost = ", ".join(gaps[:_LOST_SHOWN])
+        if len(gaps) > _LOST_SHOWN:
+            lost += f" (+{len(gaps) - _LOST_SHOWN} more)"
         # Scenario ids are corpus data (trace ids) and candidate names are operator strings: both
         # reach a rich console, where `[a]` is markup that would silently drop from the table.
         table.add_row(
@@ -423,6 +537,16 @@ def _print_coverage(coverage: list[_CandidateCoverage]) -> None:
             escape(lost) if lost else "-",
         )
     _console.print(table)
+    for row in coverage:
+        if row.scored == 0 and row.first_error is not None:
+            # A candidate that was never scored at all is the one failure a coverage table cannot
+            # explain, and its cause is already on disk. Surfacing the first one names the entry
+            # and points at the pool file, which is where the fix is.
+            _console.print(
+                f"  [yellow]{escape(row.candidate)}[/yellow] was never scored; its first cell "
+                f"failed with: {escape(row.first_error)}\n"
+                "    fix that entry in the pool file, drop it, or retry once the cause has cleared"
+            )
 
 
 def _check_out_writable(out_path: Path) -> None:

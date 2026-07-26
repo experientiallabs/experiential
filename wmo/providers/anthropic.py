@@ -44,6 +44,25 @@ class AnthropicProvider:
                 self._client = Anthropic()  # picks up ANTHROPIC_API_KEY from the environment
         return self._client
 
+    def prepare(self) -> None:
+        """Build the SDK client and prove a credential resolved. No request is sent.
+
+        Satisfies `wmo.providers.base.PreparableProvider`. Building the client alone is not enough
+        here, unlike the OpenAI backends: `Anthropic()` accepts a missing key, leaves `api_key`
+        None, and fails only when it signs a request. So the check reads the credential the SDK
+        itself resolved (from `api_key`/`auth_token`, which it fills from ANTHROPIC_API_KEY /
+        ANTHROPIC_AUTH_TOKEN) rather than re-deriving the variable list here, where it would drift.
+
+        Raises:
+            ValueError: The SDK resolved no credential for this configuration.
+        """
+        client = self._get_client()
+        if client.api_key is None and client.auth_token is None:
+            raise ValueError(
+                "AnthropicProvider resolved no credential: export ANTHROPIC_API_KEY, or name the "
+                "variable holding it explicitly (a pool entry's `api_key_env` field)"
+            )
+
     def complete(
         self,
         system: str,

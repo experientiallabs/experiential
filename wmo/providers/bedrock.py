@@ -133,6 +133,42 @@ class BedrockProvider:
             )
         return self._client
 
+    def prepare(self) -> None:
+        """Resolve the region locally. Deliberately does NOT build the boto3 client.
+
+        Satisfies `wmo.providers.base.PreparableProvider` for the part that is free, and only that
+        part. Two measured reasons the client itself is not built here:
+
+        1. `boto3.client()` walks the credential chain, whose instance-metadata provider makes an
+           HTTP request to the link-local metadata endpoint when nothing local resolves (measured
+           2.11s on a machine with no AWS config, 0.03s with AWS_EC2_METADATA_DISABLED=true). A
+           pre-flight's whole job is to run before any request, so it may not pay that.
+        2. It would not even answer the question. With no credentials the client is built anyway
+           (`credentials=None`, measured) and raises `NoCredentialsError` only when it signs the
+           first request, so absent AWS credentials are NOT locally knowable and stay a first-call
+           failure.
+
+        The region is a different story: free to resolve and fatal when missing, because botocore
+        raises `NoRegionError` while creating a bedrock-runtime client with no region. It is
+        resolved through boto3's own session so this check cannot drift from what the client does
+        (`config.region` first, then AWS_DEFAULT_REGION, then the active profile's `region`; note
+        botocore's session config does NOT read AWS_REGION).
+
+        Raises:
+            ValueError: No region resolves for this configuration.
+        """
+        # Lazy for the same reason as `_get_client`: importing boto3 costs real time, and the
+        # registry constructs every backend on any `wmo` command.
+        import boto3
+
+        if self.config.region or boto3.Session().region_name:
+            return
+        raise ValueError(
+            "BedrockProvider has no region, and botocore refuses to build a bedrock-runtime "
+            "client without one: set the region on the entry/config, export AWS_DEFAULT_REGION, "
+            "or set `region` in the AWS profile this run uses"
+        )
+
     def complete(
         self,
         system: str,

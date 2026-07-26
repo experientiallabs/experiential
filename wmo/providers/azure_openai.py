@@ -145,6 +145,27 @@ class AzureOpenAIProvider:
             )
         return self._responses_client
 
+    def prepare(self) -> None:
+        """Resolve deployment, api_version, endpoint, and key by building this config's client.
+
+        Satisfies `wmo.providers.base.PreparableProvider`. Branches exactly like `verify`: a
+        `reasoning_effort` config dispatches through the Azure v1 Responses client, everything else
+        through the api-versioned chat client, so the thing that gets prepared is the thing the
+        request will use. All four failures are local, which is what makes this free: `_deployment`
+        rejects a config with no deployment name, `_get_client` rejects a missing api_version and a
+        missing endpoint before it reaches for the SDK, and `AzureOpenAI(...)` itself refuses to
+        construct without a resolvable key. No connection is opened.
+
+        Raises:
+            ValueError: The config is missing a deployment, an api_version, or an endpoint.
+            openai.OpenAIError: No key resolved for this endpoint.
+        """
+        self._deployment()
+        if self.config.reasoning_effort is not None:
+            self._get_responses_client()
+            return
+        self._get_client()
+
     def _deployment(self) -> str:
         # On Azure, the `model` arg to the API is the deployment name, not the base model id.
         if self.config.deployment is None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -554,6 +555,7 @@ def _patch_seams(
     reward: float = 0.75,
     no_scoring: bool = False,
     throttled_models: frozenset[str] = frozenset(),
+    throttled_episodes: dict[str, tuple[bool, ...]] | None = None,
     judge_fails_on: frozenset[str] = frozenset(),
     real_kinds: frozenset[ProviderKind] = frozenset(),
 ) -> _Seams:
@@ -566,13 +568,20 @@ def _patch_seams(
             would amount to: it exists so a test can show the difference is observable.
         throttled_models: Provider model ids (`PoolEntry.model`) whose completions raise, so that
             candidate's cells come back unscored while the others are scored.
+        throttled_episodes: Per-model cycle of throttled flags over each scenario's episodes:
+            `{"pricey-1": (False, True, True)}` keeps episode 0 and loses episodes 1 and 2 of EVERY
+            scenario. `evaluate_pool` builds one provider per episode in scenario-major order, so
+            the cycle position is the episode index within the scenario. This is how a candidate
+            comes back with the same scenarios as the others but FEWER scored episodes on them.
         judge_fails_on: Scenario tasks whose episode SCORING raises, for every candidate: the
             whole pool loses those scenarios together.
         real_kinds: Provider kinds to construct for real instead of faking, so a test can exercise
-            a backend that refuses its own config. Construction is side-effect free, and no real
-            provider is ever called (the sweep must fail before any cell runs).
+            a backend that refuses its own config or cannot build its lazy client. Construction and
+            preparation are both request-free, and no real provider is ever called (the sweep must
+            fail before any cell runs).
     """
     seams = _Seams(_FakeWorldModel(reward=reward, judge_fails_on=judge_fails_on))
+    episode_cycles = throttled_episodes or {}
 
     def _load(model_dir: Path) -> tuple[WorldModel, Provider]:
         provider = _ScriptedCandidate(
@@ -584,9 +593,17 @@ def _patch_seams(
         if config.kind in real_kinds:
             return registry_get_provider(config, api_key=api_key)
         seams.built_providers.append(config.model)
+        cycle = episode_cycles.get(config.model)
+        throttled = config.model in throttled_models
+        if cycle:
+            # The pre-flight builds one provider per candidate before any episode runs, so the
+            # sweep's first episode is this model's SECOND construction; from there the count is
+            # the episode index (`evaluate_pool` builds one provider per episode).
+            episode = seams.built_providers.count(config.model) - 2
+            throttled = throttled or (episode >= 0 and cycle[episode % len(cycle)])
         return cast(
             "Provider",
-            _ScriptedCandidate(config, seams.systems, throttled=config.model in throttled_models),
+            _ScriptedCandidate(config, seams.systems, throttled=throttled),
         )
 
     monkeypatch.setattr(route_module, "load_world_model", _load)
@@ -747,6 +764,11 @@ def test_route_sweep_withholds_the_fit_handoff_on_uneven_scored_coverage(
     assert _says(result.output, "Scored coverage per candidate")
     assert _says(result.output, ", ".join(_HELD_OUT_IDS[:3]))
     assert "DIFFERENTscenarios" in flat and "cheap3,pricey0" in flat
+    # A candidate the coverage table can only show as all-zero gets its cause quoted from the
+    # matrix, named, with what to do: it is the one failure the table itself cannot explain.
+    assert _says(result.output, "pricey was never scored; its first cell failed with")
+    assert "ratelimitexceeded(429)" in flat
+    assert _says(result.output, "fix that entry in the pool file")
     # The handoff is withheld, so `sweep && fit` in a script stops instead of fitting on it, and
     # the message names the one flag that proceeds anyway.
     assert "wmooptimizeroutefit" not in flat
@@ -768,6 +790,95 @@ def test_route_sweep_allow_uneven_coverage_hands_off_and_still_states_the_bias(
     assert result.exit_code == 0, result.output
     flat = _flat(result.output)
     assert "DIFFERENTscenarios" in flat and "biasaccepted" in flat
+    assert _says(result.output, f"wmo optimize route fit {out} --kind knn")
+
+
+def test_route_sweep_withholds_the_fit_handoff_on_uneven_scored_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Uneven EPISODES, not uneven scenario presence: `pricey` keeps episode 0 of every scenario and
+    # loses episodes 1 and 2, so both candidates cover BOTH scenarios and a presence-only gate sees
+    # nothing wrong. What differs is the scored episode COUNT per (candidate, scenario), which is
+    # exactly what the fitters weigh: `fit_rank_policy` averages every surviving episode into its
+    # cluster mean (so a scenario counts three times as much for `cheap` as for `pricey`), and
+    # `_overall_best` / `best_single_on_fit` pick the default and knn fallback off the same
+    # episode-weighted means. Which episodes happened to fail must not decide the policy.
+    seams = _patch_seams(monkeypatch, throttled_episodes={"pricey-1": (False, True, True)})
+    root = _project(tmp_path, traces=_corpus())
+    out, result = _sweep(tmp_path, root, "support", "--scenarios", "2", "--episodes", "3", "--yes")
+    assert result.exit_code == 1, result.output
+    # Every cell ran and the artifact is on disk: 2 candidates x 2 scenarios x 3 episodes.
+    matrix = OutcomeMatrix.load(out)
+    assert len(matrix.outcomes) == 12
+    assert len(seams.world_model.tasks) == 12
+    assert Counter(
+        (outcome.model, outcome.scenario_id) for outcome in matrix.outcomes if outcome.scored
+    ) == Counter(
+        {
+            ("cheap", _HELD_OUT_IDS[0]): 3,
+            ("cheap", _HELD_OUT_IDS[1]): 3,
+            ("pricey", _HELD_OUT_IDS[0]): 1,
+            ("pricey", _HELD_OUT_IDS[1]): 1,
+        }
+    )
+    # Presence is identical for both candidates, so nothing but the counts could have caught this.
+    scored_scenarios = {
+        name: {o.scenario_id for o in matrix.outcomes if o.scored and o.model == name}
+        for name in ("cheap", "pricey")
+    }
+    assert scored_scenarios["cheap"] == scored_scenarios["pricey"] == set(_HELD_OUT_IDS[:2])
+    flat = _flat(result.output)
+    assert _says(result.output, "DIFFERENT numbers of scored episodes")
+    # The table says WHICH candidate thinned WHICH scenario, and by how much.
+    assert "pricey24" in flat  # 2 scored cells, 4 unscored
+    assert _says(result.output, f"{_HELD_OUT_IDS[0]} 1/3")
+    assert _says(result.output, f"{_HELD_OUT_IDS[1]} 1/3")
+    # The handoff is withheld, so `sweep && fit` stops here, and the one opt-out is named.
+    assert "wmooptimizeroutefit" not in flat
+    assert "--allow-uneven-coverage" in flat
+
+
+def test_route_sweep_allow_uneven_coverage_also_covers_uneven_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same opt-out, same bias statement, for the episode-count case: an operator who knows one
+    # candidate was throttled through part of the sweep and wants the partial data anyway.
+    _patch_seams(monkeypatch, throttled_episodes={"pricey-1": (False, True, True)})
+    root = _project(tmp_path, traces=_corpus())
+    out, result = _sweep(
+        tmp_path,
+        root,
+        "support",
+        "--scenarios",
+        "2",
+        "--episodes",
+        "3",
+        "--yes",
+        "--allow-uneven-coverage",
+    )
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert _says(result.output, "DIFFERENT numbers of scored episodes")
+    assert "biasaccepted" in flat
+    assert _says(result.output, f"wmo optimize route fit {out} --kind knn")
+
+
+def test_route_sweep_hands_off_when_every_candidate_lost_the_same_episodes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The negative control for the two tests above: EVERY candidate loses episodes 1 and 2 of every
+    # scenario, so the per-(candidate, scenario) counts are identical. That is still a comparison,
+    # like-for-like on one episode per scenario, so the handoff stands and only the counts show it.
+    _patch_seams(
+        monkeypatch,
+        throttled_episodes={"cheap-1": (False, True, True), "pricey-1": (False, True, True)},
+    )
+    root = _project(tmp_path, traces=_corpus())
+    out, result = _sweep(tmp_path, root, "support", "--scenarios", "2", "--episodes", "3", "--yes")
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    assert "cheap24-" in flat and "pricey24-" in flat  # 2 scored, 4 unscored, nothing thinner
+    assert "DIFFERENT" not in flat
     assert _says(result.output, f"wmo optimize route fit {out} --kind knn")
 
 
@@ -1115,6 +1226,200 @@ def test_route_sweep_constructs_every_backend_before_it_spends(
     assert seams.systems == []
     assert seams.world_model.tasks == []
     assert not out.exists()
+
+
+def test_route_sweep_rejects_a_config_no_backend_could_use_before_it_spends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The STATIC half of the pre-flight. An azure entry with a deployment but no `api_version`
+    # loads (the load-time rule only covers `deployment`) and CONSTRUCTS (the provider's __init__
+    # just stores the config); only `_get_client` refuses without an api-version, and that runs
+    # inside this candidate's first call, after `cheap` has been paid for. Nothing about this needs
+    # an SDK or a credential, so it is knowable from the entry alone.
+    seams = _patch_seams(monkeypatch)
+    root = _project(tmp_path, traces=_corpus())
+    pool = tmp_path / "pool.toml"
+    pool.write_text(
+        "[[model]]\n"
+        'name = "cheap"\n'
+        'kind = "openai"\n'
+        'model = "cheap-1"\n'
+        "input_per_mtok = 1.0\n"
+        "output_per_mtok = 2.0\n"
+        "\n"
+        "[[model]]\n"
+        'name = "gpt-azure"\n'
+        'kind = "azure"\n'
+        'model = "gpt-5.5"\n'
+        'deployment = "gpt-5.5"\n'  # present, so this is not the load-time rule
+        'endpoint = "https://example.openai.azure.com"\n'
+        "input_per_mtok = 1.0\n"
+        "output_per_mtok = 2.0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "matrix.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "support",
+            "--root",
+            str(root),
+            "--pool",
+            str(pool),
+            "--out",
+            str(out),
+            "--scenarios",
+            "2",
+            "--yes",
+        ],
+    )
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)  # no traceback
+    flat = _flat(result.output)
+    # Names the offending entry, its kind, and the field to add.
+    assert "'gpt-azure'" in flat and "kind=azure" in flat and "api_version" in flat
+    # Before the cost confirmation, and before any cell: the cost table never printed, no candidate
+    # was ever called, no episode was ever opened, and no matrix exists.
+    assert "USD(est)" not in flat
+    assert seams.systems == []
+    assert seams.world_model.tasks == []
+    assert not out.exists()
+
+
+def test_route_sweep_builds_every_lazy_client_before_it_spends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The LAZY-CLIENT half of the pre-flight. Constructing an `OpenAIProvider` does not read its
+    # credential: `__init__` only stores the config, and `OpenAI()` (which REFUSES to construct
+    # without a resolvable key) is built inside the first call. So with OPENAI_API_KEY unset, a
+    # pre-flight that only constructs providers passes and the whole sweep then fails cell by cell.
+    # Both candidates are the real backend here; no request is made either way, because the SDK
+    # raises while building its own client.
+    seams = _patch_seams(monkeypatch, real_kinds=frozenset({ProviderKind.OPENAI}))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    root = _project(tmp_path, traces=_corpus())
+    out, result = _sweep(tmp_path, root, "support", "--scenarios", "2", "--yes")
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)  # no traceback
+    flat = _flat(result.output)
+    # EVERY unusable candidate is named with its kind, not just the first one an operator would fix.
+    assert "'cheap'" in flat and "'pricey'" in flat and "kind=openai" in flat
+    assert "OPENAI_API_KEY" in flat  # the SDK's own advice survives into the message
+    assert "USD(est)" not in flat
+    assert seams.world_model.tasks == []
+    assert not out.exists()
+
+
+def test_route_sweep_rejects_a_bedrock_candidate_whose_region_resolves_nowhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bedrock is the backend whose client CANNOT be built in a pre-flight (boto3 resolves
+    # credentials by walking a chain that reaches the instance-metadata endpoint, and builds fine
+    # with no credentials anyway), so its region is resolved through boto3's own session instead:
+    # entry, then AWS_DEFAULT_REGION, then the active profile. Without that check, botocore's
+    # NoRegionError lands in this candidate's first cell. Every source is pointed at nothing here so
+    # the check has the same answer on any machine, and metadata lookups are disabled as a belt:
+    # this test may not touch the network.
+    seams = _patch_seams(monkeypatch, real_kinds=frozenset({ProviderKind.BEDROCK}))
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-aws-config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))
+    for name in ("AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    root = _project(tmp_path, traces=_corpus())
+    pool = tmp_path / "pool.toml"
+    pool.write_text(
+        "[[model]]\n"
+        'name = "cheap"\n'
+        'kind = "openai"\n'
+        'model = "cheap-1"\n'
+        "input_per_mtok = 1.0\n"
+        "output_per_mtok = 2.0\n"
+        "\n"
+        "[[model]]\n"
+        'name = "opus-bedrock"\n'
+        'kind = "bedrock"\n'
+        'model = "us.anthropic.claude-opus-4-8"\n'  # no region anywhere
+        "input_per_mtok = 15.0\n"
+        "output_per_mtok = 75.0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "matrix.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "support",
+            "--root",
+            str(root),
+            "--pool",
+            str(pool),
+            "--out",
+            str(out),
+            "--scenarios",
+            "2",
+            "--yes",
+        ],
+    )
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)  # no traceback
+    flat = _flat(result.output)
+    assert "'opus-bedrock'" in flat and "kind=bedrock" in flat
+    assert "region" in flat and "AWS_DEFAULT_REGION" in flat  # what went wrong and what to do
+    assert "USD(est)" not in flat
+    assert seams.systems == []
+    assert seams.world_model.tasks == []
+    assert not out.exists()
+
+
+def test_route_sweep_states_what_the_preflight_cannot_know_before_the_first_cell(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two backends keep a residual gap because closing it needs a request (bedrock AWS credentials,
+    # tinker service reachability). A usable bedrock entry therefore passes the pre-flight and the
+    # sweep runs, and the command says which entry still carries which unknown rather than leaving
+    # an operator to find out mid-sweep. Faked provider construction: nothing is called for real.
+    seams = _patch_seams(monkeypatch)
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")  # so the region check passes
+    root = _project(tmp_path, traces=_corpus())
+    pool = tmp_path / "pool.toml"
+    pool.write_text(
+        "[[model]]\n"
+        'name = "opus-bedrock"\n'
+        'kind = "bedrock"\n'
+        'model = "us.anthropic.claude-opus-4-8"\n'
+        "input_per_mtok = 15.0\n"
+        "output_per_mtok = 75.0\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "matrix.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "support",
+            "--root",
+            str(root),
+            "--pool",
+            str(pool),
+            "--out",
+            str(out),
+            "--scenarios",
+            "1",
+            "--yes",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert _says(result.output, "opus-bedrock (kind=bedrock): AWS credentials")
+    assert _says(result.output, "the pre-flight makes no request")
+    assert seams.world_model.tasks == ["task tr-010"]  # the sweep did run
 
 
 def test_route_sweep_checks_the_out_path_before_it_spends(

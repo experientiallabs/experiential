@@ -103,6 +103,28 @@ _shared_samplers: dict[str, tinker.SamplingClient] = {}
 """Process-wide `SamplingClient` cache, keyed by the exact model string."""
 
 
+def check_tinker_prerequisites() -> None:
+    """Check what the shared service client needs that resolves LOCALLY: the SDK and the key.
+
+    The local half of `shared_service_client`, split out so a caller that must NOT connect (a
+    provider pre-flight, `TinkerChatProvider.prepare`) runs exactly these checks instead of a copy
+    of them that drifts. Nothing here touches the network.
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (the distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+    """
+    try:
+        import tinker  # noqa: F401 - presence IS the check; callers import it for real
+    except ImportError as exc:
+        raise ImportError(_MISSING_TINKER_EXTRA) from exc
+    if not os.environ.get(TINKER_API_KEY_ENV):
+        raise RuntimeError(
+            f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
+            "your Tinker API key to use the tinker provider"
+        )
+
+
 def shared_service_client() -> tinker.ServiceClient:
     """The process-wide `tinker.ServiceClient`, constructed at most once.
 
@@ -125,15 +147,9 @@ def shared_service_client() -> tinker.ServiceClient:
         TinkerDeadlineError: If construction exceeds the connect deadline
             (nothing is cached, so the next call rebuilds).
     """
-    try:
-        import tinker
-    except ImportError as exc:
-        raise ImportError(_MISSING_TINKER_EXTRA) from exc
-    if not os.environ.get(TINKER_API_KEY_ENV):
-        raise RuntimeError(
-            f"{TINKER_API_KEY_ENV} is not set in the environment; set it to "
-            "your Tinker API key to use the tinker provider"
-        )
+    check_tinker_prerequisites()
+    import tinker
+
     global _shared_service
     with _shared_lock:
         if _shared_service is None:
@@ -649,6 +665,24 @@ class TinkerChatProvider:
             if window is not None:
                 return window
         return served_context_window(self.config.model)
+
+    def prepare(self) -> None:
+        """Check the SDK and the API key locally. Deliberately does NOT open a service session.
+
+        Satisfies `wmo.providers.base.PreparableProvider` for the part that is free, and only that
+        part. Constructing the client is not free in either sense: `tinker.ServiceClient()`
+        connects, and its heartbeat pins one server-side session for the life of the process
+        against a roughly 240 cumulative cap (see `shared_service_client`), so a pre-flight that
+        built one per candidate would spend a run's session budget before the first cell.
+
+        What that leaves for the first call, deliberately: the service being reachable, this model
+        being served, and the sampling client being constructible.
+
+        Raises:
+            ImportError: If the tinker SDK is not installed (the distill extra).
+            RuntimeError: If TINKER_API_KEY is missing from the environment.
+        """
+        check_tinker_prerequisites()
 
     def _get_sampler(self) -> TinkerSampler:
         if self._sampler is None:

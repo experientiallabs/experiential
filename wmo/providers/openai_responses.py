@@ -48,6 +48,18 @@ class OpenAIResponsesProvider:
                 self._client = OpenAI()  # picks up OPENAI_API_KEY from the environment
         return self._client
 
+    def prepare(self) -> None:
+        """Import the SDK and build the client, which resolves the key. No request is sent.
+
+        Satisfies `wmo.providers.base.PreparableProvider`, exactly as in `wmo.providers.openai`:
+        `OpenAI()` refuses to construct without a resolvable key and opens no connection, so this
+        turns a missing credential into a local failure instead of a first-call one.
+
+        Raises:
+            openai.OpenAIError: No key resolved for this configuration.
+        """
+        self._get_client()
+
     def complete(
         self,
         system: str,

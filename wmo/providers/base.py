@@ -246,6 +246,31 @@ it rides `wire_payload()` to the runner untouched."""
 
 
 @runtime_checkable
+class PreparableProvider(Protocol):
+    """Provider capability for resolving a backend's prerequisites WITHOUT issuing a request.
+
+    Every backend builds its SDK client lazily on first use, so constructing a provider proves
+    almost nothing: a missing SDK extra, an unset credential, or an incomplete config still
+    surfaces at the first call. This capability exists for the one caller shape that cannot live
+    with that, code about to spend money on a whole roster of models (`wmo optimize route sweep`'s
+    pre-flight), where a backend that can never be called must be a usage error at the boundary
+    instead of a mid-run abort with the earlier candidates already paid for.
+
+    `prepare()` must stay free: it may import the SDK, read the environment and the local AWS/SDK
+    credential files, and build the client, and it must NOT touch the network, because a
+    pre-flight that bills a call cannot run before spend is authorized. A backend whose client
+    cannot be built without a request prepares the locally knowable part only and documents what
+    it deliberately leaves for the first call (see `wmo.providers.bedrock` and
+    `wmo.providers.tinker`). Kept separate from :class:`Provider` for that reason: not every
+    backend can honor the whole contract.
+    """
+
+    def prepare(self) -> None:
+        """Resolve every prerequisite knowable locally, or raise saying what is missing."""
+        ...
+
+
+@runtime_checkable
 class ContextWindowProvider(Protocol):
     """Provider capability for reporting the context window its model is actually served with.
 

@@ -26,7 +26,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from wmo.providers.base import Provider, ProviderConfig, ProviderKind, TokenUsage
+from wmo.providers.base import (
+    PreparableProvider,
+    Provider,
+    ProviderConfig,
+    ProviderKind,
+    TokenUsage,
+)
 from wmo.providers.registry import get_provider
 from wmo.tracking.pricing import ModelPrice, price_for
 
@@ -207,8 +213,8 @@ def pool_provider(entry: PoolEntry) -> Provider:
 
     Construction is side-effect free for every backend (`wmo.providers.registry`): each one only
     stores its config and defers the SDK import, the credential read, and the client to its first
-    request. That is what lets a caller about to spend money construct a whole pool up front as a
-    pre-flight (`wmo optimize route sweep` does) without issuing a single request.
+    request. Which is also why construction alone is a weak pre-flight: use
+    `prepare_pool_provider` when the point is to learn whether a candidate can be CALLED.
 
     A construction failure is re-raised naming the entry and its kind: a backend that refuses to
     be built ("Bedrock authenticates with AWS credentials, not an API key") knows nothing about
@@ -222,3 +228,100 @@ def pool_provider(entry: PoolEntry) -> Provider:
         return get_provider(entry.provider_config(), api_key=api_key)
     except ValueError as exc:
         raise ValueError(f"pool model '{entry.name}' (kind={entry.kind.value}): {exc}") from exc
+
+
+def static_requirements(entry: PoolEntry) -> list[str]:
+    """What one entry's KIND needs from the entry alone, worded for the file it is edited in.
+
+    Read before any SDK is imported and before any client is built, so an entry that could never
+    be called fails on its own config. Each item is derived from the backend's request path, not
+    guessed:
+
+    - azure needs `deployment` (on the wire, Azure's `model` IS the deployment name, so
+      `AzureOpenAIProvider._deployment` refuses without it) and `api_version` (its client cannot be
+      built without one). `endpoint` is NOT required here: it legitimately comes from
+      AZURE_OPENAI_ENDPOINT, which the provider resolves.
+    - tinker needs a base model name, because `TinkerChatProvider` resolves its renderer and
+      tokenizer from `ProviderConfig.model_type` and a pool entry has no field that fills it, so a
+      `tinker://` weights path in `model` can never render a prompt.
+    - bedrock, openai, openai_responses and anthropic need nothing from the entry: a region (for
+      bedrock) or a credential (for the rest) is what they need, and both are resolved from the
+      local environment by `PreparableProvider.prepare`, not from this file.
+
+    Kept out of `PoolEntry`'s own validation on purpose, unlike the two rules that are there: a
+    saved `OutcomeMatrix` carries its pool inline, so tightening load-time validation would
+    retroactively refuse matrices whose entries only ever supplied prices. Being callable matters
+    where a candidate is about to be called.
+
+    Returns:
+        One human-readable complaint per unmet requirement; empty when the entry is complete.
+    """
+    match entry.kind:
+        case ProviderKind.AZURE_OPENAI:
+            missing: list[str] = []
+            if entry.deployment is None:
+                missing.append(
+                    "`deployment` (the Azure deployment name every request names as its model)"
+                )
+            if entry.api_version is None:
+                missing.append(
+                    "`api_version` (AzureOpenAIProvider cannot build its client without one)"
+                )
+            return [f"azure entries need {item}" for item in missing]
+        case ProviderKind.TINKER:
+            if entry.model.startswith("tinker://"):
+                return [
+                    "a tinker entry's `model` cannot be a tinker:// weights path: the renderer and "
+                    "tokenizer resolve from the BASE model name, which a pool entry has no field "
+                    "to carry, so name the base model (e.g. 'Qwen/Qwen3-8B') instead"
+                ]
+            return []
+        case (
+            ProviderKind.BEDROCK
+            | ProviderKind.OPENAI
+            | ProviderKind.OPENAI_RESPONSES
+            | ProviderKind.ANTHROPIC
+        ):
+            return []
+
+
+def prepare_pool_provider(entry: PoolEntry) -> Provider:
+    """Construct one entry's provider AND resolve every prerequisite that needs no request.
+
+    The pre-flight seam for a caller about to spend money on a whole roster (`wmo optimize route
+    sweep`). `pool_provider` alone is too weak for that: every backend builds its SDK client
+    lazily, so an uninstalled SDK extra, an unset credential, or a region that resolves nowhere
+    still lands at that candidate's FIRST CALL, after the candidates ahead of it have been paid
+    for. This runs the kind's `static_requirements` and then `PreparableProvider.prepare`, which
+    forces the lazy client to be built where that is free.
+
+    Free, and provably so: no backend's `prepare` issues a request (see each one's docstring).
+    Verifying a candidate over the wire is deliberately NOT done here, because `wmo providers
+    verify` bills a real call per model, which a pre-flight that runs before spend is authorized
+    may not do. Two backends therefore keep a documented residual gap, and callers should say so:
+    bedrock cannot resolve AWS CREDENTIALS locally (building the client walks a chain that reaches
+    the instance-metadata endpoint over the network, and succeeds with no credentials anyway), and
+    tinker cannot resolve SERVICE REACHABILITY (constructing the client connects and pins a
+    server-side session). Both stay first-call failures.
+
+    Returns:
+        The prepared provider. Callers that only wanted the check may discard it; the sweep does,
+        because `evaluate_pool` builds its own per cell to keep per-episode provider state fresh.
+
+    Raises:
+        ValueError: This entry cannot be used, named with its kind and what to do about it.
+    """
+    problems = static_requirements(entry)
+    if problems:
+        raise ValueError(
+            f"pool model '{entry.name}' (kind={entry.kind.value}): {'; '.join(problems)}"
+        )
+    provider = pool_provider(entry)
+    if isinstance(provider, PreparableProvider):
+        try:
+            provider.prepare()
+        except Exception as exc:  # noqa: BLE001 - every backend raises its own SDK's type here
+            # Re-raised as one usage error naming the entry: the SDK's own message says what is
+            # missing, and the caller is looping over candidates in a file it wants to edit.
+            raise ValueError(f"pool model '{entry.name}' (kind={entry.kind.value}): {exc}") from exc
+    return provider
