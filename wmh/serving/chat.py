@@ -310,8 +310,11 @@ class EndpointRuntime:
         # window -> (log revision the summary was computed at, the summary)
         self._savings: dict[SavingsWindow, tuple[int, EndpointSavings]] = {}
         self._lock = threading.Lock()
+        # Serializes dial changes end to end (persist + install); _lock alone only protects
+        # the in-memory swap and would let two PUTs interleave file writes and installs.
+        self._dial_lock = threading.Lock()
         if cost_quality is not None:
-            self._swap_policy(cost_quality)
+            self._install_policy(apply_cost_quality(self._base_policy, cost_quality))
 
     @property
     def cost_quality(self) -> float | None:
@@ -321,17 +324,23 @@ class EndpointRuntime:
     def set_cost_quality(self, cost_quality: float) -> None:
         """Move the dial on the live endpoint, and persist it when there is a file to persist to.
 
+        PERSIST FIRST, then swap, both under one dial lock: a failed write must leave the live
+        endpoint exactly where it was (never a dial that evaporates on restart), and two
+        overlapping PUTs must resolve to ONE (position, file) pair rather than interleaving a
+        swap from one with the write from the other.
+
         In-flight requests keep the policy they started on: the swap replaces the whole policy
         object, so no request can ever read half of one dial position and half of another. The
         pool, baseline, and evidence bank are identical across positions, so a conversation that
         spans a swap is still served by a model this endpoint knows.
         """
-        self._swap_policy(cost_quality)
-        if self._config_path is not None:
-            EndpointConfig(cost_quality=cost_quality).save(self._config_path)
-
-    def _swap_policy(self, cost_quality: float) -> None:
         adjusted = apply_cost_quality(self._base_policy, cost_quality)
+        with self._dial_lock:
+            if self._config_path is not None:
+                EndpointConfig(cost_quality=cost_quality).save(self._config_path)
+            self._install_policy(adjusted)
+
+    def _install_policy(self, adjusted: RoutingPolicy) -> None:
         with self._lock:
             self.policy = adjusted
             self._savings.clear()  # the dial changed, so the quality expectation did too
@@ -352,7 +361,11 @@ class EndpointRuntime:
             policy = self.policy
         computed = compute_savings(self.log.replay(self.name), policy, window=window)
         with self._lock:
-            self._savings[window] = (revision, computed)
+            if self.policy is policy:
+                # Store only if the dial has not moved since we captured the policy: a slow
+                # computation racing a dial swap must not resurrect the OLD dial's quality
+                # expectation under a revision the new dial also answers to.
+                self._savings[window] = (revision, computed)
         return computed
 
     def decide(self, messages: list[ChatMessage]) -> RoutingDecision:

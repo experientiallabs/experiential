@@ -39,6 +39,7 @@ from wmh.serving.chat import (
     install_openai_error_shapes,
 )
 from wmh.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmh.serving.savings import EndpointSavings, SavingsWindow
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -831,3 +832,63 @@ def test_savings_are_recomputed_when_the_log_grows_not_on_a_timer(tmp_path: Path
     finally:
         RequestLog.replay = original
     assert runtime.savings().requests_served == 1
+
+
+def test_failed_dial_persist_leaves_the_live_endpoint_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Persist-then-install: a dial whose file write fails must not serve until restart un-sets
+    # it, and must not move the live endpoint at all.
+    from wmh.serving.endpoint_config import EndpointConfig
+
+    _, runtime = _dial_client(
+        tmp_path, _knn_policy(tmp_path), config_path=tmp_path / "endpoint.toml"
+    )
+    runtime.set_cost_quality(0.25)
+    before = runtime.policy
+
+    def exploding_save(self: EndpointConfig, path: Path) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(EndpointConfig, "save", exploding_save)
+    with pytest.raises(OSError, match="disk full"):
+        runtime.set_cost_quality(1.0)
+    assert runtime.policy is before  # live dial unmoved
+    assert runtime.cost_quality == 0.25
+
+
+def test_slow_savings_computation_cannot_resurrect_the_old_dial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A savings computation that captures the old policy, races a dial move, and finishes late
+    # must NOT store its stale result under a revision the new dial answers to.
+    import wmh.serving.chat as chat_module
+
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    runtime.set_cost_quality(0.25)
+    # The empty log zeroes every savings field; serve one request so the quality expectation
+    # actually reflects the dial.
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    original = chat_module.compute_savings
+
+    moved = {"done": False}
+
+    def racing_compute(
+        rows: list[RequestLogRecord],
+        policy: RoutingPolicy,
+        *,
+        window: SavingsWindow = "all_time",
+    ) -> EndpointSavings:
+        if not moved["done"]:
+            moved["done"] = True
+            runtime.set_cost_quality(1.0)  # the dial moves mid-computation
+        return original(rows, policy, window=window)
+
+    monkeypatch.setattr(chat_module, "compute_savings", racing_compute)
+    stale = runtime.savings()  # computed against the 0.25 policy, returned to ITS caller
+    fresh = runtime.savings()  # must recompute against the 1.0 policy, not read a stale cache
+    assert fresh.expected_quality_delta_pt != stale.expected_quality_delta_pt
+    assert fresh.expected_quality_delta_pt == pytest.approx(-0.54, abs=0.01)
