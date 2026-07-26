@@ -31,13 +31,13 @@ anchor below was measured: one dial setting means one policy.
 One held-out cohort (1199 scenarios, 9 models, 70/30 stratified splits, 5 seeds), quality and
 cost both against the best single pool model on the same split:
 
-| Dial | Novelty floor | Cost knob | Guard | Quality | Cost |
-|---|---|---|---|---|---|
-| 0.00 | 0.50 | 0 | strict | +1.14 pt | -13.9% |
-| 0.25 | 0.05 | 0 | strict | +0.99 pt | -24.7% |
-| 0.50 | 0.05 | 0.01 | economic | +0.87 pt | -40.8% |
-| 0.75 | 0.05 | 0.02 | economic | +0.20 pt | -43.6% |
-| 1.00 | 0.05 | 0.03 | economic | -0.54 pt | -46.2% |
+| Dial | Name | Novelty floor | Cost knob | Guard | Quality | Cost |
+|---|---|---|---|---|---|---|
+| 0.00 | `quality-max` | 0.50 | 0 | strict | +1.14 pt | -13.9% |
+| 0.25 | `balanced` | 0.05 | 0 | strict | +0.99 pt | -24.7% |
+| 0.50 | `cost-saver` | 0.05 | 0.01 | economic | +0.87 pt | -40.8% |
+| 0.75 | `deep-saver` | 0.05 | 0.02 | economic | +0.20 pt | -43.6% |
+| 1.00 | `savings-max` | 0.05 | 0.03 | economic | -0.54 pt | -46.2% |
 
 Those five rows are measurements. **Every other dial position interpolates the knobs, not the
 outcome.** Cost falls monotonically across the anchors and is expected to between them (both
@@ -112,8 +112,9 @@ curl -s -X PUT localhost:8000/v1/endpoints/support/config \
   -H 'content-type: application/json' -d '{"cost_quality": 0.6}'
 ```
 
-`GET` returns the current position, the label (`quality-max`, `balanced`, `savings-max`, or
-`Custom` for anything between them; `as-fitted` when no dial has been set), the knobs actually
+`GET` returns the current position, its label (one per measured position: `Quality max`,
+`Balanced (default)`, `Cost saver`, `Deep saver`, `Max savings`, and `Custom` for anything in between;
+`as-fitted` when no dial has been set), the knobs actually
 being served, and the anchor table. `PUT` re-applies the mapping to the live runtime with no
 restart and persists the setting to `endpoint.toml`, so it survives one. In-flight requests keep
 the position they started on.

@@ -340,6 +340,18 @@ def cost_quality_knobs(cost_quality: float) -> CostQualityKnobs:
     )
 
 
+# Every MEASURED dial position and its name. One list, so an anchor row's label and the label
+# reported for an endpoint sitting on that position are the same string by construction, and
+# adding a measured position cannot leave a detent unnamed.
+COST_QUALITY_NAMED_POINTS: tuple[tuple[float, str], ...] = (
+    (0.0, "Quality max"),
+    (COST_QUALITY_BALANCED, "Balanced (default)"),
+    (0.5, "Cost saver"),
+    (0.75, "Deep saver"),
+    (1.0, "Max savings"),
+)
+
+
 def cost_quality_named_point(cost_quality: float) -> CostQualityPointName:
     """The label for a dial position: an anchor's name only when it sits EXACTLY on that anchor.
 
@@ -347,11 +359,7 @@ def cost_quality_named_point(cost_quality: float) -> CostQualityPointName:
     the nearer one's name: the label is what a UI shows next to that anchor's measured quality
     and cost numbers, so claiming it for an unmeasured position claims the numbers too.
     """
-    for position, name in (
-        (0.0, "quality-max"),
-        (COST_QUALITY_BALANCED, "balanced"),
-        (1.0, "savings-max"),
-    ):
+    for position, name in COST_QUALITY_NAMED_POINTS:
         if math.isclose(cost_quality, position, abs_tol=1e-9):
             return name
     return "Custom"

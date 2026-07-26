@@ -393,9 +393,11 @@ def test_the_dial_is_monotone_in_both_knobs() -> None:
     lams = [knob.pick_lam for knob in knobs]
     assert floors == sorted(floors, reverse=True)  # coverage opens up
     assert lams == sorted(lams)  # price pressure only ever rises
-    assert cost_quality_named_point(0.0) == "quality-max"
-    assert cost_quality_named_point(COST_QUALITY_BALANCED) == "balanced"
-    assert cost_quality_named_point(1.0) == "savings-max"
+    assert cost_quality_named_point(0.0) == "Quality max"
+    assert cost_quality_named_point(COST_QUALITY_BALANCED) == "Balanced (default)"
+    assert cost_quality_named_point(0.5) == "Cost saver"
+    assert cost_quality_named_point(0.75) == "Deep saver"
+    assert cost_quality_named_point(1.0) == "Max savings"
     # A position next to an anchor is "Custom", never the anchor's name: the label travels with
     # that anchor's measured quality and cost, so borrowing it borrows the numbers.
     assert cost_quality_named_point(0.4) == "Custom"
@@ -409,8 +411,18 @@ def test_the_anchor_table_covers_the_dial_and_is_sorted() -> None:
     assert dials == sorted(dials)
     assert (dials[0], dials[-1]) == (0.0, 1.0)
     assert COST_QUALITY_BALANCED in dials
+    # Every anchor is a measured point, so every anchor row carries a real name: a client renders
+    # one detent per row, and "Custom" is reserved for the positions in between.
     for anchor in COST_QUALITY_ANCHORS:
         assert anchor.named_point == cost_quality_named_point(anchor.cost_quality)
+        assert anchor.named_point != "Custom"
+    assert [anchor.named_point for anchor in COST_QUALITY_ANCHORS] == [
+        "Quality max",
+        "Balanced (default)",
+        "Cost saver",
+        "Deep saver",
+        "Max savings",
+    ]
     costs = [anchor.cost_delta_percent for anchor in COST_QUALITY_ANCHORS]
     assert costs == sorted(costs, reverse=True)  # every step up the dial measured cheaper
     assert all(cost < 0.0 for cost in costs)  # and every anchor beats the best single model
@@ -422,7 +434,7 @@ def test_the_anchor_table_serializes_under_the_platform_field_names() -> None:
     row = COST_QUALITY_ANCHORS[1].model_dump(by_alias=True)
     assert row == {
         "s": 0.25,
-        "label": "balanced",
+        "label": "Balanced (default)",
         "quality_delta_pt": 0.99,
         "cost_delta_pct": -24.7,
     }

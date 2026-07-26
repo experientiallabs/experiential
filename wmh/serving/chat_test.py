@@ -542,10 +542,17 @@ def test_config_reports_an_as_fitted_endpoint_with_the_measured_anchors(tmp_path
     # sorted, and carrying nothing else. A client interpolates between them itself, so the
     # response must never hand it a delta for a position nobody measured.
     assert [anchor["s"] for anchor in body["anchors"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    assert [anchor["label"] for anchor in body["anchors"]] == [
+        "Quality max",
+        "Balanced (default)",
+        "Cost saver",
+        "Deep saver",
+        "Max savings",
+    ]
     balanced = next(anchor for anchor in body["anchors"] if anchor["s"] == 0.25)
     assert balanced == {
         "s": 0.25,
-        "label": "balanced",
+        "label": "Balanced (default)",
         "quality_delta_pt": 0.99,
         "cost_delta_pct": -24.7,
     }
@@ -565,7 +572,7 @@ def test_put_moves_the_dial_on_the_live_endpoint(tmp_path: Path) -> None:
     assert put.status_code == 200
     body = put.json()
     assert body["cost_quality"] == 1.0
-    assert body["named_point"] == "savings-max"
+    assert body["named_point"] == "Max savings"
     assert body["knobs"] == {
         "knn_z": 0.5,
         "floor_q": 0.05,
