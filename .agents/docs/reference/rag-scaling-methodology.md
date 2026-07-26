@@ -5,7 +5,7 @@ to re-run every number. Workspace doc (disposable); the published writeups quote
 
 ## Harness pieces
 
-- `wmh/research/trace_scaling.py` — `TraceScalingAblation`: fixed-test, growing-train split (hash of
+- `wmo/research/trace_scaling.py` — `TraceScalingAblation`: fixed-test, growing-train split (hash of
   `trace_id` → fixed `test`/`valid` bands + a train *pool*; `subsample_train` shuffles per seed and
   nests as `n` grows). Sweeps `counts × modes`, scored via `score_prompt` → `replay` → `RubricJudge`.
   Knobs: `top_k`, `sample_turns`, `test_cap`, `concurrency`, `max_retrieved_observation_chars`,

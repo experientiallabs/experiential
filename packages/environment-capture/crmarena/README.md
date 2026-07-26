@@ -47,7 +47,7 @@ uv run python packages/environment-capture/crmarena/capture.py \
   task types, models `us.anthropic.claude-opus-4-8` + `-4-7`) covered; host-content-free
   (`environment_capture.scan_spans_jsonl` returns no findings).
 - **Open-loop fidelity** (suite `crmarena/default`, seed 0, Opus 4.8 target + rubric judge, run via
-  `uv run wmh eval run crmarena/default --examples-root packages/environment-capture`): mean fidelity
+  `uv run wmo eval run crmarena/default --examples-root packages/environment-capture`): mean fidelity
   **0.836** (±0.203), error-flag accuracy **0.973**, n=186 held-out steps. Structured SQL/JSON tool
   output reconstructs on par with the other structured-output corpora (bird-sql 0.864, dabstep
   0.886) and far above document-excerpt observations (financebench 0.586).

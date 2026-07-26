@@ -14,18 +14,18 @@ The loop (repeat until a full pass produces no new disagreements you'd act on):
 
 ## 1 — Run the judge on the dataset
 
-The dataset is `JUDGE_QUALITY_CASES` in `wmh/optimize/judge_quality.py`: hand-labeled
+The dataset is `JUDGE_QUALITY_CASES` in `wmo/optimize/judge_quality.py`: hand-labeled
 (action, actual, predicted) triples with the score band a sound judge must land in. Run it
 against the pinned judge model (never a failover chain — chains make scores incomparable).
-The stable entry point is the Python API (write run outputs somewhere UNCOMMITTED — `.wmh/` or
+The stable entry point is the Python API (write run outputs somewhere UNCOMMITTED — `.wmo/` or
 `/tmp` — they are working data, not repo content):
 
 ```bash
 uv run python - <<'PY'
 import json
-from wmh.optimize.judge import RubricJudge
-from wmh.optimize.judge_quality import run_judge_quality
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.optimize.judge import RubricJudge
+from wmo.optimize.judge_quality import run_judge_quality
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
 
 judge = RubricJudge(get_provider(ProviderConfig(
     kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")))
@@ -41,7 +41,7 @@ PY
 it's still around, but don't depend on it.)
 
 If the concern came from real eval runs, ALSO pull disagreements from the wild: read per-step
-scorecards from a recent `wmh eval` result (`.wmh/evals/**.json` carries `predicted`, `actual`,
+scorecards from a recent `wmo eval` result (`.wmo/evals/**.json` carries `predicted`, `actual`,
 `score`, `dimensions`, `critique` per step), sample ~20 steps across the score range, and ask of
 each: "do I agree with this verdict?" Every disagreement becomes a labeled case (see step 5 of
 the playbook for band-writing rules). The dataset must grow from real data, not toy strings.
@@ -92,7 +92,7 @@ fail. Then run exactly one experiment matched to the layer:
 - **Model** — sweep candidates with the same suite (the snippet above with a different
   `ProviderConfig`) and rank by CALIBRATION, not pass rate: control mean → 1.0, hard-defect
   mean → 0.0, and their separation. Switching judge models re-baselines every fidelity number —
-  say so explicitly, and bump `JUDGE_VERSION` in `wmh/optimize/judge.py` for any change to
+  say so explicitly, and bump `JUDGE_VERSION` in `wmo/optimize/judge.py` for any change to
   scoring semantics so persisted results stay distinguishable.
 - **Context** — change what the judge sees: payload fields (documented IN the prompt),
   truncation head/tail limits, retry feedback wording, `max_tokens`.
@@ -107,7 +107,7 @@ fail. Then run exactly one experiment matched to the layer:
   report Spearman + shift sliced by factuality band; the shift must concentrate where the defect
   was. (A ready-made driver may exist at `.agents/scripts/run_judge_regression.py`.)
 - Commit the new cases with the fix and bump `JUDGE_VERSION` if semantics changed. Run outputs
-  are working data: keep them out of git (`.wmh/`, `/tmp`); commit only the few small, stable
+  are working data: keep them out of git (`.wmo/`, `/tmp`); commit only the few small, stable
   result JSONs a finished writeup actually cites.
 
 Stop when step 1 + a fresh scorecard sample produce no disagreement worth a case. Do not stop

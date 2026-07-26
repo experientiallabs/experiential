@@ -2,7 +2,7 @@
 
 Four claims are checked, all on routerbench-ours9 with R1's cached text-embedding-3-large
 vectors and R1's exact 70/30 stratified splits (5 seeds), through
-`wmh.optimize.knn.fit_knn_policy` -> `apply_cost_quality` -> `evaluate_policy`, which is the
+`wmo.optimize.knn.fit_knn_policy` -> `apply_cost_quality` -> `evaluate_policy`, which is the
 same `knn_decision` call serving makes:
 
 0. The cost knob reproduces R1's own `r1-knn3-asym*` rows knob for knob (same family, same
@@ -39,24 +39,24 @@ import sys
 import tempfile
 from pathlib import Path
 
-from wmh.optimize.knn import (
+from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     apply_cost_quality,
     best_single_on_fit,
     cost_quality_knobs,
     fit_knn_policy,
 )
-from wmh.optimize.outcomes import OutcomeMatrix
-from wmh.optimize.policy import KNN_BANK_FILENAME, EmbedderSpec, select_model
-from wmh.optimize.routing import evaluate_policy
+from wmo.optimize.outcomes import OutcomeMatrix
+from wmo.optimize.policy import KNN_BANK_FILENAME, EmbedderSpec, select_model
+from wmo.optimize.routing import evaluate_policy
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("validate-cost-quality")
 
 PROMOTION_GATE = Path(__file__).with_name("validate_knn_promotion.py")
-DATA = Path("~/Desktop/Projects/wmh-routing-data").expanduser()
+DATA = Path("~/Desktop/Projects/wmo-routing-data").expanduser()
 SEEDS = [0, 1, 2, 3, 4]
-SHIPPED_FLOOR_Q = 0.05  # the `wmh optimize route fit` default, i.e. dial 0.25
+SHIPPED_FLOOR_Q = 0.05  # the `wmo optimize route fit` default, i.e. dial 0.25
 # Every advertised anchor, plus one position on each leg whose only claim is that it sits
 # between its neighbors (0.125 on the coverage leg, 0.875 on the price leg).
 DIAL = sorted({anchor.cost_quality for anchor in COST_QUALITY_ANCHORS} | {0.125, 0.875})

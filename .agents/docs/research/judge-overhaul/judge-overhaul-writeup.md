@@ -14,7 +14,7 @@ best-calibrated judge** (separation 0.907).
 ## Why the judge needed an overhaul
 
 The judge is the load-bearing metric of the harness: it is GEPA's fitness signal during
-`wmh build` and the fidelity scorer behind every `wmh eval` number. It had accumulated two
+`wmo build` and the fidelity scorer behind every `wmo eval` number. It had accumulated two
 structural problems:
 
 1. **Two judges, one metric.** A single-score `LLMJudge` ("match") and the 5-dimension
@@ -26,7 +26,7 @@ structural problems:
 
 ## The judge-quality meta-eval
 
-`wmh/optimize/judge_quality.py` holds 12 hand-labeled cases — (action, actual observation,
+`wmo/optimize/judge_quality.py` holds 12 hand-labeled cases — (action, actual observation,
 predicted observation) triples with the headline band a sound judge must land in, plus optional
 per-dimension bands. Content is modeled on real steps from the bundled corpora (tau-bench tool
 JSON, terminal-task bash output). Five cases are *controls* (correct behavior to preserve:
@@ -122,9 +122,9 @@ the contract in `docs/reference/failover.md`).
 ```bash
 # The meta-eval, against any pinned judge model (12 labeled cases; ~1 min):
 uv run python - <<'EOF'
-from wmh.optimize.judge import RubricJudge
-from wmh.optimize.judge_quality import run_judge_quality
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.optimize.judge import RubricJudge
+from wmo.optimize.judge_quality import run_judge_quality
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
 
 judge = RubricJudge(get_provider(ProviderConfig(
     kind=ProviderKind.BEDROCK, model="us.anthropic.claude-opus-4-8")))
@@ -135,9 +135,9 @@ print(report.summary())
 EOF
 
 # Fidelity with the overhauled judge (any corpus):
-uv run wmh eval examples/tau-bench/traces.otel.jsonl --no-rag --sample-turns sampled
+uv run wmo eval examples/tau-bench/traces.otel.jsonl --no-rag --sample-turns sampled
 ```
 
 The deterministic behavior (weighting, truncation, retry/validity, invalid exclusion) is pinned
-by `wmh/optimize/judge_test.py`, `judge_quality_test.py`, `wmh/engine/replay_test.py`,
-`eval_test.py`, and `wmh/optimize/gepa_test.py`.
+by `wmo/optimize/judge_test.py`, `judge_quality_test.py`, `wmo/engine/replay_test.py`,
+`eval_test.py`, and `wmo/optimize/gepa_test.py`.

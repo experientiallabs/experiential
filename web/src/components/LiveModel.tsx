@@ -2,7 +2,7 @@
 
 /**
  * Fallback for models not in the generated index (e.g. just built via /build): fetch the card
- * from the live `wmh serve` API and render the same standardized view.
+ * from the live `wmo serve` API and render the same standardized view.
  */
 
 import Link from "next/link";
@@ -71,7 +71,7 @@ export function LiveModel({ name, serveHint }: { name: string; serveHint: string
       <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface-sunk p-5">
         <div className="mono-label">backend offline</div>
         <p className="text-sm text-ink-soft">
-          Can&apos;t reach a local <code className="font-mono">wmh serve</code>. Start one, then
+          Can&apos;t reach a local <code className="font-mono">wmo serve</code>. Start one, then
           reload:
         </p>
         <pre className="overflow-x-auto rounded-md border border-line bg-surface p-3 font-mono text-xs">

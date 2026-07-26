@@ -1,0 +1,151 @@
+"""A Provider wrapper that retries capacity errors with narrated exponential backoff.
+
+Interactive commands (`wmo demo` / `wmo play`) wrap the serve provider in this so a transient
+throttle or 5xx becomes "retry 1/3 in 1s..." instead of a traceback. Non-capacity errors (bad
+request, auth) propagate immediately — retrying those only hides real bugs. Classification is
+llm-waterfall's (the same contract the failover chain uses), so a wrapped WaterfallProvider whose
+whole chain exhausts still reads as capacity here and gets the narrated retry.
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from typing import TypeVar
+
+from llm_waterfall import is_capacity_error
+
+from wmo.providers.base import (
+    DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
+    Completion,
+    ContextWindowProvider,
+    Message,
+    Provider,
+    ProviderConfig,
+    ToolCallingProvider,
+    VerifyResult,
+)
+
+# attempt -> sleep before the next try
+_DELAYS = (1.0, 3.0, 9.0)
+
+# on_retry(attempt_number, total_attempts, delay_seconds, error)
+RetryCallback = Callable[[int, int, float, Exception], None]
+_T = TypeVar("_T")
+
+
+class RetryingProvider:
+    """Retries `complete`/`embed` on capacity errors with exponential backoff (1s, 3s, 9s)."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        on_retry: RetryCallback | None = None,
+        *,
+        delays: tuple[float, ...] = _DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._provider = provider
+        self._on_retry = on_retry
+        self._delays = delays
+        self._sleep = sleep
+
+    @property
+    def config(self) -> ProviderConfig:
+        return self._provider.config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> Completion:
+        def call() -> Completion:
+            return self._provider.complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+
+        return self._retry(call)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._retry(lambda: self._provider.embed(texts))
+
+    def verify(self) -> VerifyResult:
+        return self._provider.verify()
+
+    def context_window(self) -> int | None:
+        """Forward the wrapped provider's served context window (None when it has none).
+
+        Retries must not hide a capability: the pi runner resolves its context guard through
+        `ContextWindowProvider`, and a wrapper that swallowed the method would silently send the
+        runner back to its fallback window.
+        """
+        if not isinstance(self._provider, ContextWindowProvider):
+            return None
+        return self._provider.context_window()
+
+    def _retry(self, call: Callable[[], _T]) -> _T:
+        total = len(self._delays)
+        for attempt, delay in enumerate(self._delays, start=1):
+            try:
+                return call()
+            except Exception as exc:  # noqa: BLE001 - classified below; non-capacity re-raises
+                if not is_capacity_error(exc):
+                    raise
+                if self._on_retry is not None:
+                    self._on_retry(attempt, total, delay, exc)
+                self._sleep(delay)
+        return call()  # final attempt: let any error propagate
+
+
+class RetryingToolCallingProvider(RetryingProvider):
+    """Capacity retries that preserve structured agent completions."""
+
+    def __init__(
+        self,
+        provider: Provider,
+        on_retry: RetryCallback | None = None,
+        *,
+        delays: tuple[float, ...] = _DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Wrap a provider that implements both provider protocols.
+
+        Args:
+            provider: Provider with the structured ``complete_chat`` capability.
+            on_retry: Optional callback before each capacity-error backoff.
+            delays: Backoff seconds before successive attempts.
+            sleep: Sleep implementation, injectable for tests.
+
+        Raises:
+            TypeError: If ``provider`` lacks structured tool calling.
+        """
+        if not isinstance(provider, ToolCallingProvider):
+            msg = "RetryingToolCallingProvider requires a ToolCallingProvider"
+            raise TypeError(msg)
+        super().__init__(provider, on_retry=on_retry, delays=delays, sleep=sleep)
+        self._tool_calling_provider = provider
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Retry one structured completion when capacity classification allows it."""
+        return self._retry(lambda: self._tool_calling_provider.complete_chat(request))
+
+
+def wrap_provider_with_retries(
+    provider: Provider,
+    on_retry: RetryCallback | None = None,
+    *,
+    delays: tuple[float, ...] = _DELAYS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> RetryingProvider:
+    """Apply retries without changing the provider's runtime capabilities."""
+    wrapper = (
+        RetryingToolCallingProvider
+        if isinstance(provider, ToolCallingProvider)
+        else RetryingProvider
+    )
+    return wrapper(provider, on_retry=on_retry, delays=delays, sleep=sleep)

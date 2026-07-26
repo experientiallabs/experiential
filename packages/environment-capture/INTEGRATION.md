@@ -86,13 +86,13 @@ venv, driven by a thin client in the adapter; add `backend/*.py` to the root ty 
    (`<task>#opus48-r1`) so trace ids never collide across waves; bump the wave counter
    every wave (`--run-start` where the script has it, otherwise its run-tag argument). Stop waves at ~5 runs/task — expand the TASK SET instead of resampling.
 5. **Verify the corpus**: hygiene == {}; unique trace ids; ingests via
-   `wmh.ingest.otel_genai.OtelGenAIAdapter().from_file(...)`; then EYEBALL several trajectories
+   `wmo.ingest.otel_genai.OtelGenAIAdapter().from_file(...)`; then EYEBALL several trajectories
    (real commands? real outputs? sane rewards?) and say what you saw in the PR.
 6. **Fidelity row**: `evals/default.toml` (copy a sibling's), run
-   `uv run wmh eval run <name>/default --examples-root packages/environment-capture`, put mean fidelity +
+   `uv run wmo eval run <name>/default --examples-root packages/environment-capture`, put mean fidelity +
    error-flag accuracy + n into your README Results with the corpus size at eval time. If
    Bedrock flaps kill the eval, configure a same-weights cross-provider chain in
-   `.wmh/fallback.toml` (`docs/reference/failover.md`) so the judge stays comparable.
+   `.wmo/fallback.toml` (`docs/reference/failover.md`) so the judge stays comparable.
 7. **README**: what the env is, contents, Results, provenance (upstream, models, dates, how the
    corpus was made), License section. Then whole gate → commit(s) → push your branch → DRAFT PR
    into the integration branch with corpus stats, license finding, mean reward, fidelity, and
@@ -103,7 +103,7 @@ venv, driven by a thin client in the adapter; add `backend/*.py` to the root ty 
 - [ ] Env stands up from a clean checkout via `fetch_data.py` + documented steps
 - [ ] Every train-split gold self-grades 1.0; grader is deterministic + LLM-free
 - [ ] One real task runs end-to-end with the real agent (smoke: transitions captured)
-- [ ] Corpus: hygiene scan == {}, unique trace ids, ingests through wmh, eyeballed
+- [ ] Corpus: hygiene scan == {}, unique trace ids, ingests through wmo, eyeballed
 - [ ] Test split uncaptured; README has provenance + license + Results
 - [ ] Whole-repo gate green; no source-cache references; no co-author trailers
 

@@ -1,6 +1,6 @@
 """Bench-EXEC: closed-loop rollouts inside the world model vs the real bird-sql environment.
 
-The EXECUTE leg of the GEV triple. It runs the SAME candidate policy (the fixed wmh
+The EXECUTE leg of the GEV triple. It runs the SAME candidate policy (the fixed wmo
 ``AgentRuntime``) and the SAME verifiers on each scenario against (a) the REAL sqlite environment
 (the bird-sql ``LocalBashEnv`` staged by ``BirdSqlAdapter``) and (b) the SIMULATED environment (the
 committed bird-sql world model), then reports per-scenario outcome agreement, the sim-optimism gap,
@@ -41,14 +41,14 @@ from environment_capture.benchmarks.bird_sql import (
 )
 from environment_capture.trajectory import Task as BirdTask
 
-from wmh.core.types import Action, Observation
-from wmh.engine import load_world_model
-from wmh.evals.closed_loop import RolloutEvidence, WorldModelEnvironment, evaluate_with_env
-from wmh.evals.gold import GoldJudge
-from wmh.evals.tasks import TaskSpec
-from wmh.harness.runtime import AgentRuntime
-from wmh.providers import get_provider
-from wmh.providers.base import Provider, ProviderConfig, ProviderKind
+from wmo.core.types import Action, Observation
+from wmo.engine import load_world_model
+from wmo.evals.closed_loop import RolloutEvidence, WorldModelEnvironment, evaluate_with_env
+from wmo.evals.gold import GoldJudge
+from wmo.evals.tasks import TaskSpec
+from wmo.harness.runtime import AgentRuntime
+from wmo.providers import get_provider
+from wmo.providers.base import Provider, ProviderConfig, ProviderKind
 
 _LOG = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ _CANDIDATE_TYPE = {
 class RealBirdEnvironment:
     """AgentEnvironment backed by the real bird-sql sqlite workspace (a LocalBashEnv).
 
-    The wmh runtime emits ``bash``/``read_file``/``write_file`` actions; the sqlite workspace is a
+    The wmo runtime emits ``bash``/``read_file``/``write_file`` actions; the sqlite workspace is a
     plain shell, so file tools are expressed as shell commands. Every observation is the REAL
     command output, the counterpart to the world model's generated observation.
     """
@@ -103,7 +103,7 @@ class RealBirdEnvironment:
         elif name == "write_file":
             path = shlex.quote(str(args.get("path", "")))
             content = str(args.get("content", ""))
-            command = f"cat > {path} <<'WMH_EOF'\n{content}\nWMH_EOF"
+            command = f"cat > {path} <<'WMO_EOF'\n{content}\nWMO_EOF"
         else:
             return Observation(content=f"tool {name!r} not available", is_error=True)
         result = self._env.execute(command if isinstance(command, str) else str(command))

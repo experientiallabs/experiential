@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Capture a multi-domain tau2-bench trace corpus across airline + retail + telecom, then convert and
-# merge into one wmh OTel corpus. This is how `packages/environment-capture/tau-bench/traces.otel.jsonl` was grown to
+# merge into one wmo OTel corpus. This is how `packages/environment-capture/tau-bench/traces.otel.jsonl` was grown to
 # ~1000 traces for the trace-scaling-law experiment (docs/trace_scaling.md).
 #
 #   packages/environment-capture/tau-bench/capture_corpus.sh
@@ -65,7 +65,7 @@ for spec in "${DOMAINS[@]}"; do
 done
 
 # Convert each domain's results into its own OTel shard, then concatenate into the merged corpus.
-# (convert_to_wmh.py infers a single domain per results.json, so convert per-domain and cat.)
+# (convert_to_wmo.py infers a single domain per results.json, so convert per-domain and cat.)
 echo "=== converting + merging -> ${OUT} ==="
 : > "$OUT"
 total=0
@@ -73,7 +73,7 @@ for spec in "${DOMAINS[@]}"; do
   domain="${spec%%:*}"
   res="tau2-bench/data/simulations/capture_${domain}/results.json"
   shard="/tmp/tau2_${domain}.otel.jsonl"
-  .venv/bin/python convert_to_wmh.py "$res" --out "$shard" --benchmark tau2-bench
+  .venv/bin/python convert_to_wmo.py "$res" --out "$shard" --benchmark tau2-bench
   cat "$shard" >> "$OUT"
 done
 # Report distinct trace count in the merged corpus.

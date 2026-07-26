@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from wm_replace_demo import WorldModelCommandEnv
 
-from wmh.core.types import Action, ActionKind, EnvState, Observation
+from wmo.core.types import Action, ActionKind, EnvState, Observation
 
 
 class _StubWorldModelEnv:

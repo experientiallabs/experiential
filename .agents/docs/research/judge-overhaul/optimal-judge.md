@@ -1,7 +1,7 @@
 # Optimal judge model (2026-07-02)
 
 Question: with the judge pinned off the failover chain (PR #51), which model should judge?
-Method: the judge-quality meta-eval (12 hand-labeled cases, `wmh/optimize/judge_quality.py`)
+Method: the judge-quality meta-eval (12 hand-labeled cases, `wmo/optimize/judge_quality.py`)
 run per candidate, each pinned; compared on pass rate and calibration. Raw runs in `raw/`
 (`judge-model-*.json`, plus the two `judge-quality-fixed*.json` Opus 4.8 runs from PR #83).
 

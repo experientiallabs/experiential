@@ -44,7 +44,7 @@ export AWS_REGION="${AWS_REGION:-us-east-1}" AWS_REGION_NAME="${AWS_REGION_NAME:
 # injects a malformed `tool_choice` for Opus 4.6/4.7 ("tool_choice.type: Field required" / "missing
 # field type"), so the tool-calling config dies on the first step for anything but 4.8. The backticks
 # config emits a fenced ```mswea_bash_command``` block instead — no tool_choice — which every Opus
-# works with AND which convert_to_wmh.py's fenced-block path parses directly.
+# works with AND which convert_to_wmo.py's fenced-block path parses directly.
 CONFIG="${CONFIG:-swebench_backticks.yaml}"
 
 # FILTER (optional): an instance-id regex to target a specific recovery set. When set, --filter

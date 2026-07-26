@@ -23,11 +23,11 @@ compaction = false
 
 # Terminus-2 cannot use the stock reasoning renderers: they hand harbor's response
 # parser a LIST and kill the trial, and they strip thinking from history, which
-# fragments the episode into one datum per turn. The wmh verbatim wrappers keep the
-# reasoning in the token stream and the episode a single datum (wmh/distill/renderers.py).
+# fragments the episode into one datum per turn. The wmo verbatim wrappers keep the
+# reasoning in the token stream and the episode a single datum (wmo/distill/renderers.py).
 [rollout.renderers]
-"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmh/nemotron3_verbatim"
-"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmh/nemotron3_ultra_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmo/nemotron3_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmo/nemotron3_ultra_verbatim"
 
 [train]
 steps = 6
@@ -90,4 +90,4 @@ max_usd = 75.0
 # WANDB_API_KEY (or a prior `wandb login`). Uncomment to enable.
 [wandb]
 enabled = true
-project = "wmh-distill"
+project = "wmo-distill"

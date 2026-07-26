@@ -10,9 +10,9 @@ Known seam limitation: `Observation.is_error` is a boolean, so the bridge coarse
 codes to {0, 1}. Agents that branch on specific non-zero codes (e.g. grep's 1-vs-2) see the
 same behavior on both backends only up to that coarsening.
 
-Usage (after `wmh build --name financebench --file .../traces.otel.jsonl`):
+Usage (after `wmo build --name financebench --file .../traces.otel.jsonl`):
     uv run python packages/environment-capture/financebench/wm_replace_demo.py \
-        --model-dir .wmh/models/financebench --limit 5
+        --model-dir .wmo/models/financebench --limit 5
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ from environment_capture.agent import BedrockBashAgent
 from environment_capture.benchmarks.financebench import FinanceBenchAdapter
 from environment_capture.trajectory import JsonValue, Task
 
-from wmh.core.types import Action, ActionKind
-from wmh.engine.loader import load_world_model
-from wmh.engine.world_model import WorldModel
-from wmh.env import Env, WorldModelEnv
+from wmo.core.types import Action, ActionKind
+from wmo.engine.loader import load_world_model
+from wmo.engine.world_model import WorldModel
+from wmo.env import Env, WorldModelEnv
 
 _HERE = Path(__file__).parent
 
@@ -100,7 +100,7 @@ def _run_task(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-dir", default=".wmh/models/financebench")
+    parser.add_argument("--model-dir", default=".wmo/models/financebench")
     parser.add_argument("--split", default="test")
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--agent-model", default="us.anthropic.claude-opus-4-8")

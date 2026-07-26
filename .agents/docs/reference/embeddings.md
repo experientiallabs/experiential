@@ -35,7 +35,7 @@ matches `embed_provider`). It is independent of the completion `model`:
 - **Azure OpenAI** — `embed_model` is the **embedding deployment name** (same role `deployment`
   plays for completions). Required for `embed()`.
 
-`get_embedder(config)` (in `wmh.retrieval.embedders`) resolves all of this: for `hashing` it builds
+`get_embedder(config)` (in `wmo.retrieval.embedders`) resolves all of this: for `hashing` it builds
 `HashingEmbedder(dim=embed_dim)`; otherwise it constructs the backing provider via the registry and
 stamps `embed_dim` onto its `ProviderConfig` so the backend requests a vector of exactly that size.
 
@@ -55,13 +55,13 @@ never a raw numpy mismatch.
 
 ## Verifying the embed path
 
-`wmh providers verify` pings each provider's completion path and, when `embed_provider` is not
+`wmo providers verify` pings each provider's completion path and, when `embed_provider` is not
 `hashing`, also embeds one tiny string through the configured embed provider and reports `ok` + the
 produced `dim` (or the failure detail). It never raises — a missing key or wrong model comes back as
 `fail`.
 
 ## Wiring at build time
 
-`wmh build --embed-provider <kind> [--embed-model <id>] [--embed-dim N]` constructs the embedder via
+`wmo build --embed-provider <kind> [--embed-model <id>] [--embed-dim N]` constructs the embedder via
 `get_embedder` and passes it into the build, so the index is built with the same `phi` that
 `WorldModel.load` will reconstruct at serve time.

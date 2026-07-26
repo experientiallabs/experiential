@@ -14,7 +14,7 @@ save_weights_for_sampler call) as the "normal" baseline for the planned
 wedge-hardening around the SDK's internal retry loop.
 
 Probe-only seams, documented deviations from the product path:
-- `wmh.distill.loop.collect_rollouts` is monkeypatched (plain attribute
+- `wmo.distill.loop.collect_rollouts` is monkeypatched (plain attribute
   assignment) with `ProbeRollouts`, mirroring `loop_test._FakeRollouts`. The
   probe never imports harbor; `harbor.job_template` points at the checked-in
   placeholder YAML next to this script purely to satisfy the config shape.
@@ -25,7 +25,7 @@ Probe-only seams, documented deviations from the product path:
   loop's `SdkTrainingClient`: the live Tinker service (SDK 0.23.3) rejects
   the `mask` loss_fn_inputs key for the importance_sampling loss
   (`ImportanceSamplingLossExtraArgs.__init__() got an unexpected keyword
-  argument 'mask'`), which `wmh.distill.data.to_tinker_datums` always sends.
+  argument 'mask'`), which `wmo.distill.data.to_tinker_datums` always sends.
   `attach_advantages` zeroes advantages at every non-loss position, so the
   mask is redundant with the advantages and `_compat_tinker_datums` drops it,
   loss-equivalently; everything else mirrors the shifted next-token layout.
@@ -34,7 +34,7 @@ Run from the repo root with only TINKER_API_KEY set:
 
     uv run python .agents/distill/tinker_probe_gsm8k.py --steps 4 \
         --tasks-per-batch 2 --group-size 2 --max-tokens 128 \
-        --budget-usd 2 --run-dir .wmh/distill-runs/probe-gsm8k-dev
+        --budget-usd 2 --run-dir .wmo/distill-runs/probe-gsm8k-dev
 """
 
 from __future__ import annotations
@@ -55,9 +55,9 @@ from uuid import uuid4
 import tinker
 from llm_waterfall.types import ChatMessage
 
-import wmh.distill.loop as loop_module
-from wmh.agents.default import default_agent
-from wmh.distill.config import (
+import wmo.distill.loop as loop_module
+from wmo.agents.default import default_agent
+from wmo.distill.config import (
     BudgetConfig,
     DistillConfig,
     EvalConfig,
@@ -71,8 +71,8 @@ from wmh.distill.config import (
     TrainConfig,
     WandbConfig,
 )
-from wmh.distill.data import TrainDatum
-from wmh.distill.loop import (
+from wmo.distill.data import TrainDatum
+from wmo.distill.loop import (
     DistillBudgetError,
     DistillProgress,
     DistillResult,
@@ -81,14 +81,14 @@ from wmh.distill.loop import (
     TrainStepOutput,
     run_distillation,
 )
-from wmh.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
-from wmh.distill.rollouts import RolloutStats
-from wmh.distill.store import AdapterStore, DistillRunStore
-from wmh.distill.teacher import EncodingTokenizer
-from wmh.distill.tokens import TrialRecord
-from wmh.harness.doc import HarnessDoc
-from wmh.providers.base import ProviderConfig
-from wmh.providers.tinker import TINKER_API_KEY_ENV, SampledSequenceLike, TokenSpan
+from wmo.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
+from wmo.distill.rollouts import RolloutStats
+from wmo.distill.store import AdapterStore, DistillRunStore
+from wmo.distill.teacher import EncodingTokenizer
+from wmo.distill.tokens import TrialRecord
+from wmo.harness.doc import HarnessDoc
+from wmo.providers.base import ProviderConfig
+from wmo.providers.tinker import TINKER_API_KEY_ENV, SampledSequenceLike, TokenSpan
 
 logger = logging.getLogger("tinker_probe_gsm8k")
 
@@ -325,7 +325,7 @@ def _compat_tinker_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Dat
 class ProbeTrainingClient:
     """`DistillTrainingClient` over the raw SDK, timed, with the compat datums.
 
-    Mirrors `wmh.distill.loop.SdkTrainingClient` (blocking calls, per-session
+    Mirrors `wmo.distill.loop.SdkTrainingClient` (blocking calls, per-session
     nonce on save names) except that `forward_backward` converts through
     `_compat_tinker_datums` so the batch survives the live service's
     importance_sampling loss-args validation (no `mask` key).
@@ -382,7 +382,7 @@ class ProbeTrainingClient:
 
     def save_state(self) -> str:
         """One timed blocking save_state under a session-unique name."""
-        name = f"wmh-probe-{self._session}-state-{self._save_counter:04d}"
+        name = f"wmo-probe-{self._session}-state-{self._save_counter:04d}"
         self._save_counter += 1
         started = time.monotonic()
         try:
@@ -593,7 +593,7 @@ def build_config(args: argparse.Namespace) -> DistillConfig:
         gate=GateConfig(k=1),
         pricing=_PLACEHOLDER_PRICING,
         budget=BudgetConfig(max_usd=args.budget_usd),
-        wandb=WandbConfig(enabled=args.wandb, project="wmh-distill", run_name=RUN_NAME),
+        wandb=WandbConfig(enabled=args.wandb, project="wmo-distill", run_name=RUN_NAME),
     )
 
 
@@ -611,11 +611,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--run-dir",
-        default=".wmh/distill-runs/probe-gsm8k",
+        default=".wmo/distill-runs/probe-gsm8k",
         help="fresh run directory for this probe's artifacts",
     )
     parser.add_argument(
-        "--wandb", action="store_true", help="enable [wandb] tracking (project wmh-distill)"
+        "--wandb", action="store_true", help="enable [wandb] tracking (project wmo-distill)"
     )
     # The three knobs that decide whether a run trains or collapses, exposed here so the
     # question can be answered for pennies instead of on a $14/step agentic run. Both real

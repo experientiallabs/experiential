@@ -7,11 +7,11 @@ wall-clock time.
 
 Unlike swe-bench/terminal-tasks, tau2 actions are TOOL CALLS (e.g. `get_user_details(user_id=...)`),
 not shell commands, so this imports the real tau2 package and uses `Environment.use_tool`. It must
-therefore run in the tau2 `.venv` set up by this directory's README — NOT under `wmh` (which never
+therefore run in the tau2 `.venv` set up by this directory's README — NOT under `wmo` (which never
 imports tau2). There is no container/process to boot; the "startup cost" the world model saves is
 loading the real domain DB into the environment.
 
-Stdlib + tau2 only (no `wmh` import). It reads this example's `traces.otel.jsonl`, picks a held-out
+Stdlib + tau2 only (no `wmo` import). It reads this example's `traces.otel.jsonl`, picks a held-out
 trace using the harness's deterministic blake2b split, reads the `domain` from trace metadata, and
 replays the trace's recorded `(tool_name, arguments)` calls.
 
@@ -53,8 +53,8 @@ def _load_traces(corpus: Path) -> "list[dict[str, Any]]":
         calls: list[tuple[str, dict[str, Any]]] = []
         for span in by_trace[tid]:
             attrs = _attr_map(span)
-            if "wmh.trace.metadata" in attrs:
-                domain = json.loads(attrs["wmh.trace.metadata"]).get("domain", "")
+            if "wmo.trace.metadata" in attrs:
+                domain = json.loads(attrs["wmo.trace.metadata"]).get("domain", "")
             args = attrs.get("gen_ai.tool.call.arguments")
             name = attrs.get("gen_ai.tool.name")
             if args and name:  # an action span (the observation span has no arguments)
@@ -64,14 +64,14 @@ def _load_traces(corpus: Path) -> "list[dict[str, Any]]":
 
 
 def _holdout(traces: list[dict[str, Any]], train_split: float) -> list[dict[str, Any]]:
-    """The held-out traces, by the SAME deterministic blake2b split the wmh harness uses."""
+    """The held-out traces, by the SAME deterministic blake2b split the wmo harness uses."""
     held: list[dict[str, Any]] = []
     for trace in traces:
         digest = hashlib.blake2b(trace["trace_id"].encode("utf-8"), digest_size=8).digest()
         fraction = int.from_bytes(digest, "big") / 2**64
         if fraction >= train_split:
             held.append(trace)
-    return held or traces  # tiny corpora: no held-out -> fall back to all (matches the wmh side)
+    return held or traces  # tiny corpora: no held-out -> fall back to all (matches the wmo side)
 
 
 def main() -> None:
@@ -101,7 +101,7 @@ def main() -> None:
             raise SystemExit(f"--trace-id {args.trace_id} not found in {args.corpus}")
         trace = by_id[args.trace_id]
     elif args.trace is None:
-        # Default: the simplest scenario — fewest recorded tool calls (matches the wmh side).
+        # Default: the simplest scenario — fewest recorded tool calls (matches the wmo side).
         trace = min(pool, key=lambda t: len(t["calls"]))
     elif 0 <= args.trace < len(pool):
         trace = pool[args.trace]

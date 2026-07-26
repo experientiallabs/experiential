@@ -159,7 +159,7 @@ class AppWorldAdapter:
         self,
         root: Path,
         *,
-        experiment_prefix: str = "wmh-cap",
+        experiment_prefix: str = "wmo-cap",
         venv_python: Path | None = None,
         backend: Path | None = None,
         timeout_s: int = 120,

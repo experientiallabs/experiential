@@ -6,7 +6,7 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "world-model-harness",
+  title: "world-model-optimizer",
   description:
     "The open source world model collection. Environments built from your agent traces.",
 };
@@ -14,7 +14,7 @@ export const metadata: Metadata = {
 function StarBanner() {
   return (
     <a
-      href="https://github.com/experientiallabs/world-model-harness"
+      href="https://github.com/experientiallabs/world-model-optimizer"
       target="_blank"
       rel="noreferrer"
       className="flex h-12 cursor-pointer items-center justify-center gap-2 bg-ink text-sm text-white hover:underline"

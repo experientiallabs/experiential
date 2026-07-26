@@ -1,4 +1,4 @@
-# This entire isolated capture environment is local-only. wmh never imports tau2;
+# This entire isolated capture environment is local-only. wmo never imports tau2;
 # only the generated trace files (committed under ../../examples/) come back into the repo.
 tau2-bench/
 .venv/

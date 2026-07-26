@@ -3,7 +3,7 @@
 /**
  * Guided build-your-own flow: traces (local path or upload) + name + provider/model + budget
  * -> POST /world_models/builds -> live SSE progress (BuildReporter stages + rollout ticks)
- * -> link to the fresh model's page. Falls back to the exact `wmh build` command when no
+ * -> link to the fresh model's page. Falls back to the exact `wmo build` command when no
  * backend answers.
  */
 
@@ -49,7 +49,7 @@ function ServeDownPanel({ serveHint }: { serveHint: string }) {
     <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface-sunk p-5">
       <div className="mono-label">backend offline</div>
       <p className="text-sm text-ink-soft">
-        No <code className="font-mono">wmh serve</code> is answering at{" "}
+        No <code className="font-mono">wmo serve</code> is answering at{" "}
         <code className="font-mono">{API_BASE}</code>. Start one from the repo root:
       </p>
       <pre className="overflow-x-auto rounded-md border border-line bg-surface p-3 font-mono text-xs">
@@ -57,7 +57,7 @@ function ServeDownPanel({ serveHint }: { serveHint: string }) {
       </pre>
       <p className="text-sm text-ink-soft">
         Or build straight from the terminal, no browser needed:{" "}
-        <code className="font-mono">uv run wmh build</code> (interactive wizard).
+        <code className="font-mono">uv run wmo build</code> (interactive wizard).
       </p>
     </div>
   );

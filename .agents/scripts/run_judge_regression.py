@@ -23,15 +23,15 @@ from statistics import fmean
 
 from pydantic import BaseModel, ValidationError
 
-from wmh.core.parsing import extract_json_object
-from wmh.core.types import Action, Observation, Step, Trace
-from wmh.engine.build import split_traces
-from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import get_adapter
-from wmh.optimize.gepa import predict_observation
-from wmh.optimize.judge import RUBRIC_DIMENSIONS, JudgeResult, RubricJudge, _clamp
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
-from wmh.providers.base import Message, Provider
+from wmo.core.parsing import extract_json_object
+from wmo.core.types import Action, Observation, Step, Trace
+from wmo.engine.build import split_traces
+from wmo.engine.prompts import BASE_ENV_PROMPT
+from wmo.ingest import get_adapter
+from wmo.optimize.gepa import predict_observation
+from wmo.optimize.judge import RUBRIC_DIMENSIONS, JudgeResult, RubricJudge, _clamp
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.providers.base import Message, Provider
 
 CORPORA = {
     "tau-bench": "examples/tau-bench/traces.otel.jsonl",

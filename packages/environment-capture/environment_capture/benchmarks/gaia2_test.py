@@ -102,7 +102,7 @@ def test_grade_reads_state_file_and_oracle(tmp_path: Path) -> None:
     # No state file yet -> 0.0 (the agent never ran / left nothing behind).
     assert adapter.grade(task, "") == 0.0
     # Backend dumped the agent's write-action log for this task.
-    (tmp_path / "runs_state" / f"wmh-cap--{task.task_id}.json").write_text(
+    (tmp_path / "runs_state" / f"wmo-cap--{task.task_id}.json").write_text(
         json.dumps(
             [
                 {

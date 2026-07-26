@@ -1,6 +1,6 @@
-# Connector fetch library (`wmh.connect`)
+# Connector fetch library (`wmo.connect`)
 
-`wmh.connect` fetches content from the tools a team already uses (GitHub, Google, Slack, Notion,
+`wmo.connect` fetches content from the tools a team already uses (GitHub, Google, Slack, Notion,
 plus Brave web search) and normalizes every result into one vendor-agnostic shape,
 `ContextItem`. It is a library, not a CLI: a host supplies a per-service access token and calls a
 connector's `pull`. Token and OAuth acquisition are the caller's responsibility; the platform
@@ -9,7 +9,7 @@ supplies tokens.
 ## Call site
 
 ```python
-from wmh.connect import ConnectorAuth, PullQuery, get_connector
+from wmo.connect import ConnectorAuth, PullQuery, get_connector
 
 connector = get_connector("github")
 items = connector.pull(
@@ -21,13 +21,13 @@ for item in items:
 ```
 
 `get_connector(name)` looks a connector up by name; `list_connectors()` returns every registered
-name, sorted. Both come from `wmh.connect`. Registration happens on import, so importing the
+name, sorted. Both come from `wmo.connect`. Registration happens on import, so importing the
 package is enough:
 
 ```python
-import wmh.connect
+import wmo.connect
 
-wmh.connect.list_connectors()
+wmo.connect.list_connectors()
 # ['brave', 'github', 'gmail', 'google-calendar', 'google-drive', 'notion', 'slack']
 ```
 
@@ -85,12 +85,12 @@ so downstream code never touches vendor JSON:
 ## Errors
 
 A failed pull raises `ConnectError` (bad or expired auth, unreachable host, a rejected request)
-with a message that says what went wrong. Import it from `wmh.connect`.
+with a message that says what went wrong. Import it from `wmo.connect`.
 
 ## Optional dependency: `connectors` extra
 
 The Notion connector's remote-MCP path uses the `mcp` client SDK, packaged as the optional
-`connectors` extra (`pip install "world-model-harness[connectors]"`). The SDK is imported lazily
-inside that path only, so `import wmh.connect` and every other connector's `pull` work without
+`connectors` extra (`pip install "world-model-optimizer[connectors]"`). The SDK is imported lazily
+inside that path only, so `import wmo.connect` and every other connector's `pull` work without
 the extra installed. Notion also accepts a pasted integration secret, which uses the REST API and
 needs no extra.

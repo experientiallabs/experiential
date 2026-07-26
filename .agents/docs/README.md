@@ -30,7 +30,7 @@ here 2026-07-02; files keep their Notion `area`/`status` in frontmatter.
 
 | Doc | Blocking staleness |
 |---|---|
-| `reference/architecture.md` | Predates `wmh/env` (PR #48), `wmh/telemetry`, the RL seam (#58+); references Notion-era doc names and old `scripts/` paths. The flagship dev doc — refresh once the merge wave settles, promote to `docs/reference/`. |
+| `reference/architecture.md` | Predates `wmo/env` (PR #48), `wmo/telemetry`, the RL seam (#58+); references Notion-era doc names and old `scripts/` paths. The flagship dev doc — refresh once the merge wave settles, promote to `docs/reference/`. |
 | `reference/runbook-build-tau2-bedrock.md` | Re-run every command live (rule 11), refresh sample outputs, promote as `docs/reference/runbook.md`. |
 | `reference/benchmarks-to-traces.md` | Corpus counts stale (swe 87 → 255+). The trace contract + add-a-benchmark recipe are the value. |
 | `reference/embeddings.md` | Spot-check provider list (post-#46/#67) and embed flags, then promote. |
@@ -60,7 +60,7 @@ filenames (`./sim_real_agreement.md`, `./closed_loop.md`) — fix links when ref
 
 ## Scripts (`.agents/scripts/`)
 
-- `run_trace_scaling.py` — stays here; promote into the `wmh research` CLI group (rule 7) only
+- `run_trace_scaling.py` — stays here; promote into the `wmo research` CLI group (rule 7) only
   if trace-scaling reruns become routine.
 - `plot_trace_scaling.py` — disposable brand-palette example (the palette in AGENTS.md rule 15
   is the contract, not this script). Writes into `.agents/docs/research/`; the published PNG is

@@ -1,7 +1,7 @@
 """Smoke-test all 5 RL-method data paths + the HTTP training seam against the tau-bench WM.
 
 Each downstream training chat (SFT + PPO + REINFORCE++, GRPO + SDPO, ICL) will consume the same
-wmh-side machinery this script exercises end-to-end at tiny scale:
+wmo-side machinery this script exercises end-to-end at tiny scale:
 
     1. ICL       -- closed-loop episode via `run_episode` + `WorldModelEnv`, plus
                     prior-episode critique injection into the next-episode agent prompt.
@@ -37,18 +37,18 @@ from typing import Callable
 
 from fastapi.testclient import TestClient
 
-from wmh.config import load_config
-from wmh.core.parsing import extract_json_object
-from wmh.core.render import render_action, render_demo
-from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Step, Trace
-from wmh.engine import ingest, split_traces_3way
-from wmh.engine.world_model import WorldModel
-from wmh.env import DONE_SIGNAL, WorldModelEnv, run_episode
-from wmh.env.scenarios import Scenario, scenarios_from_traces
-from wmh.optimize.reward import EpisodeScore
-from wmh.providers import get_provider
-from wmh.providers.base import Message, Provider, ProviderConfig, ProviderKind
-from wmh.serving.server import create_app
+from wmo.config import load_config
+from wmo.core.parsing import extract_json_object
+from wmo.core.render import render_action, render_demo
+from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Step, Trace
+from wmo.engine import ingest, split_traces_3way
+from wmo.engine.world_model import WorldModel
+from wmo.env import DONE_SIGNAL, WorldModelEnv, run_episode
+from wmo.env.scenarios import Scenario, scenarios_from_traces
+from wmo.optimize.reward import EpisodeScore
+from wmo.providers import get_provider
+from wmo.providers.base import Message, Provider, ProviderConfig, ProviderKind
+from wmo.serving.server import create_app
 
 # --- config ---------------------------------------------------------------
 
@@ -149,7 +149,7 @@ def _load_scenarios() -> tuple[list[Trace], list[Trace], list[Scenario]]:
 class HaikuToolCallAgent:
     """Ask haiku for one tool call per step; fall back to a MESSAGE action on parse failure.
 
-    Same shape as `wmh.engine.demo._propose_action`: JSON-only tool-call reply, temperature 0.
+    Same shape as `wmo.engine.demo._propose_action`: JSON-only tool-call reply, temperature 0.
     """
 
     def __init__(self, provider: Provider, examples: list[Step]) -> None:
@@ -462,7 +462,7 @@ def _method_http(wm: WorldModel) -> str:
 
 
 def main() -> int:
-    print("wmh RL smoke: loading tau-bench world model with Bedrock haiku (us-east-1)...")
+    print("wmo RL smoke: loading tau-bench world model with Bedrock haiku (us-east-1)...")
     t0 = time.monotonic()
     wm, provider = _load_wm_with_haiku()
     train, _test, scenarios = _load_scenarios()

@@ -17,7 +17,7 @@ Corpus: tau-bench, first 100 traces (deterministic cap), budget 15. Run date 202
 All models on Bedrock us-east-1. Facets, cluster naming, synthesis, and the back-agreement gate
 ran on Opus 4.8 (pinned via `--provider bedrock --model claude-opus-4-8`). Solvability rollouts ran
 the agent and the world-model simulator on Haiku 4.5 (the world model's serve provider); the
-checklist grader ran on Opus 4.8 (the `judge` role in `.wmh/settings.toml`). Facet clustering used
+checklist grader ran on Opus 4.8 (the `judge` role in `.wmo/settings.toml`). Facet clustering used
 the offline HashingEmbedder (repo default, lexical, no cost).
 
 ## Headline numbers
@@ -35,7 +35,7 @@ the offline HashingEmbedder (repo default, lexical, no cost).
 ## Why only 9 of budget 15 survived, and why two mid-size clusters got zero
 
 The 6 missing scenarios are NOT dedup and NOT allocation rounding. Two mechanisms in
-`wmh/scenarios/mining/selection.py` and `wmh/scenarios/builder.py` combine:
+`wmo/scenarios/mining/selection.py` and `wmo/scenarios/builder.py` combine:
 
 1. **Failure pinning consumed the budget.** `_pin_failures` (selection.py) guarantees every failure
    category present in the corpus keeps at least one exemplar, and it does so by EVICTING the
@@ -104,7 +104,7 @@ solvability.
 
 ## Solvable semantics (do not misread the column)
 
-From `wmh/scenarios/verification/verify.py` and `verification/judge.py`:
+From `wmo/scenarios/verification/verify.py` and `verification/judge.py`:
 `solvable = rollout.success`, where `success` is the judge's HOLISTIC boolean ("true if the episode
 as a whole achieved the task"), returned by the LLM independently of the per-item `passed` list.
 `rollout_pass_rate = sum(passed) / len(passed)` is the fraction of checklist items marked passed.
@@ -116,7 +116,7 @@ correct, not a bug. `ScenarioVerdict.ok` = `solvable and back_agreement is not F
 ## seed_state_health: 9/9 empty structured state
 
 By-design for this corpus, not a synthesis defect. The synthesizer seeds `seed_state.structured`
-from the source trace's `wmh.state.structured` span attribute; the tau-bench OTel capture never
+from the source trace's `wmo.state.structured` span attribute; the tau-bench OTel capture never
 recorded machine-readable env state on its action spans (only the free-text scratchpad is derived),
 so there is nothing structured to seed from. The scratchpad is populated on all 9.
 
@@ -124,7 +124,7 @@ Consequence for the execute step: solvability rollouts (and any future Bench-EXE
 corpus) start from a PROSE-only description of the world. The world model must reconstruct account
 balances, reservation records, and order catalogs from the scratchpad narrative, which is exactly
 where the `wrong_item_returned` simulator confusion came from. For execute-step realism this corpus
-is limited; a capture that records `wmh.state.structured` (or a corpus like bird-sql with a real
+is limited; a capture that records `wmo.state.structured` (or a corpus like bird-sql with a real
 backing store) is needed to test structured-state grounding. This is a corpus-capture gap to log,
 not a bug in synthesis or verification.
 
@@ -147,8 +147,8 @@ not a bug in synthesis or verification.
   calls (low fidelity skips GEPA; pure-RAG simulator).
 - Verification (9 scenarios, max_steps 10): 209 s.
 - Total wall: about 6 minutes.
-- Dollar cost: NOT surfaced. `wmh scenarios build` / `verify` do not route through the metered
-  provider, so no `.wmh/runs` entry is written and no cost line prints. Adding cost accounting to
+- Dollar cost: NOT surfaced. `wmo scenarios build` / `verify` do not route through the metered
+  provider, so no `.wmo/runs` entry is written and no cost line prints. Adding cost accounting to
   these CLIs is a suggested follow-up.
 
 ## Files
@@ -162,26 +162,26 @@ not a bug in synthesis or verification.
 ## Reproduce
 
 ```bash
-cd ~/Desktop/Projects/wmh-gev-bench   # worktree on branch research/gev-benchmarks
+cd ~/Desktop/Projects/wmo-gev-bench   # worktree on branch research/gev-benchmarks
 
 # Corpus: packages/environment-capture/tau-bench/traces.otel.jsonl is an untracked local capture
 # (10578 span-lines -> 1033 traces); copied from the main checkout at the same path.
 
 # 1. Build the scenario set (100 traces, budget 15).
-uv run wmh scenarios build \
+uv run wmo scenarios build \
   --file packages/environment-capture/tau-bench/traces.otel.jsonl \
   --limit 100 --budget 15 \
   --provider bedrock --model claude-opus-4-8 --region us-east-1 \
   --out .agents/docs/research/gev_bench_results/gen/tau_scenarios.json
 
 # 2. Build a low-fidelity world model for solvability rollouts (Haiku serve).
-uv run wmh build --name gev-tau --no-interactive \
+uv run wmo build --name gev-tau --no-interactive \
   --file packages/environment-capture/tau-bench/traces.otel.jsonl \
   --provider bedrock --model claude-haiku-4-5 --judge-model claude-haiku-4-5 \
-  --region us-east-1 --fidelity low --root .wmh </dev/null
+  --region us-east-1 --fidelity low --root .wmo </dev/null
 
 # 3. Verify (back-agreement + solvability), persisting the report JSON. Judge role (Opus 4.8)
-#    is set in .wmh/settings.toml [models.judge]; agent + simulator use the WM's Haiku serve.
+#    is set in .wmo/settings.toml [models.judge]; agent + simulator use the WM's Haiku serve.
 uv run python .agents/scripts/gev_bench/run_verify.py \
   --scenarios .agents/docs/research/gev_bench_results/gen/tau_scenarios.json \
   --file packages/environment-capture/tau-bench/traces.otel.jsonl \

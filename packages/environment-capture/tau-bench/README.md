@@ -2,18 +2,18 @@
 
 This directory is a **self-contained, local-only capture tool**. It runs the *real*
 [tau²-bench](https://github.com/sierra-research/tau2-bench) benchmark and converts its trajectories
-into the world-model-harness trace corpus (`packages/environment-capture/tau-bench/traces.otel.jsonl`).
+into the world-model-optimizer trace corpus (`packages/environment-capture/tau-bench/traces.otel.jsonl`).
 
 It is deliberately isolated:
 
-- **`wmh` never imports `tau2`.** Real tau²-bench needs Python 3.12–3.13 and a heavy dependency tree
-  (`litellm`, `boto3`, …); `wmh` stays on 3.11. This tool runs in its own `.venv`. Only the produced
+- **`wmo` never imports `tau2`.** Real tau²-bench needs Python 3.12–3.13 and a heavy dependency tree
+  (`litellm`, `boto3`, …); `wmo` stays on 3.11. This tool runs in its own `.venv`. Only the produced
   trace JSONL is carried back into the repo.
 - The cloned `tau2-bench/`, the `.venv/`, and any `data/` simulations are **git-ignored**. Only
   the example assets in this folder are tracked: the converter, launcher scripts, README,
   `traces.otel.jsonl`, and `models/`.
-- `examples/` is excluded from the `wmh` lint/type gate (`pyproject.toml`), since these task helpers
-  can target different Python versions and import packages `wmh` doesn't depend on.
+- `examples/` is excluded from the `wmo` lint/type gate (`pyproject.toml`), since these task helpers
+  can target different Python versions and import packages `wmo` doesn't depend on.
 
 ## Prebuilt world models
 
@@ -27,9 +27,9 @@ packages/environment-capture/tau-bench/models/tau-telecom/
 Use them as a local model root:
 
 ```bash
-uv run wmh list --root packages/environment-capture/tau-bench
-uv run wmh demo --root packages/environment-capture/tau-bench --name tau-telecom
-uv run wmh play --root packages/environment-capture/tau-bench --name tau-telecom
+uv run wmo list --root packages/environment-capture/tau-bench
+uv run wmo demo --root packages/environment-capture/tau-bench --name tau-telecom
+uv run wmo play --root packages/environment-capture/tau-bench --name tau-telecom
 ```
 
 ## Concurrency scaling law
@@ -100,15 +100,15 @@ rest are real partial trajectories. Bedrock model ids (default AWS profile, us-e
 `us.anthropic.claude-opus-4-7`, `us.anthropic.claude-opus-4-6-v1` (the `-v1` suffix is required),
 `us.anthropic.claude-opus-4-8`.
 
-## Convert to the wmh corpus
+## Convert to the wmo corpus
 
 ```bash
-TAU2_DATA_DIR="$PWD/tau2-bench/data" .venv/bin/python convert_to_wmh.py \
+TAU2_DATA_DIR="$PWD/tau2-bench/data" .venv/bin/python convert_to_wmo.py \
   tau2-bench/data/simulations/airline_capture/results.json \
   --out traces.otel.jsonl --benchmark tau2-bench
 ```
 
-`convert_to_wmh.py` produces, per simulation, one Step per agent **tool call**:
+`convert_to_wmo.py` produces, per simulation, one Step per agent **tool call**:
 
 - `action` — the real tool call (name + arguments).
 - `observation` — the **real recorded tool result** the agent saw (`gen_ai.tool.message`), error flag
@@ -120,14 +120,14 @@ TAU2_DATA_DIR="$PWD/tau2-bench/data" .venv/bin/python convert_to_wmh.py \
 reservations, all users) is megabytes per step *and* would leak the answer — handing the model a DB
 that already contains reservation `NM1VX1` turns predicting `get_reservation_details(NM1VX1)` into a
 lookup, not a reconstruction. Open-loop replay reconstructs the env from the action + retrieved
-similar past steps + the teacher-forced session history, which is the whole point. (The wmh adapter
-still *reads* `wmh.state.*` when present, for future benchmarks whose state is small and non-leaky.)
+similar past steps + the teacher-forced session history, which is the whole point. (The wmo adapter
+still *reads* `wmo.state.*` when present, for future benchmarks whose state is small and non-leaky.)
 
 Pure-conversational turns (no tool call) are not Steps: open-loop replay scores predicted
 observations for `(state, action)`, and a chat turn has no environment observation to score.
 
-The output is OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly (the per-step state
-and gold travel as optional `wmh.state.*` / `wmh.trace.metadata` attributes).
+The output is OTel-GenAI span JSONL that `wmo.ingest.otel_genai` reads directly (the per-step state
+and gold travel as optional `wmo.state.*` / `wmo.trace.metadata` attributes).
 
 ## Run ONE real scenario (the real-environment side of the comparison)
 
@@ -148,7 +148,7 @@ calls the exact recorded tool calls in order, printing the real tool results. Co
 times by eye.
 
 Because tau2 actions are tool calls (not shell commands), this imports the real `tau2` package and
-must run in the `.venv` from the Setup section above (NOT under `wmh`, which never imports tau2):
+must run in the `.venv` from the Setup section above (NOT under `wmo`, which never imports tau2):
 
 ```bash
 TAU2_DATA_DIR="$PWD/tau2-bench/data" .venv/bin/python run_real_scenario.py --trace 0

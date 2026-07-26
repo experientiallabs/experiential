@@ -5,7 +5,7 @@ Three panels. Panel A/C read the committed meta-eval runs in .agents/docs/resear
 panel B (and the "fixed" run) read bulky outputs that are NOT committed — regenerate them first:
     uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/judge-overhaul/raw/judge-quality-fixed.json
     uv run python .agents/scripts/run_judge_regression.py \
-        --cache .wmh/judge-regression-preds.json --out .agents/docs/research/judge-overhaul/raw/judge-regression.json
+        --cache .wmo/judge-regression-preds.json --out .agents/docs/research/judge-overhaul/raw/judge-regression.json
 Panels:
   A. Judge-quality meta-eval per case: expected band, baseline score, overhauled score.
   B. Old vs new judge on 47 identical real predictions, colored by new-judge factuality band.
@@ -23,7 +23,7 @@ from statistics import fmean
 
 import matplotlib.pyplot as plt
 
-from wmh.optimize.judge_quality import JUDGE_QUALITY_CASES
+from wmo.optimize.judge_quality import JUDGE_QUALITY_CASES
 
 INK = "#0a0a0a"
 MUTED = "#8a8a8a"

@@ -21,7 +21,7 @@ Captured benchmarks so far. Each is a **self-contained example** under `examples
 
 ## The trace contract
 
-Each capture produces a `wmh.core.types.Trace`. Per agent **tool call**, one `Step`:
+Each capture produces a `wmo.core.types.Trace`. Per agent **tool call**, one `Step`:
 
 - **`action`** — the real tool call (`name` + `arguments`).
 - **`observation`** — *exactly* what the real environment returned (the recorded tool result), with
@@ -37,22 +37,22 @@ criteria (expected actions + assertions), and the achieved `reward`. Gold rides 
 deferred **closed-loop** eval; the **open-loop** scorer ignores it (its ground truth is the recorded
 observation).
 
-Traces are stored as one-span-per-line OTel-GenAI JSONL that `wmh.ingest.otel_genai` reads. The
-per-step state and trace metadata travel as optional `wmh.state.*` / `wmh.trace.metadata` span
+Traces are stored as one-span-per-line OTel-GenAI JSONL that `wmo.ingest.otel_genai` reads. The
+per-step state and trace metadata travel as optional `wmo.state.*` / `wmo.trace.metadata` span
 attributes — a strict superset of the OTel GenAI semconv, so any trace that omits them still parses.
 
 ## How tau²-bench is captured
 
-The pipeline lives in `examples/tau-bench/` (capture scripts + converter next to the corpus) and is deliberately **isolated** from `wmh`:
+The pipeline lives in `examples/tau-bench/` (capture scripts + converter next to the corpus) and is deliberately **isolated** from `wmo`:
 
 - It runs Sierra's real [tau²-bench](https://github.com/sierra-research/tau2-bench) (`tau2 run`),
   which drives a fixed agent and an LLM user-simulator against the real domain environment. Both LLMs
   run on Bedrock Opus 4.8.
-- `wmh` **never imports `tau2`**. tau²-bench needs Python 3.12–3.13 + a heavy dependency tree; `wmh`
+- `wmo` **never imports `tau2`**. tau²-bench needs Python 3.12–3.13 + a heavy dependency tree; `wmo`
   stays 3.11. The capture tool runs in its own `.venv`; only the produced trace JSONL is carried back
   into the repo. (`tools/` is git-ignored except the conversion script + README, and excluded from
-  the `wmh` lint/type gate.)
-- `convert_to_wmh.py` turns a tau2 `results.json` into the corpus: per agent tool call, the real
+  the `wmo` lint/type gate.)
+- `convert_to_wmo.py` turns a tau2 `results.json` into the corpus: per agent tool call, the real
   action + the authoritative recorded observation the agent saw, with gold + reward + domain in
   `Trace.metadata`. tau2's `state_before` is left empty by design — the airline/retail DB is
   megabytes per step and would leak the answer (giving the model a DB that already contains the
@@ -67,15 +67,15 @@ The model is one **adapter per benchmark** — a self-contained example director
 
 1. **Run the real benchmark.** Install its real upstream package in an isolated env (its own
    `.venv`, whatever Python it needs). Run it with our fixed agent on Bedrock. Do **not** add it as a
-   `wmh` dependency — `wmh` must stay importable on 3.11 without it.
-2. **Convert to the trace contract.** Write a `convert_to_wmh.py` that, per recorded step, emits the
+   `wmo` dependency — `wmo` must stay importable on 3.11 without it.
+2. **Convert to the trace contract.** Write a `convert_to_wmo.py` that, per recorded step, emits the
    real `action` and the real recorded `observation`, and stamps `Trace.metadata` with the benchmark
    name + gold. Populate `state_before` only if the benchmark's state is small and **non-leaky** — if
    it would contain the answer to the action being scored (as tau2's full DB does), leave it empty and
    let replay reconstruct. Never invent state.
-3. **Emit OTel-GenAI JSONL** in the same shape (`gen_ai.*` spans + optional `wmh.state.*` /
-   `wmh.trace.metadata`) so `wmh.ingest.otel_genai` reads it with no new adapter.
+3. **Emit OTel-GenAI JSONL** in the same shape (`gen_ai.*` spans + optional `wmo.state.*` /
+   `wmo.trace.metadata`) so `wmo.ingest.otel_genai` reads it with no new adapter.
 4. **Commit** `examples/<task>/traces.otel.jsonl` plus the conversion script, launcher, README, and
    an `evals/default.toml` suite. Keep the cloned upstream, venv, and raw run output git-ignored.
 5. **Gate.** `uv run ruff check .`, `uv run ty check`, and `uv run pytest -q` must be clean over the
-   `wmh` package (the isolated `examples/` env is excluded).
+   `wmo` package (the isolated `examples/` env is excluded).

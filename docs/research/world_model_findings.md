@@ -9,7 +9,7 @@ holding the rest fixed, each layer's result motivating the next:
 | 1 | training data (trace count) | trace scaling law (#72; v1 in #32/#42) | data helps iff the observation is retrievable from `(state, action)`: tau +0.29, terminal/swe ~+0.02 |
 | 2 | retrieval itself | RAG optimization (#72) | `top_k=20` + a 2000-char observation cap; everything fancier is below the noise floor |
 | 3 | prompt optimization | GEPA scaling law (#97) | zero lift under the original optimizer; with template v2 + a representative valset, tau +0.022 and swe +0.021 |
-| 4 | test-time compute | agentic levers and fidelity tiers (#55) | per-corpus winners (reason / fetch / verify), packaged as `wmh build --fidelity` tiers |
+| 4 | test-time compute | agentic levers and fidelity tiers (#55) | per-corpus winners (reason / fetch / verify), packaged as `wmo build --fidelity` tiers |
 | 5 | self-knowledge | verbalized confidence (#120) | stated confidence is a calibrated P(good step); gating verify and model escalation on it Pareto-wins |
 | 6 | economics | concurrency scaling law (#41) | a world model saves wall-clock iff real standup cost exceeds reconstruction cost |
 
@@ -26,7 +26,7 @@ as one six-PR train (#41, #72, #97, #55, #120, #98); the six layers map to five 
   degenerate-dropped corpus where noted).
 - **Split discipline**: deterministic by hash of `trace_id` into a fixed test band (the y-axis
   never changes as the corpus grows), a fixed valid band, and a train pool
-  (`wmh.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`). Selection (GEPA, config
+  (`wmo.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`). Selection (GEPA, config
   search) uses valid; the reported number is always the untouched test slice.
 - **Metric**: open-loop reconstruction fidelity. The world model replays recorded steps
   teacher-forced (`predict_observation`); a pinned `RubricJudge` scores each predicted
@@ -171,7 +171,7 @@ derivable outputs (a word count fully computable from the command's own heredoc 
 same base prompt on the same 30-step valset three times gave 0.744/0.774/0.796 (std ≈0.02):
 promotion is argmax over single-sample evaluations inside that noise band, which systematically
 selects noise-inflated candidates (the winner's curse). Two optimizer changes landed in
-`wmh/optimize/gepa.py` from this diagnosis: a **stagnant-or-improve acceptance re-check** (a
+`wmo/optimize/gepa.py` from this diagnosis: a **stagnant-or-improve acceptance re-check** (a
 non-base winner must replicate its win on a fresh paired evaluation or base is restored,
 `OptimizeMetrics.reverted_to_base`; guard v2 re-checks on a valset-disjoint slice via
 `recheck`) and the **anti-outcome-flip reflection template** (no frequency-based outcome flips;
@@ -228,7 +228,7 @@ The measured lever matrix (rubric-v1, Opus serve):
   channel layer 5 shows also repairs confidence.
 
 No blanket config wins everywhere, hence a per-corpus search instead of defaults. The product
-packaging is `wmh build --fidelity low|medium|high|max` + runtime `--max-fidelity`:
+packaging is `wmo build --fidelity low|medium|high|max` + runtime `--max-fidelity`:
 
 | tier | prompt | retrieval phi | config search |
 |---|---|---|---|
@@ -246,7 +246,7 @@ a challenger clears the selection-noise band (`_NOISE_MARGIN`, 0.01). The guaran
 `high ≥ medium` (medium and high search different menus on different sample sizes, so adjacent
 tiers are not strictly ordered; strict rung-over-rung monotonicity would need each tier's
 incumbent seeded from the previous tier's winner, which the ladder does not do). The chosen
-config serves under `--max-fidelity`; a plain `wmh serve` stays pure RAG.
+config serves under `--max-fidelity`; a plain `wmo serve` stays pure RAG.
 
 An evidence audit removed two ingredients that failed "each ingredient must improve, not just
 cost more": semantic embeddings at high/max (layer 2's negative result, confirmed by a
@@ -380,7 +380,7 @@ wall-clock, is the portable quantity.
 
 ## Cross-model generality: the benchmark grid (#98)
 
-The layers above pin one serving model per study. `wmh eval grid` (reference:
+The layers above pin one serving model per study. `wmo eval grid` (reference:
 [`../reference/eval_grid.md`](../reference/eval_grid.md)) re-asks the base/+RAG/+GEPA/+GEPA+RAG
 question across five serving models × four benchmarks under one pinned judge, with
 `JUDGE_VERSION` stamped into every result and merges refusing mixed-version or mixed-split
@@ -464,14 +464,14 @@ machine; treat any number without that pinning as unfalsifiable.
 
 ## Reproduce
 
-All six layers are driven by the public `wmh` API; any thin driver reproduces them. Corpora:
-`packages/environment-capture/<suite>/traces.otel.jsonl` via `wmh.ingest` (adapter
+All six layers are driven by the public `wmo` API; any thin driver reproduces them. Corpora:
+`packages/environment-capture/<suite>/traces.otel.jsonl` via `wmo.ingest` (adapter
 `otel-genai`, degenerate traces dropped for swe-healthy). Splits via
-`wmh.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
+`wmo.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
 result JSONs, brand palette per AGENTS.md rule 15.
 
 ```text
-Layer 1  wmh.research.TraceScalingAblation + run_ablation
+Layer 1  wmo.research.TraceScalingAblation + run_ablation
          counts=1,4,16,64,256,648 (auto-caps at each pool), modes=base, seeds=0,1,
          sample_turns=sampled, test_cap=40, concurrency=8, top_k=5
          serve + judge us.anthropic.claude-opus-4-8 (Bedrock, AWS_PROFILE=default us-east-1),
@@ -484,7 +484,7 @@ Layer 2  same ablation, counts=1,16,<pool>, test_cap=15,
          retrieval_key="state_action"; unoptimized: top_k=5, no cap
          semantic arm: Azure ada-002 embedder; command-only key arm: retrieval_key="action"
 
-Layer 3  wmh.research.GepaScalingAblation + run_ablation
+Layer 3  wmo.research.GepaScalingAblation + run_ablation
          common: sample_turns=sampled, test_cap=40, concurrency=8, gepa_val_steps=30
          budget axis: budgets {0,1,2,4,8,16} at counts=64, seeds 0,1
          trace axis: counts {1,4,16,pool} at budgets=8, seed 0
@@ -495,7 +495,7 @@ Layer 3  wmh.research.GepaScalingAblation + run_ablation
          serve/optimize us.anthropic.claude-opus-4-7, judge us.anthropic.claude-opus-4-8,
          capacity-only failover ladder
 
-Layer 4  wmh build --fidelity low|medium|high|max (the tier ladder is the build product);
+Layer 4  wmo build --fidelity low|medium|high|max (the tier ladder is the build product);
          lever matrix via the layer-1 ablation's mode registry (reason, +kb, +fetch, +verify,
          +source, +workspace, +poll); runtime winners recorded in auto_fidelity.json
 
@@ -505,13 +505,13 @@ Layer 5  layer-1 ablation with composable modes base+conf, reason+conf, reason+c
          (confidence, judge-score) joins the calibration analysis needs);
          counts: tau 200 / terminal 160 / swe 24, seeds 0,1, test caps 40/40/20
 
-Layer 6  wmh research concurrency <suite> --side both --scenarios 16 --levels 1,2,4,8,16
+Layer 6  wmo research concurrency <suite> --side both --scenarios 16 --levels 1,2,4,8,16
          --select random --select-seed 1 (trials: tau 3 / terminal 2 / swe 1; swe auto-forces
-         --cache-shared); figures via wmh research plot-concurrency-combined
+         --cache-shared); figures via wmo research plot-concurrency-combined
 
 GEV      one shell command per scorecard; the runners (run_gen.sh / run_verify.sh /
          run_exec.sh) ship with #254 alongside the scorecards, per-episode rows, and
-         labeling sheets. GEN chains wmh scenarios build -> wmh build -> verify -> metrics;
+         labeling sheets. GEN chains wmo scenarios build -> wmo build -> verify -> metrics;
          VERIFY and EXEC re-materialize the bird-sql databases via fetch_data.py first.
          Judges: us.anthropic.claude-opus-4-8, Bedrock us-east-1 throughout.
 ```

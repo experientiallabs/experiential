@@ -4,8 +4,8 @@
 set -eo pipefail
 export PATH=/mnt/azureuser/venvs/vllm/bin:$PATH  # ninja for Qwen3.5 GDN kernels
 export HF_HOME=/mnt/azureuser/hf_cache
-PY=/mnt/azureuser/venvs/wmh-distill/bin/python
-cd /mnt/azureuser/wmh_distill
+PY=/mnt/azureuser/venvs/wmo-distill/bin/python
+cd /mnt/azureuser/wmo_distill
 
 for arm in mined random; do
   CUDA_VISIBLE_DEVICES=1 "$PY" train_sft_box.py \

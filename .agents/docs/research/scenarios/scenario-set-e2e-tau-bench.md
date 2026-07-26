@@ -66,7 +66,7 @@ Nova Lite agent rolled against the tau-bench world model, graded by the generate
 - **Back-agreement**: 5/8 (62%) — the checklist judge, grading each scenario's own source
   trajectory, matches the recorded tau2 reward 5 times of 8.
 
-Reading: this is exactly the filter working as intended — `wmh scenarios verify --drop` would
+Reading: this is exactly the filter working as intended — `wmo scenarios verify --drop` would
 keep the 4/8 scenarios passing both checks. With Nova Lite as both judge and agent these rates
 are a floor, not a ceiling; the disagreement cases are worth reading individually (rule 12) to
 split judge error from checklist error.

@@ -22,25 +22,25 @@ sys.path.insert(0, str(REPO))
 
 import numpy as np  # noqa: E402
 
-from wmh.core.types import Trace  # noqa: E402
-from wmh.engine.world_model import WorldModel  # noqa: E402
-from wmh.env.llm_agent import LLMAgent  # noqa: E402
-from wmh.ingest import get_adapter  # noqa: E402
-from wmh.providers import get_provider  # noqa: E402
-from wmh.providers.base import (  # noqa: E402
+from wmo.core.types import Trace  # noqa: E402
+from wmo.engine.world_model import WorldModel  # noqa: E402
+from wmo.env.llm_agent import LLMAgent  # noqa: E402
+from wmo.ingest import get_adapter  # noqa: E402
+from wmo.providers import get_provider  # noqa: E402
+from wmo.providers.base import (  # noqa: E402
     Message,
     Provider,
     ProviderConfig,
     ProviderKind,
 )
-from wmh.providers.retry import RetryingProvider  # noqa: E402
-from wmh.research.scenario_fidelity import (  # noqa: E402
+from wmo.providers.retry import RetryingProvider  # noqa: E402
+from wmo.research.scenario_fidelity import (  # noqa: E402
     fidelity_report,
     random_subsets,
     score_matrix,
 )
-from wmh.research.scenario_recovery import ground_truth_labels, recovery_report  # noqa: E402
-from wmh.scenarios import (  # noqa: E402
+from wmo.research.scenario_recovery import ground_truth_labels, recovery_report  # noqa: E402
+from wmo.scenarios import (  # noqa: E402
     ChecklistJudge,
     FacetExtractor,
     ScenarioBuildConfig,
@@ -170,7 +170,7 @@ def main() -> None:
     results["ours_selection"] = [s.model_dump() for s in ours]
 
     print("== Test 4: closed-loop verification of ours-K8 ==", flush=True)
-    world_model = WorldModel.load(str(WM_DIR), lite, telemetry_root=str(REPO / ".wmh"))
+    world_model = WorldModel.load(str(WM_DIR), lite, telemetry_root=str(REPO / ".wmo"))
     ours_scenarios = [s for s in pool_set.scenarios if s.scenario_id in ours_weights]
     ours_set = pool_set.model_copy(update={"scenarios": ours_scenarios})
     verification = verify_scenarios(

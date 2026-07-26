@@ -15,7 +15,7 @@ hand-tunes the base prompt) and *Design note: RAG-aware GEPA* (which explains th
 leak-free evaluation every experiment here inherits). Directions not yet run live in *Research
 directions (not yet run)*; the first completed sweep is written up in *Trace scaling law*.
 
-## The harness (`wmh/research`)
+## The harness (`wmo/research`)
 
 Three small pieces, designed so **a new experiment is one new file**:
 
@@ -27,7 +27,7 @@ Three small pieces, designed so **a new experiment is one new file**:
   small trace corpora make CIs/significance tests false precision.
 - **`pipeline.py` — the reusable primitives.** `optimize_prompt(...)` runs `GEPAOptimizer` at a
   chosen GEPA `seed`; `score_prompt(...)` replay-scores a prompt's held-out fidelity by delegating
-  to the canonical `wmh.engine.replay.replay` — the *same* scorer `wmh eval` uses. So an
+  to the canonical `wmo.engine.replay.replay` — the *same* scorer `wmo eval` uses. So an
   experiment's fidelity is directly comparable to the rest of the harness, and a judge/rubric
   upgrade (e.g. the `RubricJudge` 5-dimension scorer) lands in experiments for free.
 - **`seed_stability.py` — the first experiment** (below). `trace_scaling.py` + `scaling_split.py` — the trace scaling law sweep (see its own doc) — came next.
@@ -45,9 +45,9 @@ Candidate experiments are catalogued in [`research_directions.md`](./research_di
 
 ## The knob this added to the core (coordinate with the eval-scorer chat)
 
-`wmh/optimize/gepa.py` hardcoded the GEPA engine `seed=0`. The research harness needs to vary it, so
+`wmo/optimize/gepa.py` hardcoded the GEPA engine `seed=0`. The research harness needs to vary it, so
 the change is **surgical and backward-compatible**: `GEPAOptimizer(..., *, seed=0)` threads it
-through to `gepa.optimize(seed=...)`. Production callers (`wmh build`, `wmh serve`, `wmh eval`) pass
+through to `gepa.optimize(seed=...)`. Production callers (`wmo build`, `wmo serve`, `wmo eval`) pass
 nothing and get the old behavior; only the research harness sets it. The change is one additive
 keyword-only parameter, so conflicts with the eval-scorer chat's judge work should be mechanical.
 
@@ -81,7 +81,7 @@ AWS_REGION=us-east-1 uv run python scripts/run_seed_stability.py \
   --seeds 0,1,2 --budget 12 --judge rubric --out report.json
 ```
 
-The runner ingests + splits the corpus exactly as `wmh build` does, runs GEPA per seed on live
+The runner ingests + splits the corpus exactly as `wmo build` does, runs GEPA per seed on live
 Bedrock (offline `HashingEmbedder` for phi), prints per-seed fidelity and the mean ± std, and writes
 the full `AblationReport` JSON. Use a corpus with a real held-out split (the bundled
 `examples/tau2-bench.otel.jsonl` is 12 traces / 67 steps) for a meaningful number; pass `--judge
@@ -102,6 +102,6 @@ with deterministic fakes (which trivially give std=0).
 
 `world-models/tau-bench/` is the repo's committed, GEPA-optimized example world model (built from the
 clean `examples/tau2-bench.otel.jsonl` on Bedrock Opus 4.8). It is discovered automatically by the
-bundled search path (see `WorldModelStore` and [`ARCHITECTURE.md`](./ARCHITECTURE.md)), so `wmh
-list`, `wmh play --name tau-bench`, and `wmh serve` find it with no `--root`. It is the model the
+bundled search path (see `WorldModelStore` and [`ARCHITECTURE.md`](./ARCHITECTURE.md)), so `wmo
+list`, `wmo play --name tau-bench`, and `wmo serve` find it with no `--root`. It is the model the
 benchmark/reporting chat scores and the README points at.

@@ -36,12 +36,12 @@ from collect_teacher import (  # noqa: E402
 )
 from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, bedrock  # noqa: E402
 
-from wmh.core.types import Action, ActionKind, EnvState, Step  # noqa: E402
-from wmh.engine.world_model import WorldModel  # noqa: E402
-from wmh.env.base import WorldModelEnv  # noqa: E402
-from wmh.env.episode import DONE_SIGNAL, run_episode  # noqa: E402
-from wmh.ingest import get_adapter  # noqa: E402
-from wmh.scenarios import ChecklistJudge, ScenarioSet  # noqa: E402
+from wmo.core.types import Action, ActionKind, EnvState, Step  # noqa: E402
+from wmo.engine.world_model import WorldModel  # noqa: E402
+from wmo.env.base import WorldModelEnv  # noqa: E402
+from wmo.env.episode import DONE_SIGNAL, run_episode  # noqa: E402
+from wmo.ingest import get_adapter  # noqa: E402
+from wmo.scenarios import ChecklistJudge, ScenarioSet  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
 JUDGE_MODEL = "gemini-2.5-flash"  # default; --judge-model overrides (bedrock: prefix for Converse models)
@@ -145,7 +145,7 @@ def main() -> None:
     client = OpenAI(base_url=args.endpoint, api_key="not-needed")
     judge = ChecklistJudge(_resolve(args.judge_model))
     world_model = WorldModel.load(
-        str(WM_DIR), _resolve(args.wm_model), telemetry_root=str(REPO / ".wmh")
+        str(WM_DIR), _resolve(args.wm_model), telemetry_root=str(REPO / ".wmo")
     )
 
     pool = ScenarioSet.load(DISTILL / args.eval_pool)
@@ -169,7 +169,7 @@ def main() -> None:
         if agent.final_text:
             # "inform/refuse/communicate" checklist items live in the final reply; without this
             # the judge auto-fails them (the bug behind the first 11% baseline run).
-            from wmh.core.types import Observation
+            from wmo.core.types import Observation
 
             judged_steps.append(
                 Step(

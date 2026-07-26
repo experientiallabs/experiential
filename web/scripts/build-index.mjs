@@ -2,7 +2,7 @@
 /**
  * Generate src/data/index.json - the site's local "db" of world models.
  *
- * Walks every model dir under examples/<task>/models/ and .wmh/models/ in the repo root,
+ * Walks every model dir under examples/<task>/models/ and .wmo/models/ in the repo root,
  * reading card.json (the record the gallery renders) and metrics.json (build accuracy).
  * Models without a card are listed with a minimal synthesized card so the gallery never
  * hides a built model. Run whenever cards change: `npm run index`.
@@ -17,12 +17,12 @@ const repoRoot = resolve(here, "..", "..");
 const outPath = join(here, "..", "src", "data", "index.json");
 
 function modelRoots() {
-  // .wmh (the writable build root) comes FIRST so serveCommand() lists it first - that is where
-  // `wmh serve` writes server-side builds and uploads; putting a committed corpus dir first
+  // .wmo (the writable build root) comes FIRST so serveCommand() lists it first - that is where
+  // `wmo serve` writes server-side builds and uploads; putting a committed corpus dir first
   // would send build artifacts into the git tree.
   const roots = [];
-  const local = join(repoRoot, ".wmh", "models");
-  if (existsSync(local)) roots.push({ serveRoot: ".wmh", modelsDir: local });
+  const local = join(repoRoot, ".wmo", "models");
+  if (existsSync(local)) roots.push({ serveRoot: ".wmo", modelsDir: local });
   // Bundled corpora live under packages/environment-capture/<task>/models (WS-B2 layout).
   const captures = join(repoRoot, "packages", "environment-capture");
   if (existsSync(captures)) {
@@ -55,7 +55,7 @@ function clip(text, max) {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
-/** Format an action in the wmh-play grammar: `name {json}` / `name` / `say <msg>`. */
+/** Format an action in the wmo-play grammar: `name {json}` / `name` / `say <msg>`. */
 function formatAction(action) {
   if (!action) return null;
   if (action.kind === "tool_call") {

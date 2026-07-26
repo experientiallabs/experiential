@@ -1,6 +1,6 @@
 # The cost/quality dial (`cost_quality`)
 
-An endpoint fitted with `wmh optimize route fit --kind knn` routes each request to a pool model
+An endpoint fitted with `wmo optimize route fit --kind knn` routes each request to a pool model
 using measured evidence, and keeps a pinned fallback for everything the evidence does not
 support. The dial is the one number an operator turns afterwards to say how that endpoint should
 spend: `cost_quality` in `[0, 1]`, where **0.0 spends for quality** and **1.0 spends as little as
@@ -73,8 +73,8 @@ Three ways, same mapping.
 ```python
 from pathlib import Path
 
-from wmh.optimize.knn import COST_QUALITY_ANCHORS, apply_cost_quality
-from wmh.optimize.policy import RoutingPolicy
+from wmo.optimize.knn import COST_QUALITY_ANCHORS, apply_cost_quality
+from wmo.optimize.policy import RoutingPolicy
 
 fitted = RoutingPolicy.load(Path("models/support/policy.json"))
 cheaper = apply_cost_quality(fitted, 0.6)   # a copy; `fitted` is untouched
@@ -90,7 +90,7 @@ already-dialed policy lands on the same artifact instead of compounding.
 **On disk**, through the CLI, which also prints the anchor table:
 
 ```bash
-uv run wmh optimize route tune models/support/policy.json --cost-quality 0.6
+uv run wmo optimize route tune models/support/policy.json --cost-quality 0.6
 ```
 
 The first run copies the artifact to `policy.base.json` and every later run re-reads *that*, so

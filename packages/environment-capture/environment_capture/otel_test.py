@@ -71,7 +71,7 @@ def test_trajectory_to_spans_emits_action_observation_pairs() -> None:
     assert json.loads(a0["gen_ai.tool.call.arguments"]) == {"command": "ls docs"}
     # Task prompt + trace metadata ride only on the first action span.
     assert a0["gen_ai.prompt"] == "What is 3M's FY2018 capex?"
-    metadata = json.loads(a0["wmh.trace.metadata"])
+    metadata = json.loads(a0["wmo.trace.metadata"])
     assert metadata["benchmark"] == "financebench"
     assert metadata["task_id"] == "fb-train-0"
     assert metadata["model"] == "gpt-5.4"
@@ -79,7 +79,7 @@ def test_trajectory_to_spans_emits_action_observation_pairs() -> None:
     assert metadata["passed"] is True
     a1 = attrs(action1)
     assert "gen_ai.prompt" not in a1
-    assert "wmh.trace.metadata" not in a1
+    assert "wmo.trace.metadata" not in a1
 
     t0 = attrs(tool0)
     assert t0["gen_ai.operation.name"] == "execute_tool"

@@ -22,9 +22,9 @@ import argparse
 import json
 from pathlib import Path
 
-from wmh.config.card import load_card
-from wmh.core.render import render_action
-from wmh.engine.loader import load_world_model
+from wmo.config.card import load_card
+from wmo.core.render import render_action
+from wmo.engine.loader import load_world_model
 
 MODELS_GLOB = "*/models/*"
 SCENARIOS_PER_MODEL = 2

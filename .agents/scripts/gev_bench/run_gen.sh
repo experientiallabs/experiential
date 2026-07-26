@@ -5,13 +5,13 @@ set -euo pipefail
 OUT=.agents/docs/research/gev_bench_results/gen
 CORPUS=packages/environment-capture/tau-bench/traces.otel.jsonl
 
-uv run wmh scenarios build --file "$CORPUS" --limit 100 --budget 15 \
+uv run wmo scenarios build --file "$CORPUS" --limit 100 --budget 15 \
   --provider bedrock --model claude-opus-4-8 --region us-east-1 \
   --out "$OUT/tau_scenarios.json"
 
-uv run wmh build --name gev-tau --no-interactive --file "$CORPUS" \
+uv run wmo build --name gev-tau --no-interactive --file "$CORPUS" \
   --provider bedrock --model claude-haiku-4-5 --judge-model claude-haiku-4-5 \
-  --region us-east-1 --fidelity low --root .wmh </dev/null
+  --region us-east-1 --fidelity low --root .wmo </dev/null
 
 uv run python .agents/scripts/gev_bench/run_verify.py \
   --scenarios "$OUT/tau_scenarios.json" --file "$CORPUS" \

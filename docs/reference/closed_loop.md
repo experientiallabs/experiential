@@ -1,6 +1,6 @@
-# Closed-loop evaluation (`wmh eval --mode closed-loop`)
+# Closed-loop evaluation (`wmo eval --mode closed-loop`)
 
-Open-loop eval (`wmh eval <files>`) replays recorded steps teacher-forced and scores per-step
+Open-loop eval (`wmo eval <files>`) replays recorded steps teacher-forced and scores per-step
 reconstruction fidelity. Closed-loop is the other half: a **live agent** runs a task with the world
 model as its environment — the agent emits a tool call, the world-model LLM answers it, the agent
 reacts, until it submits or hits a turn cap — and we score **task success**, not per-step fidelity.
@@ -10,7 +10,7 @@ the simulated environment as against the real one?*
 ## Running it
 
 ```bash
-wmh eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_report.json
+wmo eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_report.json
 ```
 
 - `tasks.jsonl` — one task per line: `{"task_id": ..., "instruction": ..., "gold": ["...", ...]}`.
@@ -20,7 +20,7 @@ wmh eval tasks.jsonl --mode closed-loop --name <world-model> --k 3 --out sim_rep
   `bash`, `read_file`, `write_file`, and `submit`. Pass `--harness <name>[@ref]` to evaluate a
   stored harness version.
 - By default, the agent and world model share a provider. Configure `[models.agent]` in
-  `.wmh/settings.toml` to evaluate with a distinct agent provider. `wmh optimize` and the
+  `.wmo/settings.toml` to evaluate with a distinct agent provider. `wmo optimize` and the
   reproduction command it prints resolve the same role.
 - Every task runs **k=3 passes** (the repo's eval-reporting convention); the score is the fraction of
   passes whose transcript satisfies every gold assertion, judged by an LLM judge that never trusts
@@ -38,10 +38,10 @@ endpoint = "http://127.0.0.1:8002/v1"
 The configured provider kind and model are included in the saved report label. Keep the full
 settings file with experiment artifacts when endpoint or deployment identity matters.
 
-## Comparing two reports (`wmh eval agreement`)
+## Comparing two reports (`wmo eval agreement`)
 
 ```bash
-wmh eval agreement sim_report.json real_report.json
+wmo eval agreement sim_report.json real_report.json
 ```
 
 Compares two saved closed-loop reports task-by-task: a 2×2 confusion of pass/fail verdicts, the
@@ -56,10 +56,10 @@ those.
 
 ## Where the pieces live
 
-`wmh/evals/`: `base.py` (the general `Evaluation`/`EvalResult` interface), `open_loop.py`
-(teacher-forced replay fidelity — the default `wmh eval` mode), `closed_loop.py` (k-pass live
+`wmo/evals/`: `base.py` (the general `Evaluation`/`EvalResult` interface), `open_loop.py`
+(teacher-forced replay fidelity — the default `wmo eval` mode), `closed_loop.py` (k-pass live
 scoring + `WorldModelEnvironment`), `gold.py` (gold-assertion judge), `agreement.py`
 (report-vs-report comparison), `tasks.py` (task specs).
 
-`wmh/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the `AgentEnvironment`
+`wmo/harness/`: `runtime.py` (the fixed agent loop), `environment.py` (the `AgentEnvironment`
 seam the loop drives), `tools.py` (the tool registry).

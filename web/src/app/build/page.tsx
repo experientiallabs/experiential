@@ -13,7 +13,7 @@ export default function BuildPage() {
         <p className="max-w-2xl text-ink-soft">
           Point at your agent traces (OpenTelemetry GenAI JSONL), pick the LLM that serves the
           environment, and watch the build: ingest, split, index, optimize. The build runs on your
-          local <code className="font-mono">wmh serve</code>, so traces and keys stay on your
+          local <code className="font-mono">wmo serve</code>, so traces and keys stay on your
           machine.
         </p>
       </header>

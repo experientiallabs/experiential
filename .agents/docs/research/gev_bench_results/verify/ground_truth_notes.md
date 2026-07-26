@@ -7,7 +7,7 @@ inspected for a clean, balanced pass/fail signal.
 
 - Corpus: `packages/environment-capture/bird-sql/traces.otel.jsonl` (main checkout; not
   materialized in this worktree). 1993 traces / ~8300 spans, train split only.
-- Recorded outcome: each trace's `wmh.trace.metadata` carries `reward` in {0.0, 1.0}, the
+- Recorded outcome: each trace's `wmo.trace.metadata` carries `reward` in {0.0, 1.0}, the
   deterministic EXECUTION-MATCH grade (the agent's submitted SQL and the reference SQL are each run
   against a pristine copy of the database and their result rows compared). This is a real
   deterministic grade, not an LLM label.
@@ -18,7 +18,7 @@ inspected for a clean, balanced pass/fail signal.
   - instruction = the question + evidence hint (`gen_ai.prompt` -> `Step.task`).
   - answer = the submitted SQL (`metadata.final_answer`).
   - transcript = the bash exploration steps, rendered in the exact `RunResult.transcript()` format
-    the production judge receives in `wmh.evals.closed_loop`.
+    the production judge receives in `wmo.evals.closed_loop`.
   - gold assertion = one semantic post-condition mirroring the execution-match grade: "the final
     SQL is semantically equivalent to (returns the same result set as) <gold_sql>". The transcript
     shows the queries the agent ran and the rows they returned, so the judge has the evidence to

@@ -3,7 +3,7 @@
 # standup), then stand up the real domain environment and replay the recorded tool calls, streaming
 # all stdout + the real DB records. One command.
 #
-#   uv run wmh examples run tau-bench -- [--trace N] [...]
+#   uv run wmo examples run tau-bench -- [--trace N] [...]
 #
 # The whole thing — venv creation, `tau2-bench` install, cloning its data, importing tau2, and
 # loading the domain DB — runs and prints here, so the total wall-clock is the true cost of standing

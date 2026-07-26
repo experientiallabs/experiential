@@ -30,10 +30,10 @@ import numpy as np  # noqa: E402
 
 from run_scenario_e2e import NOVA_LITE, OUT_DIR, REGION  # noqa: E402
 
-from wmh.providers import get_provider  # noqa: E402
-from wmh.providers.base import ProviderConfig, ProviderKind  # noqa: E402
-from wmh.scenarios.mining.facets import Outcome, TraceFacet  # noqa: E402
-from wmh.scenarios.mining.selection import _allocate_slots, hybrid_select  # noqa: E402
+from wmo.providers import get_provider  # noqa: E402
+from wmo.providers.base import ProviderConfig, ProviderKind  # noqa: E402
+from wmo.scenarios.mining.facets import Outcome, TraceFacet  # noqa: E402
+from wmo.scenarios.mining.selection import _allocate_slots, hybrid_select  # noqa: E402
 
 DRAWS = 2000
 K = 8

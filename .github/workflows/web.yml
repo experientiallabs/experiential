@@ -3,11 +3,11 @@ name: web
 on:
   push:
     branches: [main]
-    paths: ["web/**", "examples/**/models/**/card.json", "examples/**/models/**/metrics.json"]
+    paths: ["web/**", "packages/environment-capture/*/models/**"]
   pull_request:
     # The committed src/data/index.json mirrors data outside web/ (model cards + metrics), so
     # changes to those must also run this gate.
-    paths: ["web/**", "examples/**/models/**/card.json", "examples/**/models/**/metrics.json"]
+    paths: ["web/**", "packages/environment-capture/*/models/**"]
 
 jobs:
   gate:

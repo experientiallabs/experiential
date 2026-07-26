@@ -7,7 +7,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "README.md"
-      - "wmh/**"
+      - "wmo/**"
       - "packages/llm-waterfall/llm_waterfall/**"
       - "packages/llm-waterfall/LICENSE"
   push:
@@ -17,7 +17,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - "README.md"
-      - "wmh/**"
+      - "wmo/**"
       - "packages/llm-waterfall/llm_waterfall/**"
       - "packages/llm-waterfall/LICENSE"
   release:
@@ -32,14 +32,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Build the WMH distribution
-        run: uv build --package world-model-harness --no-sources
+      - name: Build the WMO distribution
+        run: uv build --package world-model-optimizer --no-sources
       - name: Smoke test the wheel
         run: |
-          uv venv /tmp/wmh-wheel-smoke
-          uv pip install --python /tmp/wmh-wheel-smoke/bin/python dist/*.whl
-          /tmp/wmh-wheel-smoke/bin/python -c "import llm_waterfall, wmh"
-          /tmp/wmh-wheel-smoke/bin/wmh --help
+          uv venv /tmp/wmo-wheel-smoke
+          uv pip install --python /tmp/wmo-wheel-smoke/bin/python dist/*.whl
+          /tmp/wmo-wheel-smoke/bin/python -c "import llm_waterfall, wmo"
+          /tmp/wmo-wheel-smoke/bin/wmo --help
       - uses: actions/upload-artifact@v4
         with:
           name: python-dist

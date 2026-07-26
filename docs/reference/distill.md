@@ -1,4 +1,4 @@
-# Distill mode (`wmh optimize harness <agent> harbor --mode distill`)
+# Distill mode (`wmo optimize harness <agent> harbor --mode distill`)
 
 The other optimizer modes edit the agent's *harness*; distill mode trains the agent's *model*.
 It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
@@ -19,9 +19,9 @@ ready-to-paste serving snippet.
 - **`E2B_API_KEY`** when the run config sets `harbor.backend = "e2b"` (rollout trials in E2B
   sandboxes); `backend = "local"` runs them on your machine instead.
 - **Free E2B sandbox capacity** for `backend = "e2b"`: a running trial holds one concurrent
-  sandbox (harbor's task environment; terminus-2 itself runs in the `wmh` process), so a
+  sandbox (harbor's task environment; terminus-2 itself runs in the `wmo` process), so a
   run needs `train.trial_concurrency` free slots against your account's concurrent-sandbox
-  limit (100 by default; set `WMH_E2B_SANDBOX_CAP` when yours differs). See
+  limit (100 by default; set `WMO_E2B_SANDBOX_CAP` when yours differs). See
   [Sandbox capacity](#sandbox-capacity).
 - **A harbor job template**: the Harbor `JobConfig` YAML/JSON naming the benchmark dataset the
   trials run against, pointed at by the config's `[harbor] job_template`.
@@ -62,14 +62,14 @@ context_budget_tokens = 65536  # episodes that outgrow this are dropped whole;
 # also strip the thinking block when they re-render a turn as history, so turn N+1's prompt
 # no longer extends turn N's and every turn becomes its own datum fragment, at a cost
 # quadratic in turn count (measured: 2.7x the tokens at 6 turns, 7.8x at 20, 15.1x at 40).
-# The wmh verbatim renderers fix both: the parser sees the action text as a plain string,
+# The wmo verbatim renderers fix both: the parser sees the action text as a plain string,
 # and history replays each turn from its exact sampled ids, so the reasoning is trained on
 # and the episode stays one datum. Keyed per base model because the teacher's own rollouts
 # (warmup, teacher baseline) sample a different one. A typo here fails at config load.
 [rollout.renderers]
-"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmh/nemotron3_verbatim"
-"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmh/nemotron3_ultra_verbatim"
-# Qwen3.5 and Qwen3.6 both use "wmh/qwen3_5_verbatim"; plain Qwen3 uses "wmh/qwen3_verbatim".
+"nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmo/nemotron3_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmo/nemotron3_ultra_verbatim"
+# Qwen3.5 and Qwen3.6 both use "wmo/qwen3_5_verbatim"; plain Qwen3 uses "wmo/qwen3_verbatim".
 
 [train]
 steps = 40           # optimizer steps
@@ -130,7 +130,7 @@ kill_consecutive_steps = 2 # one short batch is a small task draw; two is a tren
 
 [wandb]
 enabled = true   # optional live tracking (needs WANDB_API_KEY or wandb login)
-project = "wmh-distill"
+project = "wmo-distill"
 ```
 
 Billing follows the provider's per-request model: every agent turn re-bills its whole prompt,
@@ -142,7 +142,7 @@ unpriced meters and no `budget.max_usd` refuses to start non-interactively.
 ## Running it
 
 ```bash
-wmh optimize harness pi harbor --mode distill \
+wmo optimize harness pi harbor --mode distill \
   --distill-config run.toml \
   --task-ids train-task-ids.json \
   --holdout-task-ids holdout-task-ids.json \
@@ -171,9 +171,9 @@ trials producing zero token spans and looks exactly like a broken model.
 
 Two mechanisms keep that from happening silently.
 
-- Every sandbox a wmh run creates is recorded, with its owning process id, in a per-process
-  JSONL ledger under the WMH user state directory (`$WMH_HOME/e2b-sandboxes`, else
-  `~/.wmh/e2b-sandboxes`), and marked released when its kill is proved. A ledger entry whose
+- Every sandbox a wmo run creates is recorded, with its owning process id, in a per-process
+  JSONL ledger under the WMO user state directory (`$WMO_HOME/e2b-sandboxes`, else
+  `~/.wmo/e2b-sandboxes`), and marked released when its kill is proved. A ledger entry whose
   owning process is gone is a provable orphan that can be killed by exact id.
 - An e2b-backed distill run preflights capacity: it counts running sandboxes, auto-reclaims
   those provable orphans, and refuses to start when `2 x train.trial_concurrency` slots are
@@ -182,9 +182,9 @@ Two mechanisms keep that from happening silently.
 To inspect or reclaim capacity by hand:
 
 ```bash
-wmh e2b reap                      # dry run: what is running, and what would be killed
-wmh e2b reap --yes                # kill orphans of dead local runs (exact recorded ids)
-wmh e2b reap --stale-minutes 60   # ALSO match harbor trial sandboxes account-wide by age
+wmo e2b reap                      # dry run: what is running, and what would be killed
+wmo e2b reap --yes                # kill orphans of dead local runs (exact recorded ids)
+wmo e2b reap --stale-minutes 60   # ALSO match harbor trial sandboxes account-wide by age
 ```
 
 `--stale-minutes` matches on the account, not just this machine, so it can kill a run on another
@@ -274,9 +274,9 @@ deliberately impossible here: the healthy, untrained baseline of this project's 
 rule would fire before the first gradient step and get muted.
 
 An accepted gate additionally saves the adapter as an immutable version under the project's
-`.wmh/adapters/<agent>/vN/` with a movable `champion` alias, and prints the serving handoff:
+`.wmo/adapters/<agent>/vN/` with a movable `champion` alias, and prints the serving handoff:
 a `[models.agent]` TOML snippet pointing at the final `tinker://...` sampler path through
-Tinker's OpenAI-compatible endpoint (authenticate by setting `WMH_ENDPOINT_API_KEY` to your
+Tinker's OpenAI-compatible endpoint (authenticate by setting `WMO_ENDPOINT_API_KEY` to your
 Tinker API key). With `[wandb] enabled = true`, steps, evals, spend, and the gate summary
 stream to a Weights & Biases run that resumes with the run dir.
 
@@ -287,7 +287,7 @@ run hits `budget.max_usd`, it saves what it can and exits with the exact resume 
 the cap in the config and rerun with:
 
 ```bash
-wmh optimize harness pi harbor --mode distill --run-dir runs/distill-01 --resume
+wmo optimize harness pi harbor --mode distill --run-dir runs/distill-01 --resume
 ```
 
 A resume needs only `--run-dir`: the CLI reloads the pinned splits, backend, and seed harness
@@ -305,14 +305,14 @@ tripwire would never fire again.
 | Symptom | Meaning and fix |
 |---|---|
 | TITO preflight failure (`TITO recompute disagreement ...`) | The sampling and scoring paths disagree on the student's own tokens, so training data would be corrupt; check that the sampler path matches the student base model and that the pinned `tinker` SDK version is unchanged. |
-| Empty-batch abort (`... every trial produced zero token spans`) | Consecutive steps sampled no completions at all. Either the student provider or its sessions are failing upstream (check the runner logs for worker completion warnings), or, on `backend = "e2b"`, trials are dying at sandbox creation because the account is at its concurrent-sandbox cap (`wmh e2b reap`). Fix the cause, then `--resume`. |
-| Every trial 429s at sandbox creation (`maximum number of concurrent E2B sandboxes`) | The account is at its concurrent-sandbox cap, usually because a crashed run's sandboxes are still running out their multi-hour timeout. Run `wmh e2b reap` to see what is holding the slots, then `wmh e2b reap --yes` (orphans of dead local runs) or `wmh e2b reap --stale-minutes N --yes` (account-wide by age). See [Sandbox capacity](#sandbox-capacity). |
-| Start refused (`not enough free E2B sandbox slots ...`) | The capacity preflight found fewer free slots than `2 x train.trial_concurrency` even after reclaiming provable orphans; free slots as above, lower `train.trial_concurrency`, or raise the cap (`WMH_E2B_SANDBOX_CAP`). |
+| Empty-batch abort (`... every trial produced zero token spans`) | Consecutive steps sampled no completions at all. Either the student provider or its sessions are failing upstream (check the runner logs for worker completion warnings), or, on `backend = "e2b"`, trials are dying at sandbox creation because the account is at its concurrent-sandbox cap (`wmo e2b reap`). Fix the cause, then `--resume`. |
+| Every trial 429s at sandbox creation (`maximum number of concurrent E2B sandboxes`) | The account is at its concurrent-sandbox cap, usually because a crashed run's sandboxes are still running out their multi-hour timeout. Run `wmo e2b reap` to see what is holding the slots, then `wmo e2b reap --yes` (orphans of dead local runs) or `wmo e2b reap --stale-minutes N --yes` (account-wide by age). See [Sandbox capacity](#sandbox-capacity). |
+| Start refused (`not enough free E2B sandbox slots ...`) | The capacity preflight found fewer free slots than `2 x train.trial_concurrency` even after reclaiming provable orphans; free slots as above, lower `train.trial_concurrency`, or raise the cap (`WMO_E2B_SANDBOX_CAP`). |
 | Degeneration abort (`... consecutive training steps at a degeneration kill level`) | The student's own sampled tokens collapsed against the baseline this run measured at its first training step: entropy fell (mode collapse) or episodes got much shorter (EOS learned too eagerly), which reverse KL alone does not show. Read the breached ratio in the message, lower `train.learning_rate` or restart from an earlier checkpoint, then `--resume` (the recorded baseline is kept, so the resumed run is not re-anchored on the collapse). |
 | A degeneration warning on a batch that was mostly infrastructure failures | The statistics are batch-pooled, so they tighten as usable episodes shrink; check `trials` against `empty_span_trials` and `infra_failed_trials` in the same row before believing it. Resampling the reference probe gave a healthy 32-episode batch a 1e-5 chance of a length warning and never once reached the kill bound, so a warning on a full batch is a real signal. |
 | High `scaffold_loss_rate` in `metrics.jsonl` | Most episodes were cut off before the model declared itself done, so the solve rate reflects the budgets. Check `stop_reason_counts`: `max_turns` wants a higher `rollout.max_turns`, `budget` a higher `rollout.episode_timeout_s`, `output_truncated` a higher `sampling.max_tokens`, `provider_error` usually means prompts are overflowing the served context window (lower `rollout.context_budget_tokens` so it sits at least `sampling.max_tokens` below the window). |
 | An eval refuses to record (`eval ... is a NULL measurement, not a 0.0`) | Every trial died before the verifier ran, so there is no solve rate to write. Almost always the concurrent-sandbox cap (a distill trial holds two sandboxes); see the E2B rows below, lower `train.trial_concurrency`, then `--resume`. |
-| Deadline expiries (`TinkerDeadlineError: tinker <call> timed out after ...`) | A wedged Tinker session was cut off instead of hanging; transient ones retry with a fresh session on their own, and a persistent one can be given more headroom via the `WMH_TINKER_DEADLINE_<KIND>` env vars the error names. |
-| Resume rejected (`LoadWeights can only be called on uninitialized models`) | Tinker accepts a checkpoint restore only on a model nothing has touched yet, so a resume loads its state as the very first call on a freshly created training client. If a restore is slow enough to blow its deadline, the run retries it on another fresh client; `WMH_TINKER_DEADLINE_LOAD_STATE` (600s by default) is how long one attempt may take, which large students may need raised. |
-| Fragmentation warning (`N of M datum(s) are fragments ...`) | The agent edited its prompt history mid-episode, so shared context re-prefills at full price and teacher scoring multiplies; keep `rollout.compaction = false`, check `[rollout.renderers]` names a `wmh/*_verbatim` renderer for every reasoning model, and check `truncated_spans` in the same row. |
+| Deadline expiries (`TinkerDeadlineError: tinker <call> timed out after ...`) | A wedged Tinker session was cut off instead of hanging; transient ones retry with a fresh session on their own, and a persistent one can be given more headroom via the `WMO_TINKER_DEADLINE_<KIND>` env vars the error names. |
+| Resume rejected (`LoadWeights can only be called on uninitialized models`) | Tinker accepts a checkpoint restore only on a model nothing has touched yet, so a resume loads its state as the very first call on a freshly created training client. If a restore is slow enough to blow its deadline, the run retries it on another fresh client; `WMO_TINKER_DEADLINE_LOAD_STATE` (600s by default) is how long one attempt may take, which large students may need raised. |
+| Fragmentation warning (`N of M datum(s) are fragments ...`) | The agent edited its prompt history mid-episode, so shared context re-prefills at full price and teacher scoring multiplies; keep `rollout.compaction = false`, check `[rollout.renderers]` names a `wmo/*_verbatim` renderer for every reasoning model, and check `truncated_spans` in the same row. |
 | Nonzero `truncated_spans` in `metrics.jsonl` | Turns sampled the full `sampling.max_tokens` and were cut off mid-answer. Nothing else reports this (harbor's own truncation guard cannot fire), so without this counter it reads as a model that writes broken actions. A truncated turn also cannot be replayed verbatim, so it fragments the episode. Raise `sampling.max_tokens`, keeping `rollout.context_budget_tokens` that far below the served window. |

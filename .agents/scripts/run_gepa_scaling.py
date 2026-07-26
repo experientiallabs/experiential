@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Live runner for the GEPA scaling law: fidelity vs. GEPA iterations and vs. training traces.
 
-The SIDECAR for `wmh.research.GepaScalingAblation` — it resolves a corpus, holds the same fixed
+The SIDECAR for `wmo.research.GepaScalingAblation` — it resolves a corpus, holds the same fixed
 test/valid split as the trace scaling law, and sweeps an (n_train × budget) grid: for each point,
 GEPA optimizes the base prompt for `budget` iterations on `n_train` traces (budget=0 = no GEPA, the
 RAG-only anchor that reproduces the trace scaling law's point), then the winner is replay-scored on
@@ -31,20 +31,20 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-from wmh.engine.eval_suites import resolve_eval_suite
-from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import get_adapter
-from wmh.optimize.judge import JUDGE_VERSION, Judge, RubricJudge
+from wmo.engine.eval_suites import resolve_eval_suite
+from wmo.engine.prompts import BASE_ENV_PROMPT
+from wmo.ingest import get_adapter
+from wmo.optimize.judge import JUDGE_VERSION, Judge, RubricJudge
 from llm_waterfall import RetryPolicy
 
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
-from wmh.providers.base import Embedder, Provider
-from wmh.providers.waterfall import WaterfallProvider
-from wmh.research import GepaScalingAblation, run_ablation
-from wmh.research.ablation import AblationReport, Condition
-from wmh.retrieval import HashingEmbedder
-from wmh.tracking.metered import MeteredProvider, classify_build_call
-from wmh.tracking.tracker import RunTracker
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.providers.base import Embedder, Provider
+from wmo.providers.waterfall import WaterfallProvider
+from wmo.research import GepaScalingAblation, run_ablation
+from wmo.research.ablation import AblationReport, Condition
+from wmo.retrieval import HashingEmbedder
+from wmo.tracking.metered import MeteredProvider, classify_build_call
+from wmo.tracking.tracker import RunTracker
 
 # The shared failover LADDER (engaged on capacity errors only, in this order) appended after each
 # role's primary: endflow-account Opus 4.6 and Sonnet 4.6 (a separate AWS account = an independent
@@ -94,7 +94,7 @@ def _chain(primary: str, region: str | None, ladder: bool) -> Provider:
     first pass. Ladder entries equal to
     the primary spec are dropped (no point retrying the same account+model immediately); OpenAI
     rungs without a key are skipped. A single rung with an @profile still goes through
-    WaterfallProvider — wmh's bare BedrockProvider has no profile support and would silently run
+    WaterfallProvider — wmo's bare BedrockProvider has no profile support and would silently run
     on the default account.
     """
     specs = [primary] + [s for s in FALLBACK_LADDER if ladder and s != primary]

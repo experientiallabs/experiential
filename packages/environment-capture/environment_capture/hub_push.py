@@ -65,7 +65,7 @@ def _dataset_card(spec: CorpusSpec) -> str:
     data_dir_lines = "".join(f"- `{d}/` — {DIR_BLURBS[d]}\n" for d in spec.data_dirs)
     return f"""---
 license: {spec.license_id}
-pretty_name: "{spec.benchmark} agent-environment traces (world-model-harness)"
+pretty_name: "{spec.benchmark} agent-environment traces (world-model-optimizer)"
 language:
 - en
 tags:
@@ -81,10 +81,10 @@ tags:
 Every trace is a REAL run: an LLM agent stepping against the actual benchmark environment, with
 each transition (tool call → true environment observation) recorded as OpenTelemetry GenAI spans
 (`{_CORPUS_FILE}`, one span per line). Captured by
-[world-model-harness](https://github.com/experientiallabs/world-model-harness)'s
+[world-model-optimizer](https://github.com/experientiallabs/world-model-optimizer)'s
 `environment-capture` package, which also holds the adapter, capture scripts, and per-corpus
 provenance: see
-[`packages/environment-capture/{spec.benchmark}/`](https://github.com/experientiallabs/world-model-harness/tree/main/packages/environment-capture/{spec.benchmark}).
+[`packages/environment-capture/{spec.benchmark}/`](https://github.com/experientiallabs/world-model-optimizer/tree/main/packages/environment-capture/{spec.benchmark}).
 
 ## License and attribution
 
@@ -106,10 +106,10 @@ path = hf_hub_download(
 )
 ```
 
-or, from a world-model-harness checkout:
+or, from a world-model-optimizer checkout:
 
 ```bash
-uv run wmh download {spec.benchmark}
+uv run wmo download {spec.benchmark}
 ```
 """
 

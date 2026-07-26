@@ -65,11 +65,11 @@ The routing optimizer's core assumption held on its first honest test.
 ## Costs
 
 GEN ~6 min wall (build 100s, verify 209s). EXEC 543s for 64 episodes. VERIFY ~40 judge
-calls x3 votes. All Bedrock; `wmh scenarios` CLIs do not meter cost (filed as a gap).
+calls x3 votes. All Bedrock; `wmo scenarios` CLIs do not meter cost (filed as a gap).
 
 ## Reproduction
 
-Each per-bench report carries exact commands. Worktree: `../wmh-gev-bench`, branch
+Each per-bench report carries exact commands. Worktree: `../wmo-gev-bench`, branch
 `research/gev-benchmarks`. Note: bird-sql databases/splits are re-materialized by
 `fetch_data.py` (gitignored by design); EXEC used the committed train-split-only
 `models/bird-sql` world model, so its test-split scenarios are a clean held-out test.

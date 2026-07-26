@@ -22,11 +22,11 @@ compaction = false
 
 # Terminus-2 cannot use the stock reasoning renderers: they hand harbor's response
 # parser a LIST and kill the trial, and they strip thinking from history, which
-# fragments the episode into one datum per turn. The wmh verbatim wrappers keep the
-# reasoning in the token stream and the episode a single datum (wmh/distill/renderers.py).
+# fragments the episode into one datum per turn. The wmo verbatim wrappers keep the
+# reasoning in the token stream and the episode a single datum (wmo/distill/renderers.py).
 [rollout.renderers]
-"Qwen/Qwen3.5-4B" = "wmh/qwen3_5_verbatim"
-"Qwen/Qwen3.5-9B" = "wmh/qwen3_5_verbatim"
+"Qwen/Qwen3.5-4B" = "wmo/qwen3_5_verbatim"
+"Qwen/Qwen3.5-9B" = "wmo/qwen3_5_verbatim"
 
 [train]
 steps = 1
@@ -69,4 +69,4 @@ max_usd = 8.0
 # WANDB_API_KEY (or a prior `wandb login`). Uncomment to enable.
 [wandb]
 enabled = true
-project = "wmh-distill"
+project = "wmo-distill"

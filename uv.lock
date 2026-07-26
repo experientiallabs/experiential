@@ -12,7 +12,7 @@ resolution-markers = [
 members = [
     "environment-capture",
     "llm-waterfall",
-    "world-model-harness",
+    "world-model-optimizer",
 ]
 
 [[package]]
@@ -3912,7 +3912,7 @@ wheels = [
 ]
 
 [[package]]
-name = "world-model-harness"
+name = "world-model-optimizer"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -4017,7 +4017,7 @@ requires-dist = [
     { name = "typer", specifier = ">=0.16" },
     { name = "uvicorn", specifier = ">=0.38" },
     { name = "wandb", marker = "extra == 'distill'", specifier = ">=0.17" },
-    { name = "world-model-harness", extras = ["otel", "viz", "e2b", "connectors", "harbor", "postgres", "distill"], marker = "extra == 'dev'" },
+    { name = "world-model-optimizer", extras = ["otel", "viz", "e2b", "connectors", "harbor", "postgres", "distill"], marker = "extra == 'dev'" },
 ]
 provides-extras = ["otel", "viz", "e2b", "harbor", "connectors", "postgres", "distill", "dev"]
 

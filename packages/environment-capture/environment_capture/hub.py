@@ -2,7 +2,7 @@
 
 Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
 dirs — lives in a dataset repo under the org. This module is the READ core every front-end
-shares: `wmh download`, `python -m environment_capture.hub fetch`, and the contract the
+shares: `wmo download`, `python -m environment_capture.hub fetch`, and the contract the
 website's serving trace-download endpoint adopts (PR #52). Plain-HTTP against the Hub's public
 REST API, so it needs no extra dependency and no token for public repos (pass ``token`` for
 private ones). Uploading lives in `environment_capture.hub_push` (the ``fetch`` extra).
@@ -12,7 +12,7 @@ files, and fetching never overwrites an existing file unless forced. Downloads s
 ``.part`` sibling and are atomically renamed, so a failed fetch never looks like a corpus.
 
 Usage (from the repo root):
-    uv run wmh download                                              # interactive picker
+    uv run wmo download                                              # interactive picker
     uv run python -m environment_capture.hub fetch dabstep           # skip if already present
     uv run python -m environment_capture.hub fetch all --force       # overwrite local copies
     uv run python -m environment_capture.hub_push bird-sql           # publish/update (write side)
@@ -184,7 +184,7 @@ class PublishedCorpus:
 
 def repo_id_for(benchmark: str) -> str:
     """The dataset repo backing one benchmark's corpus."""
-    return f"{_ORG}/wmh-{benchmark}-traces"
+    return f"{_ORG}/wmo-{benchmark}-traces"
 
 
 def corpus_path(benchmark: str) -> Path:
@@ -199,7 +199,7 @@ def corpus_path(benchmark: str) -> Path:
 def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
     """The org's live corpus datasets (Hub REST API), newest first, mapped to benchmark names.
 
-    Only repos that follow the ``wmh-<benchmark>-traces`` convention AND appear in the local
+    Only repos that follow the ``wmo-<benchmark>-traces`` convention AND appear in the local
     manifest are returned — those are the ones ``fetch_corpus`` knows where to place.
     """
     token = token if token is not None else _default_token()
@@ -210,9 +210,9 @@ def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
             continue
         repo_id = str(entry.get("id", ""))
         name = repo_id.removeprefix(f"{_ORG}/")
-        if not (name.startswith("wmh-") and name.endswith("-traces")):
+        if not (name.startswith("wmo-") and name.endswith("-traces")):
             continue
-        benchmark = name.removeprefix("wmh-").removesuffix("-traces")
+        benchmark = name.removeprefix("wmo-").removesuffix("-traces")
         if benchmark not in CORPORA:
             continue
         modified = str(entry.get("lastModified") or "")

@@ -21,14 +21,14 @@ import re
 
 import numpy as np
 
-from wmh.engine.eval_suites import resolve_eval_suite
-from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import get_adapter
-from wmh.optimize.gepa import predict_observation
-from wmh.optimize.judge import RubricJudge
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
-from wmh.research.scaling_split import partition_corpus
-from wmh.retrieval import HashingEmbedder
+from wmo.engine.eval_suites import resolve_eval_suite
+from wmo.engine.prompts import BASE_ENV_PROMPT
+from wmo.ingest import get_adapter
+from wmo.optimize.gepa import predict_observation
+from wmo.optimize.judge import RubricJudge
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.research.scaling_split import partition_corpus
+from wmo.retrieval import HashingEmbedder
 
 EXAMPLES_ROOT = "packages/environment-capture"  # was "examples/" pre-monorepo (#100/#115)
 MODEL = "us.anthropic.claude-sonnet-4-6"

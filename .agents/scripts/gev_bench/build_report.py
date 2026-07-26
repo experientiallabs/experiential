@@ -23,10 +23,10 @@ import logging
 from collections import Counter
 from pathlib import Path
 
-from wmh.core.types import ActionKind, Trace
-from wmh.ingest import get_adapter
-from wmh.scenarios.synthesis import ScenarioSet
-from wmh.scenarios.verification.verify import VerificationReport
+from wmo.core.types import ActionKind, Trace
+from wmo.ingest import get_adapter
+from wmo.scenarios.synthesis import ScenarioSet
+from wmo.scenarios.verification.verify import VerificationReport
 
 _LOG = logging.getLogger(__name__)
 

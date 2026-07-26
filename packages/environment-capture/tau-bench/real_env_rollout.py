@@ -3,9 +3,9 @@
 
 Sim2real leg of the distillation verification: the same scenarios the world-model eval uses, but
 tool calls execute against Sierra's real domain environments (real JSON DB). Transcripts are
-dumped as JSONL; judging happens wmh-side (score the transcripts with the pinned RubricJudge
-from a wmh checkout) so this venv stays
-tau2+openai only — no wmh import (see README: wmh never imports tau2 and vice versa).
+dumped as JSONL; judging happens wmo-side (score the transcripts with the pinned RubricJudge
+from a wmo checkout) so this venv stays
+tau2+openai only — no wmo import (see README: wmo never imports tau2 and vice versa).
 
 Usage (from examples/tau-bench, in the tau2 venv):
     TAU2_DATA_DIR="$PWD/tau2-bench/data" .venv/bin/python real_env_rollout.py \
@@ -37,7 +37,7 @@ def trace_domains(corpus: Path) -> dict[str, str]:
             continue
         span = json.loads(line)
         attrs = {a["key"]: a.get("value", {}).get("stringValue", "") for a in span.get("attributes", [])}
-        meta = attrs.get("wmh.trace.metadata")
+        meta = attrs.get("wmo.trace.metadata")
         if meta:
             domains[span["traceId"]] = json.loads(meta).get("domain", "")
     return domains

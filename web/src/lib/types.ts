@@ -1,6 +1,6 @@
 /**
- * Domain types, mirrored by hand from the Python models (wmh/config/card.py ModelCard,
- * wmh/core/types.py Action/Observation/Session, wmh/serving BuildSnapshot/RunRecord).
+ * Domain types, mirrored by hand from the Python models (wmo/config/card.py ModelCard,
+ * wmo/core/types.py Action/Observation/Session, wmo/serving BuildSnapshot/RunRecord).
  * Keep in sync when the serving API changes - every page renders through these.
  */
 
@@ -43,7 +43,7 @@ export type PreviewStep = {
 /** One recorded step of a scenario: the raw action to replay, plus display strings. */
 export type ScenarioStep = {
   action: Action; // the recorded action, sent verbatim during open-loop replay
-  action_label: string; // formatted in wmh-play grammar, for display + suggestion chips
+  action_label: string; // formatted in wmo-play grammar, for display + suggestion chips
   observation: string; // what the real environment recorded (the ground truth to compare against)
   is_error: boolean;
 };
@@ -79,7 +79,7 @@ export type IndexEntry = {
   held_out_accuracy: number | null;
   serve_root: string;
   preview: PreviewStep[];
-  suggestions: string[]; // example actions (wmh-play grammar) for the chips + default input
+  suggestions: string[]; // example actions (wmo-play grammar) for the chips + default input
   scenarios: Scenario[]; // recorded traces to explore + replay open-loop
 };
 

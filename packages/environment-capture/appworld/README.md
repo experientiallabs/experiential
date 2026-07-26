@@ -75,7 +75,7 @@ dynamics.
   `execute_python` transitions, mean reward **0.983** (93% of tasks fully solved by AppWorld's own
   tests). Real-host-identity audit is clean (0 trajectories).
 - **Open-loop fidelity** (suite `appworld/default`, seed 0, Opus 4.8 target + rubric judge, run via
-  `uv run wmh eval run appworld/default --examples-root packages/environment-capture`): mean fidelity
+  `uv run wmo eval run appworld/default --examples-root packages/environment-capture`): mean fidelity
   **0.802 ± 0.208**, error-flag accuracy **0.957**, n=280 held-out steps. AppWorld's structured JSON API
   observations reconstruct better than financebench's document excerpts (0.581) but below bird-sql's
   fully structured sqlite rows (0.864) — the residual is opaque per-world identifiers and values

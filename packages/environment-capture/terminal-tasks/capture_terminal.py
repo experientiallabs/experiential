@@ -6,16 +6,16 @@ The environment being reconstructed is a Unix shell. This harness stands up ONE 
 Opus agent a task, and loops: the model emits exactly one ```bash``` command, we `docker exec` it in
 the container, and feed the REAL stdout/stderr + exit code back. The recorded (command -> real
 output) pairs are the trace. This mirrors self-improvement-bench's `run_container_harness` (agents
-issue bash inside a container, real output is recorded), reduced to a single-file, wmh-free tool.
+issue bash inside a container, real output is recorded), reduced to a single-file, wmo-free tool.
 
-Isolated exactly like the other capture tools: stdlib + boto3 only, never imports `wmh`. It writes a
-trajectory JSONL in the shape `convert_to_wmh.py` already reads
+Isolated exactly like the other capture tools: stdlib + boto3 only, never imports `wmo`. It writes a
+trajectory JSONL in the shape `convert_to_wmo.py` already reads
 (`{task, task_category, tool_calls:[{name, arguments:{command}, output, isError}]}`), so:
 
     AWS_REGION=us-east-1 packages/environment-capture/terminal-tasks/.venv/bin/python capture_terminal.py \
         --per-category 60 --out trajectories.jsonl
     # then, with the committed converter:
-    python convert_to_wmh.py trajectories.jsonl --out traces.otel.jsonl --benchmark terminal-tasks
+    python convert_to_wmo.py trajectories.jsonl --out traces.otel.jsonl --benchmark terminal-tasks
 
 To beat per-model Bedrock throttling on a long run, tasks are sharded across several Opus models
 (4.6/4.7/4.8) run concurrently — the same trick tau-bench's telecom capture used.
@@ -152,7 +152,7 @@ def _docker(args: list[str], *, timeout: int = 120) -> tuple[str, int]:
 
 def _start_container() -> str:
     """Start a fresh tools container; return its id. Caller must `docker rm -f` it."""
-    name = f"wmh-term-{uuid.uuid4().hex[:12]}"
+    name = f"wmo-term-{uuid.uuid4().hex[:12]}"
     out, rc = _docker(
         ["docker", "run", "-d", "--name", name, IMAGE, "sleep", "3600"], timeout=120
     )

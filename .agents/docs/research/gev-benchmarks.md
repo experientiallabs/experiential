@@ -3,7 +3,7 @@
 Status: designs + first empirical runs (2026-07-23, wm-create chat). Each step of the
 world model triple gets its own benchmark, built empirically from real traces, with a
 manual (hand-labeled) verification leg. Modeled on the judge meta-eval pattern
-(`wmh/optimize/judge_quality.py`, PR #83): labeled cases pin required behavior,
+(`wmo/optimize/judge_quality.py`, PR #83): labeled cases pin required behavior,
 controls preserve it, defect cases prove fixes.
 
 ## Principles (recorded per Silen, 2026-07-23)
@@ -32,7 +32,7 @@ controls preserve it, defect cases prove fixes.
 - Corpus: tau-bench (packages/environment-capture/tau-bench), first 100 traces
   (deterministic cap), budget 15.
 - Automated: corpus_coverage, cluster balance, back-agreement rate, solvability rate
-  (`wmh scenarios build` + `wmh scenarios verify`).
+  (`wmo scenarios build` + `wmo scenarios verify`).
 - Manual: a blind labeling pass over every mined scenario against its provenance
   traces, 5 dimensions, 0/1 each:
   faithful (task matches what the source traces actually do), self-contained

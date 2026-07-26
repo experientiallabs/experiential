@@ -1,18 +1,18 @@
 # terminal-tasks trace capture (isolated)
 
-Converts terminal-task computer-use-agent trajectories into the world-model-harness trace corpus
+Converts terminal-task computer-use-agent trajectories into the world-model-optimizer trace corpus
 (`packages/environment-capture/terminal-tasks/traces.otel.jsonl`). These are real agent runs on a terminal/bash
 environment —
 an LLM agent issues `bash` tool calls and the **real command output** is recorded per call (including
 real failures: tracebacks, HTTP 301s, retries). The environment being reconstructed is a Unix shell:
 predict a command's real output given the command.
 
-Like the other task examples, this is isolated from `wmh`:
+Like the other task examples, this is isolated from `wmo`:
 
-- `convert_to_wmh.py` is **stdlib-only** (no `wmh` import, no third-party deps). It reads the source
+- `convert_to_wmo.py` is **stdlib-only** (no `wmo` import, no third-party deps). It reads the source
   trajectories **in place** and never copies them into the repo — only the produced OTel JSONL is
   written out.
-- `examples/` is excluded from the `wmh` lint/type gate.
+- `examples/` is excluded from the `wmo` lint/type gate.
 
 ## Prebuilt world model
 
@@ -25,9 +25,9 @@ packages/environment-capture/terminal-tasks/models/terminal-tasks/
 Use it as a local model root:
 
 ```bash
-uv run wmh list --root packages/environment-capture/terminal-tasks
-uv run wmh demo --root packages/environment-capture/terminal-tasks --name terminal-tasks
-uv run wmh play --root packages/environment-capture/terminal-tasks --name terminal-tasks
+uv run wmo list --root packages/environment-capture/terminal-tasks
+uv run wmo demo --root packages/environment-capture/terminal-tasks --name terminal-tasks
+uv run wmo play --root packages/environment-capture/terminal-tasks --name terminal-tasks
 ```
 
 ## Source data
@@ -44,7 +44,7 @@ each tool call has `name`, `arguments`, `output`, and an `isError` flag:
 
 ```bash
 cd packages/environment-capture/terminal-tasks
-python convert_to_wmh.py \
+python convert_to_wmo.py \
   <path/to/trajectories.jsonl> \
   --out traces.otel.jsonl --benchmark terminal-tasks \
   --exclude-substr <source-specific-path-fragment>
@@ -65,7 +65,7 @@ Per trajectory, one Step per tool call:
 `state_before` is empty (a shell has no compact, non-leaky state snapshot; open-loop replay
 reconstructs from action + retrieved steps + teacher-forced history).
 
-The output is OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly.
+The output is OTel-GenAI span JSONL that `wmo.ingest.otel_genai` reads directly.
 
 ## Concurrency scaling law
 

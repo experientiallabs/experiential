@@ -143,7 +143,7 @@ consistent with a simulator that is pessimistic rather than optimistic.
 
 ## Reproduction
 
-From the worktree root (`~/Desktop/Projects/wmh-gev-bench`), Bedrock creds in `.env` / ambient AWS:
+From the worktree root (`~/Desktop/Projects/wmo-gev-bench`), Bedrock creds in `.env` / ambient AWS:
 
 ```bash
 # 1. Materialize the real BIRD mini-dev databases + splits + gold (gitignored / not committed).

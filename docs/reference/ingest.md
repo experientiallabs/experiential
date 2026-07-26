@@ -2,44 +2,44 @@
 
 The harness builds a world model from **recorded agent traces**. You pick a **source** and the
 harness turns traces from whatever you already have - an observability provider, an OTLP export, a
-Postgres table, or a plain chat/tool-call log - into the normalized `wmh.core.types.Trace` shape.
+Postgres table, or a plain chat/tool-call log - into the normalized `wmo.core.types.Trace` shape.
 
-Ingestion runs two ways: as the first stage of `wmh build`, or standalone via **`wmh ingest`**,
+Ingestion runs two ways: as the first stage of `wmo build`, or standalone via **`wmo ingest`**,
 which normalizes a source into an OTel-GenAI JSONL corpus (with live progress) that any later
 command reads.
 
 Everything plugs into **one interface** (`TraceAdapter`) and **one normalizer**
-(`wmh.ingest.normalize`), so adding a source is a thin adapter, never a rewrite.
+(`wmo.ingest.normalize`), so adding a source is a thin adapter, never a rewrite.
 
 ## Quickstart
 
 ```bash
 # Standalone normalize (format auto-detected from the file; live progress):
-wmh ingest --file <export>                                   # -> <export>.otel.jsonl
-wmh ingest --file <export> --json                            # machine-readable event lines
-wmh ingest --source langfuse --pull --api-key 'pk-...:sk-...'
-wmh ingest --dsn postgresql://... --table agent_traces       # postgres rows (see below)
+wmo ingest --file <export>                                   # -> <export>.otel.jsonl
+wmo ingest --file <export> --json                            # machine-readable event lines
+wmo ingest --source langfuse --pull --api-key 'pk-...:sk-...'
+wmo ingest --dsn postgresql://... --table agent_traces       # postgres rows (see below)
 
 # Or ingest as part of a build:
-wmh build --name m --source <name> --file <export>          # build from a file export
-wmh build --name m --source <name> --pull --project <p>     # build from a live vendor pull
-wmh build                                                   # or pick the source in the wizard
+wmo build --name m --source <name> --file <export>          # build from a file export
+wmo build --name m --source <name> --pull --project <p>     # build from a live vendor pull
+wmo build                                                   # or pick the source in the wizard
 ```
 
 `--source` is a registered adapter (`otel-genai`, `chat-json`, `braintrust`, `phoenix`, `langfuse`,
 `langsmith`, `posthog`, `mastra`, `postgres`); `--file` reads an export, `--pull` fetches live
-(with `--project`/`--api-key`) for sources that support it. `wmh ingest` auto-detects a file's
-format when `--source` is omitted (`wmh.ingest.detect`); an unrecognized or mixed corpus errors
-with guidance instead of guessing. On an interactive terminal, `wmh build` with no source launches
+(with `--project`/`--api-key`) for sources that support it. `wmo ingest` auto-detects a file's
+format when `--source` is omitted (`wmo.ingest.detect`); an unrecognized or mixed corpus errors
+with guidance instead of guessing. On an interactive terminal, `wmo build` with no source launches
 a wizard that lists the sources and prompts for file-or-pull.
 
 Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL - the same format the bundled
 `examples/*.otel.jsonl` use - so a source is interchangeable with any other corpus the harness
-reads: `wmh ingest`'s output feeds `wmh build --source otel-genai --file <out>` directly.
+reads: `wmo ingest`'s output feeds `wmo build --source otel-genai --file <out>` directly.
 
 ### Progress events (the streaming contract)
 
-`wmh ingest --json` (and the library generator `wmh.ingest.stream.ingest_events`) emit one JSON
+`wmo ingest --json` (and the library generator `wmo.ingest.stream.ingest_events`) emit one JSON
 event per line: `{"type": "detected", "format", "traces"}`, then repeated
 `{"type": "progress", "normalized", "total", "note"?}`, then a terminal
 `{"type": "done", "traces", "steps", "otel_object"}` or `{"type": "error", "message", "code"?}`.
@@ -92,9 +92,9 @@ or add one.
 If your agent runs live in your own Postgres, ingest them directly - no exporter needed:
 
 ```bash
-uv run wmh ingest --source postgres --dsn "postgresql://user:pass@host:5432/db" --table agent_traces
+uv run wmo ingest --source postgres --dsn "postgresql://user:pass@host:5432/db" --table agent_traces
 # (--source postgres is implied whenever --dsn/--table are passed)
-# needs the driver extra once: pip install 'world-model-harness[postgres]'
+# needs the driver extra once: pip install 'world-model-optimizer[postgres]'
 ```
 
 On a TTY this renders a progress bar; `--json` emits the D-INGEST event lines, e.g. against a
@@ -122,7 +122,7 @@ shapes work out of the box:
 
 When the table has a `trace_id` column its value wins over any id inside the payload, so episode
 boundaries always follow your table. `--since <iso>` filters on the order column. The DSN can also
-come from `$WMH_POSTGRES_DSN`.
+come from `$WMO_POSTGRES_DSN`.
 
 For other stores (warehouses, custom logs), **point them at OpenTelemetry** and ingest with
 `--source otel-genai`: emit OTel GenAI spans and either export them to a file
@@ -131,8 +131,8 @@ For other stores (warehouses, custom logs), **point them at OpenTelemetry** and 
 **File vs. pull.** Every adapter supports `--file` (an export you already have); `--pull` (live from
 the vendor API) is opt-in per adapter and errors with a clear "export to a file" message when a
 source hasn't implemented it. File ingestion needs **no** vendor SDK - the provider adapters parse
-the export as JSON. The optional `pip install 'world-model-harness[phoenix]'` (etc.) extras install a
-provider's own SDK only if you want to drive its export tooling yourself; nothing in `wmh` imports
+the export as JSON. The optional `pip install 'world-model-optimizer[phoenix]'` (etc.) extras install a
+provider's own SDK only if you want to drive its export tooling yourself; nothing in `wmo` imports
 them.
 
 ## The chat / tool-call converter (`chat-json`)
@@ -152,12 +152,12 @@ frameworks can emit). Drop it in a file and ingest it:
 ```
 
 ```bash
-wmh build --name my-model --source chat-json --file conversation.json
+wmo build --name my-model --source chat-json --file conversation.json
 ```
 
 Each assistant tool call becomes an Action paired with its `role:"tool"` result (the Observation);
 a trailing assistant message becomes a final message step. Accepts one conversation object, a JSON
-array of them, JSONL (one per line), or a bare message list. See `wmh/ingest/messages.py`.
+array of them, JSONL (one per line), or a bare message list. See `wmo/ingest/messages.py`.
 
 ## The trace contract (what an adapter produces)
 
@@ -174,11 +174,11 @@ A `Trace` is `{trace_id, steps, source, metadata}`. Each `Step` is one
 a predicted observation for `(state_before, action)` against the recorded one, so faithful `action`
 and `observation` are what matter most.
 
-Each step also carries optional **`attribution`** (`wmh.core.types.StepAttribution`): the model
+Each step also carries optional **`attribution`** (`wmo.core.types.StepAttribution`): the model
 and provider that produced the action, token counts, cost, latency, and an `error_class`
 (`controllable` = the LLM call failed, `environmental` = the tool failed). The normalizer fills it
 best-effort from the GenAI/OpenInference vocabularies (`gen_ai.response.model`, `gen_ai.usage.*`,
-span timing/status), an explicit `wmh.attribution` JSON attribute wins verbatim, and the OTel
+span timing/status), an explicit `wmo.attribution` JSON attribute wins verbatim, and the OTel
 writer round-trips it - this is what makes an ingested corpus usable for policy training, not just
 replay.
 
@@ -187,18 +187,18 @@ replay.
 ```
                                   ┌─ from_file(path)  ─┐
   raw export / vendor API ──▶ adapter                  ├─▶ list[SpanRecord] ──▶ spans_to_traces ──▶ list[Trace]
-                                  └─ from_vendor(pull) ─┘        (wmh.ingest.normalize: the ONE normalizer)
+                                  └─ from_vendor(pull) ─┘        (wmo.ingest.normalize: the ONE normalizer)
 ```
 
-- `wmh/ingest/adapter.py` - the `TraceAdapter` protocol + the registry (`register_adapter`,
+- `wmo/ingest/adapter.py` - the `TraceAdapter` protocol + the registry (`register_adapter`,
   `get_adapter`, `list_adapters`).
-- `wmh/ingest/base.py` - `BaseTraceAdapter`: file/JSONL loading + vendor plumbing, so a concrete
+- `wmo/ingest/base.py` - `BaseTraceAdapter`: file/JSONL loading + vendor plumbing, so a concrete
   adapter only implements `spans_from_payload` (and optionally `_pull_payloads`).
-- `wmh/ingest/normalize.py` - the shared span→Trace core. Understands **both** the OTel GenAI
+- `wmo/ingest/normalize.py` - the shared span→Trace core. Understands **both** the OTel GenAI
   (`gen_ai.*`) and **OpenInference** (`openinference.span.kind`, `tool.name`, `input.value` /
   `output.value`, `llm.*`) vocabularies, pairs each action span with its following tool span, and
-  honors optional `wmh.*` enrichments.
-- `wmh/ingest/otel_writer.py` - the inverse: `Trace` → OTel-GenAI span JSONL (used to persist a
+  honors optional `wmo.*` enrichments.
+- `wmo/ingest/otel_writer.py` - the inverse: `Trace` → OTel-GenAI span JSONL (used to persist a
   corpus; round-trips losslessly through `otel-genai`).
 
 ## Add a new source in ~30 lines
@@ -206,12 +206,12 @@ replay.
 Most providers export spans that are already OTLP or OpenInference, so a new adapter is small:
 
 ```python
-# wmh/ingest/myprovider.py
+# wmo/ingest/myprovider.py
 from __future__ import annotations
 
-from wmh.ingest.adapter import register_adapter
-from wmh.ingest.base import BaseTraceAdapter
-from wmh.ingest.normalize import SpanRecord
+from wmo.ingest.adapter import register_adapter
+from wmo.ingest.base import BaseTraceAdapter
+from wmo.ingest.normalize import SpanRecord
 
 
 class MyProviderAdapter(BaseTraceAdapter):
@@ -242,16 +242,16 @@ class MyProviderAdapter(BaseTraceAdapter):
 register_adapter(MyProviderAdapter())
 ```
 
-Then import it in `wmh/ingest/__init__.py` (for registration on package import), add an inline
-`myprovider_test.py` with a recorded fixture payload (no network), and `wmh build --source myprovider`
+Then import it in `wmo/ingest/__init__.py` (for registration on package import), add an inline
+`myprovider_test.py` with a recorded fixture payload (no network), and `wmo build --source myprovider`
 picks it up. To support `--pull`, implement `_pull_payloads(pull)` returning raw payloads from the
 vendor API (use `httpx`; lazy-import the vendor SDK only if needed). To surface it in the build
-wizard's source picker, add it to `_SOURCES` in `wmh/cli/ui.py`. Mirror the four bundled provider
+wizard's source picker, add it to `_SOURCES` in `wmo/cli/ui.py`. Mirror the four bundled provider
 adapters for reference.
 
 ## Conventions
 
-Adapters live in `wmh/ingest/`, are typed (no `Any`/bare `dict`; use `wmh.core.types`
+Adapters live in `wmo/ingest/`, are typed (no `Any`/bare `dict`; use `wmo.core.types`
 `JsonValue`/`JsonObject`), and are tested inline with fixtures - never the network. Vendor SDKs are
 optional extras, imported lazily; file ingestion works with none installed.
 
@@ -305,10 +305,10 @@ the Observation, mirroring an agent's `(action) -> observation` step.
 ### Run it
 
 ```bash
-uv run wmh build --name phoenix-demo --source phoenix --file phoenix_export.json
+uv run wmo build --name phoenix-demo --source phoenix --file phoenix_export.json
 ```
 
-See `examples/ingest/phoenix_to_wmh.sh` for a runnable script.
+See `examples/ingest/phoenix_to_wmo.sh` for a runnable script.
 
 ### Caveats
 
@@ -324,7 +324,7 @@ The `langfuse` adapter turns a [Langfuse](https://langfuse.com) trace export int
 `Trace` shape the harness builds world models from. Langfuse does **not** emit OTLP spans - it models
 a *trace* with a flat list of nested *observations* - so this adapter overrides `spans_from_payload`
 and re-emits the observations in OTel-GenAI vocabulary for the shared normalizer
-(`wmh/ingest/normalize.py`).
+(`wmo/ingest/normalize.py`).
 
 ### The shape
 
@@ -360,7 +360,7 @@ Each observation has a `type` of `SPAN | GENERATION | EVENT | TOOL`. The adapter
 
 Observations are ordered by `startTime` (ISO-8601 -> a monotonic ordinal; list index when absent).
 The trace `input` becomes the step `task` (`gen_ai.prompt`), and trace `metadata` round-trips via
-`wmh.trace.metadata`. The Langfuse trace id is used as-is as the grouping key (it need not be 32-hex).
+`wmo.trace.metadata`. The Langfuse trace id is used as-is as the grouping key (it need not be 32-hex).
 
 ### Export from Langfuse
 
@@ -385,10 +385,10 @@ framework traces where tool calls are separate child observations, Langfuse's na
 ### Run
 
 ```bash
-uv run wmh build --name langfuse-demo --source langfuse --file langfuse_export.json
+uv run wmo build --name langfuse-demo --source langfuse --file langfuse_export.json
 ```
 
-See `examples/ingest/langfuse_to_wmh.sh` for the end-to-end script.
+See `examples/ingest/langfuse_to_wmo.sh` for the end-to-end script.
 
 ### Caveats
 
@@ -406,7 +406,7 @@ See `examples/ingest/langfuse_to_wmh.sh` for the end-to-end script.
 The `langsmith` adapter turns a [LangSmith](https://smith.langchain.com) (LangChain) run export into
 the normalized `Trace` shape the harness builds world models from. LangSmith does **not** emit OTLP
 spans - it models a trace as a tree of *runs* - so this adapter overrides `spans_from_payload` and
-re-emits the runs in OTel-GenAI vocabulary for the shared normalizer (`wmh/ingest/normalize.py`).
+re-emits the runs in OTel-GenAI vocabulary for the shared normalizer (`wmo/ingest/normalize.py`).
 
 ### The shape
 
@@ -472,10 +472,10 @@ JSONL (one run per line).
 ### Run
 
 ```bash
-uv run wmh build --name langsmith-demo --source langsmith --file langsmith_export.json
+uv run wmo build --name langsmith-demo --source langsmith --file langsmith_export.json
 ```
 
-See `examples/ingest/langsmith_to_wmh.sh` for the end-to-end script.
+See `examples/ingest/langsmith_to_wmo.sh` for the end-to-end script.
 
 ### Caveats
 
@@ -495,7 +495,7 @@ The `braintrust` adapter turns a [Braintrust](https://www.braintrust.dev) span-r
 normalized `Trace` shape the harness builds world models from. Braintrust does **not** emit OTLP
 spans - it logs **spans as rows** in an experiment or project log, where a *trace* is the set of rows
 that share a `root_span_id` - so this adapter overrides `spans_from_payload` and re-emits each row in
-OTel-GenAI vocabulary for the shared normalizer (`wmh/ingest/normalize.py`).
+OTel-GenAI vocabulary for the shared normalizer (`wmo/ingest/normalize.py`).
 
 ### The shape
 
@@ -534,7 +534,7 @@ The adapter maps rows so:
 Rows are grouped by `root_span_id` (the trace key; `span_id` is the per-span key) and ordered by the
 `created` ISO-8601 timestamp (-> a monotonic ordinal; list index when absent). The first user message
 in `input` becomes the step `task` (`gen_ai.prompt`), and the row `metadata` round-trips via
-`wmh.trace.metadata`. The Braintrust ids are used as-is as grouping keys (they need not be 32-hex).
+`wmo.trace.metadata`. The Braintrust ids are used as-is as grouping keys (they need not be 32-hex).
 
 ### Export from Braintrust
 
@@ -554,10 +554,10 @@ Accepted file shapes: a single span row, a JSON array of rows, an API page wrapp
 ### Run
 
 ```bash
-uv run wmh build --name braintrust-demo --source braintrust --file braintrust_export.json
+uv run wmo build --name braintrust-demo --source braintrust --file braintrust_export.json
 ```
 
-See `examples/ingest/braintrust_to_wmh.sh` for the end-to-end script.
+See `examples/ingest/braintrust_to_wmo.sh` for the end-to-end script.
 
 ### Caveats
 
@@ -577,7 +577,7 @@ See `examples/ingest/braintrust_to_wmh.sh` for the end-to-end script.
 The `posthog` adapter turns [PostHog LLM observability](https://posthog.com/docs/ai-engineering) data
 into the normalized `Trace` shape the harness builds world models from. PostHog captures LLM traces
 as analytics **events** (not OTLP spans), so this adapter maps the `$ai_*` events into the OTel-GenAI
-vocabulary for the shared normalizer (`wmh/ingest/normalize.py`).
+vocabulary for the shared normalizer (`wmo/ingest/normalize.py`).
 
 ### The shape
 
@@ -601,12 +601,12 @@ result, and turns a plain generation into a message step. Events order by `times
 
 ```bash
 # From a live PostHog project (HogQL query over $ai_* events):
-uv run wmh build --name posthog-demo --source posthog --pull \
+uv run wmo build --name posthog-demo --source posthog --pull \
   --project "$POSTHOG_PROJECT_ID" --api-key "$POSTHOG_API_KEY"
 
 # Or from an exported events file (a single event, a JSON array, JSONL, or a {"results": [...]}
 # HogQL query result):
-uv run wmh build --name posthog-demo --source posthog --file events.json
+uv run wmo build --name posthog-demo --source posthog --file events.json
 ```
 
 - **API key**: a PostHog *personal API key* (Settings → Personal API keys), passed via `--api-key`
@@ -618,14 +618,14 @@ uv run wmh build --name posthog-demo --source posthog --file events.json
 The pull runs `select event, properties, timestamp from events where event like '$ai_%'` via the
 HogQL query API and normalizes the rows.
 
-See `examples/ingest/posthog_to_wmh.sh` for a runnable script.
+See `examples/ingest/posthog_to_wmo.sh` for a runnable script.
 
 ## Ingesting Mastra traces
 
 The `mastra` adapter turns a [Mastra](https://mastra.ai) AI-tracing export into the normalized
 `Trace` shape the harness builds world models from. Mastra (a TypeScript agent framework) records
 agent runs as **AI-tracing spans** (`ExportedSpan`) typed by `type`, which this adapter maps into the
-OTel-GenAI vocabulary for the shared normalizer (`wmh/ingest/normalize.py`). The span id field is
+OTel-GenAI vocabulary for the shared normalizer (`wmo/ingest/normalize.py`). The span id field is
 `id`, and spans order by `startTime`. (Mastra renamed its LLM spans to "model" spans in the 2025-11
 release; the adapter still accepts the pre-rename aliases - `spanType`, `llm_generation`, `spanId`,
 `startedAt` - so older exports keep working.)
@@ -652,15 +652,15 @@ result; a standalone `tool_call` span becomes a complete step on its own.
 
 ```bash
 # From a running Mastra server (fetches {base}/api/observability/traces):
-uv run wmh build --name mastra-demo --source mastra --pull --project http://localhost:4111
+uv run wmo build --name mastra-demo --source mastra --pull --project http://localhost:4111
 
 # Or from an exported spans file (a single span, a JSON array, a {"spans"|"traces": [...]} wrapper,
 # or JSONL):
-uv run wmh build --name mastra-demo --source mastra --file mastra_spans.json
+uv run wmo build --name mastra-demo --source mastra --file mastra_spans.json
 ```
 
 - **Server URL**: pass the Mastra server base URL as `--project` (or set `$MASTRA_URL`), e.g.
   `http://localhost:4111`. `--api-key` is sent as a bearer token if your server requires auth.
 - **File export**: dump Mastra's stored AI spans (from its storage / the observability API) to JSON.
 
-See `examples/ingest/mastra_to_wmh.sh` for a runnable script.
+See `examples/ingest/mastra_to_wmo.sh` for a runnable script.

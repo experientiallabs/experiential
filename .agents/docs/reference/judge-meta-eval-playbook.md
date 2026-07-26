@@ -3,7 +3,7 @@
 How the judge overhaul (PR #83) was actually done, end to end, so the next agent improving ANY
 automated component — a judge, a retriever, a reward model, an optimizer prompt — can rerun the
 method instead of rediscovering it. The concrete artifacts referenced live in
-`wmh/optimize/judge_quality.py` (the suite), `.agents/scripts/run_judge_quality.py` /
+`wmo/optimize/judge_quality.py` (the suite), `.agents/scripts/run_judge_quality.py` /
 `run_judge_regression.py` / `plot_judge_overhaul.py` (drivers), and
 `.agents/docs/research/judge-overhaul/raw/judge-*.json` (every run). Finished narrative:
 `.agents/docs/research/judge-overhaul/judge-overhaul-writeup.md`.
@@ -23,7 +23,7 @@ defects:
 # Observation-length distribution across corpora (found: 190KB max, p99 32KB → truncation defect;
 # 114/685 + 273/1868 EMPTY observations → the both-empty case is common, not an edge case)
 uv run python -c "
-from wmh.ingest import get_adapter
+from wmo.ingest import get_adapter
 a = get_adapter('otel-genai')
 for f in ['examples/tau-bench/traces.otel.jsonl','examples/terminal-tasks/traces.otel.jsonl']:
     lens = sorted(len(s.observation.content) for t in a.from_file(f) for s in t.steps)
@@ -93,8 +93,8 @@ world-model predictions ONCE, cache them, then score the same cache with old and
 
 ```bash
 uv run python .agents/scripts/run_judge_regression.py \
-  --cache .wmh/judge-regression-preds.json \
-  --out   .wmh/judge-regression.json
+  --cache .wmo/judge-regression-preds.json \
+  --out   .wmo/judge-regression.json
 ```
 
 Report three things: **rank agreement** (Spearman; ours 0.963), **shift sliced by the
@@ -117,7 +117,7 @@ uv run python .agents/scripts/run_judge_quality.py --model gpt-5.5 --provider op
 Opus 4.8 best separation (0.907), Sonnet 4.6 the budget alternative. Switching judge models =
 re-baselining all fidelity numbers. Ops gotchas hit during the sweep: endflow account gets
 AccessDenied invoking Opus 4.8/4.7 (ListInferenceProfiles listing ≠ invocable); default-account
-4.8 brownouts under load — which is why the judge is PINNED (never rides `.wmh/fallback.toml`;
+4.8 brownouts under load — which is why the judge is PINNED (never rides `.wmo/fallback.toml`;
 see `docs/reference/failover.md` once PR #51 lands) while world-model calls fail over.
 
 ## 7. Judge-runtime facts worth not relearning

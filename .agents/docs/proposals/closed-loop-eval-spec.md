@@ -7,7 +7,7 @@ migrated: 2026-07-02
 
 # Closed-loop evaluation (future direction)
 
-Today the harness evaluates the world model **open-loop** (`wmh eval`, `wmh/engine/replay.py`):
+Today the harness evaluates the world model **open-loop** (`wmo eval`, `wmo/engine/replay.py`):
 each held-out step is replayed teacher-forced — feed the *real recorded* `(state, action)`, predict
 the observation, score it against the *real recorded* observation. Nothing the model generates feeds
 forward, so it is perfectly repeatable per step and isolates per-step fidelity. This doc specifies
@@ -66,7 +66,7 @@ environment reach the same verdict as the real one?*
 
 ## Reuse from the open-loop path
 
-- `predict_observation` (`wmh/optimize/gepa.py`) is already the single rollout primitive and already
+- `predict_observation` (`wmo/optimize/gepa.py`) is already the single rollout primitive and already
   accepts `temperature`; closed-loop calls it per agent tool call.
 - The world model's session machinery (`WorldModel.step`, scratchpad state, retrieval) already
   advances state across a session — closed-loop is essentially "let an agent drive `WorldModel.step`
@@ -89,4 +89,4 @@ run_closed_loop(task, agent_provider, world_model, gold, max_turns=50) -> Closed
     return ClosedLoopResult(passed=passed, turns=..., transcript=...)
 ```
 
-Status: **not implemented.** Open-loop (`wmh eval`) is the shipping eval; this is the next layer.
+Status: **not implemented.** Open-loop (`wmo eval`) is the shipping eval; this is the next layer.

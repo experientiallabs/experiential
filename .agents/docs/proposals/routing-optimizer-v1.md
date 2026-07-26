@@ -4,7 +4,7 @@ Status: awaiting Silen's back-and-forth (his explicit direction 2026-07-24: no f
 until the benchmark and approach are agreed). Everything AROUND the optimizer already exists
 on feat/optimizer-switch: pool, closed-loop OutcomeMatrix, policy artifact + serve-time
 selection, OpenAI-compatible streaming endpoint, improvement report. The fitter drops into
-`RoutingPolicy` (wmh/optimize/policy.py) and is judged by the benchmark below.
+`RoutingPolicy` (wmo/optimize/policy.py) and is judged by the benchmark below.
 
 ## 1. The benchmark: what "working" means
 
@@ -58,19 +58,19 @@ Avengers-style cluster-then-assign (2505.19797), the literature's small-data win
 Explicitly NOT in v1: trained per-query predictors (MTRouter-style, v2), cascades, bandits,
 switching-penalty learning (serving is default-sticky until phase 2).
 
-## 3. Invocation shape (CLI/factory), to reconcile with `wmh optimize <agent>`
+## 3. Invocation shape (CLI/factory), to reconcile with `wmo optimize <agent>`
 
-`wmh optimize` today means harness optimization (PR #242). Proposal: keep positional semantics
+`wmo optimize` today means harness optimization (PR #242). Proposal: keep positional semantics
 and add the switch as a subcommand group later only if a third CLI-visible optimizer appears;
 for the routing optimizer the natural surface is endpoint-centric, not optimizer-centric:
 
-    wmh route fit <world-model> --pool .wmh/pool.toml --episodes 2 [--knob 0.5]
-    wmh route report <world-model>   # rebuild the report from the pinned matrix
+    wmo route fit <world-model> --pool .wmo/pool.toml --episodes 2 [--knob 0.5]
+    wmo route report <world-model>   # rebuild the report from the pinned matrix
 
 (name "route" is internal-dev vocabulary; customer copy never says router.) Alternative
-steelman: `wmh optimize --optimizer routing <world-model>` keeps one verb as the brief sketched,
+steelman: `wmo optimize --optimizer routing <world-model>` keeps one verb as the brief sketched,
 but overloads a command whose positional args mean something else today. Recommendation: the
-endpoint-centric `wmh route` pair; revisit if Silen prefers verb unification.
+endpoint-centric `wmo route` pair; revisit if Silen prefers verb unification.
 
 ## 4. Open questions for Silen
 

@@ -1,6 +1,6 @@
 # RL smoke harness (tau-bench)
 
-`smoke.py` exercises every wmh-side data path each downstream training chat will consume
+`smoke.py` exercises every wmo-side data path each downstream training chat will consume
 end-to-end against the real tau-bench world model on Bedrock, at tiny scale (~30 haiku calls,
 `max_steps=3`, 2 scenarios). It exists so we find interface problems in the RL seam here
 before the transfer prompts spawn four training chats that would each hit the same wall.
@@ -39,7 +39,7 @@ smoke doesn't cost Opus money. All 6 paths must PASS.
 ## Verified output
 
 ```
-wmh RL smoke: loading tau-bench world model with Bedrock haiku (us-east-1)...
+wmo RL smoke: loading tau-bench world model with Bedrock haiku (us-east-1)...
   loaded wm + 822 train traces + 2 scenarios (0.2s)
 
 --- 1_ICL ---
@@ -105,7 +105,7 @@ SMOKE SUMMARY
   reward_provider=...)` kwarg before the training chats start; today's smoke works around it.
 - **Bedrock model ids need the dated suffix on inference profiles.** `us.anthropic.claude-haiku-
   4-5` alone returns `ValidationException`; the full profile id
-  `us.anthropic.claude-haiku-4-5-20251001-v1:0` works. `wmh.tracking.pricing` already strips the
+  `us.anthropic.claude-haiku-4-5-20251001-v1:0` works. `wmo.tracking.pricing` already strips the
   suffix for the price lookup, so cost accounting still works.
 - **Identical GRPO rollouts under temperature=0.** The default `provider.complete` is deterministic,
   so both rollouts in a group land on identical outputs and advantages collapse to 0. That is fine

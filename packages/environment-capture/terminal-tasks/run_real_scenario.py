@@ -9,7 +9,7 @@ Because terminal-tasks commands hit live public APIs, a real re-run reflects *cu
 output may differ from the recorded observation (rates change, releases bump) — that is the honest
 real environment.
 
-Stdlib-only and self-contained (no `wmh` import). It reads this example's `traces.otel.jsonl`, picks
+Stdlib-only and self-contained (no `wmo` import). It reads this example's `traces.otel.jsonl`, picks
 a held-out trace using the harness's deterministic blake2b split, and runs that trace's recorded
 commands inside the built container.
 
@@ -34,7 +34,7 @@ _DEFAULT_CORPUS = Path(__file__).resolve().parent / "traces.otel.jsonl"
 
 # The recorded terminal-tasks commands use curl (-> public APIs), python3 (JSON parsing), and jq.
 # A fresh container installs exactly those — the real tool standup the world model never pays.
-_IMAGE_TAG = "wmh-terminal-tasks:latest"
+_IMAGE_TAG = "wmo-terminal-tasks:latest"
 _DOCKERFILE = """\
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \\
@@ -77,14 +77,14 @@ def _load_traces(corpus: Path) -> "list[dict[str, Any]]":
 
 
 def _holdout(traces: list[dict[str, Any]], train_split: float) -> list[dict[str, Any]]:
-    """The held-out traces, by the SAME deterministic blake2b split the wmh harness uses."""
+    """The held-out traces, by the SAME deterministic blake2b split the wmo harness uses."""
     held: list[dict[str, Any]] = []
     for trace in traces:
         digest = hashlib.blake2b(trace["trace_id"].encode("utf-8"), digest_size=8).digest()
         fraction = int.from_bytes(digest, "big") / 2**64
         if fraction >= train_split:
             held.append(trace)
-    return held or traces  # tiny corpora: no held-out -> fall back to all (matches the wmh side)
+    return held or traces  # tiny corpora: no held-out -> fall back to all (matches the wmo side)
 
 
 def _exists(image: str) -> bool:
@@ -95,7 +95,7 @@ def _exists(image: str) -> bool:
 
 def _build_tools_image(tag: str, *, no_cache: bool) -> None:
     """`docker build` the fresh tools image (curl/python3/jq), streaming the apt install live."""
-    with tempfile.TemporaryDirectory(prefix="wmh-tt-build-") as ctx:
+    with tempfile.TemporaryDirectory(prefix="wmo-tt-build-") as ctx:
         (Path(ctx) / "Dockerfile").write_text(_DOCKERFILE, encoding="utf-8")
         cmd = ["docker", "build", "-t", tag]
         if no_cache:
@@ -140,7 +140,7 @@ def main() -> None:
             raise SystemExit(f"--trace-id {args.trace_id} not found in {args.corpus}")
         trace = by_id[args.trace_id]
     elif args.trace is None:
-        # Default: the simplest scenario — fewest recorded commands (matches the wmh side's default).
+        # Default: the simplest scenario — fewest recorded commands (matches the wmo side's default).
         trace = min(pool, key=lambda t: len(t["commands"]))
     elif 0 <= args.trace < len(pool):
         trace = pool[args.trace]
@@ -159,7 +159,7 @@ def main() -> None:
     # Per-run unique image tag so concurrent cold builds are fully isolated — no shared tag to
     # clobber (as if each ran on its own machine). With --cache we reuse the fixed shared tag.
     run_id = uuid.uuid4().hex[:8]
-    image_tag = _IMAGE_TAG if args.cache else f"wmh-terminal-tasks:{run_id}"
+    image_tag = _IMAGE_TAG if args.cache else f"wmo-terminal-tasks:{run_id}"
 
     start = time.monotonic()
     if args.cache and _exists(_IMAGE_TAG):
@@ -171,7 +171,7 @@ def main() -> None:
     build_done = time.monotonic()
     print(f"[container built from scratch in {build_done - start:.1f}s]\n")
 
-    container = f"wmh-real-{run_id}"
+    container = f"wmo-real-{run_id}"
     rc = subprocess.run(
         ["docker", "run", "-d", "--name", container, "-w", "/work", "--rm", image_tag,
          "sleep", "2h"],

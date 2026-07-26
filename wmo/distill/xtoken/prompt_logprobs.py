@@ -1,0 +1,475 @@
+"""Teacher-forced scoring against a self-hosted vLLM `/v1/completions` endpoint.
+
+This is the cross-tokenizer teacher's ONLY network surface. `PromptLogprobClient.score`
+submits an exact token sequence we already own and returns one logprob per position, so
+the returned row indexes one for one into the teacher token ids the chunk aligner
+produced. Nothing here tokenizes, renders, or samples.
+
+Five wire facts are load-bearing (each was a real bug or a live probe finding):
+
+1. The prompt goes on the wire as `list[int]`, NEVER as text. vLLM re-tokenizes a text
+   prompt server-side with `add_special_tokens` defaulting to True, which prepends
+   GLM's prefix/BOS and shifts EVERY position by one against our local offsets. There
+   is no error: the response looks perfectly well formed and every span sum is wrong.
+2. `/v1/chat/completions` supports neither `echo` nor `prompt_logprobs`, so it cannot
+   score a prompt at all. The chat template is applied client-side (see
+   `wmo.distill.rendering`) and the rendered ids come here.
+3. Position convention: `prompt_logprobs[p]` is the distribution FOR token p (entry 0
+   is null because token 0 has no context). That is exactly the Tinker
+   `compute_logprobs` convention `wmo.distill.teacher` already uses, so `score`
+   returns `len(token_ids)` entries with entry 0 = None and no shifting anywhere.
+   A short row is rejected rather than returned: it would silently corrupt every
+   downstream chunk sum.
+4. The response shape varies by vLLM version: `prompt_logprobs` sits either at the top
+   level or under `choices[0]`. Both are read. Each position is a dict keyed by token
+   id (a JSON string) whose value carries a `logprob`, and the REALIZED token's entry
+   is the one we want, never the argmax.
+5. Auth is a Bearer token when `api_key` is set. The repo convention for self-hosted
+   endpoints is the `WMO_ENDPOINT_API_KEY` env var (see `wmo.providers.openai`), but
+   this module never reads the environment: the caller passes the key in.
+
+Deadlines are owned here rather than through `wmo.distill.deadlines`. That module
+bounds Tinker SDK calls (futures and blocking calls with no timeout parameter) and its
+knobs are Tinker-named env vars; httpx already bounds an HTTP request natively, so
+wrapping it in a watchdog thread would add a second, weaker timer and a misleading
+`TinkerDeadlineError`. The default `timeout_s` is 1200s (20 minutes), sized for the
+real workload rather than for latency headroom: merged datum length is median ~14.5k
+and up to 65.5k teacher tokens, and a distillation step fires many of these
+concurrently, so a request waits in the server's queue behind other prefills before
+its own runs. Every request is bounded on connect, read, write, and pool, so a wedged
+connection raises `PromptLogprobTimeoutError` instead of hanging a run forever.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import threading
+import time
+from collections.abc import Callable
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from wmo.providers.base import ProviderKind, VerifyResult
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT_S = 1200.0
+"""Per-request wall-clock bound; see the module docstring for the sizing."""
+
+DEFAULT_MAX_ATTEMPTS = 3
+"""Attempts per `score` call, counting the first; only transient failures retry."""
+
+_RETRY_BASE_DELAY_S = 2.0
+_RETRY_MAX_DELAY_S = 30.0
+
+_RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+"""Statuses worth another attempt: server-side capacity, restarts, cold boots."""
+
+_COMPLETIONS_PATH = "/v1/completions"
+
+_VERIFY_PROBE_TOKEN_IDS: tuple[int, ...] = (1, 2, 3, 4)
+"""A tiny fixed sequence for verify(); small ids are valid in any real vocab."""
+
+_MAX_CANDIDATES_IN_ERROR = 8
+"""How many returned candidate ids an error message quotes before eliding."""
+
+_MAX_BODY_CHARS_IN_ERROR = 300
+
+
+class PromptLogprobError(RuntimeError):
+    """A teacher scoring request failed, or its response was unusable.
+
+    Raised for HTTP failures, unparsable bodies, and shape violations (a row of
+    the wrong length, a missing realized token). The message names the endpoint
+    and the remedy, because a wrong shape here is silent data corruption
+    downstream rather than a crash.
+    """
+
+
+class PromptLogprobTimeoutError(PromptLogprobError, TimeoutError):
+    """A teacher scoring request blew its wall-clock deadline.
+
+    Subclasses `TimeoutError` and keeps "timed out" in the message so retry
+    layers classify it as transient capacity, matching
+    `wmo.distill.deadlines.TinkerDeadlineError`'s contract.
+    """
+
+
+class _LogprobEntry(BaseModel):
+    """One candidate in a position's `prompt_logprobs` dict (rank/decoded ignored)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    logprob: float
+
+
+class _Choice(BaseModel):
+    """The one completion choice, which carries `prompt_logprobs` on some versions."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    prompt_logprobs: list[dict[str, _LogprobEntry] | None] | None = None
+
+
+class _CompletionsResponse(BaseModel):
+    """A `/v1/completions` response, tolerant of where `prompt_logprobs` lands."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    prompt_logprobs: list[dict[str, _LogprobEntry] | None] | None = None
+    choices: list[_Choice] = Field(default_factory=list)
+
+
+class _CompletionsRequest(BaseModel):
+    """The scoring request body: a token-id prompt, one throwaway sampled token."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    prompt: list[int]
+    max_tokens: int = 1
+    prompt_logprobs: int = 0
+    temperature: float = 0.0
+
+
+def _completions_url(endpoint: str) -> str:
+    """The `/v1/completions` URL for a configured endpoint.
+
+    Accepts either a bare server root (`https://host`) or a root that already
+    carries the OpenAI `/v1` prefix (the form `wmo providers` stores for
+    OpenAI-compatible servers), so a caller cannot accidentally produce
+    `/v1/v1/completions`.
+
+    Args:
+        endpoint: The teacher server base URL.
+
+    Returns:
+        The absolute URL to POST scoring requests to.
+
+    Raises:
+        ValueError: If `endpoint` is blank.
+    """
+    base = endpoint.strip().rstrip("/")
+    if not base:
+        raise ValueError(
+            "PromptLogprobClient needs a teacher endpoint URL, for example "
+            "'https://my-vllm-host' or 'https://my-vllm-host/v1'; got an empty string"
+        )
+    if base.endswith("/v1"):
+        return base + "/completions"
+    return base + _COMPLETIONS_PATH
+
+
+class PromptLogprobClient:
+    """Scores exact teacher token ids on a vLLM `/v1/completions` endpoint.
+
+    One client is safe to share across threads: httpx connection pooling and the
+    usage counter are both synchronized, so a scoring pool can fan out over
+    datums against a single client (that is how the teacher is driven in a step).
+
+    Example:
+        >>> client = PromptLogprobClient("https://vllm-host", "zai-org/GLM-5.2")
+        >>> row = client.score(teacher_token_ids)  # doctest: +SKIP
+        >>> row[0] is None  # position 0 has no context  # doctest: +SKIP
+        True
+    """
+
+    def __init__(
+        self,
+        endpoint: str,
+        model: str,
+        *,
+        api_key: str | None = None,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+        transport: httpx.BaseTransport | None = None,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        """Build a client bound to one endpoint and one served model.
+
+        Args:
+            endpoint: Teacher server base URL, with or without a `/v1` suffix.
+            model: The model id the server serves, sent as the request's `model`.
+            api_key: Bearer token for the endpoint. The repo convention is to pass
+                `WMO_ENDPOINT_API_KEY`; this module never reads the environment
+                itself, so the real provider keys cannot leak to an arbitrary host.
+                None (the norm for a private vLLM host) sends no auth header.
+            timeout_s: Per-request wall-clock bound in seconds, applied to connect,
+                read, write, and pool waits. Defaults to `DEFAULT_TIMEOUT_S`
+                (1200s), sized for a 65k-token prefill queued behind other
+                requests. Retries multiply the worst case by `max_attempts`.
+            transport: httpx transport override. Tests pass an
+                `httpx.MockTransport` so no request ever leaves the process.
+            max_attempts: Total attempts per `score` call. Only transient failures
+                (timeouts, transport errors, retryable statuses) consume attempts.
+            sleep: Backoff sleeper, injectable so tests do not wait.
+
+        Raises:
+            ValueError: If the endpoint is blank, `timeout_s` is not a positive
+                finite number, or `max_attempts` is below 1.
+        """
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError(
+                f"timeout_s must be a positive finite number of seconds, got {timeout_s!r}; "
+                f"use the default ({DEFAULT_TIMEOUT_S:g}) unless the endpoint is known to be fast"
+            )
+        if max_attempts < 1:
+            raise ValueError(
+                f"max_attempts must be at least 1, got {max_attempts}; pass 1 to disable retries"
+            )
+        self._url = _completions_url(endpoint)
+        self._model = model
+        self._timeout_s = timeout_s
+        self._max_attempts = max_attempts
+        self._sleep = sleep
+        self._usage_tokens = 0
+        self._usage_lock = threading.Lock()
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(timeout_s),
+            transport=transport,
+            headers=headers,
+        )
+
+    @property
+    def url(self) -> str:
+        """The absolute scoring URL this client posts to."""
+        return self._url
+
+    @property
+    def model(self) -> str:
+        """The served model id sent with every request."""
+        return self._model
+
+    def score(self, token_ids: list[int]) -> list[float | None]:
+        """Teacher logprobs for an exact token sequence, one entry per position.
+
+        Args:
+            token_ids: The teacher's own token ids, in the teacher's vocabulary.
+                They are sent verbatim as integers, so the returned row aligns
+                index for index with this list.
+
+        Returns:
+            A list of `len(token_ids)` entries. Entry 0 is always None (token 0
+            has no context); entry p is the teacher's logprob of `token_ids[p]`
+            given `token_ids[:p]`.
+
+        Raises:
+            ValueError: If `token_ids` is empty.
+            PromptLogprobTimeoutError: If every attempt blew the deadline.
+            PromptLogprobError: On a non-retryable HTTP status, an exhausted
+                retry budget, an unparsable body, a row length that does not
+                match the prompt, or a position whose dict lacks the realized
+                token.
+        """
+        if not token_ids:
+            raise ValueError(
+                "score() needs at least one token id; an empty prompt has nothing to score "
+                "(filter empty spans out before scoring)"
+            )
+        return self._score(token_ids, count_usage=True)
+
+    def verify(self) -> VerifyResult:
+        """One tiny scoring probe, reporting failure as `ok=False` instead of raising.
+
+        Mirrors `wmo.providers.base.verify_via_ping` and `TinkerTeacher.verify`, so
+        preflight can report every misconfigured backend at once. The probe's tokens
+        are excluded from `usage()`.
+
+        Returns:
+            `ok=True` when the endpoint answered with a well-formed row, otherwise
+            `ok=False` with the failure text in `detail`.
+        """
+        try:
+            self._score(list(_VERIFY_PROBE_TOKEN_IDS), count_usage=False)
+        except Exception as exc:  # noqa: BLE001 - verify reports failure, never raises
+            return VerifyResult(
+                ok=False, kind=ProviderKind.OPENAI, model=self._model, detail=str(exc)
+            )
+        return VerifyResult(ok=True, kind=ProviderKind.OPENAI, model=self._model, detail=self._url)
+
+    def usage(self) -> int:
+        """Cumulative teacher tokens submitted for scoring (verify probes excluded).
+
+        Counts every dispatched attempt, not only successful ones: a request that
+        timed out or died mid-response has usually already run its prefill on the
+        server, so the work is real. This matches `TinkerTeacher.usage`'s
+        "submitted, not billed-on-success" contract and feeds the same
+        teacher_prefill meter.
+        """
+        with self._usage_lock:
+            return self._usage_tokens
+
+    def close(self) -> None:
+        """Close the underlying connection pool."""
+        self._client.close()
+
+    def __enter__(self) -> PromptLogprobClient:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def _score(self, token_ids: list[int], *, count_usage: bool) -> list[float | None]:
+        body = _CompletionsRequest(model=self._model, prompt=token_ids).model_dump()
+        response = self._post(body, token_count=len(token_ids) if count_usage else 0)
+        rows = self._prompt_logprob_rows(response, expected=len(token_ids))
+        return self._realized_row(rows, token_ids)
+
+    def _post(self, body: dict[str, object], *, token_count: int) -> _CompletionsResponse:
+        """POST one scoring request, retrying only transient failures."""
+        last_error: PromptLogprobError | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            if token_count:
+                with self._usage_lock:
+                    self._usage_tokens += token_count
+            try:
+                response = self._client.post(self._url, json=body)
+            except httpx.TimeoutException as exc:
+                last_error = PromptLogprobTimeoutError(
+                    f"teacher scoring timed out after {self._timeout_s:g}s against "
+                    f"{self._url} (attempt {attempt}/{self._max_attempts}): {exc}. Raise "
+                    "timeout_s, lower the number of concurrent scoring calls, or check the "
+                    "endpoint is up and not stuck in a cold boot"
+                )
+            except httpx.TransportError as exc:
+                last_error = PromptLogprobError(
+                    f"teacher scoring could not reach {self._url} "
+                    f"(attempt {attempt}/{self._max_attempts}): {exc!r}. Check the endpoint URL "
+                    "and that the vLLM server is running and reachable from this host"
+                )
+            else:
+                if response.status_code < 400:
+                    return self._parse(response)
+                error = self._status_error(response, attempt)
+                if response.status_code not in _RETRYABLE_STATUS:
+                    raise error
+                last_error = error
+            if attempt < self._max_attempts:
+                delay = min(_RETRY_BASE_DELAY_S * 2 ** (attempt - 1), _RETRY_MAX_DELAY_S)
+                logger.warning(
+                    "teacher scoring attempt %d/%d failed (%s); retrying in %.0fs",
+                    attempt,
+                    self._max_attempts,
+                    last_error,
+                    delay,
+                )
+                self._sleep(delay)
+        assert last_error is not None  # noqa: S101 - the loop runs at least once
+        raise last_error
+
+    def _status_error(self, response: httpx.Response, attempt: int) -> PromptLogprobError:
+        """A typed error for a failing HTTP status, with a status-specific remedy."""
+        body = response.text[:_MAX_BODY_CHARS_IN_ERROR]
+        if response.status_code in (401, 403):
+            remedy = (
+                "the endpoint rejected the credentials: pass the api_key this server expects "
+                "(the repo convention is the WMO_ENDPOINT_API_KEY env var, read by the caller)"
+            )
+        elif response.status_code == 404:
+            remedy = (
+                f"no such route or model: check the base URL and that the server serves model "
+                f"{self._model!r} (GET /v1/models lists it)"
+            )
+        elif response.status_code in _RETRYABLE_STATUS:
+            remedy = (
+                "the server failed transiently (capacity, restart, or cold boot); retries are "
+                "exhausted, so lower scoring concurrency or check the server logs"
+            )
+        else:
+            remedy = (
+                "the server rejected the request: confirm this vLLM build supports "
+                "prompt_logprobs on /v1/completions and that no token id exceeds its vocab"
+            )
+        return PromptLogprobError(
+            f"teacher scoring got HTTP {response.status_code} from {self._url} "
+            f"(attempt {attempt}/{self._max_attempts}): {body!r}. {remedy}"
+        )
+
+    def _parse(self, response: httpx.Response) -> _CompletionsResponse:
+        """Parse a 2xx body, turning malformed JSON into a typed error."""
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PromptLogprobError(
+                f"teacher scoring got a non-JSON response from {self._url}: "
+                f"{response.text[:_MAX_BODY_CHARS_IN_ERROR]!r}. Check the URL points at a vLLM "
+                "OpenAI server and not at a proxy or web page"
+            ) from exc
+        try:
+            return _CompletionsResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise PromptLogprobError(
+                f"teacher scoring could not read the response from {self._url}: {exc}. Each "
+                "prompt_logprobs position must be null or a dict of token id to an object with "
+                "a 'logprob'; check the vLLM version's response format"
+            ) from exc
+
+    def _prompt_logprob_rows(
+        self, response: _CompletionsResponse, *, expected: int
+    ) -> list[dict[str, _LogprobEntry] | None]:
+        """The per-position candidate dicts, from either shape, length-validated."""
+        rows = response.prompt_logprobs
+        if rows is None and response.choices:
+            rows = response.choices[0].prompt_logprobs
+        if rows is None:
+            raise PromptLogprobError(
+                f"teacher scoring response from {self._url} carried no prompt_logprobs (neither "
+                "at the top level nor under choices[0]). The request must go to /v1/completions "
+                "with prompt_logprobs set: /v1/chat/completions supports neither prompt_logprobs "
+                "nor echo, and older servers may not support it at all"
+            )
+        if len(rows) != expected:
+            raise PromptLogprobError(
+                f"teacher scoring returned {len(rows)} prompt_logprobs entries for a "
+                f"{expected}-token prompt at {self._url} (model {self._model}). Every position "
+                "must be scored, since a short or long row silently corrupts every downstream "
+                "span sum. Send the prompt as a list[int] (a text prompt is re-tokenized "
+                "server-side, which shifts every position), and confirm the server's "
+                f"max_model_len covers {expected} tokens"
+            )
+        return rows
+
+    def _realized_row(
+        self,
+        rows: list[dict[str, _LogprobEntry] | None],
+        token_ids: list[int],
+    ) -> list[float | None]:
+        """Pull each position's REALIZED token logprob, never the argmax."""
+        row: list[float | None] = [None]
+        for index in range(1, len(token_ids)):
+            candidates = rows[index]
+            token_id = token_ids[index]
+            entry = candidates.get(str(token_id)) if candidates else None
+            if entry is None:
+                raise PromptLogprobError(
+                    f"teacher scoring returned no logprob for the realized token {token_id} at "
+                    f"position {index} of {len(token_ids)} from {self._url} "
+                    f"(candidates: {_describe_candidates(candidates)}). The realized token is "
+                    "always included when the prompt is sent as token ids with prompt_logprobs "
+                    f"set, so this means the ids are not in {self._model}'s vocabulary or the "
+                    "prompt was re-tokenized server-side"
+                )
+            row.append(entry.logprob)
+        logger.debug(
+            "teacher scored %d position(s) at %s, %d tokens submitted so far",
+            len(token_ids),
+            self._url,
+            self.usage(),
+        )
+        return row
+
+
+def _describe_candidates(candidates: dict[str, _LogprobEntry] | None) -> str:
+    """A short, deterministic rendering of a position's returned candidate ids."""
+    if not candidates:
+        return "none (the position was null or empty)"
+    keys = sorted(candidates)
+    shown = ", ".join(keys[:_MAX_CANDIDATES_IN_ERROR])
+    if len(keys) > _MAX_CANDIDATES_IN_ERROR:
+        return f"{len(keys)} returned, first ids {shown}, ..."
+    return shown

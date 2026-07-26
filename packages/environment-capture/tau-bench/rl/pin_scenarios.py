@@ -27,10 +27,10 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
-from wmh.config import load_config
-from wmh.core.types import ActionKind, Trace
-from wmh.engine import ingest, split_traces_3way
-from wmh.env import Scenario, scenarios_from_traces
+from wmo.config import load_config
+from wmo.core.types import ActionKind, Trace
+from wmo.engine import ingest, split_traces_3way
+from wmo.env import Scenario, scenarios_from_traces
 
 _HERE = Path(__file__).resolve().parent
 _MODEL_DIR = _HERE.parent / "models" / "tau-bench"

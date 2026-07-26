@@ -22,9 +22,9 @@ fallback) — see `environment_capture/benchmarks/financebench.py`.
 - `capture.py` — fresh real-run capture against this adapter (Bedrock agent), used to top up the
   corpus with richer multi-step trajectories.
 - `evals/default.toml` — fidelity suite; run with
-  `uv run wmh eval run financebench/default --examples-root packages/environment-capture`.
+  `uv run wmo eval run financebench/default --examples-root packages/environment-capture`.
 - `wm_replace_demo.py` — the same agent runs the held-out test tasks against the REAL env and a
-  world model of it (`wmh build --name financebench --file .../traces.otel.jsonl` first), graded
+  world model of it (`wmo build --name financebench --file .../traces.otel.jsonl` first), graded
   by the same deterministic grader; full transcripts land in `runs/` for auditing.
 
 ## Results (2026-07-02, corpus as committed)

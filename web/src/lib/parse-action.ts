@@ -1,5 +1,5 @@
 /**
- * Mirror of `wmh play`'s forgiving action grammar (wmh/engine/play.py:parse_action):
+ * Mirror of `wmo play`'s forgiving action grammar (wmo/engine/play.py:parse_action):
  *   - `get_user {"id": "u1"}` -> tool call with JSON arguments
  *   - `list_flights`          -> tool call, no arguments
  *   - `say hello there`       -> free-text message

@@ -35,7 +35,7 @@ fidelity.
 **Why it's parked.** Every provider the harness ships (Bedrock/Anthropic Opus 4.8, OpenAI/Azure GPT
 5.5) **rejects sampling parameters** — `temperature`, `top_p`, `top_k` return a 400 on these
 frontier reasoning models, and the provider `complete()` methods deliberately do not forward
-`temperature` (see the comments in `wmh/providers/bedrock.py`, `anthropic.py`, `_openai_common.py`).
+`temperature` (see the comments in `wmo/providers/bedrock.py`, `anthropic.py`, `_openai_common.py`).
 So both grid axes would collapse to identical T=0 calls — the experiment would report four identical
 cells no matter what. It is **inert, not just noisy**, on the current model lineup.
 

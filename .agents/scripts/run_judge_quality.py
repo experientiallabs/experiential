@@ -1,4 +1,4 @@
-"""Run the judge-quality meta-eval (wmh.optimize.judge_quality) against a real Bedrock judge.
+"""Run the judge-quality meta-eval (wmo.optimize.judge_quality) against a real Bedrock judge.
 
 Usage:
     uv run python .agents/scripts/run_judge_quality.py --out .agents/docs/research/judge-overhaul/raw/jq.json
@@ -11,9 +11,9 @@ import argparse
 import json
 from pathlib import Path
 
-from wmh.optimize.judge import RubricJudge
-from wmh.optimize.judge_quality import JUDGE_QUALITY_CASES, run_judge_quality
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.optimize.judge import RubricJudge
+from wmo.optimize.judge_quality import JUDGE_QUALITY_CASES, run_judge_quality
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
 
 
 def main() -> None:

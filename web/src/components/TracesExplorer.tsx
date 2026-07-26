@@ -5,7 +5,7 @@
  * the live world model: feed the recorded action sequence to a fresh session and compare, step by
  * step, what the world model produces against what the real environment recorded. A running
  * fidelity score summarizes how faithfully the reconstruction tracks the ground truth. This is
- * the teacher-forced replay `wmh eval` runs, made interactive.
+ * the teacher-forced replay `wmo eval` runs, made interactive.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -262,7 +262,7 @@ function DownloadPanel({ entry, onDone }: { entry: IndexEntry; onDone: () => voi
       <div className="mono-label">traces not downloaded</div>
       <p className="text-sm text-ink-soft">
         This model&apos;s traces live on the Hugging Face Hub. Download them to explore and replay
-        them here; they land on your local <code className="font-mono">wmh serve</code>, so this is
+        them here; they land on your local <code className="font-mono">wmo serve</code>, so this is
         a one-time fetch.
       </p>
       <button

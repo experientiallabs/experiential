@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Workspace scripts live outside any package tree by design (gate-exempt, nothing in
-# wmh/ may depend on them); this one-line bootstrap is what lets siblings share
+# wmo/ may depend on them); this one-line bootstrap is what lets siblings share
 # gev_bench.corpus without promoting workspace code into the package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -34,13 +34,13 @@ from gev_bench.corpus import VerifyCase, load_cases, select_balanced  # noqa: E4
 # Deliberate private-API reuse: the meta-eval must grade the EXACT production judge
 # (same prompt builder, same parser); a public re-implementation would test a copy.
 # The only deviation is temperature, which GoldJudge.score hardcodes to 0.0.
-from wmh.evals.gold import (  # noqa: E402
+from wmo.evals.gold import (  # noqa: E402
     GOLD_JUDGE_SYSTEM,
     _build_prompt,
     _parse,
 )
-from wmh.providers import ProviderConfig, ProviderKind, get_provider  # noqa: E402
-from wmh.providers.base import Message, Provider  # noqa: E402
+from wmo.providers import ProviderConfig, ProviderKind, get_provider  # noqa: E402
+from wmo.providers.base import Message, Provider  # noqa: E402
 
 _LOG = logging.getLogger(__name__)
 

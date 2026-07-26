@@ -1,9 +1,9 @@
 /**
- * Typed client for a locally running `wmh serve` (FastAPI, wmh/serving/server.py).
+ * Typed client for a locally running `wmo serve` (FastAPI, wmo/serving/server.py).
  *
  * Plain fetch wrappers, one per endpoint. Unexpected statuses throw with the server's `detail`
  * message; callers branch on thrown ApiError.status for expected failures (404, 409, 503).
- * The base URL comes from NEXT_PUBLIC_WMH_API (default: http://localhost:8000) - never a secret.
+ * The base URL comes from NEXT_PUBLIC_WMO_API (default: http://localhost:8000) - never a secret.
  */
 
 import type {
@@ -16,7 +16,7 @@ import type {
 } from "./types";
 
 export const API_BASE =
-  process.env.NEXT_PUBLIC_WMH_API ?? "http://localhost:8000";
+  process.env.NEXT_PUBLIC_WMO_API ?? "http://localhost:8000";
 
 export class ApiError extends Error {
   constructor(
@@ -65,7 +65,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** True when a wmh serve backend answers on API_BASE. */
+/** True when a wmo serve backend answers on API_BASE. */
 export async function isServeUp(): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/healthz`, { cache: "no-store" });

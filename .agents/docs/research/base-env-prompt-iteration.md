@@ -7,13 +7,13 @@ migrated: 2026-07-02
 
 # Iterating on BASE_ENV_PROMPT with replay fidelity
 
-`BASE_ENV_PROMPT` (`wmh/engine/prompts.py`) is layer (a): the env-agnostic prompt GEPA evolves from.
+`BASE_ENV_PROMPT` (`wmo/engine/prompts.py`) is layer (a): the env-agnostic prompt GEPA evolves from.
 We want it both **general** (works across domains) and a **strong GEPA starting surface** (high
 zero-/few-shot reconstruction fidelity before any evolution). We tune it by measuring, not guessing.
 
 ## The measurement loop
 
-`wmh eval` (engine: `wmh/engine/eval.py` → `wmh/engine/replay.py`) replays each trace file's held-out
+`wmo eval` (engine: `wmo/engine/eval.py` → `wmo/engine/replay.py`) replays each trace file's held-out
 split through a prompt (teacher-forced, open-loop) and scores predicted vs. real observations. The
 default `--judge rubric` is a reference-grounded 5-dimension scorer (format / factuality /
 consistency / realism / quality, mean → 0..1) modeled on Qwen-AgentWorld, with a
@@ -23,12 +23,12 @@ and overall fidelity as mean±std across steps. `--sample-turns sampled` scores 
 protocol) instead of all. Run:
 
 ```bash
-AWS_REGION=us-east-1 uv run wmh eval \
+AWS_REGION=us-east-1 uv run wmo eval \
   examples/tau-bench/traces.otel.jsonl examples/terminal-tasks/traces.otel.jsonl \
   --out report.json
 ```
 
-`wmh eval` takes one or more trace files — or use the committed per-example suites: `wmh eval run
+`wmo eval` takes one or more trace files — or use the committed per-example suites: `wmo eval run
 tau-bench` (see the *Eval suites* doc). The committed corpora are
 `examples/{tau-bench,terminal-tasks,swe-bench}/traces.otel.jsonl` (1033 / 280 / 87 traces); new
 benchmarks are added via the self-contained `examples/<task>/` capture pattern (see *Benchmarks →

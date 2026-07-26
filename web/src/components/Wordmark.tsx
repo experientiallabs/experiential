@@ -8,7 +8,7 @@ export function Wordmark({ size = "md" }: { size?: "md" | "lg" }) {
   return (
     <Link href="/" className="flex items-center justify-center gap-2">
       <Logo className={`${glyph} text-ink`} />
-      <span className={`${text} font-semibold tracking-tight`}>world-model-harness</span>
+      <span className={`${text} font-semibold tracking-tight`}>world-model-optimizer</span>
     </Link>
   );
 }

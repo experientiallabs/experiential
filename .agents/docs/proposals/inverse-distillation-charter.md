@@ -38,7 +38,7 @@ tau2-bench runner.
 
 ## What exists to build on
 
-- `wmh/scenarios/` (this branch): mining, synthesis, verification, `frozen()` eval isolation.
+- `wmo/scenarios/` (this branch): mining, synthesis, verification, `frozen()` eval isolation.
 - `feat/rl-arms-sft-ppo-rpp` branch: `examples/tau-bench/rl/export_sft_episodes.py`,
   `merge_adapter_and_splice.py`, `serve_tau_wm.py`, prior SFT-arm results.md — cherry-pick,
   don't rewrite.
@@ -71,7 +71,7 @@ per-domain, read non-telecom columns for signal.
   (Qwen3.5-9B, port 8000) — read-only for me (student-before baseline endpoint). GPU 1 free for
   training. Disk tight (~5GB free): LoRA-only, no full checkpoints.
 - Stack verified: Nova Lite WM (Bedrock), Gemini 2.5 Pro teacher + Flash judge via the OpenAI
-  provider custom endpoint (`WMH_ENDPOINT_API_KEY`), claas-verl tau scaffold pattern for the
+  provider custom endpoint (`WMO_ENDPOINT_API_KEY`), claas-verl tau scaffold pattern for the
   student loop.
 - Mining (stage 1) launched over all 1033 traces: 822 train / 211 eval by stable hash; facet
   outcomes {success 807, failure 63, unknown 163}.

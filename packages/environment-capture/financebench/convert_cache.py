@@ -1,7 +1,7 @@
-"""Convert a financebench baseline-cache of real runs into the wmh OTel GenAI trace corpus.
+"""Convert a financebench baseline-cache of real runs into the wmo OTel GenAI trace corpus.
 
 The cache holds REAL benchmark runs (real commands, real
-recorded outputs); this script re-emits them on the wmh wire format with provenance in the trace
+recorded outputs); this script re-emits them on the wmo wire format with provenance in the trace
 metadata. Trajectories with zero environment transitions (the agent submitted without running a
 command) produce no spans and are skipped explicitly, not silently.
 

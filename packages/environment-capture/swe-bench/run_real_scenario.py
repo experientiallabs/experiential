@@ -11,7 +11,7 @@ multi-GB cost every run. Pass `--warm` (optionally with `--cache`) to reuse exis
 for a faster repeat run.
 
 Needs the swebench `.venv` from this directory's README (it imports `swebench` to get the official
-Dockerfiles + setup scripts) and a running local Docker daemon. It never imports `wmh`; it reads this
+Dockerfiles + setup scripts) and a running local Docker daemon. It never imports `wmo`; it reads this
 example's `traces.otel.jsonl` and uses the harness's deterministic blake2b split to select held-out
 scenarios. If a demo batch is larger than the held-out pool but fits in the full corpus, it switches
 to the full corpus so multi-scenario demos can run from stable trace indexes.
@@ -53,8 +53,8 @@ def _attr_map(span: dict[str, Any]) -> dict[str, str]:
 def _load_traces(corpus: Path) -> "list[dict[str, Any]]":
     """Group the OTel spans into ordered traces: [{trace_id, instance_id, commands:[...]}].
 
-    Traces are ordered by their earliest span's (startTimeUnixNano, spanId) — IDENTICAL to the wmh
-    adapter (wmh/ingest/otel_genai.py), NOT by first appearance in the file. `--trace N` must select
+    Traces are ordered by their earliest span's (startTimeUnixNano, spanId) — IDENTICAL to the wmo
+    adapter (wmo/ingest/otel_genai.py), NOT by first appearance in the file. `--trace N` must select
     the SAME scenario index on both sides; ordering by file position would silently diverge from the
     world-model side whenever the corpus is not already start-time sorted.
     """
@@ -75,8 +75,8 @@ def _load_traces(corpus: Path) -> "list[dict[str, Any]]":
         commands: list[str] = []
         for span in by_trace[tid]:
             attrs = _attr_map(span)
-            if "wmh.trace.metadata" in attrs:
-                instance_id = json.loads(attrs["wmh.trace.metadata"]).get("instance_id", "")
+            if "wmo.trace.metadata" in attrs:
+                instance_id = json.loads(attrs["wmo.trace.metadata"]).get("instance_id", "")
             args = attrs.get("gen_ai.tool.call.arguments")
             if args:  # an action span (the observation span has no arguments)
                 command = json.loads(args).get("command")
@@ -87,7 +87,7 @@ def _load_traces(corpus: Path) -> "list[dict[str, Any]]":
 
 
 def _holdout(traces: list[dict[str, Any]], train_split: float) -> list[dict[str, Any]]:
-    """The held-out traces, by the SAME deterministic blake2b split the wmh harness uses."""
+    """The held-out traces, by the SAME deterministic blake2b split the wmo harness uses."""
     held: list[dict[str, Any]] = []
     for trace in traces:
         digest = hashlib.blake2b(trace["trace_id"].encode("utf-8"), digest_size=8).digest()
@@ -105,7 +105,7 @@ def _docker_build(
     Raises on a non-zero build. The streamed output IS the real dependency-install log; the caller
     times the whole call so the install cost lands in the comparison.
     """
-    with tempfile.TemporaryDirectory(prefix="wmh-swe-build-") as ctx:
+    with tempfile.TemporaryDirectory(prefix="wmo-swe-build-") as ctx:
         ctx_dir = Path(ctx)
         (ctx_dir / "Dockerfile").write_text(dockerfile, encoding="utf-8")
         for name, body in scripts.items():
@@ -607,7 +607,7 @@ def main() -> None:
     print(f"[environment stood up ({mode}) in {build_done - start:.1f}s]\n")
 
     # Run the recorded scenario in a fresh container off the stood-up instance image.
-    container = f"wmh-real-{uuid.uuid4().hex[:8]}"
+    container = f"wmo-real-{uuid.uuid4().hex[:8]}"
     rc = subprocess.run(
         ["docker", "run", "-d", "--name", container, "--platform", spec.platform,
          "-w", "/testbed", "--rm", run_image, "sleep", "2h"],

@@ -1,7 +1,7 @@
 """Core record types: one real benchmark run = one Trajectory of (action -> observation) steps.
 
 Stdlib-only (dataclasses, no pydantic) so the package stays dependency-free and shareable with
-non-wmh consumers.
+non-wmo consumers.
 """
 
 from __future__ import annotations

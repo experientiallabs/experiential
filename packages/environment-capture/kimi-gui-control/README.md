@@ -9,15 +9,15 @@ agent reads the accessibility tree, takes a single targeted action, and re-reads
 
 - `traces.otel.jsonl` - the trace corpus (**Hub-hosted, not committed**; see § Data & license):
   ~60 trajectories, one Step per agent tool call, enough for the 30 train / 8 val / 8 test benchmark
-  split. Materialize it with `uv run wmh download kimi-gui-control` (or
+  split. Materialize it with `uv run wmo download kimi-gui-control` (or
   `uv run python -m environment_capture.hub fetch kimi-gui-control`).
-- `convert_to_wmh.py` - the converter that produced the corpus (see § Regenerate).
+- `convert_to_wmo.py` - the converter that produced the corpus (see § Regenerate).
 - `evals/default.toml` - fidelity suite; run with
-  `uv run wmh eval run kimi-gui-control/default --examples-root packages/environment-capture`.
+  `uv run wmo eval run kimi-gui-control/default --examples-root packages/environment-capture`.
 
 ## What the converter produces
 
-`convert_to_wmh.py` reads the source JSONL **streaming** (the raw dump is ~9 GB / 1000 trajectories,
+`convert_to_wmo.py` reads the source JSONL **streaming** (the raw dump is ~9 GB / 1000 trajectories,
 so it never loads the file into memory) and emits one trace per trajectory, one Step per agent
 **tool call**:
 
@@ -32,7 +32,7 @@ environment from the action + retrieved similar past steps + the teacher-forced 
 
 Trajectories with **zero tool calls** are skipped: open-loop replay scores predicted observations
 for `(state, action)`, and a chat-only turn has no environment observation to score. The output is
-OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly.
+OTel-GenAI span JSONL that `wmo.ingest.otel_genai` reads directly.
 
 ## Data & license
 
@@ -42,7 +42,7 @@ OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly.
   real macOS apps; the observations are the verbatim tool outputs the agent saw. These are our own
   captures, published under MIT alongside the harness attribution above.
 - **Payload is not committed.** Per this package's `.gitignore`, `traces.otel.jsonl` is not tracked
-  in git; it lives in the public dataset `experiential-labs/wmh-kimi-gui-control-traces` on the
+  in git; it lives in the public dataset `experiential-labs/wmo-kimi-gui-control-traces` on the
   Hugging Face Hub and is fetched on demand (see § Contents). This keeps the repo free of large
   binary blobs and follows the same contract as every other corpus here (`../README.md`).
 
@@ -52,5 +52,5 @@ From the raw screenpipe dump (path is machine-local - the ~9 GB source is not re
 
 ```bash
 cd packages/environment-capture/kimi-gui-control
-python convert_to_wmh.py <raw_screenpipe_dump>.jsonl --out traces.otel.jsonl --limit 60
+python convert_to_wmo.py <raw_screenpipe_dump>.jsonl --out traces.otel.jsonl --limit 60
 ```

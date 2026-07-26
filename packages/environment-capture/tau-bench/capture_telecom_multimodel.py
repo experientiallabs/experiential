@@ -9,10 +9,10 @@ tool-calling user simulator => most LLM calls per task).
 Fix: shard the telecom task list across several Opus models (4.6 / 4.7 / 4.8), each its own
 per-model quota, run them concurrently. Each shard is a DISJOINT slice of the full task list (so no
 task is captured twice) and writes to its own save dir; `--auto-resume` makes a re-run retry only
-that shard's still-failed tasks. Merge the shards afterward with convert_to_wmh.py + cat (see
+that shard's still-failed tasks. Merge the shards afterward with convert_to_wmo.py + cat (see
 capture_corpus.sh / the README).
 
-This runs in the ISOLATED tau2 venv (Python 3.13, `tau2` installed); it imports `tau2`, never `wmh`.
+This runs in the ISOLATED tau2 venv (Python 3.13, `tau2` installed); it imports `tau2`, never `wmo`.
 
     TAU2_DATA_DIR=$PWD/tau2-bench/data AWS_REGION=us-east-1 \
       .venv/bin/python capture_telecom_multimodel.py --total 980 --concurrency 3
@@ -32,7 +32,7 @@ from tau2.run import run_tasks
 from tau2.runner.helpers import get_tasks
 
 # Persist each shard as data/simulations/<name>/results.json — the same layout the CLI's --save-to
-# produces and convert_to_wmh.py expects. The deprecated run_tasks(save_to=) treats save_to as a
+# produces and convert_to_wmo.py expects. The deprecated run_tasks(save_to=) treats save_to as a
 # literal path (NOT relative to data/simulations like the CLI), so we build the absolute path here.
 _SIM_DIR = Path(os.environ["TAU2_DATA_DIR"]) / "simulations"
 

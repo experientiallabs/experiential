@@ -34,15 +34,15 @@ import os  # noqa: E402
 
 from run_scenario_e2e import NOVA_LITE, TRACES, WM_DIR, _retrying, bedrock  # noqa: E402
 
-from wmh.core.parsing import extract_json_object  # noqa: E402
-from wmh.core.types import ActionKind, Trace  # noqa: E402
-from wmh.engine.world_model import WorldModel  # noqa: E402
-from wmh.env.base import WorldModelEnv  # noqa: E402
-from wmh.ingest import get_adapter  # noqa: E402
-from wmh.providers import get_provider  # noqa: E402
-from wmh.providers.base import Message, Provider, ProviderConfig, ProviderKind  # noqa: E402
-from wmh.scenarios import ChecklistJudge, ScenarioSet, trace_digest  # noqa: E402
-from wmh.scenarios.synthesis import EvalScenario  # noqa: E402
+from wmo.core.parsing import extract_json_object  # noqa: E402
+from wmo.core.types import ActionKind, Trace  # noqa: E402
+from wmo.engine.world_model import WorldModel  # noqa: E402
+from wmo.env.base import WorldModelEnv  # noqa: E402
+from wmo.ingest import get_adapter  # noqa: E402
+from wmo.providers import get_provider  # noqa: E402
+from wmo.providers.base import Message, Provider, ProviderConfig, ProviderKind  # noqa: E402
+from wmo.scenarios import ChecklistJudge, ScenarioSet, trace_digest  # noqa: E402
+from wmo.scenarios.synthesis import EvalScenario  # noqa: E402
 
 DISTILL = REPO / ".agents" / "docs" / "research" / "distill"
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -79,18 +79,18 @@ def _read_env_value(path, name):  # noqa: ANN001, ANN202
 def _load_gemini_key() -> None:
     """Load provider keys from the experientiallabs .env.local files (never echoed).
 
-    - AZURE_FOUNDRY_API_KEY -> WMH_ENDPOINT_API_KEY (custom-endpoint auth: DeepSeek-V4-Pro)
+    - AZURE_FOUNDRY_API_KEY -> WMO_ENDPOINT_API_KEY (custom-endpoint auth: DeepSeek-V4-Pro)
     - OPENAI_API_KEY -> OPENAI_API_KEY (gpt-5 family, direct)
-    Falls back to GEMINI_API_KEY for WMH_ENDPOINT_API_KEY only if Foundry's key is absent.
+    Falls back to GEMINI_API_KEY for WMO_ENDPOINT_API_KEY only if Foundry's key is absent.
     """
     labs = REPO.parent
-    if not os.environ.get("WMH_ENDPOINT_API_KEY"):
-        value = _read_env_value(labs / "world-model-harness" / ".env.local", "AZURE_FOUNDRY_API_KEY")
+    if not os.environ.get("WMO_ENDPOINT_API_KEY"):
+        value = _read_env_value(labs / "world-model-optimizer" / ".env.local", "AZURE_FOUNDRY_API_KEY")
         if value is None:
             value = _read_env_value(labs / "platform" / ".env.local", "GEMINI_API_KEY")
         if value is None:
             raise RuntimeError("no AZURE_FOUNDRY_API_KEY or GEMINI_API_KEY found")
-        os.environ["WMH_ENDPOINT_API_KEY"] = value
+        os.environ["WMO_ENDPOINT_API_KEY"] = value
     if not os.environ.get("OPENAI_API_KEY"):
         value = _read_env_value(labs / "world-models" / ".env.local", "OPENAI_API_KEY")
         if value is not None:
@@ -169,7 +169,7 @@ def run_teacher_episode(
                 summary = str(data.get("summary", "")).strip()
                 stop = "done"
                 break
-            from wmh.core.types import Action  # local to keep module imports tidy
+            from wmo.core.types import Action  # local to keep module imports tidy
 
             action = Action(
                 kind=ActionKind.TOOL_CALL,
@@ -281,7 +281,7 @@ def main() -> None:
         bedrock("us.amazon.nova-pro-v1:0") if args.teacher == "nova-pro" else gemini(TEACHER_MODEL)
     )
     judge = ChecklistJudge(gemini(JUDGE_MODEL))
-    world_model = WorldModel.load(str(WM_DIR), bedrock(NOVA_LITE), telemetry_root=str(REPO / ".wmh"))
+    world_model = WorldModel.load(str(WM_DIR), bedrock(NOVA_LITE), telemetry_root=str(REPO / ".wmo"))
 
     kept_records: list[dict] = []
     stats: dict[str, dict[str, float]] = defaultdict(lambda: {"attempts": 0, "kept": 0})
@@ -303,7 +303,7 @@ def main() -> None:
             stats[scenario.scenario_id]["attempts"] += 1
             if not turns:
                 continue
-            from wmh.core.types import Action, Observation, Step  # judge needs Step objects
+            from wmo.core.types import Action, Observation, Step  # judge needs Step objects
 
             steps = [
                 Step(

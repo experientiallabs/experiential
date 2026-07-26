@@ -119,13 +119,13 @@ def test_stream_to_is_atomic(tmp_path: Path) -> None:
 
 def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPatch) -> None:
     listing = [
-        {"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T06:00:00.000Z"},
+        {"id": "experiential-labs/wmo-gaia2-traces", "lastModified": "2026-07-07T06:00:00.000Z"},
         {
-            "id": "experiential-labs/wmh-bird-sql-traces",
+            "id": "experiential-labs/wmo-bird-sql-traces",
             "lastModified": "2026-07-05T00:00:00.000Z",
         },
         {"id": "experiential-labs/unrelated-dataset", "lastModified": "2026-07-06T00:00:00.000Z"},
-        {"id": "experiential-labs/wmh-not-a-benchmark-traces", "lastModified": ""},
+        {"id": "experiential-labs/wmo-not-a-benchmark-traces", "lastModified": ""},
     ]
     monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
 
@@ -223,13 +223,13 @@ def test_published_corpora_follows_pagination(monkeypatch: pytest.MonkeyPatch) -
     """An org with more datasets than one page must not hide corpora beyond page 1."""
     pages = {
         "page1": (
-            [{"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T00:00:00Z"}],
+            [{"id": "experiential-labs/wmo-gaia2-traces", "lastModified": "2026-07-07T00:00:00Z"}],
             "page2",
         ),
         "page2": (
             [
                 {
-                    "id": "experiential-labs/wmh-bird-sql-traces",
+                    "id": "experiential-labs/wmo-bird-sql-traces",
                     "lastModified": "2026-07-06T00:00:00Z",
                 }
             ],

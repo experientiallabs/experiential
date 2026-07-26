@@ -20,7 +20,7 @@ experiment the PR needs; earlier work only showed the pipeline runs end-to-end.
 
 ## 2. Where things live
 
-- **Repo (worktree):** `/Users/admin/Documents/experientiallabs/world-model-harness-scenario-construction`
+- **Repo (worktree):** `/Users/admin/Documents/experientiallabs/world-model-optimizer-scenario-construction`
   branch `feature/scenario-set-construction`, PR #81 (`gh pr view 81`). HEAD = `5a6e881`.
   Run `uv run ruff check . && uv run ty check && uv run pytest -q` before any commit (repo rule;
   AGENTS.md governs). `.agents/` is the disposable workspace — experiment scripts + results live
@@ -41,17 +41,17 @@ experiment the PR needs; earlier work only showed the pipeline runs end-to-end.
 - **Judge = Claude Opus 4.8** via AWS Bedrock, profile `claas-bedrock`, **region us-east-2 only**
   (`opus_judge()` helper). Opus is access-denied in us-west-2 and not deployed on Foundry.
 - **Student = Qwen3.5-9B**, served by vLLM on the box, port 8001 base + LoRA adapters, tunneled to
-  localhost:18002. `wmh scenarios` mining synthesis also uses gpt-5.4 with Opus as validation judge.
+  localhost:18002. `wmo scenarios` mining synthesis also uses gpt-5.4 with Opus as validation judge.
 - Forbidden per user: Nova (called "shit"), and don't silently swap in Kimi-2.5/DeepSeek-v3.2/
   gpt-5-mini — those were rejected. If gpt-5.4 or Opus is unreachable, STOP and tell the user;
   do not substitute.
 
 ## 4. What is DONE (committed)
 
-1. **`wmh/scenarios/` mining package** (the actual PR deliverable): facets → cluster → hybrid
+1. **`wmo/scenarios/` mining package** (the actual PR deliverable): facets → cluster → hybrid
    select → synthesize → **inline checklist validation** (back-agreement against the source trace,
    regen once, drop on repeat fail — folded INTO `build_scenario_set`, so an invalid scenario
-   never leaves the build; `wmh scenarios verify` remains only for extrinsic WM-solvability). 573
+   never leaves the build; `wmo scenarios verify` remains only for extrinsic WM-solvability). 573
    tests pass, ruff+ty clean.
 2. **`BedrockProvider`** gained a Converse path (for Kimi/DeepSeek) and Nova path — general, keep.
 3. **An earlier teacher-based distillation** (now superseded by this ablation) showed base→SFT
@@ -72,7 +72,7 @@ restarted from scratch on a clean serving stack.
   `distill/bc_mined.jsonl` only at the END. The base student self-rolls each scenario in the
   gpt-5.4 WM; Opus judges vs the checklist; passing episodes (with the student's own `<think>`
   reasoning) are kept.
-- **Student vLLM (ours, new):** box tmux `wmh_student_bc`, GPU 1, port **8010**, serving base
+- **Student vLLM (ours, new):** box tmux `wmo_student_bc`, GPU 1, port **8010**, serving base
   `Qwen/Qwen3.5-9B` with `--reasoning-parser qwen3 --dtype bfloat16 --max-model-len 32768`.
   Launch needs `PATH=/mnt/azureuser/venvs/vllm/bin:$PATH` (ninja for GDN kernels) and
   `HF_HOME=/mnt/azureuser/hf_cache`. Log `~/qwen35_bc_vllm.log` on the box. Tunnel
@@ -95,8 +95,8 @@ restarted from scratch on a clean serving stack.
    Foundry rate-limit load — or in parallel if limits allow.)
 3. **Train two LoRAs on GPU 1**, one per arm, IDENTICAL hyperparams:
    `.agents/scripts/train_sft_box.py` (TRL, r=32, 3 epochs, ~23 min each). Ship each `bc_*.jsonl`
-   to `/mnt/azureuser/wmh_distill/` and run in tmux on the box. Venv:
-   `/mnt/azureuser/venvs/wmh-distill/bin/python` (needs `ninja` on PATH for Qwen3.5 GDN+LoRA — a
+   to `/mnt/azureuser/wmo_distill/` and run in tmux on the box. Venv:
+   `/mnt/azureuser/venvs/wmo-distill/bin/python` (needs `ninja` on PATH for Qwen3.5 GDN+LoRA — a
    known gotcha). Save adapters `adapter_bc_mined` and `adapter_bc_random`.
 4. **Serve base + both adapters** from one vLLM (`--enable-lora --lora-modules
    bc-mined=... bc-random=... --max-lora-rank 32`), PATH must include the venv bin (ninja).
@@ -113,7 +113,7 @@ restarted from scratch on a clean serving stack.
 ## 7. Landmines already hit (don't repeat)
 
 - **The checklist judge must see the agent's FINAL message** and needs `max_tokens≥8192` (reasoning
-  judges truncate verdicts → silent failures). Both fixed in `wmh/scenarios/verification.py`; the
+  judges truncate verdicts → silent failures). Both fixed in `wmo/scenarios/verification.py`; the
   BC/eval scripts already append the final message as a judged step.
 - **Verify model availability in the right region/profile before declaring anything unavailable** —
   check ALL the `.env.local` files (memory has the map). The user corrected me twice for
@@ -124,6 +124,6 @@ restarted from scratch on a clean serving stack.
 
 ## 8. Commit hygiene
 
-Commit script/result changes to the wmh worktree as you go (they're under `.agents/`, exempt from
-the gate but still committed). Keep `wmh/` changes gate-clean. Push to PR #81's branch. End commit
+Commit script/result changes to the wmo worktree as you go (they're under `.agents/`, exempt from
+the gate but still committed). Keep `wmo/` changes gate-clean. Push to PR #81's branch. End commit
 messages with `Co-Authored-By: Claude <noreply@anthropic.com>`.

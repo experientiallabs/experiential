@@ -34,9 +34,9 @@ from run_scenario_e2e import (  # noqa: E402
     titan_embedder,
 )
 
-from wmh.ingest import get_adapter  # noqa: E402
-from wmh.research.scenario_recovery import ground_truth_labels, recovery_report  # noqa: E402
-from wmh.scenarios import FacetExtractor, cluster_facets, trace_digest  # noqa: E402
+from wmo.ingest import get_adapter  # noqa: E402
+from wmo.research.scenario_recovery import ground_truth_labels, recovery_report  # noqa: E402
+from wmo.scenarios import FacetExtractor, cluster_facets, trace_digest  # noqa: E402
 
 
 def main() -> None:

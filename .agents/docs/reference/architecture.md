@@ -7,7 +7,7 @@ migrated: 2026-07-02
 
 # Architecture
 
-World Model Harness turns a frontier LLM into the *environment* your agent steps against,
+World Model Optimizer turns a frontier LLM into the *environment* your agent steps against,
 reconstructed from your own OpenTelemetry traces. This doc is the map: how the packages fit, the
 data that flows between them, and where to plug in new pieces.
 
@@ -37,7 +37,7 @@ serving         engine          │   │
   (Anthropic, Bedrock, Azure OpenAI, OpenAI, OpenAI Responses) behind `get_provider`. `Embedder` is the narrower
   embed-only capability retrieval needs.
 - **`config`** — `HarnessConfig` (persisted to `config.toml`), `ArtifactPaths` (the on-disk layout
-  of one model), and `WorldModelStore` (named models). The store reads one root's `models/` dir — the default is the project-local `.wmh/` (where `wmh build` writes); callers can pass another root such as `examples/<task>` to read the prebuilt example artifacts committed under `examples/<task>/models/` (e.g. `tau-bench`, `tau-telecom`).
+  of one model), and `WorldModelStore` (named models). The store reads one root's `models/` dir — the default is the project-local `.wmo/` (where `wmo build` writes); callers can pass another root such as `examples/<task>` to read the prebuilt example artifacts committed under `examples/<task>/models/` (e.g. `tau-bench`, `tau-telecom`).
 - **`ingest`** — `TraceAdapter` protocol + a registry; the OTel GenAI adapter normalizes spans into
   `Trace`s. New trace sources register here.
 - **`retrieval`** — the DreamGym replay buffer. `EmbeddingRetriever` (cosine top-k over phi),
@@ -56,34 +56,34 @@ serving         engine          │   │
 - **`research`** — the optimization-research surface (`docs/gepa_research.md`). An `Ablation`
   framework (sweep named `Condition`s across seeds → mean+std) over reusable build/eval primitives
   (`optimize_prompt` / `score_prompt`) that wrap the real pipeline (`score_prompt` delegates to
-  `engine.replay`, so the `wmh eval` rubric scores experiments too). The first experiment is GEPA
+  `engine.replay`, so the `wmo eval` rubric scores experiments too). The first experiment is GEPA
   seed-stability; live runners live in `scripts/`. Parked directions: `docs/research_directions.md`.
-- **`cli`** — `build / list / eval / serve / demo / play / providers / examples / config`. `eval` also runs named example-local eval suites (`wmh eval list | run <suite> | results`); `examples` lists/launches the self-contained task examples. Each command is thin: it parses flags and delegates to an `engine` function.
+- **`cli`** — `build / list / eval / serve / demo / play / providers / examples / config`. `eval` also runs named example-local eval suites (`wmo eval list | run <suite> | results`); `examples` lists/launches the self-contained task examples. Each command is thin: it parses flags and delegates to an `engine` function.
 
 ## The two lifecycles
 
-**Build** (`wmh build` → `engine.build.build`):
+**Build** (`wmo build` → `engine.build.build`):
 `ingest` traces → `split_traces` (deterministic train/held-out) → `EmbeddingRetriever.index` →
 `GEPAOptimizer.optimize` (replays held-out steps with leak-free RAG, scores with `RubricJudge`,
 reflects to mutate the prompt) → persist prompt + frontier + index + metrics under
-`.wmh/models/<name>/`.
+`.wmo/models/<name>/`.
 
-**Serve / step** (`wmh serve` | `play` | `demo` → `loader.load_world_model` → `WorldModel.step`):
+**Serve / step** (`wmo serve` | `play` | `demo` → `loader.load_world_model` → `WorldModel.step`):
 retrieve top-k similar past steps (phi) → assemble the env prompt (`core.render.build_env_prompt`,
 the *same* assembly GEPA optimized against) → `provider.complete` → `parse_observation` → advance
 the session (history + scratchpad) → enrich the buffer.
 
 ## Where to extend
 
-- **A new LLM backend** → implement the `Provider` protocol in `wmh/providers/`, register it in
+- **A new LLM backend** → implement the `Provider` protocol in `wmo/providers/`, register it in
   `providers/registry.py`, add its env vars to `config.PROVIDER_ENV_VARS`.
 - **A new embedding model (phi)** → implement `Embedder` (`embed(texts) -> list[list[float]]`) in
-  `wmh/retrieval/embedders.py`; wire it into `get_embedder`. Set `embed_provider` / `embed_dim` in
+  `wmo/retrieval/embedders.py`; wire it into `get_embedder`. Set `embed_provider` / `embed_dim` in
   config; the persisted dim must match at load (guarded with a clear error).
-- **A new trace source / format** → implement the `TraceAdapter` protocol in `wmh/ingest/`, register
+- **A new trace source / format** → implement the `TraceAdapter` protocol in `wmo/ingest/`, register
   it; select it via `config.trace_adapter`.
-- **A different fitness signal** → implement the `Judge` protocol in `wmh/optimize/judge.py`.
-- **A new CLI command** → add a thin command in `wmh/cli/app.py` that delegates to an `engine`
+- **A different fitness signal** → implement the `Judge` protocol in `wmo/optimize/judge.py`.
+- **A new CLI command** → add a thin command in `wmo/cli/app.py` that delegates to an `engine`
   function; keep the logic in `engine` so it stays testable without the CLI.
 
 ## Conventions

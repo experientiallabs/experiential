@@ -1,7 +1,7 @@
-"""Convert a frozen baseline cache of REAL database-exploration runs into the wmh trace corpus.
+"""Convert a frozen baseline cache of REAL database-exploration runs into the wmo trace corpus.
 
 The cache holds REAL runs (real ``sqlite3``/``python3`` commands, real recorded outputs); this
-re-emits them on the wmh OTel GenAI wire format with provenance in the trace metadata. The
+re-emits them on the wmo OTel GenAI wire format with provenance in the trace metadata. The
 recording harness's submission sentinel is normalized to the neutral ``SUBMIT`` by the shared
 loader (see ``environment_capture.baseline_cache``). Zero-transition trajectories (the agent
 submitted without running a command) produce no spans and are skipped explicitly.

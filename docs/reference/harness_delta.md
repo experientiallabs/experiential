@@ -1,14 +1,14 @@
-# HarnessDelta: the update-representation interface for `wmh harness`
+# HarnessDelta: the update-representation interface for `wmo harness`
 
-This is the interface `wmh optimize` mutates through and the archive records: a typed,
+This is the interface `wmo optimize` mutates through and the archive records: a typed,
 precondition-guarded, gate-audited delta object, replacing "a harness update is a file edit".
 Getting this right matters more than any implementation detail downstream: **the update
 representation IS the search space**, and everything the meta-agent can learn about *how to
 improve harnesses* is bounded by what the update object can express.
 
-Implementation: `wmh/harness/doc.py` (the document), `wmh/harness/delta.py` (the delta),
-`wmh/harness/mutate.py` (delta parsing), `wmh/harness/proposer.py` (proposal runtimes), and
-`wmh/harness/create.py` (clustering, gate, archive).
+Implementation: `wmo/harness/doc.py` (the document), `wmo/harness/delta.py` (the delta),
+`wmo/harness/mutate.py` (delta parsing), `wmo/harness/proposer.py` (proposal runtimes), and
+`wmo/harness/create.py` (clustering, gate, archive).
 
 ---
 
@@ -70,7 +70,7 @@ A document validates as a whole at construction — tools resolve, `submit` pres
 range, skill frontmatter names match their slugs, budgets respected — so an invalid harness cannot
 exist as a value and nothing downstream re-checks.
 
-The store (`.wmh/harnesses/<name>/`) keeps append-only version directories (`v1/`, `v2/`, …) with
+The store (`.wmo/harnesses/<name>/`) keeps append-only version directories (`v1/`, `v2/`, …) with
 `doc.json` authoritative plus rendered exports, and movable aliases in `aliases.toml`
 (`champion = 3`). Rollback = re-point. Eval results key to immutable versions (or doc hashes),
 never to "whatever the harness currently is".
@@ -123,7 +123,7 @@ class HarnessDelta(BaseModel):
   validated against the parent doc — and the child re-validates as a whole `HarnessDoc` — before a
   token of eval budget is spent. Path safety, unknown-target rejection, skill-name consistency,
   and code compilation are impossible-by-construction rather than checked piecemeal.
-- **The strongest lever is code** (`code:runtime`, `wmh/harness/code_runtime.py`): live search
+- **The strongest lever is code** (`code:runtime`, `wmo/harness/code_runtime.py`): live search
   campaigns showed correct failure diagnoses that prompt- and skill-level edits could not fix —
   loop structure, retries, verification passes, context compaction, and token budgets are
   programs, not wording. The code surface holds a module defining `run(kit)`; the `RuntimeKit` is

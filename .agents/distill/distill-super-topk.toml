@@ -3,7 +3,7 @@
 # anchor's schedule, so anchor vs topk isolates the loss. Reuses the anchor
 # run's warmup collection (warmup.trajectories_from) and pre-training student
 # baseline (eval.student_baseline_from); run the anchor first under
-# .wmh/distill-runs/super-anchor. Model names are the tinker-cookbook catalog
+# .wmo/distill-runs/super-anchor. Model names are the tinker-cookbook catalog
 # names (pinned by test_checked_in_run_configs_resolve_cookbook_renderers).
 [student]
 base_model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -25,11 +25,11 @@ compaction = false
 
 # Terminus-2 cannot use the stock reasoning renderers: they hand harbor's response
 # parser a LIST and kill the trial, and they strip thinking from history, which
-# fragments the episode into one datum per turn. The wmh verbatim wrappers keep the
-# reasoning in the token stream and the episode a single datum (wmh/distill/renderers.py).
+# fragments the episode into one datum per turn. The wmo verbatim wrappers keep the
+# reasoning in the token stream and the episode a single datum (wmo/distill/renderers.py).
 [rollout.renderers]
-"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16" = "wmh/nemotron3_verbatim"
-"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmh/nemotron3_ultra_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16" = "wmo/nemotron3_verbatim"
+"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmo/nemotron3_ultra_verbatim"
 
 [train]
 loss = "topk_ce"
@@ -60,7 +60,7 @@ steps = 0
 every = 0
 tasks = 12
 k = 1
-teacher_baseline_from = ".wmh/distill-runs/headline/evals/baseline-teacher.json"
+teacher_baseline_from = ".wmo/distill-runs/headline/evals/baseline-teacher.json"
 
 [gate]
 k = 3
@@ -84,5 +84,5 @@ max_usd = 500.0
 
 [wandb]
 enabled = true
-project = "wmh-distill"
+project = "wmo-distill"
 run_name = "distill-super-topk"

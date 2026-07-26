@@ -33,25 +33,25 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from wmh.core.types import Observation, Step, Trace
-from wmh.engine.eval_suites import resolve_eval_suite
-from wmh.engine.prompts import BASE_ENV_PROMPT
-# _select_step_indices is private to wmh.engine.replay — imported so the re-judging pass
+from wmo.core.types import Observation, Step, Trace
+from wmo.engine.eval_suites import resolve_eval_suite
+from wmo.engine.prompts import BASE_ENV_PROMPT
+# _select_step_indices is private to wmo.engine.replay — imported so the re-judging pass
 # reconstructs the EXACT (trace, step) work list replay scored (same seeded turn selection).
 # Workspace-only fragility: if replay's selection changes, this script re-syncs or dies loudly
 # on the strict zip, never silently misaligns.
-from wmh.engine.replay import StepResult, _select_step_indices, replay
-from wmh.ingest import get_adapter
-from wmh.optimize.judge import Judge, RubricJudge
-from wmh.providers import ProviderConfig, ProviderKind, get_provider
-from wmh.providers.base import Provider
-from wmh.providers.waterfall import WaterfallProvider
-from wmh.research.gepa_scaling import _cap_by_steps
-from wmh.research.pipeline import optimize_prompt
-from wmh.research.scaling_split import partition_corpus, subsample_train
-from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
-from wmh.tracking.metered import MeteredProvider, classify_build_call
-from wmh.tracking.tracker import RunTracker
+from wmo.engine.replay import StepResult, _select_step_indices, replay
+from wmo.ingest import get_adapter
+from wmo.optimize.judge import Judge, RubricJudge
+from wmo.providers import ProviderConfig, ProviderKind, get_provider
+from wmo.providers.base import Provider
+from wmo.providers.waterfall import WaterfallProvider
+from wmo.research.gepa_scaling import _cap_by_steps
+from wmo.research.pipeline import optimize_prompt
+from wmo.research.scaling_split import partition_corpus, subsample_train
+from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmo.tracking.metered import MeteredProvider, classify_build_call
+from wmo.tracking.tracker import RunTracker
 
 sys.path.insert(0, str(Path(__file__).parent))
 from run_gepa_scaling import _chain  # noqa: E402

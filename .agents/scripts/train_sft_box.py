@@ -6,10 +6,10 @@ exactly the distribution the serving scaffold produces), completion = the target
 WITH its <think> block (BENCH-B2 showed training without deliberation breaks policy checking).
 Loss on completion only (TRL prompt-completion format). LoRA adapter saved small (disk is tight).
 
-Usage (on the box, wmh-distill venv):
+Usage (on the box, wmo-distill venv):
     CUDA_VISIBLE_DEVICES=1 python train_sft_box.py \
-        --data /mnt/azureuser/wmh_distill/teacher_episodes.jsonl \
-        --out /mnt/azureuser/wmh_distill/adapter_v1 [--epochs 3]
+        --data /mnt/azureuser/wmo_distill/teacher_episodes.jsonl \
+        --out /mnt/azureuser/wmo_distill/adapter_v1 [--epochs 3]
 """
 
 from __future__ import annotations

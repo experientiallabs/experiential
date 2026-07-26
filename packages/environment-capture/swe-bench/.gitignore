@@ -1,4 +1,4 @@
-# This entire isolated capture environment is local-only. wmh never imports SWE-bench or
+# This entire isolated capture environment is local-only. wmo never imports SWE-bench or
 # mini-swe-agent; only the generated trace files (committed under ../../examples/) come back into
 # the repo. The cloned harness, the venv, pulled images, and raw run output stay local.
 mini-swe-agent/

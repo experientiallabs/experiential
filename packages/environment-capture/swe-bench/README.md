@@ -3,21 +3,21 @@
 This directory is a **self-contained, local-only capture tool**. It runs the *real*
 [SWE-bench Verified](https://www.swebench.com/) benchmark with the standard
 [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) harness and converts the recorded
-agent trajectories into the world-model-harness trace corpus
+agent trajectories into the world-model-optimizer trace corpus
 (`packages/environment-capture/swe-bench/traces.otel.jsonl`).
 
 It is deliberately isolated, exactly like `packages/environment-capture/tau-bench/` and
 `packages/environment-capture/terminal-tasks/`:
 
-- **`wmh` never imports SWE-bench or mini-swe-agent.** SWE-bench Verified runs each instance in its
+- **`wmo` never imports SWE-bench or mini-swe-agent.** SWE-bench Verified runs each instance in its
   own per-instance Docker image (the buggy repo at a pinned commit + its full test env); the agent
   harness needs its own heavy dependency tree. This tool runs in its own `.venv` and uses the local
   Docker daemon. Only the produced trace JSONL is carried back into the repo.
 - The cloned harness, the `.venv/`, the pulled Docker images, and the raw run output are
   **git-ignored**. The tracked example assets are the converter, launcher scripts, README,
   `traces.otel.jsonl`, and `models/`.
-- `examples/` is excluded from the `wmh` lint/type gate (`pyproject.toml`), since these task helpers
-  can target different Python versions and import packages `wmh` doesn't depend on.
+- `examples/` is excluded from the `wmo` lint/type gate (`pyproject.toml`), since these task helpers
+  can target different Python versions and import packages `wmo` doesn't depend on.
 
 ## Prebuilt world model
 
@@ -30,9 +30,9 @@ packages/environment-capture/swe-bench/models/swe-bench/
 Use it as a local model root:
 
 ```bash
-uv run wmh list --root packages/environment-capture/swe-bench
-uv run wmh demo --root packages/environment-capture/swe-bench --name swe-bench
-uv run wmh play --root packages/environment-capture/swe-bench --name swe-bench
+uv run wmo list --root packages/environment-capture/swe-bench
+uv run wmo demo --root packages/environment-capture/swe-bench --name swe-bench
+uv run wmo play --root packages/environment-capture/swe-bench --name swe-bench
 ```
 
 ## Why capture from the REAL benchmark
@@ -80,15 +80,15 @@ minisweagent.run.benchmarks.swebench --help`. The shape that matters: a per-inst
 whose `messages` are the recorded agent loop. The default model config must not set `temperature`
 since Opus 4.8 rejects it; the bundled `swebench.yaml` config is a fine base.)
 
-## Convert to the wmh corpus
+## Convert to the wmo corpus
 
 ```bash
-.venv/bin/python convert_to_wmh.py \
+.venv/bin/python convert_to_wmo.py \
   runs/verified_capture \
   --out traces.otel.jsonl --benchmark swe-bench
 ```
 
-`convert_to_wmh.py` (stdlib-only, no `wmh` import) reads every `*.traj.json` under the run dir and
+`convert_to_wmo.py` (stdlib-only, no `wmo` import) reads every `*.traj.json` under the run dir and
 produces, per trajectory, one Step per agent **shell command**:
 
 - `action` — the real command the agent ran (`bash {"command": "..."}`), parsed from the assistant
@@ -107,7 +107,7 @@ reconstructs from the action + retrieved similar steps + teacher-forced history 
 Pure-reasoning turns (assistant messages with no command) are not Steps: open-loop replay scores a
 predicted observation for `(state, action)`, and a reasoning turn has no environment observation.
 
-The output is OTel-GenAI span JSONL that `wmh.ingest.otel_genai` reads directly.
+The output is OTel-GenAI span JSONL that `wmo.ingest.otel_genai` reads directly.
 
 ## Concurrency scaling law
 
@@ -141,7 +141,7 @@ is the slow, multi-minute cost the world model skips entirely.
 .venv/bin/python run_real_scenario.py --trace 0 --cache   # reuse cached layers after the first build
 ```
 
-Imports `swebench` (for the official base/env/instance Dockerfiles + setup scripts) but never `wmh`;
+Imports `swebench` (for the official base/env/instance Dockerfiles + setup scripts) but never `wmo`;
 reads the committed `traces.otel.jsonl` and re-implements the harness's blake2b
 train/holdout split inline so `--trace N` selects the SAME scenario as the world-model side.
 

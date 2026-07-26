@@ -3,7 +3,7 @@
 # environment (build from scratch on native x86_64, else pull the prebuilt image) and run the
 # recorded scenario, streaming all stdout. One command.
 #
-#   uv run wmh examples run swe-bench -- [--trace N] [--scenarios N] [--concurrency N]
+#   uv run wmo examples run swe-bench -- [--trace N] [--scenarios N] [--concurrency N]
 #                                        [--mode build|pull|auto] [--warm] [--cache] [...]
 #
 # The whole thing — Python venv creation, `swebench` install, the Docker standup (a from-scratch

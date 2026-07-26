@@ -1,10 +1,10 @@
-"""Emit trajectories as OTel GenAI JSONL — the wmh trace wire format.
+"""Emit trajectories as OTel GenAI JSONL — the wmo trace wire format.
 
 One OTLP-JSON span object per line. Per step: a `chat` action span (tool name + JSON arguments;
 the first one also carries the task prompt as ``gen_ai.prompt`` and the trace metadata as
-``wmh.trace.metadata``) followed by an `execute_tool` observation span (real output as
+``wmo.trace.metadata``) followed by an `execute_tool` observation span (real output as
 ``gen_ai.tool.message``, error flag via span status). The final answer is NOT emitted as a span —
-it produces no environment observation — and rides in ``wmh.trace.metadata`` instead.
+it produces no environment observation — and rides in ``wmo.trace.metadata`` instead.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def trajectory_to_spans(trajectory: Trajectory, *, benchmark: str) -> list[Span]
             if trajectory.task.prompt:
                 action_attrs.append(_attr("gen_ai.prompt", trajectory.task.prompt))
             action_attrs.append(
-                _attr("wmh.trace.metadata", json.dumps(_trace_metadata(trajectory, benchmark)))
+                _attr("wmo.trace.metadata", json.dumps(_trace_metadata(trajectory, benchmark)))
             )
         spans.append(
             {

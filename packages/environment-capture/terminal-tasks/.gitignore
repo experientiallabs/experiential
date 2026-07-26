@@ -1,4 +1,4 @@
-# This capture environment is local-only. wmh never imports the capture harness; only the generated
+# This capture environment is local-only. wmo never imports the capture harness; only the generated
 # trace file (traces.otel.jsonl) is committed. The venv and the intermediate raw trajectories stay
 # local — traces.otel.jsonl is the reproducible artifact carried back into the repo.
 .venv/

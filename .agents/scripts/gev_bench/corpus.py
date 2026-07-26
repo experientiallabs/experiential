@@ -5,9 +5,9 @@ Ground truth is the bird-sql execution-match grade recorded in each trace's meta
 No LLM ever assigns a label here, so the VERIFY benchmark measures the outcome judge against a
 truly independent signal.
 
-We reuse the production OTel adapter (`wmh.ingest.otel_genai.OtelGenAIAdapter`) to turn the span
+We reuse the production OTel adapter (`wmo.ingest.otel_genai.OtelGenAIAdapter`) to turn the span
 corpus into `Trace` objects, and reproduce `RunResult.transcript()` verbatim so the judge sees the
-exact transcript format it receives in closed-loop eval (`wmh.evals.closed_loop`).
+exact transcript format it receives in closed-loop eval (`wmo.evals.closed_loop`).
 
 The bird-sql corpus is not materialized inside this worktree; by default we read it from the main
 checkout (read-only). Override with --corpus-root / --gold-dir.
@@ -20,9 +20,9 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
-from wmh.core.types import ActionKind, Trace
-from wmh.harness.runtime import TRANSCRIPT_OBS_CHARS
-from wmh.ingest.otel_genai import OtelGenAIAdapter
+from wmo.core.types import ActionKind, Trace
+from wmo.harness.runtime import TRANSCRIPT_OBS_CHARS
+from wmo.ingest.otel_genai import OtelGenAIAdapter
 
 # Repo-root-relative default (this file sits three levels below the root). The bird-sql
 # trace corpus is not committed on every branch; load_cases fails with guidance when the

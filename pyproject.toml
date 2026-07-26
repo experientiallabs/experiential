@@ -1,5 +1,5 @@
 [project]
-name = "world-model-harness"
+name = "world-model-optimizer"
 version = "0.1.0"
 description = "Run agents, build world models from traces, and optimize agent harnesses."
 readme = "README.md"
@@ -21,12 +21,12 @@ dependencies = [
     "httpx>=0.27",
     "rich>=14.1",
     # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
-    # read core behind `wmh download` (stdlib-only; pushing needs the member's fetch extra).
-    # RELEASE ORDER: environment-capture must be published to PyPI before any wmh release —
+    # read core behind `wmo download` (stdlib-only; pushing needs the member's fetch extra).
+    # RELEASE ORDER: environment-capture must be published to PyPI before any wmo release —
     # outside the workspace this dependency resolves from PyPI, not [tool.uv.sources].
     "environment-capture",
     "gepa>=0.1.1",
-    "tomli-w>=1.0",  # writing .wmh/config.toml (stdlib tomllib reads); every `wmh build` needs it
+    "tomli-w>=1.0",  # writing .wmo/config.toml (stdlib tomllib reads); every `wmo build` needs it
     "posthog>=7.0",
     # Provider SDKs ship with the core install: a fresh `uv sync` must serve every provider the
     # wizard offers without a "No module named ..." follow-up step.
@@ -38,30 +38,30 @@ dependencies = [
 
 [project.optional-dependencies]
 otel = ["opentelemetry-proto>=1.24"]
-# Plotting/figures for research runs (wmh research plot-concurrency); kept out of the core install.
+# Plotting/figures for research runs (wmo research plot-concurrency); kept out of the core install.
 # pandas backs the concurrency-scaling plot's tidy DataFrame.
 viz = ["seaborn>=0.13", "matplotlib>=3.8", "pandas>=2.0"]
 # The e2b harness backend (`--harness-backend e2b`): the pi-node harness PROCESS executes in
 # pooled E2B microVMs while the environment stays the world model. Only those runs need it —
 # local runs stay sandbox-free — so it is an optional extra imported lazily
-# (wmh.harness.e2b_sandbox / wmh.harness.pi_e2b). Exact pin: the harbor E2B environment
-# (wmh.evals.harbor.e2b_environment) depends on version-sensitive template-build API behavior
+# (wmo.harness.e2b_sandbox / wmo.harness.pi_e2b). Exact pin: the harbor E2B environment
+# (wmo.evals.harbor.e2b_environment) depends on version-sensitive template-build API behavior
 # and embeds the e2b version in template alias derivation.
 e2b = ["e2b==2.31.0"]
-# The harbor evaluator (`wmh.evals.harbor`): scores harness candidates on real
+# The harbor evaluator (`wmo.evals.harbor`): scores harness candidates on real
 # Terminal-Bench-2-style tasks through the harbor runner. Imported lazily, same contract as
 # the e2b extra. Exact pin: our E2B template alias derivation embeds harbor's version and
 # tracks its build behavior. Running harbor task environments ON E2B additionally needs
-# `wmh[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
+# `wmo[harbor,e2b]` plus harbor's own e2b extra (`harbor[e2b]`, for dockerfile-parse).
 harbor = ["harbor==0.20.0"]
-# Context connectors (`wmh.connect`): the MCP client SDK backs the Notion connector's
+# Context connectors (`wmo.connect`): the MCP client SDK backs the Notion connector's
 # remote-MCP OAuth/pull path. Only that path needs it, so it is an optional extra imported
-# lazily (wmh.connect.notion), same contract as the e2b extra above.
+# lazily (wmo.connect.notion), same contract as the e2b extra above.
 connectors = ["mcp>=1.27"]
-# The Postgres trace source (`wmh ingest --source postgres`): the driver is imported lazily
+# The Postgres trace source (`wmo ingest --source postgres`): the driver is imported lazily
 # inside the adapter's pull path, same contract as the vendor-SDK extras.
 postgres = ["psycopg[binary]>=3.1"]
-# On-policy distillation (`wmh.distill` + the tinker provider): trains a LoRA student on
+# On-policy distillation (`wmo.distill` + the tinker provider): trains a LoRA student on
 # Tinker from harbor rollouts. Imported lazily, same contract as the e2b extra. The cookbook
 # pin tracks the 0.4.x renderer surface this integration was verified against; Tinker's model
 # lineup churns, so base-model names live in run configs, never in code. The tinker pin tracks
@@ -74,35 +74,35 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
-    "world-model-harness[otel,viz,e2b,connectors,harbor,postgres,distill]",
+    "world-model-optimizer[otel,viz,e2b,connectors,harbor,postgres,distill]",
 ]
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
 # gate covers their tests. Both members have graduated to [project.dependencies] —
-# environment-capture when `wmh download` started consuming it, llm-waterfall when
-# wmh.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
+# environment-capture when `wmo download` started consuming it, llm-waterfall when
+# wmo.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
 # members' heavy extras. The flagship wheel includes llm_waterfall's import package, while the
 # workspace dependency keeps its own metadata and extras available for development and testing.
 dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]
-wmh = "wmh.cli:main"
+wmo = "wmo.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["wmh", "packages/llm-waterfall/llm_waterfall"]
+packages = ["wmo", "packages/llm-waterfall/llm_waterfall"]
 exclude = ["**/*_test.py"]
 force-include = { "packages/llm-waterfall/LICENSE" = "llm_waterfall/LICENSE" }
 
 [tool.hatch.build.targets.sdist]
-# Publish one flagship distribution. llm_waterfall is bundled because WMH imports it as a core
+# Publish one flagship distribution. llm_waterfall is bundled because WMO imports it as a core
 # implementation module; the environment-capture dependency already resolves from PyPI.
 include = [
-    "/wmh",
+    "/wmo",
     "/packages/llm-waterfall/llm_waterfall",
     "/packages/llm-waterfall/LICENSE",
     "/README.md",
@@ -111,7 +111,7 @@ include = [
 ]
 
 [tool.uv.workspace]
-# The monorepo (AGENTS.md § Monorepo): root stays the `wmh` flagship package; members live
+# The monorepo (AGENTS.md § Monorepo): root stays the `wmo` flagship package; members live
 # under packages/, each independently published to PyPI. `uv sync` resolves the whole workspace.
 members = ["packages/*"]
 
@@ -124,7 +124,7 @@ environment-capture = { workspace = true }
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
-testpaths = ["wmh", "packages"]
+testpaths = ["wmo", "packages"]
 # tau2-bench is a local clone of the external real-environment runner (own test suite, own
 # deps) that lives beside the tau-bench member data; it is not part of this gate.
 norecursedirs = ["tau2-bench"]
@@ -133,7 +133,7 @@ norecursedirs = ["tau2-bench"]
 line-length = 100
 target-version = "py312"
 # `examples/` holds isolated, self-contained task launch/capture helpers that can depend on their
-# own benchmark environments. They are not part of the reusable `wmh` package.
+# own benchmark environments. They are not part of the reusable `wmo` package.
 extend-exclude = ["examples/", ".agents/",
     # Pre-contract benchmark dirs keep their examples-era exemption (legacy capture tooling).
     "packages/environment-capture/tau-bench/",
@@ -147,7 +147,7 @@ select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
 [tool.ruff.lint.per-file-ignores]
 # The environment-capture member's benchmark capture/smoke/fetch scripts are operator-run CLIs
 # that report progress on stdout/stderr — that is their product output, same class as the
-# legacy dirs excluded above. The never-print rule (AGENTS.md § Python) binds `wmh/` in full.
+# legacy dirs excluded above. The never-print rule (AGENTS.md § Python) binds `wmo/` in full.
 # UP040: the member still publishes for Python >=3.11, where the `type` alias keyword (3.12+)
 # is unavailable; drop this ignore when the member's own floor moves to 3.12.
 "packages/environment-capture/**" = ["T20", "UP040"]

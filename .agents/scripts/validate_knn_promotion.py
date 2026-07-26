@@ -1,16 +1,16 @@
-"""Validation gate for the kNN policy promotion: reproduce the champion through wmh code.
+"""Validation gate for the kNN policy promotion: reproduce the champion through wmo code.
 
 Chat R1 measured `knn-statz05-oai` with a research script
 (`.agents/scripts/r1_retrieval_ablations.py` on the routing/r1 worktree): +1.04 accuracy points
 over the best single model at -27% cost on routerbench-ours9, 5 of 5 split seeds. This script
-re-runs that measurement through the PRODUCTION path only: `wmh.optimize.knn.fit_knn_policy`
-writes a real .npz sidecar, and `wmh.optimize.routing.evaluate_policy` replays the policy through
+re-runs that measurement through the PRODUCTION path only: `wmo.optimize.knn.fit_knn_policy`
+writes a real .npz sidecar, and `wmo.optimize.routing.evaluate_policy` replays the policy through
 the same `knn_decision` serving calls. If the numbers move, the promotion changed the algorithm.
 
 Split identity is proven, not assumed: the stratified 70/30 split is reimplemented here (the
 research helper lives on the feat/routing-research branch, not on main) and every seed's fit/test
 sizes and best-single baseline accuracy are checked against the recorded runs in
-`~/Desktop/Projects/wmh-routing-data/runs/r1.jsonl`. Query embeddings come from R1's cached
+`~/Desktop/Projects/wmo-routing-data/runs/r1.jsonl`. Query embeddings come from R1's cached
 text-embedding-3-large vectors, so no text is re-embedded.
 
 Usage:
@@ -30,17 +30,17 @@ from pathlib import Path
 
 import numpy as np
 
-from wmh.optimize.knn import best_single_on_fit, fit_knn_policy
-from wmh.optimize.outcomes import OutcomeMatrix
-from wmh.optimize.policy import KNN_BANK_FILENAME, EmbedderSpec, select_model
-from wmh.optimize.routing import evaluate_policy
+from wmo.optimize.knn import best_single_on_fit, fit_knn_policy
+from wmo.optimize.outcomes import OutcomeMatrix
+from wmo.optimize.policy import KNN_BANK_FILENAME, EmbedderSpec, select_model
+from wmo.optimize.routing import evaluate_policy
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 FAILURES: list[str] = []
 
 logger = logging.getLogger("validate-knn")
 
-DATA = Path("~/Desktop/Projects/wmh-routing-data").expanduser()
+DATA = Path("~/Desktop/Projects/wmo-routing-data").expanduser()
 SEEDS = [0, 1, 2, 3, 4]
 # The champion's measured result, as recorded in runs/r1.jsonl (variant r1-knn-statz05-oai).
 CHAMPION_DELTA = 0.0104

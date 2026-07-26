@@ -18,7 +18,7 @@ GEPA now evaluates each step with the **same demos the serving model would retri
 
 Key realization that keeps this cheap and correct: retrieval depends only on `(state, action)`,
 not on the candidate prompt. So a step's demos are identical across every GEPA candidate. We
-therefore compute demos **once** (the module-level `_eval_steps` in `wmh/optimize/gepa.py`) and
+therefore compute demos **once** (the module-level `_eval_steps` in `wmo/optimize/gepa.py`) and
 bundle them — together with the step's within-trace history, so candidates are scored under the
 same open-loop conditions replay uses — into the `_EvalStep` that GEPA carries as its DataInst,
 rather than re-retrieving inside each candidate evaluation.
@@ -39,12 +39,12 @@ rules enforce this:
    observation we're asking it to predict, or an adjacent step that gives it away. We over-fetch
    `top_k + slack`, drop same-trace demos, then take `top_k`.
 
-The serving retriever (used at `wmh serve` time) is separate and indexes the **full** corpus —
+The serving retriever (used at `wmo serve` time) is separate and indexes the **full** corpus —
 there's no held-out set at serve time, so retrieving from everything is correct there.
 
 ## Configuration
 
-- `wmh/engine/build.py` passes a train-only GEPA retriever (sharing the stateless embedder with the
+- `wmo/engine/build.py` passes a train-only GEPA retriever (sharing the stateless embedder with the
   serving retriever) so a real build is RAG-aware by default.
 - `GEPAOptimizer(provider, judge)` with no `retriever` falls back to the original zero-shot behavior
   (used by unit tests and any caller that doesn't want retrieval).

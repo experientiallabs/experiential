@@ -1,8 +1,8 @@
 """Bench-GEN verification leg: back-agreement + solvability, persisted to JSON.
 
-`wmh scenarios verify` prints a table but never writes the VerificationReport, so this runner
+`wmo scenarios verify` prints a table but never writes the VerificationReport, so this runner
 replicates the CLI's provider wiring and dumps the full report (per-scenario verdicts included)
-for the metrics step. Roles resolve from .wmh/settings.toml (judge = Opus 4.8); the agent and the
+for the metrics step. Roles resolve from .wmo/settings.toml (judge = Opus 4.8); the agent and the
 world-model simulator fall back to the world model's own serve provider (haiku, cheap).
 
 Usage:
@@ -20,13 +20,13 @@ import logging
 import time
 from pathlib import Path
 
-from wmh import providers
-from wmh.cli.app import _load_model, _role_provider_config
-from wmh.env.llm_agent import LLMAgent
-from wmh.ingest import get_adapter
-from wmh.scenarios.synthesis import ScenarioSet
-from wmh.scenarios.verification import ChecklistJudge
-from wmh.scenarios.verification.verify import verify_scenarios
+from wmo import providers
+from wmo.cli.app import _load_model, _role_provider_config
+from wmo.env.llm_agent import LLMAgent
+from wmo.ingest import get_adapter
+from wmo.scenarios.synthesis import ScenarioSet
+from wmo.scenarios.verification import ChecklistJudge
+from wmo.scenarios.verification.verify import verify_scenarios
 
 _LOG = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--scenarios", required=True)
     parser.add_argument("--file", required=True)
     parser.add_argument("--name", default="gev-tau")
-    parser.add_argument("--root", default=".wmh")
+    parser.add_argument("--root", default=".wmo")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--max-steps", type=int, default=10)
     parser.add_argument("--out", required=True)

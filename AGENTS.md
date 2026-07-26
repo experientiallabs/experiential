@@ -1,8 +1,8 @@
-# Agent guide — world-model-harness
+# Agent guide — world-model-optimizer
 
-WMH couples three first-class capabilities: a worker-agent runtime, world models learned from
+WMO couples three first-class capabilities: a worker-agent runtime, world models learned from
 agent traces, and an optimizer that improves the worker's harness against those models. Reusable
-code lives under `wmh/`; task-specific examples live under `examples/`.
+code lives under `wmo/`; task-specific examples live under `examples/`.
 
 ## Toolchain
 
@@ -17,11 +17,11 @@ uv run pytest -q
 
 ## World models and trace lifecycle
 
-- `wmh build --file <traces> --name <model>` is the canonical trace-to-model path. Route every
+- `wmo build --file <traces> --name <model>` is the canonical trace-to-model path. Route every
   corpus through the registered `TraceAdapter` seam rather than adding parallel ingest or build
   flows.
-- New trace sources belong in `wmh/ingest/`, normalize into the `Trace` and `Step` contracts in
-  `wmh/core/types.py`, support file ingestion, and register from `wmh/ingest/__init__.py`.
+- New trace sources belong in `wmo/ingest/`, normalize into the `Trace` and `Step` contracts in
+  `wmo/core/types.py`, support file ingestion, and register from `wmo/ingest/__init__.py`.
 - Preserve the build's data boundary: deterministic train, validation, and test splits; a
   full-corpus serving index; train-only prompt optimization and knowledge extraction; untouched
   test data for final evaluation.
@@ -34,18 +34,18 @@ uv run pytest -q
 - Knowledge is editable markdown seeded from training traces only. Automated serving writes may
   touch only `learned.md` and `grounded.md`; seeded rules, entities, schemas, and human edits stay
   intact.
-- `wmh scenarios build` must retain representative clustering, source back-agreement, normalized
-  weights, provenance, and coverage. `wmh serve`, the Python API, and CLI execution must expose
+- `wmo scenarios build` must retain representative clustering, source back-agreement, normalized
+  weights, provenance, and coverage. `wmo serve`, the Python API, and CLI execution must expose
   consistent stateful `WorldModel` session, step, score, usage, and knowledge behavior. Prefer
   shared implementation where it prevents drift; separate adapters are acceptable when their
   boundary is explicit and covered by tests.
 
 ## Worker-agent execution
 
-- Keep `wmh run` as the primary supported execution surface. Bare runs use the built-in local pi
+- Keep `wmo run` as the primary supported execution surface. Bare runs use the built-in local pi
   harness; platform ids resolve to hosted world-model or agent sessions. Add another public entry
   point only for a distinct user need, with consistent lifecycle and safety behavior.
-- `wmh providers set` owns the project-local worker model in `.wmh/settings.toml`. Local runs and
+- `wmo providers set` owns the project-local worker model in `.wmo/settings.toml`. Local runs and
   builds use that role unless explicit flags override it; credentials remain in the environment
   or gitignored `.env`, never in settings.
 - Only bare runs execute harness code and bash on the user's machine. Preserve the explicit local
@@ -57,7 +57,7 @@ uv run pytest -q
   snapshots, incremental bidirectional patches, final three-way reconciliation, concurrent local
   edits, and the complete remote recovery archive on conflict.
 - Detached sessions must survive without a local process. Persist the transcript cursor and sync
-  checkpoint under WMH user state, then catch up before send, attach, or end.
+  checkpoint under WMO user state, then catch up before send, attach, or end.
 - For optimizer and eval E2B runs, sandbox the real pi process while the environment remains the
   world-model simulation. Reuse warm sandboxes within score waves, isolate concurrent cells,
   meter sandbox lifetime, retry uncertain transport only in a fresh sandbox, and fail closed when
@@ -65,10 +65,10 @@ uv run pytest -q
 
 ## Harness optimization
 
-- `wmh optimize harness <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
-  harness-creation workflow. Keep CLI wiring in `wmh/cli/harness_app.py` and search behavior in
-  `wmh/harness/create.py` (world-model delta search) or `wmh/harness/population.py` plus
-  `wmh/harness/project_proposer.py` (the `harbor` environment's complete-source population
+- `wmo optimize harness <agent> <world-model> --tasks <tasks.jsonl>` is the primary public
+  harness-creation workflow. Keep CLI wiring in `wmo/cli/harness_app.py` and search behavior in
+  `wmo/harness/create.py` (world-model delta search) or `wmo/harness/population.py` plus
+  `wmo/harness/project_proposer.py` (the `harbor` environment's complete-source population
   search); another public workflow needs a distinct user case and equivalent validation, audit,
   and versioning guarantees.
 - A harness is a validated `HarnessDoc`, not an editable directory. Its typed surfaces cover
@@ -83,7 +83,7 @@ uv run pytest -q
 - Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
   deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
   promotion or rollback.
-- `wmh optimize harness <agent> harbor --mode distill` is the third optimization surface: instead
+- `wmo optimize harness <agent> harbor --mode distill` is the third optimization surface: instead
   of editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
   student from rollouts of harbor's OWN `terminus_2` agent on harbor tasks (measured: our pi
   scaffold needed 2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59%
@@ -97,12 +97,12 @@ uv run pytest -q
   only then does the adapter version land in `AdapterStore` with the champion alias. Run
   configuration is a per-run TOML passed via `--distill-config` (student, teacher, harbor,
   rollout, train, sampling, warmup, eval, gate, pricing, budget, tripwire, wandb sections),
-  snapshotted into the run dir; the CLI face lives in `wmh/cli/harness_distill.py` and the loop
-  in `wmh/distill/`. Degeneration tripwires (`[tripwire]`, `wmh/distill/tripwire.py`) watch the
+  snapshotted into the run dir; the CLI face lives in `wmo/cli/harness_distill.py` and the loop
+  in `wmo/distill/`. Degeneration tripwires (`[tripwire]`, `wmo/distill/tripwire.py`) watch the
   student's own sampled tokens for the collapse a KL curve hides; their thresholds are fractions
   of a baseline each run measures at its first training step and persists in its run manifest,
   never absolute nats or token counts. See `docs/reference/distill.md` for the user-facing how-to.
-- `wmh scenarios build` produces a weighted `ScenarioSet`; `wmh optimize harness --tasks` currently
+- `wmo scenarios build` produces a weighted `ScenarioSet`; `wmo optimize harness --tasks` currently
   requires `TaskSpec` JSONL. Do not treat those artifact formats as interchangeable.
 - Changes here require focused coverage in `create_test.py`, `delta_test.py`, `store_test.py`,
   `proposer_test.py`, and the scenario builder or verification tests as applicable.
@@ -115,7 +115,7 @@ uv run pytest -q
 - **Never `print`.** All diagnostic/progress output goes through a module logger
   (`logging.getLogger(__name__)`), never the `print` builtin — enforced by ruff's `T20` rules.
   The one exception is deliberate user-facing CLI presentation, which goes through the rich
-  `Console` in `wmh/cli/ui.py` (that is product output, not logging).
+  `Console` in `wmo/cli/ui.py` (that is product output, not logging).
 
 ## Writing
 
@@ -134,23 +134,23 @@ uv run pytest -q
    in scope or prevent meaningful validation.
 
 2. **Tests live inline next to the code.** A module `foo.py` is tested by `foo_test.py` in the same
-   directory (e.g. `wmh/engine/world_model.py` → `wmh/engine/world_model_test.py`). There is no
+   directory (e.g. `wmo/engine/world_model.py` → `wmo/engine/world_model_test.py`). There is no
    top-level `tests/` directory. Pytest is configured (`python_files = ["*_test.py"]`) to discover
    these.
 
 3. **Avoid generic types.** Do not use `Any`, bare `dict`/`object`, or untyped `**kwargs` where a
    concrete type is practical. Prefer explicit pydantic models and fields; for genuinely arbitrary
-   JSON use pydantic's `JsonValue` (see `wmh/core/types.py:JsonObject`), not `Any`.
+   JSON use pydantic's `JsonValue` (see `wmo/core/types.py:JsonObject`), not `Any`.
 
 4. **Keep the structure coherent and the command surface intentional.** Code is organized into
-   domain subpackages under `wmh/` (`core`, `config`, `providers`, `ingest`, `retrieval`,
+   domain subpackages under `wmo/` (`core`, `config`, `providers`, `ingest`, `retrieval`,
    `optimize`, `engine`, `serving`, `cli`). Add a CLI command when it represents a clear user
    workflow; avoid both unrelated command sprawl and hiding useful behavior behind internal APIs.
 
-5. **Keep the top-level layout intentional.** The default tracked top-level directories are: `wmh/`,
+5. **Keep the top-level layout intentional.** The default tracked top-level directories are: `wmo/`,
    `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`, plus
    `packages/`: the monorepo workspace members (see § Monorepo). A new top-level concept requires
-   an explicit architecture rationale plus updates to this guide and `wmh/repo_layout_test.py`;
+   an explicit architecture rationale plus updates to this guide and `wmo/repo_layout_test.py`;
    do not force it into an unrelated directory merely to preserve the current list. What each
    surface is for:
    - `docs/`: **reviewed public documentation** in `docs/research/` (completed research writeups
@@ -160,11 +160,11 @@ uv run pytest -q
      doc and records its purpose. Update or remove superseded material only after checking
      references and retaining durable evidence. `docs/`
      never mentions `.agents/` at all, not even as a disclaimed pointer (enforced by
-     `wmh/repo_layout_test.py`): a reader of docs/ should never learn the workspace exists.
-     Reproduction lives in the report itself, quoted as public `wmh` API/CLI plus the exact
+     `wmo/repo_layout_test.py`): a reader of docs/ should never learn the workspace exists.
+     Reproduction lives in the report itself, quoted as public `wmo` API/CLI plus the exact
      parameter pins.
      Everything else that is "generated" stays out of git: eval results under the local
-     `.wmh/evals/` artifact root, built models under `.wmh/models/` (intentional prebuilt
+     `.wmo/evals/` artifact root, built models under `.wmo/models/` (intentional prebuilt
      example artifacts under `examples/<task>/models/`), eval suite definitions under
      `examples/<task>/evals/`. Never commit local settings files (`settings.toml` anywhere).
    - `.agents/` — **the agents' workspace**: one-off scripts, experiment runners, plans,
@@ -178,7 +178,7 @@ uv run pytest -q
      committed and goes to the Notion experiments area under Research with a SHA-256
      manifest, enforced by .gitignore on `research/distill/`), `proposals/`. When work matures,
      promote its durable output (writeup → `docs/research/`, verified how-to → `docs/reference/`,
-     reusable code → `wmh/`, dataset tooling → `examples/<task>/`). Retire obsolete working
+     reusable code → `wmo/`, dataset tooling → `examples/<task>/`). Retire obsolete working
      material only after checking active references and preserving unique evidence or decisions.
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
      its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean
@@ -187,7 +187,7 @@ uv run pytest -q
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
    - `packages/`: every workspace member lives here, one directory per package:
-     `packages/llm-waterfall/` (stateless LLM failover, bundled into the flagship WMH wheel) and
+     `packages/llm-waterfall/` (stateless LLM failover, bundled into the flagship WMO wheel) and
      `packages/environment-capture/` (benchmark adapters + real-run trace capture emitting OTel
      GenAI JSONL, consumed from PyPI). Per-benchmark data dirs
      (`packages/environment-capture/<benchmark>/`) follow
@@ -203,11 +203,11 @@ uv run pytest -q
    logic belongs under `packages/environment-capture/<benchmark>/` (all ten benchmark integrations live
    there — tau-bench, terminal-tasks, swe-bench included); non-benchmark task examples belong
    under `examples/<task>/`. Either way a dir is self-contained: `traces.otel.jsonl`, optional
-   `evals/*.toml`, task-local helpers. Launch helpers through `wmh examples run <task> -- <args>`
+   `evals/*.toml`, task-local helpers. Launch helpers through `wmo examples run <task> -- <args>`
    (discovery spans both roots).
 
 7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
-   If a workflow is generally useful outside one example dataset, implement it in `wmh/` and expose
+   If a workflow is generally useful outside one example dataset, implement it in `wmo/` and expose
    it through the CLI. When a workspace member already owns the right contract, prefer its public
    API; use a separate implementation when requirements differ materially and document the boundary
    (see Monorepo).
@@ -219,7 +219,7 @@ uv run pytest -q
 9. **Design every public surface from the perspective of a dev using it.** Before implementing a
    feature, write the call site first — the Python snippet or CLI invocation an outside developer
    would type — and judge it: is it obvious, minimal, and hard to misuse? Public surfaces (the
-   `wmh` Python API, CLI commands, pydantic models) stay small, composable, and explicitly typed.
+   `wmo` Python API, CLI commands, pydantic models) stay small, composable, and explicitly typed.
    Extend via the existing seam for that concern (a new `TraceAdapter`, provider, retriever, eval
    scorer) when that seam matches the new behavior. If it does not, introduce a focused abstraction
    and document why; do not force distinct semantics through an ill-fitting seam or accumulate
@@ -263,8 +263,8 @@ uv run pytest -q
 
 ## Monorepo
 
-This repo is a **uv workspace** monorepo. The root `pyproject.toml` is the `wmh` flagship
-package (its quickstart is unchanged: clone → `uv sync` → `uv run wmh ...`), and each member lives
+This repo is a **uv workspace** monorepo. The root `pyproject.toml` is the `wmo` flagship
+package (its quickstart is unchanged: clone → `uv sync` → `uv run wmo ...`), and each member lives
 under `packages/<name>/` with its own `pyproject.toml` and version. The release policy is explicit
 per member rather than inferred from workspace membership.
 Rules of the road:
@@ -272,16 +272,16 @@ Rules of the road:
 - **Membership**: `[tool.uv.workspace].members = ["packages/*"]` in the root pyproject — a new dir under `packages/` with a pyproject IS a member; anything inside the
   workspace that depends on a member resolves it from source via `[tool.uv.sources]`
   (`{ workspace = true }`), never from PyPI.
-- **Dependency arrows**: members never import `wmh`, and members remain installable and usable
+- **Dependency arrows**: members never import `wmo`, and members remain installable and usable
   standalone. Published dependencies such as `environment-capture` need BOTH halves: declare them
   in `[project.dependencies]` and use `[tool.uv.sources]` for in-workspace source resolution. The
   intentional `llm-waterfall` exception is bundled into the flagship wheel, so it remains a
-  workspace development dependency but is not a `Requires-Dist` dependency of WMH. Do not add a
+  workspace development dependency but is not a `Requires-Dist` dependency of WMO. Do not add a
   second runtime copy or a separate release requirement without revisiting the one-distribution
-  decision. Carve-out: the no-wmh-import rule binds the member's
+  decision. Carve-out: the no-wmo-import rule binds the member's
   PUBLISHED source tree (what `[tool.hatch.build]`/`include` ships in the wheel). Local research
   and capture scripts inside per-benchmark data dirs (e.g.
-  `packages/environment-capture/tau-bench/rl/`) may import `wmh`: they are workspace tooling
+  `packages/environment-capture/tau-bench/rl/`) may import `wmo`: they are workspace tooling
   that happens to live next to the data it operates on, they never ship, and the member must
   stay installable without them.
 - **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
@@ -290,7 +290,7 @@ Rules of the road:
   its own `[tool.ruff]`/`[tool.ty]` tables (ruff resolves the closest config). `web/` keeps its
   own separate JS gate (rule 5).
 - **Publishing**: `.github/workflows/python-package.yml` builds and publishes only the flagship
-  `world-model-harness` distribution. Its wheel includes `wmh` plus `llm_waterfall`; the publish
+  `world-model-optimizer` distribution. Its wheel includes `wmo` plus `llm_waterfall`; the publish
   job runs only for a GitHub release and uses the `pypi` trusted-publisher environment. Do not add
   member publishing workflows unless the release policy changes explicitly.
 - **Shared capabilities**: when a member already owns the needed contract, prefer consuming its
@@ -301,7 +301,7 @@ Rules of the road:
 
 The repo is the single source of truth for project docs: finished, production-ready reports in
 `docs/` (rule 5); working docs, plans, and drafts in `.agents/docs/`. The former Notion docs
-database (Eng Docs → world-model-harness, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) was
+database (Eng Docs → world-model-optimizer, page `38e0f8b3-f591-8087-b6b7-fc883178dc5e`) was
 migrated into `.agents/docs/` on 2026-07-02 and is deprecated — do not add new project docs to
 Notion. Review working docs in `.agents/docs/` periodically. Promote durable decisions and evidence
 to `docs/`; remove obsolete material only after checking references and preserving anything unique.

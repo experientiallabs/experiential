@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Live runner for the trace scaling law: fidelity vs. number of training traces.
 
-The SIDECAR for `wmh.research.TraceScalingAblation` — it resolves a corpus, holds a fixed test/valid
+The SIDECAR for `wmo.research.TraceScalingAblation` — it resolves a corpus, holds a fixed test/valid
 split, and sweeps the TRAIN trace count (e.g. 10, 20, 50, … capped at the corpus) for one or both
 modes (`base` = shipped prompt + RAG, `gepa` = GEPA-optimized per count), reporting test fidelity
 mean ± std across seeds at each point. The curve says whether more traces keep buying fidelity or
@@ -28,17 +28,17 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from wmh.engine.eval_suites import resolve_eval_suite
-from wmh.engine.prompts import BASE_ENV_PROMPT
-from wmh.ingest import drop_degenerate_traces, get_adapter
-from wmh.optimize.judge import Judge, RubricJudge
-from wmh.providers import ProviderConfig, ProviderKind, get_provider, provider_or_chain
-from wmh.providers.base import Embedder, Provider
-from wmh.providers.retry import RetryingProvider
-from wmh.research import TraceScalingAblation, run_ablation
-from wmh.research.ablation import AblationReport, Condition
-from wmh.retrieval import HashingEmbedder
-from wmh.tracking import MeteredProvider, Phase, RunRecord, RunTracker
+from wmo.engine.eval_suites import resolve_eval_suite
+from wmo.engine.prompts import BASE_ENV_PROMPT
+from wmo.ingest import drop_degenerate_traces, get_adapter
+from wmo.optimize.judge import Judge, RubricJudge
+from wmo.providers import ProviderConfig, ProviderKind, get_provider, provider_or_chain
+from wmo.providers.base import Embedder, Provider
+from wmo.providers.retry import RetryingProvider
+from wmo.research import TraceScalingAblation, run_ablation
+from wmo.research.ablation import AblationReport, Condition
+from wmo.retrieval import HashingEmbedder
+from wmo.tracking import MeteredProvider, Phase, RunRecord, RunTracker
 
 
 # Default scaling ladder: log-spaced from a single trace up, capped at the corpus by the ablation
@@ -142,7 +142,7 @@ def _make_backends(
     transient Bedrock capacity errors. The embedder is offline hashing (default), Azure ada-002
     (`--embedder azure`, semantic), or None (`--no-rag`).
     """
-    # Serve rides the config-driven failover chain (.wmh/fallback.toml rungs incl. the
+    # Serve rides the config-driven failover chain (.wmo/fallback.toml rungs incl. the
     # Anthropic-direct last resort) inside retry backoff; the JUDGE stays pinned to a single
     # backend — a judge that switches models mid-run scores steps on different scales.
     serve_raw: Provider = RetryingProvider(

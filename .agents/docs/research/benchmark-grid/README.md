@@ -1,6 +1,6 @@
 # benchmark-grid — reference run inputs & artifacts
 
-The inputs and saved results of the 4-benchmark × 5-model `wmh eval grid` reference run
+The inputs and saved results of the 4-benchmark × 5-model `wmo eval grid` reference run
 (terminal-tasks, tau-bench, kimi-gui-control, swe-bench). The user-facing feature doc is
 `docs/reference/eval_grid.md`; this directory is research scratch (raw JSONs + evolved prompts),
 not a product artifact.
@@ -10,7 +10,7 @@ not a product artifact.
 **1. The archived JSONs are `rubric-v1`, reference-only.** Every `grid_*_{api,qwen}.json` was
 scored by the pre-overhaul judge (before PR #83). They are stamped `"judge_version": "rubric-v1"`.
 rubric-v1 scores run roughly +0.12 higher than the current `rubric-v2` judge on the same
-predictions, so **these numbers are NOT comparable to any fresh run** (`wmh eval grid` now stamps
+predictions, so **these numbers are NOT comparable to any fresh run** (`wmo eval grid` now stamps
 `rubric-v2`). Re-run under `rubric-v2` before comparing.
 
 **2. Eight of the twenty GEPA prompts are byte-identical to `BASE_ENV_PROMPT` (no-op GEPA).**
@@ -40,7 +40,7 @@ prompt"), so fresh runs cannot reintroduce these no-op cells — the disclosure 
   12 evolved, per above).
 - `grid_<suite>_{api,qwen}.json` — the saved `rubric-v1` `GridResult`s (API-model grid + the
   self-hosted Qwen grid, which runs in its own process). Re-render figures from these with
-  `wmh eval grid-plot` / `grid-heatmap` (charts are regenerable, so no PNGs are committed).
+  `wmo eval grid-plot` / `grid-heatmap` (charts are regenerable, so no PNGs are committed).
 
 One more reference-run caveat: for `swe-bench` the api and qwen JSONs were scored on slightly
 different held-out sets (api = 8 traces / 12 steps, qwen = 5 traces / 17 steps) despite the same

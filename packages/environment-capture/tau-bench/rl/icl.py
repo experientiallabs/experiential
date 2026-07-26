@@ -41,14 +41,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError
 
-from wmh.core.parsing import extract_json_object
-from wmh.core.render import render_action
-from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Step
-from wmh.engine.world_model import WorldModel
-from wmh.env import DONE_SIGNAL, Scenario, WorldModelEnv, run_episode
-from wmh.optimize.reward import EpisodeScore
-from wmh.providers.base import Message, Provider, ProviderConfig, ProviderKind
-from wmh.providers.registry import get_provider
+from wmo.core.parsing import extract_json_object
+from wmo.core.render import render_action
+from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Step
+from wmo.engine.world_model import WorldModel
+from wmo.env import DONE_SIGNAL, Scenario, WorldModelEnv, run_episode
+from wmo.optimize.reward import EpisodeScore
+from wmo.providers.base import Message, Provider, ProviderConfig, ProviderKind
+from wmo.providers.registry import get_provider
 
 _HERE = Path(__file__).resolve().parent
 _MODEL_DIR = _HERE.parent / "models" / "tau-bench"
@@ -124,7 +124,7 @@ class _Done(BaseModel):
 
 
 class PolicyAgent:
-    """wmh `Agent`: an LLM proposing tau tool calls from task + episode history (+ ICL memory).
+    """wmo `Agent`: an LLM proposing tau tool calls from task + episode history (+ ICL memory).
 
     A malformed policy reply gets ONE re-ask with a terse nudge; a second failure ends the
     episode (never feed garbage to the world model). `parse_failures` counts both, so rows
@@ -355,7 +355,7 @@ def main() -> int:
     )
     parser.add_argument("--memory", type=Path, default=_HERE / "icl_memory.jsonl")
     parser.add_argument("--out", type=Path, default=None, help="results JSONL (default: derived)")
-    parser.add_argument("--wandb", action="store_true", help="log rows to wandb wmh-rl-transfer")
+    parser.add_argument("--wandb", action="store_true", help="log rows to wandb wmo-rl-transfer")
     args = parser.parse_args()
     if args.attempts < 1:
         parser.error("--attempts must be >= 1")
@@ -374,7 +374,7 @@ def main() -> int:
         import wandb
 
         run = wandb.init(
-            project="wmh-rl-transfer",
+            project="wmo-rl-transfer",
             name=f"icl-{args.mode}-{args.scenarios}-wm_{args.wm}",
             config={k: str(v) for k, v in vars(args).items()},
         )

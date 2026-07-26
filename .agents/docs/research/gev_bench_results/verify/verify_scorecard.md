@@ -79,7 +79,7 @@ the exact success condition the recorded reward encodes. Full inventory in `grou
 
 - Judge inputs match production exactly: instruction = question + evidence hint, answer = submitted
   SQL, transcript = `RunResult.transcript()` verbatim format, traces loaded with the production OTel
-  adapter (`wmh.ingest.otel_genai.OtelGenAIAdapter`). The gold assertion is one semantic
+  adapter (`wmo.ingest.otel_genai.OtelGenAIAdapter`). The gold assertion is one semantic
   post-condition mirroring the execution-match grade ("final SQL is equivalent to the reference
   query"); the transcript shows the queries the agent ran and the rows they returned.
 - DEVIATION: `GoldJudge.score` hardcodes temperature 0.0. To get the vote-agreement proxy the runner

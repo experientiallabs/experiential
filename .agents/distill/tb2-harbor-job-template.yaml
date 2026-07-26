@@ -1,7 +1,7 @@
-job_name: wmh-distill-placeholder
-jobs_dir: /tmp/wmh-distill-jobs
+job_name: wmo-distill-placeholder
+jobs_dir: /tmp/wmo-distill-jobs
 n_concurrent_trials: 1
-# Task sandboxes on E2B (the scorer rewrites this to wmh's E2B environment import
+# Task sandboxes on E2B (the scorer rewrites this to wmo's E2B environment import
 # path); must agree with the requested --backend or the scorer rejects the combo.
 environment:
   type: e2b

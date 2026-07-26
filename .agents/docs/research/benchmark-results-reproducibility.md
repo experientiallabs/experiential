@@ -13,7 +13,7 @@ migrated: 2026-07-02
 > were removed). The methodology and the headline conclusion (the GEPA lift is stable, not
 > run-to-run luck) stand; rerun the commands below for current numbers.
 
-The base-vs-GEPA comparison comes from open-loop reconstruction fidelity (`wmh eval`) on the
+The base-vs-GEPA comparison comes from open-loop reconstruction fidelity (`wmo eval`) on the
 committed tau-bench corpus (at the time: 66 traces / 433 steps; telecom + airline + retail, captured
 from Sierra's real tau²-bench). This doc records the exact methodology so the numbers can be
 regenerated.
@@ -25,12 +25,12 @@ $1–2 each and take a few minutes (84 held-out steps × judge calls).
 
 ```bash
 # Base prompt (the un-evolved BASE_ENV_PROMPT)
-AWS_REGION=us-east-1 uv run wmh eval examples/tau-bench/traces.otel.jsonl \
+AWS_REGION=us-east-1 uv run wmo eval examples/tau-bench/traces.otel.jsonl \
   --region us-east-1 --judge rubric --train-split 0.7 --seed 0 \
   --out base_report.json
 
 # GEPA-optimized prompt (the committed example model)
-AWS_REGION=us-east-1 uv run wmh eval examples/tau-bench/traces.otel.jsonl \
+AWS_REGION=us-east-1 uv run wmo eval examples/tau-bench/traces.otel.jsonl \
   --region us-east-1 --prompt examples/tau-bench/models/tau-telecom/prompts/optimized.txt \
   --judge rubric --train-split 0.7 --seed 0 \
   --out optimized_report.json
@@ -76,5 +76,5 @@ one split — not seed-to-seed variance, which remains a GEPA-research follow-up
   in the committed reports are a single sample each.
 - Retrieval uses the offline lexical `HashingEmbedder` (semantic phi untested).
 - `held_out_accuracy` in `examples/tau-bench/models/tau-telecom/metrics.json` (0.675) is GEPA's *internal*
-  validation score over its own 317-rollout search — a different measurement from these `wmh eval`
+  validation score over its own 317-rollout search — a different measurement from these `wmo eval`
   fidelity numbers; don't conflate them.

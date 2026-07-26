@@ -105,7 +105,7 @@ enters the world model).
   mean fidelity **0.773**, error-flag accuracy **0.939**, n=196 held-out steps (the earlier
   0.652 @10 traces was a noisy small-n measurement). Measured via a cross-provider failover
   chain (bedrock-4.8 → anthropic-direct-4.8 → bedrock-4.7; same Opus 4.8 weights on the first
-  two links, so the judge stays comparable; today the supported route is a `.wmh/fallback.toml`
+  two links, so the judge stays comparable; today the supported route is a `.wmo/fallback.toml`
   chain, see `docs/reference/failover.md`).
   Sits mid-family: above financebench's document excerpts (0.586), below
   appworld's structured API observations (0.793); the residual is opaque per-universe identifiers

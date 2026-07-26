@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/experientiallabs/world-model-harness/tree/main/llm-waterfall"
+Repository = "https://github.com/experientiallabs/world-model-optimizer/tree/main/llm-waterfall"
 
 [project.optional-dependencies]
 openai = ["openai>=1.40"]
