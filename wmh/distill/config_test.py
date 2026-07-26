@@ -216,10 +216,50 @@ tags = ["smoke", "tb2"]
     assert cfg.wandb.tags == ["smoke", "tb2"]
 
 
-def test_compaction_true_rejected(tmp_path: Path) -> None:
-    text = MINIMAL_TOML + "\n[rollout]\ncompaction = true\n"
+def test_compaction_rejected_with_a_verbatim_renderer(tmp_path: Path) -> None:
+    """The one combination that silently corrupts: merge an episode whose prefix moved."""
+    text = MINIMAL_TOML + (
+        "\n[rollout]\ncompaction = true\n\n"
+        '[rollout.renderers]\n"Qwen/Qwen3-8B" = "wmh/qwen3_verbatim"\n'
+    )
     with pytest.raises(ValueError, match="prefix property"):
         load_distill_config(_write(tmp_path, text))
+
+
+def test_compaction_allowed_with_a_strip_history_renderer(tmp_path: Path) -> None:
+    """Compaction costs nothing once the episode is already one datum per turn.
+
+    Leaving it off is what let a context overflow FAIL the trial instead of
+    ending the episode, which took 24% of teacher trials out of the denominator
+    rather than scoring them zero.
+    """
+    text = MINIMAL_TOML + (
+        "\n[rollout]\ncompaction = true\n\n"
+        '[rollout.renderers]\n"Qwen/Qwen3-8B" = "wmh/qwen3_5_strip_history"\n'
+    )
+    assert load_distill_config(_write(tmp_path, text)).rollout.compaction is True
+
+
+def test_defer_baselines_requires_an_imported_student_before(tmp_path: Path) -> None:
+    """Deferred, student-before runs after the LoRA moved -- it MUST be imported, not measured."""
+    text = MINIMAL_TOML + "\n[eval]\ndefer_baselines = true\n"
+    with pytest.raises(ValueError, match="student_baseline_from"):
+        load_distill_config(_write(tmp_path, text))
+
+
+def test_defer_baselines_accepted_with_a_student_baseline(tmp_path: Path) -> None:
+    """The teacher may be measured late (fixed base model); the student may not."""
+    text = MINIMAL_TOML + (
+        "\n[eval]\ndefer_baselines = true\n"
+        'student_baseline_from = "runs/base/evals/baseline-student-before.json"\n'
+    )
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.eval.defer_baselines is True
+
+
+def test_compaction_defaults_off(tmp_path: Path) -> None:
+    """Off unless asked for: it is a real change to what the model sees."""
+    assert load_distill_config(_write(tmp_path, MINIMAL_TOML)).rollout.compaction is False
 
 
 @pytest.mark.parametrize("steps", [0, 1, 5])
@@ -827,7 +867,7 @@ def test_checked_in_run_configs_name_a_verbatim_renderer_for_every_tinker_model(
     configs actually carry the entries.
     """
     pytest.importorskip("tinker_cookbook")
-    from wmh.distill.renderers import VERBATIM_RENDERERS
+    from wmh.distill.renderers import WMH_RENDERERS
 
     config_dir = Path(__file__).resolve().parents[2] / ".agents" / "distill"
     paths = sorted(config_dir.glob("*.toml"))
@@ -843,7 +883,31 @@ def test_checked_in_run_configs_name_a_verbatim_renderer_for_every_tinker_model(
         for model in sampled:
             renderer = cfg.rollout.renderers.get(model)
             assert renderer is not None, f"{path.name}: no rollout.renderers entry for {model}"
-            assert renderer in VERBATIM_RENDERERS, f"{path.name}: {model} = {renderer}"
+            assert renderer in WMH_RENDERERS, f"{path.name}: {model} = {renderer}"
+
+
+def test_the_config_module_never_imports_the_distill_extra_at_module_scope() -> None:
+    """`wmh --help` must work on a base install: the CLI imports this module eagerly.
+
+    Renderer-name validation needs tinker-cookbook, so it lives behind a lazy import
+    inside the validator and only runs when a config actually names renderers.
+    """
+    import ast
+
+    import wmh.distill.config as config_module
+
+    assert config_module.__file__ is not None
+    tree = ast.parse(Path(config_module.__file__).read_text(encoding="utf-8"))
+    roots: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            roots.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            roots.add(node.module.split(".")[0])
+    assert not roots & {"tinker", "tinker_cookbook", "harbor"}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            assert node.module != "wmh.distill.renderers"
 
 
 def test_a_renderer_name_the_cookbook_cannot_build_is_rejected_at_load(tmp_path: Path) -> None:
@@ -895,3 +959,18 @@ def test_super_topk_configs_pin_clip_and_centering_explicitly(name: str) -> None
     assert cfg.train.advantage_clip == pytest.approx(4.0)
     assert cfg.train.center_advantages is True
     assert cfg.warmup.steps == 0
+
+
+def test_training_turn_cap_defaults_to_the_rollout_cap(tmp_path: Path) -> None:
+    """Unset means one cap everywhere, which is the pre-existing behaviour."""
+    cfg = load_distill_config(_write(tmp_path, MINIMAL_TOML))
+    assert cfg.train.rollout_max_turns is None
+    assert cfg.rollout.max_turns == 100
+
+
+def test_training_turn_cap_is_separate_from_the_eval_cap(tmp_path: Path) -> None:
+    """Evals must stay at rollout.max_turns or the paired before/after delta is void."""
+    text = MINIMAL_TOML + "\n[rollout]\nmax_turns = 100\n\n[train]\nrollout_max_turns = 20\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.train.rollout_max_turns == 20
+    assert cfg.rollout.max_turns == 100, "the eval-side cap must not move"

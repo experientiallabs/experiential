@@ -472,6 +472,8 @@ def test_log_step_flattens_the_metrics_row(fake_wandb: _FakeWandb, tmp_path: Pat
         "train/overlong_drops": 1,
         "train/mismatch_drops": 0,
         "train/clipped_tokens": 3,
+        # Updates per step: the cheapest explanation for a null result, so it charts.
+        "train/optimizer_updates": 1,
         "train/loss_tokens": 40,
         "train/context_tokens": 200,
         "train/reverse_kl_per_token": -0.25,

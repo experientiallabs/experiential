@@ -76,7 +76,9 @@ from wmh.distill.loop import (
     DistillBudgetError,
     DistillProgress,
     DistillResult,
+    OptimStepOutput,
     SdkSamplingClient,
+    TrainStepOutput,
     run_distillation,
 )
 from wmh.distill.rendering import ChatRendering, RendererTokenizer, build_renderer
@@ -339,24 +341,44 @@ class ProbeTrainingClient:
         """The student base model's HF tokenizer."""
         return cast("EncodingTokenizer", self._client.get_tokenizer())
 
-    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> None:
-        """One timed blocking forward/backward batch (compat datum conversion)."""
+    def forward_backward(self, datums: Sequence[TrainDatum], loss_fn: str) -> TrainStepOutput:
+        """One timed blocking forward/backward batch (compat datum conversion).
+
+        Returns a real `TrainStepOutput`. It used to return None, which violated the
+        `TrainingClient` protocol it stands in for -- the loop reads `.loss` off this and
+        crashed with `'NoneType' object has no attribute 'loss'`, so the probe could not run
+        at all. The loss is read from the response's metrics rather than fabricated: absent
+        or non-numeric becomes None, which the loop already treats as "backend reported no
+        loss metric".
+        """
         converted = _compat_tinker_datums(datums)
         started = time.monotonic()
         try:
-            self._client.forward_backward(
+            response = self._client.forward_backward(
                 converted, cast("tinker.types.LossFnType", loss_fn)
             ).result()
         finally:
             self._timer.record("train.forward_backward", time.monotonic() - started)
+        metrics = getattr(response, "metrics", None) or {}
+        loss = metrics.get("total_loss:sum", metrics.get("total_loss"))
+        return TrainStepOutput(loss=float(loss) if isinstance(loss, (int, float)) else None)
 
-    def optim_step(self, learning_rate: float) -> None:
-        """One timed blocking Adam step."""
+    def optim_step(self, learning_rate: float) -> OptimStepOutput:
+        """One timed blocking Adam step.
+
+        Returns a real `OptimStepOutput` for the same reason as `forward_backward`: the loop
+        reads `.grad_norm` off it, and returning None broke the protocol. Grad norm is
+        reported only if the backend supplies one; never fabricated.
+        """
         started = time.monotonic()
         try:
-            self._client.optim_step(tinker.types.AdamParams(learning_rate=learning_rate)).result()
+            response = self._client.optim_step(
+                tinker.types.AdamParams(learning_rate=learning_rate)
+            ).result()
         finally:
             self._timer.record("train.optim_step", time.monotonic() - started)
+        norm = getattr(response, "grad_norm", None)
+        return OptimStepOutput(grad_norm=float(norm) if isinstance(norm, (int, float)) else None)
 
     def save_state(self) -> str:
         """One timed blocking save_state under a session-unique name."""
@@ -515,11 +537,24 @@ class ProbeRollouts:
                         ),
                     )
                 )
+        # `RolloutStats` grew four required fields (raw_solve_rate, executed_trials,
+        # infra_failed_trials, scaffold_loss_rate) after this probe was written, and the probe
+        # was not re-run in between, so it bit-rotted into a hard ValidationError -- the
+        # fast-iteration tool the goal file points at for cheap pre-checks was unusable. Every
+        # probe trial completes by construction (there is no harness to lose an episode to), so
+        # the honest values are: nothing infra-failed, everything executed, no scaffold loss.
+        # solve_rate stays 0.0 because these are ungraded math completions with no verifier;
+        # on-policy distillation needs no reward, and the probe's pass signal is the reverse-KL
+        # trend, not a solve rate.
         stats = RolloutStats(
             trials=len(records),
             trials_with_spans=len(records),
             solve_rate=0.0,
+            raw_solve_rate=0.0,
+            executed_trials=len(records),
+            infra_failed_trials=0,
             empty_span_trials=0,
+            scaffold_loss_rate=0.0,
         )
         logger.info(
             "probe rollouts step %d: %d trial(s) from %s (%d task(s) x %d attempt(s))",
@@ -549,6 +584,9 @@ def build_config(args: argparse.Namespace) -> DistillConfig:
             sampler_refresh_every=1,
             save_state_every=4,
             trial_concurrency=1,
+            learning_rate=args.learning_rate,
+            num_substeps=args.num_substeps,
+            advantage_clip=args.advantage_clip,
         ),
         sampling=SamplingConfig(temperature=1.0, max_tokens=args.max_tokens),
         eval=EvalConfig(every=0, tasks=len(HOLDOUT_TASK_IDS), k=1),
@@ -579,6 +617,26 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--wandb", action="store_true", help="enable [wandb] tracking (project wmh-distill)"
     )
+    # The three knobs that decide whether a run trains or collapses, exposed here so the
+    # question can be answered for pennies instead of on a $14/step agentic run. Both real
+    # model pairs collapsed at their first honest update count -- Qwen upward (length 5.33x),
+    # Nano downward (entropy 0.35x) -- and the suspected cause is the UNBOUNDED advantage
+    # magnitude, not the sign (audited: advantage = teacher_lp - sampled_lp = -reverse_kl,
+    # which is the cookbook's construction and correct). This probe is the cheap way to test
+    # that: hold everything else fixed and vary the bound.
+    parser.add_argument(
+        "--num-substeps",
+        type=int,
+        default=1,
+        help="minibatches (and optimizer updates) per collected batch; 1 = historical behaviour",
+    )
+    parser.add_argument(
+        "--advantage-clip",
+        type=float,
+        default=None,
+        help="bound |advantage| per token; unset (default) trains the raw teacher-minus-student gap",
+    )
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="optimizer lr")
     return parser.parse_args(argv)
 
 

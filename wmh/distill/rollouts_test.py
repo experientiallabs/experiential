@@ -8,6 +8,8 @@ import logging
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import cast
+from unittest import mock
 
 import pytest
 from harbor.models.job.config import JobConfig
@@ -347,15 +349,15 @@ def test_terminus_2_agent_kwargs_register_the_wmh_verbatim_renderers(tmp_path: P
     """
     from tinker_cookbook.renderers import get_registered_renderer_names, unregister_renderer
 
-    from wmh.distill.renderers import VERBATIM_RENDERERS
+    from wmh.distill.renderers import WMH_RENDERERS
 
-    for name in VERBATIM_RENDERERS:
+    for name in WMH_RENDERERS:
         unregister_renderer(name)
-    assert not set(VERBATIM_RENDERERS) & set(get_registered_renderer_names())
+    assert not set(WMH_RENDERERS) & set(get_registered_renderer_names())
 
     terminus_2_agent_kwargs(_cfg(tmp_path), _provider_config())
 
-    assert set(VERBATIM_RENDERERS) <= set(get_registered_renderer_names())
+    assert set(WMH_RENDERERS) <= set(get_registered_renderer_names())
 
 
 def test_terminus_2_agent_kwargs_reject_a_non_tinker_provider(tmp_path: Path) -> None:
@@ -959,3 +961,61 @@ def test_collect_rollouts_warns_when_turns_hit_the_output_cap(
         "sampled the full sampling.max_tokens = 16" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_harbor_tinker_llm_shares_one_service_client() -> None:
+    """Harbor builds a TinkerLLM per TRIAL; a client each would exhaust Tinker's session cap.
+
+    Measured before the patch: step 0 clean, step 1 three failures, step 2 THIRTY-ONE trials
+    rejected with `400 Too many active sessions`. The cap is ~240 and each step burns 64.
+    """
+    import asyncio
+
+    from harbor.llms.tinker import TinkerLLM
+
+    from wmh.distill.rollouts import _share_harbor_tinker_service_client
+
+    _share_harbor_tinker_service_client()
+
+    built: list[object] = []
+
+    class _FakeService:
+        async def create_sampling_client_async(self, **kwargs: object) -> object:
+            built.append(kwargs)
+            return object()
+
+    service = _FakeService()
+    with mock.patch("wmh.providers.tinker.shared_service_client", return_value=service):
+
+        class _Stub:
+            """The TinkerLLM attribute surface the patched method touches."""
+
+            def __init__(self) -> None:
+                self._sampling_client: object | None = None
+                self._service_client: object | None = None
+                self._model_path: str | None = None
+                self._model_name = "Qwen/Qwen3.5-9B"
+
+        first, second = _Stub(), _Stub()
+        ensure = cast("Callable[[object], object]", TinkerLLM._ensure_client)
+        client_a = asyncio.run(ensure(first))  # ty: ignore[invalid-argument-type]
+        client_b = asyncio.run(ensure(second))  # ty: ignore[invalid-argument-type]
+
+    assert first._service_client is second._service_client is service, (
+        "every TinkerLLM must reuse ONE ServiceClient or sessions leak per trial"
+    )
+    assert client_a is not client_b, "each LLM still gets its own sampling client"
+    assert len(built) == 2
+
+
+def test_sharing_the_harbor_client_is_idempotent() -> None:
+    """`terminus_2_agent_kwargs` calls it on every batch, so repeats must be free."""
+    from harbor.llms.tinker import TinkerLLM
+
+    from wmh.distill.rollouts import _share_harbor_tinker_service_client
+
+    _share_harbor_tinker_service_client()
+    patched = TinkerLLM._ensure_client
+    _share_harbor_tinker_service_client()
+    _share_harbor_tinker_service_client()
+    assert TinkerLLM._ensure_client is patched

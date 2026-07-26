@@ -386,10 +386,18 @@ def build_datums(
         context_tokens=context_tokens,
     )
     if stats.fragments:
+        # Not always a fault. A history-editing renderer (wmh/qwen3_5_strip_history) drops prior
+        # turns' reasoning by design, which breaks the prefix property on purpose and makes every
+        # turn its own datum -- a near-1.0 rate is the EXPECTED reading there, not a regression.
+        # The message says what it costs and lets the reader judge, rather than asserting a bug:
+        # the old wording ("check the harness prefix pins") sent a reader hunting for a break that
+        # the configuration had deliberately chosen.
         logger.warning(
-            "%d of %d datum(s) are fragments (fragmentation rate %.2f): the agent "
-            "edited its history mid-episode, so shared context is re-prefilled and "
-            "teacher scoring costs multiply; check the harness prefix pins",
+            "%d of %d datum(s) are fragments (fragmentation rate %.2f): turns are scored "
+            "separately rather than merged, so shared context is re-prefilled per turn and "
+            "teacher scoring cost rises with turn count. Expected under a history-editing "
+            "renderer; unexpected under a verbatim one, where it means the prefix property "
+            "broke and the harness pins need checking",
             stats.fragments,
             stats.datums,
             stats.fragmentation_rate,

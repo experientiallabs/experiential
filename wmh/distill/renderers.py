@@ -35,6 +35,27 @@ Chat._messages -> message_history -> TinkerLLM.call ->
 renderer.build_generation_prompt`, every step of which passes `content`
 through untouched. No harbor code is modified.
 
+Keeping the reasoning in the token stream is not free, and the module ships
+BOTH sides of the trade (`VerbatimHistoryMixin` and `StripHistoryMixin`, one
+renderer family each). A turn's thinking is in its sampled ids either way, so
+the model reasons every turn and the loss covers every reasoning token in both;
+what differs is whether a LATER prompt still contains it:
+
+- carry it (verbatim): the episode is one datum, but the context grows with
+  every turn's reasoning. Measured on a 53-trial TB2 teacher baseline, this put
+  27 of 53 episodes over the window, and terminus-2 turns a context overflow
+  into a FAILED trial rather than a finished episode -- so those trials left the
+  denominator instead of scoring zero, and the reported solve rate was 95.8% of
+  the survivors.
+- drop it (strip history): later prompts stay small (that same set: final
+  context p50 23,631 -> 8,682, max 49,117 -> 40,162), which is also what the
+  stock renderers and the published terminus-2 setups do. The cost is the
+  prefix property, so the episode fragments into one datum per turn and teacher
+  prefill rises ~5.1x cold, ~2.6x once the shared prefix bills cached.
+
+Pick by whether the episode fits the window: an overflow costs a whole trial
+AND biases the measurement, whereas fragmentation only costs money.
+
 Only a CLEANLY terminated turn is carried verbatim. A turn that hit the output
 cap has no stop token, so re-rendering it from its ids would splice an
 unterminated assistant message into the context; those fall back to the base
@@ -187,6 +208,58 @@ class VerbatimHistoryMixin(Renderer):
         )
 
 
+class StripHistoryMixin(Renderer):
+    """Parses a sampled turn to plain text and lets the base renderer drop thinking.
+
+    Mix in FIRST, as with `VerbatimHistoryMixin`. This is the OTHER side of the
+    trade that module docstring describes, and the two cannot be combined:
+
+    - `VerbatimHistoryMixin` replays a turn's exact ids, so reasoning survives
+      into later prompts and the episode is ONE datum. The cost is context:
+      every turn's thinking accumulates.
+    - this mixin keeps only the action text, so later prompts carry no prior
+      reasoning and stay small. The cost is the prefix property: turn N's
+      sampled ids (which include its thinking) are no longer a substring of
+      turn N+1's prompt, so the episode fragments into one datum PER TURN.
+
+    Both keep the model REASONING and both train on those reasoning tokens --
+    thinking is in every sampled turn and inside the loss mask either way. What
+    differs is only whether the model is shown its own earlier reasoning, which
+    is a serving choice; the stock reasoning renderers, and the published
+    terminus-2 setups, do not show it.
+
+    Measured on the 53-trial Qwen3.6-27B teacher baseline that motivated this:
+    carrying reasoning forward pushed 27 of 53 episodes (51%) past the context
+    budget, and a `ContextLengthExceededError` fails the whole trial rather
+    than ending it, so those episodes left the denominator entirely. Fragmented
+    datums cost more teacher prefill; overflowed episodes cost the measurement.
+    """
+
+    def parse_response(self, response: list[int]) -> tuple[Message, ParseTermination]:
+        """Parse a sampled turn down to its text parts, as a plain `str`.
+
+        The base reasoning renderers return content as a LIST of thinking/text
+        parts, which is what makes harbor's terminus-2 parsers raise (see the
+        module docstring). Narrowing to the text parts hands them the `str`
+        they expect, and -- because the thinking parts are simply gone from the
+        message -- the base `render_message` has nothing to carry forward.
+
+        Args:
+            response: The turn's sampled token ids, exactly as the sampler
+                returned them.
+
+        Returns:
+            The parsed message with plain-text content, and its termination.
+        """
+        message, termination = super().parse_response(response)
+        message["content"] = get_text_content(message)
+        return message, termination
+
+
+class Qwen3_5StripHistoryRenderer(StripHistoryMixin, Qwen3_5Renderer):
+    """Qwen3.5 and Qwen3.6 with thinking on, dropped from history after each turn."""
+
+
 class Qwen3VerbatimRenderer(VerbatimHistoryMixin, Qwen3Renderer):
     """Qwen3 with thinking on and a verbatim-id history."""
 
@@ -207,6 +280,7 @@ QWEN3_VERBATIM = "wmh/qwen3_verbatim"
 QWEN3_5_VERBATIM = "wmh/qwen3_5_verbatim"
 NEMOTRON3_VERBATIM = "wmh/nemotron3_verbatim"
 NEMOTRON3_ULTRA_VERBATIM = "wmh/nemotron3_ultra_verbatim"
+QWEN3_5_STRIP_HISTORY = "wmh/qwen3_5_strip_history"
 
 
 def _build_qwen3(tokenizer: Tokenizer, image_processor: ImageProcessor | None = None) -> Renderer:
@@ -233,28 +307,52 @@ def _build_nemotron3_ultra(
     return Nemotron3UltraVerbatimRenderer(tokenizer, image_processor=image_processor)
 
 
+def _build_qwen3_5_strip_history(
+    tokenizer: Tokenizer, image_processor: ImageProcessor | None = None
+) -> Renderer:
+    """Build the Qwen3.5/Qwen3.6 renderer that drops prior turns' reasoning."""
+    return Qwen3_5StripHistoryRenderer(tokenizer, image_processor=image_processor)
+
+
 VERBATIM_RENDERERS = {
     QWEN3_VERBATIM: _build_qwen3,
     QWEN3_5_VERBATIM: _build_qwen3_5,
     NEMOTRON3_VERBATIM: _build_nemotron3,
     NEMOTRON3_ULTRA_VERBATIM: _build_nemotron3_ultra,
 }
-"""Every wmh verbatim renderer name, mapped to its cookbook factory.
+"""The renderers that carry a sampled turn forward as its exact ids.
+
+One datum per episode, at the cost of a context that grows with every turn's
+reasoning. Prefer these only when the episode fits the model's window.
+"""
+
+STRIP_HISTORY_RENDERERS = {
+    QWEN3_5_STRIP_HISTORY: _build_qwen3_5_strip_history,
+}
+"""The renderers that drop prior turns' reasoning from later prompts.
+
+Small contexts, at the cost of per-turn datums. Only the Qwen3.5/3.6 family is
+built out, because that is the pair these runs train; the mixin is family-
+agnostic, so adding a Nemotron variant is a subclass and a factory.
+"""
+
+WMH_RENDERERS = {**VERBATIM_RENDERERS, **STRIP_HISTORY_RENDERERS}
+"""Every wmh renderer name, mapped to its cookbook factory.
 
 Name these from `[rollout.renderers]` in a run config, keyed by the base model
 whose rollouts should use them (`student.base_model`, `teacher.model`).
 """
 
 
-def register_verbatim_renderers() -> None:
-    """Register every wmh verbatim renderer with the cookbook's global registry.
+def register_wmh_renderers() -> None:
+    """Register every wmh renderer with the cookbook's global registry.
 
     Idempotent: registration is a dict assignment keyed by name, so repeated
     calls leave the registry in the same state. Call it before anything
     resolves a renderer by name (terminus-2 resolves `llm_kwargs.renderer_name`
     inside its own `TinkerLLM`, in this process).
     """
-    for name, factory in VERBATIM_RENDERERS.items():
+    for name, factory in WMH_RENDERERS.items():
         register_renderer(name, factory)
 
 
@@ -292,7 +390,7 @@ def is_known_renderer(name: str) -> bool:
     Returns:
         True when `get_renderer` would accept the name.
     """
-    if name in VERBATIM_RENDERERS or is_renderer_registered(name):
+    if name in WMH_RENDERERS or is_renderer_registered(name):
         return True
     try:
         get_renderer(name, cast("Tokenizer", _RendererNameProbe()))

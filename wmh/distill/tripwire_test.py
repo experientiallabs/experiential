@@ -386,3 +386,125 @@ def test_health_summary_of_an_unmeasurable_batch_says_so() -> None:
         episodes=0, sampled_tokens=0, entropy_per_token=None, mean_generation_tokens=None
     )
     assert health_summary(health, _baseline()) == "entropy/token n/a, gen tokens/episode n/a"
+
+
+# The Qwen3.5-9B <- Qwen3.6-27B run of 2026-07-26, which is why the ceilings exist. Ratios
+# are its measured `entropy_ratio` and `generation_tokens_ratio` per step, against its own
+# step-0 baseline of 0.513 nats/token.
+REFUTATION_ENTROPY_RATIOS = (1.00, 1.28, 1.49, 1.68)
+REFUTATION_LENGTH_RATIOS = (1.00, 2.31, 3.24, 5.33)
+REFUTATION_BASELINE_ENTROPY = 0.513
+REFUTATION_BASELINE_LENGTH = 10522.703125
+
+
+def _refutation_health(entropy_ratio: float, length_ratio: float) -> PolicyHealth:
+    """One step of the refutation run, expressed as its measured ratios."""
+    length = REFUTATION_BASELINE_LENGTH * length_ratio
+    return PolicyHealth(
+        episodes=64,
+        sampled_tokens=int(length * 64),
+        entropy_per_token=REFUTATION_BASELINE_ENTROPY * entropy_ratio,
+        mean_generation_tokens=length,
+    )
+
+
+def _refutation_baseline() -> TripwireBaseline:
+    """That run's step-0 baseline."""
+    return TripwireBaseline(
+        step=0,
+        entropy_per_token=REFUTATION_BASELINE_ENTROPY,
+        mean_generation_tokens=REFUTATION_BASELINE_LENGTH,
+        episodes=64,
+        sampled_tokens=673453,
+    )
+
+
+def test_the_runaway_that_had_to_be_stopped_by_hand_now_kills_itself() -> None:
+    """The regression this whole two-sided change exists for.
+
+    Under downside-only bounds this run's four steps produced ZERO breaches while
+    context overflow discarded 22 of 64 episodes and a third of the trainable datums,
+    so a human had to read the metrics and stop it. With ceilings it must warn early
+    and reach kill level on its own.
+    """
+    cfg = TripwireConfig()
+    baseline = _refutation_baseline()
+    levels: list[tuple[int, list[tuple[str, str, str]]]] = []
+    for step, (entropy_ratio, length_ratio) in enumerate(
+        zip(REFUTATION_ENTROPY_RATIOS, REFUTATION_LENGTH_RATIOS, strict=True)
+    ):
+        breaches = evaluate_breaches(cfg, baseline, _refutation_health(entropy_ratio, length_ratio))
+        levels.append((step, [(b.metric, b.level, b.direction) for b in breaches]))
+
+    assert levels[0][1] == [], "step 0 IS the baseline and must never fire against itself"
+    assert ("mean_generation_tokens", "warn", "ceiling") in levels[1][1], (
+        "2.31x length at step 1 is where a human should have been asked to look"
+    )
+    kill_steps = [step for step, bs in levels if any(level == "kill" for _, level, _ in bs)]
+    assert kill_steps, "the run that had to be stopped by hand must now stop itself"
+    assert kill_steps[0] <= 2, (
+        "kill must land by step 2, the step where overflow drops reached 14 of 64 and the "
+        f"batch began collapsing; got first kill at step {kill_steps[0]}"
+    )
+
+
+def test_the_ceilings_stay_silent_on_the_healthy_probe() -> None:
+    """A ceiling that fires on healthy data is worse than no ceiling.
+
+    Same drift cases as the floor test, plus their upside mirrors: the 32-episode
+    resampling put pooled length noise at 0.62x on the downside, whose reciprocal
+    1.61x is the upside a stationary policy can show.
+    """
+    cfg = TripwireConfig()
+    baseline = _baseline()
+    for entropy, tokens in (
+        (PROBE_BASELINE_ENTROPY_NATS, float(PROBE_BASELINE_EPISODE_TOKENS)),
+        (0.181 * 1.40, PROBE_BASELINE_EPISODE_TOKENS * 1.61),
+        (0.181 * 1.20, PROBE_BASELINE_EPISODE_TOKENS * 1.90),
+    ):
+        health = PolicyHealth(
+            episodes=32,
+            sampled_tokens=int(tokens * 32),
+            entropy_per_token=entropy,
+            mean_generation_tokens=tokens,
+        )
+        assert evaluate_breaches(cfg, baseline, health) == [], (entropy, tokens)
+
+
+def test_ceiling_kill_outranks_a_floor_warn_on_the_other_metric() -> None:
+    """Both directions can fire in one step, each on its own metric."""
+    baseline = _baseline()
+    health = PolicyHealth(
+        episodes=32,
+        sampled_tokens=1_000_000,
+        entropy_per_token=baseline.entropy_per_token * 0.4,  # floor warn
+        mean_generation_tokens=baseline.mean_generation_tokens * 3.5,  # ceiling kill
+    )
+    breaches = {b.metric: b for b in evaluate_breaches(TripwireConfig(), baseline, health)}
+    assert breaches["entropy_per_token"].level == "warn"
+    assert breaches["entropy_per_token"].direction == "floor"
+    assert breaches["mean_generation_tokens"].level == "kill"
+    assert breaches["mean_generation_tokens"].direction == "ceiling"
+
+
+def test_a_ceiling_breach_reads_as_above_not_under() -> None:
+    """The breach message names the direction, or it reads as its own opposite."""
+    baseline = _baseline()
+    health = PolicyHealth(
+        episodes=32,
+        sampled_tokens=1_000_000,
+        entropy_per_token=baseline.entropy_per_token,
+        mean_generation_tokens=baseline.mean_generation_tokens * 2.2,
+    )
+    (breach,) = evaluate_breaches(TripwireConfig(), baseline, health)
+    assert "at or above" in breach.describe()
+    assert "length_warn_mult" in breach.describe()
+
+
+def test_a_kill_ceiling_under_its_warn_ceiling_is_rejected() -> None:
+    """The comparison INVERTS between floors and ceilings; getting it wrong would
+    abort a run at a ratio it never warned about."""
+    with pytest.raises(ValueError, match="length_kill_mult"):
+        TripwireConfig(length_warn_mult=3.0, length_kill_mult=2.0)
+    with pytest.raises(ValueError, match="entropy_kill_mult"):
+        TripwireConfig(entropy_warn_mult=2.0, entropy_kill_mult=1.5)

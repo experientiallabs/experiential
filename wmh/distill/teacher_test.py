@@ -343,8 +343,24 @@ def test_sdk_logprob_scorer_bounds_the_future(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("WMH_TINKER_DEADLINE_COMPUTE_LOGPROBS", "0.05")
 
     class _WedgedClient:
-        def compute_logprobs(self, model_input: object) -> _NeverResolvingFuture:
-            del model_input
+        """Wedged on `sample`, which is what scoring issues.
+
+        `SdkLogprobScorer.compute_logprobs` calls `sample` with
+        `include_prompt_logprobs=True` rather than the SDK's `compute_logprobs`
+        wrapper, because that wrapper makes exactly this request and then
+        discards `prompt_cache_hit_tokens` with the rest of the response. The
+        deadline still carries the COMPUTE_LOGPROBS label, since the workload is
+        the same prefill.
+        """
+
+        def sample(
+            self,
+            prompt: object,
+            num_samples: int,
+            sampling_params: object,
+            include_prompt_logprobs: bool = False,
+        ) -> _NeverResolvingFuture:
+            del prompt, num_samples, sampling_params, include_prompt_logprobs
             return _NeverResolvingFuture()
 
     scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _WedgedClient()))
@@ -595,3 +611,91 @@ def test_sdk_logprob_scorer_topk_missing_fields_is_actionable() -> None:
     scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _Client()))
     with pytest.raises(RuntimeError, match="prompt_logprobs"):
         scorer.topk_prompt_logprobs([1, 2, 3], 2)
+
+
+# --- service-reported prefix-cache accounting ---------------------------------
+
+
+class _CachingClient:
+    """A sampling client whose prefill responses report cache hits."""
+
+    def __init__(self, hits: object) -> None:
+        self._hits = hits
+        self.calls = 0
+
+    def sample(
+        self,
+        prompt: object,
+        num_samples: int,
+        sampling_params: object,
+        include_prompt_logprobs: bool = False,
+        topk_prompt_logprobs: int = 0,
+    ) -> object:
+        del prompt, num_samples, sampling_params, include_prompt_logprobs, topk_prompt_logprobs
+        self.calls += 1
+        hits = self._hits
+
+        class _Response:
+            prompt_logprobs = [None, -0.5, -0.25]
+            topk_prompt_logprobs = [None, [(2, -0.5)], [(3, -0.25)]]
+            prompt_cache_hit_tokens = hits
+
+        class _Future:
+            def result(self, timeout: float | None = None) -> object:
+                del timeout
+                return _Response()
+
+        return _Future()
+
+
+def test_scoring_accumulates_the_services_reported_cache_hits() -> None:
+    """The field the SDK's own compute_logprobs throws away.
+
+    Tinker's prefix cache works (a repeated prompt measured 16,000 of 16,000
+    tokens cached) while every `*_cached_prefill` meter read 0 by construction,
+    so the run ledger overstated spend. Reading it makes the ledger a bill.
+    """
+    pytest.importorskip("tinker")
+    client = _CachingClient(1200)
+    scorer = SdkLogprobScorer(cast("tinker.SamplingClient", client))
+
+    assert scorer.cache_hit_tokens == 0
+    scorer.compute_logprobs([1, 2, 3])
+    assert scorer.cache_hit_tokens == 1200
+    scorer.compute_logprobs([1, 2, 3])
+    assert scorer.cache_hit_tokens == 2400, "counts accumulate across calls"
+
+
+def test_the_topk_path_also_reports_cache_hits() -> None:
+    """Both scoring paths bill the same meters, so both must measure the same way."""
+    pytest.importorskip("tinker")
+    client = _CachingClient(700)
+    scorer = SdkLogprobScorer(cast("tinker.SamplingClient", client))
+    scorer.topk_prompt_logprobs([1, 2, 3], 2)
+    assert scorer.cache_hit_tokens == 700
+
+
+@pytest.mark.parametrize("hits", [None, "1200", 3.5])
+def test_an_unreadable_cache_count_bills_uncached_instead_of_crashing(hits: object) -> None:
+    """Cost accounting must never be able to kill a paid run.
+
+    If a future SDK renames or retypes the field, the right outcome is a ledger
+    that reverts to billing everything at the uncached rate -- an overstatement,
+    which is what we already lived with -- not an exception on the hot path
+    after the service has already been paid for the scoring.
+    """
+    pytest.importorskip("tinker")
+    scorer = SdkLogprobScorer(cast("tinker.SamplingClient", _CachingClient(hits)))
+    assert scorer.compute_logprobs([1, 2, 3]) == [None, -0.5, -0.25]
+    assert scorer.cache_hit_tokens == 0
+
+
+def test_cached_usage_is_zero_for_a_teacher_whose_scorer_cannot_report() -> None:
+    """An injected fake keeps working and can only make the ledger conservative."""
+    client = FakeSamplingClient(seed="tinker://fake/sampler/teacher/0")
+    teacher = TinkerTeacher(_spec(), sampling_client=client)
+    prompt = [100, 101, 102]
+    sequence = client.sample(prompt, max_tokens=4, temperature=1.0)
+    teacher.score([_datum(prompt, sequence.tokens)])
+    assert teacher.usage() > 0
+    assert teacher.cached_usage() == 0

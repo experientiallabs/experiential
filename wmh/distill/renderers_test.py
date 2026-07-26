@@ -49,17 +49,21 @@ from wmh.distill.data import build_datums
 from wmh.distill.renderers import (
     NEMOTRON3_ULTRA_VERBATIM,
     NEMOTRON3_VERBATIM,
+    QWEN3_5_STRIP_HISTORY,
     QWEN3_5_VERBATIM,
     QWEN3_VERBATIM,
     VERBATIM_RENDERERS,
+    WMH_RENDERERS,
     Nemotron3UltraVerbatimRenderer,
     Nemotron3VerbatimRenderer,
+    Qwen3_5StripHistoryRenderer,
     Qwen3_5VerbatimRenderer,
     Qwen3VerbatimRenderer,
+    StripHistoryMixin,
     VerbatimContent,
     VerbatimHistoryMixin,
     is_known_renderer,
-    register_verbatim_renderers,
+    register_wmh_renderers,
 )
 from wmh.distill.tokens import TrialRecord
 from wmh.providers.tinker import TokenSpan
@@ -277,7 +281,7 @@ def _run_episode(
 ) -> _Episode:
     """Drive a synthetic terminus-2 episode through real harbor code."""
     _tokenizer_or_skip(base_model)
-    register_verbatim_renderers()
+    register_wmh_renderers()
     bodies = list(script) if script is not None else _script(fmt=fmt)
     llm = _ScriptedTinkerLLM(
         script=bodies,
@@ -349,7 +353,7 @@ def _masked_text(datum: TrainDatum, tokenizer: object, mask: float) -> str:
 
 def test_the_four_verbatim_renderers_register_under_wmh_names() -> None:
     """The names a run config points `[rollout.renderers]` at."""
-    register_verbatim_renderers()
+    register_wmh_renderers()
     registered = get_registered_renderer_names()
     assert set(VERBATIM_RENDERERS) == {
         QWEN3_VERBATIM,
@@ -357,17 +361,17 @@ def test_the_four_verbatim_renderers_register_under_wmh_names() -> None:
         NEMOTRON3_VERBATIM,
         NEMOTRON3_ULTRA_VERBATIM,
     }
-    for name in VERBATIM_RENDERERS:
+    for name in WMH_RENDERERS:
         assert name in registered
         assert name.startswith("wmh/"), "namespaced so a cookbook name can never be shadowed"
 
 
 def test_registration_is_idempotent() -> None:
     """The rollout collector calls it on every batch, so repeats must be free."""
-    register_verbatim_renderers()
+    register_wmh_renderers()
     before = sorted(get_registered_renderer_names())
-    register_verbatim_renderers()
-    register_verbatim_renderers()
+    register_wmh_renderers()
+    register_wmh_renderers()
     assert sorted(get_registered_renderer_names()) == before
 
 
@@ -392,15 +396,70 @@ def test_each_registered_renderer_builds_and_claims_the_extension_property(
 ) -> None:
     """`get_renderer` must resolve the name against the model's real tokenizer."""
     tokenizer = _tokenizer_or_skip(base_model)
-    register_verbatim_renderers()
+    register_wmh_renderers()
     renderer = get_renderer(renderer_name, tokenizer)  # ty: ignore[invalid-argument-type]
     assert isinstance(renderer, VerbatimHistoryMixin)
     assert renderer.has_extension_property
 
 
+def test_strip_history_keeps_reasoning_in_the_turn_and_out_of_the_next_prompt() -> None:
+    """The whole point of the strip-history renderer, asserted on real token ids.
+
+    Reasoning must stay in what we TRAIN on (the sampled turn, which the loss
+    masks over) and stay out of what we PROMPT with (every later turn), because
+    carrying it forward is what overflowed the context window.
+    """
+    episode = _run_episode(QWEN3_5_MODEL, QWEN3_5_STRIP_HISTORY)
+
+    def decode(ids: list[int]) -> str:
+        return str(episode.tokenizer.decode(ids))  # ty: ignore[unresolved-attribute]
+
+    # The `<think>` OPEN tag lives in the renderer's generation prefill, not in the sampled
+    # ids, so the reasoning TEXT is what to assert on at both ends.
+    for index, completion in enumerate(episode.completions):
+        assert REASONING[index] in decode(completion), (
+            f"turn {index} must still reason -- that is what we distill"
+        )
+    for index, prompt in enumerate(episode.prompts):
+        carried = [thought for thought in REASONING[:index] if thought in decode(prompt)]
+        assert not carried, (
+            f"prompt {index} carries {len(carried)} prior turn(s) of reasoning; "
+            "context grows with every turn and the episode overflows"
+        )
+    assert all(error == "" for error in episode.errors), (
+        "harbor's parser must accept the content, which is why it is a plain str"
+    )
+    assert all(count > 0 for count in episode.command_counts), "actions must survive the strip"
+
+
+def test_strip_history_fragments_the_episode_into_per_turn_datums() -> None:
+    """The cost side of the trade, made explicit so a regression cannot hide it.
+
+    Dropping thinking from history means turn N's sampled ids are not a
+    substring of prompt N+1, so the prefix merge cannot fire. This is expected,
+    not a bug -- but it multiplies teacher prefill, so it is pinned.
+    """
+    episode = _run_episode(QWEN3_5_MODEL, QWEN3_5_STRIP_HISTORY)
+    datums = _datums(episode)
+    assert len(datums) == len(episode.completions) > 1, "one datum per turn"
+
+    merged = _datums(_run_episode(QWEN3_5_MODEL, QWEN3_5_VERBATIM))
+    assert len(merged) == 1, "the verbatim renderer still merges, for contexts that fit"
+
+
+def test_strip_history_renderer_disclaims_the_extension_property() -> None:
+    """It must report False, or `build_datums` would merge non-prefix turns."""
+    tokenizer = _tokenizer_or_skip(QWEN3_5_MODEL)
+    register_wmh_renderers()
+    renderer = get_renderer(QWEN3_5_STRIP_HISTORY, tokenizer)  # ty: ignore[invalid-argument-type]
+    assert isinstance(renderer, StripHistoryMixin)
+    assert not renderer.has_extension_property
+    assert Qwen3_5StripHistoryRenderer.__mro__[1] is StripHistoryMixin
+
+
 def test_is_known_renderer_accepts_wmh_and_builtin_names_and_rejects_typos() -> None:
     """Config load is where a renderer typo must die, not the first paid rollout."""
-    for name in VERBATIM_RENDERERS:
+    for name in WMH_RENDERERS:
         assert is_known_renderer(name)
     for name in ("qwen3", "qwen3_5", "nemotron3", "nemotron3_ultra_disable_thinking"):
         assert is_known_renderer(name)
@@ -570,7 +629,7 @@ def test_a_turn_that_never_stopped_is_not_carried_verbatim() -> None:
     break, and is counted by `RolloutStats.truncated_spans`.
     """
     tokenizer = _tokenizer_or_skip(QWEN3_5_MODEL)
-    register_verbatim_renderers()
+    register_wmh_renderers()
     renderer = get_renderer(QWEN3_5_VERBATIM, tokenizer)  # ty: ignore[invalid-argument-type]
     body = "reasoning that never closes and never terminates"
     ids = list(tokenizer.encode(body, add_special_tokens=False))  # ty: ignore[unresolved-attribute]

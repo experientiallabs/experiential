@@ -125,6 +125,21 @@ class TeacherClient(Protocol):
         ...
 
 
+@runtime_checkable
+class CachedUsageTeacher(Protocol):
+    """A teacher that can report how much of its prefill the service cached.
+
+    Deliberately NOT part of `TeacherClient`: every existing teacher and test
+    fake satisfies that seam today, and widening it would force each of them to
+    grow a method whose only honest answer is 0. A caller narrows to this at
+    runtime and falls back to billing everything uncached.
+    """
+
+    def cached_usage(self) -> int:
+        """Of `usage()`, the tokens served from the service's prefix cache."""
+        ...
+
+
 class EncodingTokenizer(Protocol):
     """The tokenizer slice the fingerprint check needs: encoding only.
 
@@ -150,6 +165,23 @@ class LogprobScorer(Protocol):
 
 
 @runtime_checkable
+class CacheReportingScorer(Protocol):
+    """A scorer that can report the service's own prefix-cache hit count.
+
+    Kept a separate, runtime-checked protocol rather than folded into
+    `LogprobScorer` so the deterministic fakes and any externally injected
+    scorer keep satisfying the base seam unchanged; the caller treats a scorer
+    without this as "cache unknown", which bills every token at the uncached
+    rate exactly as before.
+    """
+
+    @property
+    def cache_hit_tokens(self) -> int:
+        """Prompt tokens the service reported serving from its prefix cache."""
+        ...
+
+
+@runtime_checkable
 class TopkLogprobScorer(Protocol):
     """The prefill-only top-k call `score_topk` additionally needs.
 
@@ -171,23 +203,92 @@ class SdkLogprobScorer:
 
     def __init__(self, client: tinker.SamplingClient) -> None:
         self._client = client
+        self._cache_hit_tokens = 0
 
     @property
     def sdk_client(self) -> tinker.SamplingClient:
         """The wrapped SDK client (shared-cache eviction compares its identity)."""
         return self._client
 
+    @property
+    def cache_hit_tokens(self) -> int:
+        """Prompt tokens the service reported serving from its prefix cache.
+
+        Accumulated across every scoring call this scorer has made, so the
+        caller can bill the cached portion at the cached rate instead of
+        assuming zero.
+        """
+        return self._cache_hit_tokens
+
+    def _record_cache_hits(self, response: object) -> None:
+        """Add one response's reported cache hits, tolerating their absence.
+
+        Read defensively on purpose. This is COST ACCOUNTING on the hot path of
+        a paid run: if a future SDK renames or drops `prompt_cache_hit_tokens`,
+        the correct outcome is a ledger that quietly reverts to billing
+        everything uncached (an overstatement, the behaviour we already lived
+        with), not an AttributeError that kills a run mid-batch after the
+        service has already been paid for the scoring. Logged at debug once per
+        call rather than warned, because a scorer that cannot report is the
+        normal case for injected fakes.
+
+        Args:
+            response: The SDK sample response.
+        """
+        hits = getattr(response, "prompt_cache_hit_tokens", None)
+        if isinstance(hits, int):
+            self._cache_hit_tokens += hits
+            return
+        logger.debug(
+            "teacher scoring response carries no usable prompt_cache_hit_tokens (%r); "
+            "billing this call's prefill as uncached",
+            hits,
+        )
+
     def compute_logprobs(self, token_ids: list[int]) -> list[float | None]:
-        """One deadline-bounded compute_logprobs call on the full sequence.
+        """One deadline-bounded prefill call on the full sequence.
+
+        Issued as `sample` rather than the SDK's `compute_logprobs`, which is
+        not a different request: the SDK's own implementation is exactly this
+        call (`num_samples=1`, `max_tokens=1`, `include_prompt_logprobs=True`)
+        followed by `return sample_res.prompt_logprobs`. It throws the rest of
+        the response away, including `prompt_cache_hit_tokens` -- which is the
+        service's own measurement of how much of this prefill it did not have to
+        recompute, and the single number that decides whether our cost figures
+        are a bill or a ceiling. Tinker's prefix cache demonstrably works (a
+        repeated prompt measured 16,000 of 16,000 tokens cached) while every
+        `*_cached_prefill` meter read 0 by construction, so the run ledger has
+        been overstating spend by an unknown factor. Same request, same
+        `prompt_logprobs`, one more field kept.
+
+        The deadline keeps the `compute_logprobs` label deliberately: the
+        workload is byte-for-byte the same prefill, and relabelling it `sample`
+        would silently swap in a deadline tuned for generation instead.
 
         Raises:
             TinkerDeadlineError: If the deadline expires (the session is
                 likely wedged; the caller should retry with a fresh one).
+            RuntimeError: If the response carries no prompt logprobs even
+                though the request asked for them (SDK drift).
         """
         import tinker
 
-        future = self._client.compute_logprobs(tinker.ModelInput.from_ints(token_ids))
-        return wait_with_deadline("compute_logprobs", future)
+        future = self._client.sample(
+            prompt=tinker.ModelInput.from_ints(token_ids),
+            num_samples=1,
+            sampling_params=tinker.SamplingParams(max_tokens=1),
+            include_prompt_logprobs=True,
+        )
+        response = wait_with_deadline("compute_logprobs", future)
+        self._record_cache_hits(response)
+        realized = response.prompt_logprobs
+        if realized is None:
+            raise RuntimeError(
+                "the teacher's prefill sample response carries no prompt_logprobs even "
+                "though include_prompt_logprobs was set; check the pinned tinker SDK "
+                "version (0.23.3 populates it on request)"
+            )
+        return list(realized)
 
     def topk_prompt_logprobs(
         self, token_ids: list[int], k: int
@@ -219,6 +320,7 @@ class SdkLogprobScorer:
             topk_prompt_logprobs=k,
         )
         response = wait_with_deadline("sample", future)
+        self._record_cache_hits(response)
         realized = response.prompt_logprobs
         rows = response.topk_prompt_logprobs
         if realized is None or rows is None:
@@ -537,6 +639,20 @@ class TinkerTeacher:
     def usage(self) -> int:
         """Total tokens submitted through score() so far (verify probes excluded)."""
         return self._usage_tokens
+
+    def cached_usage(self) -> int:
+        """Of `usage()`, the tokens the SERVICE reported serving from its cache.
+
+        Zero when the active scorer cannot report it (an injected fake, or a
+        future SDK that drops the field), which bills everything at the uncached
+        rate — the same conservative behaviour the ledger had before this was
+        readable. The count is cumulative and monotonic like `usage()`, so a
+        caller takes deltas around a step.
+        """
+        scorer = self._scorer
+        if isinstance(scorer, CacheReportingScorer):
+            return scorer.cache_hit_tokens
+        return 0
 
 
 def tokenizer_fingerprint_check(

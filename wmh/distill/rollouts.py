@@ -170,13 +170,16 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
     - `collect_rollout_details=True` is what records `prompt_token_ids`,
       `completion_token_ids` and `logprobs` per turn. Without it a trial
       produces rewards and no training data at all.
-    - `enable_summarize=False` is NOT optional. Summarization rewrites the
-      chat history mid-episode, which harbor itself warns leaves rollout
-      details incomplete, and which would break the prefix property the
-      one-datum-per-episode cost model depends on (the same reason
-      `rollout.compaction` is rejected outright). With it off, a context
-      overflow raises instead, ending the episode on a recorded
-      `ContextLengthExceededError`.
+    - `enable_summarize` follows `rollout.compaction`, which defaults False and
+      which `RolloutConfig` only allows to be true under a history-editing
+      renderer. Off, a context overflow raises and the trial FAILS on a
+      recorded `ContextLengthExceededError` -- it does not score zero, it
+      leaves the denominator. On, terminus-2 compacts and the episode
+      continues; under a strip-history renderer that costs nothing structural,
+      because every real turn is still recorded (the summarization subagents
+      bypass the `Chat` entirely) and the episode was already one datum per
+      turn. See `RolloutConfig.compaction` for why this is not the blanket
+      rejection it used to be.
     - `max_turns` is terminus-2's `max_episodes`, and
       `llm_kwargs.context_limit` / `max_tokens` are the context and output
       budgets the agent measures itself against.
@@ -222,20 +225,86 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
     # deferred because wmh.distill.renderers subclasses cookbook classes at module scope, and
     # `import wmh.distill.rollouts` must keep working without the distill extra (the CLI imports
     # it eagerly). Registration is idempotent.
-    from wmh.distill.renderers import register_verbatim_renderers
+    from wmh.distill.renderers import register_wmh_renderers
 
-    register_verbatim_renderers()
+    register_wmh_renderers()
+    _share_harbor_tinker_service_client()
     return {
         "llm_backend": "tinker",
         "llm_kwargs": llm_kwargs,
         "collect_rollout_details": True,
         "temperature": cfg.sampling.temperature,
         "max_turns": cfg.rollout.max_turns,
-        "enable_summarize": False,
+        "enable_summarize": cfg.rollout.compaction,
         # The cap is deliberate here, so terminus-2's "consider removing this limit" warning is
         # noise on every trial.
         "suppress_max_turns_warning": True,
     }
+
+
+_HARBOR_TINKER_CLIENT_SHARED = False
+
+
+def _share_harbor_tinker_service_client() -> None:
+    """Make harbor's `TinkerLLM` reuse wmh's process-wide `ServiceClient`.
+
+    Harbor's `TinkerLLM._ensure_client` does `tinker.ServiceClient()` per
+    instance and never closes it, and terminus-2 builds one `TinkerLLM` per
+    TRIAL. The SDK's service client starts a heartbeat task that strongly
+    references its holder, so each one pins a live server-side session for the
+    rest of the process -- the exact leak `wmh.providers.tinker.
+    shared_service_client` exists to prevent for wmh's own call paths. Harbor's
+    class was the one path that still bypassed it.
+
+    Measured cost of not doing this, on a 64-episode-per-step run: step 0 clean,
+    step 1 three failures, step 2 THIRTY-ONE trials rejected with
+    `400 Too many active sessions. Please ensure you are not creating extra
+    ServiceClient objects`, halving that step's datums. The cap is ~240
+    sessions and each step burns 64, so the failure arrives on schedule and
+    worsens every step.
+
+    Only the client construction changes; the sampling-client selection below
+    it is harbor's own logic, reproduced exactly. Idempotent, and a no-op if
+    harbor's internals move -- a rollout that samples successfully matters more
+    than this optimization, so a shape mismatch leaves the original in place.
+    """
+    global _HARBOR_TINKER_CLIENT_SHARED
+    if _HARBOR_TINKER_CLIENT_SHARED:
+        return
+    from harbor.llms.tinker import TinkerLLM
+
+    from wmh.providers import tinker as tinker_provider
+
+    if not hasattr(TinkerLLM, "_ensure_client"):  # pragma: no cover - upstream moved
+        logger.warning(
+            "harbor's TinkerLLM has no _ensure_client; leaving its service-client "
+            "construction alone. Watch for '400 Too many active sessions' errors"
+        )
+        _HARBOR_TINKER_CLIENT_SHARED = True
+        return
+
+    async def _ensure_client_shared(self: object) -> object:
+        """Harbor's `_ensure_client`, but on the shared service client."""
+        existing = getattr(self, "_sampling_client", None)
+        if existing is not None:
+            return existing
+        # Resolved through the MODULE, not captured at patch time, so
+        # `rebuild_shared_service_client()` (the wedge-recovery path) is honoured.
+        service = tinker_provider.shared_service_client()
+        self._service_client = service  # ty: ignore[unresolved-attribute]
+        model_path = getattr(self, "_model_path", None)
+        if model_path:
+            client = await service.create_sampling_client_async(model_path=model_path)
+        else:
+            client = await service.create_sampling_client_async(
+                base_model=self._model_name  # ty: ignore[unresolved-attribute]
+            )
+        self._sampling_client = client  # ty: ignore[unresolved-attribute]
+        return client
+
+    TinkerLLM._ensure_client = _ensure_client_shared  # ty: ignore[invalid-assignment]
+    _HARBOR_TINKER_CLIENT_SHARED = True
+    logger.info("harbor TinkerLLM patched to share wmh's process-wide tinker ServiceClient")
 
 
 class RolloutStats(BaseModel):

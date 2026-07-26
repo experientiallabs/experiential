@@ -253,7 +253,7 @@ class RolloutConfig(BaseModel):
         # Deferred: wmh.distill.renderers subclasses cookbook classes at module scope, and
         # wmh.distill.config is imported by the CLI, which must work without the distill extra.
         try:
-            from wmh.distill.renderers import VERBATIM_RENDERERS, is_known_renderer
+            from wmh.distill.renderers import WMH_RENDERERS, is_known_renderer
         except ImportError as exc:
             raise ImportError(MISSING_DISTILL_EXTRA) from exc
         for model, renderer in value.items():
@@ -263,34 +263,70 @@ class RolloutConfig(BaseModel):
                 f"rollout.renderers names the renderer {renderer!r} for {model!r}, which "
                 "tinker-cookbook cannot build; a name that does not resolve would only fail on "
                 "the run's first rollout. Use one of the wmh verbatim renderers "
-                f"({', '.join(sorted(VERBATIM_RENDERERS))}) or a built-in cookbook name "
+                f"({', '.join(sorted(WMH_RENDERERS))}) or a built-in cookbook name "
                 "(qwen3, qwen3_5, nemotron3, nemotron3_ultra, their *_disable_thinking "
                 "variants, ...)"
             )
         return value
 
     compaction: bool = False
+    """Whether terminus-2 may summarize its own history to stay inside the window.
 
-    @field_validator("compaction")
-    @classmethod
-    def _reject_compaction(cls, value: bool) -> bool:
-        """Reject compaction: it breaks the prefix property the cost model relies on.
+    Maps to terminus-2's `enable_summarize`, whose own default is True; this
+    defaults False because it is only SAFE under a history-editing renderer.
 
-        Every turn's prompt must extend the previous turn's tokens verbatim so
-        prefill work amortizes across turns and sampled spans stay aligned for
-        teacher scoring. Compacting mid-rollout rewrites the prefix, so each
-        later turn would be a full re-prefill and issued spans would no longer
-        appear verbatim in the episode tokens.
+    Compaction rewrites the prompt prefix mid-episode, so it is incompatible
+    with the prefix property and therefore with one-datum-per-episode: under a
+    verbatim renderer it would turn amortized prefill into a full re-prefill
+    per turn and stop sampled spans appearing verbatim in the episode tokens.
+    That is why it used to be rejected outright.
+
+    Under a strip-history renderer the prefix property is ALREADY gone by
+    design (the episode is one datum per turn either way), so compaction costs
+    nothing structurally and buys back the episodes that would otherwise die.
+    Two things make it safe there, both verified in harbor's source rather than
+    assumed:
+
+    - `Chat.reset_response_chain()` clears only `_last_response_id`; nothing
+      clears `_prompt_token_ids_list`/`_completion_token_ids_list`, so every
+      real turn is still recorded even though `chat._messages` is truncated to
+      three. Harbor's "rollout details will be incomplete" warning is about the
+      single-linear-trajectory assumption, which strip-history already broke.
+    - the three summarization subagents call `self._llm.call(...)` directly,
+      bypassing the `Chat`, so their turns never enter the training data.
+
+    Leaving it off costs whole trials: on the 17-task holdout with reasoning
+    dropped from history, terminal output alone still pushed 24% of teacher
+    episodes past the window, and an overflow FAILS the trial rather than
+    ending the episode.
+    """
+
+    @model_validator(mode="after")
+    def _compaction_needs_a_history_editing_renderer(self) -> RolloutConfig:
+        """Reject compaction when a renderer is relying on the prefix property.
+
+        Combining the two silently produces the worst case: the datum builder
+        would still try to merge an episode whose prefix compaction has
+        rewritten, so spans would stop matching the episode tokens.
         """
-        if value:
+        if not self.compaction:
+            return self
+        from wmh.distill.renderers import VERBATIM_RENDERERS
+
+        verbatim = sorted(
+            f"{model} = {name!r}"
+            for model, name in self.renderers.items()
+            if name in VERBATIM_RENDERERS
+        )
+        if verbatim:
             raise ValueError(
-                "rollout.compaction = true is not supported: compaction rewrites the "
-                "token prefix mid-episode, breaking the prefix property that keeps "
-                "prefill costs amortized across turns and sampled spans verbatim in "
-                "the episode; set compaction = false (episodes that outgrow "
-                "context_budget_tokens are dropped whole from training instead)"
+                "rollout.compaction = true cannot be combined with a verbatim renderer "
+                f"({'; '.join(verbatim)}): compaction rewrites the token prefix mid-episode, "
+                "which breaks the prefix property those renderers exist to preserve. Either "
+                "set compaction = false, or point [rollout.renderers] at a strip-history "
+                "renderer, whose episodes are already one datum per turn"
             )
-        return value
+        return self
 
 
 class TrainConfig(BaseModel):
@@ -368,6 +404,62 @@ class TrainConfig(BaseModel):
     sampler_refresh_every: int = Field(default=1, ge=1)
     save_state_every: int = Field(default=8, ge=1)
     trial_concurrency: int = Field(default=8, ge=1)
+
+    num_substeps: int = Field(default=1, ge=1)
+    """Optimizer updates to take per collected rollout batch.
+
+    1 (the default, and what every run before 2026-07-26 did) means ONE
+    `forward_backward` over every datum followed by ONE `optim_step`: a whole
+    batch of agent rollouts buys a single gradient step. Measured, that was
+    **$66 per update**, and a 15-step run would be fifteen updates total --
+    for a rank-32 LoRA that is a nudge, not training.
+
+    Splitting the same datums into N shuffled minibatches and taking N updates
+    costs NOTHING extra in rollouts, which are 94% of the bill and already
+    paid for by the time we get here. At 1,095 datums a 64-datum minibatch is
+    17 updates per batch instead of 1.
+
+    The tradeoff is that updates 2..N are OFF-POLICY with respect to the
+    weights that sampled the batch -- which is the standard PPO setting and
+    the reason `train.loss = "ppo"` has a ratio clip at all. With
+    `num_substeps = 1` that clip is inert by construction, because the
+    sampling policy and the training policy are the same weights and the ratio
+    is identically 1. Raising this is what makes it do its job. Shuffle order
+    is seeded per step, so a rerun reproduces the same minibatches.
+
+    Keep it modest relative to the batch: too many updates on one batch drifts
+    far from the sampling policy, and our advantages are unclipped
+    (`advantage_clip` unset), so the ratio clip is the only bound in the
+    system.
+    """
+
+    rollout_max_turns: int | None = Field(default=None, ge=1)
+    """Turn cap for TRAINING rollouts only; `None` uses `rollout.max_turns`.
+
+    Evals deliberately keep `rollout.max_turns`, because student-before and
+    student-after must run under identical settings or the paired delta
+    measures the config change instead of the training. Capping only the
+    training side is safe in a way it would NOT be for RL: on-policy
+    distillation's signal is the per-token teacher-minus-student gap on
+    whatever the student did, so a truncated episode is still valid
+    supervision for the turns it did take. It does not need the episode to
+    succeed.
+
+    This is the cost lever that matters, because both cost and latency grow
+    superlinearly in turns: every turn re-prefills the whole conversation, and
+    under a history-editing renderer every turn is also its own teacher-scored
+    datum. Measured over 193 real TB2 episodes (Qwen3.6-27B and Qwen3.5-9B):
+
+        cap   solved episodes kept   input tokens kept   est USD/step
+         10            34%                   6%                14
+         20            63%                  18%                44
+         30            81%                  33%                79
+        100           100%                 100%               242
+
+    tinker-cookbook's own harbor multi-turn distillation recipe pins
+    `max_turns=10` with `max_trajectory_tokens=24576` for terminal-bench-2.0,
+    which is the same reconciliation reached independently.
+    """
 
     log_sample_rollouts: int = Field(default=2, ge=0)
     """How many sample episodes each batch renders to human-readable text:
@@ -457,6 +549,41 @@ class EvalConfig(BaseModel):
     `teacher_baseline_from`, except the model check is on the report's
     recorded `base_model` field: the student's provider model is a per-run
     sampler path and never matches across runs."""
+
+    defer_baselines: bool = False
+    """Start training immediately and resolve the gate baselines at finalize.
+
+    The two baselines feed only `gate_distillation`; nothing in the training
+    loop reads them. Measured up front they are pure latency, so this moves
+    them off the critical path and lets a SEPARATE process measure them while
+    training runs.
+
+    That process needs its own `HOME`. Harbor's task cache is a hardcoded
+    `~/.cache/harbor` with no env override, and `_copy_task_source_to_target`
+    does an unconditional `rmtree` + `copytree` of the task directory even when
+    the cache is already warm -- so two concurrent harbor jobs under one HOME
+    delete each other's tasks out from under a running trial.
+
+    Requires `student_baseline_from`. The student-before baseline is the one
+    measurement whose meaning depends on WHEN it runs: at finalize the LoRA has
+    trained, so re-measuring it there would quietly report the trained student
+    as the "before" number and collapse the very delta the run exists to show.
+    Deferred, it must be imported. The teacher is a fixed base model, so it may
+    be measured late without harm.
+    """
+
+    @model_validator(mode="after")
+    def _deferred_baselines_need_an_imported_student(self) -> EvalConfig:
+        """Refuse to defer without a student-before to import."""
+        if self.defer_baselines and not self.student_baseline_from:
+            raise ValueError(
+                "eval.defer_baselines = true requires eval.student_baseline_from: deferring "
+                "runs the student-before baseline AFTER training, when the LoRA has already "
+                "moved, so it would measure the TRAINED student and report it as the "
+                "pre-training number. Point it at the concurrent baseline run's "
+                "evals/baseline-student-before.json"
+            )
+        return self
 
 
 class GateConfig(BaseModel):
@@ -594,12 +721,25 @@ class TripwireConfig(BaseModel):
     that always fires gets muted, which is strictly worse than no tripwire, so
     do not replace any fraction below with an absolute nats or token count.
 
-    Both bounds are one-sided, on the DOWNSIDE. The runaway direction of the
-    same pathology (a student that never learns to stop) shows up as
-    `mean_generation_tokens` rising instead, and the metrics row already carries
-    its sharper signals: `stop_reason_counts` (`max_turns`, `output_truncated`)
-    and `scaffold_loss_rate`. Nothing here aborts on it, because an episode cap
-    bounds it already.
+    Bounds are TWO-SIDED, as of 2026-07-26. They used to be downside-only, on
+    the reasoning that "an episode cap bounds the runaway direction already".
+    A measured run refuted that: with `train.rollout_max_turns = 20` in force
+    the whole time, `mean_generation_tokens` still reached **5.33x** baseline
+    over four steps, because the cap bounds TURNS while each turn grew — 172
+    turns pinned the 12,288-token output cap in a single step. The real damage
+    was invisible to both bounds: episodes overflowing the context budget are
+    dropped whole, so trainable datums fell 1,129 -> 689 and 22 of 64 episodes
+    were discarded, while every downside tripwire stayed silent and a human had
+    to stop the run by eye. Entropy climbed 1.68x over the same steps, which is
+    the signature a sibling lane saw before its model scored 0/30 on AIME with
+    78k-character repetition loops.
+
+    So each metric now answers to a floor (`*_frac`, a fraction) AND a ceiling
+    (`*_mult`, a multiple). The asymmetry in the defaults is deliberate: a
+    policy can legitimately grow somewhat (this student was distilling toward a
+    teacher that genuinely takes longer turns, 1,068 median context tokens per
+    turn against the student's 770), so the ceilings sit further from 1.0 than
+    the floors do.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -639,6 +779,38 @@ class TripwireConfig(BaseModel):
     than nine out of ten healthy episodes. The sibling's 50x collapse (2,866 to
     about 50 tokens) is a ratio of 0.017, two orders of magnitude past this."""
 
+    entropy_warn_mult: float = Field(default=1.5, gt=1.0)
+    """Warn when the batch-pooled entropy RISES to this multiple of baseline.
+
+    The measured refutation run climbed 0.513 -> 0.862 nats/token, a ratio of
+    1.68, and nothing fired. A sibling lane's degenerate model (AIME 0/30, 78k
+    repetition loops) climbed 0.26 -> 0.82, a ratio of 3.15, and rising entropy
+    was its ONLY warning. 1.5 sits below the run we know went wrong."""
+
+    entropy_kill_mult: float = Field(default=2.5, gt=1.0)
+    """Abort (after `kill_consecutive_steps`) at this multiple of baseline.
+
+    Above the 1.68 that a run reached while still producing a measurable (if
+    insignificant) gain, and below the 3.15 of the run that ended degenerate,
+    so this kills the established pathology without killing a run that is still
+    arguably learning."""
+
+    length_warn_mult: float = Field(default=2.0, gt=1.0)
+    """Warn when mean sampled tokens per episode RISES to this multiple.
+
+    Reached at step 1 of the refutation run (2.31x), which is when a human
+    should have been asked to look, and comfortably above the upside of ordinary
+    batch-composition noise: the probe resampling that set the floors put the
+    downside p0.1 at 0.62 for this batch shape, whose reciprocal is 1.61."""
+
+    length_kill_mult: float = Field(default=3.0, gt=1.0)
+    """Abort (after `kill_consecutive_steps`) at this multiple of baseline.
+
+    Chosen against measured damage rather than taste: the refutation run passed
+    3.0x at step 2, which is the step where context-overflow drops reached 14 of
+    64 episodes and the batch began collapsing. Two consecutive steps past this
+    is the point where further spend buys less supervision each step."""
+
     kill_consecutive_steps: int = Field(default=2, ge=1)
     """Consecutive kill-level steps tolerated before the run aborts.
 
@@ -648,25 +820,42 @@ class TripwireConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_kill_below_warn(self) -> TripwireConfig:
-        """Keep every kill fraction at or under its warn fraction.
+        """Keep every kill threshold on the far side of its warn threshold.
+
+        Both directions, and the comparison inverts between them: a kill FLOOR
+        must sit at or below its warn floor, while a kill CEILING must sit at or
+        above its warn ceiling. Getting that inversion wrong is the whole reason
+        this is checked rather than left to the reader.
 
         Returns:
             This config, unchanged, when each kill threshold is reachable only
             through its warn threshold.
 
         Raises:
-            ValueError: If a kill fraction sits above its warn fraction, which
-                would abort the run without ever having warned about it.
+            ValueError: If a kill threshold sits on the near side of its warn
+                threshold, which would abort the run without ever having warned
+                about it.
         """
-        pairs = (
+        floors = (
             ("entropy", self.entropy_kill_frac, self.entropy_warn_frac),
             ("length", self.length_kill_frac, self.length_warn_frac),
         )
-        for metric, kill, warn in pairs:
+        for metric, kill, warn in floors:
             if kill > warn:
                 raise ValueError(
                     f"tripwire.{metric}_kill_frac ({kill}) must be <= "
                     f"tripwire.{metric}_warn_frac ({warn}), or the run would abort at a "
+                    "ratio it never warned about first"
+                )
+        ceilings = (
+            ("entropy", self.entropy_kill_mult, self.entropy_warn_mult),
+            ("length", self.length_kill_mult, self.length_warn_mult),
+        )
+        for metric, kill, warn in ceilings:
+            if kill < warn:
+                raise ValueError(
+                    f"tripwire.{metric}_kill_mult ({kill}) must be >= "
+                    f"tripwire.{metric}_warn_mult ({warn}), or the run would abort at a "
                     "ratio it never warned about first"
                 )
         return self

@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import random
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -117,6 +118,7 @@ from wmh.distill.store import (
     build_handoff_toml,
 )
 from wmh.distill.teacher import (
+    CachedUsageTeacher,
     EncodingTokenizer,
     SdkLogprobScorer,
     TeacherClient,
@@ -475,6 +477,16 @@ class StepMetrics(BaseModel):
     """Trained loss tokens whose raw advantage hit the clip bound (0 under
     `topk_ce`, which clips nothing, and 0 when `train.advantage_clip` is
     unset)."""
+
+    optimizer_updates: int = Field(default=1, ge=0)
+    """Optimizer updates this step took (`train.num_substeps`, or fewer if the
+    batch had less than that many replica groups).
+
+    Recorded because it is the quantity that most cheaply explains a null
+    result and was invisible for the project's first several runs: the loop
+    took ONE update per collected batch, so a 4-step run was 5 updates total
+    and could not have moved a rank-32 LoRA whatever the objective did. A run
+    summary that reports tokens but not updates hides that."""
 
     loss_tokens: int = Field(ge=0)
     """Sampled (mask 1.0) tokens in the trained batch, counted once per SOURCE
@@ -1565,6 +1577,48 @@ def _batch_reverse_kl(
     return kl_sum / kl_count if kl_count else None
 
 
+def _split_cached_prefill(submitted: int, cached: int) -> tuple[int, int]:
+    """Split one batch's scoring volume into (uncached, cached) billable tokens.
+
+    Pure arithmetic, separated from the charging so the guards can be tested
+    without a loop instance. Both inputs are DELTAS of monotonic counters, and
+    both can arrive nonsensical:
+
+    - `cached` can be negative when the teacher rebuilt its scorer mid-batch
+      (the wedged-session path drops and replaces it, restarting the counter).
+      Left alone that would CREDIT the run for spend it really made.
+    - `cached` can exceed `submitted` for the same reason, or if a response
+      counts cache hits over a prompt the caller did not attribute to this
+      batch, which would bill negative uncached tokens.
+
+    Args:
+        submitted: Tokens submitted for scoring in this batch.
+        cached: Tokens the service reported serving from its prefix cache.
+
+    Returns:
+        `(uncached, cached)`, both non-negative and summing to `max(submitted, 0)`.
+    """
+    total = max(submitted, 0)
+    billable_cached = min(max(cached, 0), total)
+    return total - billable_cached, billable_cached
+
+
+def _teacher_cached_usage(teacher: TeacherClient) -> int:
+    """The teacher's cumulative service-cached prefill tokens, or 0 if unknown.
+
+    Args:
+        teacher: The run's teacher client.
+
+    Returns:
+        `cached_usage()` when the teacher reports one, else 0 — which bills every
+        scoring token at the uncached rate, the behaviour the ledger had before
+        the field was readable.
+    """
+    if isinstance(teacher, CachedUsageTeacher):
+        return teacher.cached_usage()
+    return 0
+
+
 def _teacher_rows(
     teacher: TeacherClient, datums: Sequence[TrainDatum]
 ) -> tuple[list[list[float | None]], float | None]:
@@ -1930,6 +1984,31 @@ class _DistillRun:
             consecutive_steps=self._degeneration_streak,
             breaches=kills,
         )
+
+    def _charge_teacher_scoring(self, usage_before: int, cached_before: int) -> None:
+        """Charge one batch of teacher scoring, splitting off what the service cached.
+
+        The cached split is the SERVICE's own `prompt_cache_hit_tokens`, not a
+        wmh-side guess at which prefixes repeat (that is what `batch_billing`
+        does for rollouts). Before this was read, every scoring token was billed
+        at the uncached rate, which is why the run ledger is a ceiling rather
+        than a bill: the one calibration available put the estimate at \\$1,332
+        against a true \\$1,140.92.
+
+        Falls back to charging everything uncached when the teacher cannot report
+        a cache count, so an injected fake or a future SDK that drops the field
+        can only ever make the ledger conservative, never optimistic.
+
+        Args:
+            usage_before: `teacher.usage()` sampled before the scoring call.
+            cached_before: `cached_usage()` sampled at the same moment.
+        """
+        uncached, cached = _split_cached_prefill(
+            self._teacher.usage() - usage_before,
+            _teacher_cached_usage(self._teacher) - cached_before,
+        )
+        self._budget.charge("teacher_prefill", uncached)
+        self._budget.charge("teacher_cached_prefill", cached)
 
     def _charge_rollout_billing(self, billing: SpanBilling, *, teacher: bool) -> None:
         """Charge one rollout batch's per-request billing to its model's meters.
@@ -2626,8 +2705,22 @@ class _DistillRun:
             step=step,
         )
         sampler_path = self._sampler.sampler_path
+        # Training rollouts may run under a tighter turn cap than evals do (see
+        # `TrainConfig.rollout_max_turns`), via the same model_copy override `_run_eval` uses
+        # for its attempt count. Evals keep `rollout.max_turns` so student-before and
+        # student-after stay like-for-like -- capping the measurement too would make the paired
+        # delta report the config change rather than the training.
+        rollout_cfg = cfg
+        if cfg.train.rollout_max_turns is not None:
+            rollout_cfg = cfg.model_copy(
+                update={
+                    "rollout": cfg.rollout.model_copy(
+                        update={"max_turns": cfg.train.rollout_max_turns}
+                    )
+                }
+            )
         records, roll_stats = collect_rollouts(
-            step, batch, cfg, self._harness, self._student_provider(), self._run_dir
+            step, batch, rollout_cfg, self._harness, self._student_provider(), self._run_dir
         )
         self._charge_rollout_billing(batch_billing(records), teacher=False)
         self._log_sample_rollouts(kind="train", name=f"step-{step:04d}", step=step, records=records)
@@ -2640,6 +2733,7 @@ class _DistillRun:
 
         datums, datum_stats = build_datums(records, cfg)
         teacher_usage_before = self._teacher.usage()
+        teacher_cached_before = _teacher_cached_usage(self._teacher)
         advantage_mean: float | None = None
         advantage_std: float | None = None
         clipped_tokens = 0
@@ -2661,7 +2755,7 @@ class _DistillRun:
                 # Charged even when scoring raises mid-batch: the pool joins
                 # every submitted call before propagating, so the whole batch
                 # was billed server-side whether or not a row came back.
-                self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
+                self._charge_teacher_scoring(teacher_usage_before, teacher_cached_before)
             reverse_kl = _batch_reverse_kl(datums, scores.realized)
             trained, topk_stats = build_topk_ce_datums(datums, scores.topk, cfg.train.topk)
             loss_fn = CROSS_ENTROPY_LOSS
@@ -2673,7 +2767,7 @@ class _DistillRun:
                 rows, reverse_kl = _teacher_rows(self._teacher, datums)
             finally:
                 # Same contract as the topk_ce branch above.
-                self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
+                self._charge_teacher_scoring(teacher_usage_before, teacher_cached_before)
             trained, adv_stats = attach_advantages(datums, rows, cfg)
             # importance_sampling and ppo ride identical datums (see
             # `to_tinker_datums`); only the service-side loss differs.
@@ -2691,6 +2785,7 @@ class _DistillRun:
         train_tokens = sum(len(datum.model_input_tokens) for datum in trained)
         pg_loss: float | None = None
         grad_norm: float | None = None
+        optimizer_updates = 0
         if trained:
             logger.info(
                 "step %d: %d datum(s) into forward_backward under loss_fn %r (train.loss = %r)",
@@ -2699,10 +2794,62 @@ class _DistillRun:
                 loss_fn,
                 cfg.train.loss,
             )
-            train_output = self._training.forward_backward(trained, loss_fn=loss_fn)
-            optim_output = self._training.optim_step(cfg.train.learning_rate)
-            pg_loss = train_output.loss
-            grad_norm = optim_output.grad_norm
+            # Minibatch into `train.num_substeps` optimizer updates. At 1 (the historical
+            # behaviour) this is one forward_backward over everything and a single update -- a
+            # whole batch of agent rollouts, measured at ~$66, buying ONE gradient step. The
+            # rollouts are already paid for by the time we get here, so extra updates over the
+            # same datums cost nothing and are the cheapest learning signal available.
+            #
+            # Shuffled, not chunked in order: datums arrive grouped by episode (one per turn),
+            # so contiguous minibatches would be maximally correlated. Seeded on the step so a
+            # rerun reproduces the same minibatches.
+            #
+            # Updates 2..N are off-policy w.r.t. the weights that sampled the batch, which is
+            # the standard PPO setting and what `loss = "ppo"`'s ratio clip exists for. At
+            # num_substeps = 1 that clip is inert by construction: sampling and training share
+            # the same weights, so the ratio is identically 1.
+            # Shuffle GROUPS, not datums. Under topk_ce one source token becomes k rank
+            # replicas that share a model input and whose weights renormalize to 1 ACROSS the
+            # group, so splitting a group over two updates would apply one token's target
+            # distribution at two different weight states. Grouping by shared model input keeps
+            # replicas together whatever k is, and is a no-op for one-datum-per-source losses.
+            groups: list[list[TrainDatum]] = []
+            for datum in trained:
+                if groups and tuple(groups[-1][0].model_input_tokens) == tuple(
+                    datum.model_input_tokens
+                ):
+                    groups[-1].append(datum)
+                else:
+                    groups.append([datum])
+            if cfg.train.num_substeps > 1:
+                # Only reorder when it buys something: at 1 substep the shuffle cannot change
+                # the gradient and would only churn the batch order runs have always had.
+                random.Random(_seed_from_name(f"{self._name}-substep-{step}")).shuffle(groups)
+            substeps = min(cfg.train.num_substeps, len(groups))
+            per = math.ceil(len(groups) / substeps)
+            chunks = [
+                [datum for group in groups[i : i + per] for datum in group]
+                for i in range(0, len(groups), per)
+            ]
+            losses: list[float] = []
+            for index, chunk in enumerate(chunks):
+                train_output = self._training.forward_backward(chunk, loss_fn=loss_fn)
+                optim_output = self._training.optim_step(cfg.train.learning_rate)
+                if train_output.loss is not None:
+                    losses.append(train_output.loss)
+                grad_norm = optim_output.grad_norm
+                if len(chunks) > 1:
+                    logger.info(
+                        "step %d substep %d/%d: %d datum(s), loss %s",
+                        step,
+                        index + 1,
+                        len(chunks),
+                        len(chunk),
+                        "n/a" if train_output.loss is None else f"{train_output.loss:.4f}",
+                    )
+            # Mean over substeps: the reported loss stays comparable to the single-update runs.
+            pg_loss = sum(losses) / len(losses) if losses else None
+            optimizer_updates = len(chunks)
             self._budget.charge("student_train", train_tokens)
         else:
             logger.warning(
@@ -2738,6 +2885,7 @@ class _DistillRun:
             overlong_drops=datum_stats.overlong_drops,
             mismatch_drops=mismatch_drops,
             clipped_tokens=clipped_tokens,
+            optimizer_updates=optimizer_updates,
             loss_tokens=trained_loss_tokens,
             context_tokens=trained_context_tokens,
             reverse_kl_per_token=reverse_kl,
@@ -2968,6 +3116,19 @@ class _DistillRun:
         except BudgetExhausted as exc:
             self._abort_for_budget(exc, completed_step=None)
 
+        # Baselines feed the GATE only -- nothing in the training loop reads them -- so they are
+        # not on the critical path for starting work. Deferred, they run at finalize instead,
+        # which frees the training loop to start immediately while a SEPARATE process measures
+        # them concurrently. That process must have its own HOME: harbor's task cache is a
+        # hardcoded `~/.cache/harbor` (no env override) and `_copy_task_source_to_target` does an
+        # UNCONDITIONAL rmtree+copytree of the task dir even when the cache is warm, so two
+        # concurrent harbor jobs sharing a HOME delete each other's tasks mid-run.
+        if cfg.eval.defer_baselines:
+            self._deferred_baselines = True
+            for step in range(start_step, cfg.train.steps):
+                self._train_step(step)
+            return self._finalize(None, None)
+
         teacher_report = self._eval_or_load(
             TEACHER_BASELINE_EVAL,
             self._holdout_ids,
@@ -3020,9 +3181,40 @@ class _DistillRun:
         return self._finalize(teacher_report, before_report)
 
     def _finalize(
-        self, teacher_report: DistillEvalReport, before_report: DistillEvalReport
+        self,
+        teacher_report: DistillEvalReport | None,
+        before_report: DistillEvalReport | None,
     ) -> DistillResult:
         cfg = self._cfg
+        if teacher_report is None or before_report is None:
+            # Deferred: measure (or import) the gate references now that training is done. By
+            # this point the concurrent baseline process has long since written its reports, so
+            # `eval.teacher_baseline_from` / `student_baseline_from` normally import rather than
+            # re-measure, and no second harbor job ever runs beside the training one.
+            self._emit("baseline", "measuring deferred gate baselines after training")
+            teacher_report = self._eval_or_load(
+                TEACHER_BASELINE_EVAL,
+                self._holdout_ids,
+                cfg.gate.k,
+                self._teacher_provider(),
+                phase="baseline",
+                teacher_metered=True,
+                reuse=True,
+                pin_provider=True,
+                baseline_from=cfg.eval.teacher_baseline_from,
+                baseline_from_field="eval.teacher_baseline_from",
+            )
+            before_report = self._eval_or_load(
+                STUDENT_BEFORE_EVAL,
+                self._holdout_ids,
+                cfg.gate.k,
+                self._student_provider(),
+                phase="baseline",
+                teacher_metered=False,
+                reuse=True,
+                baseline_from=cfg.eval.student_baseline_from,
+                baseline_from_field="eval.student_baseline_from",
+            )
         self._emit("finalize", "saving final training state and sampler weights")
         final_sampler = self._sampler.refresh(cfg.train.steps)
         final_state = self._training.save_state()

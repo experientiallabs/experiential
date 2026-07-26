@@ -50,6 +50,18 @@ put the entropy ratio under 0.5, let alone the 0.3 kill bound. Requiring
 tripwire tightens as the batch shrinks, though, so a step whose batch was
 decimated by infrastructure failures is the one case worth reading beside its
 `trials` and `empty_span_trials` counts before believing a length warning.
+
+Both directions, since 2026-07-26. The bounds above are floors, and for a while
+they were the only bounds, on the argument that a turn cap already bounds the
+runaway direction. A measured run refuted that: under a 20-turn training cap the
+pooled length still reached 5.33x baseline and entropy 1.68x, because the cap
+bounds turns while each turn grew (172 turns pinned the 12,288-token output cap
+in one step). Nothing fired, and the damage landed somewhere neither floor
+watches — episodes over the context budget are dropped whole, so 22 of 64
+episodes and a third of the trainable datums disappeared while every metric the
+tripwire reads looked "fine, just larger". Each metric now answers to a ceiling
+(`*_mult`) as well, and the ceilings are set from that run's own trajectory:
+see `TripwireConfig` for which observation fixed each number.
 """
 
 from __future__ import annotations
@@ -69,6 +81,15 @@ TripwireMetric = Literal["entropy_per_token", "mean_generation_tokens"]
 """The two statistics under tripwire, named exactly as the metrics-row keys."""
 
 TripwireLevel = Literal["warn", "kill"]
+
+TripwireDirection = Literal["floor", "ceiling"]
+"""Which side of the baseline a breach is on.
+
+`floor` is collapse (the ratio fell to a fraction); `ceiling` is runaway (it
+rose to a multiple). Both are the same pathology seen from opposite ends, and a
+run has been lost to each: a sibling lane's length fell 50x, and this lane's
+length rose 5.33x until context overflow was discarding a third of every batch.
+"""
 
 
 class PolicyHealth(BaseModel):
@@ -214,13 +235,15 @@ class TripwireBreach(BaseModel):
 
     metric: TripwireMetric
     level: TripwireLevel
+    direction: TripwireDirection
     baseline: float
     value: float
     ratio: float
     """`value / baseline`; the tripwire is a bound on this, never on `value`."""
 
     threshold_frac: float
-    """The configured fraction the ratio fell to or below."""
+    """The configured bound the ratio reached: a fraction for a `floor` breach,
+    a multiple for a `ceiling` one."""
 
     config_field: str
     """The `[tripwire]` key that set `threshold_frac`, so a breach message says
@@ -228,9 +251,10 @@ class TripwireBreach(BaseModel):
 
     def describe(self) -> str:
         """One line naming the metric, its baseline, the value, and the ratio."""
+        crossed = "at or under" if self.direction == "floor" else "at or above"
         return (
             f"{self.metric} {self.value:.4g} is {self.ratio:.2f}x this run's baseline "
-            f"{self.baseline:.4g} (measured at its first training step), at or under the "
+            f"{self.baseline:.4g} (measured at its first training step), {crossed} the "
             f"{self.level} threshold {self.threshold_frac:.2f} ({self.config_field})"
         )
 
@@ -254,12 +278,16 @@ class _MetricReading(BaseModel):
     kill_frac: float
     warn_field: str
     kill_field: str
+    warn_mult: float
+    kill_mult: float
+    warn_mult_field: str
+    kill_mult_field: str
 
 
 def _readings(
     cfg: TripwireConfig, baseline: TripwireBaseline, health: PolicyHealth
 ) -> list[_MetricReading]:
-    """Both metrics wired to their configured fractions, in report order."""
+    """Both metrics wired to their configured bounds, in report order."""
     return [
         _MetricReading(
             metric="entropy_per_token",
@@ -269,6 +297,10 @@ def _readings(
             kill_frac=cfg.entropy_kill_frac,
             warn_field="tripwire.entropy_warn_frac",
             kill_field="tripwire.entropy_kill_frac",
+            warn_mult=cfg.entropy_warn_mult,
+            kill_mult=cfg.entropy_kill_mult,
+            warn_mult_field="tripwire.entropy_warn_mult",
+            kill_mult_field="tripwire.entropy_kill_mult",
         ),
         _MetricReading(
             metric="mean_generation_tokens",
@@ -278,6 +310,10 @@ def _readings(
             kill_frac=cfg.length_kill_frac,
             warn_field="tripwire.length_warn_frac",
             kill_field="tripwire.length_kill_frac",
+            warn_mult=cfg.length_warn_mult,
+            kill_mult=cfg.length_kill_mult,
+            warn_mult_field="tripwire.length_warn_mult",
+            kill_mult_field="tripwire.length_kill_mult",
         ),
     ]
 
@@ -285,13 +321,19 @@ def _readings(
 def evaluate_breaches(
     cfg: TripwireConfig, baseline: TripwireBaseline, health: PolicyHealth
 ) -> list[TripwireBreach]:
-    """Compare one step's health against the baseline fractions.
+    """Compare one step's health against the baseline bounds, both sides.
 
     A metric with no measurement (None) is skipped rather than treated as zero:
     a batch that sampled nothing is an infrastructure failure, and the
     all-empty-batch abort owns it. The boundary belongs to the breach side (a
-    ratio exactly at the fraction fires), so a threshold set to a value that was
-    actually observed is never silently inert.
+    ratio exactly at the fraction or the multiple fires), so a threshold set to a
+    value that was actually observed is never silently inert.
+
+    Kill is checked before warn on BOTH sides before either warn is considered,
+    so a metric that has blown through a kill bound is never reported as a mere
+    warning. A ratio cannot breach a floor and a ceiling at once (the validator
+    keeps every fraction <= 1 < every multiple), so the two directions cannot
+    collide.
 
     Args:
         cfg: The run's `[tripwire]` section (its `enabled` flag is the caller's
@@ -308,18 +350,27 @@ def evaluate_breaches(
         ratio = metric_ratio(reading.value, reading.baseline)
         if reading.value is None or ratio is None:
             continue
+        level: TripwireLevel
+        direction: TripwireDirection
         if ratio <= reading.kill_frac:
-            level: TripwireLevel = "kill"
+            level, direction = "kill", "floor"
             threshold, field = reading.kill_frac, reading.kill_field
+        elif ratio >= reading.kill_mult:
+            level, direction = "kill", "ceiling"
+            threshold, field = reading.kill_mult, reading.kill_mult_field
         elif ratio <= reading.warn_frac:
-            level = "warn"
+            level, direction = "warn", "floor"
             threshold, field = reading.warn_frac, reading.warn_field
+        elif ratio >= reading.warn_mult:
+            level, direction = "warn", "ceiling"
+            threshold, field = reading.warn_mult, reading.warn_mult_field
         else:
             continue
         breaches.append(
             TripwireBreach(
                 metric=reading.metric,
                 level=level,
+                direction=direction,
                 baseline=reading.baseline,
                 value=reading.value,
                 ratio=ratio,

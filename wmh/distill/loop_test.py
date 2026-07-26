@@ -3395,3 +3395,162 @@ def test_warmup_exercises_concurrency_not_just_one_token() -> None:
     assert all(len(span.sampled_ids) == 1 for span in client.issued), (
         "each warmup stream must stay a single throwaway token"
     )
+
+
+def test_num_substeps_takes_many_optimizer_updates_per_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One rollout batch should be able to buy more than one gradient step.
+
+    At the historical default of 1, a whole batch of agent rollouts (measured at ~$66) bought a
+    single update. The rollouts are already paid for by the time the optimizer runs, so extra
+    updates over the same datums are the cheapest learning signal available.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    base = _cfg()
+    cfg = base.model_copy(
+        update={"train": base.train.model_copy(update={"steps": 1, "num_substeps": 4})}
+    )
+    _run(env, cfg)
+
+    training = env.service.training
+    assert training is not None
+    assert len(training.inner.optim_step_lrs) == 4, "four minibatches -> four updates"
+    assert len(training.inner.forward_backward_calls) == 4
+
+
+def test_one_substep_keeps_the_batch_whole(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default must reproduce the pre-substep behaviour: one batch, one update."""
+    env = _setup(tmp_path, monkeypatch)
+    base = _cfg()
+    cfg = base.model_copy(update={"train": base.train.model_copy(update={"steps": 1})})
+    _run(env, cfg)
+
+    training = env.service.training
+    assert training is not None
+    assert len(training.inner.optim_step_lrs) == 1
+    assert len(training.inner.forward_backward_calls) == 1
+
+
+def test_substeps_never_split_a_topk_replica_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """topk_ce renormalizes weights ACROSS a source's k replicas.
+
+    Splitting a group over two updates would apply one token's target distribution at two
+    different weight states, so a group moves between minibatches whole or not at all.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    k = 3
+    base = _cfg()
+    cfg = base.model_copy(
+        update={
+            "train": base.train.model_copy(
+                update={"steps": 1, "loss": "topk_ce", "topk": k, "num_substeps": 3}
+            )
+        }
+    )
+    _run(env, cfg)
+
+    training = env.service.training
+    assert training is not None
+    assert len(training.inner.forward_backward_calls) > 1, "the split must actually have happened"
+    for batch, _ in training.inner.forward_backward_calls:
+        counts: dict[tuple[int, ...], int] = {}
+        for datum in batch:
+            key = tuple(datum.model_input_tokens)
+            counts[key] = counts.get(key, 0) + 1
+        assert set(counts.values()) == {k}, (
+            f"a replica group was split across minibatches: {sorted(counts.values())}"
+        )
+
+
+def test_metrics_row_records_optimizer_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Updates per step must be visible in the row, not just inferable from config.
+
+    This is the quantity that most cheaply explains a null result, and it was invisible for the
+    project's first several runs: one update per collected batch meant a "4-step run" was 5
+    updates and could not have moved a rank-32 LoRA whatever the objective did.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    base = _cfg()
+    cfg = base.model_copy(
+        update={"train": base.train.model_copy(update={"steps": 1, "num_substeps": 4})}
+    )
+    _run(env, cfg)
+
+    rows = [
+        json.loads(line)
+        for line in (env.run_dir / "metrics.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    training = env.service.training
+    assert training is not None
+    steps = [r for r in rows if r.get("phase") != "warmup"]
+    assert steps[-1]["optimizer_updates"] == len(training.inner.optim_step_lrs) == 4
+
+
+# --- service-reported cached prefill accounting -------------------------------
+
+
+def test_cached_prefill_split_never_credits_or_double_bills() -> None:
+    """The ledger must stay conservative under every nonsensical delta.
+
+    Both inputs are deltas of monotonic counters that a mid-batch scorer rebuild
+    can reset, so the two failure directions both have to be closed: a negative
+    cached delta would CREDIT the run for spend it made, and a cached delta above
+    the submitted volume would bill negative uncached tokens.
+    """
+    from wmh.distill.loop import _split_cached_prefill
+
+    # The ordinary case: part of the prefill was served from cache.
+    assert _split_cached_prefill(1000, 400) == (600, 400)
+    # Nothing cached (a teacher that cannot report, or a genuine cold prefix).
+    assert _split_cached_prefill(1000, 0) == (1000, 0)
+    # Fully cached, which is the measured behaviour on a repeated prompt.
+    assert _split_cached_prefill(1000, 1000) == (0, 1000)
+    # A scorer rebuilt mid-batch restarted its counter: never a credit.
+    assert _split_cached_prefill(1000, -700) == (1000, 0)
+    # Cache count above the batch's own volume: clamped, never negative uncached.
+    assert _split_cached_prefill(1000, 1500) == (0, 1000)
+    # An empty batch bills nothing at all.
+    assert _split_cached_prefill(0, 0) == (0, 0)
+    assert _split_cached_prefill(-5, 3) == (0, 0)
+
+    for submitted, cached in ((1000, 400), (1000, -700), (1000, 1500), (0, 5), (-5, 3)):
+        uncached, billable = _split_cached_prefill(submitted, cached)
+        assert uncached >= 0 and billable >= 0
+        assert uncached + billable == max(submitted, 0), (submitted, cached)
+
+
+def test_a_teacher_that_cannot_report_cache_hits_bills_everything_uncached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fallback, end to end through a real run.
+
+    The fake sampling client reports no cache hits, so every scoring token must
+    land on teacher_prefill and none on teacher_cached_prefill -- the exact
+    behaviour the ledger had before the field was readable, which keeps a fake or
+    a future SDK drift from making the ledger optimistic.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    _run(env, _cfg())
+
+    rows = [
+        json.loads(line)
+        for line in (env.run_dir / "metrics.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    assert rows, "the run wrote no metrics rows"
+    assert any(row["teacher_prefill_tokens"] > 0 for row in rows), "teacher scoring was not billed"
+    # Isolate the rows whose ONLY teacher charge is scoring. A row that also
+    # carries teacher-in-harness rollout billing (the gate baseline, warmup
+    # collection -- identifiable because the teacher GENERATED in it) splits its
+    # cached share from `batch_billing`, a wmh-side estimate of repeated prefixes
+    # that is legitimately nonzero and is not what this test is about.
+    scoring_only = [row for row in rows if not row["teacher_sample_tokens"]]
+    assert scoring_only, "no scoring-only row to check"
+    assert all(row["teacher_prefill_tokens"] > 0 for row in scoring_only)
+    assert all(row["teacher_cached_prefill_tokens"] == 0 for row in scoring_only)
