@@ -70,7 +70,7 @@ def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderCon
     api_version = configured.api_version
     if api_version is None and kind is ProviderKind.AZURE_OPENAI:
         api_version = _DEFAULT_AZURE_API_VERSION
-    return ProviderConfig(
+    config = ProviderConfig(
         kind=kind,
         model=configured.model,
         model_type=configured.model_type,
@@ -80,3 +80,8 @@ def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderCon
         api_version=api_version,
         reasoning_effort=configured.reasoning_effort,
     )
+    if configured.chat_max_tokens_field is None:
+        # Unset keeps meaning "resolve from the built-in catalog", which is right for every named
+        # model; forcing the field here would override the catalog for all of them.
+        return config
+    return config.model_copy(update={"chat_max_tokens_field": configured.chat_max_tokens_field})

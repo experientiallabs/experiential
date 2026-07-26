@@ -8,7 +8,11 @@ import pytest
 import typer
 
 import wmo.cli.model_roles as model_roles_module
-from wmo.cli.model_roles import OptInModelRole, resolve_opt_in_model_provider
+from wmo.cli.model_roles import (
+    OptInModelRole,
+    _model_config,
+    resolve_opt_in_model_provider,
+)
 from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -187,3 +191,32 @@ def test_unknown_provider_names_the_configured_role(tmp_path: Path, role: OptInM
         match=rf"settings \[models\.{role}\] has unknown provider 'bogus'",
     ):
         resolve_opt_in_model_provider(str(root), role, _Provider())
+
+
+def test_role_pins_the_output_budget_field_for_a_model_outside_the_catalog() -> None:
+    """A promoted tinker:// student must reach the provider with the field its endpoint takes.
+
+    Without this the role resolves `max_completion_tokens` (the catalog fallback for an unknown
+    model id) and every agent call to Tinker's serving endpoint 400s.
+    """
+    config = _model_config(
+        ModelRole(
+            provider="openai",
+            model="tinker://runs/abc/sampler/final",
+            model_type="Qwen/Qwen3-8B",
+            endpoint="https://tinker.example/oai/api/v1",
+            chat_max_tokens_field="max_tokens",
+        ),
+        role="agent",
+    )
+
+    assert config.chat_max_tokens_field == "max_tokens"
+    assert config.resolved_chat_max_tokens_field() == "max_tokens"
+
+
+def test_role_without_the_field_still_resolves_from_the_catalog() -> None:
+    """Unset must keep meaning "ask the catalog", so this cannot override every named model."""
+    config = _model_config(ModelRole(provider="openai", model="gpt-5.5"), role="agent")
+
+    assert config.chat_max_tokens_field == "max_completion_tokens"
+    assert config.resolved_chat_max_tokens_field() == "max_completion_tokens"

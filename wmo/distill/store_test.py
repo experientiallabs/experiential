@@ -26,9 +26,13 @@ from wmo.distill.store import (
     WarmupRecord,
     WarmupTrialsManifest,
     build_handoff_toml,
+    is_tinker_endpoint,
+    student_pool_entry,
 )
 from wmo.distill.tokens import TrialRecord
 from wmo.distill.tripwire import TripwireBaseline
+from wmo.providers.base import ProviderKind
+from wmo.providers.pool import load_pool, upsert_pool_entry
 from wmo.providers.tinker import TokenSpan
 
 
@@ -478,6 +482,11 @@ def test_handoff_snippet_content_and_default_endpoint() -> None:
                 "model": "tinker://runs/abc/sampler/final",
                 "model_type": "Qwen/Qwen3-4B",
                 "endpoint": DEFAULT_TINKER_OPENAI_ENDPOINT,
+                # Added deliberately, not loosened: a tinker:// path is outside the built-in
+                # catalog, so capability resolution falls back to `max_completion_tokens`, which
+                # Tinker's endpoint answers with a 400 on every call. The snippet has to pin the
+                # name that endpoint takes or the promoted student is unusable.
+                "chat_max_tokens_field": "max_tokens",
             }
         }
     }
@@ -504,3 +513,260 @@ def test_handoff_rejects_non_tinker_sampler_path() -> None:
 def test_handoff_rejects_unembeddable_values() -> None:
     with pytest.raises(ValueError, match="cannot be embedded"):
         build_handoff_toml('tinker://bad"path', base_model="Qwen/Qwen3-4B")
+
+
+def test_student_pool_entry_addresses_the_adapter_as_an_openai_endpoint() -> None:
+    entry = student_pool_entry(_card(), name="student", input_per_mtok=0.1, output_per_mtok=0.4)
+
+    assert entry.name == "student"
+    assert entry.kind is ProviderKind.OPENAI
+    assert entry.model == "tinker://fake/sampler/final/0"  # the weights, not a family name
+    assert entry.model_type == "Qwen/Qwen3-8B"  # capability resolution keys on the base model
+    assert entry.endpoint == DEFAULT_TINKER_OPENAI_ENDPOINT
+    assert entry.api_key_env == "TINKER_API_KEY"
+    assert entry.tier == "open"
+
+
+def test_student_pool_entry_asks_for_the_classic_output_budget_field() -> None:
+    """Tinker's OpenAI-compatible endpoint 400s on `max_completion_tokens`.
+
+    A `tinker://` path is not in the built-in catalog, so nothing else can supply this: without
+    the explicit field every routed call to the student fails.
+    """
+    entry = student_pool_entry(_card(), name="s", input_per_mtok=0.1, output_per_mtok=0.4)
+
+    assert entry.chat_max_tokens_field == "max_tokens"
+    assert entry.provider_config().resolved_chat_max_tokens_field() == "max_tokens"
+
+
+def test_student_pool_entry_prices_are_required_and_carried() -> None:
+    """An unpriced candidate reports $0 and a cost-aware policy would route everything to it."""
+    entry = student_pool_entry(_card(), name="s", input_per_mtok=0.1, output_per_mtok=0.4)
+
+    assert entry.price().input_per_mtok == 0.1
+    assert entry.price().output_per_mtok == 0.4
+    with pytest.raises(TypeError):  # no default: the caller must state a price
+        student_pool_entry(_card(), name="s")  # ty: ignore[missing-argument]
+
+
+def test_student_pool_entry_honors_an_endpoint_override() -> None:
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint="https://self-hosted.example/v1",
+    )
+
+    assert entry.endpoint == "https://self-hosted.example/v1"
+
+
+def test_student_pool_entry_rejects_a_non_tinker_sampler_path() -> None:
+    with pytest.raises(ValueError, match="tinker://"):
+        student_pool_entry(
+            _card(sampler="Qwen/Qwen3-8B"), name="s", input_per_mtok=0.1, output_per_mtok=0.4
+        )
+
+
+def test_student_pool_entry_round_trips_through_the_pool_file(tmp_path: Path) -> None:
+    """The end of the keystone path: card -> entry -> pool.toml -> loadable candidate."""
+    path = tmp_path / "pool.toml"
+    entry = student_pool_entry(_card(), name="student", input_per_mtok=0.1, output_per_mtok=0.4)
+
+    upsert_pool_entry(entry, path)
+
+    assert load_pool(path).entry("student") == entry
+
+
+def test_student_pool_entry_never_sends_the_tinker_key_to_another_host() -> None:
+    """A custom --endpoint must not inherit TINKER_API_KEY.
+
+    `pool_provider` resolves `api_key_env` and hands the value straight to the client as an
+    explicit credential, so inheriting the default here would send a Tinker bearer token to
+    whatever host the caller named.
+    """
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint="https://someone-elses-host.example/v1",
+    )
+
+    assert entry.api_key_env is None  # falls back to WMO_ENDPOINT_API_KEY in the provider
+    assert entry.chat_max_tokens_field == "max_completion_tokens"  # not Tinker's convention
+
+
+def test_student_pool_entry_takes_an_explicit_credential_for_a_custom_host() -> None:
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint="https://my-vllm.example/v1",
+        api_key_env="MY_VLLM_KEY",
+        chat_max_tokens_field="max_tokens",
+    )
+
+    assert entry.api_key_env == "MY_VLLM_KEY"
+    assert entry.chat_max_tokens_field == "max_tokens"
+
+
+def test_student_pool_entry_keeps_the_tinker_defaults_on_an_explicit_tinker_endpoint() -> None:
+    """Naming Tinker's endpoint by hand is still Tinker, so the defaults must still apply."""
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint=DEFAULT_TINKER_OPENAI_ENDPOINT,
+    )
+
+    assert entry.api_key_env == "TINKER_API_KEY"
+    assert entry.chat_max_tokens_field == "max_tokens"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        DEFAULT_TINKER_OPENAI_ENDPOINT,
+        DEFAULT_TINKER_OPENAI_ENDPOINT + "/",
+        DEFAULT_TINKER_OPENAI_ENDPOINT + "//",
+        f"  {DEFAULT_TINKER_OPENAI_ENDPOINT}  ",
+    ],
+)
+def test_equivalent_spellings_of_the_tinker_endpoint_keep_its_defaults(endpoint: str) -> None:
+    """A pasted trailing slash must not reclassify Tinker's own endpoint as somebody else's host.
+
+    Getting this wrong is silent: the entry would swap TINKER_API_KEY for the
+    WMO_ENDPOINT_API_KEY fallback and `max_tokens` for `max_completion_tokens`, so the student
+    400s on a URL that is Tinker's.
+    """
+    entry = student_pool_entry(
+        _card(), name="s", input_per_mtok=0.1, output_per_mtok=0.4, endpoint=endpoint
+    )
+
+    assert entry.api_key_env == "TINKER_API_KEY"
+    assert entry.chat_max_tokens_field == "max_tokens"
+    parsed = tomllib.loads(
+        build_handoff_toml("tinker://w/1", base_model="Qwen/Qwen3-8B", endpoint=endpoint)
+    )
+    assert parsed["models"]["agent"]["chat_max_tokens_field"] == "max_tokens"
+
+
+def test_a_genuinely_different_host_is_not_read_as_tinker() -> None:
+    """The normalization must not become a prefix match: a lookalike host is still custom."""
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint=DEFAULT_TINKER_OPENAI_ENDPOINT + "/proxy",
+    )
+
+    assert entry.api_key_env is None
+    assert entry.chat_max_tokens_field == "max_completion_tokens"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "HTTPS://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1",
+        "https://Tinker.ThinkingMachines.Dev/services/tinker-prod/oai/api/v1",
+        "https://TINKER.THINKINGMACHINES.DEV/services/tinker-prod/oai/api/v1/",
+    ],
+)
+def test_case_variant_tinker_urls_keep_its_defaults(endpoint: str) -> None:
+    """Scheme and host are case-insensitive per RFC 3986, so these are all Tinker's endpoint."""
+    entry = student_pool_entry(
+        _card(), name="s", input_per_mtok=0.1, output_per_mtok=0.4, endpoint=endpoint
+    )
+
+    assert entry.api_key_env == "TINKER_API_KEY"
+    assert entry.chat_max_tokens_field == "max_tokens"
+
+
+def test_a_case_variant_PATH_is_not_read_as_tinker() -> None:
+    """The path is case-SENSITIVE, so a different route is a different resource, not Tinker's.
+
+    Treating it as Tinker's would hand `TINKER_API_KEY` to a route the operator never named.
+    """
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint="https://tinker.thinkingmachines.dev/services/tinker-prod/OAI/API/V1",
+    )
+
+    assert entry.api_key_env is None
+    assert entry.chat_max_tokens_field == "max_completion_tokens"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://tinker.thinkingmachines.dev:443/services/tinker-prod/oai/api/v1",
+        "https://tinker.thinkingmachines.dev:443/services/tinker-prod/oai/api/v1/",
+        "  HTTPS://TINKER.THINKINGMACHINES.DEV:443/services/tinker-prod/oai/api/v1  ",
+    ],
+)
+def test_the_spelled_out_default_https_port_keeps_the_tinker_defaults(endpoint: str) -> None:
+    """`:443` on an https URL is redundant (RFC 3986 section 3.2.3), so this IS Tinker's endpoint.
+
+    A URL copied out of a proxy config or a log line often carries the port. Reading it as a
+    custom host is silent: the entry swaps TINKER_API_KEY for the WMO_ENDPOINT_API_KEY fallback
+    and `max_tokens` for `max_completion_tokens`, so every routed call to the student fails auth
+    or 400s on a URL that is Tinker's own.
+    """
+    assert is_tinker_endpoint(endpoint)
+    entry = student_pool_entry(
+        _card(), name="s", input_per_mtok=0.1, output_per_mtok=0.4, endpoint=endpoint
+    )
+
+    assert entry.api_key_env == "TINKER_API_KEY"
+    assert entry.chat_max_tokens_field == "max_tokens"
+    parsed = tomllib.loads(
+        build_handoff_toml("tinker://w/1", base_model="Qwen/Qwen3-8B", endpoint=endpoint)
+    )
+    assert parsed["models"]["agent"]["chat_max_tokens_field"] == "max_tokens"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://tinker.thinkingmachines.dev:8443/services/tinker-prod/oai/api/v1",
+        # Not parseable as the default port, so it is compared as written: guessing what an
+        # operator meant is the wrong side to err on when a credential rides on the answer.
+        "https://tinker.thinkingmachines.dev:0443/services/tinker-prod/oai/api/v1",
+        "https://tinker.thinkingmachines.dev:notaport/services/tinker-prod/oai/api/v1",
+    ],
+)
+def test_a_port_that_is_not_the_scheme_default_is_a_different_service(endpoint: str) -> None:
+    """Only the redundant port may be dropped: `:8443` on that host is a proxy, not Tinker."""
+    assert not is_tinker_endpoint(endpoint)  # must also not raise on an unparseable port
+    entry = student_pool_entry(
+        _card(), name="s", input_per_mtok=0.1, output_per_mtok=0.4, endpoint=endpoint
+    )
+
+    assert entry.api_key_env is None
+    assert entry.chat_max_tokens_field == "max_completion_tokens"
+
+
+def test_only_the_schemes_own_default_port_is_redundant() -> None:
+    """http implies 80 and https implies 443; each other combination is a distinct endpoint."""
+    from wmo.distill.store import _normalize_endpoint
+
+    assert _normalize_endpoint("http://h.example/v1") == _normalize_endpoint(
+        "http://h.example:80/v1"
+    )
+    assert _normalize_endpoint("https://h.example/v1") == _normalize_endpoint(
+        "https://h.example:443/v1"
+    )
+    # 443 is not http's default port, nor 80 https's: those name a real port on that host.
+    assert _normalize_endpoint("http://h.example/v1") != _normalize_endpoint(
+        "http://h.example:443/v1"
+    )
+    assert _normalize_endpoint("https://h.example/v1") != _normalize_endpoint(
+        "https://h.example:80/v1"
+    )

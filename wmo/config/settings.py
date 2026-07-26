@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 import tomli_w
+from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, Field, ValidationError
 
 from wmo.config.config import ARTIFACT_DIR
@@ -34,6 +35,11 @@ class ModelRole(BaseModel):
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version (azure roles get a default)
     reasoning_effort: str | None = None  # structured reasoning effort, when supported
+    # The output-budget parameter this backend accepts. Unset means "resolve it from the built-in
+    # catalog", which is right for every named model; a custom `endpoint` outside the catalog (a
+    # tinker:// student on Tinker's serving endpoint wants the classic `max_tokens`) has to say so
+    # here, or every call to it 400s on the wrong parameter name.
+    chat_max_tokens_field: ChatMaxTokensField | None = None
 
 
 class ModelsSettings(BaseModel):

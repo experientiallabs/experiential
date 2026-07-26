@@ -926,8 +926,6 @@ def _checked_in_config(name: str) -> DistillConfig:
     return load_distill_config(Path(__file__).parent / "configs" / name)
 
 
-
-
 def test_training_turn_cap_defaults_to_the_rollout_cap(tmp_path: Path) -> None:
     """Unset means one cap everywhere, which is the pre-existing behaviour."""
     cfg = load_distill_config(_write(tmp_path, MINIMAL_TOML))

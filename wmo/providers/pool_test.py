@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +16,14 @@ from pydantic import ValidationError
 
 from wmo.providers.azure_openai import AzureOpenAIProvider
 from wmo.providers.base import ProviderConfig, ProviderKind, TokenUsage
-from wmo.providers.pool import DEFAULT_POOL_PATH, PoolEntry, load_pool, pool_provider
+from wmo.providers.pool import (
+    DEFAULT_POOL_PATH,
+    PoolEntry,
+    PoolLockTimeout,
+    load_pool,
+    pool_provider,
+    upsert_pool_entry,
+)
 from wmo.providers.registry import get_provider
 
 _POOL_TOML = """
@@ -248,3 +262,385 @@ def test_azure_entry_requires_deployment() -> None:
             input_per_mtok=1.0,
             output_per_mtok=2.0,
         )
+
+
+def _student_entry(name: str = "student") -> PoolEntry:
+    """A distilled-student shaped entry: a weights path the catalog cannot resolve."""
+    return PoolEntry(
+        name=name,
+        kind=ProviderKind.OPENAI,
+        model="tinker://weights/abc123",
+        model_type="Qwen/Qwen3-30B-A3B",
+        chat_max_tokens_field="max_tokens",
+        endpoint="https://tinker.example/oai/api/v1",
+        api_key_env="TINKER_API_KEY",
+        tier="open",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+    )
+
+
+def test_provider_config_forwards_model_type_and_max_tokens_field() -> None:
+    """Both new fields must reach ProviderConfig, or a routed student 400s on every call.
+
+    `model` is a tinker:// weights path the built-in catalog cannot resolve, so capability
+    resolution has only `model_type` and the explicit field to go on.
+    """
+    config = _student_entry().provider_config()
+
+    assert config.model_type == "Qwen/Qwen3-30B-A3B"
+    assert config.chat_max_tokens_field == "max_tokens"
+    assert config.resolved_chat_max_tokens_field() == "max_tokens"
+
+
+def test_pool_entry_defaults_keep_the_built_in_contract() -> None:
+    """An entry that says nothing keeps the catalog's answer, so this cannot regress GPT-5.x."""
+    entry = PoolEntry(name="gpt", kind=ProviderKind.OPENAI, model="gpt-5.5")
+
+    assert entry.model_type is None
+    assert entry.provider_config().resolved_chat_max_tokens_field() == "max_completion_tokens"
+
+
+def test_upsert_pool_entry_creates_the_file_and_appends(tmp_path: Path) -> None:
+    path = tmp_path / "nested" / "pool.toml"
+
+    assert upsert_pool_entry(_student_entry(), path) is False
+
+    assert [m.name for m in load_pool(path).models] == ["student"]
+    entry = load_pool(path).entry("student")
+    assert entry.model_type == "Qwen/Qwen3-30B-A3B"
+    assert entry.chat_max_tokens_field == "max_tokens"
+    assert entry.api_key_env == "TINKER_API_KEY"
+
+
+def test_upsert_pool_entry_replaces_by_name_and_keeps_the_others(tmp_path: Path) -> None:
+    path = tmp_path / "pool.toml"
+    path.write_text(_POOL_TOML, encoding="utf-8")
+    before = [m.name for m in load_pool(path).models]
+
+    assert upsert_pool_entry(_student_entry(), path) is False
+    assert upsert_pool_entry(_student_entry(), path) is True
+
+    after = [m.name for m in load_pool(path).models]
+    assert after == [*before, "student"]  # replaced in place, nothing duplicated or dropped
+
+
+def test_upsert_pool_entry_does_not_stamp_defaults_onto_existing_entries(tmp_path: Path) -> None:
+    """Hand-maintained entries must not gain every default just because a student was added.
+
+    Byte-level preservation of the whole file is covered by
+    `test_upsert_pool_entry_appends_without_touching_a_byte_of_the_existing_file`; this checks the
+    narrower property that survives even a REPLACEMENT, which has to re-render the roster.
+    """
+    path = tmp_path / "pool.toml"
+    path.write_text(_POOL_TOML, encoding="utf-8")
+
+    upsert_pool_entry(_student_entry(), path)
+
+    written = path.read_text(encoding="utf-8")
+    assert 'tier = "frontier"' not in written  # the default was never stamped onto gpt-5.5
+    assert "chat_max_tokens_field" in written  # but the student's explicit value is there
+    gpt = load_pool(path).entry("gpt-5.5")
+    assert gpt.input_per_mtok is None  # still priced from the built-in table, as authored
+
+
+def test_upsert_pool_entry_names_the_file_when_it_is_not_valid_toml(tmp_path: Path) -> None:
+    path = tmp_path / "pool.toml"
+    path.write_text("[[model]\nname = broken", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"is not valid TOML"):
+        upsert_pool_entry(_student_entry(), path)
+
+
+def test_upsert_pool_entry_rejects_a_file_that_is_not_a_model_array(tmp_path: Path) -> None:
+    path = tmp_path / "pool.toml"
+    path.write_text('model = "not-an-array"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"\[\[model\]\] tables"):
+        upsert_pool_entry(_student_entry(), path)
+
+
+def test_upsert_pool_entry_uses_a_process_private_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two concurrent upserts must not be able to rename each other's half-written file.
+
+    A shared fixed `.tmp` path turns a lost update into a CORRUPT roster: writer A can rename
+    B's partially written file into place. Distinct temps bound the damage to last-writer-wins.
+    """
+    seen: list[str] = []
+    real_write = Path.write_text
+
+    def _record(self: Path, data: str, **kwargs: object) -> int:
+        if self.suffix == ".tmp":
+            seen.append(self.name)
+        return real_write(self, data, **kwargs)  # ty: ignore[invalid-argument-type]
+
+    monkeypatch.setattr(Path, "write_text", _record)
+    upsert_pool_entry(_student_entry(), tmp_path / "pool.toml")
+
+    assert seen == [f"pool.toml.{os.getpid()}.tmp"]
+    assert list(tmp_path.glob("*.tmp")) == []  # the temp is gone once renamed
+
+
+def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "pool.toml"
+    path.write_text(_POOL_TOML, encoding="utf-8")
+    real_replace = Path.replace
+
+    def _boom(self: Path, target: object) -> Path:
+        if self.suffix == ".tmp":
+            raise OSError("disk full")
+        return real_replace(self, target)  # ty: ignore[invalid-argument-type]
+
+    monkeypatch.setattr(Path, "replace", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        upsert_pool_entry(_student_entry(), path)
+
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert load_pool(path).models  # the roster is untouched and still loadable
+
+
+_COMMENTED_POOL = """# Roster for the support endpoint. Keep this file under review.
+[[model]]
+name = "gpt-5.5"
+kind = "azure"
+model = "gpt-5.5"
+deployment = "gpt-5.5"
+# billed to the prod OpenAI account
+api_key_env = "AZURE_PROD_KEY"
+
+# Cheap tier. DO NOT delete: the savings figure is quoted against this row.
+[[model]]
+name = "haiku"
+kind = "anthropic"
+model = "claude-haiku-4-5"
+"""
+
+
+def test_upsert_pool_entry_appends_without_touching_a_byte_of_the_existing_file(
+    tmp_path: Path,
+) -> None:
+    """An operator's comments say which account a row bills to; losing them silently is not ok."""
+    path = tmp_path / "pool.toml"
+    path.write_text(_COMMENTED_POOL, encoding="utf-8")
+
+    assert upsert_pool_entry(_student_entry(), path) is False
+
+    written = path.read_text(encoding="utf-8")
+    assert written.startswith(_COMMENTED_POOL)  # byte-identical prefix, comments included
+    assert "DO NOT delete" in written
+    assert "billed to the prod OpenAI account" in written
+    assert [m.name for m in load_pool(path).models] == ["gpt-5.5", "haiku", "student"]
+
+
+def test_upsert_pool_entry_append_round_trips_when_the_file_has_no_trailing_newline(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pool.toml"
+    path.write_text(
+        '[[model]]\nname = "haiku"\nkind = "anthropic"\nmodel = "claude-haiku-4-5"',
+        encoding="utf-8",
+    )
+
+    upsert_pool_entry(_student_entry(), path)
+
+    assert [m.name for m in load_pool(path).models] == ["haiku", "student"]
+
+
+def test_upsert_pool_entry_blames_a_pre_existing_bad_row_on_the_file_not_the_new_entry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "pool.toml"
+    path.write_text(
+        '[[model]]\nname = "mine"\nkind = "openai"\nmodel = "some/self-hosted-model"\n',
+        encoding="utf-8",
+    )
+
+    original = path.read_text(encoding="utf-8")
+    with pytest.raises(ValueError, match=r"already invalid, before adding 'student'"):
+        upsert_pool_entry(_student_entry(), path)
+
+    # Validate-before-write: a rejected upsert must leave the roster exactly as it was, and must
+    # not strand a temp file beside it.
+    assert path.read_text(encoding="utf-8") == original
+    assert list(path.parent.glob("*.tmp")) == []
+
+
+def test_upsert_pool_entry_keeps_both_registrations_when_two_threads_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two concurrent writers adding different entries must BOTH land in the roster.
+
+    An unlocked read-modify-write loses one of them and reports success to both, so a model an
+    operator registered is simply absent from the pool with nothing saying so.
+
+    The race is forced, not hoped for: every read of the roster parks on a barrier, so both
+    writers provably hold the SAME snapshot before either writes, which is exactly the
+    interleaving that drops an entry. With the write lock held across the whole cycle the second
+    writer cannot reach its first read until the first writer has finished, so the barrier times
+    out (its wait is far shorter than the lock's), the reads happen in sequence, and the second
+    writer merges onto the roster it can now see.
+    """
+    path = tmp_path / "pool.toml"
+    path.write_text(_COMMENTED_POOL, encoding="utf-8")
+    read_together = threading.Barrier(2, timeout=1.0)
+    real_read = Path.read_text
+
+    def _park_on_every_roster_read(self: Path, **kwargs: object) -> str:
+        text = real_read(self, **kwargs)  # ty: ignore[invalid-argument-type]
+        if self.name == path.name:
+            with contextlib.suppress(threading.BrokenBarrierError):
+                read_together.wait()
+        return text
+
+    monkeypatch.setattr(Path, "read_text", _park_on_every_roster_read)
+    failures: list[BaseException] = []
+
+    def _register(name: str) -> None:
+        try:
+            upsert_pool_entry(_student_entry(name), path)
+        except BaseException as exc:  # noqa: BLE001 - reported by the main thread's assertions
+            failures.append(exc)
+
+    writers = [
+        threading.Thread(target=_register, args=(name,), name=name)
+        for name in ("student-a", "student-b")
+    ]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=60)
+        assert not writer.is_alive(), f"{writer.name} never finished; the lock wait is not bounded"
+    monkeypatch.undo()  # the assertions below read the roster without parking on the barrier
+
+    registered = sorted(entry.name for entry in load_pool(path).models)
+    assert registered == ["gpt-5.5", "haiku", "student-a", "student-b"], (
+        f"a concurrent registration was lost (writer errors: {failures})"
+    )
+    assert failures == []
+    assert "DO NOT delete" in path.read_text(encoding="utf-8")  # appends, so comments survive
+    # The lock file is the only extra artifact: no half-written temp survives a race.
+    assert sorted(child.name for child in tmp_path.iterdir()) == ["pool.toml", "pool.toml.lock"]
+
+
+# The child of `test_upsert_pool_entry_keeps_every_registration_from_concurrent_processes`: one
+# real `wmo` process registering one candidate. It signals readiness, then spins until the parent
+# releases every writer at once, so the processes collide on the roster instead of queueing.
+_WRITER_PROGRAM = """
+import sys
+import time
+from pathlib import Path
+
+from wmo.providers.base import ProviderKind
+from wmo.providers.pool import PoolEntry, upsert_pool_entry
+
+pool_path, name, ready_path, start_path = (
+    Path(sys.argv[1]),
+    sys.argv[2],
+    Path(sys.argv[3]),
+    Path(sys.argv[4]),
+)
+entry = PoolEntry(
+    name=name,
+    kind=ProviderKind.OPENAI,
+    model="tinker://weights/" + name,
+    input_per_mtok=0.1,
+    output_per_mtok=0.4,
+)
+ready_path.write_text("ready", encoding="utf-8")
+while not start_path.exists():
+    time.sleep(0.001)
+upsert_pool_entry(entry, pool_path)
+"""
+
+
+def test_upsert_pool_entry_keeps_every_registration_from_concurrent_processes(
+    tmp_path: Path,
+) -> None:
+    """The cross-process half: separate `wmo optimize route student` runs must not erase each other.
+
+    The threaded test above pins the interleaving; this one proves the lock is held against other
+    PROCESSES, which is the situation an operator actually hits (two terminals, or a script
+    registering several students at once). Nothing is patched here, so the loss it guards against
+    is timing-dependent: with the roster unlocked, eight writers released together keep whichever
+    entry landed last and drop the rest.
+    """
+    path = tmp_path / "pool.toml"
+    path.write_text(_COMMENTED_POOL, encoding="utf-8")
+    start = tmp_path / "start"
+    names = [f"student-{index}" for index in range(8)]
+    environment = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])}
+    writers = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                _WRITER_PROGRAM,
+                str(path),
+                name,
+                str(tmp_path / f"ready-{name}"),
+                str(start),
+            ],
+            env=environment,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for name in names
+    ]
+    try:
+        deadline = time.monotonic() + 60.0
+        while not all((tmp_path / f"ready-{name}").exists() for name in names):
+            assert time.monotonic() < deadline, "the concurrent writers never became ready"
+            time.sleep(0.01)
+        start.write_text("go", encoding="utf-8")
+        for writer in writers:
+            stderr = writer.communicate(timeout=60.0)[1]
+            assert writer.returncode == 0, stderr
+    finally:
+        for writer in writers:
+            if writer.poll() is None:
+                writer.kill()
+
+    assert sorted(entry.name for entry in load_pool(path).models) == sorted(
+        ["gpt-5.5", "haiku", *names]
+    )
+    assert "DO NOT delete" in path.read_text(encoding="utf-8")
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_upsert_pool_entry_reports_a_stuck_writer_instead_of_hanging(tmp_path: Path) -> None:
+    """A held lock must fail with an actionable message inside the bound, never wedge the CLI."""
+    path = tmp_path / "pool.toml"
+    path.write_text(_COMMENTED_POOL, encoding="utf-8")
+    lock_path = path.with_name(f"{path.name}.lock")
+    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(PoolLockTimeout, match=r"writing the model pool at .*pool\.toml"):
+            upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05)
+    finally:
+        os.close(holder)
+
+    assert [entry.name for entry in load_pool(path).models] == ["gpt-5.5", "haiku"]  # untouched
+    assert list(tmp_path.glob("*.tmp")) == []
+    # Once the holder is gone the lock is free again: the kernel owns that release, so a leftover
+    # lock FILE is never a held lock and cannot wedge the next run.
+    assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05) is False
+
+
+def test_upsert_pool_entry_releases_the_lock_when_it_rejects_the_roster(tmp_path: Path) -> None:
+    """A rejected upsert must not leave the roster locked, or one bad row wedges every later run."""
+    path = tmp_path / "pool.toml"
+    path.write_text(
+        '[[model]]\nname = "mine"\nkind = "openai"\nmodel = "some/self-hosted-model"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"already invalid"):
+        upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05)
+
+    path.write_text(_COMMENTED_POOL, encoding="utf-8")  # the operator fixes the row
+    assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05) is False
