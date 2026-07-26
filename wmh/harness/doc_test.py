@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+from wmh.harness import doc as doc_module
 from wmh.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
@@ -15,6 +18,7 @@ from wmh.harness.doc import (
     SurfaceKind,
     code_surface_id,
 )
+from wmh.harness.runtime import JSON_PROTOCOL_CLAUSE
 from wmh.harness.skills import Skill
 
 
@@ -397,8 +401,15 @@ def test_transport_retries_reaches_e2b_pi_runtime() -> None:
     pool.close()
 
 
-def test_episode_timeout_reaches_e2b_pi_runtime_and_rejects_local_noop() -> None:
+def test_episode_timeout_reaches_every_pi_runtime_and_rejects_non_pi_runtimes() -> None:
+    """The wall budget is pi-node policy on BOTH backends, not an e2b-only knob.
+
+    It used to be rejected under `backend="local"`, so the SSH transport silently kept its
+    hardcoded `timeout 300 node` and 31% of long TerminalBench-2 trials died on that clock while
+    the configured budget was ignored.
+    """
     from wmh.harness.pi_e2b import E2BPiRuntime
+    from wmh.harness.pi_runtime import PiRuntime
 
     runtime = _pi_doc().runtime(
         _stub_provider(),
@@ -409,12 +420,17 @@ def test_episode_timeout_reaches_e2b_pi_runtime_and_rejects_local_noop() -> None
     assert isinstance(runtime, E2BPiRuntime)
     assert runtime._episode_timeout_s == 12_000  # noqa: SLF001 - public policy passthrough
     runtime.close()
-    with pytest.raises(ValueError, match="episode_timeout_s applies only to e2b pi-node"):
-        _pi_doc().runtime(
-            _stub_provider(),
-            backend="local",
-            episode_timeout_s=12_000,
-        )
+
+    local = _pi_doc().runtime(
+        _stub_provider(),
+        backend="local",
+        episode_timeout_s=12_000,
+    )
+    assert isinstance(local, PiRuntime)
+    assert local._episode_timeout_s == 12_000  # noqa: SLF001 - public policy passthrough
+
+    with pytest.raises(ValueError, match="episode_timeout_s applies only to pi-node"):
+        HarnessDoc.baseline().runtime(_stub_provider(), episode_timeout_s=12_000)
 
 
 @pytest.mark.parametrize("value", [True, float("nan"), float("inf"), 0, -1.0])
@@ -427,3 +443,48 @@ def test_episode_timeout_validates_once_at_the_runtime_entry_point(value: object
             backend="e2b",
             episode_timeout_s=cast("float", value),
         )
+
+
+# --- one tool protocol per runtime (audit defect 6) ----------------------------------------------
+def test_structured_tool_runtimes_do_not_carry_the_json_action_clause() -> None:
+    """The pi path passes STRUCTURED tool schemas; its renderer defines the calling convention.
+
+    Shipping the JSON-action clause there declares a protocol nothing parses. Verified live in
+    `super-topk/samples/step-0009.md`: the model received the tool schemas twice, in two notations,
+    with two contradictory conventions, and 14.7% of Super trials spent at least one turn's
+    reasoning on the JSON envelope (16% of the turns that hit the output cap contained such
+    reasoning).
+    """
+    doc = HarnessDoc.baseline("base")
+
+    json_runtime_prompt = doc.assembled_prompt()
+    structured_prompt = doc.assembled_prompt(structured_tools=True)
+
+    assert JSON_PROTOCOL_CLAUSE in json_runtime_prompt
+    assert JSON_PROTOCOL_CLAUSE not in structured_prompt
+    # Everything else is unchanged: same task guidance, same tool listing.
+    assert "capable command-line agent" in structured_prompt
+    assert "## Tools" in structured_prompt
+    assert "call `submit` with your answer" in structured_prompt
+    # No blank-line scar where the clause was.
+    assert "\n\n\n" not in structured_prompt
+
+
+def test_stripping_the_json_clause_is_a_no_op_on_an_edited_prompt() -> None:
+    """An optimizer-edited prompt surface that never carried the clause is untouched."""
+    doc = HarnessDoc(
+        name="edited",
+        surfaces=[
+            Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="Be a careful agent."),
+            Surface(id=TOOL_POLICY_ID, kind=SurfaceKind.TOOL_POLICY, content="bash\nsubmit"),
+        ],
+    )
+    assert doc.assembled_prompt(structured_tools=True) == doc.assembled_prompt()
+
+
+def test_every_pi_runtime_gets_the_structured_tool_prompt() -> None:
+    """The three pi branches of runtime() must all opt in, or one path keeps the contradiction."""
+    source = Path(doc_module.__file__).read_text(encoding="utf-8")
+    assert source.count("self.assembled_prompt(skills, structured_tools=True)") == 3
+    # CodeRuntime really does parse JSON via parse_tool_call, so it keeps the clause.
+    assert source.count("system_prompt=self.assembled_prompt(skills),") == 1

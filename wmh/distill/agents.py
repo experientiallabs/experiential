@@ -71,6 +71,7 @@ class WmhDistillHarborAgent(WmhHarborAgent):
         e2b_template: str | None = None,
         episode_timeout_sec: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
         episode_workers: int = DEFAULT_EPISODE_WORKERS,
+        context_window: int | None = None,
     ) -> None:
         if not isinstance(token_sink_dir, str) or not token_sink_dir:
             raise ValueError(
@@ -94,6 +95,7 @@ class WmhDistillHarborAgent(WmhHarborAgent):
             e2b_template=e2b_template,
             episode_timeout_sec=episode_timeout_sec,
             episode_workers=episode_workers,
+            context_window=context_window,
         )
 
     def _build_provider(self, config: ProviderConfig) -> Provider:

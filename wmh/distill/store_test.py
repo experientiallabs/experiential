@@ -28,6 +28,7 @@ from wmh.distill.store import (
     build_handoff_toml,
 )
 from wmh.distill.tokens import TrialRecord
+from wmh.distill.tripwire import TripwireBaseline
 from wmh.providers.tinker import TokenSpan
 
 
@@ -106,6 +107,7 @@ def test_step_metrics_row_round_trips_the_rl_and_cost_fields(tmp_path: Path) -> 
         tasks=2,
         trials=4,
         solve_rate=0.5,
+        loss="ppo",
         empty_span_trials=0,
         datums=4,
         fragments=0,
@@ -117,6 +119,12 @@ def test_step_metrics_row_round_trips_the_rl_and_cost_fields(tmp_path: Path) -> 
         loss_tokens=40,
         context_tokens=200,
         reverse_kl_per_token=-0.25,
+        entropy_per_token=0.181,
+        mean_generation_tokens=7577.0,
+        entropy_baseline=0.2,
+        entropy_ratio=0.905,
+        generation_tokens_baseline=8000.0,
+        generation_tokens_ratio=0.947,
         reward_mean=0.5,
         advantage_mean=0.05,
         advantage_std=1.2,
@@ -140,6 +148,17 @@ def test_step_metrics_row_round_trips_the_rl_and_cost_fields(tmp_path: Path) -> 
     assert row == {"step": 4, **metrics.model_dump(mode="json")}
     assert row["cumulative_usd"] == 3.25
     assert row["reward_mean"] == 0.5
+    # The degeneration pair persists with its baseline and ratio, so a row read
+    # back months later still says what the collapse was measured against.
+    assert row["entropy_per_token"] == 0.181
+    assert row["mean_generation_tokens"] == 7577.0
+    assert row["entropy_baseline"] == 0.2
+    assert row["entropy_ratio"] == 0.905
+    assert row["generation_tokens_baseline"] == 8000.0
+    assert row["generation_tokens_ratio"] == 0.947
+    # The objective persists in the row: advantage_mean and clip_fraction are
+    # only interpretable next to the loss that produced them.
+    assert row["loss"] == "ppo"
     assert row["clip_fraction"] == 0.075
     assert row["pg_loss"] == 1.5
     assert row["grad_norm"] is None  # unreported backend metrics persist as null
@@ -316,6 +335,50 @@ def test_checkpoint_same_step_replaces_earlier_record(tmp_path: Path) -> None:
     records = store.checkpoints()
     assert len(records) == 1
     assert records[0].state_path == "tinker://fake/state/1"
+
+
+def test_tripwire_baseline_survives_in_the_manifest_beside_checkpoints(tmp_path: Path) -> None:
+    """The baseline must survive `--resume`, so it rides the run manifest, and
+    the checkpoint cadence must not clobber it (nor it the checkpoints)."""
+    store = DistillRunStore(tmp_path / "run")
+    assert store.read_tripwire_baseline() is None
+    baseline = TripwireBaseline(
+        step=0,
+        entropy_per_token=0.181,
+        mean_generation_tokens=7577.0,
+        episodes=47,
+        sampled_tokens=356122,
+    )
+    store.write_tripwire_baseline(baseline)
+    store.record_checkpoint(4, "tinker://fake/state/0", "tinker://fake/sampler/s/0")
+
+    reopened = DistillRunStore(tmp_path / "run")
+    assert reopened.read_tripwire_baseline() == baseline
+    assert [record.step for record in reopened.checkpoints()] == [4]
+
+
+def test_a_manifest_without_a_baseline_still_loads(tmp_path: Path) -> None:
+    """Run dirs written before the tripwires existed resume unchanged."""
+    store = DistillRunStore(tmp_path / "run")
+    store.run_dir.mkdir(parents=True)
+    store.checkpoints_path.write_text(
+        json.dumps(
+            {
+                "checkpoints": [
+                    {
+                        "step": 2,
+                        "state_path": "tinker://fake/state/0",
+                        "sampler_path": "tinker://fake/sampler/s/0",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert store.read_tripwire_baseline() is None
+    latest = store.latest_checkpoint()
+    assert latest is not None
+    assert latest.step == 2
 
 
 def test_gate_model_card_and_handoff_writes(tmp_path: Path) -> None:

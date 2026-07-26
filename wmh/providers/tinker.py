@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 from llm_waterfall.types import ChatChoice, ChatMessage, ChatTool, ChatUsage
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 from wmh.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
 from wmh.distill.rendering import (
@@ -62,6 +62,7 @@ from wmh.distill.rendering import (
 )
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
+    UNPARSED_TOOL_CALLS_KEY,
     ChatRequest,
     ChatResponse,
     Completion,
@@ -86,6 +87,13 @@ _MISSING_TINKER_EXTRA = (
 # The tinker SamplingParams default; used when a structured request carries no
 # temperature (pi normally stamps one on every request).
 _DEFAULT_CHAT_TEMPERATURE = 1.0
+
+_WEDGE_REBUILD_THRESHOLD = 3
+"""Consecutive deadline expiries before the process-wide service client is rebuilt.
+
+Not 1: an isolated expiry is ordinary under load, and each rebuild pins another server-side
+session against a ~240 cumulative cap. Not 10: two live runs burned 30+ minutes and 96
+consecutive expiries producing nothing while a fresh process reached the same service in 1.7s."""
 
 _shared_lock = threading.Lock()
 """Guards the process-wide service client and sampling-client cache below."""
@@ -133,6 +141,39 @@ def shared_service_client() -> tinker.ServiceClient:
         return _shared_service
 
 
+def rebuild_shared_service_client() -> None:
+    """Discard the process-wide service client so the next call builds a fresh session.
+
+    Last resort for a wedge that survives sampling-client replacement. The SDK can drop a
+    long-lived session into an internal JWT-refresh/heartbeat retry loop where calls neither
+    return nor raise; our deadlines convert that into repeated expiries, and `_drop_wedged_sampler`
+    rebuilds the SamplingClient -- but from THIS client. If the wedge lives here, every
+    replacement inherits it and the run expires forever while a brand-new process talks to the
+    same service in 1.7s. Measured live: two runs sat at 96 and 9 consecutive expiries with zero
+    rollouts for 30+ minutes, while an independent probe created a client in 0.7s and sampled a
+    4,000-token prompt in 1.7s.
+
+    Deliberately NOT called on every expiry. Each `ServiceClient` pins one live server-side
+    session for the life of the process (its heartbeat strongly references it, so it is never
+    collected), and the service rejects new sessions at roughly 240 cumulative -- so rebuilding
+    freely trades a wedge for a capacity wall. Callers must require several CONSECUTIVE expiries
+    first. The cached sampling clients are dropped with it: they were built from the discarded
+    client and would keep its wedge.
+    """
+    global _shared_service
+    with _shared_lock:
+        if _shared_service is None and not _shared_samplers:
+            return
+        logger.warning(
+            "rebuilding the process-wide tinker service client after repeated deadline "
+            "expiries; %d cached sampling client(s) are dropped with it. Each rebuild pins "
+            "another server-side session for this process, so this must stay rare",
+            len(_shared_samplers),
+        )
+        _shared_service = None
+        _shared_samplers.clear()
+
+
 def shared_sampling_client(model: str) -> tinker.SamplingClient:
     """The process-wide sampling client for one model, from the shared cache.
 
@@ -172,6 +213,54 @@ def shared_sampling_client(model: str) -> tinker.SamplingClient:
         return client
 
 
+_served_context_windows: dict[str, int] | None = None
+"""Cached `model_name -> max_context_length` from the service's own capabilities."""
+
+
+def served_context_window(model: str) -> int | None:
+    """The context window the Tinker service actually serves `model` with, or None.
+
+    Read from the service's `get_server_capabilities()` (`SupportedModel.max_context_length`), not
+    from a table in this repo: the context tier is part of the served model identity (the catalog
+    names carry a `:262144`-style suffix) and hardcoding any number here is exactly how a 128k
+    assumption against a 64k deployment produced 118 context-overflow 400s in one run. The lookup
+    tolerates the model string carrying a checkpoint/tier suffix the catalog name does not.
+
+    Args:
+        model: The model string the sampler was built with.
+
+    Returns:
+        The served window in tokens, or None when the service does not list the model (or the
+        capability probe is unavailable).
+
+    Raises:
+        ImportError: If the tinker SDK is not installed (the distill extra).
+        RuntimeError: If TINKER_API_KEY is missing from the environment.
+    """
+    global _served_context_windows
+    with _shared_lock:
+        cached = _served_context_windows
+    if cached is None:
+        service = shared_service_client()
+        capabilities = call_with_deadline("connect", service.get_server_capabilities)
+        cached = {
+            supported.model_name: supported.max_context_length
+            for supported in capabilities.supported_models
+            if supported.model_name and supported.max_context_length
+        }
+        with _shared_lock:
+            _served_context_windows = cached
+    direct = cached.get(model)
+    if direct is not None:
+        return direct
+    # A sampler path (tinker://...) or a name carrying an extra suffix still identifies one served
+    # model; match on the longest listed name the model string starts with.
+    prefixes = [name for name in cached if model.startswith(name)]
+    if not prefixes:
+        return None
+    return cached[max(prefixes, key=len)]
+
+
 def evict_shared_sampling_client(model: str, client: tinker.SamplingClient) -> None:
     """Drop one model's cached sampling client if it is still `client`.
 
@@ -200,6 +289,14 @@ class TokenSpan(BaseModel):
 
     This is the tokens-in-tokens-out ground truth for one completion: training
     data is assembled from these ids verbatim, never from re-encoded text.
+
+    The optional `delta_start`, `delta_messages`, and `tools` fields carry the
+    CANONICAL conversation beside the tokens, so a cross-tokenizer teacher can
+    re-render the same conversation with its own chat template instead of
+    guessing at the student template's framing. They are optional for
+    backward compatibility: sinks recorded before they existed still load, and
+    `wmh.distill.tokens.reconstruct_conversation` reports honestly (None) that
+    such a sink cannot be replayed.
     """
 
     call_index: int
@@ -210,12 +307,55 @@ class TokenSpan(BaseModel):
     sampled_logprobs: list[float]
     """Sampler-assigned logprob for each sampled token, aligned one to one."""
 
+    delta_start: int | None = None
+    """Index into this call's full message list at which `delta_messages`
+    begins, i.e. the exact boundary the prompt tokens were built at:
+
+    - 0: the prompt is a FULL re-render of the whole history (call 0, or an
+      incremental-prompt fallback), so the token prefix restarts here and the
+      message-side replay restarts with it.
+    - `len(previous call's messages) + 1`: the ordinary incremental case; the
+      prompt is (previous prompt + raw sampled ids + rendered suffix of the
+      delta), skipping the caller's echo of the previous assistant turn.
+    - `len(messages)` with an empty delta: the caller re-asked an identical
+      history (the previous turn was discarded), so the replay drops that
+      discarded assistant turn too.
+
+    None only on sinks recorded before this field existed."""
+
+    delta_messages: list[ChatMessage] | None = None
+    """The canonical messages this call ADDED relative to the previous call
+    (`messages[delta_start:]`), never the whole history: per-call full history
+    would be quadratic in text and real TB2 tool results are large (a single
+    observed prompt was 55,222 tokens). Concatenating the deltas mirrors the
+    token-side prefix merge exactly, because `delta_start` IS the boundary the
+    prompt suffix was rendered at. None only on sinks recorded before this
+    field existed (distinct from `[]`, a genuinely empty delta)."""
+
+    tools: list[ChatTool] = Field(default_factory=list)
+    """The tool schemas this call rendered with; empty when none were rendered
+    (including `tool_choice="none"`). Recorded on EVERY span, not just call 0:
+    schemas are small and normally constant, and a mid-episode tool change
+    (which fragments the prompt anyway) then stays visible per call rather
+    than being silently attributed to the first one."""
+
     @model_validator(mode="after")
     def _check_alignment(self) -> TokenSpan:
         if len(self.sampled_logprobs) != len(self.sampled_token_ids):
             raise ValueError(
                 f"sampled_logprobs length {len(self.sampled_logprobs)} does not match "
                 f"sampled_token_ids length {len(self.sampled_token_ids)}"
+            )
+        if (self.delta_start is None) != (self.delta_messages is None):
+            raise ValueError(
+                "delta_start and delta_messages must be recorded together (the delta "
+                "boundary is meaningless without its messages, and vice versa); leave "
+                "both unset only for spans recorded before the conversation fields existed"
+            )
+        if self.delta_start is not None and self.delta_start < 0:
+            raise ValueError(
+                f"delta_start {self.delta_start} is negative; it is an index into the "
+                "call's message list, so 0 (a full re-render) is the minimum"
             )
         return self
 
@@ -359,6 +499,18 @@ class _SampledTurn(BaseModel):
     parsed: ParsedAssistantMessage
 
 
+class _PromptBuild(BaseModel):
+    """One built prompt plus the message boundary it was built at (internal).
+
+    `delta_start` is the single source of truth for the delta boundary: the
+    token suffix is rendered from it and the recorded `TokenSpan.delta_messages`
+    is sliced at it, so the message delta and the token delta cannot disagree.
+    """
+
+    prompt_token_ids: list[int]
+    delta_start: int
+
+
 @dataclass
 class _PromptState:
     """The provider's last successful call, for incremental prompt extension.
@@ -445,14 +597,11 @@ class TinkerChatProvider:
         recorder: Optional per-episode span recorder; when present, every
             successful completion records exactly one `TokenSpan`.
         api_key: Accepted for `get_provider`'s explicit-credential channel and
-            REJECTED when set. The Tinker SDK reads `TINKER_API_KEY` from the
-            process environment when it builds a `ServiceClient`; it takes no
-            per-client credential, so a pool entry's key cannot be honored
-            here. Failing loudly beats silently sampling on a different
-            account than the pool entry named.
-
-    Raises:
-        ValueError: If `api_key` is set.
+            REJECTED when set. Tinker authenticates through the process-wide
+            shared `ServiceClient` (`TINKER_API_KEY`), which is cached per
+            process rather than per credential, so a per-entry key cannot be
+            honored here. Failing loudly beats silently sampling on a
+            different account than the pool entry named.
     """
 
     def __init__(
@@ -464,14 +613,11 @@ class TinkerChatProvider:
         recorder: TokenRecorder | None = None,
         api_key: str | None = None,
     ) -> None:
-        # get_provider promises the backend authenticates with exactly this key
-        # (wmh/providers/registry.py). Tinker structurally cannot, so refuse
-        # rather than break that contract quietly.
         if api_key is not None:
             raise ValueError(
-                "the tinker provider does not accept an explicit api_key: the SDK reads "
-                f"{TINKER_API_KEY_ENV} from the process environment, so a per-entry key "
-                f"cannot be honored; drop api_key_env from the pool entry and export "
+                "the tinker provider does not accept an explicit api_key: it authenticates "
+                f"through the process-wide shared service client, which reads {TINKER_API_KEY_ENV} "
+                "from the environment; drop api_key_env from the pool entry and export "
                 f"{TINKER_API_KEY_ENV} instead"
             )
         self.config = config
@@ -479,6 +625,7 @@ class TinkerChatProvider:
         # Only a client the provider built itself may be dropped and rebuilt
         # after a deadline expiry; an injected one cannot be reconstructed.
         self._owns_sampler = sampling_client is None
+        self._consecutive_expiries = 0
         self._rendering = renderer
         self._recorder = recorder
         self._prompt_state: _PromptState | None = None
@@ -498,6 +645,22 @@ class TinkerChatProvider:
                 "so the renderer and tokenizer can be resolved"
             )
         return base
+
+    def context_window(self) -> int | None:
+        """The served context window for this student, from the service's capabilities.
+
+        Satisfies `wmh.providers.base.ContextWindowProvider`, which is how the pi runner calibrates
+        its context guard to the real deployment instead of a hardcoded number. Resolved from
+        `config.model_type` (the base/catalog name that names the context tier) and falling back to
+        `config.model`; None when the service does not list either.
+        """
+        for candidate in (self.config.model_type, self.config.model):
+            if not candidate or candidate.startswith("tinker://"):
+                continue
+            window = served_context_window(candidate)
+            if window is not None:
+                return window
+        return served_context_window(self.config.model)
 
     def _get_sampler(self) -> TinkerSampler:
         if self._sampler is None:
@@ -521,15 +684,37 @@ class TinkerChatProvider:
         process-wide, so leaving it cached would hand the same wedged session
         to every future trial. An injected client is never dropped: the
         provider cannot rebuild what it did not build.
+
+        After `_WEDGE_REBUILD_THRESHOLD` CONSECUTIVE expiries this escalates and
+        discards the process-wide service client too. Replacing only the sampling client
+        cannot heal a wedge that lives one level up, because the replacement is built from
+        the same service client -- the failure mode that stalled two live runs at 96 and 9
+        consecutive expiries with zero rollouts for 30+ minutes while a fresh process
+        sampled the same model in 1.7s. The counter resets on any success
+        (`note_healthy_call`), so only an unbroken run of failures escalates.
         """
         if self._owns_sampler and self._sampler is not None:
+            self._consecutive_expiries += 1
             logger.warning(
-                "dropping the tinker sampling client after a deadline expiry; "
-                "the next attempt builds a fresh session"
+                "dropping the tinker sampling client after a deadline expiry (%d consecutive); "
+                "the next attempt builds a fresh session",
+                self._consecutive_expiries,
             )
             if isinstance(self._sampler, SdkSampler):
                 evict_shared_sampling_client(self.config.model, self._sampler.sdk_client)
             self._sampler = None
+            if self._consecutive_expiries >= _WEDGE_REBUILD_THRESHOLD:
+                rebuild_shared_service_client()
+                self._consecutive_expiries = 0
+
+    def note_healthy_call(self) -> None:
+        """Reset the consecutive-expiry counter after a call that succeeded.
+
+        Without this the counter is cumulative, and a run that expires occasionally over
+        hours would eventually rebuild the service client for no reason -- each rebuild
+        pinning another server-side session against a ~240 cap.
+        """
+        self._consecutive_expiries = 0
 
     def _get_rendering(self) -> ChatRendering:
         if self._rendering is None:
@@ -617,6 +802,10 @@ class TinkerChatProvider:
             # happens only after the whole completion succeeds, below).
             self._drop_wedged_sampler()
             raise
+        # The call returned, so whatever wedge the expiry counter was tracking has cleared.
+        # Without this reset the count is cumulative and a run that expires occasionally over
+        # hours would eventually rebuild the service client for no reason.
+        self.note_healthy_call()
         sampled_ids = list(sequence.tokens)
         logprobs = sequence.logprobs
         if logprobs is None or len(logprobs) != len(sampled_ids):
@@ -691,8 +880,18 @@ class TinkerChatProvider:
             content=parsed.text or None,
             tool_calls=parsed.tool_calls or None,
         )
+        # An unreadable tool call travels WITH the completion so the agent scaffold can feed the
+        # parser's complaint back as an observation. Without it, a dropped call is indistinguishable
+        # from prose and ends the episode as a clean-looking submission.
+        choice_extra: dict[str, list[str]] = (
+            {UNPARSED_TOOL_CALLS_KEY: list(parsed.unparsed_errors)}
+            if parsed.unparsed_errors
+            else {}
+        )
         return ChatResponse(
-            choices=[ChatChoice(index=0, message=message, finish_reason=finish_reason)],
+            choices=[
+                ChatChoice(index=0, message=message, finish_reason=finish_reason, **choice_extra)
+            ],
             usage=ChatUsage(
                 prompt_tokens=len(turn.prompt_token_ids),
                 completion_tokens=len(turn.sampled_token_ids),

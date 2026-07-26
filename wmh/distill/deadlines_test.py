@@ -58,11 +58,11 @@ class _BrokenFuture:
 
 def test_defaults_match_the_documented_values() -> None:
     assert DEFAULT_DEADLINES_S == {
-        "sample": 120.0,
-        "compute_logprobs": 60.0,
-        "forward_backward": 120.0,
-        "optim_step": 120.0,
-        "save_state": 120.0,
+        "sample": 300.0,
+        "compute_logprobs": 300.0,
+        "forward_backward": 900.0,
+        "optim_step": 600.0,
+        "save_state": 600.0,
         "load_state": 600.0,
         "save_weights_for_sampler": 600.0,
         "connect": 60.0,
@@ -142,7 +142,7 @@ def test_env_override_parses_as_seconds(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_unset_env_falls_back_to_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(env_var_for("sample"), raising=False)
-    assert deadline_for("sample") == 120.0
+    assert deadline_for("sample") == 300.0
 
 
 def test_sub_millisecond_override_clamps_up(monkeypatch: pytest.MonkeyPatch) -> None:

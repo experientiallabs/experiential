@@ -35,18 +35,30 @@ from pydantic import JsonValue
 
 from wmh.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmh.harness.environment import AgentEnvironment, is_env_action
-from wmh.harness.runner_link import params_schema
-from wmh.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_TURNS, RunResult, StopReason
+from wmh.harness.runner_link import params_schema, provider_context_window, stop_reason_for_done
+from wmh.harness.runtime import (
+    DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_MAX_TURNS,
+    RunResult,
+    StopReason,
+    validate_episode_timeout_s,
+)
 from wmh.harness.skills import SkillLibrary
 from wmh.harness.tools import READ_SKILL, ToolSpec
-from wmh.providers.base import Provider, ToolCallingProvider
+from wmh.providers.base import UNPARSED_TOOL_CALLS_KEY, Provider, ToolCallingProvider
 
 # The runner: node runs here, reached over SSH. The checkout keeps pi's node_modules; per-episode
 # source is overwritten from the harness surfaces.
 PI_RUNNER_HOST = os.environ.get("PI_RUNNER_HOST", "kion@nucbox.local")
 PI_RUNNER_DIR = os.environ.get("PI_RUNNER_DIR", "~/pi-run")
 DEFAULT_MAX_ENV_ACTIONS = 40
-_ENTRY_TS = os.path.join(os.path.dirname(__file__), "pi_entry", "entry.ts")
+_PI_ENTRY_DIR = os.path.join(os.path.dirname(__file__), "pi_entry")
+_ENTRY_TS = os.path.join(_PI_ENTRY_DIR, "entry.ts")
+# entry.ts imports the shared classify + nudge policy, so it must be materialized alongside it.
+_TERMINATION_TS = os.path.join(_PI_ENTRY_DIR, "runner_termination.ts")
+# Cleanup headroom past the node wall budget: one SSH round trip plus process teardown.
+_NODE_TEARDOWN_GRACE_S = 60.0
 # Runner paths are interpolated into remote shell commands, so restrict them to characters that
 # cannot break out of the command (allows `~` expansion; rejects spaces, quotes, `;`, `$`, etc.).
 _SAFE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9_./~-]+$")
@@ -72,6 +84,7 @@ class _Episode:
         max_env_actions: int,
         max_turns: int,
         max_output_tokens: int,
+        context_window: int | None = None,
     ) -> None:
         self.instruction = instruction
         self.system_prompt = system_prompt
@@ -83,9 +96,16 @@ class _Episode:
         self.max_env_actions = max_env_actions
         self.max_turns = max_turns
         self.max_output_tokens = max_output_tokens
+        self.context_window = context_window
         self.steps: list[Step] = []
         self.answer: str = ""
         self.proxy_error: str = ""
+        self.done_reason: str = ""
+        # The host's view of the most recent worker completion, which entry.ts reads back through
+        # GET /signal so its termination classifier sees the same evidence the frame runners get.
+        self.finish_reason: str = ""
+        self.unparsed_tool_calls: list[str] = []
+        self.tool_call_turns: int = 0
         self.done = threading.Event()
         self._env_calls = 0
 
@@ -95,10 +115,20 @@ class _Episode:
             "system": self.system_prompt,
             "max_turns": self.max_turns,
             "max_output_tokens": self.max_output_tokens,
+            "context_window": self.context_window,
             "tools": [
                 {"name": t.name, "description": t.description, "parameters": _params_schema(t)}
                 for t in self.tools
             ],
+        }
+
+    def signal_json(self) -> JsonObject:
+        """The host's view of the last worker completion, for entry.ts's classifier."""
+        return {
+            "finish_reason": self.finish_reason,
+            "unparsed_tool_calls": list(self.unparsed_tool_calls),
+            "provider_error": self.proxy_error,
+            "tool_call_turns": self.tool_call_turns,
         }
 
     def run_tool(self, name: str, arguments: JsonObject) -> JsonObject:
@@ -178,8 +208,11 @@ class _ShimHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        if self.path.rstrip("/") == "/task":
+        path = self.path.rstrip("/")
+        if path == "/task":
             self._send_json(self._ep.task_json())
+        elif path == "/signal":
+            self._send_json(self._ep.signal_json())
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -198,8 +231,11 @@ class _ShimHandler(BaseHTTPRequestHandler):
                 )
             )
         elif path == "/done":
-            answer = self._read_body().get("answer")
+            body = self._read_body()
+            answer = body.get("answer")
+            reason = body.get("reason")
             self._ep.answer = answer if isinstance(answer, str) else ""
+            self._ep.done_reason = reason if isinstance(reason, str) else ""
             self._send_json({})
             self._ep.done.set()
         else:
@@ -216,6 +252,16 @@ class _ShimHandler(BaseHTTPRequestHandler):
             completion = self._ep.provider.complete_chat(self._ep.worker_request(body))
             choice = completion.choices[0]
             message = choice.message
+            # Record the host's view of this turn BEFORE streaming it: entry.ts reads it back to
+            # classify why the episode ended (truncated at the cap vs unparsed vs prose only).
+            self._ep.proxy_error = ""
+            self._ep.finish_reason = choice.finish_reason or "stop"
+            unparsed = (choice.model_extra or {}).get(UNPARSED_TOOL_CALLS_KEY)
+            self._ep.unparsed_tool_calls = (
+                [str(item) for item in unparsed] if isinstance(unparsed, list) else []
+            )
+            if message.tool_calls:
+                self._ep.tool_call_turns += 1
             content = message.content if isinstance(message.content, str) else ""
             delta: dict[str, JsonValue] = {"role": "assistant", "content": content}
             if message.tool_calls:
@@ -258,6 +304,8 @@ class PiRuntime:
         max_env_actions: int = DEFAULT_MAX_ENV_ACTIONS,
         max_turns: int = DEFAULT_MAX_TURNS,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        episode_timeout_s: float = DEFAULT_EVAL_EPISODE_TIMEOUT_S,
+        context_window: int | None = None,
     ) -> None:
         if not isinstance(provider, ToolCallingProvider):
             raise TypeError("PiRuntime needs a ToolCallingProvider")
@@ -280,6 +328,12 @@ class PiRuntime:
             raise ValueError("max_output_tokens must be >= 1")
         self._max_turns = max_turns
         self._max_output_tokens = max_output_tokens
+        # The SSH path used to hardcode `timeout 300 node`, so every configured wall budget was
+        # silently 300s and 30% of long TerminalBench-2 trials died on it.
+        self._episode_timeout_s = validate_episode_timeout_s(episode_timeout_s)
+        self._context_window = (
+            context_window if context_window is not None else provider_context_window(provider)
+        )
         for label, path in (("PI_RUNNER_DIR", PI_RUNNER_DIR), ("workdir", self._workdir)):
             if not _SAFE_REMOTE_PATH.match(path):
                 raise ValueError(
@@ -299,6 +353,7 @@ class PiRuntime:
             max_env_actions=self._max_env_actions,
             max_turns=self._max_turns,
             max_output_tokens=self._max_output_tokens,
+            context_window=self._context_window,
         )
         server = _ShimServer(("127.0.0.1", self._port), _ShimHandler)
         server.episode = episode
@@ -321,18 +376,21 @@ class PiRuntime:
             )
         if episode.proxy_error:
             # The worker LLM proxy failed (auth/outage/HTTP error); entry.ts still POSTs /done, but
-            # this is infrastructure failure, not an agent submission — never count it as SUBMITTED.
+            # this is infrastructure failure, not an agent submission, so never count it as
+            # SUBMITTED.
             return self._error_result(
                 task_id,
                 episode,
                 instruction,
                 f"worker LLM proxy error: {episode.proxy_error}",
-                StopReason.ERROR,
+                StopReason.PROVIDER_ERROR,
             )
+        # entry.ts reports WHY it finished; only an explicit submit is a completion.
+        stop_reason = stop_reason_for_done(episode.done_reason)
         return RunResult(
             task_id=task_id,
             steps=episode.steps,
-            stop_reason=StopReason.SUBMITTED,
+            stop_reason=stop_reason,
             answer=episode.answer,
             turns=len(episode.steps),
         )
@@ -363,7 +421,13 @@ class PiRuntime:
         The files stream as one JSON blob into a python materializer on the runner (one SSH round
         trip, no per-file scp), with node_modules symlinked from the persistent checkout.
         """
-        blob = json.dumps({"entry.ts": _read(_ENTRY_TS), **self._files})
+        blob = json.dumps(
+            {
+                "entry.ts": _read(_ENTRY_TS),
+                "runner_termination.ts": _read(_TERMINATION_TS),
+                **self._files,
+            }
+        )
         writer = (
             "import json,sys,os\n"
             "d=json.load(sys.stdin)\n"
@@ -382,11 +446,16 @@ class PiRuntime:
             raise _MaterializeError(f"remote materialize failed (rc={result.returncode}): {detail}")
 
     def _run_node(self) -> tuple[int, str]:
-        """Run entry.ts on the runner with a reverse tunnel back to the local shim."""
+        """Run entry.ts on the runner with a reverse tunnel back to the local shim.
+
+        The node wall budget is the configured episode timeout, not a fixed 300s: TerminalBench-2
+        tasks compile toolchains and boot VMs, and the old constant killed 30% of them mid-turn.
+        """
         url = f"http://127.0.0.1:{self._port}"
+        node_timeout_s = int(self._episode_timeout_s)
         remote_cmd = (
             f"cd {self._workdir} && PI_SHIM_URL={url} "
-            f"timeout 300 node --experimental-strip-types entry.ts"
+            f"timeout {node_timeout_s} node --experimental-strip-types entry.ts"
         )
         proc = subprocess.run(
             [
@@ -402,7 +471,7 @@ class PiRuntime:
             ],
             capture_output=True,
             text=True,
-            timeout=360,
+            timeout=self._episode_timeout_s + _NODE_TEARDOWN_GRACE_S,
         )
         return proc.returncode, (proc.stderr or "").strip()[-500:]
 

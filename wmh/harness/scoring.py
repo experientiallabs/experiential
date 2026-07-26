@@ -9,6 +9,11 @@ directory is the record, so the report carries paths, not copied or hashed evide
 Reward interpretation is frozen protocol (paper semantics): `positive-binary` counts a trial as
 passed iff its raw reward is strictly positive; `raw` counts it passed iff the reward is exactly
 1.0. Raw rewards stay untouched in the cells either way.
+
+A cell may also carry a `GradedTests`: the verifier's per-test counts, whose pass fraction is a
+GRADED score beside the binary reward, never instead of it. The reward remains the benchmark's own
+definition of success and the headline; the graded score exists because a small binary holdout has
+no resolution (see `GradedTests`).
 """
 
 from __future__ import annotations
@@ -64,6 +69,54 @@ class ScoreRequest(BaseModel):
         return value
 
 
+class GradedTests(BaseModel):
+    """One trial's per-test counts, the resolution a binary reward throws away.
+
+    A benchmark trial usually runs several verifier tests and then collapses them into one
+    pass/fail bit. That bit is the benchmark's definition of success and stays the headline, but it
+    is a terrible measurement instrument on a small holdout: on this project's 48-episode
+    TerminalBench-2 probe, 9 of 46 gradeable trials (19.6%) scored `reward = 0` while passing at
+    least one test, and 2 of 12 tasks sat at a flat 0.00 binary rate where no improvement could
+    ever register. `score` is those same trials read at test resolution.
+
+    Two honesty constraints are built in:
+
+    - **`resolved` is the denominator, not the test count.** Only tests that returned a verdict
+      (passed or failed) are counted. A skipped, pending, or otherwise unresolved test is a
+      statement about the grader, not the agent, and it does not block the binary pass either (a
+      pytest suite exits 0 with skips), so counting it as a failure would put the graded score
+      BELOW a trial the benchmark calls a pass. Those tests are carried in `unresolved` instead.
+    - **This is coarse, not continuous.** A trial with `resolved = 1` is exactly as binary as the
+      reward, and the probe's tasks carried 1 to 6 tests, so most graded scores fall on 0, 1/2, 1.
+      Report it as added resolution, never as a continuous metric.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    passed: int = Field(strict=True, ge=0)
+    """Tests that returned a passing verdict."""
+
+    resolved: int = Field(strict=True, ge=1)
+    """Tests that returned any verdict (passed or failed): the `score` denominator."""
+
+    unresolved: int = Field(default=0, strict=True, ge=0)
+    """Tests the grader never resolved (skipped, pending, other), excluded from `score`."""
+
+    @model_validator(mode="after")
+    def _validate_counts(self) -> GradedTests:
+        if self.passed > self.resolved:
+            raise ValueError(
+                f"passed ({self.passed}) cannot exceed resolved ({self.resolved}); resolved counts "
+                "every test that returned a verdict, passing ones included"
+            )
+        return self
+
+    @property
+    def score(self) -> float:
+        """The graded score in [0, 1]: resolved tests that passed."""
+        return self.passed / self.resolved
+
+
 class ScoreCell(BaseModel):
     """One trial: the raw evaluator reward, its pass interpretation, and where the evidence is."""
 
@@ -80,6 +133,32 @@ class ScoreCell(BaseModel):
     # A short diagnostic, e.g. "completed with AgentTimeoutError". A trial that failed but still
     # produced a verifier reward is a candidate outcome, and the note says why it looks that way.
     note: str = Field(default="", max_length=MAX_CELL_NOTE_CHARS)
+    infra_failed: bool = Field(default=False, strict=True)
+    """True when this cell's `reward` is a STAND-IN because infrastructure died, not a measurement.
+
+    Set only by evaluation-tolerant scoring (`missing_reward="zero"`), and set on exactly one
+    condition: no verifier reward exists for this trial. That covers both an agent that never ran
+    (a sandbox the E2B concurrency cap refused, a transport that died first) and an agent whose
+    work was never graded (the verifier timed out or wrote nothing parseable). Its 0.0 keeps
+    advantage estimation defined, but a reported solve rate must EXCLUDE it, in both directions:
+    three Super `student-before` baselines were published as 0.0% when 51/51 trials were
+    rate-limited and no model ever ran, and 2 of 48 TerminalBench-2 probe trials held a measured
+    solve rate at 20.8% by counting ungradeable submissions as definite failures. Search-mode
+    scoring never sets this, because it raises on a missing reward instead."""
+
+    tests: GradedTests | None = None
+    """The verifier's per-test counts for this trial, when it wrote a readable test report.
+
+    None is NOT a zero. It means no graded score exists for this trial: no report was written (the
+    verifier timing out is the same evidence that makes a cell `infra_failed`), the report was
+    unparseable, or the evaluator produces none at all. Every graded rate therefore runs over the
+    cells whose `graded_score` is not None, exactly as `solve_rate` runs over gradeable cells; a
+    missing report must never be averaged in as 0.0."""
+
+    @property
+    def graded_score(self) -> float | None:
+        """This trial's graded test-pass score in [0, 1]; None when no test report exists."""
+        return None if self.tests is None else self.tests.score
 
     @field_validator("attempt", mode="before")
     @classmethod

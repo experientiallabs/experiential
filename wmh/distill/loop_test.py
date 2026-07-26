@@ -16,7 +16,7 @@ import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, cast, get_args
 
 import pytest
 from llm_waterfall.types import ChatMessage, ChatTool
@@ -39,6 +39,7 @@ from wmh.distill.config import (
     StudentConfig,
     TeacherConfig,
     TrainConfig,
+    TripwireConfig,
     WarmupConfig,
 )
 from wmh.distill.data import AdvantageStats, TrainDatum, attach_advantages
@@ -51,8 +52,12 @@ from wmh.distill.fake_tinker import (
     FakeTrainingClient,
 )
 from wmh.distill.loop import (
+    _WARMUP_STREAMS,
+    ADVANTAGE_LOSS_BY_MODE,
     EVAL_ROLLOUTS_DIR,
+    IMPORTANCE_SAMPLING_LOSS,
     MAX_CONSECUTIVE_EMPTY_STEPS,
+    PPO_LOSS,
     SDK_GRAD_NORM_METRIC_NAMES,
     SDK_LOSS_METRIC_NAMES,
     STUDENT_AFTER_EVAL,
@@ -60,8 +65,10 @@ from wmh.distill.loop import (
     TEACHER_BASELINE_EVAL,
     WARMUP_ROLLOUTS_DIR,
     DistillBudgetError,
+    DistillDegenerationError,
     DistillEmptyBatchError,
     DistillEvalReport,
+    DistillNullEvalError,
     DistillProgress,
     DistillResult,
     DistillSamplingClient,
@@ -70,6 +77,7 @@ from wmh.distill.loop import (
     SdkServiceClient,
     SdkTrainingClient,
     StepMetrics,
+    StudentSampler,
     TaskSampler,
     TrainStepOutput,
     WarmupMetrics,
@@ -77,15 +85,18 @@ from wmh.distill.loop import (
     resume_command,
     run_distillation,
     sdk_metric_value,
+    tinker_provider_config,
 )
-from wmh.distill.rollouts import RolloutStats
+from wmh.distill.rollouts import RolloutStats, rollout_stats
 from wmh.distill.samples import SampleRollout
 from wmh.distill.store import AdapterStore, DistillRunStore
 from wmh.distill.teacher import EncodingTokenizer
 from wmh.distill.tokens import TrialRecord
 from wmh.distill.tracking import DistillTracker
 from wmh.harness.doc import HarnessDoc
-from wmh.providers.base import ProviderConfig
+from wmh.harness.runtime import StopReason
+from wmh.harness.scoring import GradedTests
+from wmh.providers.base import ProviderConfig, ProviderKind
 from wmh.providers.tinker import SampledSequenceLike, TokenSpan
 
 _NAME = "distill-loop-test"
@@ -287,6 +298,34 @@ class _FakeRollouts:
         self.zero_trial_train_steps: set[int] = set()
         """TRAIN steps whose batch returns no trials at all (harbor scored nothing)."""
 
+        self.stop_reason = StopReason.SUBMITTED.value
+        """The stop reason every trial records; anything else is a scaffold loss."""
+
+        self.infra_fail_all = False
+        """When True, every trial is an infra failure (the E2B sandbox-cap outage)."""
+
+        self.omit_test_reports = False
+        """When True, no trial carries a CTRF test breakdown (a verifier that graded but wrote no
+        readable report), so every graded rate must report a null measurement, not a 0.0."""
+
+        self.tokens_per_call = 5
+        """Tokens each of an episode's two sampling calls generates by default."""
+
+        self.tokens_per_call_by_train_step: dict[int, int] = {}
+        """Per-train-step override of `tokens_per_call`: a length collapse.
+
+        Episode length is exactly 2 x this (no stop sequences), so a step set to
+        2 pools to 0.4x the default batch's 10 tokens/episode (the tripwire's
+        warn band) and a step set to 1 pools to 0.2x (its kill band)."""
+
+        self.entropy_by_train_step: dict[int, float] = {}
+        """Per-train-step override of every sampled logprob's magnitude.
+
+        The fake sampler's own logprobs are hash-derived (about 2.05 nats
+        pooled); pinning them makes an entropy RATIO exact. Only the recorded
+        span logprobs change, never the token ids, so the fake training client's
+        TITO assertion still sees the sampler's real tokens."""
+
     def __call__(
         self,
         step_index: int,
@@ -318,8 +357,7 @@ class _FakeRollouts:
                     doc_hash=harness.doc_hash,
                 )
             )
-            stats = RolloutStats(trials=0, trials_with_spans=0, solve_rate=0.0, empty_span_trials=0)
-            return [], stats
+            return [], rollout_stats([], max_tokens=4096)
         client = self.service.create_sampling_client(provider_config.model)
         records: list[TrialRecord] = []
         for task_index, task_id in enumerate(task_ids):
@@ -328,7 +366,13 @@ class _FakeRollouts:
                 if self.teacher_fail_all and provider_config.model == _TEACHER:
                     passed = False
                 trial_name = f"{task_id}__s{attempt}"
-                spans = [] if empty_batch else self._spans(client, task_id, step_index, attempt)
+                spans = (
+                    []
+                    if empty_batch
+                    else self._spans(
+                        client, task_id, step_index, attempt, is_train_batch=is_train_batch
+                    )
+                )
                 records.append(
                     TrialRecord(
                         task_id=task_id,
@@ -337,19 +381,23 @@ class _FakeRollouts:
                         reward=1.0 if passed else 0.0,
                         passed=passed,
                         spans=spans,
-                        stop_reason="submitted",
+                        stop_reason=None if self.infra_fail_all else self.stop_reason,
+                        infra_failed=self.infra_fail_all,
+                        # Two tests per task, the probe's own most common shape: a failing trial
+                        # still passes one of them, so the graded rate is strictly above the binary
+                        # one. An infra failure has no verifier evidence, so it has no report.
+                        tests=(
+                            None
+                            if self.infra_fail_all or self.omit_test_reports
+                            else GradedTests(passed=2 if passed else 1, resolved=2)
+                        ),
                         artifact_dir=str(
                             run_dir / "harbor" / f"step-{step_index:04d}" / trial_name
                         ),
                     )
                 )
-        with_spans = sum(1 for record in records if record.spans)
-        stats = RolloutStats(
-            trials=len(records),
-            trials_with_spans=with_spans,
-            solve_rate=sum(1 for record in records if record.passed) / len(records),
-            empty_span_trials=len(records) - with_spans,
-        )
+        # The real aggregator, so the fake cannot drift from the stats the loop reads.
+        stats = rollout_stats(records, max_tokens=4096)
         self.calls.append(
             _RolloutCall(
                 step_index=step_index,
@@ -368,6 +416,8 @@ class _FakeRollouts:
         task_id: str,
         step_index: int,
         attempt: int,
+        *,
+        is_train_batch: bool = True,
     ) -> list[TokenSpan]:
         if self.fabricate_spans:
             # Token ids no sampler ever issued: a TITO violation by construction.
@@ -379,24 +429,33 @@ class _FakeRollouts:
                     sampled_logprobs=[-0.1, -0.2, -0.3],
                 )
             ]
+        max_tokens = self.tokens_per_call
+        entropy: float | None = None
+        if is_train_batch:
+            max_tokens = self.tokens_per_call_by_train_step.get(step_index, max_tokens)
+            entropy = self.entropy_by_train_step.get(step_index)
         prompt = [ord(ch) for ch in f"{task_id}:{step_index}:{attempt}:"]
-        first = client.sample(prompt, max_tokens=5, temperature=0.7)
+        first = client.sample(prompt, max_tokens=max_tokens, temperature=0.7)
         assert first.logprobs is not None
         follow = [*prompt, *first.tokens, *(ord(ch) for ch in "|obs|")]
-        second = client.sample(follow, max_tokens=5, temperature=0.7)
+        second = client.sample(follow, max_tokens=max_tokens, temperature=0.7)
         assert second.logprobs is not None
+
+        def logprobs(issued: Sequence[float]) -> list[float]:
+            return [-entropy] * len(issued) if entropy is not None else list(issued)
+
         return [
             TokenSpan(
                 call_index=0,
                 prompt_token_ids=prompt,
                 sampled_token_ids=list(first.tokens),
-                sampled_logprobs=list(first.logprobs),
+                sampled_logprobs=logprobs(first.logprobs),
             ),
             TokenSpan(
                 call_index=1,
                 prompt_token_ids=follow,
                 sampled_token_ids=list(second.tokens),
-                sampled_logprobs=list(second.logprobs),
+                sampled_logprobs=logprobs(second.logprobs),
             ),
         ]
 
@@ -558,6 +617,9 @@ class _RecordingTracker:
         self.steps: list[tuple[int, StepMetrics]] = []
         self.warmup_steps: list[tuple[int, WarmupMetrics]] = []
         self.evals: list[tuple[str, float, int | None]] = []
+        self.graded_evals: list[tuple[str, float | None]] = []
+        """Every `log_eval`'s graded companion (None when the batch measured none)."""
+
         self.samples: list[tuple[str, int | None, list[SampleRollout]]] = []
         self.summaries: list[_TrackedSummary] = []
         self.finish_calls = 0
@@ -568,8 +630,16 @@ class _RecordingTracker:
     def log_warmup_step(self, warmup_step: int, metrics: WarmupMetrics) -> None:
         self.warmup_steps.append((warmup_step, metrics))
 
-    def log_eval(self, name: str, solve_rate: float, step: int | None) -> None:
+    def log_eval(
+        self,
+        name: str,
+        solve_rate: float,
+        step: int | None,
+        *,
+        graded_solve_rate: float | None = None,
+    ) -> None:
         self.evals.append((name, solve_rate, step))
+        self.graded_evals.append((name, graded_solve_rate))
 
     def log_samples(self, kind: str, step: int | None, samples: list[SampleRollout]) -> None:
         self.samples.append((kind, step, list(samples)))
@@ -622,6 +692,10 @@ def test_three_step_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert [row["step"] for row in rows] == [0, 1, 2]
     for row in rows:
         assert row["solve_rate"] == 0.5
+        # The graded companion beside it: every failing trial still passed 1 of its 2 tests, which
+        # binary cannot see at all. Its own denominator rides along.
+        assert row["graded_solve_rate"] == 0.75
+        assert row["graded_trials"] == 4
         assert row["fragmentation_rate"] == 0.0
         assert row["datums"] == 4  # 2 tasks x 2 attempts, each merged to one datum
         assert isinstance(row["reverse_kl_per_token"], float)
@@ -731,6 +805,89 @@ def test_three_step_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert store.read_spend() == pytest.approx(result.spend.total_usd)
 
 
+def test_eval_reports_record_the_graded_rate_beside_the_binary_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every persisted eval report carries the graded rate and its own denominator.
+
+    The holdout is what a TerminalBench-2 comparison is read off, so the report on disk (not just
+    the dashboard) has to carry the resolution: binary 0.5 here, graded 0.75, over the same trials.
+    """
+    env = _setup(tmp_path, monkeypatch)
+
+    _run(env, _cfg())
+
+    store = DistillRunStore(env.run_dir)
+    for key in ("baseline-teacher", "baseline-student-before", "step-0001", "student-after"):
+        report = DistillEvalReport.model_validate_json(
+            (store.evals_dir / f"{key}.json").read_text(encoding="utf-8")
+        )
+        assert report.solve_rate == 0.5, key
+        assert report.graded_solve_rate == 0.75, key
+        # Every gradeable trial had a test report here, so the denominators agree.
+        assert report.graded_trials == report.executed_trials == report.trials, key
+
+
+def test_a_run_whose_verifiers_write_no_test_report_records_no_graded_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Graded-absent must stay distinguishable from graded-zero all the way out to the artifacts.
+
+    Every trial here is graded by the verifier (real binary rewards) but leaves no readable CTRF
+    report, so `graded_trials` is 0 everywhere, nothing is charted, and the placeholder 0.0 is only
+    ever readable next to that zero denominator.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.omit_test_reports = True
+    tracker = _RecordingTracker()
+
+    _run(env, _cfg(), tracker=tracker)
+
+    store = DistillRunStore(env.run_dir)
+    for row in store.read_metrics():
+        assert row["solve_rate"] == 0.5  # the binary rate is unaffected
+        assert row["graded_trials"] == 0
+        assert row["graded_solve_rate"] == 0.0
+    report = DistillEvalReport.model_validate_json(
+        (store.evals_dir / "student-after.json").read_text(encoding="utf-8")
+    )
+    assert (report.solve_rate, report.graded_trials, report.graded_solve_rate) == (0.5, 0, 0.0)
+    assert all(graded is None for _name, graded in tracker.graded_evals)
+    # The operator's line says it in words rather than printing "graded 0.000".
+    training = [event.message for event in env.progress if event.phase == "training"]
+    assert training
+    assert all("no graded score (no readable test report)" in message for message in training)
+
+
+def test_a_baseline_imported_from_a_run_without_graded_scores_charts_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older run's report has `graded_trials == 0`, which is absent, not 0.0.
+
+    Charting its placeholder 0.0 would put a fabricated graded rate beside a real binary one.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    teacher_src = _write_prior_baseline(
+        tmp_path / "prior" / "evals" / "baseline-teacher.json",
+        name=TEACHER_BASELINE_EVAL,
+        provider_model=_TEACHER,
+        base_model=_TEACHER,
+    )
+    tracker = _RecordingTracker()
+
+    _run(env, _reuse_cfg(teacher_from=teacher_src), tracker=tracker)
+
+    graded = dict(tracker.graded_evals)
+    assert graded["baseline-teacher"] is None  # imported, predates the metric
+    assert graded["student-after"] == 0.75  # measured here
+    copied = DistillEvalReport.model_validate_json(
+        (DistillRunStore(env.run_dir).evals_dir / "baseline-teacher.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (copied.graded_solve_rate, copied.graded_trials) == (0.0, 0)
+
+
 def _token_totals(datums: Sequence[TrainDatum]) -> tuple[int, int]:
     """A datum list's (loss, context) token totals."""
     loss = sum(datum.loss_token_count for datum in datums)
@@ -838,6 +995,13 @@ def test_tracker_sees_every_step_eval_summary_and_finish(
         ("baseline-student-before", 0.5, None),
         ("step-0001", 0.5, 1),
         ("student-after", 0.5, 2),
+    ]
+    # Each one also carries its graded companion, so the dashboard charts both series.
+    assert tracker.graded_evals == [
+        ("baseline-teacher", 0.75),
+        ("baseline-student-before", 0.75),
+        ("step-0001", 0.75),
+        ("student-after", 0.75),
     ]
 
     (summary,) = tracker.summaries
@@ -1547,6 +1711,284 @@ def test_resume_with_an_empty_run_dir_is_rejected(
         _run(env, _cfg(), resume=True)
 
 
+# -- the degeneration tripwires (entropy and generation length) --------------------------------
+
+
+def _tripwire_cfg(*, steps: int = 4, tripwire: TripwireConfig | None = None) -> DistillConfig:
+    """A config for the tripwire tests: no interim evals, N training steps.
+
+    Each step's batch is 2 tasks x 2 attempts = 4 episodes of 2 calls x 5
+    tokens, so the healthy pooled baseline is exactly 10 sampled tokens per
+    episode and `_FakeRollouts.tokens_per_call_by_train_step` sets exact ratios
+    against it.
+    """
+    base = _cfg()
+    return base.model_copy(
+        update={
+            "train": base.train.model_copy(update={"steps": steps}),
+            "eval": EvalConfig(every=0, tasks=2, k=1),
+            "tripwire": tripwire if tripwire is not None else TripwireConfig(),
+        }
+    )
+
+
+def _rows_by_step(env: _Env) -> list[JsonObject]:
+    return [row for row in DistillRunStore(env.run_dir).read_metrics() if "phase" not in row]
+
+
+def test_the_first_training_step_arms_the_baseline_once_and_persists_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The baseline is measured at step 0, written to the run manifest, and never
+    re-measured: every later row is judged against that one number."""
+    env = _setup(tmp_path, monkeypatch)
+
+    _run(env, _tripwire_cfg(steps=3))
+
+    baseline = DistillRunStore(env.run_dir).read_tripwire_baseline()
+    assert baseline is not None
+    assert baseline.step == 0
+    assert baseline.episodes == 4  # 2 tasks x 2 attempts, all span-bearing
+    assert baseline.sampled_tokens == 40  # x 2 calls x 5 tokens
+    assert baseline.mean_generation_tokens == pytest.approx(10.0)
+    rows = _rows_by_step(env)
+    assert [row["step"] for row in rows] == [0, 1, 2]
+    # Row 0 IS the baseline (ratio exactly 1.0), and every later row carries the
+    # same baseline rather than its own.
+    assert _number(rows[0], "entropy_per_token") == pytest.approx(baseline.entropy_per_token)
+    assert _number(rows[0], "entropy_ratio") == pytest.approx(1.0)
+    assert _number(rows[0], "generation_tokens_ratio") == pytest.approx(1.0)
+    for row in rows:
+        assert _number(row, "entropy_baseline") == pytest.approx(baseline.entropy_per_token)
+        assert _number(row, "generation_tokens_baseline") == pytest.approx(10.0)
+        assert _number(row, "mean_generation_tokens") == pytest.approx(10.0)
+
+
+def test_an_absolutely_flat_run_never_fires_because_the_baseline_is_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The false-alarm regression this whole design exists for.
+
+    Every step here sits at 0.05 nats/token and 2 sampled tokens per episode:
+    numbers the sibling lane's ABSOLUTE thresholds would kill on immediately,
+    including at step 0 before a single gradient step. Because the baseline is
+    the run's own first step, nothing fires and the run finishes.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    steps = 4
+    env.rollouts.entropy_by_train_step = dict.fromkeys(range(steps), 0.05)
+    env.rollouts.tokens_per_call_by_train_step = dict.fromkeys(range(steps), 1)
+
+    result = _run(env, _tripwire_cfg(steps=steps))
+
+    assert result.steps_completed == steps
+    rows = _rows_by_step(env)
+    for row in rows:
+        assert _number(row, "entropy_per_token") == pytest.approx(0.05)
+        assert _number(row, "mean_generation_tokens") == pytest.approx(2.0)
+        assert _number(row, "entropy_ratio") == pytest.approx(1.0)
+        assert _number(row, "generation_tokens_ratio") == pytest.approx(1.0)
+
+
+def test_a_warn_level_step_warns_and_keeps_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A single warn-level step names the metric, the baseline, the value and the
+    ratio, and costs the run nothing else."""
+    env = _setup(tmp_path, monkeypatch)
+    # 2 of 5 tokens per call: 4 sampled tokens per episode against a 10-token
+    # baseline, i.e. exactly the 0.5 warn fraction for length. Entropy stays put.
+    env.rollouts.tokens_per_call_by_train_step = {1: 2}
+
+    with caplog.at_level(logging.WARNING, logger="wmh.distill.loop"):
+        result = _run(env, _tripwire_cfg(steps=3))
+
+    assert result.steps_completed == 3
+    assert "degeneration tripwire at step 1" in caplog.text
+    assert "mean_generation_tokens 4 is 0.40x this run's baseline 10" in caplog.text
+    assert "tripwire.length_warn_frac" in caplog.text
+    rows = _rows_by_step(env)
+    assert _number(rows[1], "generation_tokens_ratio") == pytest.approx(0.4)
+    # Warn level only: the streak counter never armed, so nothing aborted.
+    assert "before the run aborts" not in caplog.text
+
+
+def test_two_consecutive_kill_level_steps_abort_with_the_resume_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kill path mirrors the budget abort: checkpoint first, then a typed
+    error carrying the exact resume command."""
+    env = _setup(tmp_path, monkeypatch)
+    # 1 of 5 tokens per call: 2 sampled tokens per episode, 0.2x baseline, under
+    # the 0.25 length kill fraction.
+    env.rollouts.tokens_per_call_by_train_step = {1: 1, 2: 1}
+
+    with pytest.raises(DistillDegenerationError) as excinfo:
+        _run(env, _tripwire_cfg(steps=4))
+
+    error = excinfo.value
+    assert error.consecutive_steps == 2
+    assert [breach.metric for breach in error.breaches] == ["mean_generation_tokens"]
+    assert all(breach.level == "kill" for breach in error.breaches)
+    expected_command = resume_command(_NAME, env.run_dir)
+    assert error.resume_command == expected_command
+    assert expected_command in str(error)
+    assert "0.20x this run's baseline" in str(error)
+    # Exactly three train batches ran: the abort fired at the second kill-level
+    # step, before a fourth could spend more on a degenerate policy.
+    train_steps = [call.step_index for call in env.rollouts.calls if call.run_dir == env.run_dir]
+    assert train_steps == [0, 1, 2]
+    # Artifacts persisted, exactly as the budget path does it.
+    store = DistillRunStore(env.run_dir)
+    assert [row["step"] for row in _rows_by_step(env)] == [0, 1, 2]
+    latest = store.latest_checkpoint()
+    assert latest is not None
+    assert latest.step == 2
+    env.service.create_lora_training_client(_STUDENT).load_state(latest.state_path)
+    assert not store.gate_path.exists()
+
+
+def test_non_consecutive_kill_level_steps_never_abort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One bad batch is a small task draw; the streak resets on a healthy step."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.tokens_per_call_by_train_step = {1: 1, 3: 1}  # healthy step 2 between
+
+    result = _run(env, _tripwire_cfg(steps=4))
+
+    assert result.steps_completed == 4
+    rows = _rows_by_step(env)
+    assert _number(rows[1], "generation_tokens_ratio") == pytest.approx(0.2)
+    assert _number(rows[2], "generation_tokens_ratio") == pytest.approx(1.0)
+    assert _number(rows[3], "generation_tokens_ratio") == pytest.approx(0.2)
+
+
+def test_an_unmeasurable_step_neither_breaches_nor_clears_the_streak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An all-empty batch is not evidence of health, so it must not launder a
+    collapse; it also cannot fabricate a breach out of a zero."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.tokens_per_call_by_train_step = {1: 1, 3: 1}
+    env.rollouts.empty_span_train_steps = {2}  # measures nothing between the two kills
+
+    with pytest.raises(DistillDegenerationError) as excinfo:
+        _run(env, _tripwire_cfg(steps=5))
+
+    assert excinfo.value.consecutive_steps == 2
+    rows = _rows_by_step(env)
+    assert [row["step"] for row in rows] == [0, 1, 2, 3]
+    assert rows[2]["entropy_per_token"] is None
+    assert rows[2]["entropy_ratio"] is None
+
+
+def test_an_entropy_collapse_alone_aborts_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mode collapse at unchanged episode length: the signal a KL curve hides."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.entropy_by_train_step = {0: 1.0, 1: 0.2, 2: 0.2}
+
+    with pytest.raises(DistillDegenerationError) as excinfo:
+        _run(env, _tripwire_cfg(steps=4))
+
+    assert [breach.metric for breach in excinfo.value.breaches] == ["entropy_per_token"]
+    rows = _rows_by_step(env)
+    assert _number(rows[0], "entropy_per_token") == pytest.approx(1.0)
+    assert _number(rows[1], "entropy_ratio") == pytest.approx(0.2)
+    # Length never moved, so only the entropy leg fired.
+    assert _number(rows[1], "generation_tokens_ratio") == pytest.approx(1.0)
+
+
+def test_resume_reuses_the_recorded_baseline_instead_of_re_measuring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure mode that makes a resumed run's tripwire blind.
+
+    Session 1 measures a healthy baseline at step 0 and aborts on budget.
+    Session 2 resumes into steps that have collapsed. If it re-baselined on its
+    own first step (the already-collapsed step 1), every ratio would read 1.0
+    and nothing would ever fire again; reusing the recorded baseline kills the
+    run instead.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    with pytest.raises(DistillBudgetError):
+        _run(env, _train_priced_cfg(budget_max=1.0))
+
+    store = DistillRunStore(env.run_dir)
+    healthy = store.read_tripwire_baseline()
+    assert healthy is not None
+    assert healthy.step == 0
+    assert healthy.mean_generation_tokens == pytest.approx(10.0)
+
+    env.rollouts.tokens_per_call_by_train_step = {1: 1, 2: 1}
+    with pytest.raises(DistillDegenerationError) as excinfo:
+        _run(env, _tripwire_cfg(steps=4), resume=True)
+
+    assert excinfo.value.consecutive_steps == 2
+    # The manifest still records the step-0 baseline, untouched by the resume.
+    assert store.read_tripwire_baseline() == healthy
+    resumed_rows = [row for row in _rows_by_step(env) if _number(row, "step") > 0]
+    assert [row["step"] for row in resumed_rows] == [1, 2]
+    for row in resumed_rows:
+        assert _number(row, "generation_tokens_baseline") == pytest.approx(10.0)
+        assert _number(row, "generation_tokens_ratio") == pytest.approx(0.2)
+
+
+def test_a_disabled_tripwire_still_measures_but_never_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`enabled = false` silences the warning and the abort; the metrics, the
+    baseline, and the ratios stay, because they cost nothing."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.tokens_per_call_by_train_step = {1: 1, 2: 1}
+
+    result = _run(env, _tripwire_cfg(steps=3, tripwire=TripwireConfig(enabled=False)))
+
+    assert result.steps_completed == 3
+    assert DistillRunStore(env.run_dir).read_tripwire_baseline() is not None
+    rows = _rows_by_step(env)
+    assert _number(rows[1], "generation_tokens_ratio") == pytest.approx(0.2)
+    assert _number(rows[2], "generation_tokens_ratio") == pytest.approx(0.2)
+
+
+def test_the_progress_line_carries_both_health_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+
+    _run(env, _tripwire_cfg(steps=2))
+
+    training = [event.message for event in env.progress if event.phase == "training"]
+    assert training
+    assert all("entropy/token" in message for message in training)
+    assert all("gen tokens/episode 10" in message for message in training)
+    assert "1.00x baseline" in training[0]
+    # Both solve rates on the operator's line, each with its own denominator.
+    assert all("solve rate 0.50" in message for message in training)
+    assert all("graded 0.750 over 4 graded trial(s)" in message for message in training)
+
+
+def test_an_all_empty_first_step_leaves_the_tripwire_unarmed_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dead batch is no baseline: step 0 measures nothing (its row carries no
+    entropy at all), and step 1 arms the tripwire instead."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.empty_span_train_steps = {0}
+
+    _run(env, _tripwire_cfg(steps=3))
+
+    baseline = DistillRunStore(env.run_dir).read_tripwire_baseline()
+    assert baseline is not None
+    assert baseline.step == 1
+    rows = _rows_by_step(env)
+    assert rows[0]["entropy_per_token"] is None
+    assert rows[0]["entropy_baseline"] is None
+    assert _number(rows[1], "entropy_ratio") == pytest.approx(1.0)
+
+
 # -- the supervised warmup phase ---------------------------------------------------------------
 
 
@@ -2136,6 +2578,28 @@ def test_overlapping_splits_are_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_tinker_provider_config_is_the_one_shape_every_rollout_samples_through() -> None:
+    """The student sampler's provider config IS the shared helper's output.
+
+    The helper is also the seam a rollout-only caller (the scaffold probe in
+    `.agents/distill/probe_scaffold.py`) uses to sample the BASE student
+    without opening a training client, so `model == base_model` must be legal
+    and must carry the same renderer identity.
+    """
+    base = tinker_provider_config(_STUDENT, _STUDENT)
+    assert base.kind is ProviderKind.TINKER
+    assert base.model == _STUDENT and base.model_type == _STUDENT
+
+    service = _Service()
+    sampler = StudentSampler(service, service.create_lora_training_client(_STUDENT, 8), _NAME)
+    path = sampler.refresh(0)
+
+    assert path.startswith("tinker://")
+    assert sampler.provider_config(_STUDENT) == tinker_provider_config(path, _STUDENT)
+    # The teacher side is the same call with the teacher's identity and renderer.
+    assert tinker_provider_config(_TEACHER, _TEACHER).model_type == _TEACHER
+
+
 def test_task_sampler_is_seeded_unique_and_covering() -> None:
     ids = ["a", "b", "c", "d", "e"]
     first = TaskSampler(ids, seed=7)
@@ -2519,6 +2983,184 @@ def test_loop_sampling_adapter_deadline_evicts_the_shared_cache(
     assert path not in providers_tinker._shared_samplers
 
 
+# -- the ppo loss mode (raw-gap advantages, ratio clipping in the loss) --------------------------
+
+
+def _ppo_cfg(
+    *,
+    steps: int = 2,
+    advantage_clip: float | None = None,
+    center_advantages: bool = False,
+) -> DistillConfig:
+    """The OpenClaw-RL / Slime objective: raw gap under Tinker's ppo loss."""
+    base = _cfg()
+    return base.model_copy(
+        update={
+            "train": base.train.model_copy(
+                update={
+                    "steps": steps,
+                    "loss": "ppo",
+                    "advantage_clip": advantage_clip,
+                    "center_advantages": center_advantages,
+                }
+            )
+        }
+    )
+
+
+def test_ppo_two_step_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The full loop in ppo mode: wire loss, raw-gap advantages, TITO, gate.
+
+    The datums are the importance_sampling datums (`to_tinker_datums`); what
+    changes is the loss name on the wire and the fact that nothing reshapes
+    the advantage, so `clip_fraction` is 0 for the whole run and
+    `advantage_mean` is the mean teacher-minus-student gap.
+    """
+    env = _setup(tmp_path, monkeypatch)
+
+    result = _run(env, _ppo_cfg())
+
+    assert result.steps_completed == 2
+    assert result.gate.accepted
+    # Every batch went out under the ppo loss, and the fake training client
+    # asserts TITO before recording a call, so two recorded batches are two
+    # passing checks. No datum is flagged topk: the wire format is unchanged.
+    assert _loss_fns(env) == ["ppo"] * 2
+    training = env.service.training
+    assert training is not None
+    for batch, _ in training.inner.forward_backward_calls:
+        assert len(batch) == 4
+        assert not any(datum.topk for datum in batch)
+        assert all(datum.advantages for datum in batch)
+
+    rows = [row for row in DistillRunStore(env.run_dir).read_metrics() if "phase" not in row]
+    assert [row["step"] for row in rows] == [0, 1]
+    for row in rows:
+        assert row["loss"] == "ppo"
+        # Unclipped: no token can hit a bound that is not set.
+        assert _number(row, "clipped_tokens") == 0
+        assert _number(row, "clip_fraction") == 0.0
+        # Uncentered, so the mean advantage is the objective itself: the
+        # negated reverse KL over the same trained tokens.
+        assert _number(row, "advantage_mean") == pytest.approx(
+            -_number(row, "reverse_kl_per_token")
+        )
+        assert _number(row, "advantage_mean") != 0.0
+        assert _number(row, "advantage_std") >= 0.0
+        assert isinstance(row["pg_loss"], float)
+        assert isinstance(row["grad_norm"], float)
+
+
+def test_ppo_mode_still_catches_fabricated_spans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Token-in-token-out is enforced under ppo exactly as under the default."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.fabricate_spans = True
+    with pytest.raises(AssertionError, match="TITO violation"):
+        _run(env, _ppo_cfg())
+
+
+@pytest.mark.parametrize(
+    ("mode", "wire_loss"),
+    [
+        ("importance_sampling", "importance_sampling"),
+        ("ppo", "ppo"),
+        ("topk_ce", "cross_entropy"),
+    ],
+)
+def test_every_loss_mode_dispatches_to_its_wire_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, wire_loss: str
+) -> None:
+    """`train.loss` decides the wire `loss_fn`, and the row records the mode.
+
+    Two of the three modes share the wire format and differ only in the loss
+    name (the service clips the ratio for ppo); topk_ce trains replicas under
+    cross_entropy. A metrics row that only carried the wire name could not
+    tell topk_ce from the supervised warmup, so it carries the mode.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    base = _cfg()
+    cfg = base.model_copy(
+        update={"train": base.train.model_copy(update={"steps": 1, "loss": mode, "topk": 2})}
+    )
+
+    _run(env, cfg)
+
+    assert _loss_fns(env) == [wire_loss]
+    rows = [row for row in DistillRunStore(env.run_dir).read_metrics() if "phase" not in row]
+    assert [row["loss"] for row in rows] == [mode]
+
+
+def test_every_configurable_loss_mode_is_wired_to_a_wire_loss() -> None:
+    """No `train.loss` value may reach the step loop without a dispatch.
+
+    The config Literal is the source of truth for the modes; a value added
+    there but not to `ADVANTAGE_LOSS_BY_MODE` (or to the topk_ce branch) would
+    otherwise fail with a bare KeyError at the first training step, after the
+    run has already paid for rollouts and teacher scoring.
+    """
+    modes = set(get_args(TrainConfig.model_fields["loss"].annotation))
+    assert modes == {"importance_sampling", "ppo", "topk_ce"}
+    assert set(ADVANTAGE_LOSS_BY_MODE) == modes - {"topk_ce"}
+    assert set(ADVANTAGE_LOSS_BY_MODE.values()) == {IMPORTANCE_SAMPLING_LOSS, PPO_LOSS}
+
+
+def test_advantage_clip_off_versus_on_shows_up_in_the_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clipping is observable end to end, and 0.0 clip_fraction means OFF.
+
+    A bound tight enough that every gap hits it drives clip_fraction to 1.0
+    and shrinks the trained advantages to the bound; with no bound nothing is
+    counted and the raw gaps ride through. Without the contrast, an unset
+    clip and a never-biting clip would read identically on the dashboard.
+    """
+    clipped_env = _setup(tmp_path / "clipped", monkeypatch)
+    _run(clipped_env, _ppo_cfg(steps=1, advantage_clip=1e-6))
+    clipped_rows = [
+        row for row in DistillRunStore(clipped_env.run_dir).read_metrics() if "phase" not in row
+    ]
+    (clipped_row,) = clipped_rows
+    assert _number(clipped_row, "clipped_tokens") > 0
+    assert _number(clipped_row, "clip_fraction") == pytest.approx(1.0)
+    assert abs(_number(clipped_row, "advantage_mean")) <= 1e-6
+
+    raw_env = _setup(tmp_path / "raw", monkeypatch)
+    _run(raw_env, _ppo_cfg(steps=1))
+    (raw_row,) = [
+        row for row in DistillRunStore(raw_env.run_dir).read_metrics() if "phase" not in row
+    ]
+    assert _number(raw_row, "clipped_tokens") == 0
+    assert _number(raw_row, "clip_fraction") == 0.0
+    assert abs(_number(raw_row, "advantage_mean")) > 1e-6
+
+
+def test_centering_on_flattens_the_advantage_mean_the_metric_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With centering ON the mean is ~0 by construction; OFF it reads the gap.
+
+    This is why the default moved: `advantage_mean` is how the run is read,
+    and under centering it can only ever say 0.
+    """
+    centered_env = _setup(tmp_path / "centered", monkeypatch)
+    _run(centered_env, _ppo_cfg(steps=1, center_advantages=True))
+    (centered_row,) = [
+        row for row in DistillRunStore(centered_env.run_dir).read_metrics() if "phase" not in row
+    ]
+    assert _number(centered_row, "advantage_mean") == pytest.approx(0.0, abs=1e-9)
+    # The spread survives centering, so the step still carries signal.
+    assert _number(centered_row, "advantage_std") > 0.0
+
+    raw_env = _setup(tmp_path / "raw", monkeypatch)
+    _run(raw_env, _ppo_cfg(steps=1))
+    (raw_row,) = [
+        row for row in DistillRunStore(raw_env.run_dir).read_metrics() if "phase" not in row
+    ]
+    assert _number(raw_row, "advantage_mean") != pytest.approx(0.0, abs=1e-9)
+
+
 # -- the topk_ce loss mode -----------------------------------------------------------------------
 
 
@@ -2600,3 +3242,156 @@ def test_topk_ce_mode_survives_fabricated_span_detection(
     env.rollouts.fabricate_spans = True
     with pytest.raises(AssertionError, match="TITO violation in topk datum"):
         _run(env, _topk_cfg())
+
+
+# --- observability: the scaffold-loss rate reaches the metrics row and the tracker ---------------
+def test_metrics_rows_carry_the_scaffold_loss_rate_and_stop_reason_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run whose episodes never submit must SAY so, in the row and on the dashboard.
+
+    The pi/Nemotron-3 runs sat at 88.8% scaffold loss with every trial recorded as `submitted`, so
+    nothing in metrics.jsonl, wandb, or the CLI could show that the harness was setting the score.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.stop_reason = StopReason.NO_TOOL_CALL.value
+    tracker = _RecordingTracker()
+
+    _run(env, _cfg(), tracker=tracker)
+
+    rows = [row for row in DistillRunStore(env.run_dir).read_metrics() if "phase" not in row]
+    assert rows
+    for row in rows:
+        assert row["scaffold_loss_rate"] == 1.0
+        assert row["stop_reason_counts"] == {"no_tool_call": 4}
+        assert row["executed_trials"] == 4
+        assert row["infra_failed_trials"] == 0
+    # The same numbers reach the tracker, which is what puts them on a chart.
+    assert all(metrics.scaffold_loss_rate == 1.0 for _, metrics in tracker.steps)
+    assert all(metrics.stop_reason_counts == {"no_tool_call": 4} for _, metrics in tracker.steps)
+
+
+def test_a_submitting_run_reports_zero_scaffold_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+
+    _run(env, _cfg())
+
+    rows = [row for row in DistillRunStore(env.run_dir).read_metrics() if "phase" not in row]
+    for row in rows:
+        assert row["scaffold_loss_rate"] == 0.0
+        assert row["stop_reason_counts"] == {"submitted": 4}
+
+
+def test_the_cli_progress_line_shows_the_scaffold_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.stop_reason = StopReason.OUTPUT_TRUNCATED.value
+
+    _run(env, _cfg())
+
+    training = [event.message for event in env.progress if event.phase == "training"]
+    assert training
+    assert all("scaffold loss 100%" in message for message in training)
+
+
+# --- an eval where nothing ran is a null measurement, not 0.0% (audit defect 5) ------------------
+def test_an_all_infra_failed_eval_refuses_to_become_a_zero_solve_rate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three Super `baseline-student-before` reports were written as 0.0% from 51/51 rate-limited
+    trials, then used as the no-regression leg of a promotion gate. That must stop the run."""
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.infra_fail_all = True
+
+    with pytest.raises(DistillNullEvalError, match="NULL measurement"):
+        _run(env, _cfg())
+
+    # Nothing was persisted for the gate to read back.
+    evals_dir = DistillRunStore(env.run_dir).evals_dir
+    assert not (evals_dir / f"{TEACHER_BASELINE_EVAL}.json").exists()
+
+
+def test_an_eval_report_records_the_infra_and_scaffold_breakdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _setup(tmp_path, monkeypatch)
+    env.rollouts.stop_reason = StopReason.MAX_TURNS.value
+
+    _run(env, _cfg())
+
+    path = DistillRunStore(env.run_dir).evals_dir / f"{STUDENT_AFTER_EVAL}.json"
+    report = DistillEvalReport.model_validate_json(path.read_text(encoding="utf-8"))
+    assert report.executed_trials == report.trials
+    assert report.infra_failed_trials == 0
+    assert report.scaffold_loss_rate == 1.0
+    assert report.stop_reason_counts == {"max_turns": report.trials}
+
+
+def test_sampler_refresh_warms_the_new_weights_before_returning() -> None:
+    """Every refresh must serve one throwaway token before the batch launches.
+
+    Freshly published weights are cold; launching 64 episodes at once means every first call
+    races the same load, and the losers exhaust their retries and report `provider_error` at turn
+    0-2 while the survivors run 28 turns cleanly. Measured live on a `baseline-student-before`
+    wave: 7 of 51 episodes (~15%) died that way at a mean of 2.0 turns, against 6% for the same
+    model sampled from already-warm BASE weights in a 48-episode probe. One serial call absorbs
+    the cold start once instead of 64 episodes paying for it in parallel.
+    """
+    service = _Service()
+    sampler = StudentSampler(service, service.create_lora_training_client(_STUDENT, 8), _NAME)
+
+    sampler.refresh(0)
+
+    # `client` is typed as the protocol slice the loop uses; the fake's issued-span ledger is
+    # what records the warmup, so narrow to it rather than widening the protocol for a test.
+    client = sampler.client
+    assert isinstance(client, FakeSamplingClient)
+    assert client.issued, "refresh() returned without warming the sampler"
+    warmup = client.issued[0]
+    assert len(warmup.sampled_ids) == 1, "the warmup must be one throwaway token, not a rollout"
+
+
+def test_a_sampler_that_cannot_warm_still_yields_a_path(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warmup is best-effort: aborting a paid run inside it trades a partial batch for none."""
+
+    def refuse(*_args: object, **_kwargs: object) -> NoReturn:
+        raise RuntimeError("weights still loading")
+
+    monkeypatch.setattr(FakeSamplingClient, "sample", refuse)
+    service = _Service()
+    sampler = StudentSampler(service, service.create_lora_training_client(_STUDENT, 8), _NAME)
+
+    with caplog.at_level(logging.WARNING, logger=loop_module.__name__):
+        path = sampler.refresh(0)
+
+    assert path.startswith("tinker://")
+    assert "did not serve a token" in caplog.text
+
+
+def test_warmup_exercises_concurrency_not_just_one_token() -> None:
+    """The warmup must issue several CONCURRENT calls, not one serial call.
+
+    A single serial token woke the model but a live 64-episode training wave still lost 7 of its
+    first 34 episodes (~21%) at a mean of 0.7 turns. The cost is the sampler's ramp to serving
+    many simultaneous streams, not one weight load, so a warmup that never fans out cannot
+    prevent it.
+    """
+    service = _Service()
+    sampler = StudentSampler(service, service.create_lora_training_client(_STUDENT, 8), _NAME)
+
+    sampler.refresh(0)
+
+    client = sampler.client
+    assert isinstance(client, FakeSamplingClient)
+    assert len(client.issued) == _WARMUP_STREAMS > 1, (
+        "warmup must fan out; one call does not trigger the sampler's ramp"
+    )
+    assert all(len(span.sampled_ids) == 1 for span in client.issued), (
+        "each warmup stream must stay a single throwaway token"
+    )

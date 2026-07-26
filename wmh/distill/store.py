@@ -11,12 +11,13 @@ or needs to resume lives under it:
       warmup-trials.json  # the warmup collection's TrialRecords (loadable by other runs)
       evals/<name>.json   # interim and final eval payloads, keyed by eval name
       samples/<name>.md   # per-batch sample episode rollouts (step-NNNN, warmup, eval-<name>)
-      checkpoints.json    # manifest of saved tinker:// state + sampler paths
+      checkpoints.json    # manifest of saved tinker:// state + sampler paths, plus the
+                          # degeneration tripwires' baseline (it must survive --resume)
       gate.json           # the DistillGateRecord verdict
       model_card.json     # the run's DistillModelCard
       handoff.toml        # the [models.agent] serving snippet for the user
-      harbor/step-NNNN/   # per-step harbor jobs dirs (written by the rollout collector)
-      tokens/step-NNNN/   # per-step token sinks (written by the rollout collector)
+      harbor/step-NNNN/   # per-step harbor jobs dirs (written by the rollout collector;
+                          # each trial dir's result.json carries that trial's token spans)
       warmup-rollouts/    # the warmup phase's isolated rollout root (teacher trials)
 
 `AdapterStore` mirrors `wmh/harness/store.py`'s `HarnessStore` idiom for the
@@ -41,6 +42,7 @@ from wmh.core.types import JsonObject
 from wmh.distill.config import DistillConfig, load_distill_config, snapshot_toml
 from wmh.distill.gate import DistillGateRecord
 from wmh.distill.tokens import TrialRecord
+from wmh.distill.tripwire import TripwireBaseline
 
 logger = logging.getLogger(__name__)
 
@@ -170,11 +172,20 @@ class CheckpointRecord(BaseModel):
 
 
 class CheckpointManifest(BaseModel):
-    """The checkpoints.json shape: every saved checkpoint, in save order."""
+    """The checkpoints.json shape: every saved checkpoint, plus resume-scoped state."""
 
     model_config = ConfigDict(extra="forbid")
 
     checkpoints: list[CheckpointRecord] = Field(default_factory=list)
+
+    tripwire_baseline: TripwireBaseline | None = None
+    """The degeneration tripwires' reference, measured at the run's first
+    training step (None before that step, or on manifests predating the field).
+
+    It rides the run manifest rather than a metrics row because it must survive
+    `--resume`: a resumed session that re-measures its baseline would anchor on
+    an already-degenerated policy, making the collapse the new normal and the
+    tripwire blind. See `wmh.distill.tripwire.TripwireBaseline`."""
 
 
 class DistillModelCard(BaseModel):
@@ -541,6 +552,31 @@ class DistillRunStore:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         write_text_atomic(self.checkpoints_path, manifest.model_dump_json(indent=2))
         return record
+
+    def write_tripwire_baseline(self, baseline: TripwireBaseline) -> Path:
+        """Persist the degeneration tripwires' baseline into `checkpoints.json`.
+
+        Written the moment the baseline is measured (the run's first training
+        step), not at the next checkpoint cadence: a session that dies in
+        between must not lose it, or the resumed session would re-baseline
+        against whatever policy it restores. `record_checkpoint` reads the
+        manifest before rewriting it, so the two never clobber each other.
+
+        Args:
+            baseline: The measured baseline.
+
+        Returns:
+            The manifest path.
+        """
+        manifest = self._read_manifest()
+        manifest.tripwire_baseline = baseline
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(self.checkpoints_path, manifest.model_dump_json(indent=2))
+        return self.checkpoints_path
+
+    def read_tripwire_baseline(self) -> TripwireBaseline | None:
+        """The recorded tripwire baseline, or None when none was measured yet."""
+        return self._read_manifest().tripwire_baseline
 
     def checkpoints(self) -> list[CheckpointRecord]:
         """Every recorded checkpoint, in record order."""

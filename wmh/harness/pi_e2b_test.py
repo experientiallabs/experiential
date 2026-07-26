@@ -51,7 +51,12 @@ from wmh.harness.pi_e2b import (
     session_entry_files,
     start_live_runner,
 )
-from wmh.harness.runtime import Runtime, RuntimeCancelled, StopReason
+from wmh.harness.runtime import (
+    MAX_NONACTION_TURNS,
+    Runtime,
+    RuntimeCancelled,
+    StopReason,
+)
 from wmh.harness.skills import Skill, SkillLibrary
 from wmh.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
 
@@ -567,7 +572,7 @@ def test_send_writes_base64_json_line_to_the_runner_pid() -> None:
 def test_recv_reassembles_partial_lines_and_collects_interleaved_stderr() -> None:
     hello: JsonObject = {"type": "hello", "n": 1}
     a: JsonObject = {"type": "llm_request", "req_id": 1}
-    b: JsonObject = {"type": "done", "answer": "x"}
+    b: JsonObject = {"type": "done", "reason": "submit", "answer": "x"}
     line = _line(hello)
     events: list[_Event] = [
         (line[:10], None, None),  # partial line: no frame yet
@@ -1126,7 +1131,7 @@ def test_end_to_end_fake_episode_answers_tools_via_the_host_side_environment(
         {"type": "hello", "node_version": "v22.0.0"},
         {"type": "llm_request", "req_id": 1, "openai_body": body},
         {"type": "tool_request", "req_id": 2, "name": "bash", "arguments": {"command": "echo hi"}},
-        {"type": "done", "answer": "finished"},
+        {"type": "done", "reason": "submit", "answer": "finished"},
     ]
     factory, made = _factory_for([script])
     env = _RecordingEnv()  # a plain AgentEnvironment: the world-model shape in real evals
@@ -1197,7 +1202,7 @@ def test_skill_bodies_are_advertised_and_served_host_side_in_e2b(
             "name": "read_skill",
             "arguments": {"name": "missing"},
         },
-        {"type": "done", "answer": "finished"},
+        {"type": "done", "reason": "submit", "answer": "finished"},
     ]
     factory, made = _factory_for([script])
     env = _RecordingEnv()
@@ -1224,8 +1229,8 @@ def test_two_runtimes_sharing_a_pool_reuse_warm_sandboxes(
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
     script: list[JsonObject] = [
         {"type": "hello"},  # one hello: the runner process persists across episodes and docs
-        {"type": "done", "answer": "a1"},
-        {"type": "done", "answer": "a2"},
+        {"type": "done", "reason": "submit", "answer": "a1"},
+        {"type": "done", "reason": "submit", "answer": "a2"},
     ]
     factory, made = _factory_for([script])
     with E2BSandboxPool(sandbox_factory=factory) as pool:
@@ -1254,7 +1259,7 @@ def test_pi_episode_error_is_not_retried_and_keeps_the_sandbox_reusable(
     script: list[JsonObject] = [
         {"type": "hello"},
         {"type": "episode_error", "note": "pi failed"},
-        {"type": "done", "answer": "next episode"},
+        {"type": "done", "reason": "submit", "answer": "next episode"},
     ]
     factory, made = _factory_for([script])
     pool = E2BSandboxPool(sandbox_factory=factory)
@@ -1278,7 +1283,7 @@ def test_episode_wall_budget_retires_without_retry_or_reuse(
     factory, made = _factory_for(
         [
             [{"type": "hello"}],
-            [{"type": "hello"}, {"type": "done", "answer": "fresh"}],
+            [{"type": "hello"}, {"type": "done", "reason": "submit", "answer": "fresh"}],
         ]
     )
     pool = E2BSandboxPool(sandbox_factory=factory)
@@ -1321,7 +1326,9 @@ def test_close_kills_a_private_pool_but_never_a_shared_one(
 ) -> None:
     monkeypatch.delenv(E2B_TEMPLATE_ENV, raising=False)
     # Private pool: pool=None makes the runtime build its own from the (patched) default factory.
-    factory, made = _factory_for([[{"type": "hello"}, {"type": "done", "answer": "a"}]])
+    factory, made = _factory_for(
+        [[{"type": "hello"}, {"type": "done", "reason": "submit", "answer": "a"}]]
+    )
     monkeypatch.setattr(pi_e2b_module, "default_sandbox_factory", lambda **_kw: factory)
     private = _runtime()
     assert private.run("t1", "go", _RecordingEnv()).answer == "a"
@@ -1329,7 +1336,9 @@ def test_close_kills_a_private_pool_but_never_a_shared_one(
     assert made[0].kills == 1  # the runtime owned its pool, so close tore the sandbox down
 
     # Shared pool: the pool's owner (a whole search) outlives any one runtime.
-    factory2, made2 = _factory_for([[{"type": "hello"}, {"type": "done", "answer": "b"}]])
+    factory2, made2 = _factory_for(
+        [[{"type": "hello"}, {"type": "done", "reason": "submit", "answer": "b"}]]
+    )
     pool = E2BSandboxPool(sandbox_factory=factory2)
     shared = _runtime(pool=pool)
     assert shared.run("t1", "go", _RecordingEnv()).answer == "b"
@@ -1435,7 +1444,7 @@ def test_run_retries_once_on_a_fresh_sandbox_after_transport_death(
             [
                 {"type": "hello"},
                 {"type": "tool_request", "req_id": 1, "name": "bash", "arguments": {}},
-                {"type": "done", "answer": "recovered"},
+                {"type": "done", "reason": "submit", "answer": "recovered"},
             ],
         ]
     )
@@ -1473,7 +1482,7 @@ def test_zero_transport_retry_budget_never_replays_an_episode(
             [{"type": "hello"}],
             [
                 {"type": "hello"},
-                {"type": "done", "answer": "must not run"},
+                {"type": "done", "reason": "submit", "answer": "must not run"},
             ],
         ]
     )
@@ -1500,7 +1509,7 @@ def test_run_retries_e2b_send_timeout_once_on_a_fresh_sandbox(
     script: list[JsonObject] = [
         {"type": "hello"},
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
-        {"type": "done", "answer": "recovered"},
+        {"type": "done", "reason": "submit", "answer": "recovered"},
     ]
     factory, made = _factory_for([script, script])
 
@@ -1530,7 +1539,7 @@ def test_run_retries_broken_pipe_once_on_a_fresh_sandbox(
     script: list[JsonObject] = [
         {"type": "hello"},
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
-        {"type": "done", "answer": "recovered"},
+        {"type": "done", "reason": "submit", "answer": "recovered"},
     ]
     factory, made = _factory_for([script, script])
 
@@ -1558,7 +1567,7 @@ def test_run_retries_http2_remote_stream_reset_once_on_a_fresh_sandbox(
     script: list[JsonObject] = [
         {"type": "hello"},
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
-        {"type": "done", "answer": "recovered"},
+        {"type": "done", "reason": "submit", "answer": "recovered"},
     ]
     factory, made = _factory_for([script, script])
 
@@ -1616,7 +1625,7 @@ def test_provider_http2_remote_stream_reset_is_not_a_transport_retry(
     script: list[JsonObject] = [
         {"type": "hello"},
         {"type": "llm_request", "req_id": 1, "openai_body": {}},
-        {"type": "done", "answer": "provider error handled"},
+        {"type": "done", "reason": "submit", "answer": "provider error handled"},
     ]
     factory, made = _factory_for([script, script])
 
@@ -2292,3 +2301,213 @@ def test_start_live_runner_without_hello_closes_the_channel() -> None:
         start_live_runner(fake, template="wmh-pi-node", hello_timeout=0.3)
     # close() asked the runner to exit (a shutdown frame reached its stdin).
     assert any(f.get("type") == "shutdown" for f in _sent_frames(fake))
+
+
+# --- the real runner_stdio.ts, driven by node against a stub Agent ------------------------------
+#
+# runner_stdio.ts imports only node builtins and the per-episode `src/agent.ts` it materializes
+# from the episode_start frame, so the whole termination policy runs here with no npm install, no
+# sandbox, and no model. This is the regression the audit's headline defect needs: before the fix
+# a prose-only turn ended the episode immediately with a `done` frame the host read as SUBMITTED.
+_NUDGE_MARKER = "[ERROR]"
+
+
+def _stub_agent_source(*, submit_on_prompt: int | None = None) -> str:
+    """A pi-shaped Agent that emits prose-only turns and records every prompt it receives.
+
+    The prompt count and the latest prompt text ride out on the assistant text, which the runner
+    reports as the `done` frame's answer, so the test can see exactly how many times the runner
+    re-prompted and with what.
+    """
+    submit_at = "null" if submit_on_prompt is None else str(submit_on_prompt)
+    return f"""export class Agent {{
+  state = {{ messages: [], errorMessage: undefined }};
+  listeners = [];
+  prompts = [];
+  constructor(options) {{ this.tools = options.initialState.tools ?? []; }}
+  subscribe(listener) {{ this.listeners.push(listener); return () => {{}}; }}
+  steer(_m) {{}}
+  abort() {{}}
+  async prompt(text) {{
+    this.prompts.push(text);
+    if (this.prompts.length === {submit_at}) {{
+      const submit = this.tools.find((t) => t.name === "submit");
+      await submit.execute("call-1", {{ answer: "finished" }});
+      return;
+    }}
+    const message = {{
+      role: "assistant",
+      content: [{{ type: "text", text: `prompts=${{this.prompts.length}}|last=${{text}}` }}],
+    }};
+    for (const listener of this.listeners) await listener({{ type: "turn_end", message }});
+  }}
+}}
+"""
+
+
+def _run_stdio_episode(
+    tmp_path: Path,
+    agent_source: str,
+    *,
+    start_overrides: JsonObject | None = None,
+) -> list[JsonObject]:
+    """Drive one episode through the real runner_stdio.ts, returning every frame it emitted."""
+    import os
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed")
+    runner = Path(pi_e2b_module.__file__).with_name("pi_entry") / "runner_stdio.ts"
+    env = os.environ.copy()
+    env["NODE_NO_WARNINGS"] = "1"
+    (tmp_path / "package.json").write_text('{"type":"module"}\n', encoding="utf-8")
+    process = subprocess.Popen(  # noqa: S603 - resolved local Node executable, no shell
+        [node, "--experimental-strip-types", str(runner)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=tmp_path,
+    )
+    start: JsonObject = {
+        "type": "episode_start",
+        "episode_id": "ep-1",
+        "task_id": "t1",
+        "instruction": "do it",
+        "system": "sys",
+        "tools": [],
+        "files": {"src/agent.ts": agent_source},
+        "max_turns": 50,
+        "max_output_tokens": 4096,
+        **(start_overrides or {}),
+    }
+    frames: list[JsonObject] = []
+    try:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(_line(start))
+        process.stdin.flush()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            raw = process.stdout.readline()
+            if not raw:
+                break
+            wire = raw.strip()
+            if not wire:
+                continue
+            frame = cast("JsonObject", json.loads(base64.b64decode(wire)))
+            if frame.get("type") == TRANSPORT_KEEPALIVE_TYPE:
+                continue
+            frames.append(frame)
+            if frame.get("type") in ("done", "episode_error"):
+                break
+    finally:
+        process.kill()
+        process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+    return frames
+
+
+def _terminal_frame(frames: Sequence[JsonObject]) -> JsonObject:
+    terminal = [f for f in frames if f.get("type") in ("done", "episode_error")]
+    assert terminal, f"runner emitted no terminal frame: {frames}"
+    return terminal[-1]
+
+
+def test_stdio_runner_nudges_a_prose_only_turn_instead_of_reporting_a_completion(
+    tmp_path: Path,
+) -> None:
+    """A turn with no tool call is not a completion: nudge first, and never claim `submit`.
+
+    Before this, `agent.prompt()` returning on a prose-only turn sent `done` immediately and the
+    host recorded StopReason.SUBMITTED with reward 0. 17.6% of Ultra trials and 14.9% of Super
+    trials died exactly this way.
+    """
+    frames = _run_stdio_episode(tmp_path, _stub_agent_source())
+    done = _terminal_frame(frames)
+
+    assert done["type"] == "done"
+    # The distinct reason the host maps to StopReason.NO_TOOL_CALL.
+    assert done["reason"] == "no_tool_call"
+    # The episode did NOT end on the first prose-only turn: MAX_NONACTION_TURNS prompts ran, and
+    # the later ones carried the nudge.
+    answer = str(done["answer"])
+    assert answer.startswith(f"prompts={MAX_NONACTION_TURNS}|")
+    assert _NUDGE_MARKER in answer
+    assert "call exactly one tool now, or call `submit`" in answer
+
+
+def test_stdio_runner_lets_a_nudged_agent_still_submit(tmp_path: Path) -> None:
+    """The nudge is a recovery path, not a formality: a submit after prose reports `submit`."""
+    frames = _run_stdio_episode(tmp_path, _stub_agent_source(submit_on_prompt=2))
+    done = _terminal_frame(frames)
+
+    assert done["type"] == "done"
+    assert done["reason"] == "submit"
+    assert done["answer"] == "finished"
+
+
+def test_stdio_runner_uses_the_hosts_context_window(tmp_path: Path) -> None:
+    """The served window arrives on episode_start; nothing assumes 128k."""
+    source = """export class Agent {
+  state = { messages: [], errorMessage: undefined };
+  listeners = [];
+  prompts = [];
+  constructor(options) {
+    this.model = options.initialState.model;
+    this.tools = options.initialState.tools ?? [];
+  }
+  subscribe(listener) { this.listeners.push(listener); return () => {}; }
+  steer(_m) {}
+  abort() {}
+  async prompt(text) {
+    this.prompts.push(text);
+    const submit = this.tools.find((t) => t.name === "submit");
+    await submit.execute("call-1", { answer: `contextWindow=${this.model.contextWindow}` });
+  }
+}
+"""
+    frames = _run_stdio_episode(
+        tmp_path, source, start_overrides={"context_window": 65_536, "tools": []}
+    )
+    done = _terminal_frame(frames)
+    assert done["answer"] == "contextWindow=65536"
+
+
+def test_every_pi_episode_runner_reports_why_it_finished() -> None:
+    """No episode runner may send a bare `done`, on any transport."""
+    entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
+    for filename in ("runner_stdio.ts", "runner_service.ts"):
+        source = (entry / filename).read_text(encoding="utf-8")
+        assert 'reason: "submit"' in source, filename
+        assert "classifyEnd(" in source and "shouldNudge(" in source, filename
+        # A `done` frame with an answer but no reason is exactly the old defect.
+        assert 'conn.send({ type: "done", episode_id: episodeId, answer:' not in source, filename
+    shim_entry = (entry / "entry.ts").read_text(encoding="utf-8")
+    assert 'sendDone(params.answer ?? "", "submit")' in shim_entry
+    assert "classifyEnd(" in shim_entry and "shouldNudge(" in shim_entry
+
+
+def test_no_pi_runner_hardcodes_a_context_window() -> None:
+    """All four runners take the served window from the host and share one fallback constant."""
+    entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
+    for filename in ("entry.ts", "runner_stdio.ts", "runner_live.ts", "runner_service.ts"):
+        source = (entry / filename).read_text(encoding="utf-8")
+        assert "contextWindow: 128000" not in source, filename
+        assert "contextWindow," in source, filename
+        assert "context_window" in source, filename
+        assert "DEFAULT_CONTEXT_WINDOW" in source, filename
+
+
+def test_the_termination_policy_ships_with_the_stdio_runner() -> None:
+    """runner_stdio.ts imports it, so the sandbox upload set must carry it."""
+    assert "runner_termination.ts" in pi_e2b_module._RUNNER_FILES  # noqa: SLF001 - deploy contract
+    entry = Path(pi_e2b_module.__file__).with_name("pi_entry")
+    policy = (entry / "runner_termination.ts").read_text(encoding="utf-8")
+    # The TS and Python nudge budgets are one policy; they must not drift.
+    assert f"MAX_NONACTION_TURNS = {MAX_NONACTION_TURNS}" in policy

@@ -1,4 +1,4 @@
-"""Prefix-merge datum builder: harbor trials to importance_sampling training data.
+"""Prefix-merge datum builder: harbor trials to advantage-weighted training data.
 
 `build_datums` turns each trial's recorded `TokenSpan`s into `TrainDatum`s
 with the tinker-cookbook's `trajectory_to_data` merge semantics: as long as
@@ -17,7 +17,9 @@ a run trace marked with the overflow stop reason) and for merged lengths over
 
 `attach_advantages` fills the reverse-KL advantages from teacher logprobs,
 and `to_tinker_datums` converts to real `tinker.Datum`s in the shifted
-next-token layout the cookbook uses; `to_tinker_sft_datums` is the
+next-token layout the cookbook uses (one wire format for both
+advantage-weighted losses, `importance_sampling` and `ppo`);
+`to_tinker_sft_datums` is the
 cross_entropy sibling for the supervised warmup phase (teacher-sampled
 trajectories need no advantages, only the loss-mask weights). For the
 `topk_ce` loss, `build_topk_ce_datums` turns teacher top-k candidate rows
@@ -206,7 +208,8 @@ class AdvantageStats(BaseModel):
     """Datums dropped because their teacher logprobs did not align."""
 
     clipped_tokens: int = Field(ge=0)
-    """Loss tokens whose raw advantage hit the clip bound (attached datums only)."""
+    """Loss tokens whose raw advantage hit the clip bound (attached datums
+    only); always 0 when `train.advantage_clip` is None (clipping off)."""
 
     loss_tokens: int = Field(ge=0)
     """Loss tokens across the attached datums (the clip-fraction denominator)."""
@@ -220,9 +223,15 @@ class AdvantageStats(BaseModel):
     """
 
     advantage_mean: float | None
-    """Mean advantage over the attached datums' loss tokens, after clipping and
-    any centering (so ~0.0 under `train.center_advantages`); None when no loss
-    token survived."""
+    """Mean advantage over the attached datums' loss tokens, exactly as
+    trained (after any clipping and any centering); None when no loss token
+    survived.
+
+    Under the default objective (no clipping, no centering) this is the mean
+    teacher-minus-student logprob gap, i.e. the negated reverse KL over the
+    trained tokens: the direct read of how far the student still is from the
+    teacher, and the number that should shrink as the run works. Under
+    `train.center_advantages` it is ~0.0 by construction and says nothing."""
 
     advantage_std: float | None
     """Population standard deviation over the same loss tokens; None when none."""
@@ -395,10 +404,14 @@ def attach_advantages(
 ) -> tuple[list[TrainDatum], AdvantageStats]:
     """Fill per-token reverse-KL advantages from teacher logprobs.
 
-    Each loss token gets `clip(teacher_lp - sampled_lp, +-advantage_clip)`;
-    context (mask 0.0) tokens get 0.0. With `train.center_advantages` the mean
-    over ALL loss tokens in the batch is subtracted from every loss token
-    after clipping, so the batch-mean advantage is zero.
+    Each loss token gets `teacher_lp - sampled_lp`, bounded to
+    `+-train.advantage_clip` when that bound is set (None, the default,
+    trains the raw gap and clips nothing, which is what `train.loss = "ppo"`
+    expects: the ratio clip inside the loss is the regularizer); context
+    (mask 0.0) tokens get 0.0. With `train.center_advantages` the mean over
+    ALL loss tokens in the batch is then subtracted from every loss token, so
+    the batch-mean advantage is zero; without it (the default) the raw gaps
+    ride through and `AdvantageStats.advantage_mean` reads the objective.
 
     `teacher_logprobs[i]` scores `datums[i].model_input_tokens` in the
     compute_logprobs convention: entry p is the logprob of token p given the
@@ -410,15 +423,15 @@ def attach_advantages(
         datums: Datums from `build_datums` (advantages not yet attached).
         teacher_logprobs: One per-position logprob list per datum, aligned
             one to one with `datums`.
-        cfg: The run config; reads `train.advantage_clip` and
-            `train.center_advantages`.
+        cfg: The run config; reads `train.advantage_clip` (None = no
+            clipping) and `train.center_advantages`.
 
     Returns:
         New datums with advantages attached (drops removed, order preserved)
         and the stats, including the trained advantage distribution (mean and
         population std over the attached datums' loss tokens) and the kept
-        clip/loss/context token counts the loop derives `clip_fraction` and
-        its per-step token totals from.
+        clip/loss token counts the loop derives `clip_fraction` from (no
+        token counts as clipped when clipping is off).
 
     Raises:
         ValueError: If `teacher_logprobs` does not have one entry per datum;
@@ -460,6 +473,9 @@ def attach_advantages(
                 missing_position = position
                 break
             raw = teacher_lp - datum.sampled_logprobs[position]
+            if clip is None:
+                advantages[position] = raw
+                continue
             clipped = min(max(raw, -clip), clip)
             if clipped != raw:
                 datum_clipped += 1
@@ -722,7 +738,18 @@ def build_topk_ce_datums(
 
 
 def to_tinker_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
-    """Convert attached datums to real `tinker.Datum`s for importance_sampling.
+    """Convert attached datums to real `tinker.Datum`s for the advantage losses.
+
+    One wire format serves both `importance_sampling` and `ppo`: the SDK
+    (tinker 0.23.3) lists both in `types.LossFnType`, its
+    `forward_backward(data, loss_fn, loss_fn_config)` takes the same
+    `Datum`s for either, and the cookbook's RL path submits exactly this
+    keyset under both (`tinker_cookbook/rl/train.py:train_step` strips
+    "mask" and passes `loss_fn` straight through, and its own docstring
+    names `"importance_sampling"` and `"ppo"` as the values). `ppo` differs
+    only server-side, in what the loss does with the advantages: it bounds
+    the update by clipping the policy ratio (Tinker's default epsilon; this
+    code sends no `loss_fn_config`) rather than trusting a bounded advantage.
 
     Produces the cookbook's shifted next-token layout: model input is every
     token but the last, and target_tokens, logprobs, and advantages are the
@@ -773,9 +800,10 @@ def to_tinker_datums(train_datums: Sequence[TrainDatum]) -> list[tinker.Datum]:
                     "logprobs": tinker.TensorData(
                         data=datum.sampled_logprobs[1:], dtype="float32", shape=[length]
                     ),
-                    # No "mask" key: the live importance_sampling loss accepts exactly
-                    # target_tokens, logprobs, and advantages (a "mask" kwarg is rejected
-                    # server-side, observed 2026-07-23). Masking is expressed through the
+                    # No "mask" key: the live importance_sampling and ppo losses accept
+                    # exactly target_tokens, logprobs, and advantages (a "mask" kwarg is
+                    # rejected server-side, observed 2026-07-23; the cookbook strips the
+                    # same key for both losses). Masking is expressed through the
                     # advantages instead: attach_advantages leaves context positions at
                     # 0.0, and a zero-advantage position contributes zero loss.
                     "advantages": tinker.TensorData(

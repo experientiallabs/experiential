@@ -434,7 +434,8 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
 
     E2B caps concurrent sandboxes per account, and a running trial holds
     `E2B_SANDBOXES_PER_TRIAL` of them (harbor's task environment, which lives for its own
-    multi-hour timeout, plus the pooled pi worker). When orphans of an earlier crashed run fill
+    multi-hour timeout; terminus-2 itself runs in this process and needs no sandbox of its
+    own). When orphans of an earlier crashed run fill
     the account, every trial fails at sandbox creation with a 429 and the run produces zero
     token spans, which reads exactly like a broken model. So: count what is running, reclaim
     this machine's provable orphans (exact ids whose owning process is gone), and fail with the
@@ -493,8 +494,8 @@ def _capacity_failure_message(check: CapacityCheck, trial_concurrency: int) -> s
         f"not enough free E2B sandbox slots: {check.alive} of {check.cap} concurrent "
         f"sandboxes are in use, leaving {check.free} free, but this run needs "
         f"{check.required} ({E2B_SANDBOXES_PER_TRIAL} per trial x "
-        f"train.trial_concurrency={trial_concurrency}: harbor's task environment plus the pi "
-        f"worker).{reaped} Either run `wmh e2b reap --stale-minutes 60 --yes` to kill older "
+        f"train.trial_concurrency={trial_concurrency}: harbor's task environment)"
+        f".{reaped} Either run `wmh e2b reap --stale-minutes 60 --yes` to kill older "
         f"harbor trial sandboxes (account-wide: it can kill another machine's run), {lower}wait "
         f"for the other runs to finish, or raise the account cap (set ${E2B_SANDBOX_CAP_ENV} "
         f"when your cap is not {DEFAULT_E2B_SANDBOX_CAP})"

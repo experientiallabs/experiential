@@ -8,16 +8,18 @@ would sample only failures starts OPD from the teacher's successful
 trajectories; `warmup.trajectories_from` loads another run's recorded
 collection instead of collecting, charging nothing), then the training loop
 (harbor rollouts from the current student sampler, prefix-merge datums,
-teacher scoring, reverse-KL advantages, one `importance_sampling` optimizer
-step per training step; under `train.loss = "topk_ce"` the teacher instead
-top-k scores each datum in one prefill-only request and the step trains
-rank-aligned weighted cross_entropy replicas, the reverse-KL metric still
-coming from that same request's realized logprobs), and finally the holdout
-gate that decides whether the adapter is promoted into the `AdapterStore`.
+teacher scoring, reverse-KL advantages, one optimizer step per training step
+under the loss `train.loss` selects: `importance_sampling` or `ppo` over the
+same advantage-carrying datums, or `topk_ce`, where the teacher instead top-k
+scores each datum in one prefill-only request and the step trains rank-aligned
+weighted cross_entropy replicas, the reverse-KL metric still coming from that
+same request's realized logprobs), and finally the holdout gate that decides
+whether the adapter is promoted into the `AdapterStore`.
 
 Layout: everything lands in the `DistillRunStore` run directory. The rollout
-collector writes its per-step `harbor/step-NNNN/` and `tokens/step-NNNN/`
-dirs under the run dir for training batches; eval batches (baselines, interim
+collector writes its per-step `harbor/step-NNNN/` jobs dir under the run dir
+for training batches (each trial's sampled token spans live inside its own
+harbor trial dir, in `result.json`); eval batches (baselines, interim
 evals, student-after) get their own isolated roots under
 `eval-rollouts/<eval-name>/` so their harbor job dirs never collide with a
 training step's, and the warmup phase's teacher trials likewise land under
@@ -51,10 +53,20 @@ phase is recorded as the run store's `warmup.json` marker and never re-runs
 trials themselves resuming trial-level through harbor (the teacher's identity
 is stable across sessions). Steps and student evals whose harbor job dirs
 were left by a prior session re-run whole (the rollout collector wipes
-stale-policy job dirs). A budget abort (`DistillBudgetError`) and an
+stale-policy job dirs). A budget abort (`DistillBudgetError`), an
 all-empty-batch abort (`DistillEmptyBatchError`, raised when consecutive
-training steps show the student provider producing no completions) both
-carry the exact resume command.
+training steps show the student provider producing no completions) and a
+degeneration abort (`DistillDegenerationError`, below) all carry the exact
+resume command.
+
+Degeneration tripwires: every step also pools the student's own sampled
+logprobs and generation lengths into `entropy_per_token` and
+`mean_generation_tokens` (`wmh.distill.tripwire`) and compares them against a
+baseline THIS run measured at its first training step, which is persisted in
+the checkpoint manifest so a resumed session never re-anchors on an already
+degenerated policy. Breaches warn, and a kill-level streak aborts the run the
+same way the budget path does. The thresholds are fractions of that measured
+baseline, never absolute values; `TripwireConfig` records why.
 """
 
 from __future__ import annotations
@@ -63,6 +75,7 @@ import hashlib
 import logging
 import random
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, Protocol, cast, runtime_checkable
 from uuid import uuid4
@@ -112,6 +125,16 @@ from wmh.distill.teacher import (
 )
 from wmh.distill.tokens import TrialRecord
 from wmh.distill.tracking import DistillTracker, build_tracker
+from wmh.distill.tripwire import (
+    PolicyHealth,
+    TripwireBaseline,
+    TripwireBreach,
+    capture_baseline,
+    evaluate_breaches,
+    health_summary,
+    metric_ratio,
+    policy_health,
+)
 from wmh.harness.doc import (
     MAX_OUTPUT_TOKENS_ID,
     MAX_TURNS_ID,
@@ -136,9 +159,37 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_WARMUP_STREAMS = 8
+"""Concurrent throwaway calls issued against freshly published sampler weights.
+
+Not 1: a single serial token woke the model but a 64-episode wave still lost ~21% of its
+episodes at a mean of 0.7 turns, because the cost is the sampler's ramp to many simultaneous
+streams, not one weight load. Not 64: the point is to trigger the ramp, and the wave itself
+finishes it, so this trades a few seconds of warmup for the tail of a 45-step run."""
+
 IMPORTANCE_SAMPLING_LOSS = "importance_sampling"
+PPO_LOSS = "ppo"
+"""The clipped-ratio surrogate over the SAME datums as importance_sampling.
+
+Both are values of the SDK's `types.LossFnType` (tinker 0.23.3) and both take
+exactly the `to_tinker_datums` keyset; `ppo` differs only in what the service
+does with the advantages: it bounds the update by clipping the policy ratio
+(service-side epsilon, no `loss_fn_config` is sent) instead of relying on a
+bounded advantage, which is why `train.loss = "ppo"` is the mode that wants
+`advantage_clip` unset and `center_advantages = false`. With one
+forward/backward per batch off a sampler refreshed every step, that ratio sits
+at ~1 and the clip rarely binds (see `TrainConfig.loss`); `advantage_std` and
+`grad_norm` in the metrics row are what actually show an outlier-driven step.
+"""
+
 CROSS_ENTROPY_LOSS = "cross_entropy"
 """The warmup phase's supervised loss (see `to_tinker_sft_datums` for the keyset)."""
+
+ADVANTAGE_LOSS_BY_MODE = {
+    "importance_sampling": IMPORTANCE_SAMPLING_LOSS,
+    "ppo": PPO_LOSS,
+}
+"""Wire `loss_fn` per `train.loss` mode that trains advantages (topk_ce is CE)."""
 
 DEFAULT_TITO_MEAN_TOLERANCE = 0.25
 """Max mean |issued - recomputed| logprob gap the preflight recompute accepts.
@@ -252,6 +303,45 @@ class DistillEmptyBatchError(RuntimeError):
         self.consecutive_steps = consecutive_steps
 
 
+class DistillDegenerationError(RuntimeError):
+    """The policy degenerated past a tripwire's kill bound; the run aborted.
+
+    Mirrors `DistillEmptyBatchError` ergonomics: state was checkpointed and the
+    error carries the exact resume command (a resumed run restarts from the last
+    healthy checkpoint and keeps the SAME persisted baseline).
+
+    Attributes:
+        resume_command: The exact CLI command that resumes this run.
+        consecutive_steps: How many kill-level steps ran back to back.
+        breaches: The final step's kill-level breaches, in report order.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        resume_command: str,
+        consecutive_steps: int,
+        breaches: Sequence[TripwireBreach],
+    ) -> None:
+        super().__init__(message)
+        self.resume_command = resume_command
+        self.consecutive_steps = consecutive_steps
+        self.breaches = tuple(breaches)
+
+
+class DistillNullEvalError(RuntimeError):
+    """An eval batch produced no verifier evidence at all, so it has no solve rate.
+
+    Raised instead of writing a `DistillEvalReport` when no trial in the batch was graded, either
+    because none ran (the live failure was the E2B concurrent-sandbox cap: 51/51 trials
+    rate-limited, harbor jobs finishing in 52 to 199 seconds, and three `baseline-student-before`
+    reports written as 0.0%, then used as the no-regression leg of a promotion gate) or because
+    the verifier never produced a reward for any of them. A null measurement must stop the run,
+    not become a number.
+    """
+
+
 class DistillEvalReport(BaseModel):
     """One eval batch's persisted outcome (baselines, interim evals, student-after)."""
 
@@ -274,7 +364,36 @@ class DistillEvalReport(BaseModel):
     attempts: int = Field(ge=1)
     trials: int = Field(ge=0)
     solve_rate: float = Field(ge=0.0, le=1.0)
+    """Passing share of EXECUTED trials (infrastructure failures excluded)."""
+
+    graded_solve_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Mean graded test-pass score over `graded_trials`, beside the binary `solve_rate`.
+
+    The power metric for comparing two runs on a small holdout, where binary has no resolution;
+    `solve_rate` stays the headline and the gate's number. 0.0 with `graded_trials == 0` is a null
+    measurement, not a score. See `RolloutStats.graded_solve_rate`. 0.0 on reports from before this
+    field."""
+
+    graded_trials: int = Field(default=0, ge=0)
+    """Gradeable trials that carried a readable test report: the `graded_solve_rate`
+    denominator."""
+
     empty_span_trials: int = Field(ge=0)
+
+    executed_trials: int = Field(default=0, ge=0)
+    """Trials that produced verifier evidence; 0 only on reports from before this field."""
+
+    infra_failed_trials: int = Field(default=0, ge=0)
+    """Trials excluded from `solve_rate` because no verifier reward exists for them.
+
+    Either the agent never ran or its work was never graded; see `RolloutStats.infra_failed_trials`
+    for why one count covers both and where the per-trial causes live."""
+
+    scaffold_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Share of executed trials that never reached an explicit submit."""
+
+    stop_reason_counts: dict[str, int] = Field(default_factory=dict)
+    """Trials per recorded stop reason."""
 
     source: str | None = None
     """Provenance note when the report was imported from a prior run via
@@ -304,7 +423,45 @@ class StepMetrics(BaseModel):
     tasks: int = Field(ge=0)
     trials: int = Field(ge=0)
     solve_rate: float = Field(ge=0.0, le=1.0)
+    """Passing share of EXECUTED trials (infrastructure failures excluded)."""
+
+    graded_solve_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Mean graded test-pass score over `graded_trials`, beside the binary `solve_rate`.
+
+    Extra resolution for run-to-run comparison, never a replacement: `solve_rate` is the benchmark's
+    own definition and stays the headline. 0.0 with `graded_trials == 0` is a null measurement. See
+    `RolloutStats.graded_solve_rate`. 0.0 on rows from before this field."""
+
+    graded_trials: int = Field(default=0, ge=0)
+    """Gradeable trials that carried a readable test report: the `graded_solve_rate`
+    denominator."""
+
+    raw_solve_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Passing share of ALL trials, which is what advantage estimation sees."""
+
+    executed_trials: int = Field(default=0, ge=0)
+    infra_failed_trials: int = Field(default=0, ge=0)
+    """Trials with no verifier reward (nothing ran, or nothing graded it); not in `solve_rate`."""
+
+    scaffold_loss_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Share of executed trials that never reached an explicit submit.
+
+    The audit headline: 88.8% for Super, invisible in every artifact. A rise here means the harness,
+    not the model, is deciding the solve rate."""
+
+    stop_reason_counts: dict[str, int] = Field(default_factory=dict)
+    """Trials per recorded stop reason (`submitted`, `max_turns`, `budget`, `no_tool_call`,
+    `output_truncated`, `unparsed_tool_call`, `provider_error`, `unknown`)."""
+
     empty_span_trials: int = Field(ge=0)
+    truncated_spans: int = Field(default=0, ge=0)
+    """Turns that sampled the full `sampling.max_tokens` and were cut off mid-answer.
+
+    Charts as `train/truncated_spans`. Nothing else reports it: harbor's own truncation guard is
+    unreachable (see `RolloutStats.truncated_spans`), so without this series a run whose output
+    cap is too low reads as a run whose model writes broken actions. 0 on rows from before this
+    field."""
+
     datums: int = Field(ge=0)
     """Datums the optimizer step trained on; under `train.loss = "topk_ce"`
     these are the rank replicas, so k x the surviving source datums."""
@@ -316,7 +473,8 @@ class StepMetrics(BaseModel):
     mismatch_drops: int = Field(ge=0)
     clipped_tokens: int = Field(ge=0)
     """Trained loss tokens whose raw advantage hit the clip bound (0 under
-    `topk_ce`, which clips nothing)."""
+    `topk_ce`, which clips nothing, and 0 when `train.advantage_clip` is
+    unset)."""
 
     loss_tokens: int = Field(ge=0)
     """Sampled (mask 1.0) tokens in the trained batch, counted once per SOURCE
@@ -332,6 +490,45 @@ class StepMetrics(BaseModel):
     batch's: a datum the teacher scored but the alignment check later dropped
     still contributed the positions that did come back."""
 
+    entropy_per_token: float | None
+    """`-mean(sampled_logprobs)` over the batch's loss positions, pooled.
+
+    The degeneration tripwire's first signal, and the one a KL curve cannot
+    give: reverse KL can fall while the policy collapses into a single mode.
+    The tokens came from the policy that scored them, so this is an unbiased
+    single-sample estimator of that policy's entropy, pooled over the batch.
+    Read it as a LOWER bound on the T=1 entropy, since rollouts sample at
+    `sampling.temperature` (0.7 for the headline run) and that concentrates the
+    distribution the tokens are drawn from. Pooled over the whole batch, never
+    per episode (`wmh.distill.tripwire.policy_health` says why). None when the
+    batch recorded no sampled token."""
+
+    mean_generation_tokens: float | None
+    """Sampled tokens per episode, pooled over the batch's span-bearing episodes.
+
+    The tripwire's second signal, against the mirror pathology: pure KL gives
+    EOS no gradient, so a student either never learns to stop or collapses to
+    near-empty answers (a sibling lane fell 2,866 to about 50 tokens). Measured
+    from the recorded spans, so whole-episode datum drops (the longest episodes)
+    cannot deflate it. None when no episode recorded a sampled token."""
+
+    entropy_baseline: float | None
+    """`entropy_per_token` as measured at this run's first training step; None
+    until the baseline is captured. Every tripwire bound is a fraction of this,
+    never an absolute nats value (see `TripwireConfig`)."""
+
+    entropy_ratio: float | None
+    """`entropy_per_token / entropy_baseline`: the number the tripwire bounds.
+    1.0 at the baseline step; None until a baseline exists."""
+
+    generation_tokens_baseline: float | None
+    """`mean_generation_tokens` at this run's first training step; None until
+    the baseline is captured."""
+
+    generation_tokens_ratio: float | None
+    """`mean_generation_tokens / generation_tokens_baseline`; None until a
+    baseline exists."""
+
     reward_mean: float | None
     """Mean verifier reward over the step's trials; None when no trial ran.
 
@@ -339,16 +536,37 @@ class StepMetrics(BaseModel):
     and only diverges if a verifier ever emits fractional rewards.
     """
 
+    loss: Literal["importance_sampling", "ppo", "topk_ce"]
+    """Which objective this step trained (`train.loss`), so a metrics row and
+    a dashboard point say what produced them.
+
+    `importance_sampling` and `ppo` submit the same advantage-carrying datums
+    and differ only in the service-side loss (`ppo` clips the policy ratio);
+    `topk_ce` submits rank-aligned replicas under the `cross_entropy` wire
+    loss and carries no advantage metrics at all."""
+
     advantage_mean: float | None
-    """Mean advantage over the trained loss tokens (post clip and centering,
-    so ~0.0 under `train.center_advantages`); None when nothing was trained."""
+    """Mean advantage over the trained loss tokens, exactly as trained (after
+    any clipping and any centering); None when nothing was trained or the
+    mode builds no advantages (`topk_ce`).
+
+    With the default objective (no clip, no centering) this is the mean
+    teacher-minus-student gap over the trained tokens, i.e. the negated
+    reverse KL: the number that should move toward 0 as the student closes on
+    the teacher. Under `train.center_advantages` it is ~0.0 by construction
+    and carries no information."""
 
     advantage_std: float | None
-    """Population std over the same loss tokens; None when nothing was trained."""
+    """Population std over the same loss tokens; None when nothing was trained.
+
+    Read it next to `advantage_mean` under the unclipped objective: it is the
+    per-token magnitude the gradient actually sees, and a run whose std grows
+    without its mean moving is being driven by outlier tokens."""
 
     clip_fraction: float = Field(ge=0.0, le=1.0)
     """Trained loss tokens whose raw advantage hit the clip bound, as a
-    fraction of the trained loss tokens (0.0 when nothing was trained)."""
+    fraction of the trained loss tokens (0.0 when nothing was trained, and
+    0.0 for the whole run when `train.advantage_clip` is unset)."""
 
     pg_loss: float | None
     """The batch loss the training backend reported for the step's
@@ -749,9 +967,11 @@ class SdkTrainingClient:
         """Convert to real tinker datums and run one bounded forward/backward.
 
         The loss decides the wire conversion: cross_entropy datums (the
-        warmup phase) carry {target_tokens, weights}, importance_sampling
-        datums carry {target_tokens, logprobs, advantages}; each loss rejects
-        any other keyset server-side.
+        warmup phase and topk_ce replicas) carry {target_tokens, weights},
+        while both advantage losses (importance_sampling and ppo) carry
+        {target_tokens, logprobs, advantages}; each loss rejects any other
+        keyset server-side. No `loss_fn_config` is sent, so ppo's ratio-clip
+        epsilon is the service default.
 
         Never retried on a deadline expiry: gradients may already have been
         accumulated server-side, so a re-submit could count the batch twice.
@@ -918,6 +1138,29 @@ def _seed_from_name(name: str) -> int:
     return int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big")
 
 
+def tinker_provider_config(model: str, base_model: str) -> ProviderConfig:
+    """The rollout provider config for one Tinker model identity.
+
+    The single shape every distillation rollout samples through: the tinker
+    provider kind (the only one that records token spans), `model` as the exact
+    identity being sampled, and `model_type` as the base model whose renderer
+    and tokenizer that identity uses. Both loop callers go through it (the
+    student's current sampler weights, the teacher's stable model or
+    checkpoint), and so does any out-of-loop caller that needs the same
+    provider without standing up a training client (a rollout-only probe).
+
+    Args:
+        model: The exact model string to sample: a `tinker://` sampler-weights
+            path, a checkpoint ref, or a base model name.
+        base_model: The base model name that names the renderer/tokenizer
+            identity (equal to `model` when sampling a base model directly).
+
+    Returns:
+        The validated provider config.
+    """
+    return ProviderConfig(kind=ProviderKind.TINKER, model=model, model_type=base_model)
+
+
 class TaskSampler:
     """A seeded shuffle-cycle over the train task ids.
 
@@ -1037,8 +1280,60 @@ class StudentSampler:
         self._client = self._service.create_sampling_client(path)
         self._path = path
         self._last_step = step
+        self._warm(step, path)
         logger.debug("student sampler refreshed for step %d: %s", step, path)
         return path
+
+    def _warm(self, step: int, path: str) -> None:
+        """Serve throwaway tokens CONCURRENTLY so the batch never races a cold sampler.
+
+        Freshly published sampler weights are not immediately hot. Launching the whole wave at
+        once means every episode's FIRST call races the same weight load, and the losers exhaust
+        their retries and report `provider_error` at turn 0-2 while the survivors go on to run 24+
+        turns cleanly.
+
+        Two live measurements shaped this, and the second is why the warmup is concurrent rather
+        than a single call:
+
+        1. A 51-episode eval wave lost 7 episodes (~15%) at a mean of 2.0 turns, against 6% for
+           the same model sampled from already-warm BASE weights. A base-weights probe therefore
+           cannot detect this at all.
+        2. After adding a ONE-token serial warmup, a 64-episode training wave still lost 7 of its
+           first 34 episodes (~21%) at a mean of **0.7 turns**. One token wakes the model but does
+           not make it scale: the cost is not a single weight load, it is the sampler's ramp to
+           serving many streams at once, so the warmup has to exercise concurrency too.
+
+        `_WARMUP_STREAMS` concurrent throwaway calls approximate the wave's own fan-out. Failure
+        of any stream is deliberately NOT fatal: a sampler that cannot serve one token will fail
+        loudly in the batch anyway, and aborting a paid run inside a warmup trades a partial batch
+        for no batch.
+        """
+        client = self._client
+        if client is None:  # pragma: no cover - refresh() just assigned it
+            return
+
+        def once() -> None:
+            client.sample(prompt_token_ids=[0], max_tokens=1, temperature=0.0)
+
+        failures: list[BaseException] = []
+        with ThreadPoolExecutor(max_workers=_WARMUP_STREAMS) as pool:
+            for future in [pool.submit(once) for _ in range(_WARMUP_STREAMS)]:
+                error = future.exception()
+                if error is not None:
+                    failures.append(error)
+        if failures:
+            first = failures[0]
+            logger.warning(
+                "student sampler warmup for step %d (%s): %d of %d streams did not serve a token "
+                "(first: %s: %s); launching the batch anyway, but expect turn-0 provider_error "
+                "losses if the weights are still loading",
+                step,
+                path,
+                len(failures),
+                _WARMUP_STREAMS,
+                type(first).__name__,
+                first,
+            )
 
     @property
     def sampler_path(self) -> str:
@@ -1064,9 +1359,7 @@ class StudentSampler:
         Args:
             base_model: The student base model name (renderer identity).
         """
-        return ProviderConfig(
-            kind=ProviderKind.TINKER, model=self.sampler_path, model_type=base_model
-        )
+        return tinker_provider_config(self.sampler_path, base_model)
 
 
 # -- preflight -----------------------------------------------------------------------------------
@@ -1296,6 +1589,26 @@ def _teacher_rows(
     return rows, _batch_reverse_kl(datums, rows)
 
 
+def _graded_phrase(graded_solve_rate: float, graded_trials: int) -> str:
+    """One progress-line clause for the graded rate, saying so when there is none.
+
+    A batch with no readable test report has no graded score, and its stats carry 0.0 as a
+    placeholder; printing that as "graded 0.000" would report a null measurement as a total failure.
+    """
+    if not graded_trials:
+        return "no graded score (no readable test report)"
+    return f"graded {graded_solve_rate:.3f} over {graded_trials} graded trial(s)"
+
+
+def _measured_graded_rate(report: DistillEvalReport) -> float | None:
+    """The report's graded solve rate, or None when it measured none.
+
+    None covers both an eval whose trials left no readable test report and a baseline imported from
+    a run that predates the field (`graded_trials == 0`), so neither charts a fabricated 0.0.
+    """
+    return report.graded_solve_rate if report.graded_trials else None
+
+
 class _RunBudget:
     """This session's `BudgetMeter` plus the USD prior sessions already spent.
 
@@ -1402,6 +1715,10 @@ class _DistillRun:
         self._prev_tokens: dict[MeterName, int] = dict.fromkeys(METER_NAMES, 0)
         self._prev_usd = 0.0
         self._empty_step_streak = 0
+        self._degeneration_streak = 0
+        # Loaded from the run manifest on resume (never re-measured there);
+        # captured at this session's first training step otherwise.
+        self._tripwire_baseline: TripwireBaseline | None = None
         self._resumed = False
 
     # -- plumbing --------------------------------------------------------------------------------
@@ -1495,6 +1812,125 @@ class _DistillRun:
             consecutive_steps=self._empty_step_streak,
         )
 
+    def _arm_tripwire(self, step: int, health: PolicyHealth) -> TripwireBaseline | None:
+        """Return the run's tripwire baseline, capturing it at the first step.
+
+        Capture happens exactly once per RUN, not per session: a baseline read
+        back from the manifest on resume is kept as is, because re-measuring
+        against a policy that already degenerated is what makes a resumed run's
+        tripwire blind. Capture is deliberately NOT gated on
+        `tripwire.enabled`: the baseline and the per-step ratios cost nothing
+        and stay in `metrics.jsonl` even when the abort is switched off.
+
+        Args:
+            step: The 0-based training step being measured.
+            health: That step's batch-pooled health.
+
+        Returns:
+            The armed baseline, or None when no step has been measurable yet (an
+            all-empty batch cannot serve as a reference); the next step retries.
+        """
+        if self._tripwire_baseline is not None:
+            return self._tripwire_baseline
+        captured = capture_baseline(step, health)
+        if captured is None:
+            logger.warning(
+                "step %d measured no usable policy baseline (%d episode(s) with spans, "
+                "%d sampled token(s)), so the degeneration tripwire stays unarmed; the "
+                "next step retries",
+                step,
+                health.episodes,
+                health.sampled_tokens,
+            )
+            return None
+        self._tripwire_baseline = captured
+        self._store.write_tripwire_baseline(captured)
+        cfg = self._cfg.tripwire
+        logger.info(
+            "degeneration tripwire armed from step %d: entropy %.4f nats/token, %.0f sampled "
+            "tokens/episode (%d episode(s), %d token(s)). Thresholds are FRACTIONS of these, "
+            "never absolutes: entropy warn %.2f / kill %.2f, length warn %.2f / kill %.2f, "
+            "kill after %d consecutive step(s)%s",
+            captured.step,
+            captured.entropy_per_token,
+            captured.mean_generation_tokens,
+            captured.episodes,
+            captured.sampled_tokens,
+            cfg.entropy_warn_frac,
+            cfg.entropy_kill_frac,
+            cfg.length_warn_frac,
+            cfg.length_kill_frac,
+            cfg.kill_consecutive_steps,
+            "" if cfg.enabled else " (tripwire.enabled = false: metrics only, no abort)",
+        )
+        return captured
+
+    def _check_degeneration(
+        self, step: int, health: PolicyHealth, baseline: TripwireBaseline | None
+    ) -> None:
+        """Warn on a degeneration breach, and abort after a kill-level streak.
+
+        Args:
+            step: The 0-based training step that just completed its metrics row.
+            health: That step's batch-pooled health.
+            baseline: The run's armed baseline, or None when none exists yet.
+
+        Raises:
+            DistillDegenerationError: After `tripwire.kill_consecutive_steps`
+                steps in a row at kill level; the step's state is checkpointed
+                first and the message carries the exact resume command. A step
+                that measured nothing at all breaks neither the streak nor the
+                silence: it is not evidence, and the empty-batch abort owns it.
+        """
+        cfg = self._cfg.tripwire
+        if not cfg.enabled or baseline is None:
+            return
+        if baseline.step == step:
+            # The baseline step is its own reference (ratio 1.0), so it can only
+            # breach through a misconfigured fraction above 1.0. It never fires.
+            return
+        if health.entropy_per_token is None and health.mean_generation_tokens is None:
+            # An all-empty batch is no evidence either way, so it neither breaches
+            # nor clears a streak (the empty-batch abort is what owns that case).
+            return
+        breaches = evaluate_breaches(cfg, baseline, health)
+        for breach in breaches:
+            logger.warning("degeneration tripwire at step %d: %s", step, breach.describe())
+        kills = [breach for breach in breaches if breach.level == "kill"]
+        if not kills:
+            self._degeneration_streak = 0
+            return
+        self._degeneration_streak += 1
+        if self._degeneration_streak < cfg.kill_consecutive_steps:
+            logger.warning(
+                "step %d is at a degeneration KILL level; %d/%d consecutive step(s) before "
+                "the run aborts (a healthy step resets the streak)",
+                step,
+                self._degeneration_streak,
+                cfg.kill_consecutive_steps,
+            )
+            return
+        state_path = self._training.save_state()
+        self._store.record_checkpoint(step, state_path, self._sampler.sampler_path)
+        command = resume_command(self._cli_agent, self._run_dir)
+        detail = "; ".join(breach.describe() for breach in kills)
+        raise DistillDegenerationError(
+            f"aborting after {self._degeneration_streak} consecutive training steps at a "
+            f"degeneration kill level: {detail}. The student's own sampled tokens collapsed "
+            "against the baseline this run measured at its first training step, which is the "
+            "failure reverse KL alone cannot show (KL falls while the policy degenerates): "
+            "entropy falling is mode collapse, length falling is answers collapsing toward "
+            "empty. Read the step's solve_rate beside it (a real collapse takes the solve rate "
+            "with it, a student that merely got more efficient does not), then lower "
+            "train.learning_rate or restart from an earlier checkpoint before spending more. "
+            "Run artifacts were "
+            f"persisted (checkpoint at step {step}), and the recorded baseline is reused as is "
+            f"on resume, so a resumed run is not re-anchored on the collapse: {command}",
+            resume_command=command,
+            consecutive_steps=self._degeneration_streak,
+            breaches=kills,
+        )
+
     def _charge_rollout_billing(self, billing: SpanBilling, *, teacher: bool) -> None:
         """Charge one rollout batch's per-request billing to its model's meters.
 
@@ -1529,11 +1965,7 @@ class _DistillRun:
         return self._sampler.provider_config(self._cfg.student.base_model)
 
     def _teacher_provider(self) -> ProviderConfig:
-        return ProviderConfig(
-            kind=ProviderKind.TINKER,
-            model=self._teacher_identity,
-            model_type=self._cfg.teacher.model,
-        )
+        return tinker_provider_config(self._teacher_identity, self._cfg.teacher.model)
 
     def _log_sample_rollouts(
         self, *, kind: str, name: str, step: int | None, records: Sequence[TrialRecord]
@@ -1682,6 +2114,19 @@ class _DistillRun:
         self._log_sample_rollouts(
             kind=f"eval-{key}", name=f"eval-{key}", step=completed_step, records=records
         )
+        if stats.trials and not stats.executed_trials:
+            raise DistillNullEvalError(
+                f"eval {key} is a NULL measurement, not a 0.0: not one of {stats.trials} trial(s) "
+                "carries a verifier reward, so no solve rate exists to record. Read the cells' "
+                f"`infra-failure:` notes under {self._run_dir / EVAL_ROLLOUTS_DIR / key} for the "
+                "exact causes. Trials that never started are almost always the E2B "
+                "concurrent-sandbox account cap (a distill trial holds one sandbox: harbor's "
+                "task environment), so lower train.trial_concurrency (currently "
+                f"{cfg.train.trial_concurrency}), reap orphaned sandboxes, and re-run; trials that "
+                "ran but were never graded (VerifierTimeoutError) usually need a longer "
+                "verifier.override_timeout_sec in the harbor job template. Writing 0.0% here "
+                "would put a null baseline behind gate.require_no_regression"
+            )
         report = DistillEvalReport(
             name=key,
             provider_model=provider.model,
@@ -1690,10 +2135,31 @@ class _DistillRun:
             attempts=attempts,
             trials=stats.trials,
             solve_rate=stats.solve_rate,
+            graded_solve_rate=stats.graded_solve_rate,
+            graded_trials=stats.graded_trials,
             empty_span_trials=stats.empty_span_trials,
+            executed_trials=stats.executed_trials,
+            infra_failed_trials=stats.infra_failed_trials,
+            scaffold_loss_rate=stats.scaffold_loss_rate,
+            stop_reason_counts=dict(stats.stop_reason_counts),
         )
+        if stats.infra_failed_trials or stats.scaffold_loss_rate:
+            self._emit(
+                phase,
+                f"eval {key}: solve rate {stats.solve_rate:.3f} over "
+                f"{stats.executed_trials}/{stats.trials} executed trial(s) "
+                f"({stats.infra_failed_trials} infra failure(s) excluded), "
+                f"{_graded_phrase(stats.graded_solve_rate, stats.graded_trials)}, scaffold loss "
+                f"{stats.scaffold_loss_rate:.0%} {stats.stop_reason_counts}",
+                step=completed_step,
+            )
         self._store.write_eval(key, report)
-        self._tracker.log_eval(key, report.solve_rate, completed_step)
+        self._tracker.log_eval(
+            key,
+            report.solve_rate,
+            completed_step,
+            graded_solve_rate=_measured_graded_rate(report),
+        )
         try:
             self._budget.check()
         except BudgetExhausted as exc:
@@ -1877,7 +2343,9 @@ class _DistillRun:
             update={"name": key, "source": f"reused from {path} via {config_field}"}
         )
         self._store.write_eval(key, stamped)
-        self._tracker.log_eval(key, stamped.solve_rate, None)
+        self._tracker.log_eval(
+            key, stamped.solve_rate, None, graded_solve_rate=_measured_graded_rate(stamped)
+        )
         self._emit(
             phase,
             f"eval {key}: reused {path} (solve rate {stamped.solve_rate:.3f}, "
@@ -1965,7 +2433,11 @@ class _DistillRun:
                 "trajectories, so point warmup.trajectories_from at a run with a "
                 "matching teacher, or unset it to collect fresh"
             )
-        return list(manifest.records), rollout_stats(manifest.records)
+        # THIS run's output cap, not the source run's: the truncation count is read
+        # beside this run's metrics and must answer "would these turns be cut off here".
+        return list(manifest.records), rollout_stats(
+            manifest.records, max_tokens=self._cfg.sampling.max_tokens
+        )
 
     def _collect_warmup_trials(self) -> tuple[list[TrialRecord], RolloutStats]:
         """Collect the warmup phase's teacher rollouts and persist their manifest.
@@ -2160,6 +2632,12 @@ class _DistillRun:
         self._charge_rollout_billing(batch_billing(records), teacher=False)
         self._log_sample_rollouts(kind="train", name=f"step-{step:04d}", step=step, records=records)
 
+        # Degeneration signals come from the RAW spans (before any datum drop),
+        # and the baseline is armed here so this step's row already carries its
+        # own ratios; the breach check itself runs after the row is persisted.
+        health = policy_health(records)
+        tripwire_baseline = self._arm_tripwire(step, health)
+
         datums, datum_stats = build_datums(records, cfg)
         teacher_usage_before = self._teacher.usage()
         advantage_mean: float | None = None
@@ -2197,7 +2675,9 @@ class _DistillRun:
                 # Same contract as the topk_ce branch above.
                 self._budget.charge("teacher_prefill", self._teacher.usage() - teacher_usage_before)
             trained, adv_stats = attach_advantages(datums, rows, cfg)
-            loss_fn = IMPORTANCE_SAMPLING_LOSS
+            # importance_sampling and ppo ride identical datums (see
+            # `to_tinker_datums`); only the service-side loss differs.
+            loss_fn = ADVANTAGE_LOSS_BY_MODE[cfg.train.loss]
             mismatch_drops = adv_stats.mismatch_drops
             advantage_mean = adv_stats.advantage_mean
             advantage_std = adv_stats.advantage_std
@@ -2212,6 +2692,13 @@ class _DistillRun:
         pg_loss: float | None = None
         grad_norm: float | None = None
         if trained:
+            logger.info(
+                "step %d: %d datum(s) into forward_backward under loss_fn %r (train.loss = %r)",
+                step,
+                len(trained),
+                loss_fn,
+                cfg.train.loss,
+            )
             train_output = self._training.forward_backward(trained, loss_fn=loss_fn)
             optim_output = self._training.optim_step(cfg.train.learning_rate)
             pg_loss = train_output.loss
@@ -2235,7 +2722,15 @@ class _DistillRun:
             tasks=len(batch),
             trials=roll_stats.trials,
             solve_rate=roll_stats.solve_rate,
+            graded_solve_rate=roll_stats.graded_solve_rate,
+            graded_trials=roll_stats.graded_trials,
+            raw_solve_rate=roll_stats.raw_solve_rate,
+            executed_trials=roll_stats.executed_trials,
+            infra_failed_trials=roll_stats.infra_failed_trials,
+            scaffold_loss_rate=roll_stats.scaffold_loss_rate,
+            stop_reason_counts=dict(roll_stats.stop_reason_counts),
             empty_span_trials=roll_stats.empty_span_trials,
+            truncated_spans=roll_stats.truncated_spans,
             datums=len(trained),
             fragments=datum_stats.fragments,
             fragmentation_rate=datum_stats.fragmentation_rate,
@@ -2246,9 +2741,26 @@ class _DistillRun:
             loss_tokens=trained_loss_tokens,
             context_tokens=trained_context_tokens,
             reverse_kl_per_token=reverse_kl,
+            entropy_per_token=health.entropy_per_token,
+            mean_generation_tokens=health.mean_generation_tokens,
+            entropy_baseline=(
+                tripwire_baseline.entropy_per_token if tripwire_baseline is not None else None
+            ),
+            entropy_ratio=metric_ratio(
+                health.entropy_per_token,
+                tripwire_baseline.entropy_per_token if tripwire_baseline is not None else None,
+            ),
+            generation_tokens_baseline=(
+                tripwire_baseline.mean_generation_tokens if tripwire_baseline is not None else None
+            ),
+            generation_tokens_ratio=metric_ratio(
+                health.mean_generation_tokens,
+                tripwire_baseline.mean_generation_tokens if tripwire_baseline is not None else None,
+            ),
             reward_mean=(
                 sum(record.reward for record in records) / len(records) if records else None
             ),
+            loss=cfg.train.loss,
             advantage_mean=advantage_mean,
             advantage_std=advantage_std,
             clip_fraction=(clipped_tokens / trained_loss_tokens if trained_loss_tokens else 0.0),
@@ -2273,8 +2785,12 @@ class _DistillRun:
         self._emit(
             "training",
             f"step {step + 1}/{cfg.train.steps}: solve rate "
-            f"{roll_stats.solve_rate:.2f}, reverse KL/token {kl_text}, "
-            f"{len(trained)} datum(s)",
+            f"{roll_stats.solve_rate:.2f} ({roll_stats.executed_trials}/{roll_stats.trials} "
+            f"executed), "
+            f"{_graded_phrase(roll_stats.graded_solve_rate, roll_stats.graded_trials)}, "
+            f"scaffold loss {roll_stats.scaffold_loss_rate:.0%}, reverse KL/token "
+            f"{kl_text}, {health_summary(health, tripwire_baseline)}, "
+            f"{len(trained)} datum(s) under {cfg.train.loss}",
             step=step,
         )
 
@@ -2286,6 +2802,7 @@ class _DistillRun:
         self._check_empty_batch_streak(
             step, roll_stats.trials, roll_stats.empty_span_trials, len(trained)
         )
+        self._check_degeneration(step, health, tripwire_baseline)
 
         if (step + 1) % cfg.train.sampler_refresh_every == 0:
             self._sampler.refresh(step + 1)
@@ -2383,6 +2900,19 @@ class _DistillRun:
             # evals); summing metrics rows is only the pre-ledger fallback.
             recorded_spend = store.read_spend()
             prior_usd = recorded_spend if recorded_spend is not None else store.budget_spent()
+            # Reused exactly as recorded, never re-measured: a fresh baseline
+            # taken after a collapse would treat the collapse as normal and the
+            # tripwire would never fire again. None only when the prior session
+            # never completed a measurable step.
+            self._tripwire_baseline = store.read_tripwire_baseline()
+            if self._tripwire_baseline is not None:
+                logger.info(
+                    "reusing the recorded degeneration baseline from step %d (entropy "
+                    "%.4f nats/token, %.0f sampled tokens/episode)",
+                    self._tripwire_baseline.step,
+                    self._tripwire_baseline.entropy_per_token,
+                    self._tripwire_baseline.mean_generation_tokens,
+                )
         else:
             if store.config_path.exists() or store.last_step() is not None:
                 raise ValueError(
@@ -2607,7 +3137,8 @@ def run_distillation(
     Args:
         name: The adapter/run name (a safe single path segment).
         cfg: The validated run config; snapshotted into the run dir.
-        harness: The pinned harness document the pi agent runs in every trial.
+        harness: The pinned document whose hash keys every trial's harbor job
+            dir; the rollout agent itself is harbor's terminus-2.
         train_task_ids: The train split's task ids (unique, non-empty).
         holdout_task_ids: The holdout split's task ids (unique, non-empty,
             disjoint from the train split); baselines and the gate run here.

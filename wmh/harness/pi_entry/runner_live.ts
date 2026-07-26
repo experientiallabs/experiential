@@ -34,6 +34,9 @@ console.warn = toStderr;
 console.debug = toStderr;
 
 const AGENT_MODEL = process.env.PI_AGENT_MODEL ?? "worker";
+// Last-resort model context window when session_start carries none. The host resolves the REAL
+// served window (provider/SDK model info) and sends it as context_window; never assume a size here.
+const DEFAULT_CONTEXT_WINDOW = 128000;
 const TRANSPORT_KEEPALIVE_MS = 30_000;
 const LIVE_OUTBOX = process.env.WMH_LIVE_OUTBOX?.trim() || null;
 
@@ -410,6 +413,10 @@ class Session {
 			Number.isInteger(frame.max_output_tokens) && frame.max_output_tokens >= 1
 				? frame.max_output_tokens
 				: 4096;
+		const contextWindow =
+			Number.isInteger(frame.context_window) && frame.context_window >= 1024
+				? frame.context_window
+				: DEFAULT_CONTEXT_WINDOW;
 		const AgentCtor = await loadAgent(frame);
 		assertInteractive(AgentCtor);
 		this.bridge = await startLlmBridge(this.conn);
@@ -423,7 +430,7 @@ class Session {
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 128000,
+			contextWindow,
 			maxTokens: maxOutputTokens,
 		};
 

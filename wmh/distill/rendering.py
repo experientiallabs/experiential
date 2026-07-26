@@ -18,6 +18,7 @@ tinker-cookbook is an optional extra and is imported lazily
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, cast
 
 from llm_waterfall.types import ChatFunctionCall, ChatMessage, ChatTool, ChatToolCall
@@ -27,6 +28,7 @@ if TYPE_CHECKING:
     from tinker_cookbook.renderers import Renderer
     from tinker_cookbook.renderers.base import Message as RendererMessage
     from tinker_cookbook.renderers.base import RenderedMessage, ToolSpec
+    from tinker_cookbook.renderers.base import ToolCall as RendererToolCall
     from tinker_cookbook.tokenizer_utils import Tokenizer
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,29 @@ class ParsedAssistantMessage(BaseModel):
 
     stopped: bool
     """True when generation terminated cleanly (stop sequence or EOS), False on truncation."""
+
+    unparsed_errors: list[str] = Field(default_factory=list)
+    """Parser complaints for tool calls that could not be decoded and were not salvaged.
+
+    Surfaced (not just logged) so the agent scaffold can feed the complaint back to the model as an
+    observation. A turn whose only tool call failed to parse is NOT a completion: reporting it as
+    plain prose is how a truncated `write_file` became a "submitted" episode with reward 0."""
+
+    salvaged_tool_calls: int = 0
+    """How many of `tool_calls` were recovered from a truncated/unterminated emission."""
+
+    def to_chat_message(self) -> ChatMessage:
+        """This turn as an llm_waterfall assistant message.
+
+        The single place a parsed sample becomes a canonical `ChatMessage`, so
+        the response the agent sees and the assistant turn a conversation
+        replay reconstructs (`wmh.distill.tokens.reconstruct_conversation`)
+        cannot drift apart. Empty text and an empty tool-call list collapse to
+        None, matching the OpenAI-shaped messages the agent sends back.
+        """
+        return ChatMessage(
+            role="assistant", content=self.text or None, tool_calls=self.tool_calls or None
+        )
 
 
 class ChatRendering(Protocol):
@@ -110,6 +135,40 @@ class ChatRendering(Protocol):
     def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
         """Parse sampled token ids into an assistant message (text plus tool calls)."""
         ...
+
+
+_TOOL_CALL_OPEN = "<tool_call>"
+_TOOL_CALL_CLOSE = "</tool_call>"
+
+
+def salvage_truncated_tool_call(text: str) -> str | None:
+    """Close an unterminated trailing tool-call block so a parser can read it.
+
+    A turn cut off at the output-token cap ends mid-emission, so the template's closers are simply
+    absent (`</parameter></function></tool_call>`) and every parser sees plain prose. The reference
+    terminus-2 agent recovers the action instead of discarding the turn; this is the same repair,
+    restricted to appending the closers the emission opened. Nothing is rewritten or guessed: a
+    block that is malformed for any other reason (two `<function=` blocks, a stray `</think>`) still
+    fails to parse afterwards and becomes an explicit parse error the model is told about.
+
+    Args:
+        text: The sampled turn's decoded text.
+
+    Returns:
+        The repaired text, or None when there is no unterminated tool-call block to repair (no
+        opener, the last opener is already closed, or no function name was emitted yet).
+    """
+    open_at = text.rfind(_TOOL_CALL_OPEN)
+    if open_at < 0 or text.rfind(_TOOL_CALL_CLOSE) > open_at:
+        return None
+    block = text[open_at:].rstrip()
+    if "<function=" not in block:
+        return None
+    if block.rfind("<parameter=") > block.rfind("</parameter>"):
+        block += "\n</parameter>"
+    if block.rfind("<function=") > block.rfind("</function>"):
+        block += "\n</function>"
+    return text[:open_at] + block + f"\n{_TOOL_CALL_CLOSE}"
 
 
 def _text_content(content: JsonValue) -> str:
@@ -177,6 +236,17 @@ def renderer_messages_from_chat(messages: list[ChatMessage]) -> list[RendererMes
             ]
         out.append(renderer_msg)
     return out
+
+
+def _chat_tool_calls(calls: Sequence[RendererToolCall]) -> list[ChatToolCall]:
+    """Cookbook renderer tool calls as llm_waterfall chat tool calls."""
+    return [
+        ChatToolCall(
+            id=tc.id or f"call_{index}",
+            function=ChatFunctionCall(name=tc.function.name, arguments=tc.function.arguments),
+        )
+        for index, tc in enumerate(calls)
+    ]
 
 
 def tool_specs_from_chat(tools: list[ChatTool]) -> list[ToolSpec]:
@@ -399,46 +469,116 @@ class CookbookChatRendering:
 
         Thinking parts are rendered back inline as `<think>...</think>` so the
         parsed text round-trips the decoded sample exactly (the cookbook's
-        `parse_content_blocks` preserves whitespace). Tool calls the renderer
-        could not parse are dropped with a warning, matching the cookbook's
-        LiteLLM provider.
+        `parse_content_blocks` preserves whitespace).
+
+        A turn whose tool call the renderer could not read is NOT reported as
+        plain prose. First the truncation repair runs
+        (`salvage_truncated_tool_call`, re-parsed through this same renderer, so
+        an emission cut off at the output cap still yields its action); when that
+        recovers nothing, the parser's own complaints are surfaced on
+        `unparsed_errors` for the scaffold to feed back to the model. The
+        RECORDED token span is never touched by any of this: the repair exists
+        only to read an action out of the turn, so the training data stays a
+        verbatim prefix of the episode.
         """
         message, termination = self._renderer.parse_response(sampled_ids)
-        content = message["content"]
-        if isinstance(content, str):
-            text = content
-        else:
-            fragments: list[str] = []
-            for part in content:
-                if part["type"] == "thinking":
-                    fragments.append("<think>" + part["thinking"] + "</think>")
-                elif part["type"] == "text":
-                    fragments.append(part["text"])
-                else:
-                    raise ValueError(
-                        "sampled response contained a non-text content part "
-                        f"({part['type']!r}); the tinker provider is text-only"
-                    )
-            text = "".join(fragments)
-        tool_calls = [
-            ChatToolCall(
-                id=tc.id or f"call_{index}",
-                function=ChatFunctionCall(name=tc.function.name, arguments=tc.function.arguments),
-            )
-            for index, tc in enumerate(message.get("tool_calls") or [])
-        ]
-        unparsed = message.get("unparsed_tool_calls") or []
-        if unparsed:
+        text = self._message_text(message)
+        tool_calls = _chat_tool_calls(message.get("tool_calls") or [])
+        unparsed_errors = [item.error for item in message.get("unparsed_tool_calls") or []]
+        salvaged = 0
+        if not tool_calls:
+            tool_calls, unparsed_errors, salvaged = self._salvage(text, unparsed_errors)
+        if unparsed_errors and not tool_calls:
             logger.warning(
-                "dropping %d tool call(s) the renderer could not parse: %s",
-                len(unparsed),
-                "; ".join(item.error for item in unparsed),
+                "no tool call could be read from a sampled turn (%d parser complaint(s): %s); "
+                "the scaffold feeds this back to the model instead of ending the episode",
+                len(unparsed_errors),
+                "; ".join(unparsed_errors),
             )
         # is_clean, not is_stop_sequence: some renderers (e.g. role_colon) report a
         # clean end-of-turn via the model's EOS token, which must not read as truncation.
         return ParsedAssistantMessage(
-            text=text, tool_calls=tool_calls, stopped=termination.is_clean
+            text=text,
+            tool_calls=tool_calls,
+            stopped=termination.is_clean,
+            unparsed_errors=unparsed_errors,
+            salvaged_tool_calls=salvaged,
         )
+
+    def _message_text(self, message: RendererMessage) -> str:
+        """The parsed turn's text, with thinking rendered back inline."""
+        content = message["content"]
+        if isinstance(content, str):
+            return content
+        fragments: list[str] = []
+        for part in content:
+            if part["type"] == "thinking":
+                fragments.append("<think>" + part["thinking"] + "</think>")
+            elif part["type"] == "text":
+                fragments.append(part["text"])
+            else:
+                raise ValueError(
+                    "sampled response contained a non-text content part "
+                    f"({part['type']!r}); the tinker provider is text-only"
+                )
+        return "".join(fragments)
+
+    def _salvage(
+        self, text: str, unparsed_errors: list[str]
+    ) -> tuple[list[ChatToolCall], list[str], int]:
+        """Recover a tool call from an unterminated emission, through this renderer.
+
+        Args:
+            text: The parsed turn's text (an unclosed `<tool_call>` block survives here as text,
+                which is exactly the emission to repair).
+            unparsed_errors: Parse complaints the first pass already produced.
+
+        Returns:
+            The recovered calls, the errors to report, and how many calls were salvaged. When
+            nothing is recoverable the errors are returned unchanged, except that an unterminated
+            block that still fails to parse contributes its own complaint.
+        """
+        repaired = salvage_truncated_tool_call(text)
+        if repaired is None:
+            return [], unparsed_errors, 0
+        tokenizer = self._renderer.tokenizer
+        try:
+            # The end-of-turn framing is part of the repair: renderers skip block parsing
+            # entirely on a turn they read as truncated (`if not termination.is_clean:
+            # return`), so without it the re-parse hands the whole emission back as prose.
+            repaired_ids = [
+                *tokenizer.encode(repaired, add_special_tokens=False),
+                *self._end_of_turn_ids(),
+            ]
+            message, _ = self._renderer.parse_response(repaired_ids)
+        except Exception as exc:  # noqa: BLE001 - salvage is best effort; report, never raise
+            return [], [*unparsed_errors, f"truncated tool call could not be salvaged: {exc}"], 0
+        salvaged_calls = _chat_tool_calls(message.get("tool_calls") or [])
+        if salvaged_calls:
+            logger.info(
+                "salvaged %d tool call(s) from a tool-call emission that was cut off before its "
+                "closing tags; the episode continues instead of ending as a completion",
+                len(salvaged_calls),
+            )
+            return salvaged_calls, [], len(salvaged_calls)
+        errors = [item.error for item in message.get("unparsed_tool_calls") or []] or [
+            "tool-call block was left unterminated and could not be repaired"
+        ]
+        return [], [*unparsed_errors, *errors], 0
+
+    def _end_of_turn_ids(self) -> list[int]:
+        """Token ids that mark one assistant turn as cleanly ended, per the renderer.
+
+        Taken from the renderer's own stop sequences (token ids for the Qwen/Nemotron families,
+        strings for the plainer templates), so no template framing is hardcoded here.
+        """
+        stops = self._renderer.get_stop_sequences()
+        if not stops:
+            return []
+        first = stops[0]
+        if isinstance(first, int):
+            return [first]
+        return list(self._renderer.tokenizer.encode(first, add_special_tokens=False))
 
 
 def build_renderer(base_model: str, tokenizer: RendererTokenizer) -> CookbookChatRendering:
