@@ -603,7 +603,9 @@ def _select2(
     return best
 
 
-def run_round9(name: str, matrix: OutcomeMatrix, seeds: list[int]) -> None:
+def run_round9(
+    name: str, matrix: OutcomeMatrix, seeds: list[int], *, oracle2_only: bool = False
+) -> None:
     drv = _driver()
     embeddings = load_embeddings(matrix)
     task_vecs = _task_vectors(name, matrix)
@@ -649,8 +651,9 @@ def run_round9(name: str, matrix: OutcomeMatrix, seeds: list[int]) -> None:
         }
 
         arms = [("r2-oracle2-cascade", oracle_stats, None, "oracle2")]
-        arms.append(("r2-cascade2", cheap_stat_from(gain_scores), gain_scores, "two-signal"))
-        if seed == 0:
+        if not oracle2_only:
+            arms.append(("r2-cascade2", cheap_stat_from(gain_scores), gain_scores, "two-signal"))
+        if seed == 0 and not oracle2_only:
             sh_scores, _sc = _oof_gain_scores(matrix, fit_ids, embeddings, seed, cheap, strong)
             keys = list(sh_scores)
             values = shuffled_rewards(np.asarray([sh_scores[k] for k in keys]), seed)
@@ -987,13 +990,14 @@ def main() -> None:
     oracle_only = "--oracle-only" in args
     round9 = "--round9" in args
     round10 = "--round10" in args
+    oracle2_only = "--oracle2-only" in args
     drv = _driver()
     matrices = drv._matrices()
     for name in wanted:
         if round10:
             run_round10(name, matrices[name], seeds)
         elif round9:
-            run_round9(name, matrices[name], seeds)
+            run_round9(name, matrices[name], seeds, oracle2_only=oracle2_only)
         else:
             run_matrix(name, matrices[name], seeds, oracle_only=oracle_only)
 
