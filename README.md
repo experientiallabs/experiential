@@ -1,8 +1,8 @@
 # World Model Optimizer
 
-`wmo` is an open-source project for running and building continuously improving agents. It gives you
-one OpenAI-compatible endpoint that routes each request to the cheapest model that can handle it,
-measured on your own traces.
+`wmo` turns agent traces you already collect into continuous improvement. Start with a model
+endpoint at frontier quality with 40%+ lower cost. Keep improving it with world model simulations,
+meta-harness optimization, and model distillation.
 
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
@@ -26,8 +26,15 @@ wmo providers set
 ```bash
 wmo build --file traces.jsonl --name my-endpoint
 
+# Score every registered model on held-out tasks from your traces. One full episode per
+# (model, task), 20 tasks by default, so it costs real API calls: it estimates and confirms
+# first. --traces is needed again because the build does not keep the corpus it read.
 wmo optimize route sweep my-endpoint --pool .wmo/pool.toml \
-  --traces traces.otel.jsonl --out matrix.json
+  --traces traces.otel.jsonl --out matrix.json --scenarios 20
+
+# Turn those measurements into a policy. --kind knn is the validated one; the flag still
+# defaults to rank. --fallback is what a request gets unless the evidence says a cheaper
+# model handles it. --out must be the path serve reads, or you get a server with no routing.
 wmo optimize route fit matrix.json --kind knn --fallback gpt-5.5 \
   --out .wmo/models/my-endpoint/policy.json
 ```
@@ -46,7 +53,7 @@ wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
 ```
 
 Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md), serve
-a single model with no routing via `wmo optimize route pin`, or optimize the agent scaffold with
+a single model with no routing via `wmo optimize route pin`, or build an optimized harness for your agent with
 `wmo optimize harness`.
 
 ### Hosted platform
@@ -76,6 +83,8 @@ wmo optimize harness my-agent my-environment --tasks tasks.jsonl --backend e2b
 ```
 
 ## Use a world model as an API
+
+`world-model-optimizer` includes world models that can be used to simulate your agent environment for testing and optimization.
 
 ```python
 from wmo import Action, ActionKind
