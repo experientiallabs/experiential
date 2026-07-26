@@ -14,24 +14,23 @@ meta-harness optimization, and model distillation.
 
 ## Getting started
 
-**1. Register your models.**
+**1. Register your providers.**
 
 ```bash
 pip install world-model-optimizer
 wmo providers set
 ```
 
-**2. Tune a router on your traces.**
+**2. Tune a router on your OTel traces.**
 
 ```bash
 wmo build --file traces.jsonl --name my-endpoint
 
 # Score every registered model on held-out tasks from your traces
-wmo optimize route sweep my-endpoint --pool .wmo/pool.toml \
-  --traces traces.otel.jsonl --out matrix.json
+wmo optimize route sweep my-endpoint --traces traces.otel.jsonl
 
 # Turn those measurements into a routing policy
-wmo optimize route fit matrix.json --kind knn --fallback gpt-5.5 \
+wmo optimize route fit matrix.json --kind knn \
   --out .wmo/models/my-endpoint/policy.json
 ```
 
