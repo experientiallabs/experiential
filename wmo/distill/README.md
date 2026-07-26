@@ -1,4 +1,4 @@
-# `wmh.distill`
+# `wmo.distill`
 
 Distill a smaller student from a larger teacher on real agent tasks, training a Tinker LoRA and
 gating whether the adapter is promoted. Three modes, in descending order of maturity.
@@ -11,7 +11,7 @@ The student samples episodes, the teacher scores the student's own sampled token
 `compute_logprobs`, and the per-token gap drives the update. Shipped and measured.
 
 ```bash
-wmh optimize model run --config run.toml --run-dir runs/d1 \
+wmo optimize model run --config run.toml --run-dir runs/d1 \
   --task-ids train.json --holdout-task-ids holdout.json --backend e2b --yes
 ```
 
@@ -51,7 +51,7 @@ OpenAI-compatible endpoint. Alignment is by byte boundary: the student's tokens 
 chunks whose byte spans the teacher's tokenization also respects, and advantages are computed per
 chunk rather than per token.
 
-**Not runnable on this build.** `wmh/distill/xtoken/` is present but inert (no importers), and the
+**Not runnable on this build.** `wmo/distill/xtoken/` is present but inert (no importers), and the
 runtime rejects `teacher.backend = "openai_compat"` even though the config schema validates it.
 PR #258 activates the path.
 

@@ -1736,7 +1736,7 @@ class _RunBudget:
 
 UNWIRED_TEACHER_BACKEND = (
     'teacher.backend = "openai_compat" (chunk alignment) validates but is not wired up on '
-    "this build: the byte-aligned chunk scorer in wmh.distill.xtoken has no caller yet, so "
+    "this build: the byte-aligned chunk scorer in wmo.distill.xtoken has no caller yet, so "
     "the loop would score this teacher through Tinker with same-tokenizer alignment and "
     'ignore teacher.endpoint entirely. Set teacher.backend = "tinker" with a '
     "Tinker-lineup teacher that shares the student's tokenizer (dropping teacher.endpoint, "
