@@ -499,18 +499,6 @@ class _SampledTurn(BaseModel):
     parsed: ParsedAssistantMessage
 
 
-class _PromptBuild(BaseModel):
-    """One built prompt plus the message boundary it was built at (internal).
-
-    `delta_start` is the single source of truth for the delta boundary: the
-    token suffix is rendered from it and the recorded `TokenSpan.delta_messages`
-    is sliced at it, so the message delta and the token delta cannot disagree.
-    """
-
-    prompt_token_ids: list[int]
-    delta_start: int
-
-
 @dataclass
 class _PromptState:
     """The provider's last successful call, for incremental prompt extension.

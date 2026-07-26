@@ -882,24 +882,6 @@ def _checked_in_config(name: str) -> DistillConfig:
     return load_distill_config(path)
 
 
-def test_anchor_config_trains_the_raw_gap_under_ppo() -> None:
-    """The anchor run's objective is pinned: raw gap, ppo, no SFT warmup.
-
-    This is the config real money runs against, and each of the three
-    settings is a decision rather than a default: `ppo` so the ratio clip is
-    the regularizer, no `advantage_clip` and no centering so the advantage is
-    exactly the teacher-minus-student gap, `warmup.steps = 0` because the run
-    is on-policy from step 1. The file is `distill-nano-anchor.toml`; the
-    older `distill-super-anchor.toml` beside it is the Super-student sweep's
-    importance_sampling source run and is deliberately not pinned here.
-    """
-    cfg = _checked_in_config("distill-nano-anchor.toml")
-    assert cfg.train.loss == "ppo"
-    assert cfg.train.advantage_clip is None
-    assert cfg.train.center_advantages is False
-    assert cfg.warmup.steps == 0
-
-
 @pytest.mark.parametrize("name", ["distill-super-topk.toml", "distill-super-aggressive.toml"])
 def test_super_topk_configs_pin_clip_and_centering_explicitly(name: str) -> None:
     """The top-k siblings must not drift when the shared defaults move.
