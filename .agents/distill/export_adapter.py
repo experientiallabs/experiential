@@ -27,8 +27,10 @@ Usage (from the distill worktree root; venv has tinker + tinker_cookbook):
   # old adapter before loading the next one)
   .venv/bin/python .agents/distill/export_adapter.py --unload pi-step-0040
 
-TINKER_API_KEY is taken from the environment, falling back to
-platform/.env.local (never printed).
+TINKER_API_KEY is taken from the environment. If it is unset, the script reads
+it from an env file (never printed): ``$WMO_ENV_FILE`` when set, otherwise
+``<repo>/.env.local`` and then ``<repo>/../platform/.env.local``. A missing env
+file is only a warning; the hard failure is the key itself being unavailable.
 
 Server ops (box h100-dev-box-6, azureuser@40.80.93.150):
   start:  tmux new-session -d -s nemotron-serve \
@@ -57,19 +59,42 @@ DEFAULT_HOST = "azureuser@40.80.93.150"
 DEFAULT_REMOTE_DIR = "/nvme/lora-adapters"
 DEFAULT_PORT = 8100
 BOX_EXPORT_PY = "/nvme/work/nemotron-serve/.export-venv/bin/python"
-ENV_LOCAL = Path("/Users/admin/Documents/experientiallabs/platform/.env.local")
+
+# Env file that can supply TINKER_API_KEY when the environment does not. Resolved from the
+# repo, never from one machine's home directory: an explicit override first, then this
+# checkout's own .env.local, then the sibling platform checkout that holds the shared keys.
+ENV_FILE_VAR = "WMO_ENV_FILE"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _env_file_candidates() -> list[Path]:
+    """Env files to search for TINKER_API_KEY, most specific first."""
+    override = os.environ.get(ENV_FILE_VAR)
+    if override:
+        return [Path(override).expanduser()]
+    return [REPO_ROOT / ".env.local", REPO_ROOT.parent / "platform" / ".env.local"]
 
 
 def _ensure_tinker_api_key() -> None:
+    """Put TINKER_API_KEY in the environment, reading an env file only as a fallback."""
     if os.environ.get("TINKER_API_KEY"):
         return
-    if ENV_LOCAL.exists():
-        for line in ENV_LOCAL.read_text().splitlines():
+    candidates = _env_file_candidates()
+    for path in candidates:
+        if not path.exists():
+            print(f"note: no env file at {path}")
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
             m = re.match(r"^(?:export\s+)?TINKER_API_KEY=(.*)$", line.strip())
             if m:
                 os.environ["TINKER_API_KEY"] = m.group(1).strip().strip("'\"")
                 return
-    sys.exit("TINKER_API_KEY not set and not found in platform/.env.local")
+        print(f"note: {path} exists but has no TINKER_API_KEY line")
+    searched = ", ".join(str(path) for path in candidates)
+    sys.exit(
+        "TINKER_API_KEY is not set. Export it, add a TINKER_API_KEY=... line to one of "
+        f"{searched}, or point {ENV_FILE_VAR} at an env file that has one."
+    )
 
 
 def _slug(tinker_path: str) -> str:

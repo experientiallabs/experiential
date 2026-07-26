@@ -10,8 +10,12 @@ the same `knn_decision` serving calls. If the numbers move, the promotion change
 Split identity is proven, not assumed: the stratified 70/30 split is reimplemented here (the
 research helper lives on the feat/routing-research branch, not on main) and every seed's fit/test
 sizes and best-single baseline accuracy are checked against the recorded runs in
-`~/Desktop/Projects/wmo-routing-data/runs/r1.jsonl`. Query embeddings come from R1's cached
-text-embedding-3-large vectors, so no text is re-embedded.
+`<routing-data>/runs/r1.jsonl`. Query embeddings come from R1's cached text-embedding-3-large
+vectors, so no text is re-embedded.
+
+The routing data (`runs/`, `matrices/`, `cache/`) is a multi-GB research corpus that is not in
+git. It defaults to the gitignored `.wmo/routing-data/` under the repo root; point
+`$WMO_ROUTING_DATA` at it if you keep it elsewhere.
 
 Usage:
     uv run python .agents/scripts/validate_knn_promotion.py            # ours9 gate + curves
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import statistics
 import sys
@@ -40,11 +45,32 @@ FAILURES: list[str] = []
 
 logger = logging.getLogger("validate-knn")
 
-DATA = Path("~/Desktop/Projects/wmo-routing-data").expanduser()
+ENV_ROUTING_DATA = "WMO_ROUTING_DATA"
+# The corpus is untracked research data, so it defaults to the gitignored .wmo/ artifact root of
+# whatever checkout this script runs from; ENV_ROUTING_DATA moves it anywhere else.
+DEFAULT_ROUTING_DATA = Path(__file__).resolve().parents[2] / ".wmo" / "routing-data"
 SEEDS = [0, 1, 2, 3, 4]
 # The champion's measured result, as recorded in runs/r1.jsonl (variant r1-knn-statz05-oai).
 CHAMPION_DELTA = 0.0104
 DELTA_TOLERANCE = 0.003
+
+
+def routing_data() -> Path:
+    """Root of the routing research corpus, holding `runs/`, `matrices/`, and `cache/`.
+
+    Raises:
+        SystemExit: if the corpus is not where the environment says it is, naming the
+            directory that is missing and the variable that redirects the lookup.
+    """
+    override = os.environ.get(ENV_ROUTING_DATA)
+    root = Path(override).expanduser() if override else DEFAULT_ROUTING_DATA
+    if not root.is_dir():
+        raise SystemExit(
+            f"routing corpus not found at {root}. It is multi-GB research data that git does "
+            f"not carry: set {ENV_ROUTING_DATA} to the directory holding runs/, matrices/, and "
+            "cache/, or place the corpus at that default path."
+        )
+    return root
 
 
 def stratified_split(
@@ -122,7 +148,7 @@ def baseline_on_test(matrix: OutcomeMatrix, model: str, test_ids: list[str]) -> 
 def recorded_runs(variant: str, matrix_name: str) -> dict[int, dict[str, float]]:
     """Per-seed headline numbers R1 recorded for `variant`, keyed by split seed."""
     out: dict[int, dict[str, float]] = {}
-    with (DATA / "runs" / "r1.jsonl").open(encoding="utf-8") as handle:
+    with (routing_data() / "runs" / "r1.jsonl").open(encoding="utf-8") as handle:
         for line in handle:
             record = json.loads(line)
             if (
@@ -144,8 +170,9 @@ def recorded_runs(variant: str, matrix_name: str) -> dict[int, dict[str, float]]
 
 def ours9_gate(*, se_floor: bool) -> None:
     """The gate: 5 seeds of routerbench-ours9 through fit_knn_policy + evaluate_policy."""
-    matrix = OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json")
-    embedder = CachedEmbedder(matrix, DATA / "cache" / "routerbench-ours9-oai3l-tasks.npy")
+    data = routing_data()
+    matrix = OutcomeMatrix.load(data / "matrices" / "routerbench-ours9_matrix.json")
+    embedder = CachedEmbedder(matrix, data / "cache" / "routerbench-ours9-oai3l-tasks.npy")
     spec = EmbedderSpec(
         kind="azure", dim=embedder.dim, deployment="text-embedding-3-large", endpoint="https://x"
     )
@@ -225,8 +252,9 @@ def ours9_gate(*, se_floor: bool) -> None:
 
 def confidence_curve(matrix_name: str, cache_name: str, *, rag_num: int, fallback: str) -> None:
     """Routed-away fraction and quality/cost as the z knob tightens, with `fallback` pinned."""
-    matrix = OutcomeMatrix.load(DATA / "matrices" / f"{matrix_name}_matrix.json")
-    embedder = CachedEmbedder(matrix, DATA / "cache" / cache_name)
+    data = routing_data()
+    matrix = OutcomeMatrix.load(data / "matrices" / f"{matrix_name}_matrix.json")
+    embedder = CachedEmbedder(matrix, data / "cache" / cache_name)
     spec = EmbedderSpec(
         kind="azure", dim=embedder.dim, deployment="text-embedding-3-large", endpoint="https://x"
     )

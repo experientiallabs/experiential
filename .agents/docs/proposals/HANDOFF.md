@@ -3,8 +3,8 @@
 > **STATUS 2026-07-04: EXPERIMENT COMPLETE.** The ablation ran end-to-end; the hypothesis was
 > NOT supported — bc-random (36.5% success / 0.581 pass-rate) ≥ bc-mined (22.2% / 0.488) ≥/≈
 > base (27.0% / 0.425) on the 21 held-out scenarios, k=3, gpt-5.4 WM, Opus 4.8 judge; no paired
-> comparison reaches p<0.05 at n=21. Full numbers + verdict in the journal
-> (`~/Documents/claas-verl/experiments/tau/07_03_2026_wm-mined-scenario-distill.md`) and the
+> comparison reaches p<0.05 at n=21. Full numbers + verdict in the journal (the claas-verl repo,
+> `experiments/tau/07_03_2026_wm-mined-scenario-distill.md`) and the
 > PR #81 comment. Everything below is kept for provenance.
 
 You are taking over an autonomous experiment mid-flight. Read this whole file, verify the live
@@ -20,19 +20,19 @@ experiment the PR needs; earlier work only showed the pipeline runs end-to-end.
 
 ## 2. Where things live
 
-- **Repo (worktree):** `/Users/admin/Documents/experientiallabs/world-model-optimizer-scenario-construction`
-  branch `feature/scenario-set-construction`, PR #81 (`gh pr view 81`). HEAD = `5a6e881`.
+- **Repo (worktree):** a worktree of this repo on branch `feature/scenario-set-construction`,
+  PR #81 (`gh pr view 81`). HEAD = `5a6e881`. Every path below is relative to that root.
   Run `uv run ruff check . && uv run ty check && uv run pytest -q` before any commit (repo rule;
   AGENTS.md governs). `.agents/` is the disposable workspace — experiment scripts + results live
   under `.agents/scripts/` and `.agents/docs/research/distill/`.
-- **Experiment journal:** `~/Documents/claas-verl/experiments/tau/07_03_2026_wm-mined-scenario-distill.md`
-  (append results here; claas-verl is a separate git repo — the RL training stack).
+- **Experiment journal:** `experiments/tau/07_03_2026_wm-mined-scenario-distill.md` in the
+  claas-verl repo (append results there; claas-verl is a separate checkout, the RL stack).
 - **GPU box:** `azureuser@4.154.170.26` (NOT .179 — that's a typo in an earlier instruction),
   2×H100. **GPU 0 is the user's `qwen35pilot` tmux — DO NOT TOUCH.** GPU 1 is ours. Real disk is
   `/mnt/azureuser` (251 GB); `/data` is an empty decoy; root has ~5 GB free (LoRA adapters only).
-- **Credentials:** map is in your memory file
-  `~/.claude/projects/-Users-admin-Documents-experientiallabs/memory/platform-secrets-env-local.md`.
-  Never print key values. The scripts load keys themselves (see `collect_teacher.py::_load_gemini_key`).
+- **Credentials:** map is in this project's agent memory, file
+  `memory/platform-secrets-env-local.md`. Never print key values. The scripts load keys
+  themselves (see `collect_teacher.py::_load_gemini_key`).
 
 ## 3. The approved model stack (the user was very specific — do not substitute)
 

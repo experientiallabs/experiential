@@ -22,8 +22,9 @@ R1's own `r1-knn3-asym-lam*` rows (same family, no novelty floor) and the R3 `r3
 sweep that motivated the lam range (a DIFFERENT family: kNN-P probabilities under a fixed-margin
 guard over hashing embeddings, which is why its numbers do not transfer).
 
-Split identity, the embedding cache, and the recorded-run loaders are reused from
-`validate_knn_promotion.py` rather than copied, so the two gates cannot drift apart.
+Split identity, the embedding cache, the recorded-run loaders, and the routing-corpus location
+are reused from `validate_knn_promotion.py` rather than copied, so the two gates cannot drift
+apart. That corpus is untracked research data: see `$WMO_ROUTING_DATA` in the sibling gate.
 
 Usage:
     uv run python .agents/scripts/validate_cost_quality.py
@@ -54,7 +55,6 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("validate-cost-quality")
 
 PROMOTION_GATE = Path(__file__).with_name("validate_knn_promotion.py")
-DATA = Path("~/Desktop/Projects/wmo-routing-data").expanduser()
 SEEDS = [0, 1, 2, 3, 4]
 SHIPPED_FLOOR_Q = 0.05  # the `wmo optimize route fit` default, i.e. dial 0.25
 # Every advertised anchor, plus one position on each leg whose only claim is that it sits
@@ -90,8 +90,9 @@ def recorded_iid(variant: str, params_filter: str | None = None) -> tuple[float,
     """
     deltas: list[float] = []
     costs: list[float] = []
+    runs = _promotion_gate().routing_data() / "runs"  # ty: ignore[unresolved-attribute]
     for name in ("r1.jsonl", "r3.jsonl"):
-        path = DATA / "runs" / name
+        path = runs / name
         if not path.is_file():
             continue
         with path.open(encoding="utf-8") as handle:
@@ -110,15 +111,16 @@ def recorded_iid(variant: str, params_filter: str | None = None) -> tuple[float,
                 deltas.append(record["result"]["accuracy"] - base["accuracy"])
                 costs.append(record["result"]["cost_per_call"] / base["cost_per_call"] - 1.0)
     if not deltas:
-        raise AssertionError(f"no iid rows recorded for variant {variant}")
+        raise AssertionError(f"no iid rows recorded for variant {variant} under {runs}")
     return statistics.mean(deltas) * 100, statistics.mean(costs) * 100, len(deltas)
 
 
 def measure() -> dict[float, tuple[float, float, float]]:
     """Sweep the dial on ours9: dial -> (mean delta points, mean cost percent, routed away)."""
     gate = _promotion_gate()
-    matrix = OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json")
-    embedder = gate.CachedEmbedder(matrix, DATA / "cache" / "routerbench-ours9-oai3l-tasks.npy")  # ty: ignore[unresolved-attribute]
+    data = gate.routing_data()  # ty: ignore[unresolved-attribute]
+    matrix = OutcomeMatrix.load(data / "matrices" / "routerbench-ours9_matrix.json")
+    embedder = gate.CachedEmbedder(matrix, data / "cache" / "routerbench-ours9-oai3l-tasks.npy")  # ty: ignore[unresolved-attribute]
     spec = EmbedderSpec(
         kind="azure", dim=embedder.dim, deployment="text-embedding-3-large", endpoint="https://x"
     )
@@ -181,8 +183,9 @@ def reference_rows() -> None:
     This is the knob-level check; `measure()` covers the operator-facing dial built on top.
     """
     gate = _promotion_gate()
-    matrix = OutcomeMatrix.load(DATA / "matrices" / "routerbench-ours9_matrix.json")
-    embedder = gate.CachedEmbedder(matrix, DATA / "cache" / "routerbench-ours9-oai3l-tasks.npy")  # ty: ignore[unresolved-attribute]
+    data = gate.routing_data()  # ty: ignore[unresolved-attribute]
+    matrix = OutcomeMatrix.load(data / "matrices" / "routerbench-ours9_matrix.json")
+    embedder = gate.CachedEmbedder(matrix, data / "cache" / "routerbench-ours9-oai3l-tasks.npy")  # ty: ignore[unresolved-attribute]
     spec = EmbedderSpec(
         kind="azure", dim=embedder.dim, deployment="text-embedding-3-large", endpoint="https://x"
     )
