@@ -811,7 +811,12 @@ def build_handoff_toml(sampler_path: str, *, base_model: str, endpoint: str | No
             "path returned by save_weights_for_sampler (recorded in the run's "
             "checkpoints.json and model card)"
         )
-    resolved_endpoint = endpoint if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
+    # Stripped before it is STORED, not just before it is classified. `is_tinker_endpoint`
+    # tolerates surrounding whitespace so a pasted URL still gets Tinker's credential and
+    # output-budget defaults, but the entry's endpoint becomes the OpenAI client's base_url
+    # verbatim, so persisting the padded string would classify correctly and then fail every
+    # routed call on an unusable URL.
+    resolved_endpoint = endpoint.strip() if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
     budget_field = (
         STUDENT_CHAT_MAX_TOKENS_FIELD
         if is_tinker_endpoint(resolved_endpoint)
@@ -969,7 +974,12 @@ def student_pool_entry(
             "routable student needs the path save_weights_for_sampler returned (recorded in the "
             "run's checkpoints.json and model card)"
         )
-    resolved_endpoint = endpoint if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
+    # Stripped before it is STORED, not just before it is classified. `is_tinker_endpoint`
+    # tolerates surrounding whitespace so a pasted URL still gets Tinker's credential and
+    # output-budget defaults, but the entry's endpoint becomes the OpenAI client's base_url
+    # verbatim, so persisting the padded string would classify correctly and then fail every
+    # routed call on an unusable URL.
+    resolved_endpoint = endpoint.strip() if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
     on_tinker = is_tinker_endpoint(resolved_endpoint)
     if api_key_env is None and on_tinker:
         api_key_env = STUDENT_API_KEY_ENV

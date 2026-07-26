@@ -770,3 +770,46 @@ def test_only_the_schemes_own_default_port_is_redundant() -> None:
     assert _normalize_endpoint("https://h.example/v1") != _normalize_endpoint(
         "https://h.example:80/v1"
     )
+
+
+@pytest.mark.parametrize("padded", ["  {}  ", "\t{}\n", "{} "])
+def test_a_padded_endpoint_is_stripped_before_it_is_stored(padded: str) -> None:
+    """Classification tolerates whitespace, so storage must remove it, not preserve it.
+
+    The entry's endpoint becomes the OpenAI client's `base_url` verbatim. Persisting the padded
+    string would pick Tinker's defaults correctly and then fail every routed call on a URL the
+    client cannot use.
+    """
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint=padded.format(DEFAULT_TINKER_OPENAI_ENDPOINT),
+    )
+
+    assert entry.endpoint == DEFAULT_TINKER_OPENAI_ENDPOINT
+    assert entry.api_key_env == "TINKER_API_KEY"  # still classified as Tinker
+
+
+def test_a_padded_custom_endpoint_is_also_stripped() -> None:
+    entry = student_pool_entry(
+        _card(),
+        name="s",
+        input_per_mtok=0.1,
+        output_per_mtok=0.4,
+        endpoint="  https://my-vllm.example/v1  ",
+    )
+
+    assert entry.endpoint == "https://my-vllm.example/v1"
+    assert entry.api_key_env is None  # and still a custom host
+
+
+def test_a_padded_endpoint_is_stripped_in_the_handoff_snippet() -> None:
+    text = build_handoff_toml(
+        "tinker://w/1", base_model="Qwen/Qwen3-8B", endpoint=f"  {DEFAULT_TINKER_OPENAI_ENDPOINT} "
+    )
+    parsed = tomllib.loads(text)
+
+    assert parsed["models"]["agent"]["endpoint"] == DEFAULT_TINKER_OPENAI_ENDPOINT
+    assert parsed["models"]["agent"]["chat_max_tokens_field"] == "max_tokens"
