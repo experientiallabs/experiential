@@ -217,9 +217,30 @@ tags = ["smoke", "tb2"]
 
 
 def test_compaction_true_rejected(tmp_path: Path) -> None:
+    # Rejected for a different reason than the ephemeral-reasoning history drops
+    # reasoning: compaction rewrites history from unrecorded state, so a recorded
+    # span can no longer be attributed to the conversation that produced it.
     text = MINIMAL_TOML + "\n[rollout]\ncompaction = true\n"
-    with pytest.raises(ValueError, match="prefix property"):
+    with pytest.raises(ValueError, match="rewrites the chat history mid-episode"):
         load_distill_config(_write(tmp_path, text))
+
+
+def test_observation_clip_defaults_to_the_documented_margin(tmp_path: Path) -> None:
+    """The clip is a config field with a default, not a constant in the renderer."""
+    cfg = load_distill_config(_write(tmp_path, MINIMAL_TOML))
+    assert cfg.rollout.observation_clip_tokens == 2000
+    pinned = load_distill_config(
+        _write(tmp_path, MINIMAL_TOML + "\n[rollout]\nobservation_clip_tokens = 512\n")
+    )
+    assert pinned.rollout.observation_clip_tokens == 512
+    off = load_distill_config(
+        _write(tmp_path, MINIMAL_TOML + "\n[rollout]\nobservation_clip_tokens = 0\n")
+    )
+    assert off.rollout.observation_clip_tokens == 0
+    with pytest.raises(ValueError, match="observation_clip_tokens"):
+        load_distill_config(
+            _write(tmp_path, MINIMAL_TOML + "\n[rollout]\nobservation_clip_tokens = -1\n")
+        )
 
 
 @pytest.mark.parametrize("steps", [0, 1, 5])

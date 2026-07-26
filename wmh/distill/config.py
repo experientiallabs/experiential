@@ -189,6 +189,29 @@ class RolloutConfig(BaseModel):
     below the served window, or a full-budget prompt plus its output cap exceeds the window and
     the sampling call 400s."""
 
+    observation_clip_tokens: int = Field(default=2000, ge=0)
+    """Per-command terminal-output clip, in tokens; 0 disables it.
+
+    A command batch's observation is clipped to this many tokens (head plus tail, with a marker
+    naming the dropped count) when the wmh verbatim renderers build the prompt, which is where the
+    SAMPLING prompt is built, so the recorded `prompt_token_ids` training consumes already carry the
+    clip. The conversation's opening message (task instruction plus initial terminal state) is never
+    clipped.
+
+    2,000 is a margin, not a squeeze. Measured over one TerminalBench-2 run: 770 observations,
+    median 349 tokens, p90 1,222, max 6,096, so the clip touches only the tail. Harbor's own
+    per-observation cap (`Terminus2._limit_output_length`) is 10,000 BYTES, far too loose in token
+    terms to bound that tail. It exists for the output-heavy episode the ephemeral-reasoning history
+    alone does not rescue (`make-mips-interpreter`: 64,228 -> 62,086 tokens against a usable 65,530
+    ceiling, its context being terminal output rather than reasoning).
+
+    **Must be identical in every arm of a comparison.** The clip changes what the model reads, so a
+    baseline arm and a post-training arm measured under different values are not measuring the same
+    task; that reintroduces from the other side exactly the comparability problem the context
+    ceiling caused. One run config feeds every arm's rollouts through
+    `wmh.distill.rollouts.terminus_2_agent_kwargs`, which is what makes this hold within a run;
+    across runs, compare only runs that pin the same value."""
+
     renderers: dict[str, str] = Field(default_factory=dict)
     """Per-base-model override of the chat renderer terminus-2's `TinkerLLM` builds prompts with,
     keyed by the base model name (`student.base_model`, `teacher.model`). A model with no entry
@@ -205,15 +228,15 @@ class RolloutConfig(BaseModel):
     `nemotron3`, `nemotron3_ultra` and `qwen3_5` (the auto renderer for both Qwen3.5 and Qwen3.6)
     return that content as a LIST of thinking/text parts, which harbor's
     `TerminusJSONPlainParser` raises `TypeError` on, killing the trial before it grades anything.
-    Those same renderers also strip the thinking block when they re-render an assistant turn that
-    is no longer last, so turn N+1's prompt diverges from turn N's and EVERY turn becomes its own
-    datum fragment, at a cost quadratic in turn count (2.7x the tokens at 6 turns, 7.8x at 20,
-    15.1x at 40).
-
     What to name here: the wmh VERBATIM renderer for every Nemotron-3 or Qwen3.5/3.6 model in the
-    run. `wmh.distill.renderers` wraps each reasoning renderer so the parser sees a plain `str`
-    of the action text while the model's own reasoning is replayed into history token for token,
-    which fixes both failures at once and keeps the episode a single datum:
+    run. `wmh.distill.renderers` wraps each reasoning renderer so the parser sees a plain `str` of
+    the action text while the turn's own sampled ids ride along, and a historical turn replays those
+    ids MINUS its reasoning ("verbatim content, ephemeral reasoning"). The model still thinks fully
+    on every turn and the run still trains on those reasoning tokens; they are simply not re-sent in
+    every later prompt, which is what keeps long episodes inside the context ceiling (see the module
+    docstring for the measured trials). The cost is that each turn is its own training datum, so
+    shared context is re-prefilled per turn, at a volume quadratic in turn count (2.7x the tokens at
+    6 turns, 7.8x at 20, 15.1x at 40):
 
         [rollout.renderers]
         "Qwen/Qwen3.5-9B" = "wmh/qwen3_5_verbatim"
@@ -274,21 +297,24 @@ class RolloutConfig(BaseModel):
     @field_validator("compaction")
     @classmethod
     def _reject_compaction(cls, value: bool) -> bool:
-        """Reject compaction: it breaks the prefix property the cost model relies on.
+        """Reject compaction: it rewrites history the recorded spans cannot follow.
 
-        Every turn's prompt must extend the previous turn's tokens verbatim so
-        prefill work amortizes across turns and sampled spans stay aligned for
-        teacher scoring. Compacting mid-rollout rewrites the prefix, so each
-        later turn would be a full re-prefill and issued spans would no longer
-        appear verbatim in the episode tokens.
+        Distinct from the ephemeral-reasoning history the wmh verbatim renderers
+        apply, which is a fixed, per-message rule the SAMPLING prompt is built
+        under, so every recorded prompt matches what was trained on. Compaction
+        rewrites earlier messages mid-episode, from state no artifact records, so
+        a recorded span's prompt can no longer be attributed to the conversation
+        that produced it and the sampled spans stop appearing verbatim in the
+        episode tokens at all.
         """
         if value:
             raise ValueError(
                 "rollout.compaction = true is not supported: compaction rewrites the "
-                "token prefix mid-episode, breaking the prefix property that keeps "
-                "prefill costs amortized across turns and sampled spans verbatim in "
-                "the episode; set compaction = false (episodes that outgrow "
-                "context_budget_tokens are dropped whole from training instead)"
+                "chat history mid-episode from state no artifact records, so sampled "
+                "spans stop appearing verbatim in the episode tokens and cannot be "
+                "attributed to the conversation that produced them; set "
+                "compaction = false (episodes that outgrow context_budget_tokens are "
+                "dropped whole from training instead)"
             )
         return value
 

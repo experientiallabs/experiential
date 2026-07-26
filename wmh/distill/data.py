@@ -9,6 +9,16 @@ prompt is not such an extension starts a new datum (a fragment), which is
 correct but re-prefills shared context; the fragmentation rate is therefore a
 first-class cost metric, not a curiosity.
 
+Under the ephemeral-reasoning history these runs sample with
+(`wmh.distill.renderers`: a historical turn replays without its reasoning) that
+extension test fails at every turn boundary that had a `</think>`, so the
+normal shape is ONE DATUM PER TURN and a fragmentation rate near 1. That is
+correct and intended, not a defect to chase: each datum is a self-contained
+prompt-to-completion pair whose `sampled_logprobs` were measured under exactly
+the context it carries. Each datum also records WHICH spans it covers
+(`TrainDatum.span_indices`), which is what lets the cross-tokenizer teacher
+score a per-turn datum against the conversation as it stood for that turn.
+
 Alignment is sacred: episodes are never truncated (that would desynchronize
 tokens from their sampled logprobs), only dropped whole and counted, both for
 context overflow (any call measured over `rollout.context_budget_tokens`, or
@@ -85,6 +95,21 @@ class TrainDatum(BaseModel):
 
     fragment_index: int = Field(ge=0)
     """0-based index of this datum within its episode; > 0 means a prefix break."""
+
+    span_indices: list[int] = Field(default_factory=list)
+    """Positions (0-based, in call order) of the trial's spans this datum covers.
+
+    One entry per contiguous sampled run in `loss_mask`, in the same order, so
+    `span_indices[i]` is the span that produced run i (`sampled_runs`). A span
+    that sampled nothing produces no run and appears in no datum, which keeps
+    that one-to-one correspondence exact.
+
+    This is the datum's provenance, and the cross-tokenizer path needs it: with
+    one datum per turn, scoring a datum means re-rendering the conversation as
+    it stood for THAT turn, and only the span mapping says which turn that is.
+    Empty means the datum was built without provenance (constructed directly
+    rather than by `_merge_trial_spans`); consumers that need it must say so and
+    skip, never guess."""
 
     model_input_tokens: list[int]
     """The full unshifted token sequence (context deltas plus sampled spans)."""
@@ -179,7 +204,12 @@ class DatumStats(BaseModel):
     """Datums beyond the first of their episode (each one is a prefix break)."""
 
     fragmentation_rate: float = Field(ge=0.0, le=1.0)
-    """fragments / datums; every fragment re-prefills context, so this is cost."""
+    """fragments / datums; every fragment re-prefills context, so this is cost.
+
+    Near 1.0 is the EXPECTED reading under the ephemeral-reasoning history the
+    wmh verbatim renderers apply (one datum per turn, module docstring), where it
+    reads as the price of keeping long episodes inside the context ceiling. It is
+    a defect signal only for a run whose renderers do hold the prefix property."""
 
     overflow_drops: int = Field(ge=0)
     """Trials dropped for context overflow (measured or stop-reason marked)."""
@@ -242,8 +272,11 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
         spans: The trial's recorded spans, in any order (sorted by call_index).
 
     Returns:
-        The episode's datums in order: one when every prompt extended the
-        accumulated tokens as a prefix, more when the history was edited. A
+        The episode's datums in order: one per turn under the
+        ephemeral-reasoning history (every prompt drops the previous turn's
+        reasoning, so no prompt extends the accumulated tokens), one for the
+        whole episode when every prompt did extend them, and the mixture in
+        between. Each datum records the spans it covers in `span_indices`. A
         fragment containing no sampled tokens (possible only when a span
         sampled nothing) carries no trainable signal and is skipped.
     """
@@ -251,9 +284,11 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
     tokens: list[int] = []
     mask: list[float] = []
     logprobs: list[float] = []
+    covered: list[int] = []
 
     def flush() -> None:
         if not tokens:
+            covered.clear()
             return
         if not any(value == 1.0 for value in mask):
             logger.debug(
@@ -266,6 +301,7 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
                 TrainDatum(
                     trial_name=trial_name,
                     fragment_index=len(datums),
+                    span_indices=list(covered),
                     model_input_tokens=list(tokens),
                     loss_mask=list(mask),
                     sampled_logprobs=list(logprobs),
@@ -274,8 +310,9 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
         tokens.clear()
         mask.clear()
         logprobs.clear()
+        covered.clear()
 
-    for span in sorted(spans, key=lambda item: item.call_index):
+    for position, span in enumerate(sorted(spans, key=lambda item: item.call_index)):
         prompt = span.prompt_token_ids
         if tokens and _is_prefix(tokens, prompt):
             delta = prompt[len(tokens) :]
@@ -288,6 +325,10 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
         tokens.extend(span.sampled_token_ids)
         mask.extend([1.0] * len(span.sampled_token_ids))
         logprobs.extend(span.sampled_logprobs)
+        # Only a span that sampled something produces a run, so only those are
+        # recorded: `span_indices` stays one-to-one with the datum's sampled runs.
+        if span.sampled_token_ids:
+            covered.append(position)
     flush()
     return datums
 
@@ -301,8 +342,10 @@ def build_datums(
     each span's prompt extends the accumulated tokens (previous prompt plus
     previous sampled tokens) exactly as a list prefix; the appended context
     delta gets loss mask 0.0 and sampled tokens get 1.0. A non-prefix span
-    starts a new datum (fragment). Two whole-episode drops protect alignment
-    and cost, never truncation:
+    starts a new datum (fragment), and under the ephemeral-reasoning history
+    that is every span, so the normal output is one datum per TURN (module
+    docstring). Two whole-episode drops protect alignment and cost, never
+    truncation:
 
     - context overflow: any recorded call whose prompt plus sampled tokens
       exceeds `cfg.rollout.context_budget_tokens` (measured from the spans),
@@ -378,10 +421,13 @@ def build_datums(
         context_tokens=context_tokens,
     )
     if stats.fragments:
-        logger.warning(
-            "%d of %d datum(s) are fragments (fragmentation rate %.2f): the agent "
-            "edited its history mid-episode, so shared context is re-prefilled and "
-            "teacher scoring costs multiply; check the harness prefix pins",
+        logger.info(
+            "%d of %d datum(s) are fragments (fragmentation rate %.2f): each one "
+            "re-prefills its shared context and costs its own teacher scoring call. "
+            "Expected near 1.0 under the ephemeral-reasoning history (one datum per "
+            "turn, which is what keeps long episodes inside the context ceiling); a "
+            "nonzero rate under a prefix-preserving renderer means the agent edited "
+            "its history mid-episode instead, so check the harness prefix pins",
             stats.fragments,
             stats.datums,
             stats.fragmentation_rate,
@@ -504,6 +550,7 @@ def attach_advantages(
         TrainDatum(
             trial_name=datum.trial_name,
             fragment_index=datum.fragment_index,
+            span_indices=datum.span_indices,
             model_input_tokens=datum.model_input_tokens,
             loss_mask=datum.loss_mask,
             sampled_logprobs=datum.sampled_logprobs,
@@ -702,6 +749,7 @@ def build_topk_ce_datums(
                 TrainDatum(
                     trial_name=datum.trial_name,
                     fragment_index=datum.fragment_index,
+                    span_indices=datum.span_indices,
                     model_input_tokens=datum.model_input_tokens,
                     loss_mask=datum.loss_mask,
                     sampled_logprobs=datum.sampled_logprobs,

@@ -7,16 +7,22 @@ transport stubbed by a scripted sampler, and the recorded token spans then go
 through the REAL `wmh.distill.data.build_datums`. Nothing here talks to Tinker,
 E2B or the network beyond loading a cached tokenizer.
 
-Four invariants are what this module exists to protect:
+Five invariants are what this module exists to protect:
 
 1. tokens-in-tokens-out: the loss-mask-1.0 ids are exactly the recorded
    completion ids, concatenated;
-2. the prefix property: every turn's prompt extends the previous prompt plus
-   its sampled tokens, so an episode is ONE datum;
-3. the reasoning survives exactly once, inside the loss mask and nowhere in the
-   mask-0 context;
+2. verbatim content, ephemeral reasoning: a turn's reasoning is in its OWN
+   loss mask and in no later prompt, while its action content is replayed into
+   history as the exact ids the sampler issued. The episode is therefore one
+   datum PER TURN, which is the deliberate cost of the context it saves;
+3. the sampling prompt and the training prompt are the same tokens: what the
+   sampler saw is what the datum trains on, so `sampled_logprobs` describe the
+   sequence they are attached to. This is the one way to get the change silently
+   wrong, so it is asserted rather than assumed;
 4. harbor's terminus-2 parsers accept the content, including when the model's
-   reasoning itself contains a JSON blob that looks like an action.
+   reasoning itself contains a JSON blob that looks like an action;
+5. a per-command observation is clipped to `rollout.observation_clip_tokens`
+   with its head, tail and a marker kept, and the task instruction never is.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from wmh.distill.data import build_datums
 from wmh.distill.renderers import (
     NEMOTRON3_ULTRA_VERBATIM,
     NEMOTRON3_VERBATIM,
+    OBSERVATION_CLIP_MARKER,
     QWEN3_5_VERBATIM,
     QWEN3_VERBATIM,
     VERBATIM_RENDERERS,
@@ -82,6 +89,8 @@ REASONING_RENDERERS = [
 
 TURNS = 6
 COMMANDS = ["ls -la\n", "make\n", "cat src/parser.c\n", "make\n", "./run_tests.sh\n", "echo ok\n"]
+_OBSERVATION_HEAD = "=== first line of the observation ==="
+_FILLER_LINE = "gcc -c -O2 -Wall -Wextra -Isrc -o build/obj/unit"
 REASONING = [
     "The terminal is at a fresh prompt in /app and nothing has run yet, so I should list the "
     "files before deciding anything.",
@@ -239,6 +248,17 @@ class _Episode:
     command_counts: list[int]
     keystrokes: list[list[str]]
     tokenizer: object
+    histories: list[list[dict[str, object]]]
+    """The message list each turn was sampled from, exactly as harbor's
+    `TinkerLLM.call` assembles it (the chat history plus this turn's user
+    message), so a test can re-render a turn's prompt the way training would."""
+
+    renderer_name: str
+    base_model: str
+
+    def text(self, token_ids: Sequence[int]) -> str:
+        """Decode ids keeping the template's special tokens."""
+        return str(self.tokenizer.decode(list(token_ids), skip_special_tokens=False))  # ty: ignore[unresolved-attribute]
 
     @property
     def spans(self) -> list[TokenSpan]:
@@ -274,10 +294,26 @@ def _run_episode(
     fmt: str = "json",
     script: Sequence[str] | None = None,
     truncate_turn: int | None = None,
+    observation_clip_tokens: int = 0,
+    observation_filler: int = 0,
+    instruction: str = "Fix the build in /app and make the tests pass.",
 ) -> _Episode:
-    """Drive a synthetic terminus-2 episode through real harbor code."""
+    """Drive a synthetic terminus-2 episode through real harbor code.
+
+    Args:
+        base_model: The Tinker lineup model whose tokenizer and renderer run.
+        renderer_name: The registered renderer terminus-2 resolves.
+        fmt: `json` or `xml`, selecting the terminus-2 response parser.
+        script: Per-turn assistant bodies; defaults to `_script(fmt=fmt)`.
+        truncate_turn: Turn index to cut off mid-answer (no stop token).
+        observation_clip_tokens: The per-observation clip the renderers are
+            registered with; 0 disables it.
+        observation_filler: How many filler lines each command observation
+            carries, for driving the clip.
+        instruction: The opening user message (never an observation).
+    """
     _tokenizer_or_skip(base_model)
-    register_verbatim_renderers()
+    register_verbatim_renderers(observation_clip_tokens)
     bodies = list(script) if script is not None else _script(fmt=fmt)
     llm = _ScriptedTinkerLLM(
         script=bodies,
@@ -289,18 +325,32 @@ def _run_episode(
     )
     chat = Chat(llm)
     parser = TerminusJSONPlainParser() if fmt == "json" else TerminusXMLPlainParser()
-    prompt = "Fix the build in /app and make the tests pass."
+    prompt = instruction
     errors: list[str] = []
     counts: list[int] = []
     keystrokes: list[list[str]] = []
+    histories: list[list[dict[str, object]]] = []
     for index in range(len(bodies)):
+        # Exactly what `TinkerLLM.call` renders: the chat history so far plus
+        # this turn's user message.
+        histories.append(
+            [
+                {"role": message.get("role", "user"), "content": message.get("content", "")}
+                for message in chat.messages
+            ]
+            + [{"role": "user", "content": prompt}]
+        )
         response = asyncio.run(chat.chat(prompt))
         result = parser.parse_response(response.content)
         errors.append(result.error)
         counts.append(len(result.commands))
         keystrokes.append([command.keystrokes for command in result.commands])
         feedback = f"\n\nERROR: {result.error}" if result.error else ""
-        prompt = f"root@host:/app# {COMMANDS[index]}\n(output of turn {index})\n" + feedback
+        filler = "".join(f"{_FILLER_LINE} {line}\n" for line in range(observation_filler))
+        prompt = (
+            f"root@host:/app# {COMMANDS[index]}\n{_OBSERVATION_HEAD}\n"
+            f"{filler}(output of turn {index})\n" + feedback
+        )
     details = chat.rollout_details[0]
     return _Episode(
         prompts=[list(ids) for ids in details["prompt_token_ids"]],
@@ -309,6 +359,9 @@ def _run_episode(
         command_counts=counts,
         keystrokes=keystrokes,
         tokenizer=llm._renderer.tokenizer,
+        histories=histories,
+        renderer_name=renderer_name,
+        base_model=base_model,
     )
 
 
@@ -387,15 +440,38 @@ def test_the_mixin_comes_first_in_every_mro(renderer_class: type) -> None:
 
 
 @pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
-def test_each_registered_renderer_builds_and_claims_the_extension_property(
+def test_each_registered_renderer_builds_and_disclaims_the_extension_property(
     base_model: str, renderer_name: str
 ) -> None:
-    """`get_renderer` must resolve the name against the model's real tokenizer."""
+    """`get_renderer` must resolve the name against the model's real tokenizer.
+
+    The extension property is deliberately NOT claimed: turn N's reasoning is
+    absent from turn N+1's prompt, so the prompts are not prefixes of one
+    another. The cookbook's own merge paths gate on this flag, so reporting True
+    would merge sequences that are not extensions.
+    """
     tokenizer = _tokenizer_or_skip(base_model)
     register_verbatim_renderers()
     renderer = get_renderer(renderer_name, tokenizer)  # ty: ignore[invalid-argument-type]
     assert isinstance(renderer, VerbatimHistoryMixin)
-    assert renderer.has_extension_property
+    assert not renderer.has_extension_property
+
+
+@pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
+def test_the_registered_factory_carries_the_configured_observation_clip(
+    base_model: str, renderer_name: str
+) -> None:
+    """The clip reaches the renderer through registration, not a global.
+
+    That is what makes one config value apply identically in every arm: every
+    rollout path builds its renderer from this registry (see
+    `wmh.distill.rollouts.terminus_2_agent_kwargs`).
+    """
+    tokenizer = _tokenizer_or_skip(base_model)
+    register_verbatim_renderers(1234)
+    assert get_renderer(renderer_name, tokenizer).observation_clip_tokens == 1234  # ty: ignore[invalid-argument-type, unresolved-attribute]
+    register_verbatim_renderers()
+    assert get_renderer(renderer_name, tokenizer).observation_clip_tokens == 0  # ty: ignore[invalid-argument-type, unresolved-attribute]
 
 
 def test_is_known_renderer_accepts_wmh_and_builtin_names_and_rejects_typos() -> None:
@@ -413,17 +489,31 @@ def test_is_known_renderer_accepts_wmh_and_builtin_names_and_rejects_typos() -> 
 
 def test_verbatim_content_is_a_string_that_survives_copies() -> None:
     """The ids ride from parse_response to render_message inside harbor's own plumbing."""
-    content = VerbatimContent('{"analysis": "a"}', [11, 22, 33])
+    content = VerbatimContent('{"analysis": "a"}', [11, 22, 33], 2)
     assert isinstance(content, str)
     assert content == '{"analysis": "a"}'
     assert json.dumps({"content": content}) == '{"content": "{\\"analysis\\": \\"a\\"}"}'
-    assert copy.copy(content).ids == [11, 22, 33]
-    assert copy.deepcopy(content).ids == [11, 22, 33]
-    assert pickle.loads(pickle.dumps(content)).ids == [11, 22, 33]
+    for survivor in (
+        copy.copy(content),
+        copy.deepcopy(content),
+        pickle.loads(pickle.dumps(content)),
+    ):
+        assert survivor.ids == [11, 22, 33]
+        # The reasoning boundary has to survive too: a copy that forgot it would
+        # replay the reasoning back into history.
+        assert survivor.content_start == 2
+        assert survivor.content_ids == [33]
     # Derived strings lose the ids, which is the safe direction: a turn whose ids
     # were lost re-renders through the base renderer instead of emitting wrong tokens.
     assert not hasattr(content.strip(), "ids")
     assert not hasattr(f"{content}", "ids")
+
+
+def test_verbatim_content_with_no_reasoning_block_replays_whole() -> None:
+    """content_start 0 means nothing was dropped, so every id replays."""
+    content = VerbatimContent("plain", [7, 8, 9])
+    assert content.content_start == 0
+    assert content.content_ids == [7, 8, 9]
 
 
 def test_verbatim_content_copies_the_ids_it_is_given() -> None:
@@ -444,35 +534,85 @@ def test_loss_mask_ids_are_exactly_the_recorded_completions(
     """TITO: the tokens trained on are the tokens the sampler returned, in order.
 
     Anything else means the loss and the sampled logprobs describe different
-    sequences, which no metric downstream would reveal.
+    sequences, which no metric downstream would reveal. The merge is now one
+    datum per turn, so the check runs over the datums CONCATENATED: every
+    sampled id is trained on exactly once, reasoning included, and nothing else
+    is.
     """
     episode = _run_episode(base_model, renderer_name)
     datums = _datums(episode)
-    assert len(datums) == 1
-    trained = [
-        token
-        for token, weight in zip(datums[0].model_input_tokens, datums[0].loss_mask, strict=True)
-        if weight == 1.0
-    ]
+    trained = [token for datum in datums for token in datum.sampled_token_ids()]
     expected = [token for completion in episode.completions for token in completion]
     assert trained == expected
     assert len(trained) == sum(len(completion) for completion in episode.completions)
+    # Per datum, too: a datum's loss mask covers its own turn's completion whole.
+    for datum, completion in zip(datums, episode.completions, strict=True):
+        assert datum.sampled_token_ids() == completion
 
 
-# -- invariant 2: the prefix property ------------------------------------------------------------
+# -- invariant 2: verbatim content, ephemeral reasoning ------------------------------------------
 
 
 @pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
-def test_every_turn_extends_the_previous_one_so_the_episode_is_one_datum(
+def test_every_turn_is_its_own_datum_because_history_drops_its_reasoning(
     base_model: str, renderer_name: str
 ) -> None:
-    """The whole cost model: one datum per episode, not one per turn."""
+    """The deliberate reversal: prompt(N+1) is no longer an extension of turn N.
+
+    Turn N's reasoning is not in turn N+1's prompt, so the prefix test fails at
+    every boundary and the episode becomes one datum per turn. That is the
+    accepted cost (re-prefilled context, quadratic in turns) of episodes that
+    stay inside the context ceiling; each datum is still a self-contained
+    prompt-to-completion pair, and each one records which span it holds.
+    """
     episode = _run_episode(base_model, renderer_name)
     assert len(episode.prompts) == TURNS
-    assert episode.prefix_breaks() == []
+    assert episode.prefix_breaks() == list(range(1, TURNS))
     datums = _datums(episode)
-    assert len(datums) == 1
-    assert datums[0].fragment_index == 0
+    assert len(datums) == TURNS
+    assert [datum.fragment_index for datum in datums] == list(range(TURNS))
+    assert [datum.span_indices for datum in datums] == [[turn] for turn in range(TURNS)]
+    # Each datum is exactly its turn's recorded call: that prompt, then that
+    # completion, and nothing else.
+    for datum, prompt, completion in zip(datums, episode.prompts, episode.completions, strict=True):
+        assert datum.model_input_tokens == [*prompt, *completion]
+        assert datum.loss_mask == [0.0] * len(prompt) + [1.0] * len(completion)
+
+
+@pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
+def test_a_historical_turn_replays_its_exact_action_ids_without_its_reasoning(
+    base_model: str, renderer_name: str
+) -> None:
+    """The mechanism, at renderer level: which ids a history turn contributes.
+
+    The replayed ids must be a SUFFIX of the sampled ids (never a re-encoding of
+    decoded text, which could retokenize differently) and must start after the
+    turn's `</think>`.
+    """
+    tokenizer = _tokenizer_or_skip(base_model)
+    register_verbatim_renderers()
+    renderer = get_renderer(renderer_name, tokenizer)  # ty: ignore[invalid-argument-type]
+    body = _script(turns=1)[0]
+    # The Qwen3.5/Nemotron generation header prefills `<think>\n`, so the sampled
+    # ids start inside the block, exactly as the sampler would return them.
+    sampled = list(
+        tokenizer.encode(  # ty: ignore[unresolved-attribute]
+            body.split("<think>\n", 1)[1], add_special_tokens=False
+        )
+    ) + [renderer._end_message_token]  # noqa: SLF001 - the stop token the sampler appends
+    message, termination = renderer.parse_response(sampled)
+    assert termination.is_clean
+    content = message["content"]
+    assert isinstance(content, VerbatimContent)
+
+    close_think = renderer.close_think_ids  # ty: ignore[unresolved-attribute]
+    assert content.content_start == sampled.index(close_think[0]) + len(close_think)
+    # A suffix of the sampled ids, so nothing was re-encoded.
+    assert content.content_ids == sampled[len(sampled) - len(content.content_ids) :]
+    replayed = str(tokenizer.decode(content.content_ids, skip_special_tokens=False))  # ty: ignore[unresolved-attribute]
+    assert REASONING[0] not in replayed
+    assert "</think>" not in replayed
+    assert '"keystrokes": "ls -la\\n"' in replayed
 
 
 @pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
@@ -493,23 +633,94 @@ def test_the_stock_reasoning_renderer_is_the_thing_being_fixed(
         _run_episode(base_model, stock)
 
 
-# -- invariant 3: the reasoning survives, exactly once ---------------------------------------
+@pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
+def test_the_reasoning_is_trained_on_once_and_appears_in_no_prompt(
+    base_model: str, renderer_name: str
+) -> None:
+    """The point of the change: think fully every turn, re-send it never.
+
+    Per turn: that turn's reasoning is inside its own loss mask exactly once, and
+    no prompt in the episode contains any turn's reasoning. The ACTION content of
+    every earlier turn is still there, which is what makes the history usable at
+    all.
+    """
+    episode = _run_episode(base_model, renderer_name)
+    datums = _datums(episode)
+    for turn, datum in enumerate(datums):
+        trained_text = _masked_text(datum, episode.tokenizer, 1.0)
+        context_text = _masked_text(datum, episode.tokenizer, 0.0)
+        assert trained_text.count("</think>") == 1
+        assert trained_text.count(REASONING[turn]) == 1
+        for thought in REASONING[:TURNS]:
+            assert thought not in context_text
+        # Every earlier turn's action survives in the context verbatim.
+        for earlier in range(turn):
+            assert f'"keystrokes": "{COMMANDS[earlier]}"'.replace("\n", "\\n") in context_text
 
 
 @pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
-def test_the_reasoning_is_inside_the_loss_mask_and_never_in_the_context(
+def test_the_context_shrinks_by_the_reasoning_it_no_longer_carries(
     base_model: str, renderer_name: str
 ) -> None:
-    """Kion's requirement: distillation trains on the reasoning, once per turn."""
+    """The measured effect, in miniature: per-turn growth without the reasoning.
+
+    Each prompt grows by (this turn's observation + the previous turn's ACTION),
+    never by the previous turn's reasoning. Asserted as a token count so the test
+    fails if the drop silently stops happening, which decoded-text checks alone
+    would not catch (a re-encoded action could look right and tokenize wrong).
+    """
     episode = _run_episode(base_model, renderer_name)
-    datum = _datums(episode)[0]
-    trained_text = _masked_text(datum, episode.tokenizer, 1.0)
-    context_text = _masked_text(datum, episode.tokenizer, 0.0)
-    assert trained_text.count("</think>") == TURNS
-    assert context_text.count("</think>") == 0
-    for thought in REASONING[:TURNS]:
-        assert trained_text.count(thought) == 1
-        assert thought not in context_text
+    reasoning_tokens = [
+        len(episode.tokenizer.encode(thought, add_special_tokens=False))  # ty: ignore[unresolved-attribute]
+        for thought in REASONING[:TURNS]
+    ]
+    for turn in range(1, TURNS):
+        growth = len(episode.prompts[turn]) - len(episode.prompts[turn - 1])
+        # The previous turn's whole completion (reasoning included) would have
+        # been at least this much bigger.
+        assert growth < len(episode.completions[turn - 1]) + reasoning_tokens[turn - 1]
+
+
+# -- invariant 3: the sampling prompt is the training prompt --------------------------------------
+
+
+@pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
+def test_the_sampling_prompt_and_the_training_prompt_are_the_same_tokens(
+    base_model: str, renderer_name: str
+) -> None:
+    """The one way to get this change silently wrong, closed by assertion.
+
+    If the reasoning drop happened when ASSEMBLING training data rather than when
+    building the sampling prompt, the datum's context would not be the context
+    `sampled_logprobs` were measured under. Importance sampling would then
+    reweight against logprobs that do not describe the sequence, and nothing
+    would error: the run would simply train on mismatched weights.
+
+    Two halves, both required:
+
+    1. every datum's mask-0 prefix IS the recorded prompt of the call it holds
+       (what training consumes is what the sampler consumed);
+    2. re-rendering that call's conversation with a FRESH renderer built from the
+       same name reproduces the recorded prompt id for id and byte for byte, so
+       the drop is a property of the renderer rather than of one instance's
+       state, and no later re-render can diverge from it.
+    """
+    episode = _run_episode(base_model, renderer_name)
+    datums = _datums(episode)
+    tokenizer = _tokenizer_or_skip(base_model)
+    register_verbatim_renderers()
+    fresh = get_renderer(renderer_name, tokenizer)  # ty: ignore[invalid-argument-type]
+
+    for turn, (datum, prompt) in enumerate(zip(datums, episode.prompts, strict=True)):
+        context = [
+            token
+            for token, weight in zip(datum.model_input_tokens, datum.loss_mask, strict=True)
+            if weight == 0.0
+        ]
+        assert context == prompt, f"turn {turn}: the datum's context is not the sampled prompt"
+        rerendered = fresh.build_generation_prompt(episode.histories[turn]).to_ints()  # ty: ignore[invalid-argument-type]
+        assert rerendered == prompt, f"turn {turn}: re-render diverged from the sampled prompt"
+        assert episode.text(rerendered).encode("utf-8") == episode.text(prompt).encode("utf-8")
 
 
 # -- invariant 4: harbor's parsers accept the content ------------------------------------------
@@ -529,7 +740,7 @@ def test_the_xml_parser_reads_every_turn() -> None:
     episode = _run_episode(QWEN3_5_MODEL, QWEN3_5_VERBATIM, fmt="xml")
     assert episode.errors == [""] * TURNS
     assert all(count >= 1 for count in episode.command_counts)
-    assert episode.prefix_breaks() == []
+    assert len(_datums(episode)) == TURNS
 
 
 @pytest.mark.parametrize(("base_model", "renderer_name"), REASONING_RENDERERS)
@@ -559,15 +770,18 @@ def test_reasoning_that_contains_a_json_action_never_reaches_the_parser(
     assert all(count == 1 for count in episode.command_counts)
     assert [keys[0] for keys in episode.keystrokes] == COMMANDS[:TURNS]
     assert all("rm -rf /\n" not in keys for keys in episode.keystrokes)
-    assert episode.prefix_breaks() == []
-    assert len(_datums(episode)) == 1
+    assert len(_datums(episode)) == TURNS
+    # The decoy, which lives in the reasoning, reaches no later prompt either.
+    for prompt in episode.prompts:
+        assert "decoy" not in episode.text(prompt)
 
 
 def test_a_turn_that_never_stopped_is_not_carried_verbatim() -> None:
     """A truncated turn has no stop token, so replaying its ids would corrupt the context.
 
-    It falls back to the base renderer, which is visible downstream as a prefix
-    break, and is counted by `RolloutStats.truncated_spans`.
+    It falls back to the base renderer, which re-renders it from text rather than
+    from the ids the sampler issued, and is counted by
+    `RolloutStats.truncated_spans`.
     """
     tokenizer = _tokenizer_or_skip(QWEN3_5_MODEL)
     register_verbatim_renderers()
@@ -577,3 +791,107 @@ def test_a_turn_that_never_stopped_is_not_carried_verbatim() -> None:
     message, termination = renderer.parse_response(ids)
     assert not termination.is_clean
     assert not isinstance(message["content"], VerbatimContent)
+
+
+def test_a_turn_with_no_reasoning_block_replays_verbatim_and_still_merges() -> None:
+    """No `</think>` means nothing to drop, so that boundary keeps the old behavior.
+
+    The turn replays under its OWN sampling header with all of its ids, so
+    prompt(N+1) really does extend prompt(N) plus sampled(N) and the two turns
+    merge into ONE datum. Worth pinning twice over: it is the branch that proves
+    the fragmentation is caused by the reasoning drop and nothing else, and it is
+    why a datum can hold more than one span (hence `span_indices`, plural).
+    """
+    # Qwen3.5's generation header prefills `<think>\n`, so a turn that never
+    # emits `</think>` is a turn whose sampled ids carry no boundary at all.
+    unclosed = [f"<think>\nturn {index} never closes its reasoning" for index in range(2)]
+    episode = _run_episode(QWEN3_5_MODEL, QWEN3_5_VERBATIM, script=unclosed)
+    assert episode.prefix_breaks() == []
+    datums = _datums(episode)
+    assert len(datums) == 1
+    assert datums[0].span_indices == [0, 1]
+
+    # An EMPTY think block still leaves a `</think>` in the sampled ids, so the
+    # drop fires and the boundary breaks, exactly as for real reasoning.
+    empty_block = [
+        f"<think>\n\n</think>\n\n{_json_action(index, COMMANDS[index], complete=False)}"
+        for index in range(2)
+    ]
+    assert _run_episode(QWEN3_5_MODEL, QWEN3_5_VERBATIM, script=empty_block).prefix_breaks() == [1]
+
+
+# -- invariant 5: the per-command observation clip -----------------------------------------------
+
+
+def test_a_long_observation_is_clipped_to_the_configured_budget() -> None:
+    """Head, tail and a marker survive; the middle is dropped and named."""
+    budget = 200
+    episode = _run_episode(
+        QWEN3_5_MODEL,
+        QWEN3_5_VERBATIM,
+        observation_clip_tokens=budget,
+        observation_filler=400,
+    )
+    unclipped = _run_episode(
+        QWEN3_5_MODEL, QWEN3_5_VERBATIM, observation_clip_tokens=0, observation_filler=400
+    )
+    # Growth per turn is bounded by the clip plus the marker and the replayed
+    # action, so the whole episode stays far shorter than the unclipped one.
+    assert len(episode.prompts[-1]) < len(unclipped.prompts[-1]) / 2
+
+    later = episode.text(episode.prompts[2])
+    assert "tokens of terminal output omitted" in later
+    assert _OBSERVATION_HEAD in later, "the head of the observation is kept"
+    assert "(output of turn 0)" in later, "the tail of the observation is kept"
+    assert later.count(_FILLER_LINE) < 400, "the middle is dropped"
+    # The clip is bounded: one observation's own tokens cannot exceed the budget
+    # plus the marker, however long the command printed.
+    marker_tokens = len(
+        episode.tokenizer.encode(  # ty: ignore[unresolved-attribute]
+            OBSERVATION_CLIP_MARKER.format(dropped=999_999), add_special_tokens=False
+        )
+    )
+    growth = len(episode.prompts[2]) - len(episode.prompts[1])
+    assert growth <= budget + marker_tokens + len(episode.completions[1])
+
+
+def test_the_task_instruction_is_never_clipped() -> None:
+    """The opening message is not an observation; clipping it would change the task."""
+    instruction = "Fix the build in /app. " + " ".join(
+        f"Requirement {index}: keep every acceptance criterion." for index in range(300)
+    )
+    episode = _run_episode(
+        QWEN3_5_MODEL, QWEN3_5_VERBATIM, observation_clip_tokens=50, instruction=instruction
+    )
+    for prompt in episode.prompts:
+        assert instruction in episode.text(prompt)
+        assert "Requirement 299" in episode.text(prompt)
+
+
+def test_a_short_observation_is_left_alone() -> None:
+    """Under budget means untouched: no marker, nothing dropped."""
+    episode = _run_episode(QWEN3_5_MODEL, QWEN3_5_VERBATIM, observation_clip_tokens=2000)
+    text = episode.text(episode.prompts[-1])
+    assert "omitted" not in text
+    for turn in range(TURNS - 1):
+        assert f"(output of turn {turn})" in text
+
+
+def test_the_clip_is_stable_across_the_turns_that_replay_it() -> None:
+    """A clipped observation must clip identically every time it is re-rendered.
+
+    Otherwise the training prompt of a later turn would disagree with the one the
+    sampler saw for THAT turn, which is the same silent mismatch the reasoning
+    drop has to avoid: every turn's prompt is a fresh full render.
+    """
+    episode = _run_episode(
+        QWEN3_5_MODEL, QWEN3_5_VERBATIM, observation_clip_tokens=120, observation_filler=300
+    )
+    tokenizer = _tokenizer_or_skip(QWEN3_5_MODEL)
+    register_verbatim_renderers(120)
+    fresh = get_renderer(QWEN3_5_VERBATIM, tokenizer)  # ty: ignore[invalid-argument-type]
+    for turn, prompt in enumerate(episode.prompts):
+        assert fresh.build_generation_prompt(episode.histories[turn]).to_ints() == prompt  # ty: ignore[invalid-argument-type]
+    # Turn 0's clipped observation is still byte-identical in the last prompt.
+    first = episode.text(episode.prompts[1]).split("<|im_start|>user\n")[-1]
+    assert first.split("<|im_end|>")[0] in episode.text(episode.prompts[-1])

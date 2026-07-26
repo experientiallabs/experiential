@@ -211,8 +211,7 @@ class ChunkAdvantageStats(BaseModel):
     """Loss tokens no chunk covered; these keep advantage 0.0."""
 
     clipped_chunks: int = Field(ge=0)
-    """Chunks whose per-token advantage hit the clip bound before centering;
-    always 0 when `train.advantage_clip` is None (clipping off)."""
+    """Chunks whose per-token advantage hit the clip bound before centering."""
 
     chunk_reverse_kl: float | None
     """`mean(student_lp - teacher_lp)` over scored loss tokens, the
@@ -220,10 +219,7 @@ class ChunkAdvantageStats(BaseModel):
     when nothing was scored."""
 
     advantage_mean: float | None
-    """Mean advantage over scored loss tokens exactly as trained (after any
-    clipping and any centering). With both off (the defaults) it is the mean
-    chunk gap, so it reads the objective; under `train.center_advantages` it
-    is ~0.0 by construction."""
+    """Mean advantage over scored loss tokens after clipping and centering."""
 
     advantage_std: float | None
     """Population standard deviation over the same tokens."""
@@ -241,11 +237,15 @@ def _chunk_totals(
     teacher_logprobs: Sequence[float | None],
     clip: float | None,
 ) -> tuple[list[float], int] | None:
-    """Per-chunk totals for one datum, or None when the teacher row fails.
+    """Per-chunk clipped totals for one datum, or None when the teacher row fails.
 
     Returns `(totals, clipped)` where `totals[i]` is chunk i's contribution
-    after per-token clipping, and `clipped` counts chunks that hit the bound
-    (`clip=None` clips nothing, so `clipped` is 0).
+    after per-token clipping, and `clipped` counts chunks that hit the bound.
+
+    `clip` of None disables clipping entirely and reports zero clipped chunks,
+    which is what `train.advantage_clip = None` means. The same-tokenizer lane
+    made that field optional, so typing it as a bare float here would raise
+    TypeError on a perfectly valid config rather than train unclipped.
     """
     totals: list[float] = []
     clipped_count = 0
@@ -287,10 +287,9 @@ def attach_chunk_advantages(
 ) -> tuple[list[TrainDatum], ChunkAdvantageStats]:
     """Fill per-token advantages from chunk-aligned teacher logprobs.
 
-    Each chunk gets `(teacher_sum - student_sum) / student_len` (bounded to
-    `+-train.advantage_clip` when that bound is set; None, the default, clips
-    nothing) broadcast to its student tokens, so the chunk contributes its
-    reverse-KL gap regardless of length. Under `train.center_advantages` the mean over
+    Each chunk gets `clip((teacher_sum - student_sum) / student_len)`
+    broadcast to its student tokens, so the chunk contributes its reverse-KL
+    gap regardless of length. Under `train.center_advantages` the mean over
     CHUNK TOTALS is then subtracted from every chunk's total (see the module
     docstring for why token-level centering would invert long chunks).
     Positions no chunk covers stay at 0.0 and are never centered.
@@ -301,8 +300,8 @@ def attach_chunk_advantages(
         teacher_logprobs: One per-position teacher logprob row per datum, in
             the teacher's OWN tokenization (length `teacher_token_count`);
             entry p is the logprob of teacher token p given tokens before it.
-        cfg: The run config; reads `train.advantage_clip` (None = no
-            clipping) and `train.center_advantages`.
+        cfg: The run config; reads `train.advantage_clip` and
+            `train.center_advantages`.
 
     Returns:
         New datums with advantages attached (drops removed, order preserved)
@@ -399,6 +398,7 @@ def attach_chunk_advantages(
             TrainDatum(
                 trial_name=datum.trial_name,
                 fragment_index=datum.fragment_index,
+                span_indices=datum.span_indices,
                 model_input_tokens=datum.model_input_tokens,
                 loss_mask=datum.loss_mask,
                 sampled_logprobs=datum.sampled_logprobs,

@@ -10,6 +10,7 @@ with a stub since no cookbook renderer exists for the fake base model.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import threading
@@ -22,6 +23,10 @@ import pytest
 from llm_waterfall.types import ChatMessage, ChatTool
 
 import wmh.distill.loop as loop_module
+import wmh.distill.xtoken.chunks as xtoken_chunks
+import wmh.distill.xtoken.plan as xtoken_plan
+import wmh.distill.xtoken.prompt_logprobs as xtoken_prompt_logprobs
+import wmh.distill.xtoken.teacher_render as xtoken_render
 import wmh.providers.tinker as providers_tinker
 
 if TYPE_CHECKING:
@@ -93,10 +98,11 @@ from wmh.distill.store import AdapterStore, DistillRunStore
 from wmh.distill.teacher import EncodingTokenizer
 from wmh.distill.tokens import TrialRecord
 from wmh.distill.tracking import DistillTracker
+from wmh.distill.xtoken.chunks import ChunkAdvantageStats
 from wmh.harness.doc import HarnessDoc
 from wmh.harness.runtime import StopReason
 from wmh.harness.scoring import GradedTests
-from wmh.providers.base import ProviderConfig, ProviderKind
+from wmh.providers.base import ProviderConfig, ProviderKind, VerifyResult
 from wmh.providers.tinker import SampledSequenceLike, TokenSpan
 
 _NAME = "distill-loop-test"
@@ -269,6 +275,9 @@ class _RolloutCall:
     task_ids: tuple[str, ...]
     attempts: int
     provider_model: str
+    provider: ProviderConfig
+    """The whole provider config, for the tests that assert its kind and endpoint."""
+
     run_dir: Path
     doc_hash: str
 
@@ -353,6 +362,7 @@ class _FakeRollouts:
                     task_ids=tuple(task_ids),
                     attempts=cfg.train.group_size,
                     provider_model=provider_config.model,
+                    provider=provider_config,
                     run_dir=run_dir,
                     doc_hash=harness.doc_hash,
                 )
@@ -404,6 +414,7 @@ class _FakeRollouts:
                 task_ids=tuple(task_ids),
                 attempts=cfg.train.group_size,
                 provider_model=provider_config.model,
+                provider=provider_config,
                 run_dir=run_dir,
                 doc_hash=harness.doc_hash,
             )
@@ -3310,3 +3321,209 @@ def test_warmup_exercises_concurrency_not_just_one_token() -> None:
     assert all(len(span.sampled_ids) == 1 for span in client.issued), (
         "each warmup stream must stay a single throwaway token"
     )
+
+
+# -- the cross-tokenizer (chunk-aligned) teacher --------------------------------------------------
+
+_SERVED_ENDPOINT = "http://teacher.invalid:8000/v1"
+
+
+def _fake_chunk_advantage_stats(datums: int) -> ChunkAdvantageStats:
+    """Neutral stats for the stubbed chunk path (see `_chunk_stubs`)."""
+    return ChunkAdvantageStats(
+        datums=datums,
+        mismatch_drops=0,
+        empty_coverage_drops=0,
+        chunks=datums,
+        scored_loss_tokens=datums,
+        unscored_loss_tokens=0,
+        clipped_chunks=0,
+        chunk_reverse_kl=0.0,
+        advantage_mean=0.0,
+        advantage_std=0.0,
+    )
+
+
+class _FakeChunkTeacher:
+    """Stands in for the cross-tokenizer HTTP scoring client.
+
+    The real `PromptLogprobClient` reaches a live endpoint in `verify()` and
+    retries on failure, so constructing it against a fake URL would wedge the
+    suite. These tests exercise teacher/train-arm ROUTING, none of which depends
+    on real scoring.
+    """
+
+    def __init__(self) -> None:
+        self.scored: list[list[int]] = []
+
+    def verify(self) -> VerifyResult:
+        return VerifyResult(ok=True, kind=ProviderKind.OPENAI, model=_TEACHER)
+
+    def usage(self) -> int:
+        return 0
+
+    def score(self, token_ids: list[int]) -> list[float | None]:
+        self.scored.append(list(token_ids))
+        return [None] + [-0.5] * (len(token_ids) - 1)
+
+
+def _chunk_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the collaborators the chunk arm needs a live endpoint and a real tokenizer for.
+
+    The alignment itself (render, islands, partition intersection, advantage
+    math) is covered by `chunk_scoring_test.py` and `wmh/distill/xtoken/*_test.py`;
+    what these tests own is which teacher the loop builds, which train arm runs,
+    and which provider the teacher baseline uses.
+    """
+    monkeypatch.setattr(loop_module, "_build_chunk_teacher", lambda _teacher: _FakeChunkTeacher())
+    monkeypatch.setattr(loop_module, "_load_teacher_tokenizer", lambda _teacher: object())
+    monkeypatch.setattr(
+        loop_module,
+        "_chunk_scored_datums",
+        lambda datums, *_args, **_kwargs: (
+            list(datums),
+            [],
+            [],
+            loop_module._ChunkScoringStats(scored=len(datums), loss_tokens=1),
+        ),
+    )
+    monkeypatch.setattr(
+        loop_module,
+        "attach_chunk_advantages",
+        lambda datums, _plans, _rows, _cfg: (
+            list(datums),
+            _fake_chunk_advantage_stats(len(datums)),
+        ),
+    )
+
+
+def _served_teacher_cfg() -> DistillConfig:
+    """The 3-step config whose teacher is a served, chunk-aligned endpoint."""
+    return _cfg().model_copy(
+        update={
+            "teacher": TeacherConfig(
+                backend="openai_compat",
+                model=_TEACHER,
+                endpoint=_SERVED_ENDPOINT,
+                tokenizer="fake/teacher-tokenizer",
+                alignment="chunk",
+            )
+        }
+    )
+
+
+def _baseline_call(env: _Env) -> _RolloutCall:
+    """The single rollout batch that measured the teacher holdout baseline."""
+    baseline_dir = env.run_dir / EVAL_ROLLOUTS_DIR / TEACHER_BASELINE_EVAL
+    [call] = [call for call in env.rollouts.calls if call.run_dir == baseline_dir]
+    return call
+
+
+def test_tinker_teacher_baseline_samples_the_tinker_teacher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default teacher is unchanged by the served branch existing."""
+    env = _setup(tmp_path, monkeypatch)
+
+    _run(env, _cfg())
+
+    provider = _baseline_call(env).provider
+    assert provider.kind is ProviderKind.TINKER
+    assert provider.model == _TEACHER
+    assert provider.endpoint is None
+
+
+def test_build_chunk_teacher_binds_the_endpoint_and_the_endpoint_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One variable (`WMH_ENDPOINT_API_KEY`) authenticates the teacher, scoring or generating.
+
+    `PromptLogprobClient` never reads the environment itself, so passing the key
+    here is the only way it is supplied; the dialect is `echo` because
+    `prompt_logprobs` is vLLM-specific and no hosted provider serves it.
+    """
+    monkeypatch.setenv("WMH_ENDPOINT_API_KEY", "sk-endpoint")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-must-not-leak")
+
+    client = loop_module._build_chunk_teacher(
+        TeacherConfig(
+            backend="openai_compat",
+            model=_TEACHER,
+            endpoint=_SERVED_ENDPOINT,
+            tokenizer="fake/teacher-tokenizer",
+            alignment="chunk",
+        )
+    )
+
+    assert client.model == _TEACHER
+    assert client.url.startswith(_SERVED_ENDPOINT)
+    assert client.url.endswith("/completions")
+
+
+def test_a_served_chunk_teacher_runs_its_baseline_through_the_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A teacher that cannot score student ids can still GENERATE the gate baseline."""
+    env = _setup(tmp_path, monkeypatch)
+    _chunk_stubs(monkeypatch)
+
+    result = _run(env, _served_teacher_cfg())
+
+    provider = _baseline_call(env).provider
+    assert provider.kind is ProviderKind.OPENAI
+    assert provider.model == _TEACHER
+    assert provider.endpoint == _SERVED_ENDPOINT
+    # `max_tokens` is the spelling every OpenAI-compatible server accepts.
+    assert provider.resolved_chat_max_tokens_field() == "max_tokens"
+
+    # Training batches (run_dir is the run root) are untouched: still the student.
+    train_calls = [call for call in env.rollouts.calls if call.run_dir == env.run_dir]
+    assert len(train_calls) == 3
+    assert all(call.provider.kind is ProviderKind.TINKER for call in train_calls)
+
+    # A real gate verdict, measured against the served teacher's solve rate.
+    assert result.gate.teacher_solve_rate == pytest.approx(0.5)
+    assert result.gate.reason
+
+
+def test_chunk_alignment_trains_under_the_advantage_loss_not_topk_ce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The chunk arm broadcasts one advantage per chunk, so it rides the advantage loss.
+
+    Also asserts the drop-reason line is logged: a chunk run whose coverage
+    collapses is diagnosable only from those counters.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    _chunk_stubs(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger=loop_module.__name__):
+        _run(env, _served_teacher_cfg())
+
+    assert _loss_fns(env) == [IMPORTANCE_SAMPLING_LOSS] * 3
+    assert "chunk scoring:" in caplog.text
+    # NOT the same-tokenizer fingerprint claim: this teacher's vocabulary differs by design.
+    assert "cross-tokenizer teacher" in caplog.text
+    assert "assumed same-tokenizer" not in caplog.text
+
+
+def test_module_scope_never_imports_transformers() -> None:
+    """`transformers` arrives only with the distill extra, and this module is on the CLI path.
+
+    `wmh.cli.app -> harness_app -> harness_distill -> loop`, so a top-level
+    `import transformers` here makes the bare-wheel CLI, and the CI wheel smoke
+    that runs `wmh --help`, die with ModuleNotFoundError before argv is parsed.
+    The teacher tokenizer load is deferred inside `_load_teacher_tokenizer` for
+    exactly that reason, and the whole `wmh.distill.xtoken` package it reaches
+    through must stay clean too.
+    """
+    for module in (loop_module, xtoken_chunks, xtoken_plan, xtoken_prompt_logprobs, xtoken_render):
+        assert module.__file__ is not None
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        roots: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                roots.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                roots.add(node.module.split(".")[0])
+        assert "transformers" not in roots, module.__name__

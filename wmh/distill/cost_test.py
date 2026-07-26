@@ -105,15 +105,38 @@ def test_episode_billing_single_call_repeats_nothing() -> None:
     assert billing == SpanBilling(unique_tokens=5, cached_tokens=0, sampled_tokens=2)
 
 
-def test_episode_billing_fragmented_falls_back_to_summing() -> None:
-    # Turn 2 edited its history (not a prefix extension), the same break
-    # build_datums fragments on: its whole prompt re-prefills at full price.
+def test_episode_billing_charges_only_the_diverging_part_of_a_broken_prefix() -> None:
+    # Turn 2 is not a prefix EXTENSION (the same break build_datums fragments on)
+    # but it still shares a verbatim prefix, which is what the service discounts.
+    # Charging its whole prompt at the full rate would over-report the run.
     p1, s1 = [1, 2, 3, 4], [5, 6]
     p2, s2 = [1, 2, 99], [7, 8]
     billing = episode_billing([_span(0, p1, s1), _span(1, p2, s2)])
-    # unique = (4 + 2) + (3 + 2) = 11; per-request = 4 + 3 = 7 < unique, so
-    # nothing is cached.
-    assert billing == SpanBilling(unique_tokens=11, cached_tokens=0, sampled_tokens=4)
+    # unique = (4 + 2) + ((3 - 2 shared) + 2) = 9; per-request = 4 + 3 = 7, of
+    # which 2 tokens repeat verbatim and bill at the cached rate.
+    assert billing == SpanBilling(unique_tokens=9, cached_tokens=0, sampled_tokens=4)
+
+
+def test_episode_billing_discounts_the_shared_prefix_of_an_ephemeral_reasoning_turn() -> None:
+    """The measured shape: consecutive prompts share everything but the last turn.
+
+    A turn whose reasoning was dropped from history leaves prompt(N+1) sharing
+    prompt(N) up to its generation header and then diverging. The datum merge
+    must refuse that (the sampled ids are missing, so tokens and logprobs would
+    not line up) while billing must still charge the shared part at the cached
+    rate, or a training run's projected spend inflates by the cached discount
+    over the whole context.
+    """
+    context = list(range(1, 101))
+    header, reasoning, action = [900], [901, 902, 903], [904, 905]
+    p1 = [*context, *header]
+    s1 = [*reasoning, *action]
+    # Turn 2 replays only the action, so it shares `context` and nothing after.
+    p2 = [*context, *action, 906, *header]
+    billing = episode_billing([_span(0, p1, s1), _span(1, p2, [907])])
+    # per-request = 101 + 104 = 205; unique = (101 + 5) + ((104 - 100 shared) + 1)
+    # = 111, so the 94 verbatim repeats bill at the cached rate.
+    assert billing == SpanBilling(unique_tokens=111, cached_tokens=94, sampled_tokens=6)
 
 
 def test_episode_billing_sorts_spans_by_call_index() -> None:
@@ -168,10 +191,13 @@ def test_estimate_hand_computed_tokens() -> None:
         "student_prefill": 28 * 4352,
         "student_cached_prefill": 28 * 2944,
         "student_sample": 28 * 256,
-        "student_train": 12 * 4352,
-        # Teacher scoring (one full-price request per train episode) plus the
+        # Training is per DATUM, and the ephemeral-reasoning history makes that
+        # one datum per turn: the per-request prompt sum (7296) plus the sampled
+        # tokens (256), not one episode length.
+        "student_train": 12 * 7552,
+        # Teacher scoring (one full-price request per train DATUM) plus the
         # teacher baseline's unique volume.
-        "teacher_prefill": (12 + 6) * 4352,
+        "teacher_prefill": 12 * 7552 + 6 * 4352,
         "teacher_cached_prefill": 6 * 2944,
         "teacher_sample": 6 * 256,
     }
@@ -212,11 +238,11 @@ def test_estimate_hand_computed_usd() -> None:
     assert usd["student_prefill"] == pytest.approx(28 * 4352 / 1e6 * 1.0)
     assert usd["student_cached_prefill"] == pytest.approx(28 * 2944 / 1e6 * 0.2)
     assert usd["student_sample"] == pytest.approx(28 * 256 / 1e6 * 2.0)
-    assert usd["student_train"] == pytest.approx(12 * 4352 / 1e6 * 4.0)
-    assert usd["teacher_prefill"] == pytest.approx(18 * 4352 / 1e6 * 10.0)
+    assert usd["student_train"] == pytest.approx(12 * 7552 / 1e6 * 4.0)
+    assert usd["teacher_prefill"] == pytest.approx((12 * 7552 + 6 * 4352) / 1e6 * 10.0)
     assert usd["teacher_cached_prefill"] == pytest.approx(6 * 2944 / 1e6 * 2.0)
     assert usd["teacher_sample"] == pytest.approx(6 * 256 / 1e6 * 25.0)
-    assert estimate.priced_usd == pytest.approx(1.2186624)
+    assert estimate.priced_usd == pytest.approx(1.7562624)
     assert estimate.is_fully_priced()
     assert estimate.unpriced_meters == []
 
@@ -276,8 +302,8 @@ def test_estimate_clamps_batch_to_train_split() -> None:
         "student_prefill": 6 * 4352,
         "student_cached_prefill": 6 * 2944,
         "student_sample": 6 * 256,
-        "student_train": 4 * 4352,
-        "teacher_prefill": 4 * 4352,
+        "student_train": 4 * 7552,
+        "teacher_prefill": 4 * 7552,
         "teacher_cached_prefill": 0,
         "teacher_sample": 0,
     }
@@ -295,14 +321,17 @@ def test_estimate_context_budget_caps_episode_and_per_turn_prompts() -> None:
     cfg.rollout.context_budget_tokens = 2048
     # episode tokens = min(2048, 4352) = 2048; sampled = min(256, 2048) = 256.
     # Both per-turn prompts (3072 and 4224) cap at 2048, so the per-request
-    # volume is 4096 and the cached repeat is 4096 - 2048 = 2048.
+    # volume is 4096 and the cached repeat is 4096 - 2048 = 2048. The per-datum
+    # (per-turn) training volume is that per-request sum plus the sampled tokens:
+    # 4096 + 256 = 4352, which the context budget does NOT cap, because it is a
+    # sum over datums rather than one sequence length.
     estimate = estimate_run_cost(cfg, n_train_tasks=5, n_holdout_tasks=3)
     assert _tokens(estimate) == {
         "student_prefill": 28 * 2048,
         "student_cached_prefill": 28 * 2048,
         "student_sample": 28 * 256,
-        "student_train": 12 * 2048,
-        "teacher_prefill": 18 * 2048,
+        "student_train": 12 * 4352,
+        "teacher_prefill": 12 * 4352 + 6 * 2048,
         "teacher_cached_prefill": 6 * 2048,
         "teacher_sample": 6 * 256,
     }

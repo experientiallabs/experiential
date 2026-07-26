@@ -10,13 +10,21 @@ whether the harness, renderer, and policy line up.
 `render_episode_text` renders one trial: a prefix-clean episode decodes in a
 single pass over the final span's prompt plus its sampled tokens (the full
 conversation as the model saw it, template included), while an episode whose
-history was edited mid-run decodes per fragment with a `FRAGMENT_BREAK`
+prompts do not extend each other decodes per fragment with a `FRAGMENT_BREAK`
 marker line in between; over-long bodies keep head and tail
 (`truncate_middle`). `sample_rollouts` picks and renders the first N
 span-bearing trials of a batch, and `samples_markdown` joins them into the
 document `DistillRunStore.write_samples` persists. The loop calls these after
 every training batch, the warmup collection, and each eval batch
 (`train.log_sample_rollouts` sets N; 0 disables).
+
+Under the ephemeral-reasoning history (`wmh.distill.renderers`) the per-fragment
+shape is the normal one: ONE fragment per turn, each a full prompt plus its
+sampled tokens, so consecutive fragments repeat the conversation they share and
+a long episode's body is mostly repetition before `truncate_middle` elides its
+middle. Each fragment is still exactly one call's real token stream, which is
+what makes the artifact trustworthy; reading a specific turn means finding its
+fragment rather than scrolling one continuous conversation.
 """
 
 from __future__ import annotations
@@ -34,7 +42,8 @@ MAX_EPISODE_CHARS = 40_000
 
 FRAGMENT_BREAK = (
     "----- FRAGMENT BREAK: the next call's prompt did not extend the episode "
-    "tokens, so the context re-rendered from scratch -----"
+    "tokens, so this fragment restates the conversation it shares (the normal "
+    "shape when history drops each turn's reasoning) -----"
 )
 """Marker line between the per-fragment decodes of a non-prefix-clean episode."""
 
@@ -129,9 +138,12 @@ def render_episode_text(record: TrialRecord, renderer: SpecialsDecoder) -> str:
     span/fragment/token counts); the body is the episode's exact token stream
     decoded WITH special tokens. A prefix-clean episode decodes in one pass
     (the final span's prompt plus its sampled tokens IS the full conversation
-    including every template marker); a fragmented episode decodes per
-    fragment with `FRAGMENT_BREAK` lines in between. Bodies beyond
-    `MAX_EPISODE_CHARS` keep head and tail (`truncate_middle`).
+    including every template marker); an episode whose prompts do not extend
+    each other decodes per fragment with `FRAGMENT_BREAK` lines in between,
+    which under the ephemeral-reasoning history means one fragment per turn
+    (module docstring). Bodies beyond `MAX_EPISODE_CHARS` keep head and tail
+    (`truncate_middle`), so a long episode's sample shows its first turns and
+    its last ones.
 
     Args:
         record: The scored trial with its recorded spans.

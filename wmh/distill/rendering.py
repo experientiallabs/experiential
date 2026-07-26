@@ -33,6 +33,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+OPEN_THINK = "<think>"
+CLOSE_THINK = "</think>"
+"""The reasoning-block markers every renderer in this lineup emits.
+
+Defined here, in the module that has no optional-extra dependency, because both
+sides of the ephemeral-reasoning history need them: `wmh.distill.renderers`
+resolves `CLOSE_THINK` to token ids to find the boundary in a turn's SAMPLED ids
+(never in decoded text), and `wmh.distill.tokens` splits on it in the canonical
+message text when it rebuilds the history a teacher re-renders.
+"""
+
 MISSING_DISTILL_EXTRA = (
     "the tinker-cookbook SDK is not installed; run `uv sync --extra distill` "
     "to use the Tinker distillation provider"
@@ -513,7 +524,7 @@ class CookbookChatRendering:
         fragments: list[str] = []
         for part in content:
             if part["type"] == "thinking":
-                fragments.append("<think>" + part["thinking"] + "</think>")
+                fragments.append(OPEN_THINK + part["thinking"] + CLOSE_THINK)
             elif part["type"] == "text":
                 fragments.append(part["text"])
             else:

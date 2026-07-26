@@ -53,18 +53,30 @@ context_budget_tokens = 65536  # episodes that outgrow this are dropped whole;
                                # also terminus-2's TinkerLLM context_limit, so keep
                                # it sampling.max_tokens below the served window or a
                                # full-budget call exceeds it
+observation_clip_tokens = 2000 # per-command terminal-output clip (head + tail + a
+                               # marker); 0 disables. Measured over one TerminalBench-2
+                               # run: 770 observations, median 349 tokens, p90 1,222,
+                               # max 6,096, so this only touches the tail. Keep it
+                               # IDENTICAL across arms you compare: it changes what the
+                               # model reads, so a baseline and a post-training run at
+                               # different values are not measuring the same task.
 
 # REQUIRED for any REASONING student or teacher. Terminus-2 keeps only the parsed text of
 # each assistant turn, and the auto-discovered renderer of a reasoning model (nemotron3,
 # nemotron3_ultra, qwen3_5, which also serves Qwen3.6) hands the terminus parser a list
-# instead of a string, raising TypeError before the trial grades anything. Those renderers
-# also strip the thinking block when they re-render a turn as history, so turn N+1's prompt
-# no longer extends turn N's and every turn becomes its own datum fragment, at a cost
-# quadratic in turn count (measured: 2.7x the tokens at 6 turns, 7.8x at 20, 15.1x at 40).
-# The wmh verbatim renderers fix both: the parser sees the action text as a plain string,
-# and history replays each turn from its exact sampled ids, so the reasoning is trained on
-# and the episode stays one datum. Keyed per base model because the teacher's own rollouts
-# (warmup, teacher baseline) sample a different one. A typo here fails at config load.
+# instead of a string, raising TypeError before the trial grades anything. The wmh verbatim
+# renderers fix that (the parser sees the action text as a plain string) and set the history
+# policy: a historical turn replays its exact sampled ids MINUS its reasoning. The model still
+# thinks fully every turn and the run still trains on those reasoning tokens; they are just not
+# re-sent in every later prompt. Measured on a real TerminalBench-2 run, that is what keeps
+# long episodes alive: 9 of 19 trials sat over 60,000 tokens against a usable 65,530 ceiling
+# and 8 of 17 holdout trials died with ContextLengthExceededError (excluded from the solve rate
+# as infra failures, which biases it toward short tasks); dropping reasoning from history halves
+# them (merge-diff-arc-agi-task 64,228 -> 31,411, dna-assembly 64,969 -> 40,257). The cost is
+# that each turn becomes its own training datum, so shared context re-prefills per turn, at a
+# volume quadratic in turn count (2.7x the tokens at 6 turns, 7.8x at 20, 15.1x at 40).
+# Keyed per base model because the teacher's own rollouts (warmup, teacher baseline) sample a
+# different one. A typo here fails at config load.
 [rollout.renderers]
 "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16" = "wmh/nemotron3_verbatim"
 "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16" = "wmh/nemotron3_ultra_verbatim"
@@ -313,5 +325,6 @@ tripwire would never fire again.
 | An eval refuses to record (`eval ... is a NULL measurement, not a 0.0`) | Every trial died before the verifier ran, so there is no solve rate to write. Almost always the concurrent-sandbox cap (a distill trial holds two sandboxes); see the E2B rows below, lower `train.trial_concurrency`, then `--resume`. |
 | Deadline expiries (`TinkerDeadlineError: tinker <call> timed out after ...`) | A wedged Tinker session was cut off instead of hanging; transient ones retry with a fresh session on their own, and a persistent one can be given more headroom via the `WMH_TINKER_DEADLINE_<KIND>` env vars the error names. |
 | Resume rejected (`LoadWeights can only be called on uninitialized models`) | Tinker accepts a checkpoint restore only on a model nothing has touched yet, so a resume loads its state as the very first call on a freshly created training client. If a restore is slow enough to blow its deadline, the run retries it on another fresh client; `WMH_TINKER_DEADLINE_LOAD_STATE` (600s by default) is how long one attempt may take, which large students may need raised. |
-| Fragmentation warning (`N of M datum(s) are fragments ...`) | The agent edited its prompt history mid-episode, so shared context re-prefills at full price and teacher scoring multiplies; keep `rollout.compaction = false`, check `[rollout.renderers]` names a `wmh/*_verbatim` renderer for every reasoning model, and check `truncated_spans` in the same row. |
-| Nonzero `truncated_spans` in `metrics.jsonl` | Turns sampled the full `sampling.max_tokens` and were cut off mid-answer. Nothing else reports this (harbor's own truncation guard cannot fire), so without this counter it reads as a model that writes broken actions. A truncated turn also cannot be replayed verbatim, so it fragments the episode. Raise `sampling.max_tokens`, keeping `rollout.context_budget_tokens` that far below the served window. |
+| Fragmentation line (`N of M datum(s) are fragments ...`) | EXPECTED at a rate near 1.0 with the `wmh/*_verbatim` renderers: a historical turn replays without its reasoning, so every turn is its own datum. It reads as the re-prefill cost of keeping long episodes inside the context ceiling, and the volume it implies is what `student_train` and `teacher_prefill` meter. It is a defect signal only for a renderer that does hold the prefix property (then: keep `rollout.compaction = false` and check `truncated_spans` in the same row). |
+| Nonzero `truncated_spans` in `metrics.jsonl` | Turns sampled the full `sampling.max_tokens` and were cut off mid-answer. Nothing else reports this (harbor's own truncation guard cannot fire), so without this counter it reads as a model that writes broken actions. A truncated turn also has no stop token, so it cannot be replayed from its ids and its history tokens are a retokenization of its text. Raise `sampling.max_tokens`, keeping `rollout.context_budget_tokens` that far below the served window. |
+| `ContextLengthExceededError` trials (`provider_error` in `stop_reason_counts`) | A prompt outgrew `rollout.context_budget_tokens`, the trial died, and it is excluded from the solve rate as an infrastructure failure, which biases the score toward short tasks. Confirm `[rollout.renderers]` names a `wmh/*_verbatim` renderer (history then carries no reasoning, which roughly halves a long episode's context) and lower `rollout.observation_clip_tokens` for tasks whose context is terminal OUTPUT rather than reasoning. |

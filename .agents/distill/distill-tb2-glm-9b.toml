@@ -1,0 +1,169 @@
+# THE headline run: Qwen3.5-9B distilled from GLM-5.2 on TerminalBench-2, across
+# tokenizers. The teacher never generates here -- it SCORES the student's own
+# trajectories on its own tokenization, and the two are joined inside
+# byte-identical content spans (teacher.alignment = "chunk").
+#
+# Why this configuration and not the 27B on math:
+#   - Measured headroom on TB2 (24 tasks, identical harness, 1 attempt):
+#     GLM-5.2 0.556 graded vs Qwen3.5-9B 0.335 graded, +23.4 pp, paired 95% CI
+#     [+2.9, +45.1], 6 of 7 discordant tasks favour GLM. That gap is a LOWER
+#     bound: GLM lost 5 of 24 trials to its own output-token budget.
+#   - On AIME the relationship inverts (Qwen3.6-27B 93.3% beats every teacher
+#     measurement available), so math cannot demonstrate this method at all. An
+#     earlier 8-step 9B math run lost >=25 pp, which is what distilling toward a
+#     teacher that is not better looks like.
+#
+# Only importance_sampling works across vocabularies: top-k CE would need
+# teacher-vocab candidate ids as student targets, and the config validator
+# rejects that combination.
+[student]
+base_model = "Qwen/Qwen3.5-9B"
+lora_rank = 32
+
+[teacher]
+backend = "openai_compat"
+model = "accounts/fireworks/models/glm-5p2"
+tokenizer = "zai-org/GLM-5.2"
+alignment = "chunk"
+# Fireworks is the only hosted provider measured to score caller-supplied token
+# ids faithfully: echo + INTEGER logprobs + token-id prompts, exact round trip.
+# Azure/Bedrock/OpenRouter/Cloudflare/DeepInfra all structurally cannot (they
+# either reject echo, silently ignore it, or normalize the response). Azure is
+# still the right endpoint for GLM GENERATION, which is why the headroom eval
+# used it and this run does not.
+endpoint = "https://api.fireworks.ai/inference/v1"
+
+[harbor]
+job_template = ".agents/distill/tb2-harbor-job-template.yaml"
+backend = "e2b"
+reward_key = "reward"
+
+[rollout]
+# Measured on real TB2 episodes: p50 21 calls, p95 57, max 72. A 20-turn cap is
+# a silent rollout filter, not a safety limit.
+max_turns = 100
+# p50 trial wall 597 s, p95 1,185 s, max 1,988 s. The 300 s default kills most
+# trials on the clock and scores them 0, which reads as incapability.
+episode_timeout_s = 1800.0
+# 65,024 and NOT 65,536: Tinker rejected a 65,534-token sample for this model
+# ("exceeds the maximum allowed length (65530)"), so the advertised ceiling is
+# not the usable one. Qwen3.5-9B has no long-context variant in the catalog --
+# both it and the 27B report max_context 65,536 -- so long episodes (observed
+# prompts of 68,879 / 80,733 / 168,839) are DROPPED WHOLE and counted rather
+# than compacted. Compaction is refused by config validation for a reason: it
+# rewrites the token prefix mid-episode, which destroys the verbatim-prefix
+# property that both the cost model and cross-tokenizer scoring depend on.
+context_budget_tokens = 65024
+compaction = false
+
+# MANDATORY, not a tuning knob: the auto-discovered `qwen3_5` renderer STRIPS the
+# thinking block when it re-renders an assistant turn, which breaks the verbatim
+# token prefix and so destroys the cross-tokenizer join. The wmh verbatim renderer
+# carries each turn's exact sampled ids forward instead. Only the student needs an
+# entry -- the teacher is reached over HTTP and never sampled through terminus-2.
+[rollout.renderers]
+"Qwen/Qwen3.5-9B" = "wmh/qwen3_5_verbatim"
+
+[train]
+# WIDE, not long: step wall-clock is set by the SLOWEST single episode, so at
+# 16 episodes on 16 concurrent slots a step costs ~30 min regardless of batch
+# size. Widening is therefore nearly free while adding steps is not: 8 x 64
+# episodes is ~4h of training against ~12h for 24 x 16, and sees MORE data
+# (512 vs 384 episodes) with a better gradient per step. The cost is fewer
+# optimizer steps for the adapter to move; extend from the checkpoint rather
+# than restarting if 8 proves too few.
+steps = 8
+tasks_per_batch = 16
+group_size = 4
+learning_rate = 1e-4
+loss = "importance_sampling"
+advantage_clip = 4.0
+center_advantages = true
+max_datum_tokens = 65024
+sampler_refresh_every = 1
+save_state_every = 2
+# 2 E2B sandboxes per trial, sandbox creates capped at 4/sec; 16 trials per step
+# admits in ~8 s of gating.
+# 64 trials = 128 E2B sandboxes (2 per trial) against a ~1100 cap, admitted in
+# ~32 s at the 4-creates/sec gate.
+# 24, not 64: Tinker's ~240-session cap is SHARED across lanes, and each trial
+# process pins one session for its lifetime. At 64 concurrent against another
+# lane's live run the pool exhausted -- 30 rejections and ~17% of trials
+# producing no spans. 24 leaves the sibling lane its headroom. Step wall-clock is
+# set by the slowest episode, so 64 episodes now run in ~3 waves instead of 1,
+# costing minutes per step rather than multiplying it.
+trial_concurrency = 24
+
+# temperature 1.0 keeps the sampler's issued logprobs comparable to the
+# untempered teacher logprobs, which is what makes the reverse-KL advantage
+# unbiased. It is also the only temperature at which the entropy tripwire
+# (mean of -sampled_logprobs) estimates anything real.
+[sampling]
+temperature = 1.0
+max_tokens = 16384
+
+[eval]
+every = 0
+tasks = 17
+k = 1
+# PLUMBING ONLY, not a result. A served (openai_compat) teacher cannot GENERATE
+# through the terminus-2 rollout collector -- that path requires a Tinker provider
+# so the student's exact token spans are recorded, and it raises for kind
+# 'openai'. So the teacher's holdout baseline cannot be measured in-run, and
+# without this import the run aborts at TEACHER_BASELINE_EVAL.
+#
+# This report was measured under the **pi** scaffold, so the gate's
+# `min_teacher_fraction * teacher_rate` threshold is CROSS-SCAFFOLD and is not
+# the finding. GLM's own solve rate does not depend on the student's history
+# policy, so the reasoning-drop change does not invalidate it -- only the
+# scaffold difference does. The result of this run is student-before vs
+# student-after, both measured under terminus-2 with the same history policy and
+# the same observation clip. A terminus-2-native GLM number can be collected
+# afterwards for the writeup without blocking training.
+teacher_baseline_from = "/Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken-t2/.agents/distill/baseline-teacher-16.json"
+# The teacher's holdout baseline is IMPORTED, not measured, for a hard reason: a
+# served (openai_compat) teacher cannot generate through the terminus-2 rollout
+# collector at all -- `terminus_2_agent_kwargs` raises for any non-Tinker provider
+# kind, deliberately, so a training batch can never silently lose token spans. So
+# a chunk run would abort at the teacher baseline. `_eval_or_load` short-circuits
+# before `_run_eval` when this is set, and `_import_baseline` matches on
+# provider.model, task ids and attempts.
+#
+# HONESTY NOTE: this report was measured under the **pi** scaffold, not
+# terminus-2, so the gate's `min_teacher_fraction * teacher_rate` threshold is a
+# CROSS-SCAFFOLD number and means little. That is acceptable only because the
+# gate is informational here (`require_no_regression = false`, nothing is
+# promoted). The run's actual result is student-before vs student-after, both
+# measured under terminus-2 on the same holdout -- that comparison is clean.
+
+[gate]
+k = 1
+min_teacher_fraction = 0.7
+# The 17-task holdout cannot resolve a real effect on its own (historically only
+# a handful are ever solved, so a binary rate there reads noise). The gate is
+# kept for its mechanics; the REAL measurement is a separate paired eval on a
+# larger set with partial credit, which is how the +23.4 pp headroom was
+# established in the first place.
+require_no_regression = false
+
+# Teacher prices MUST be set here. The sibling vLLM config leaves them unset on
+# the argument that a self-hosted teacher bills no meter; with Fireworks that is
+# false, and an unset rate silently drops the teacher out of budget enforcement.
+# Fireworks `echo` also disables prompt caching, so every scoring call bills as
+# uncached prefill.
+[pricing]
+teacher_prefill = 0.90
+
+[budget]
+# 1500, not 300: the loop's own estimate assumes cached prefill, but Tinker
+# sampling does NO prefix caching (measured n_cache_tokens == 0 over 39M tokens,
+# ~$1.92/episode on a 27B, 3.6x a cached model). At 512 episodes a 300 cap can
+# abort mid-run, which wastes every step already paid for. Money is not this
+# lane's constraint (10k) -- wall clock is -- so the cap exists to stop a runaway,
+# not to ration a planned run.
+max_usd = 1500.0
+
+[wandb]
+enabled = true
+project = "wmh-distill"
+run_name = "tb2-glm5.2-to-qwen3.5-9b-xtoken"

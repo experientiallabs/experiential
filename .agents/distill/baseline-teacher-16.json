@@ -1,0 +1,28 @@
+{
+ "name": "baseline-teacher",
+ "provider_model": "accounts/fireworks/models/glm-5p2",
+ "base_model": "accounts/fireworks/models/glm-5p2",
+ "task_ids": [
+  "build-pov-ray",
+  "constraints-scheduling",
+  "distribution-search",
+  "dna-assembly",
+  "fix-ocaml-gc",
+  "gcode-to-text",
+  "kv-store-grpc",
+  "make-mips-interpreter",
+  "merge-diff-arc-agi-task",
+  "nginx-request-logging",
+  "path-tracing-reverse",
+  "pytorch-model-cli",
+  "raman-fitting",
+  "schemelike-metacircular-eval",
+  "sparql-university",
+  "write-compressor"
+ ],
+ "attempts": 1,
+ "trials": 16,
+ "solve_rate": 0.5,
+ "empty_span_trials": 17,
+ "source": "subset of /Users/admin/Documents/experientiallabs/world-model-harness/.claude/worktrees/xtoken/.wmh/xtoken-runs/tb2-glm-9b/evals/baseline-teacher.json excluding winning-avg-corewars, whose harbor trial hangs indefinitely (harbor's summarization fallback ignores the episode timeout). Its recorded teacher reward was 0.0, so the solved count is unchanged and the rate is 8/16. Measured under the pi scaffold: this sets the gate threshold only and is NOT the finding."
+}

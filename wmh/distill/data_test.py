@@ -134,6 +134,57 @@ def test_append_only_episode_merges_into_one_datum_with_exact_masks() -> None:
     assert stats.context_tokens == 6
 
 
+def test_a_merged_episode_records_every_span_it_covers() -> None:
+    """Span provenance is what pairs a datum with the turn it holds.
+
+    Under the ephemeral-reasoning history a datum is one turn, and the
+    cross-tokenizer teacher can only score it against the right conversation
+    slice if the datum says which spans it covers (`turn_conversation`).
+    """
+    datums, _stats = build_datums([_record(_append_only_spans())], _cfg())
+    assert [datum.span_indices for datum in datums] == [[0, 1, 2]]
+
+
+def test_per_turn_fragments_each_record_their_own_span() -> None:
+    """The normal shape under the ephemeral-reasoning history: one datum per turn.
+
+    Each turn's prompt drops the previous turn's reasoning, so no prompt extends
+    the accumulated tokens and every span becomes its own datum, aligned with its
+    own recorded logprobs.
+    """
+    # 100/102 are reasoning ids, 101/103 the action ids that survive in history:
+    # each prompt shares a long prefix with the previous one and still is not an
+    # extension of it, which is exactly the shape the merge must split.
+    spans = [
+        _span(0, [10, 11], [100, 101]),
+        _span(1, [10, 11, 101, 12], [102, 103]),
+        _span(2, [10, 11, 101, 103, 13], [104]),
+    ]
+    datums, stats = build_datums([_record(spans)], _cfg())
+
+    assert [datum.span_indices for datum in datums] == [[0], [1], [2]]
+    assert [datum.fragment_index for datum in datums] == [0, 1, 2]
+    assert [datum.sampled_token_ids() for datum in datums] == [[100, 101], [102, 103], [104]]
+    assert stats.fragments == 2
+    assert stats.fragmentation_rate == pytest.approx(2 / 3)
+
+
+def test_a_span_that_sampled_nothing_is_in_no_datum_s_span_indices() -> None:
+    """`span_indices` stays one-to-one with the datum's sampled runs.
+
+    A span with no sampled tokens contributes context and no run, so recording it
+    would shift every later run against its message and misalign the whole datum.
+    """
+    spans = [
+        _span(0, [10, 11], []),
+        _span(1, [10, 11, 12], [100, 101]),
+    ]
+    datums, _stats = build_datums([_record(spans)], _cfg())
+    assert len(datums) == 1
+    assert datums[0].span_indices == [1]
+    assert datums[0].sampled_token_ids() == [100, 101]
+
+
 def test_spans_are_sorted_by_call_index_before_merging() -> None:
     spans = _append_only_spans()
     shuffled = [spans[2], spans[0], spans[1]]

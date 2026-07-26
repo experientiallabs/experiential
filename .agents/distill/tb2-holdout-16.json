@@ -1,0 +1,18 @@
+[
+ "build-pov-ray",
+ "constraints-scheduling",
+ "distribution-search",
+ "dna-assembly",
+ "fix-ocaml-gc",
+ "gcode-to-text",
+ "kv-store-grpc",
+ "make-mips-interpreter",
+ "merge-diff-arc-agi-task",
+ "nginx-request-logging",
+ "path-tracing-reverse",
+ "pytorch-model-cli",
+ "raman-fitting",
+ "schemelike-metacircular-eval",
+ "sparql-university",
+ "write-compressor"
+]

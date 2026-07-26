@@ -172,11 +172,18 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
       produces rewards and no training data at all.
     - `enable_summarize=False` is NOT optional. Summarization rewrites the
       chat history mid-episode, which harbor itself warns leaves rollout
-      details incomplete, and which would break the prefix property the
-      one-datum-per-episode cost model depends on (the same reason
+      details incomplete, and which would leave recorded spans that cannot be
+      attributed to the conversation that produced them (the same reason
       `rollout.compaction` is rejected outright). With it off, a context
       overflow raises instead, ending the episode on a recorded
-      `ContextLengthExceededError`.
+      `ContextLengthExceededError` - the failure the ephemeral-reasoning
+      history and `rollout.observation_clip_tokens` exist to keep away from.
+    - `store_all_messages=True` persists the agent's own chat history into
+      `agent_result.metadata["all_messages"]`, the CANONICAL (tokenizer-independent)
+      view of the same turns. A cross-tokenizer teacher re-renders that message
+      list with its own chat template, so without it the whole chunk-aligned
+      teacher path degrades to zero coverage
+      (`wmh.distill.tokens.load_trial_rollout_spans`).
     - `max_turns` is terminus-2's `max_episodes`, and
       `llm_kwargs.context_limit` / `max_tokens` are the context and output
       budgets the agent measures itself against.
@@ -186,6 +193,13 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
       renderer. The wmh verbatim renderers are registered with the cookbook
       here, because this is the one call site every rollout path shares, and
       terminus-2 resolves the name from that registry in this process.
+    - `rollout.observation_clip_tokens` rides that same registration, which is
+      what makes the per-command terminal-output clip identical in EVERY arm:
+      training steps, the warmup collection, and every eval wave (student
+      before, student after, teacher baseline) all reach terminus-2 through
+      this function, so no arm can read differently clipped observations than
+      another. A clip that differed between arms would change the task each arm
+      sees and make their solve rates incomparable.
 
     Args:
         cfg: The validated run config.
@@ -224,7 +238,7 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
     # it eagerly). Registration is idempotent.
     from wmh.distill.renderers import register_verbatim_renderers
 
-    register_verbatim_renderers()
+    register_verbatim_renderers(cfg.rollout.observation_clip_tokens)
     return {
         "llm_backend": "tinker",
         "llm_kwargs": llm_kwargs,
@@ -232,6 +246,18 @@ def terminus_2_agent_kwargs(cfg: DistillConfig, provider_config: ProviderConfig)
         "temperature": cfg.sampling.temperature,
         "max_turns": cfg.rollout.max_turns,
         "enable_summarize": False,
+        # The CANONICAL side of the tokens-in-tokens-out contract, and the only way a
+        # cross-tokenizer teacher can score these rollouts at all. Terminus-2 copies its
+        # chat history into `agent_result.metadata["all_messages"]`
+        # (harbor/agents/terminus_2/terminus_2.py:1639, inside a `finally`, so it survives a
+        # timeout or an error), and `harbor.llms.chat.Chat.chat` appends exactly
+        # `[user_message, assistant_message]` per LLM call (harbor/llms/chat.py:117-122).
+        # With `enable_summarize=False` there is exactly ONE LLM call per turn and nothing
+        # rewrites the list, so it is append-only and 2:1 aligned with the recorded token
+        # turns, which is what `wmh.distill.tokens.load_trial_rollout_spans` verifies before
+        # trusting it. Cheap: the messages are already in memory, and the text is the same
+        # text the token ids encode.
+        "store_all_messages": True,
         # The cap is deliberate here, so terminus-2's "consider removing this limit" warning is
         # noise on every trial.
         "suppress_max_turns_warning": True,
@@ -302,6 +328,24 @@ class RolloutStats(BaseModel):
     empty_span_trials: int = Field(ge=0)
     """Trials that recorded no token span (died before the first completion)."""
 
+    trials_without_delta: int = Field(default=0, ge=0)
+    """Span-bearing trials where at least one span has `delta_messages is None`.
+
+    The cross-tokenizer kill switch made visible. `reconstruct_conversation`
+    returns None if ANY span in a trial lost its canonical messages, so one
+    unverifiable turn anywhere in an episode discards that whole episode's
+    teacher signal - and it does so silently, in the sense that the step still
+    reports datums > 0 with chunk coverage near zero rather than raising. Under
+    terminus-2 the whole trial degrades together (`load_trial_rollout_spans`
+    either trusts the stored chat history for every turn or for none), so this
+    reads as "trials whose teacher scoring is unusable".
+
+    Counts only span-bearing trials: a trial with no spans at all is already
+    reported by `empty_span_trials`, and double-counting it here would hide
+    whether the deltas or the tokens were the thing that went missing.
+
+    0 on records assembled before this field existed."""
+
     truncated_spans: int = Field(default=0, ge=0)
     """Turns that sampled the full output cap, so the model was cut off mid-answer.
 
@@ -314,12 +358,13 @@ class RolloutStats(BaseModel):
     half-written action, the parser reports an error, and the episode continues
     as if the model had simply answered badly.
 
-    A truncated turn also has no stop token, so it cannot be replayed verbatim
-    (`wmh.distill.renderers`) and shows up downstream as a prefix break, which
-    means a fragmented episode and multiplied teacher-scoring cost. Counted per
-    SPAN, since one bad turn does not spoil the episode's other turns; a rising
-    count means `sampling.max_tokens` is too low for the reasoning these tasks
-    provoke, not that the model got worse.
+    A truncated turn also has no stop token, so it cannot be replayed from its
+    ids at all (`wmh.distill.renderers` carries only cleanly terminated turns)
+    and falls back to the base renderer, which re-renders it from TEXT: those
+    history tokens are then a retokenization rather than the ids the sampler
+    issued. Counted per SPAN, since one bad turn does not spoil the episode's
+    other turns; a rising count means `sampling.max_tokens` is too low for the
+    reasoning these tasks provoke, not that the model got worse.
 
     0 on records assembled before this field existed."""
 
@@ -423,6 +468,11 @@ def rollout_stats(records: Sequence[TrialRecord], *, max_tokens: int) -> Rollout
         executed_trials=len(executed),
         infra_failed_trials=len(records) - len(executed),
         empty_span_trials=len(records) - with_spans,
+        trials_without_delta=sum(
+            1
+            for record in records
+            if record.spans and any(span.delta_messages is None for span in record.spans)
+        ),
         truncated_spans=sum(truncated_per_record),
         truncated_span_trials=sum(1 for count in truncated_per_record if count),
         stop_reason_counts=dict(sorted(counts.items())),
@@ -618,6 +668,16 @@ def collect_rollouts(
             "they carry reward signal but no training data",
             stats.empty_span_trials,
             stats.trials,
+            step_name,
+        )
+    if stats.trials_without_delta:
+        logger.warning(
+            "%d/%d span-bearing trial(s) in %s carry no canonical message delta, so a "
+            "cross-tokenizer (teacher.alignment = 'chunk') teacher cannot score them at all "
+            "and they contribute zero chunk coverage while still reporting datums; the "
+            "per-trial warnings above name which invariant failed",
+            stats.trials_without_delta,
+            stats.trials_with_spans,
             step_name,
         )
     if stats.infra_failed_trials:

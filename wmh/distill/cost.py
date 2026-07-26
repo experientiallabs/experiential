@@ -189,16 +189,27 @@ def episode_billing(spans: Sequence[TokenSpan]) -> SpanBilling:
     repeated prefix billed at the cached rate. The model here:
 
     - per-request volume = sum over spans of `len(prompt_token_ids)`.
-    - unique = tokens the episode put through the model for the first time.
-      For a prefix-clean episode (every prompt extends the previous prompt
-      plus its sampled tokens verbatim, the same test `build_datums` merges
-      on) this is exactly the final span's prompt plus sampled length. A
-      prefix break restarts the accumulation, so a fragmented episode's
-      unique volume is the sum over fragments: re-prefilled context counts
-      as unique again, matching what the service re-bills at the full rate.
+    - unique = tokens the episode put through the model for the first time,
+      measured per call as the prompt beyond its LONGEST COMMON PREFIX with the
+      previous call's prompt plus sampled tokens. For a prefix-clean episode
+      (every prompt extends the previous one verbatim, the same test
+      `build_datums` merges on) that common prefix is the whole accumulation, so
+      unique is exactly the final span's prompt plus sampled length.
     - cached = the per-request volume beyond unique, clamped at zero (a
-      single-call episode repeats nothing). Under the prefix property every
-      repeat is verbatim, so the cached rate applies to all of it.
+      single-call episode repeats nothing).
+
+    The longest-common-prefix measure, rather than the all-or-nothing prefix
+    test the datum merge uses, is what matches the SERVICE's billing: Tinker
+    discounts the verbatim repeated prompt PREFIX of a request, and it neither
+    knows nor cares whether the rest of that request continues the previous one.
+    The distinction is load-bearing under the ephemeral-reasoning history
+    (`wmh.distill.renderers`), where consecutive prompts share everything up to
+    the previous turn's generation header and then diverge: the merge correctly
+    refuses to treat that as an extension (the sampled ids are missing, so the
+    tokens no longer line up with their logprobs), while billing correctly still
+    charges nearly all of it at the cached rate. Charging it at the full rate
+    would over-report a training run's spend by roughly the cached discount over
+    the whole context.
 
     Args:
         spans: One episode's recorded spans, in any order (sorted by
@@ -214,10 +225,7 @@ def episode_billing(spans: Sequence[TokenSpan]) -> SpanBilling:
     for span in sorted(spans, key=lambda item: item.call_index):
         prompt = span.prompt_token_ids
         per_request += len(prompt)
-        if accumulated and prompt[: len(accumulated)] == accumulated:
-            unique += len(prompt) - len(accumulated)
-        else:
-            unique += len(prompt)
+        unique += len(prompt) - _common_prefix_length(prompt, accumulated)
         unique += len(span.sampled_token_ids)
         sampled += len(span.sampled_token_ids)
         accumulated = list(prompt) + list(span.sampled_token_ids)
@@ -226,6 +234,16 @@ def episode_billing(spans: Sequence[TokenSpan]) -> SpanBilling:
         cached_tokens=max(per_request - unique, 0),
         sampled_tokens=sampled,
     )
+
+
+def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
+    """How many leading tokens two sequences share."""
+    shared = 0
+    for a, b in zip(left, right, strict=False):
+        if a != b:
+            break
+        shared += 1
+    return shared
 
 
 def batch_billing(records: Sequence[TrialRecord]) -> SpanBilling:
@@ -267,24 +285,28 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
     - `sampled = avg_turns x min(sampling.max_tokens, 512)`
     - `episode_tokens = min(rollout.context_budget_tokens,
       2048 + avg_turns x (1024 + sampled_per_turn))`: the episode's final
-      unique sequence length under the prefix property (the estimate assumes
-      prefix-clean episodes, so this is also the unique billing volume)
+      sequence length, which is also its unique SAMPLING volume (consecutive
+      prompts share everything but the last turn, whether or not they are
+      strict extensions; see `episode_billing`)
     - per-request prefill: turn k's prompt is
       `min(2048 + k x 1024 + (k - 1) x sampled_per_turn,
       context_budget_tokens)` and every turn re-bills it whole, so the
       per-request volume is the sum over turns; the part beyond
       `episode_tokens` is the verbatim repeat billed at the cached rate
       (see `episode_billing` for the same split on actual spans)
+    - `datum_tokens = per_request_tokens + sampled`: the TRAINING volume, which
+      is per datum and therefore per turn under the ephemeral-reasoning history
+      (`wmh.distill.data`), not one episode length
 
     Meter mapping: every student episode charges `episode_tokens` (its unique
     volume) to student_prefill, the repeated per-request volume to
     student_cached_prefill, and `sampled` to student_sample; every train
-    episode additionally charges `episode_tokens` to student_train
-    (forward_backward over the full datum; x `train.topk` under the
+    episode additionally charges `datum_tokens` to student_train
+    (forward_backward over every datum; x `train.topk` under the
     `topk_ce` loss, whose k rank replicas each carry the full sequence) and
-    `episode_tokens` to teacher_prefill (the teacher scores each episode's
-    full sequence once, one full-price request with no repeats to cache;
-    the topk_ce prefill-only request bills the same volume). Teacher-in-harness
+    `datum_tokens` to teacher_prefill (the teacher scores each datum once at
+    full price, with no repeats to cache; the topk_ce prefill-only request bills
+    the same volume). Teacher-in-harness
     episodes (the gate baseline and the warmup collection) charge `sampled`
     to teacher_sample (they bill the teacher's SAMPLING rate on what they
     generate) plus per-request prefill exactly like a student episode, onto
@@ -334,6 +356,14 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
         for turn in range(1, avg_turns + 1)
     )
     cached_tokens = max(per_request_tokens - episode_tokens, 0)
+    # Training and teacher scoring are per DATUM, and under the
+    # ephemeral-reasoning history each turn is its own datum carrying its own
+    # whole prompt (`wmh.distill.data`), so their volume is the per-request
+    # prompt sum plus the sampled tokens, not one episode's length. That is the
+    # quadratic-in-turns cost the history buys the context ceiling with, and it
+    # is the dominant term of a training run: projecting one episode length here
+    # under-reported it by roughly turns/2.
+    datum_tokens = per_request_tokens + sampled_tokens
 
     tasks_per_step = min(cfg.train.tasks_per_batch, n_train_tasks)
     train_episodes = cfg.train.steps * tasks_per_step * cfg.train.group_size
@@ -354,9 +384,9 @@ def estimate_run_cost(cfg: DistillConfig, n_train_tasks: int, n_holdout_tasks: i
         "student_prefill": student_episodes * episode_tokens,
         "student_cached_prefill": student_episodes * cached_tokens,
         "student_sample": student_episodes * sampled_tokens,
-        "student_train": train_episodes * episode_tokens * train_replication,
+        "student_train": train_episodes * datum_tokens * train_replication,
         "teacher_prefill": (
-            train_episodes * episode_tokens + teacher_harness_episodes * episode_tokens
+            train_episodes * datum_tokens + teacher_harness_episodes * episode_tokens
         ),
         "teacher_cached_prefill": teacher_harness_episodes * cached_tokens,
         "teacher_sample": teacher_harness_episodes * sampled_tokens,

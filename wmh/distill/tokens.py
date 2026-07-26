@@ -20,6 +20,21 @@ Two span sources feed the same `TrialRecord` shape, one per rollout agent:
 
 Either way `assemble_trial_records` joins the spans with the scorer's reward
 cells into `TrialRecord`s, the unit the datum builder consumes.
+
+`reconstruct_conversation` replays the canonical (tokenizer-independent)
+conversation of one episode from the same spans: the per-span message deltas
+concatenated, with each span's own sampled tokens parsed back into the
+assistant turn they represent. That message list plus the recorded tool
+schemas is what a cross-tokenizer teacher re-renders with its own chat
+template, so multi-turn agentic rollouts (not just single-turn math) can be
+scored token-for-token against a different tokenizer.
+
+That replay is per TRIAL, while a training datum is per TURN under the
+ephemeral-reasoning history (`wmh.distill.renderers`), so `turn_conversation`
+slices the replay down to one datum's view: truncated after that datum's last
+assistant turn, with reasoning stripped from the earlier ones exactly as the
+student's own prompt carried them. That slice, not the whole replay, is what the
+teacher scores a per-turn datum against.
 """
 
 from __future__ import annotations
@@ -28,10 +43,13 @@ import json
 import logging
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Protocol
 
+from llm_waterfall.types import ChatMessage, ChatTool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmh.core.types import JsonObject
+from wmh.distill.rendering import CLOSE_THINK, ParsedAssistantMessage
 from wmh.harness.runtime import StopReason
 from wmh.harness.scoring import GradedTests, ScoreCell
 from wmh.providers.tinker import TokenSpan
@@ -202,6 +220,175 @@ def _float_lists(value: object) -> list[list[float]] | None:
     return rows
 
 
+def _chat_messages(value: object) -> list[ChatMessage] | None:
+    """`value` as canonical chat messages, or None when it is not shaped like them."""
+    if not isinstance(value, list):
+        return None
+    messages: list[ChatMessage] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        try:
+            messages.append(ChatMessage.model_validate(item))
+        except ValidationError:
+            return None
+    return messages
+
+
+def _terminus_turn_deltas(
+    agent_result: JsonObject,
+    prompts: Sequence[Sequence[int]],
+    completions: Sequence[Sequence[int]],
+    *,
+    trial_name: str,
+) -> list[list[ChatMessage]] | None:
+    """The canonical per-turn message delta of one terminus-2 episode.
+
+    Terminus-2 copies its whole chat history into
+    `agent_result.metadata["all_messages"]` when it runs with
+    `store_all_messages=True` (`wmh.distill.rollouts.terminus_2_agent_kwargs`
+    always sets it). `harbor.llms.chat.Chat.chat` appends exactly
+    `[user_message, assistant_message]` per LLM call and nothing else touches
+    the list, so with `enable_summarize=False` (exactly one LLM call per turn)
+    it is append-only and **2:1 aligned** with the recorded token turns: turn
+    `i`'s canonical delta is `[all_messages[2 * i]]`, the USER message alone.
+
+    The assistant halves are deliberately NOT returned. Terminus-2 stores the
+    renderer's thinking-stripped `str` view of the response, so reusing it would
+    delete every reasoning island the cross-tokenizer teacher exists to score;
+    the assistant turn is re-derived from `TokenSpan.sampled_token_ids` by
+    `reconstruct_conversation` instead.
+
+    Two invariants are checked before the mapping is trusted, because harbor has
+    real code paths that break it (`_unwind_messages_to_free_tokens` truncates
+    the list, the summarization handoff rewrites it, and the
+    `OutputLengthExceededError` handler appends a message PAIR with no
+    corresponding LLM call - all three are unreachable for a distillation
+    rollout, which is exactly what these checks confirm rather than assume):
+
+    a. `len(all_messages) == 2 * len(prompts)`, and every even index holds the
+       `user` message the pairing depends on;
+    b. the token prefix chain, `prompts[i]` starting with
+       `prompts[i - 1] + completions[i - 1]` for every `i >= 1`, which is what
+       says the episode really is one linear conversation whose turns extend
+       each other.
+
+    Args:
+        agent_result: The trial's `agent_result` object from `result.json`.
+        prompts: The recorded per-turn prompt token ids.
+        completions: The recorded per-turn completion token ids, aligned with
+            `prompts`.
+        trial_name: The harbor trial name, for the log lines.
+
+    Returns:
+        One delta list per turn, aligned with `prompts`, or None when the
+        capture is absent or either invariant fails. None means the WHOLE trial
+        degrades (no span gets a delta), never that some turns are paired and
+        others are not: a mis-paired delta is silent corruption, while a missing
+        one is counted (`RolloutStats.trials_without_delta`) and skipped.
+    """
+    metadata = agent_result.get("metadata")
+    raw = metadata.get("all_messages") if isinstance(metadata, dict) else None
+    if raw is None:
+        logger.warning(
+            "harbor trial %s recorded no agent_result.metadata['all_messages'], so its "
+            "canonical conversation is unknown and a cross-tokenizer teacher cannot score "
+            "it; the trial ran without terminus-2's store_all_messages=True (an older run "
+            "dir, or a harbor build without the flag). Re-run the rollout step to capture it",
+            trial_name,
+        )
+        return None
+    messages = _chat_messages(raw)
+    if messages is None:
+        logger.warning(
+            "harbor trial %s recorded agent_result.metadata['all_messages'] that is not a "
+            "list of chat messages (%s); it contributes no canonical conversation",
+            trial_name,
+            type(raw).__name__,
+        )
+        return None
+    if len(messages) != 2 * len(prompts):
+        logger.warning(
+            "harbor trial %s recorded %d stored message(s) against %d token turn(s), but "
+            "harbor appends exactly one [user, assistant] pair per LLM call, so the counts "
+            "must satisfy messages == 2 x turns; the chat history was rewritten mid-episode "
+            "(summarization or a context unwind) or a message pair was appended without an "
+            "LLM call. Nothing can realign them after the fact, so the trial contributes no "
+            "canonical conversation rather than mis-paired deltas",
+            trial_name,
+            len(messages),
+            len(prompts),
+        )
+        return None
+    misplaced = [index for index in range(0, len(messages), 2) if messages[index].role != "user"]
+    if misplaced:
+        logger.warning(
+            "harbor trial %s stored a non-user message at even index/indices %s, so the "
+            "[user, assistant] pairing the per-turn delta depends on does not hold; the "
+            "trial contributes no canonical conversation",
+            trial_name,
+            misplaced[:8],
+        )
+        return None
+    for index in range(1, len(prompts)):
+        previous = len(prompts[index - 1])
+        shared = _common_prefix_length(prompts[index - 1], prompts[index])
+        # Scale-aware: a real episode's prompts are thousands of tokens and diverge
+        # only at the trailing generation suffix, but a short synthetic episode has
+        # no room for a fixed 64-token allowance -- `previous - 64` would go negative
+        # and the guard would never fire at all.
+        allowed_gap = min(_HISTORY_HEADER_SLACK, previous // 4)
+        if shared < previous - allowed_gap:
+            logger.warning(
+                "harbor trial %s breaks the conversation chain at turn %d: it shares only "
+                "%d of turn %d's %d prompt tokens, far short of the whole history, so the "
+                "chat was REWRITTEN rather than appended to and the stored messages cannot "
+                "be attributed to turns; the trial contributes no canonical conversation",
+                trial_name,
+                index,
+                shared,
+                index - 1,
+                previous,
+            )
+            return None
+    return [[messages[2 * index]] for index in range(len(prompts))]
+
+
+_HISTORY_HEADER_SLACK = 64
+"""Tokens by which turn i's prompt may fall short of sharing all of turn i-1's.
+
+Turn i-1's prompt ENDS with the generation suffix (`<|im_start|>assistant\n<think>\n`
+for Qwen3.5), but in turn i that same assistant turn is re-rendered as HISTORY,
+under the base renderer's historical header. So the two prompts diverge a few
+tokens before the end of the shorter one even in a perfectly linear episode, and
+an exact-extension test is wrong.
+
+This replaced such a test, which asserted `prompts[i]` began with
+`prompts[i-1] + completions[i-1]`. That held only while history replayed each
+turn's FULL sampled ids. Once reasoning became ephemeral (see
+`wmh.distill.renderers.VerbatimHistoryMixin`) it failed at turn 1 of every
+trial, silently degrading every trial to "no canonical conversation" -- a live
+run aborted with `no_replay` on 2,321 of 2,321 datums, which is the correct
+failure but for the wrong reason.
+
+The guard's real job is to catch a chat history that was REWRITTEN (a
+summarization handoff, a context unwind) rather than appended to, and that
+shortens the shared prefix by hundreds or thousands of tokens, not by tens. 64
+is comfortably above the longest generation suffix in this lineup and far below
+any real rewrite.
+"""
+
+
+def _common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
+    """How many leading ids two token sequences share."""
+    shared = 0
+    for a, b in zip(left, right, strict=False):
+        if a != b:
+            break
+        shared += 1
+    return shared
+
+
 def load_trial_rollout_spans(artifact_dir: Path) -> list[TokenSpan]:
     """Read the token spans harbor recorded for one terminus-2 trial.
 
@@ -218,6 +405,17 @@ def load_trial_rollout_spans(artifact_dir: Path) -> list[TokenSpan]:
     summarization handoff); they are separate conversations whose prompts do
     not extend the main chat, so they are skipped and warned about. The
     distill collector disables summarization precisely so none exist.
+
+    Each span also carries the CANONICAL message delta of its turn when the
+    trial's stored chat history can be trusted to align with the token turns
+    (see `_terminus_turn_deltas`), which is what lets a cross-tokenizer teacher
+    re-render the same conversation with its own chat template. When it cannot,
+    every span in the trial keeps `delta_messages=None` and the trial is counted
+    in `RolloutStats.trials_without_delta`: degrade visibly, never mis-align.
+
+    `tools` stays empty on every span. Terminus-2 passes no tool schemas at all
+    (it parses actions out of the assistant's text), so there is no tool-schema
+    mapping for the teacher render to preserve.
 
     Args:
         artifact_dir: The harbor trial directory (one cell's `artifact_dir`).
@@ -286,6 +484,7 @@ def load_trial_rollout_spans(artifact_dir: Path) -> list[TokenSpan]:
             len(logprobs),
         )
         return []
+    deltas = _terminus_turn_deltas(agent_result, prompts, completions, trial_name=artifact_dir.name)
     spans: list[TokenSpan] = []
     for index, (prompt, completion, row) in enumerate(
         zip(prompts, completions, logprobs, strict=True)
@@ -297,6 +496,15 @@ def load_trial_rollout_spans(artifact_dir: Path) -> list[TokenSpan]:
                     prompt_token_ids=prompt,
                     sampled_token_ids=completion,
                     sampled_logprobs=row,
+                    # `delta_start` follows from the same 2:1 alignment: the conversation
+                    # replayed before this call's delta is
+                    # [user_0, assistant_0, ..., assistant_{index - 1}], exactly 2 x index
+                    # messages, which is `len(previous call's messages) + 1` as the field
+                    # documents. Both fields are set together or neither is (the model's
+                    # validator enforces that), so a trial with no trusted capture keeps the
+                    # honest "no canonical messages" spelling on every span.
+                    delta_start=None if deltas is None else 2 * index,
+                    delta_messages=None if deltas is None else deltas[index],
                 )
             )
         except ValidationError as exc:
@@ -311,6 +519,222 @@ def load_trial_rollout_spans(artifact_dir: Path) -> list[TokenSpan]:
             )
             return []
     return spans
+
+
+class SampledTurnParser(Protocol):
+    """The one thing conversation replay needs from a renderer.
+
+    `wmh.distill.rendering.CookbookChatRendering` (and anything satisfying
+    `ChatRendering`) satisfies this structurally; the parse is what turns a
+    span's raw sampled ids back into a structured assistant turn.
+    """
+
+    def parse_response(self, sampled_ids: list[int]) -> ParsedAssistantMessage:
+        """Parse sampled token ids into an assistant message (text plus tool calls)."""
+        ...
+
+
+class ConversationReplay(BaseModel):
+    """One episode's canonical conversation, replayed from its token spans.
+
+    This is the cross-tokenizer hand-off: a teacher with a different tokenizer
+    re-renders `messages` (and `tools`) with its own chat template instead of
+    trying to reuse the student's token ids, and `assistant_index_by_span`
+    pairs each sampled span with the assistant message its tokens produced so
+    the chunk planner knows which rendered region a span must align to.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[ChatMessage]
+    """The full conversation in order: the spans' message deltas interleaved
+    with the assistant turn each span sampled."""
+
+    tools: list[ChatTool] | None = None
+    """The tool schemas the episode was sampled with; None when there were none.
+
+    None rather than `[]`, because that is what the teacher renderer reads as
+    "render no tools section at all" (`wmh.distill.xtoken.teacher_render`).
+    `TokenSpan.tools` spells the same thing as an empty list, so the two are
+    normalized here rather than at every consumer."""
+
+    assistant_index_by_span: dict[int, int]
+    """Span position (0-based, equal to `call_index` for a sink that passed
+    `load_trial_spans`) to the index in `messages` of the assistant message
+    that span's sampled tokens produced."""
+
+
+def reconstruct_conversation(
+    spans: Sequence[TokenSpan], rendering: SampledTurnParser
+) -> ConversationReplay | None:
+    """Replay one episode's canonical conversation from its recorded spans.
+
+    Walks the spans in call order, appending each span's `delta_messages` (the
+    messages that call added) and then the assistant message that span's
+    sampled ids parse to, so the result is the conversation the agent actually
+    held: system, user, assistant (with tool calls), tool result, assistant,
+    and so on.
+
+    The assistant turns are re-derived from the sampled ids, never read back
+    from a recorded message: the recorded assistant content is whatever the
+    agent's own renderer kept (terminus-2 keeps a thinking-stripped `str`), and
+    trusting it would delete every reasoning island the teacher has to score.
+
+    Args:
+        spans: One trial's spans in call order, as `load_trial_spans` or
+            `load_trial_rollout_spans` returns them.
+        rendering: The student's rendering, used only to parse each span's
+            sampled ids back into a structured assistant turn.
+
+    Returns:
+        The replay, or None when this episode cannot be replayed honestly:
+        no spans at all, a span recorded before message capture existed (an old
+        sink), a span whose prompt was reused or fully re-rendered rather than
+        extended (`TokenSpan.delta_messages` is None for both), or spans that
+        disagree about their tool schemas. Callers must degrade (skip the
+        cross-tokenizer path for the trial) rather than score a conversation
+        that differs from the sampled one; the reason is logged.
+    """
+    if not spans:
+        logger.info("no token spans to reconstruct a conversation from; nothing was sampled")
+        return None
+    tools = spans[0].tools
+    messages: list[ChatMessage] = []
+    assistant_index_by_span: dict[int, int] = {}
+    for index, span in enumerate(spans):
+        if span.delta_messages is None:
+            logger.warning(
+                "cannot reconstruct the conversation: span %d (call_index %d) carries no "
+                "delta_messages, so the canonical messages of that call are unknown; the "
+                "sink predates message capture or that call re-rendered/reused its prompt "
+                "instead of extending the previous one. Re-run the rollout step to capture "
+                "messages, and skip the cross-tokenizer teacher for this trial",
+                index,
+                span.call_index,
+            )
+            return None
+        if span.tools != tools:
+            logger.warning(
+                "cannot reconstruct the conversation: span %d (call_index %d) was rendered "
+                "with different tool schemas than span 0, so one tool list cannot describe "
+                "the episode; split the spans at the schema change before reconstructing",
+                index,
+                span.call_index,
+            )
+            return None
+        messages.extend(span.delta_messages)
+        parsed = rendering.parse_response(span.sampled_token_ids)
+        assistant_index_by_span[index] = len(messages)
+        # Same shape TinkerChatProvider.complete_chat handed the agent, so the
+        # replayed turn is the turn the conversation actually continued from.
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content=parsed.text or None,
+                tool_calls=parsed.tool_calls or None,
+            )
+        )
+    return ConversationReplay(
+        messages=messages,
+        # `[]` and None both mean "no schemas were rendered"; the teacher
+        # renderer only understands the None spelling.
+        tools=tools or None,
+        assistant_index_by_span=assistant_index_by_span,
+    )
+
+
+class TurnConversation(BaseModel):
+    """One datum's slice of an episode: the context it saw, plus its own turns."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    messages: list[ChatMessage]
+    """The conversation up to and including this datum's last assistant turn."""
+
+    assistant_indices: list[int]
+    """Index into `messages` of each of this datum's assistant turns, in the
+    order of the datum's sampled runs, which is what pairs a run with the
+    rendered region it must align to (`build_chunk_plan`)."""
+
+
+def turn_conversation(
+    replay: ConversationReplay, span_positions: Sequence[int]
+) -> TurnConversation | None:
+    """The conversation as it stood when one datum's spans were sampled.
+
+    Under the ephemeral-reasoning history (`wmh.distill.renderers`) an episode
+    becomes one datum per turn, so a datum is no longer the whole episode and
+    cannot be scored against the whole replay: pairing it with the episode's
+    first assistant turn would align the wrong text and silently corrupt every
+    advantage. This builds the datum's own view instead:
+
+    - truncated after the datum's LAST assistant turn, because nothing later
+      existed when it was sampled;
+    - with reasoning removed from every EARLIER assistant turn, because that is
+      what the student's own prompt carried. The teacher then conditions on the
+      same history the student did, which is the whole point of scoring the
+      conversation rather than the tokens.
+
+    The datum's own turns keep their reasoning: those are the tokens being
+    scored, and the teacher render is asked for them explicitly
+    (`clear_thinking=False`, `wmh.distill.xtoken.teacher_render`).
+
+    A datum covering several turns (possible when a turn had no reasoning to
+    drop, so the next prompt did extend it) keeps all of them; its earlier turns
+    have no reasoning to remove, which is exactly why they merged.
+
+    Args:
+        replay: The whole episode's replay (`reconstruct_conversation`).
+        span_positions: The datum's `span_indices`: which spans of the trial it
+            covers, in order.
+
+    Returns:
+        The datum's conversation view, or None when it cannot be built
+        honestly: no span positions at all (a datum with no provenance), or a
+        position the replay does not know. Callers must skip and count, never
+        fall back to the whole episode.
+    """
+    if not span_positions:
+        logger.warning(
+            "cannot build a per-turn conversation: the datum carries no span provenance "
+            "(TrainDatum.span_indices is empty), so which turn it holds is unknown; build "
+            "datums through build_datums and skip the cross-tokenizer teacher for it"
+        )
+        return None
+    try:
+        assistant_indices = [
+            replay.assistant_index_by_span[position] for position in span_positions
+        ]
+    except KeyError:
+        logger.warning(
+            "cannot build a per-turn conversation: the datum names span position(s) %s but the "
+            "replay only covers %s, so the datum and the replay describe different episodes",
+            list(span_positions),
+            sorted(replay.assistant_index_by_span),
+        )
+        return None
+    scored = set(assistant_indices)
+    messages: list[ChatMessage] = []
+    for index, message in enumerate(replay.messages[: max(assistant_indices) + 1]):
+        if message.role == "assistant" and index not in scored:
+            messages.append(_without_reasoning(message))
+        else:
+            messages.append(message)
+    return TurnConversation(messages=messages, assistant_indices=assistant_indices)
+
+
+def _without_reasoning(message: ChatMessage) -> ChatMessage:
+    """The same assistant message with its reasoning block removed.
+
+    Mirrors what the student's own prompt carries for a historical turn: the
+    content after the first `</think>`, tool calls untouched. A message with no
+    reasoning block is returned unchanged.
+    """
+    content = message.content
+    if not isinstance(content, str) or CLOSE_THINK not in content:
+        return message
+    _reasoning, _marker, visible = content.partition(CLOSE_THINK)
+    return message.model_copy(update={"content": visible or None})
 
 
 _TERMINUS_EXCEPTION_STOP_REASONS = {

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from harbor.models.job.config import JobConfig
+from llm_waterfall.types import ChatMessage
 
 import wmh.distill.rollouts as rollouts_module
 from wmh.distill.config import (
@@ -263,6 +264,9 @@ def test_collect_rollouts_wires_terminus_2_and_joins_harbor_rollout_details(
         "temperature": cfg.sampling.temperature,
         "max_turns": cfg.rollout.max_turns,
         "enable_summarize": False,
+        # The canonical conversation the cross-tokenizer teacher re-renders; without
+        # it every trial degrades to `delta_messages=None` and scores nothing.
+        "store_all_messages": True,
         "suppress_max_turns_warning": True,
     }
     assert kwargs["attempts"] == _GROUP_SIZE
@@ -578,6 +582,44 @@ def test_rollout_stats_is_a_pure_function_of_the_records() -> None:
     assert empty.trials == 0
     assert empty.solve_rate == 0.0
     assert empty.empty_span_trials == 0
+
+
+def _captured_span(call_index: int) -> TokenSpan:
+    """A span carrying its canonical message delta, as a captured terminus-2 turn does."""
+    return TokenSpan(
+        call_index=call_index,
+        prompt_token_ids=[1, 2, call_index],
+        sampled_token_ids=[70, 71],
+        sampled_logprobs=[-0.5, -1.0],
+        delta_start=2 * call_index,
+        delta_messages=[ChatMessage(role="user", content=f"observation {call_index}")],
+    )
+
+
+def test_rollout_stats_counts_the_trials_a_cross_tokenizer_teacher_cannot_score() -> None:
+    """One span without `delta_messages` disqualifies its WHOLE trial, silently.
+
+    `reconstruct_conversation` returns None for the trial, so the step still
+    reports datums > 0 with chunk coverage near zero rather than raising. This
+    count is the only place that says so.
+    """
+    captured = _trial("task-a", passed=True, spans=True)
+    captured = captured.model_copy(update={"spans": [_captured_span(0), _captured_span(1)]})
+    partial = _trial("task-b", passed=False, spans=True)
+    partial = partial.model_copy(update={"spans": [_captured_span(0), _span(1)]})
+    uncaptured = _trial("task-c", passed=False, spans=True)
+    spanless = _trial("task-d", passed=False, spans=False)
+
+    stats = rollout_stats([captured, partial, uncaptured, spanless], max_tokens=4096)
+
+    assert stats.trials_with_spans == 3
+    # task-b (one span short) and task-c (no capture at all); task-d has no spans
+    # to lose a delta from and is already reported by empty_span_trials.
+    assert stats.trials_without_delta == 2
+    assert stats.empty_span_trials == 1
+
+    fully_captured = rollout_stats([captured], max_tokens=4096)
+    assert fully_captured.trials_without_delta == 0
 
 
 def test_module_scope_never_imports_the_harbor_extra() -> None:
