@@ -295,7 +295,7 @@ def run_grid(
     """
     from pathlib import Path
 
-    from wmo.engine.build import split_traces, split_traces_3way
+    from wmo.engine.build import split_holdout
     from wmo.ingest import get_adapter
 
     if val_frac is None:
@@ -326,11 +326,9 @@ def run_grid(
     adapter = get_adapter("otel-genai")
     for path in paths:
         traces = adapter.from_file(str(path))
-        if use_3way:
-            _, _, holdout = split_traces_3way(traces, train_split, val_frac)
-        else:
-            _, holdout = split_traces(traces, train_split)
-        holdout = holdout or traces
+        # `val_frac` is 0.0 exactly when the 3-way cut was not usable, which is the 2-way branch
+        # of `split_holdout`; a corpus with no held-out band scores everything.
+        _train, holdout, _tiny_corpus = split_holdout(traces, train_split, val_frac)
         if max_holdout_traces is not None:
             holdout = holdout[:max_holdout_traces]
         result.total_test_traces += len(holdout)

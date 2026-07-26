@@ -15,7 +15,7 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
-from wmo.engine.build import split_traces, split_traces_3way
+from wmo.engine.build import split_holdout
 from wmo.engine.knowledge import seeded_knowledge_text
 from wmo.engine.replay import ReplayReport, replay, valid_scores
 from wmo.ingest import get_adapter
@@ -98,12 +98,9 @@ def evaluate_files(
         traces = adapter.from_file(str(path))
         if not traces:
             continue
-        if val_frac:  # truthy (a positive val band); None or 0.0 keeps the plain 2-way split
-            train, _val, holdout = split_traces_3way(traces, train_split, val_frac)
-        else:
-            train, holdout = split_traces(traces, train_split)
-        if not holdout:  # tiny corpus: evaluate on everything
-            train, holdout = traces, traces
+        # 3-way when `val_frac` is a positive band, 2-way otherwise; a tiny corpus with no
+        # held-out trace falls back to scoring everything (see `split_holdout`).
+        train, holdout, _tiny_corpus = split_holdout(traces, train_split, val_frac)
         if max_holdout_traces is not None:
             holdout = sorted(holdout, key=lambda t: t.trace_id)[:max_holdout_traces]
         retriever = EmbeddingRetriever(embedder) if embedder is not None else None

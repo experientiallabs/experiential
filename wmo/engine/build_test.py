@@ -8,7 +8,7 @@ import pytest
 
 from wmo.config import ArtifactPaths, HarnessConfig
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.engine.build import build, split_traces, split_traces_3way
+from wmo.engine.build import build, split_holdout, split_traces, split_traces_3way
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.retrieval import HashingEmbedder
 
@@ -96,6 +96,40 @@ def test_split_traces_3way_rejects_degenerate_fractions() -> None:
         split_traces_3way(traces, 0.7, 0.4)  # sums to > 1 -> empty test
     with pytest.raises(ValueError, match="train_frac"):
         split_traces_3way(traces, 0.0, 0.5)
+
+
+def test_split_holdout_returns_the_test_band_of_the_3way_cut() -> None:
+    # The one owner of "the band a measurement may score on": with a positive val band it is the
+    # reserved TEST band, never the val band a prompt was selected on.
+    traces = [Trace(trace_id=f"t{i}") for i in range(60)]
+    train, holdout, tiny_corpus = split_holdout(traces, 0.6, 0.2)
+    three_train, three_val, three_test = split_traces_3way(traces, 0.6, 0.2)
+    ids = lambda ts: {t.trace_id for t in ts}  # noqa: E731
+    assert ids(train) == ids(three_train)
+    assert ids(holdout) == ids(three_test)
+    assert not ids(holdout) & ids(three_val)
+    assert tiny_corpus is False
+
+
+def test_split_holdout_without_a_val_band_is_the_plain_2way_split() -> None:
+    traces = [Trace(trace_id=f"t{i}") for i in range(60)]
+    two_train, two_test = split_traces(traces, 0.6)
+    ids = lambda ts: {t.trace_id for t in ts}  # noqa: E731
+    for val_frac in (None, 0.0):
+        train, holdout, tiny_corpus = split_holdout(traces, 0.6, val_frac)
+        assert ids(train) == ids(two_train)
+        assert ids(holdout) == ids(two_test)
+        assert tiny_corpus is False
+
+
+def test_split_holdout_falls_back_to_the_whole_corpus_and_says_so() -> None:
+    # A corpus too small to leave a held-out band scores everything (the established `wmo eval`
+    # behavior), and the flag lets a caller warn that those scores are not leak-free.
+    traces = [Trace(trace_id="t2"), Trace(trace_id="t4")]  # both hash into the train band
+    assert split_traces_3way(traces, 0.8, 0.1)[2] == []  # so the 3-way cut leaves no test band
+    train, holdout, tiny_corpus = split_holdout(traces, 0.8, 0.1)
+    assert tiny_corpus is True
+    assert train is traces and holdout is traces
 
 
 def test_cap_gepa_valset_bounds_steps_and_keeps_at_least_one_trace() -> None:

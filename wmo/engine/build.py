@@ -101,6 +101,28 @@ def split_traces_3way(
     return train, val, test
 
 
+def split_holdout(
+    traces: list[Trace], train_frac: float, val_frac: float | None = None
+) -> tuple[list[Trace], list[Trace], bool]:
+    """Split into (train, the band a measurement may score, tiny-corpus fallback flag).
+
+    One owner for the "cut the corpus, then fall back to everything when it is too small" idiom
+    every measurement path needs (`wmo eval`, the eval grid, `wmo optimize route sweep`).
+
+    A positive `val_frac` cuts 3-way on the build's hash line and returns the reserved TEST band,
+    the one prompt selection never saw; `None` or `0` keeps the plain 2-way split. A corpus too
+    small to leave a held-out band falls back to the WHOLE corpus on both sides and the third
+    element is True, because those scores are NOT leak-free and a caller may need to say so.
+    """
+    if val_frac:
+        train, _val, holdout = split_traces_3way(traces, train_frac, val_frac)
+    else:
+        train, holdout = split_traces(traces, train_frac)
+    if not holdout:
+        return traces, traces, True
+    return train, holdout, False
+
+
 def build(
     config: HarnessConfig,
     *,

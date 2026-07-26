@@ -9,7 +9,13 @@ from pydantic import ValidationError
 
 from wmo.providers.azure_openai import AzureOpenAIProvider
 from wmo.providers.base import ProviderConfig, ProviderKind, TokenUsage
-from wmo.providers.pool import DEFAULT_POOL_PATH, PoolEntry, load_pool, pool_provider
+from wmo.providers.pool import (
+    DEFAULT_POOL_PATH,
+    PoolEntry,
+    load_pool,
+    pool_api_key,
+    pool_provider,
+)
 from wmo.providers.registry import get_provider
 
 _POOL_TOML = """
@@ -147,6 +153,42 @@ def test_pool_provider_passes_explicit_key(tmp_path: Path, monkeypatch: pytest.M
     assert client.api_key == "sk-pool-test"
 
 
+def test_pool_provider_names_the_entry_when_a_backend_refuses_its_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A backend that refuses to be built says nothing about WHICH candidate did it, and callers
+    # loop over a whole pool (`wmo optimize route sweep` constructs all of them as a pre-flight),
+    # so the entry name and kind have to survive into the message an operator reads.
+    monkeypatch.setenv("WMO_POOL_TEST_KEY", "sk-present")
+    entry = PoolEntry(
+        name="student",
+        kind=ProviderKind.TINKER,
+        model="Qwen/Qwen3-8B",
+        api_key_env="WMO_POOL_TEST_KEY",  # set: this is a backend refusal, not a missing key
+        input_per_mtok=0.1,
+        output_per_mtok=0.2,
+    )
+    with pytest.raises(ValueError, match=r"pool model 'student' \(kind=tinker\)") as failure:
+        pool_provider(entry)
+    # The backend's own advice is preserved, not replaced by the identification.
+    assert "TINKER_API_KEY" in str(failure.value)
+
+
+def test_pool_api_key_checks_credentials_without_building_a_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The seam a caller about to spend on a whole pool uses to check every candidate up front:
+    # same verdict as `pool_provider`, no provider constructed and no network client touched.
+    pool = load_pool(_write_pool(tmp_path))
+    monkeypatch.delenv("AZURE_SILEN_RESOURCE_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="AZURE_SILEN_RESOURCE_API_KEY"):
+        pool_api_key(pool.entry("deepseek-v4-pro"))
+    monkeypatch.setenv("AZURE_SILEN_RESOURCE_API_KEY", "sk-pool-test")
+    assert pool_api_key(pool.entry("deepseek-v4-pro")) == "sk-pool-test"
+    # An entry with no api_key_env uses the backend's default credentials, and says so with None.
+    assert pool_api_key(pool.entry("fable")) is None
+
+
 def test_pool_entry_unknown_name_lists_available(tmp_path: Path) -> None:
     pool = load_pool(_write_pool(tmp_path))
     with pytest.raises(KeyError, match="deepseek-v4-pro"):
@@ -245,6 +287,21 @@ def test_azure_entry_requires_deployment() -> None:
             name="no-deploy",
             kind=ProviderKind.AZURE_OPENAI,
             model="gpt-5.5",
+            input_per_mtok=1.0,
+            output_per_mtok=2.0,
+        )
+
+
+def test_bedrock_entry_rejects_api_key_env_at_load() -> None:
+    # `BedrockProvider.__init__` refuses an explicit key, and providers are built lazily per
+    # eval cell: caught at load this is a config typo, caught at the first cell it aborts a
+    # paid-for sweep. Same boundary as the azure `deployment` rule above.
+    with pytest.raises(ValidationError, match="api_key_env"):
+        PoolEntry(
+            name="claude-bedrock",
+            kind=ProviderKind.BEDROCK,
+            model="us.anthropic.claude-opus-4-8",
+            api_key_env="AWS_SOMETHING",
             input_per_mtok=1.0,
             output_per_mtok=2.0,
         )

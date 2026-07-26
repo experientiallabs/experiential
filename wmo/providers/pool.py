@@ -78,6 +78,14 @@ class PoolEntry(BaseModel):
                 f"pool model '{self.name}': azure entries need `deployment` (the Azure "
                 "deployment name to call)"
             )
+        if self.kind is ProviderKind.BEDROCK and self.api_key_env is not None:
+            # Same boundary: `BedrockProvider.__init__` refuses an explicit key, and a sweep
+            # constructs providers lazily per cell, so this would abort mid-run after the
+            # candidates ahead of it had already been paid for.
+            raise ValueError(
+                f"pool model '{self.name}': bedrock authenticates with AWS credentials "
+                "(profile/role), not an API key; drop api_key_env from this entry"
+            )
         return self
 
     def price(self) -> ModelPrice:
@@ -171,15 +179,46 @@ def load_pool(path: Path = DEFAULT_POOL_PATH) -> ModelPool:
     return ModelPool.model_validate({"models": data.get("model", [])})
 
 
+def pool_api_key(entry: PoolEntry) -> str | None:
+    """One entry's own API key, read from its `api_key_env`; None means backend defaults.
+
+    Separate from `pool_provider` so a caller about to spend money on a WHOLE pool can resolve
+    every candidate's credentials up front (`wmo optimize route sweep` does, before its cost
+    confirmation) instead of discovering an unset variable at the first cell of a candidate it
+    already paid to reach. The lookup is local `os.environ`, so it costs nothing to run early.
+
+    Raises:
+        ValueError: `api_key_env` names a variable that is unset or empty.
+    """
+    if not entry.api_key_env:
+        return None
+    api_key = os.environ.get(entry.api_key_env)
+    if not api_key:
+        raise ValueError(
+            f"pool model '{entry.name}': environment variable {entry.api_key_env} is unset "
+            "or empty; export that account's API key or drop api_key_env to use the "
+            "backend's default credentials"
+        )
+    return api_key
+
+
 def pool_provider(entry: PoolEntry) -> Provider:
-    """Construct the provider for one pool entry, resolving its per-account API key."""
-    api_key: str | None = None
-    if entry.api_key_env:
-        api_key = os.environ.get(entry.api_key_env)
-        if not api_key:
-            raise ValueError(
-                f"pool model '{entry.name}': environment variable {entry.api_key_env} is unset "
-                "or empty; export that account's API key or drop api_key_env to use the "
-                "backend's default credentials"
-            )
-    return get_provider(entry.provider_config(), api_key=api_key)
+    """Construct the provider for one pool entry, resolving its per-account API key.
+
+    Construction is side-effect free for every backend (`wmo.providers.registry`): each one only
+    stores its config and defers the SDK import, the credential read, and the client to its first
+    request. That is what lets a caller about to spend money construct a whole pool up front as a
+    pre-flight (`wmo optimize route sweep` does) without issuing a single request.
+
+    A construction failure is re-raised naming the entry and its kind: a backend that refuses to
+    be built ("Bedrock authenticates with AWS credentials, not an API key") knows nothing about
+    the pool it came from, and the caller is usually looping over candidates.
+
+    Raises:
+        ValueError: The entry names an unset `api_key_env`, or its backend refuses this config.
+    """
+    api_key = pool_api_key(entry)
+    try:
+        return get_provider(entry.provider_config(), api_key=api_key)
+    except ValueError as exc:
+        raise ValueError(f"pool model '{entry.name}' (kind={entry.kind.value}): {exc}") from exc
