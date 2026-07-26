@@ -31,10 +31,10 @@ verdict and evidence pointers; the PR carrying it is the track's living research
 
 | family | examples | prefix-stability prior | status |
 | --- | --- | --- | --- |
-| heuristic | self-information filtering, dedup, recency windows | deterministic by construction | awaiting c1 |
-| symbolic | AST/syntax-aware pruning, template dedup, schema-aware tool-log compaction | deterministic by construction | awaiting c1 |
-| learned (build) | LLMLingua-2-style token classification, cheap-LM forward-pass scorer | deterministic IF greedy/thresholded, must be tested | awaiting c1; H100 boxes available |
-| hosted (buy) | The Token Company Bear-2 et al. | unknown, must be tested empirically | awaiting c1 wrap |
+| heuristic | self-information filtering, dedup, recency windows | deterministic by construction | round 0 audited (verdicts below) |
+| symbolic | AST/syntax-aware pruning, template dedup, schema-aware tool-log compaction | deterministic by construction | round 0 audited (verdicts below) |
+| learned (build) | LLMLingua-2-style token classification, cheap-LM forward-pass scorer | deterministic IF greedy/thresholded, must be tested | round 0 audited; accuracy leg next |
+| hosted (buy) | The Token Company Bear-2, Compresr et al. | unknown | CUT (Silen ruling 2026-07-26: open source only; buy-vs-build closed as BUILD) |
 
 Lit review (citation-screened) lands in wmh-compression-data/findings/lit-review.md and
 gets summarized here. GPU resources: h100-dev-box-6 and h100-dev-box-3 (2x H100 each,
@@ -73,5 +73,72 @@ C3 item 0; no savings number ships before it lands.
 
 ## Verdicts
 
-(the table fills as children report and master verifies; round 0 = append-stability
-audit across all slate methods + hosted arms, $0, before any live accuracy spend)
+### Round 0: the append-stability audit (C1, 2026-07-25, $0, no API calls)
+
+The track's cheapest disqualifier, run before any live accuracy spend and, to our
+knowledge, the first published-style append-stability numbers for any compression
+method. Setup: 12 methods x 5 corpora (tau-bench, terminal-tasks, swe-bench,
+financebench, tau-bench-real), 120 multi-turn transcripts rebuilt from the routing
+matrices' stored task + replies, churn measured at every turn boundary. Churn = the
+fraction of the previously emitted compressed prefix that is no longer a byte-for-byte
+prefix after one appended turn (0 = append-only = provider cache survives). Code:
+wmh/research/compression.py (+tests) and .agents/scripts/run_compression_audit.py;
+evidence: .agents/docs/research/compression_round0/ and the track data root
+(runs/c1.jsonl, findings/c1.md). All methods passed same-input-3x determinism (CPU
+fp32).
+
+| method | append-only | churn mean | token ratio | verdict (kill bar 1) |
+| --- | --- | --- | --- | --- |
+| head-truncate-absolute | 5/5 | 0.000 | 0.38 | survives |
+| head-truncate-ratio | 5/5 | 0.000 | 0.47 | survives (see correction below) |
+| dedup-keep-first | 5/5 | 0.000 | 0.93 | survives; finds little (see caveat) |
+| per-turn-truncate-at-append | 5/5 | 0.000 | 0.60 | survives; strongest free structural candidate |
+| json-minify | 5/5 | 0.000 | 0.98 | survives; finds almost nothing (see caveat) |
+| selective-context-absolute | 5/5 | 0.000 | 0.25 | survives |
+| llmlingua2-fixed-threshold | 5/5 | 0.000 | 0.60 | survives; the accuracy leg is the live question |
+| selective-context-percentile | 0/5 | 0.302 | 0.58 | DEAD for cached prefixes; non-cacheable segments only |
+| llmlingua2-percentile (stock rule) | 0/5 | 0.580 | 0.57 | DEAD for cached prefixes; non-cacheable segments only |
+| rolling-observation-mask | 0/5 | 0.258 | 0.70 | DEAD for cached prefixes; truncate-at-append replaces it |
+| tail-recency-window | 0/5 | 0.611 | 0.43 | DEAD for cached prefixes |
+| random-removal (control) | 0/5 | 0.986 | 0.51 | control only |
+
+The headline mechanism: THE SELECTION RULE DECIDES PREFIX STABILITY, THE SCORER DOES
+NOT. The same scorer (GPT-2 self-information, or LLMLingua-2 177M keep-probabilities)
+churns 24-81% of the emitted prefix per turn under the stock per-input percentile rule
+and is byte-stable append-only under a fixed absolute threshold, on every corpus.
+Stock LLMLingua-2 selection forfeits essentially the whole provider cache every turn
+(worst churn 0.81 on swe-bench); its shipped-but-never-evaluated fixed-threshold path
+survives at ratio 0.51-0.68.
+
+Corrections and caveats carried forward:
+
+- Correction to the lit review's truncation table: head-keep truncation with a RATIO
+  budget IS append-only (round(ratio x n) is nondecreasing, so the kept prefix only
+  extends; pinned by a test). "Ratio budgets are never append-only" is a fact about
+  percentile selection, not head-keep truncation.
+- The audit transcripts carry agent replies but not environment observations (the
+  routing matrices do not store them), so token-reduction headroom is understated for
+  every method and especially the symbolic family (dedup found 3-12%, json-minify
+  0-4% on replies-only text; the literature puts observations at ~84% of agent-turn
+  tokens). Stability verdicts are unaffected: stability is a property of the
+  algorithm, not the text mix.
+- Ratio-matching rule for all future accuracy grids: controls must match each
+  method's ACHIEVED token ratio per corpus (selective-context-absolute calibrated to
+  keep ~50% of line-units kept only 13-37% of tokens).
+- Our scorers run per-turn/per-unit local; stock implementations chunk the whole
+  prompt at global 512-token boundaries, so the percentile churn rows are lower
+  bounds on the stock implementations.
+- Learned-method latency (4.5-6 s/10k tokens) is local-CPU-fp32 and provisional; the
+  H100 leg (realistic batch, hosting amortized) gates kill bar 3, not this round.
+
+### Acceptance benchmark (C1's second deliverable, seam agreed, implementation next)
+
+A cell = (compressor config, model) evaluated closed-loop on held-out wm scenarios by
+`evaluate_pool(..., provider_factory=...)` (wmh/env/closed_loop.py) with a
+CompressingProvider wrapper that compresses request context before the call and
+records raw vs compressed tokens + compressor wall time. Cost is cache-adjusted via
+`PoolEntry.cost_usd`; matched-ratio random-removal and truncation controls are just
+two more compressor configs, so every grid carries them by construction; output is
+RunRecord JSONL so the routing dashboard's power rule and paired-by-seed conventions
+apply unchanged, and C2 runs its joint grids through the same entry point. First live
+corpus: financebench-s80, after a master-approved cost projection.
