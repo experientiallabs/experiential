@@ -14,6 +14,7 @@ Figures (into .agents/docs/research/figures/):
   routing_verdict_census.png  how every group scored under the honest verdict rules
   routing_confidence_curve.png  the "route only when confident" dial (numbers from PR #259)
   routing_signal_map.png      where signal lives vs how big the test set is
+  routing_pareto_niches.png   per-niche frontiers: the pool, the niche champion, the ceiling
 
 Two deliberate deviations from the brief, both to avoid a misleading chart:
 
@@ -32,8 +33,10 @@ Two deliberate deviations from the brief, both to avoid a misleading chart:
 from __future__ import annotations
 
 import importlib.util
+import json
 import statistics
 import sys
+import textwrap
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +50,7 @@ if TYPE_CHECKING:
 
 BUILDER = Path(__file__).with_name("build_dashboard.py")
 OUT_DIR = Path(".agents/docs/research/figures")
+MATRIX_DIR = Path.home() / "Desktop/Projects/wmh-routing-data/matrices"
 
 # House style: near-black ink, hairline grid, restrained accents, generous whitespace.
 INK = "#0a0a0a"
@@ -69,6 +73,26 @@ CONFIDENCE_ROUTED_AWAY = [69.1, 68.0, 64.9, 48.0, 30.9]
 CONFIDENCE_ACC = [0.9607, 0.9607, 0.9607, 0.9635, 0.9579]
 
 HEADLINE_MATRIX = "routerbench-ours9"
+
+# The per-niche panels. Each is (run-record cohort, matrix file stem, the lead-in caption).
+NICHES = [
+    (
+        "financebench-s80",
+        "financebench-s80",
+        "deployable frontier today = the niche's best model; the ceiling is the cascade's "
+        "+7.3pt at -24% cost",
+    ),
+    (
+        "tau-bench-s80",
+        "tau-bench-s80",
+        "step 1 of niche optimization: discover the niche's own champion (sonnet-5 here, not "
+        "the global fallback)",
+    ),
+]
+# Always call these out by name: the anchor of each niche, plus the global fallback so the
+# reader can see it is NOT automatically the right model for a given niche.
+ALWAYS_LABEL = {"fable-5"}
+ORACLE_VARIANT = "r2-oracle2-cascade"  # an upper bound, never deployable: it peeks at rewards
 # The PROMOTED champion, pinned by name rather than picked by best delta. Unguarded kNN
 # variants score higher here (r1-knn-noguard-oai reaches +1.33pt) but are not deployable: the
 # guard is what keeps the router from dipping below baseline under distribution shift, which
@@ -508,6 +532,237 @@ def fig_signal_map(groups: list[dict], plt: ModuleType) -> Path:
     return save(fig, "routing_signal_map.png")
 
 
+def pool_points(stem: str) -> list[tuple[str, float, float]]:
+    """Per-model (name, mean reward, mean cost per episode) straight from the outcome matrix.
+
+    This is the whole pool on the whole niche - every scenario, every episode - which is a
+    different population from the router points on the same axes: those are held-out split
+    means. The panel subtitle says so, because putting both on one frame without saying it
+    would invite reading a router's gain off the pool's spread.
+    """
+    matrix = json.loads((MATRIX_DIR / f"{stem}_matrix.json").read_text(encoding="utf-8"))
+    rewards: dict[str, list[float]] = defaultdict(list)
+    costs: dict[str, list[float]] = defaultdict(list)
+    for outcome in matrix["outcomes"]:
+        if outcome.get("reward") is None:
+            continue
+        rewards[outcome["model"]].append(outcome["reward"])
+        costs[outcome["model"]].append(outcome["cost_usd"])
+    return sorted(
+        ((m, statistics.mean(rewards[m]), statistics.mean(costs[m])) for m in rewards),
+        key=lambda row: -row[1],
+    )
+
+
+def niche_family(group: dict) -> str:
+    """Colour bucket within a niche panel: champion lineage, multi-call, or neither.
+
+    The r3b-* sweep (novelty floors, hybrids, the SVM) carries no "knn" in its name so the
+    dashboard's family_of files it under other; here it belongs with the champion lineage it
+    was derived from, which is what the reader needs to see.
+    """
+    if group["fam"] == "multi":
+        return "multi"
+    if group["v"].startswith(("r3b-", "r1-knn", "r3x-")) or group["fam"] == "knn":
+        return "champion"
+    return "rest"
+
+
+def fig_niches(groups: list[dict], plt: ModuleType) -> Path:
+    """Figure 5: we optimize per niche. One panel per niche, its own pool and its own answer."""
+    fig, axes = plt.subplots(1, len(NICHES), figsize=(13.0, 6.6), dpi=200)
+    fig.patch.set_facecolor("white")
+
+    for ax, (cohort, stem, caption) in zip(axes, NICHES, strict=True):
+        ax.set_facecolor("white")
+        pool = pool_points(stem)
+        best_model, best_reward, best_cost = pool[0]
+        rows = [
+            g
+            for g in groups
+            if g["m"] == cohort and g["tier"] != "anchor" and "shuffl" not in g["v"]
+        ]
+        # Router deltas are PAIRED against this held-out baseline, so every router-relative
+        # number (the cost ratio included) has to use it rather than the pool's matrix-wide
+        # cost, or the panel quotes two bases and contradicts its own caption.
+        anchor = next((g for g in groups if g["m"] == cohort and g["tier"] == "anchor"), None)
+        base_cost = anchor["cost"] if anchor else best_cost
+
+        # The pool itself: every model we could have used, the niche's winner in ink.
+        for name, reward, cost in pool[1:]:
+            ax.scatter(
+                cost,
+                reward,
+                s=34,
+                facecolor=GRAY_LIGHT,
+                edgecolor=GRAY_MID,
+                linewidth=1.0,
+                zorder=3,
+            )
+            if name in ALWAYS_LABEL:
+                ax.annotate(
+                    f"{name} {reward:.1%}\n{cost / best_cost:.1f}x the cost of "
+                    f"{best_model}, and worse",
+                    xy=(cost, reward),
+                    xytext=(0, -14),
+                    textcoords="offset points",
+                    fontsize=8.5,
+                    color=RED,
+                    ha="center",
+                    va="top",
+                )
+        ax.scatter(
+            best_cost,
+            best_reward,
+            marker="D",
+            s=95,
+            facecolor=INK,
+            edgecolor="white",
+            linewidth=1.4,
+            zorder=7,
+        )
+        ax.annotate(
+            f"{best_model} {best_reward:.1%}\nthis niche's best single model",
+            xy=(best_cost, best_reward),
+            xytext=(11, -4),
+            textcoords="offset points",
+            fontsize=9,
+            color=INK,
+            ha="left",
+            fontweight="bold",
+        )
+
+        # Without this line the panel misleads: the diamond is a matrix-wide mean over all 80
+        # scenarios, the coloured points are held-out split means, and on tau that gap is 6pt
+        # of population difference that reads as routers losing to the best model. Draw the
+        # baseline the routers are actually paired against, and say which one it is.
+        if anchor is not None:
+            ax.axhline(anchor["acc"], color=MUTED, linewidth=1.3, linestyle="--", zorder=2)
+            ax.annotate(
+                f"held-out baseline {anchor['acc']:.1%}",
+                xy=(0.015, anchor["acc"]),
+                xycoords=("axes fraction", "data"),
+                xytext=(0, 4),
+                textcoords="offset points",
+                fontsize=8.5,
+                color=MUTED,
+                ha="left",
+                va="bottom",
+            )
+
+        # Routers and cascades measured on this niche's held-out splits.
+        on_anchor = 0
+        for g in rows:
+            bucket = niche_family(g)
+            if g["v"] == ORACLE_VARIANT:
+                continue
+            colour = {"champion": TEAL, "multi": RED}.get(bucket, GRAY_MID)
+            solid = g["tier"] in {"beats", "promising"}
+            if g["tier"] == "identical":
+                on_anchor += 1
+            ax.errorbar(
+                [g["cost"]],
+                [g["acc"]],
+                yerr=[g["sd"]],
+                fmt="o",
+                markersize=6.5,
+                color=colour,
+                markerfacecolor=colour if solid else "white",
+                markeredgecolor=colour,
+                markeredgewidth=1.7,
+                elinewidth=1.1,
+                capsize=0,
+                ecolor=colour,
+                alpha=0.95,
+                zorder=5,
+            )
+
+        oracle = next((g for g in rows if g["v"] == ORACLE_VARIANT), None)
+        if oracle is not None:
+            ax.errorbar(
+                [oracle["cost"]],
+                [oracle["acc"]],
+                yerr=[oracle["sd"]],
+                fmt="none",
+                elinewidth=1.3,
+                capsize=0,
+                ecolor=RED,
+                zorder=6,
+            )
+            ax.scatter(
+                oracle["cost"],
+                oracle["acc"],
+                marker="*",
+                s=340,
+                facecolor=RED,
+                edgecolor="white",
+                linewidth=1.3,
+                zorder=8,
+            )
+            ax.annotate(
+                f"cascade ceiling (oracle decision)\n{oracle['acc']:.1%}, "
+                f"{100 * oracle['d']:+.1f}pt at {oracle['cost'] / base_cost - 1:+.0%} cost\n"
+                "NOT deployable: it reads the reward",
+                xy=(oracle["cost"], oracle["acc"]),
+                xytext=(0, 15),
+                textcoords="offset points",
+                fontsize=8.5,
+                color=RED,
+                ha="center",
+                fontweight="bold",
+            )
+        if on_anchor:
+            ax.annotate(
+                f"{on_anchor} guarded configs land exactly\non the anchor: the guard never\n"
+                "fired, nothing here to win",
+                xy=(0.02, 0.99),
+                xycoords="axes fraction",
+                fontsize=8.5,
+                color=TEAL,
+                ha="left",
+                va="top",
+            )
+
+        ax.set_xscale("log")
+        ax.set_xlabel("cost per episode, USD (log)", fontsize=10.5, color=INK)
+        ax.set_ylabel("reward", fontsize=10.5, color=INK)
+        n_test = rows[0]["ntmed"] if rows else 0
+        titled(
+            ax,
+            cohort,
+            f"9-model pool on 80 scenarios · routers on {n_test:.0f} held-out scenarios/seed",
+        )
+        style_axes(ax)
+        ax.yaxis.set_major_formatter(lambda v, _: f"{v:.0%}")
+        ax.annotate(
+            "\n".join(textwrap.wrap(caption, 62)),
+            xy=(0, -0.155),
+            xycoords="axes fraction",
+            fontsize=9,
+            color=MUTED,
+            va="top",
+        )
+
+    fig.text(
+        0.5,
+        0.015,
+        textwrap.fill(
+            "Gray dots are the pool models over the whole niche; coloured points are routers "
+            "and cascades on held-out splits (+-1 sd across seeds). Teal = guarded champion "
+            "lineage, red = multi-call. The dashed line is the anchor model measured on those "
+            "same held-out splits, which is the bar every coloured point is paired against - "
+            "compare to the line, not to the diamond.",
+            118,
+        ),
+        fontsize=8.5,
+        color=MUTED,
+        ha="center",
+        va="bottom",
+    )
+    fig.tight_layout(rect=(0, 0.17, 1, 1))
+    return save(fig, "routing_pareto_niches.png")
+
+
 def main() -> None:
     import matplotlib
 
@@ -520,6 +775,7 @@ def main() -> None:
     written.append(census_path)
     written.append(fig_confidence(plt))
     written.append(fig_signal_map(groups, plt))
+    written.append(fig_niches(groups, plt))
 
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     sys.stderr.write(
