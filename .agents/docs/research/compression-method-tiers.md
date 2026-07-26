@@ -1,0 +1,46 @@
+# Token compression: method tiers and findings (living doc, the track's canonical record)
+
+Track brief: the serving path gains a compression stage (request -> compress -> route ->
+provider call) and the policy artifact becomes JOINT (per task-cluster: compression config
++ model). This doc mirrors routing-method-tiers.md: every method tried lands here with its
+verdict and evidence pointers; the PR carrying it is the track's living research PR.
+
+## Binding methodology (violations invalidate a result)
+
+- Accounting: every savings claim is CACHE-ADJUSTED effective cost per completed task,
+  compressor inference cost and latency included. Prefix-stability (deterministic,
+  append-only under conversation growth) or scoped-outside-the-cached-prefix is a hard
+  requirement: breaking the provider prompt cache trades a ~0.9x discount on the prefix
+  for the tokens saved.
+- Evaluation: closed-loop on held-out wm scenarios (generate/execute/verify), 5 split
+  seeds, PAIRED-BY-SEED vs the uncompressed baseline; power rule = 3+ seeds AND 30+ test
+  scenarios else "candidate"; judge-noise discount 15-17% on wm corpora; the real-benchmark
+  confirmation leg (tau-bench-real) for headline claims.
+- Controls, mandatory in every accuracy grid: random token removal at matched ratio and
+  truncation at matched ratio. A compressor that does not beat both has learned nothing.
+- Long-tail failure hunting, mandatory: read the 10 worst per-scenario regressions per
+  grid family, categorize which removed token classes changed answers (numbers, entities,
+  negations, tool syntax); categories feed the per-cluster risk tiers.
+- Live-run budgets: stored matrices cannot simulate compression accuracy (it changes the
+  model's input); every live grid needs a master-approved cost projection first.
+- Data conventions: runs as RunRecord JSONL in ~/Desktop/Projects/wmh-compression-data/
+  runs/<chat>.jsonl (fit outputs OUT of params), findings per chat in findings/<chat>.md,
+  cohorts never merged across capture configs (s80 vs 25-scen lesson).
+
+## Method families under test (Silen's cut: heuristic, symbolic, learned; build AND buy)
+
+| family | examples | prefix-stability prior | status |
+| --- | --- | --- | --- |
+| heuristic | self-information filtering, dedup, recency windows | deterministic by construction | awaiting c1 |
+| symbolic | AST/syntax-aware pruning, template dedup, schema-aware tool-log compaction | deterministic by construction | awaiting c1 |
+| learned (build) | LLMLingua-2-style token classification, cheap-LM forward-pass scorer | deterministic IF greedy/thresholded, must be tested | awaiting c1; H100 boxes available |
+| hosted (buy) | The Token Company Bear-2 et al. | unknown, must be tested empirically | awaiting c1 wrap |
+
+Lit review (citation-screened) lands in wmh-compression-data/findings/lit-review.md and
+gets summarized here. GPU resources: h100-dev-box-6 and h100-dev-box-3 (2x H100 each,
+running), a100-backup-1 (1x A100, running); h100-dev-box is OCCUPIED (vllm work), do not
+touch.
+
+## Verdicts
+
+(none yet - the table fills as children report and master verifies)
