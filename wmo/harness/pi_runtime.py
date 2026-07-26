@@ -24,6 +24,7 @@ sequential lane, which is what the current search driver uses.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -450,9 +451,14 @@ class PiRuntime:
 
         The node wall budget is the configured episode timeout, not a fixed 300s: TerminalBench-2
         tasks compile toolchains and boot VMs, and the old constant killed 30% of them mid-turn.
+
+        `timeout` takes whole seconds here, and the budget is rounded UP to one: truncating would
+        silently shorten every fractional budget, and any budget under a second would truncate to
+        `timeout 0`, which GNU coreutils reads as "no timeout at all" and would leave the node
+        unbounded until the outer SSH subprocess deadline fires.
         """
         url = f"http://127.0.0.1:{self._port}"
-        node_timeout_s = int(self._episode_timeout_s)
+        node_timeout_s = math.ceil(self._episode_timeout_s)
         remote_cmd = (
             f"cd {self._workdir} && PI_SHIM_URL={url} "
             f"timeout {node_timeout_s} node --experimental-strip-types entry.ts"

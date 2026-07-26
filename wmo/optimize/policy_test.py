@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -20,8 +21,10 @@ from wmo.optimize.policy import (
     select_model,
 )
 from wmo.providers.base import ProviderKind
+from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval.embedders import HashingEmbedder
+from wmo.tracking.pricing import ModelPrice
 
 
 def _pool() -> list[PoolEntry]:
@@ -162,6 +165,48 @@ def test_policy_round_trips_through_json(tmp_path: Path) -> None:
     path = tmp_path / "policy.json"
     policy.save(path)
     assert RoutingPolicy.load(path) == policy
+
+
+def test_openrouter_candidate_keeps_the_price_it_was_fitted_under(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An OpenRouter candidate is priced once, at fit, and the policy carries that price.
+
+    The pool snapshot on the artifact is the record: serving reloads it, so a live catalog
+    fetch (or a vendor price change) can never silently re-price a policy already deployed.
+    """
+    catalog = tmp_path / "openrouter-prices.json"
+    catalog.write_text(
+        PriceCatalog(
+            fetched_at=time.time(),
+            source="test fixture",
+            prices={"z-ai/glm-4.6": ModelPrice(input_per_mtok=0.4, output_per_mtok=1.75)},
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CATALOG_PATH_ENV, str(catalog))
+    pool = [
+        PoolEntry(name="haiku-4-5", kind=ProviderKind.ANTHROPIC, model="claude-haiku-4-5"),
+        PoolEntry(name="or-glm", kind=ProviderKind.OPENROUTER, model="z-ai/glm-4.6"),
+    ]
+    policy = RoutingPolicy(kind="static", default_model="or-glm", pool=pool)
+    path = tmp_path / "policy.json"
+    policy.save(path)
+
+    # The catalog doubles its price after the fit; the deployed artifact must not follow.
+    catalog.write_text(
+        PriceCatalog(
+            fetched_at=time.time(),
+            source="test fixture",
+            prices={"z-ai/glm-4.6": ModelPrice(input_per_mtok=0.8, output_per_mtok=3.5)},
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    served = RoutingPolicy.load(path)
+
+    assert select_model(served, "anything").model == "or-glm"
+    assert served.pool[1].price().input_per_mtok == 0.4
+    assert served.pool[1].price().output_per_mtok == 1.75
 
 
 def test_azure_embedder_spec_requires_backend_fields() -> None:

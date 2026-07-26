@@ -57,6 +57,7 @@ from wmo.distill.loop import (
 from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
 from wmo.distill.store import (
     DEFAULT_TINKER_OPENAI_ENDPOINT,
+    STUDENT_CHAT_MAX_TOKENS_FIELD,
     AdapterStore,
     DistillRunStore,
     build_handoff_toml,
@@ -791,6 +792,9 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
         model=result.final_sampler_path,
         model_type=cfg.student.base_model,
         endpoint=DEFAULT_TINKER_OPENAI_ENDPOINT,
+        # A tinker:// path is outside the built-in catalog, so capability resolution would fall
+        # back to `max_completion_tokens`, which Tinker's endpoint 400s on. Pin the name it takes.
+        chat_max_tokens_field=STUDENT_CHAT_MAX_TOKENS_FIELD,
     )
     save_settings(settings, root)
     console.print(

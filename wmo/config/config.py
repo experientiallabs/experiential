@@ -19,6 +19,12 @@ from wmo.providers.models import resolve_provider_model
 
 ARTIFACT_DIR = ".wmo"
 
+# Mirror of `wmo.engine.build.DEFAULT_TRAIN_SPLIT`, the one cut point on the trace-id hash line
+# that `wmo build` and `wmo eval` share. The canonical constant lives next to the split functions
+# and cannot be imported here (build.py imports this module, so the arrow would be a cycle), so
+# `config_test.py` asserts the two stay equal instead.
+_DEFAULT_TRAIN_SPLIT = 0.8
+
 
 class FidelityTier(StrEnum):
     """Build-effort tiers: how much is spent making the artifact faithful.
@@ -131,6 +137,9 @@ PROVIDER_ENV_VARS: dict[ProviderKind, list[str]] = {
     ProviderKind.AZURE_OPENAI: ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
     ProviderKind.OPENAI: ["OPENAI_API_KEY"],
     ProviderKind.OPENAI_RESPONSES: ["OPENAI_API_KEY"],
+    # Same literal-not-import rule as TINKER below; `wmo.providers.openrouter
+    # .OPENROUTER_API_KEY_ENV` is what the provider reads, and a test pins the two together.
+    ProviderKind.OPENROUTER: ["OPENROUTER_API_KEY"],
     # Kept as a literal like every other entry (importing the provider module here would
     # invert the config -> providers dependency); `wmo.providers.tinker.TINKER_API_KEY_ENV`
     # is the name the provider actually reads, and a test pins the two together.
@@ -152,7 +161,7 @@ class HarnessConfig(BaseModel):
     embed_dim: int = 512  # phi dimensionality; index + query embedder must agree on this
     top_k: int = 5  # demos retrieved per step (DreamGym k)
     # train/held-out ratio for GEPA; a proper fraction so both splits can be non-empty
-    train_split: float = Field(default=0.8, gt=0.0, lt=1.0)
+    train_split: float = Field(default=_DEFAULT_TRAIN_SPLIT, gt=0.0, lt=1.0)
     gepa_budget: int = 10  # GEPA iterations; ~valset_cap calls each (see _cap_gepa_valset)
     # Model id the GEPA judge runs on (same provider kind as serve). None = the serve model.
     judge_model: str | None = None
@@ -209,7 +218,7 @@ class HarnessConfig(BaseModel):
         embed_model: str | None,
         embed_dim: int,
         gepa_budget: int,
-        train_split: float = 0.8,
+        train_split: float = _DEFAULT_TRAIN_SPLIT,
         judge_model: str | None = None,
         trace_adapter: str = "otel-genai",
     ) -> HarnessConfig:

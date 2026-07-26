@@ -1,7 +1,6 @@
 title = "SWE-bench default replay"
 description = "Open-loop reconstruction fidelity over the bundled SWE-bench trace corpus."
 files = ["../traces.otel.jsonl"]
-train_split = 0.7
 sample_turns = "all"
 seed = 0
 

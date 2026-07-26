@@ -15,7 +15,7 @@ from statistics import fmean, pstdev
 
 from pydantic import BaseModel, Field
 
-from wmo.engine.build import split_holdout
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_holdout
 from wmo.engine.knowledge import seeded_knowledge_text
 from wmo.engine.replay import ReplayReport, replay, valid_scores
 from wmo.ingest import get_adapter
@@ -62,7 +62,7 @@ def evaluate_files(
     judge: Judge,
     *,
     embedder: Embedder | None = None,
-    train_split: float = 0.7,
+    train_split: float = DEFAULT_TRAIN_SPLIT,
     val_frac: float | None = None,
     top_k: int = 5,
     sample_turns: str = "all",
@@ -75,7 +75,10 @@ def evaluate_files(
     """Replay-score each trace file's held-out split. `embedder=None` -> zero-shot (no retrieval).
 
     Each file is split deterministically; tiny corpora with no held-out trace fall back to scoring
-    every trace. RAG, when enabled, retrieves from that file's own train split only (leak-free).
+    every trace. `train_split` defaults to `DEFAULT_TRAIN_SPLIT`, the same cut `wmo build` makes on
+    the same hash line: override it only to match a model that was built with a different ratio,
+    because a smaller value here hands GEPA's training traces back as scored "held-out" steps.
+    RAG, when enabled, retrieves from that file's own train split only (leak-free).
     `sample_turns`/`seed` are forwarded to `replay` (see its docstring). `max_holdout_traces` caps
     how many held-out traces are scored per file (a deterministic prefix by trace_id) - for cheap
     dry-runs; the train side stays full so retrieval is unaffected.
@@ -153,7 +156,7 @@ class OpenLoopEval:
         judge: Judge,
         *,
         embedder: Embedder | None = None,
-        train_split: float = 0.7,
+        train_split: float = DEFAULT_TRAIN_SPLIT,
         top_k: int = 5,
         sample_turns: str = "all",
         seed: int = 0,

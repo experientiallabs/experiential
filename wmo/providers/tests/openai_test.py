@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
+from llm_waterfall import ChatMaxTokensField
 
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -12,6 +15,9 @@ from wmo.providers.base import (
     ProviderKind,
 )
 from wmo.providers.openai import OpenAIProvider
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 class _FakeMessage:
@@ -62,6 +68,43 @@ class _FakeChatCompletions:
         return self.response
 
 
+class _FakeStreamDelta:
+    def __init__(self, content: str | None) -> None:
+        self.content = content
+
+
+class _FakeStreamChoice:
+    def __init__(self, content: str | None) -> None:
+        self.delta = _FakeStreamDelta(content)
+
+
+class _FakeStreamChunk:
+    """One wire chunk: a content delta, or the terminal usage-bearing chunk with no choices."""
+
+    def __init__(self, content: str | None, usage: _FakeUsage | None = None) -> None:
+        self.choices = [_FakeStreamChoice(content)] if content is not None else []
+        self.usage = usage
+
+
+class _FakeStreamingCompletions:
+    """A chat.completions whose `create` returns the chunk sequence a stream would yield."""
+
+    def __init__(self, chunks: list[_FakeStreamChunk]) -> None:
+        self.chunks = chunks
+        self.last_kwargs: dict[str, object] = {}
+        self.closed = False
+
+    def create(self, **kwargs: object) -> _FakeStreamingCompletions:
+        self.last_kwargs = kwargs
+        return self
+
+    def __iter__(self) -> Iterator[_FakeStreamChunk]:
+        return iter(self.chunks)
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class _FakeEmbeddingItem:
     def __init__(self, embedding: list[float]) -> None:
         self.embedding = embedding
@@ -83,12 +126,16 @@ class _FakeEmbeddings:
 
 
 class _FakeChat:
-    def __init__(self, completions: _FakeChatCompletions) -> None:
+    def __init__(self, completions: _FakeChatCompletions | _FakeStreamingCompletions) -> None:
         self.completions = completions
 
 
 class _FakeClient:
-    def __init__(self, chat: _FakeChatCompletions, embeddings: _FakeEmbeddings) -> None:
+    def __init__(
+        self,
+        chat: _FakeChatCompletions | _FakeStreamingCompletions,
+        embeddings: _FakeEmbeddings,
+    ) -> None:
         self.chat = _FakeChat(chat)
         self.embeddings = embeddings
 
@@ -274,3 +321,77 @@ def test_structured_chat_applies_temperature_capability_before_wire(
     )
 
     assert ("temperature" in chat.last_kwargs) is expects_temperature
+
+
+def _student_provider(field: ChatMaxTokensField) -> OpenAIProvider:
+    """A student-shaped config: a weights path the catalog cannot resolve, plus explicit field."""
+    return OpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.OPENAI,
+            model="tinker://weights/abc123",
+            model_type="Qwen/Qwen3-30B-A3B",
+            chat_max_tokens_field=field,
+            endpoint="https://tinker.example/oai/api/v1",
+        )
+    )
+
+
+def test_complete_honors_the_configured_output_budget_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that wants classic `max_tokens` must get it from `complete`, not just chat.
+
+    An OpenAI-compatible endpoint outside the built-in catalog (Tinker's serving endpoint, a
+    vLLM build) 400s on the name it does not accept, so a routed student would fail every
+    non-structured call while `complete_chat` worked.
+    """
+    provider = _student_provider("max_tokens")
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(3, 2)))
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=77)
+
+    assert chat.last_kwargs["max_tokens"] == 77
+    assert "max_completion_tokens" not in chat.last_kwargs
+
+
+def test_stream_honors_the_configured_output_budget_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same contract on the streaming path, which the endpoint uses for `stream=True`."""
+    provider = _student_provider("max_tokens")
+    chat = _FakeStreamingCompletions(
+        [_FakeStreamChunk("hi"), _FakeStreamChunk(None, _FakeUsage(3, 2))]
+    )
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    chunks = list(provider.stream("sys", [Message(role="user", content="hi")], max_tokens=55))
+
+    assert [c.delta for c in chunks if c.delta] == ["hi"]
+    assert chunks[-1].done is True
+    assert chat.last_kwargs["max_tokens"] == 55
+    assert "max_completion_tokens" not in chat.last_kwargs
+
+
+def test_built_in_models_still_send_max_completion_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The catalog still wins for a known model, so this fix cannot regress GPT-5.x."""
+    provider = OpenAIProvider(_config())
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(chat, _FakeEmbeddings(_FakeEmbeddingResponse([]))),
+    )
+
+    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=64)
+
+    assert chat.last_kwargs["max_completion_tokens"] == 64
+    assert "max_tokens" not in chat.last_kwargs

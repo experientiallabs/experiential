@@ -162,7 +162,7 @@ not a bug in synthesis or verification.
 ## Reproduce
 
 ```bash
-cd ~/Desktop/Projects/wmo-gev-bench   # worktree on branch research/gev-benchmarks
+# Run every command below from the repo root of a checkout on branch research/gev-benchmarks.
 
 # Corpus: packages/environment-capture/tau-bench/traces.otel.jsonl is an untracked local capture
 # (10578 span-lines -> 1033 traces); copied from the main checkout at the same path.

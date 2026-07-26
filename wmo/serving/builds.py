@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from wmo.config import ArtifactPaths, HarnessConfig, WorldModelStore
 from wmo.config.card import make_build_card, save_card
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT
 from wmo.engine.build import build as run_build
 from wmo.engine.reporting import BuildReporter
 from wmo.providers import get_provider, verify_all
@@ -60,7 +61,7 @@ class BuildRouteRequest(BaseModel):
     model: str = "claude-opus-4-8"
     region: str | None = None
     gepa_budget: int = 50
-    train_split: float = 0.8
+    train_split: float = DEFAULT_TRAIN_SPLIT
     embed_dim: int = 512
 
 

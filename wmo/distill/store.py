@@ -33,8 +33,10 @@ import logging
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import tomli_w
+from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
@@ -43,6 +45,8 @@ from wmo.distill.config import DistillConfig, load_distill_config, snapshot_toml
 from wmo.distill.gate import DistillGateRecord
 from wmo.distill.tokens import TrialRecord
 from wmo.distill.tripwire import TripwireBaseline
+from wmo.providers.base import ProviderKind
+from wmo.providers.pool import PoolEntry
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +81,8 @@ DEFAULT_TINKER_OPENAI_ENDPOINT = (
 )
 
 _ALIASES_FILE = "aliases.toml"
-_CARD_FILE = "model_card.json"
+MODEL_CARD_FILE = "model_card.json"
+"""The per-run and per-adapter-version model card filename."""
 
 _CONFIG_FILE = "config.toml"
 _METRICS_FILE = "metrics.jsonl"
@@ -86,7 +91,6 @@ _WARMUP_FILE = "warmup.json"
 _WARMUP_TRIALS_FILE = "warmup-trials.json"
 _CHECKPOINTS_FILE = "checkpoints.json"
 _GATE_FILE = "gate.json"
-_MODEL_CARD_FILE = "model_card.json"
 _HANDOFF_FILE = "handoff.toml"
 _EVALS_DIR = "evals"
 _SAMPLES_DIR = "samples"
@@ -251,7 +255,7 @@ class DistillRunStore:
 
     @property
     def model_card_path(self) -> Path:
-        return self.run_dir / _MODEL_CARD_FILE
+        return self.run_dir / MODEL_CARD_FILE
 
     @property
     def handoff_path(self) -> Path:
@@ -733,12 +737,12 @@ class AdapterStore:
             The version's model card, stamped with its name and version.
         """
         version = self.resolve_version(name, ref)
-        path = self.dir_for(name) / f"v{version}" / _CARD_FILE
+        path = self.dir_for(name) / f"v{version}" / MODEL_CARD_FILE
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
             raise FileNotFoundError(
-                f"adapter {name!r} v{version} has no {_CARD_FILE} at {path}; the version "
+                f"adapter {name!r} v{version} has no {MODEL_CARD_FILE} at {path}; the version "
                 "directory is corrupt, so re-save the adapter or remove the broken version"
             ) from exc
         card = DistillModelCard.model_validate_json(text)
@@ -767,7 +771,7 @@ class AdapterStore:
         stamped = card.model_copy(update={"name": name, "version": version})
         directory = self.dir_for(name) / f"v{version}"
         directory.mkdir(parents=True, exist_ok=False)  # append-only: collision is a bug
-        write_text_atomic(directory / _CARD_FILE, stamped.model_dump_json(indent=2))
+        write_text_atomic(directory / MODEL_CARD_FILE, stamped.model_dump_json(indent=2))
         if alias is not None:
             self.set_alias(name, alias, version)
         return version
@@ -786,6 +790,10 @@ def build_handoff_toml(sampler_path: str, *, base_model: str, endpoint: str | No
         base_model: The student's base model name, written as `model_type` so
             capability resolution keys on the model family, not the raw
             weights path (the same shape the CLI's `--promote` writes).
+            The snippet also pins `chat_max_tokens_field`, because a
+            `tinker://` path is outside the built-in catalog: on Tinker's
+            endpoint the resolved default would be `max_completion_tokens`,
+            which that endpoint answers with a 400 on every call.
         endpoint: The OpenAI-compatible base URL; defaults to
             `DEFAULT_TINKER_OPENAI_ENDPOINT`.
 
@@ -803,7 +811,17 @@ def build_handoff_toml(sampler_path: str, *, base_model: str, endpoint: str | No
             "path returned by save_weights_for_sampler (recorded in the run's "
             "checkpoints.json and model card)"
         )
-    resolved_endpoint = endpoint if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
+    # Stripped before it is STORED, not just before it is classified. `is_tinker_endpoint`
+    # tolerates surrounding whitespace so a pasted URL still gets Tinker's credential and
+    # output-budget defaults, but the entry's endpoint becomes the OpenAI client's base_url
+    # verbatim, so persisting the padded string would classify correctly and then fail every
+    # routed call on an unusable URL.
+    resolved_endpoint = endpoint.strip() if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
+    budget_field = (
+        STUDENT_CHAT_MAX_TOKENS_FIELD
+        if is_tinker_endpoint(resolved_endpoint)
+        else "max_completion_tokens"
+    )
     values = (
         ("sampler path", sampler_path),
         ("base model", base_model),
@@ -826,4 +844,162 @@ def build_handoff_toml(sampler_path: str, *, base_model: str, endpoint: str | No
         f'model = "{sampler_path}"\n'
         f'model_type = "{base_model}"\n'
         f'endpoint = "{resolved_endpoint}"\n'
+        f'chat_max_tokens_field = "{budget_field}"\n'
+    )
+
+
+# Tinker's OpenAI-compatible endpoint takes the classic `max_tokens`; answering with
+# `max_completion_tokens` (what the built-in catalog defaults to, and what a `tinker://` weights
+# path resolves to since the catalog has never heard of it) is a 400 on every routed call.
+STUDENT_CHAT_MAX_TOKENS_FIELD: ChatMaxTokensField = "max_tokens"
+
+# The pool entry reads the Tinker API key straight from its own env var through the pool's
+# trusted explicit-credential channel (`PoolEntry.api_key_env` -> `pool_provider` ->
+# `get_provider(api_key=...)`). The `[models.agent]` handoff has no such channel and falls back
+# to `WMO_ENDPOINT_API_KEY`, so routing a student needs one fewer copy of the key.
+STUDENT_API_KEY_ENV = "TINKER_API_KEY"
+
+
+def is_tinker_endpoint(endpoint: str) -> bool:
+    """Whether `endpoint` addresses Tinker's own OpenAI-compatible service.
+
+    This answer decides which credential gets sent and which output-budget parameter is used, so
+    it is compared on URL equivalence rather than string equality. An exact match would read a
+    pasted `.../oai/api/v1/`, or a host typed in different case, as somebody else's host: it would
+    quietly swap `TINKER_API_KEY` for the `WMO_ENDPOINT_API_KEY` fallback and `max_tokens` for
+    `max_completion_tokens`, and leave the student 400ing on a URL that is Tinker's.
+
+    Scheme and host are case-insensitive per RFC 3986 section 3.1 and 3.2.2, so they are lowered.
+    The scheme's own default port is redundant (section 3.2.3), so `https://...:443/...` is the
+    same endpoint as the canonical URL and keeps its defaults. Any OTHER port is a different
+    service and stays significant: `:8443` on Tinker's host is somebody's proxy, not Tinker.
+    The PATH is not case-insensitive, and is compared as written: `/oai/api/v1` and `/OAI/API/V1`
+    are different resources on a server that chooses to distinguish them, and reading one as the
+    other would hand a credential to a route the operator did not name. Trailing slashes and
+    surrounding whitespace are stripped either way.
+    """
+    return _normalize_endpoint(endpoint) == _normalize_endpoint(DEFAULT_TINKER_OPENAI_ENDPOINT)
+
+
+# The port each scheme already implies, which a URL may spell out without changing what it
+# addresses (RFC 3986 section 3.2.3).
+_DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443}
+
+
+def _normalize_endpoint(endpoint: str) -> tuple[str, str, str]:
+    """An OpenAI-compatible base URL as (scheme, authority, path), normalized where URLs let it."""
+    parsed = urlsplit(endpoint.strip())
+    scheme = parsed.scheme.lower()
+    return scheme, _normalize_authority(scheme, parsed.netloc), parsed.path.rstrip("/")
+
+
+def _normalize_authority(scheme: str, netloc: str) -> str:
+    """`netloc` lowercased, with only the port `scheme` already implies dropped.
+
+    Dropping the redundant default port is what keeps a pasted `:443` on Tinker's own defaults.
+    Only that exact spelling is dropped, so a non-default port (`:8443`) stays part of the host
+    and reads as a custom endpoint, and so does anything unparseable as the default port
+    (`:0443`, `:notaport`): comparing those as written keeps a credential decision on the safe
+    side rather than guessing what the operator meant.
+    """
+    authority = netloc.lower()
+    default = _DEFAULT_PORTS.get(scheme)
+    if default is None:  # a scheme with no implied port: nothing is redundant
+        return authority
+    # rpartition leaves a bracketed IPv6 literal alone: "[::1]" splits to a "1]" port, which
+    # never matches a default port, so only a real trailing ":443"/":80" is removed.
+    host, separator, port = authority.rpartition(":")
+    if separator and port == str(default):
+        return host
+    return authority
+
+
+def student_pool_entry(
+    card: DistillModelCard,
+    *,
+    name: str,
+    input_per_mtok: float,
+    output_per_mtok: float,
+    endpoint: str | None = None,
+    api_key_env: str | None = None,
+    chat_max_tokens_field: ChatMaxTokensField | None = None,
+) -> PoolEntry:
+    """Build the routable pool entry for a distilled student, from its model card.
+
+    This is the seam that makes a trained adapter a routing candidate: the card records the
+    `tinker://` weights path and the base model, and this turns that pair into a `PoolEntry` the
+    router can select and serving can call, with no hand-edited TOML in between. The entry
+    addresses the student as any OpenAI-compatible server is addressed (`kind="openai"` plus an
+    `endpoint`), which is the same shape `build_handoff_toml` writes for `[models.agent]`.
+
+    Prices are REQUIRED and have no default. A candidate whose cost is unknown reports $0, which
+    would make it unconditionally the cheapest model in the pool and let a cost-aware policy route
+    everything to it on evidence that does not exist. `PoolEntry` refuses an unpriced non-built-in
+    model for the same reason, and a `tinker://` path is never in the built-in price table.
+
+    The Tinker-specific defaults apply ONLY when the entry actually points at Tinker. Reading
+    `TINKER_API_KEY` for a host the caller named would send a Tinker bearer token to that host,
+    and the pool's whole credential rule is that an operator pairs a key with an endpoint
+    deliberately (see the module docstring of `wmo.providers.pool`), never that a helper picks
+    the pairing. A custom endpoint therefore gets `api_key_env=None`, which is the documented
+    custom-endpoint convention: the openai provider falls back to `WMO_ENDPOINT_API_KEY` and
+    never sends a key the caller did not put there. Its output-budget field likewise falls back
+    to the repo-wide default rather than inheriting Tinker's `max_tokens`. Pass `api_key_env` or
+    `chat_max_tokens_field` explicitly to override either.
+
+    Args:
+        card: The run's model card (`<run_dir>/model_card.json`), or an adapter version's.
+        name: The pool handle: the stable name policy artifacts and request logs key on.
+        input_per_mtok: Prompt-token price, USD per 1M tokens, at the serving endpoint.
+        output_per_mtok: Completion-token price, USD per 1M tokens, at the serving endpoint.
+        endpoint: The OpenAI-compatible base URL; defaults to
+            `DEFAULT_TINKER_OPENAI_ENDPOINT`.
+        api_key_env: Env var holding the endpoint's key. Defaults to `TINKER_API_KEY` on
+            Tinker's own endpoint and to None (the provider's `WMO_ENDPOINT_API_KEY`
+            fallback) on any other.
+        chat_max_tokens_field: Output-budget parameter the endpoint accepts. Defaults to
+            `max_tokens` on Tinker's own endpoint and to the repo-wide
+            `max_completion_tokens` on any other.
+
+    Returns:
+        A validated `PoolEntry` ready for `upsert_pool_entry`.
+
+    Raises:
+        ValueError: If the card's sampler path is not a `tinker://` weights path, so there is
+            nothing servable to point an entry at.
+    """
+    if not card.sampler_path.startswith("tinker://"):
+        raise ValueError(
+            f"model card sampler path {card.sampler_path!r} is not a tinker:// weights path; a "
+            "routable student needs the path save_weights_for_sampler returned (recorded in the "
+            "run's checkpoints.json and model card)"
+        )
+    # Stripped before it is STORED, not just before it is classified. `is_tinker_endpoint`
+    # tolerates surrounding whitespace so a pasted URL still gets Tinker's credential and
+    # output-budget defaults, but the entry's endpoint becomes the OpenAI client's base_url
+    # verbatim, so persisting the padded string would classify correctly and then fail every
+    # routed call on an unusable URL.
+    resolved_endpoint = endpoint.strip() if endpoint is not None else DEFAULT_TINKER_OPENAI_ENDPOINT
+    on_tinker = is_tinker_endpoint(resolved_endpoint)
+    if api_key_env is None and on_tinker:
+        api_key_env = STUDENT_API_KEY_ENV
+    if chat_max_tokens_field is None:
+        chat_max_tokens_field = (
+            STUDENT_CHAT_MAX_TOKENS_FIELD if on_tinker else "max_completion_tokens"
+        )
+    return PoolEntry(
+        name=name,
+        kind=ProviderKind.OPENAI,
+        model=card.sampler_path,
+        # The weights path carries no capability information, so the base model is what
+        # temperature and output-budget resolution key on.
+        model_type=card.base_model,
+        chat_max_tokens_field=chat_max_tokens_field,
+        endpoint=resolved_endpoint,
+        api_key_env=api_key_env,
+        # A distilled student is the small open model in the pool, not the frontier anchor: the
+        # improvement report's comparison reads `tier` to tell those roles apart.
+        tier="open",
+        input_per_mtok=input_per_mtok,
+        output_per_mtok=output_per_mtok,
     )

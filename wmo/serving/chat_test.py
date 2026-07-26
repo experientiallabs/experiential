@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -29,7 +30,8 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmo.providers.pool import PoolEntry
+from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+from wmo.providers.pool import PoolEntry, load_pool
 from wmo.retrieval.embedders import HashingEmbedder
 from wmo.serving.chat import (
     EndpointRuntime,
@@ -40,6 +42,7 @@ from wmo.serving.chat import (
 )
 from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
 from wmo.serving.savings import EndpointSavings, SavingsWindow
+from wmo.tracking.pricing import ModelPrice
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -934,3 +937,50 @@ def test_the_seven_day_savings_window_is_never_served_from_cache(tmp_path: Path)
         assert reads["n"] == 3  # all_time cached after the first
     finally:
         RequestLog.replay = original
+
+
+def test_an_openrouter_candidate_is_served_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `kind = "openrouter"` pool entry survives the whole serving path.
+
+    Catalog-resolved price -> valid PoolEntry -> policy artifact on disk -> mounted endpoint ->
+    an OpenAI-compatible completion attributed to that candidate. The provider factory is the
+    usual echo fake (no network); `pool_test.py` covers the real `pool_provider` resolution.
+    """
+    catalog = tmp_path / "openrouter-prices.json"
+    catalog.write_text(
+        PriceCatalog(
+            fetched_at=time.time(),
+            source="test fixture",
+            prices={"z-ai/glm-4.6": ModelPrice(input_per_mtok=0.4, output_per_mtok=1.75)},
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(CATALOG_PATH_ENV, str(catalog))
+    pool_file = tmp_path / "pool.toml"
+    pool_file.write_text(
+        '[[model]]\nname = "or-glm"\nkind = "openrouter"\nmodel = "z-ai/glm-4.6"\ntier = "open"\n',
+        encoding="utf-8",
+    )
+    policy_path = tmp_path / POLICY_FILENAME
+    RoutingPolicy(kind="static", default_model="or-glm", pool=load_pool(pool_file).models).save(
+        policy_path
+    )
+
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy.load(policy_path),
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["x-wmo-routed-model"] == "or-glm"
+    assert response.json()["choices"][0]["message"]["content"] == "served by or-glm"

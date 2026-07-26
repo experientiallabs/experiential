@@ -4,6 +4,12 @@ With `ProviderConfig.endpoint` set, the same provider speaks to any OpenAI-compa
 (vLLM, llama.cpp, a proxy) instead: the endpoint becomes the client's base_url, auth comes from
 `WMO_ENDPOINT_API_KEY` (never `OPENAI_API_KEY` — the real key must not leak to arbitrary hosts),
 and `temperature` IS forwarded (self-hosted servers accept sampling params; GPT 5.5 rejects them).
+
+Every call path resolves the output-budget parameter name once, from
+`ProviderConfig.resolved_chat_max_tokens_field`, and passes it down. GPT-5.x wants
+`max_completion_tokens`, but a server outside the built-in catalog can want the classic
+`max_tokens` (Tinker's OpenAI-compatible endpoint does) and answers the wrong name with a 400,
+so `complete` and `stream` must honor the config exactly as `complete_chat` does.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ class OpenAIProvider:
         self._api_key = api_key
         self._client: OpenAI | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
+        self._max_tokens_field = config.resolved_chat_max_tokens_field()
 
     def _get_client(self) -> OpenAI:
         # Lazy: don't import the SDK or read the key env vars until first use.
@@ -112,6 +119,7 @@ class OpenAIProvider:
             # Self-hosted OpenAI-compatible servers honor sampling params (a policy being
             # trained NEEDS temperature diversity); real OpenAI GPT-5.5 rejects them.
             temperature=temperature if self.config.endpoint else None,
+            max_tokens_field=self._max_tokens_field,
         )
 
     def stream(
@@ -130,6 +138,7 @@ class OpenAIProvider:
             messages,
             max_tokens,
             temperature=temperature if self.config.endpoint else None,
+            max_tokens_field=self._max_tokens_field,
         )
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
@@ -142,7 +151,7 @@ class OpenAIProvider:
             self._get_client().chat.completions,
             self.config.model,
             request,
-            max_tokens_field=self.config.resolved_chat_max_tokens_field(),
+            max_tokens_field=self._max_tokens_field,
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
