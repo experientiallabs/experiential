@@ -372,8 +372,11 @@ def providers_set(
         options=pool_registry.EntryOptions(
             endpoint=config.endpoint,
             region=config.region,
-            deployment=config.deployment,
-            api_version=config.api_version,
+            # The RAW flags, not the worker config's: `_worker_provider_config` fills an Azure
+            # deployment in from the model id when none was given, and a pool entry must never
+            # inherit a guessed deployment name (nothing can derive an operator's own).
+            deployment=deployment,
+            api_version=api_version,
             api_key_env=api_key_env,
             tier=cast("Tier", tier) if tier is not None else "frontier",
             input_per_mtok=input_per_mtok,

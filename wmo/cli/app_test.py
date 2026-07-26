@@ -716,6 +716,71 @@ def test_providers_set_rejects_an_unknown_tier(
     assert "frontier, open" in result.output
 
 
+def test_providers_set_never_guesses_an_azure_deployment_for_the_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The worker config fills an Azure deployment in from the model id when none was given; a
+    # pool entry must not inherit that guess, because Azure sends the deployment as the request
+    # model and a guessed name addresses a route that does not exist.
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "azure",
+            "--model",
+            "gpt-5.5",
+            "--pool-model",
+            "gpt-5.5",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "azure needs --deployment" in result.output
+    assert not (root / "pool.toml").exists()
+    # The worker role is still saved with its derived deployment: only the pool is strict.
+    worker = load_settings(root).models.worker
+    assert worker is not None and worker.deployment == "gpt-5.5"
+
+
+def test_providers_set_registers_a_named_azure_deployment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _accept_every_provider(monkeypatch)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "azure",
+            "--model",
+            "gpt-5.5",
+            "--deployment",
+            "chat-prod",
+            "--api-version",
+            "2025-01-01-preview",
+            "--pool-model",
+            "gpt-5.5",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    entry = read_pool_entries(root / "pool.toml")[0]
+    assert (entry.name, entry.model, entry.deployment) == ("chat-prod", "gpt-5.5", "chat-prod")
+    assert entry.api_version == "2025-01-01-preview"
+
+
 def test_providers_set_rejects_half_a_price_pair(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -583,25 +583,61 @@ def test_every_pass_is_live_verified_including_a_switched_backend(tmp_path: Path
     assert seen[1].api_version == "2025-01-01-preview"
 
 
-def test_one_ping_covers_a_whole_pass(tmp_path: Path) -> None:
-    # The ping costs real money, so it proves the credential once per pass rather than once per
-    # candidate; `wmo providers verify` is what bills a call per model.
+def test_every_candidate_is_pinged_on_its_own_route(tmp_path: Path) -> None:
+    # A pass is not one route. Every Azure candidate names a different operator-chosen
+    # deployment, so a first deployment that answers proves nothing about the second, and a
+    # once-per-pass ping would wave the rest through.
     pool = tmp_path / "pool.toml"
-    calls = 0
+    pinged: list[str] = []
 
-    def count(entry: PoolEntry) -> VerifyResult:
-        nonlocal calls
-        calls += 1
+    def record(entry: PoolEntry) -> VerifyResult:
+        pinged.append(entry.deployment or entry.model)
         return _ok(entry)
 
     written, _, _ = _drive(
         pool,
-        ["y", "openrouter", *_openrouter_pass(_SONNET, _DEEPSEEK), "n"],
-        verify=count,
+        [
+            "y",
+            "azure",
+            "gpt-5.4",
+            "gpt-5.5",
+            "",
+            "frontier",
+            "",  # api key env
+            "chat-prod",
+            "2025-01-01-preview",
+            "",  # gpt-5.4: deployment, api-version, handle
+            "chat-preview",
+            "2025-01-01-preview",
+            "",  # gpt-5.5
+            "n",
+        ],
+        kind=ProviderKind.AZURE_OPENAI,
+        verify=record,
     )
 
     assert written == 2
-    assert calls == 1
+    assert pinged == ["chat-prod", "chat-preview"]
+
+
+def test_a_candidate_that_fails_its_ping_does_not_take_the_others_down(tmp_path: Path) -> None:
+    # Per-candidate verification means a per-candidate decision: one unreachable deployment is
+    # declined on its own, and the rest of the selection still lands.
+    pool = tmp_path / "pool.toml"
+
+    def refuse_second(entry: PoolEntry) -> VerifyResult:
+        if entry.model == _DEEPSEEK:
+            return VerifyResult(ok=False, kind=entry.kind, model=entry.model, detail="404 model")
+        return _ok(entry)
+
+    written, _, _ = _drive(
+        pool,
+        ["y", "openrouter", _SONNET, _DEEPSEEK, "", "frontier", "", "", "n", "n"],
+        verify=refuse_second,
+    )
+
+    assert written == 1
+    assert [entry.model for entry in read_pool_entries(pool)] == [_SONNET]
 
 
 def test_a_failed_ping_registers_nothing_unless_it_is_overridden(tmp_path: Path) -> None:
@@ -671,7 +707,24 @@ def test_one_azure_deployment_cannot_describe_several_pool_models(tmp_path: Path
     assert not pool.exists()
 
 
-def test_several_azure_pool_models_default_to_their_own_deployment_names(tmp_path: Path) -> None:
+def test_a_scripted_azure_registration_must_name_its_deployment(tmp_path: Path) -> None:
+    # Deployment names are chosen by whoever created them. Defaulting to the model id would
+    # write a candidate addressing a route that does not exist, and a script has nobody to ask.
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+
+    with pytest.raises(typer.BadParameter, match="azure needs --deployment"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.AZURE_OPENAI,
+            model_ids=["gpt-5.4"],
+            options=EntryOptions(),
+        )
+    assert not pool.exists()
+
+
+def test_one_azure_deployment_registers_cleanly(tmp_path: Path) -> None:
     pool = tmp_path / "pool.toml"
     console = Console(file=StringIO(), width=120, no_color=True)
 
@@ -679,15 +732,13 @@ def test_several_azure_pool_models_default_to_their_own_deployment_names(tmp_pat
         console,
         pool_path=pool,
         kind=ProviderKind.AZURE_OPENAI,
-        model_ids=["gpt-5.4", "gpt-5.5"],
-        options=EntryOptions(),
+        model_ids=["gpt-5.4"],
+        options=EntryOptions(deployment="chat-prod", api_version="2025-01-01-preview"),
     )
 
-    entries = read_pool_entries(pool)
-    assert [(entry.name, entry.deployment) for entry in entries] == [
-        ("gpt-5.4", "gpt-5.4"),
-        ("gpt-5.5", "gpt-5.5"),
-    ]
+    entry = read_pool_entries(pool)[0]
+    assert (entry.name, entry.model, entry.deployment) == ("chat-prod", "gpt-5.4", "chat-prod")
+    assert entry.api_version == "2025-01-01-preview"
 
 
 @pytest.mark.parametrize("kind", list(ProviderKind))

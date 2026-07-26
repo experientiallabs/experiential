@@ -206,12 +206,10 @@ def register_from_provider(
 ) -> int:
     """One pass: choose `kind`'s models, answer its requirements, write them. Returns the count.
 
-    Every requirement is collected before anything is verified or written, so the one live ping
-    this pass pays for goes out with the connection details the first entry will actually carry
-    (an Azure deployment is asked for per model, and pinging the base model id instead would
-    verify a route no entry uses).
-
-    `verify` is that ping; None uses the real one.
+    `verify` is the live ping (None uses the real one). It runs once per CANDIDATE rather than
+    once per pass, because a pass is not one route: on Azure every candidate names a different
+    operator-chosen deployment, so a first deployment that answers proves nothing about the
+    second. `wmo providers verify` bills a call per model for the same reason.
     """
     catalog = list_provider_models(kind)
     _describe_catalog(console, catalog)
@@ -220,59 +218,41 @@ def register_from_provider(
         console.print("[dim]nothing selected[/dim]")
         return 0
     shared = _ask_shared_options(console, ask, kind, options)
-    drafts = [
-        (model, _ask_per_model_options(console, ask, kind, model, shared)) for model in chosen
-    ]
-    if not _verify_pass(console, ask, kind=kind, draft=drafts[0], verify=verify):
-        return 0
     written = 0
-    for model, per_model in drafts:
+    for model in chosen:
         if _register_one(
-            console, ask, pool_path=pool_path, kind=kind, model=model, options=per_model
+            console, ask, pool_path=pool_path, kind=kind, model=model, options=shared, verify=verify
         ):
             written += 1
     return written
 
 
-def _verify_pass(
+def _verify_candidate(
     console: Console,
     ask: PromptReader,
     *,
-    kind: ProviderKind,
-    draft: tuple[CatalogModel, EntryOptions],
+    entry: PoolEntry,
     verify: ProviderCheck | None,
 ) -> bool:
-    """Ping this pass's backend once, and say whether to go on registering its candidates.
+    """Ping one candidate, and say whether to register it.
 
-    `wmo providers set` already bills exactly one ping to prove the WORKER provider works, and
-    the roster is the one artifact where a silently broken candidate is expensive: `wmo optimize
-    route sweep` pays for every candidate ahead of it before reaching the one that 401s. So a
-    pass pays the same single cheap ping for the backend it is about to register, whether or not
-    it is the backend the command just set (the pool models are different models from the
-    worker's, and a switched backend was never checked beyond its environment variables).
+    `wmo providers set` already bills a ping to prove the WORKER provider works, and the roster
+    is the artifact where an unproved candidate is most expensive: `wmo optimize route sweep`
+    pays for every candidate ahead of the one that 401s before it finds out. So each candidate
+    the registry is about to write pays the same cheap ping, over its own route (its endpoint,
+    deployment, region) and its own `api_key_env` account.
 
-    A failure does not discard the selection silently: it is reported and the user decides,
-    because a roster is legitimately built on a machine that does not hold the key.
+    A failure does not discard the pick silently: it is reported and the user decides, because a
+    roster is legitimately built on a machine that does not hold the key.
     """
-    model, options = draft
-    try:
-        # The candidate itself, so the ping travels the exact route the roster will: this
-        # entry's endpoint, deployment, region, and its own `api_key_env` account.
-        entry = build_pool_entry(name="probe", kind=kind, model=model, options=options)
-    except (ValidationError, ValueError):
-        # Not a valid candidate at all. `_register_one` reports that per model, with the failing
-        # model named; pre-empting it here would blame the whole pass for one bad row.
-        return True
-    console.print(f"verifying {kind.value} ({escape(model.id)})...")
+    console.print(f"verifying {entry.kind.value} ({escape(entry.deployment or entry.model)})...")
     result = (verify or verify_pool_entry)(entry)
+    label = f"{entry.kind.value} ({escape(entry.deployment or entry.model)})"
     if result.ok:
-        console.print(f"  {_CHECK} {kind.value} ({escape(model.id)}) reachable")
+        console.print(f"  {_CHECK} {label} reachable")
         return True
-    console.print(
-        f"  [red]x {kind.value} ({escape(model.id)}) failed[/red]: "
-        f"{escape(result.detail or 'unknown error')}"
-    )
-    return _ask_yes_no(console, ask, "Register these candidates anyway?", default=False)
+    console.print(f"  [red]x {label} failed[/red]: {escape(result.detail or 'unknown error')}")
+    return _ask_yes_no(console, ask, "Register it anyway?", default=False)
 
 
 def verify_pool_entry(entry: PoolEntry) -> VerifyResult:
@@ -305,22 +285,19 @@ def register_model_ids(
     same canonical model type and published price an interactive one would; an id the catalog
     does not list is registered verbatim, exactly as a typed id is.
 
+    Azure is the one backend this cannot do in bulk. On the wire its deployment name IS the
+    model, deployment names are chosen by whoever created them, and nothing in a catalog can
+    guess one: derived from the model id they would silently address deployments that do not
+    exist, and one `--deployment` shared across ids would point several candidates at one route.
+    So a scripted Azure registration is one explicitly named deployment per invocation.
+
     Raises:
         typer.BadParameter: An entry cannot be built (a missing price, an Azure deployment), the
-            roster refuses it, or one explicit Azure deployment was given for several models.
+            roster refuses it, or Azure was given no deployment or several models for one.
             Non-interactively there is nobody to ask, so this fails loudly rather than writing a
             candidate that cannot be called.
     """
-    if kind is ProviderKind.AZURE_OPENAI and options.deployment is not None and len(model_ids) > 1:
-        # On the wire Azure's model IS the deployment name, so one deployment applied to several
-        # models would register several candidates that all call the same deployment while
-        # advertising models it does not serve. Unlike a shared endpoint or price, a shared
-        # deployment name is never a coherent answer.
-        raise typer.BadParameter(
-            "one --deployment cannot describe several --pool-model ids on azure: the deployment "
-            "name IS the model on the wire, so run this once per deployment, or drop --deployment "
-            "to name each deployment after its own model id"
-        )
+    _check_azure_deployment(kind, model_ids, options)
     catalog = list_provider_models(kind)
     written = 0
     for model_id in model_ids:
@@ -343,6 +320,30 @@ def register_model_ids(
         if _write(console, entry, pool_path):
             written += 1
     return written
+
+
+def _check_azure_deployment(
+    kind: ProviderKind, model_ids: list[str], options: EntryOptions
+) -> None:
+    """Refuse a scripted Azure registration that cannot name the deployment it will call.
+
+    Raises:
+        typer.BadParameter: No `--deployment`, or one `--deployment` for several models.
+    """
+    if kind is not ProviderKind.AZURE_OPENAI or not model_ids:
+        return
+    if options.deployment is None:
+        raise typer.BadParameter(
+            "azure needs --deployment alongside --pool-model: an Azure deployment name is chosen "
+            "by whoever created it and is what every request names as its model, so it cannot be "
+            "derived from a model id (deriving it would register a route that does not exist)"
+        )
+    if len(model_ids) > 1:
+        raise typer.BadParameter(
+            "one --deployment cannot describe several --pool-model ids on azure: the deployment "
+            "name IS the model on the wire, so several ids sharing it would all call the same "
+            "deployment; run this once per deployment"
+        )
 
 
 def choose_models(
@@ -467,17 +468,33 @@ def _register_one(
     kind: ProviderKind,
     model: CatalogModel,
     options: EntryOptions,
+    verify: ProviderCheck | None,
 ) -> bool:
-    """Name one already-resolved candidate and write it. False when it was skipped.
+    """Ask what this one model still needs, prove it answers, name it, write it.
 
-    `options` is this model's own resolved settings (`_ask_per_model_options` has already run for
-    it), because the pass verifies the first candidate's real connection details before writing
-    any of them.
+    In that order: the connection details come first because the ping needs them, the ping comes
+    before the handle prompt because there is no point naming a candidate that cannot be called,
+    and the handle comes last because it is the only answer the roster keys on.
+
+    Returns:
+        True when the roster gained or changed this entry, False when it was skipped.
     """
+    per_model = _ask_per_model_options(console, ask, kind, model, options)
+    try:
+        probe = build_pool_entry(name="probe", kind=kind, model=model, options=per_model)
+    except (ValidationError, ValueError) as exc:
+        console.print(f"  [red]skipped {escape(model.id)}[/red]: {escape(str(exc))}")
+        return False
+    problems = static_requirements(probe)
+    if problems:
+        console.print(f"  [red]skipped {escape(model.id)}[/red]: {escape('; '.join(problems))}")
+        return False
+    if not _verify_candidate(console, ask, entry=probe, verify=verify):
+        return False
     entries = read_pool_entries(pool_path)
     taken = {entry.name: entry for entry in entries}
-    known = _existing_handle(entries, kind, model, options)
-    default_name = known or _unique_handle(_handle_base(kind, model, options), set(taken))
+    known = _existing_handle(entries, kind, model, per_model)
+    default_name = known or _unique_handle(_handle_base(kind, model, per_model), set(taken))
     while True:
         name = _ask_text(console, ask, f"Handle for {model.id}", default_name)
         clash = taken.get(name)
@@ -490,16 +507,7 @@ def _register_one(
         )
         if _ask_yes_no(console, ask, f"Replace '{name}'?", default=False):
             break
-    try:
-        entry = build_pool_entry(name=name, kind=kind, model=model, options=options)
-    except (ValidationError, ValueError) as exc:
-        console.print(f"  [red]skipped {escape(model.id)}[/red]: {escape(str(exc))}")
-        return False
-    problems = static_requirements(entry)
-    if problems:
-        console.print(f"  [red]skipped {escape(model.id)}[/red]: {escape('; '.join(problems))}")
-        return False
-    return _write(console, entry, pool_path)
+    return _write(console, probe.model_copy(update={"name": name}), pool_path)
 
 
 def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
