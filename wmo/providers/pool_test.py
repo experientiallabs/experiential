@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,11 @@ from pydantic import ValidationError
 
 from wmo.providers.azure_openai import AzureOpenAIProvider
 from wmo.providers.base import ProviderConfig, ProviderKind, TokenUsage
+from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV, OpenRouterProvider
+from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import DEFAULT_POOL_PATH, PoolEntry, load_pool, pool_provider
 from wmo.providers.registry import get_provider
+from wmo.tracking.pricing import ModelPrice
 
 _POOL_TOML = """
 [[model]]
@@ -248,3 +252,146 @@ def test_azure_entry_requires_deployment() -> None:
             input_per_mtok=1.0,
             output_per_mtok=2.0,
         )
+
+
+# --- OpenRouter entries: priced from the published catalog, not by hand -----------------------
+
+_OPENROUTER_POOL = """
+[[model]]
+name = "or-sonnet"
+kind = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[[model]]
+name = "or-glm-free"
+kind = "openrouter"
+model = "z-ai/glm-4.6:free"
+tier = "open"
+"""
+
+
+_SONNET_PRICE = ModelPrice(
+    input_per_mtok=3.0,
+    output_per_mtok=15.0,
+    cache_read_per_mtok=0.3,
+    cache_write_per_mtok=3.75,
+)
+_FREE_PRICE = ModelPrice(input_per_mtok=0.0, output_per_mtok=0.0)
+
+
+def _catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prices: dict[str, ModelPrice] | None = None,
+) -> Path:
+    """Point price resolution at a fixture catalog on disk (the suite never fetches)."""
+    path = tmp_path / "openrouter-prices.json"
+    catalog = PriceCatalog(
+        fetched_at=time.time(),
+        source="test fixture",
+        prices=prices
+        if prices is not None
+        else {"anthropic/claude-sonnet-4": _SONNET_PRICE, "z-ai/glm-4.6:free": _FREE_PRICE},
+    )
+    path.write_text(catalog.model_dump_json(), encoding="utf-8")
+    monkeypatch.setenv(CATALOG_PATH_ENV, str(path))
+    return path
+
+
+def test_openrouter_entry_needs_only_a_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The launch promise: a pool entry is a name, a kind, and a model id. Both tiers, including
+    # the cache rates, come from OpenRouter's published catalog.
+    _catalog(tmp_path, monkeypatch)
+    pool = load_pool(_write_pool(tmp_path, _OPENROUTER_POOL))
+
+    entry = pool.entry("or-sonnet")
+    assert entry.price().input_per_mtok == 3.0
+    assert entry.price().output_per_mtok == 15.0
+    assert entry.cached_input_per_mtok == pytest.approx(0.3)
+    assert entry.cache_write_per_mtok == pytest.approx(3.75)
+    # 500k fresh @ $3 + 500k cached @ $0.30 = 1.5 + 0.15 = $1.65.
+    usage = TokenUsage(input_tokens=1_000_000, output_tokens=0, cached_input_tokens=500_000)
+    assert entry.cost_usd(usage) == pytest.approx(1.65)
+    assert pool.entry("or-glm-free").price().input_per_mtok == 0.0
+
+
+def test_openrouter_entry_offline_falls_back_to_the_explicit_price_error(tmp_path: Path) -> None:
+    # No cache and no network (the conftest fetch stub refuses): the entry must fail with the
+    # ordinary "declare the prices" instruction, and say WHY the automatic route did not apply.
+    with pytest.raises(ValidationError) as excinfo:
+        load_pool(_write_pool(tmp_path, _OPENROUTER_POOL))
+    message = str(excinfo.value)
+    assert "OpenRouter price catalog" in message
+    assert "unreachable" in message
+    assert "add input_per_mtok and output_per_mtok" in message
+
+
+def test_openrouter_entry_with_explicit_prices_keeps_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A negotiated rate is the operator's, and the catalog is never consulted for it (the
+    # fixture below prices the same model very differently, and must lose).
+    _catalog(tmp_path, monkeypatch)
+    entry = PoolEntry(
+        name="or-sonnet",
+        kind=ProviderKind.OPENROUTER,
+        model="anthropic/claude-sonnet-4",
+        input_per_mtok=1.0,
+        output_per_mtok=2.0,
+    )
+    assert entry.price().input_per_mtok == 1.0
+    assert entry.cached_input_per_mtok is None
+
+
+def test_a_priced_entry_is_never_repriced_by_a_later_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The persistence property behind a fitted policy: the resolved numbers live ON the entry,
+    # and RoutingPolicy/OutcomeMatrix serialize entries verbatim. Re-validating a persisted
+    # entry against a catalog that has since doubled its price must not move it.
+    _catalog(tmp_path, monkeypatch)
+    fitted = load_pool(_write_pool(tmp_path, _OPENROUTER_POOL)).entry("or-sonnet")
+    snapshot = fitted.model_dump_json()
+
+    _catalog(
+        tmp_path,
+        monkeypatch,
+        {"anthropic/claude-sonnet-4": ModelPrice(input_per_mtok=6.0, output_per_mtok=30.0)},
+    )
+    reloaded = PoolEntry.model_validate_json(snapshot)
+
+    assert reloaded.input_per_mtok == 3.0
+    assert reloaded.price().output_per_mtok == 15.0
+
+
+def test_openrouter_pool_entry_resolves_to_the_openrouter_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _catalog(tmp_path, monkeypatch)
+    monkeypatch.setenv("OPENROUTER_ACCOUNT_B_KEY", "sk-or-account-b")
+    pool = load_pool(
+        _write_pool(tmp_path, _OPENROUTER_POOL + '\napi_key_env = "OPENROUTER_ACCOUNT_B_KEY"\n')
+    )
+
+    provider = pool_provider(pool.entry("or-glm-free"))
+
+    assert isinstance(provider, OpenRouterProvider)
+    assert provider.config.kind is ProviderKind.OPENROUTER
+    assert provider.config.model == "z-ai/glm-4.6:free"
+    assert provider._get_client().api_key == "sk-or-account-b"  # noqa: SLF001 - asserting wiring
+
+
+def test_openrouter_provider_falls_back_to_the_shared_account_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No api_key_env on the entry: the single-key launch path, straight from the environment.
+    _catalog(tmp_path, monkeypatch)
+    monkeypatch.setenv(OPENROUTER_API_KEY_ENV, "sk-or-shared")
+    pool = load_pool(_write_pool(tmp_path, _OPENROUTER_POOL))
+
+    provider = pool_provider(pool.entry("or-sonnet"))
+
+    assert isinstance(provider, OpenRouterProvider)
+    assert provider._get_client().api_key == "sk-or-shared"  # noqa: SLF001 - asserting wiring

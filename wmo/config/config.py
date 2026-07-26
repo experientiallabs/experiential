@@ -131,6 +131,9 @@ PROVIDER_ENV_VARS: dict[ProviderKind, list[str]] = {
     ProviderKind.AZURE_OPENAI: ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
     ProviderKind.OPENAI: ["OPENAI_API_KEY"],
     ProviderKind.OPENAI_RESPONSES: ["OPENAI_API_KEY"],
+    # Same literal-not-import rule as TINKER below; `wmo.providers.openrouter
+    # .OPENROUTER_API_KEY_ENV` is what the provider reads, and a test pins the two together.
+    ProviderKind.OPENROUTER: ["OPENROUTER_API_KEY"],
     # Kept as a literal like every other entry (importing the provider module here would
     # invert the config -> providers dependency); `wmo.providers.tinker.TINKER_API_KEY_ENV`
     # is the name the provider actually reads, and a test pins the two together.
