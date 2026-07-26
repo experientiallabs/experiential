@@ -444,6 +444,38 @@ def test_route_tune_refuses_a_snapshot_after_the_matrix_was_rebuilt_in_place(
     assert RoutingPolicy.load(policy_file).cost_quality is None  # the refit is untouched
 
 
+def test_route_tune_survives_a_matrix_path_that_looks_like_a_dial_suffix(tmp_path: Path) -> None:
+    """An operator-supplied path must not be able to truncate the fit identity it opens.
+
+    Regression: `fit_provenance` split on the FIRST ` | cost_quality=`, and `fitted_from` starts
+    with the matrix path. A path containing that substring therefore discarded the digest and
+    every fit flag behind it, collapsing unrelated fits onto one identity, and `tune` dialed the
+    superseded snapshot over the refit. This name carries a COMPLETE, well-formed dial suffix,
+    which is the worst case: the fit flags follow the path, so the real suffix is still the only
+    one at the end of the string.
+    """
+    hostile = "m | cost_quality=0.5 (floor_q=0.05, lam=0, guard=symmetric).json"
+    policy_file = tmp_path / POLICY_FILENAME
+    assert _fit_knn(_knn_matrix_file(tmp_path, name=hostile), policy_file).exit_code == 0
+    for dial in ("0.6", "0.2"):  # no refit between these: the dial must still move freely
+        tuned = runner.invoke(
+            app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", dial]
+        )
+        assert tuned.exit_code == 0, tuned.output
+    assert RoutingPolicy.load(policy_file).cost_quality == 0.2
+
+    rebuilt = _knn_matrix_file(tmp_path, flip=True, name=hostile)  # same path, opposite labels
+    assert _fit_knn(rebuilt, policy_file, fallback="b").exit_code == 0
+    stale = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.3"]
+    )
+    assert stale.exit_code != 0
+    assert "as-fitted snapshot of a different fit" in _flat(stale.output)
+    after = RoutingPolicy.load(policy_file)
+    assert after.default_model == "b"  # the refit survives, not a dialed copy of the old fit
+    assert after.cost_quality is None
+
+
 def test_embedder_provenance_separates_two_azure_resources() -> None:
     """A deployment name is not an embedder identity; the resource behind it is.
 

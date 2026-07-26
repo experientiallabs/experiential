@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -279,6 +280,17 @@ COST_QUALITY_MAX_LAM = 0.03
 # absolute, so the suffix is rewritten (never stacked) and `fit_provenance` strips it back off.
 COST_QUALITY_PROVENANCE_MARK = " | cost_quality="
 
+# The WHOLE trailer that mark introduces, anchored to the end of the string. `fit_provenance`
+# matches this shape rather than searching for the mark alone, because the mark can also occur
+# inside the fit half: `fitted_from` opens with an operator-supplied matrix path, and splitting
+# on the first occurrence of a substring that path contains would throw away the digest and
+# every fit flag after it, collapsing two unrelated fits onto one identity. The fit flags always
+# follow the path, so an occurrence inside the path is never at the end and never matches here.
+_DIAL_SUFFIX = re.compile(
+    re.escape(COST_QUALITY_PROVENANCE_MARK) + r"[\d.eE+-]+ "
+    r"\(floor_q=[\d.eE+-]+, lam=[\d.eE+-]+, guard=(?:symmetric|asymmetric)\)$"
+)
+
 CostQualityPointName = str
 
 
@@ -290,7 +302,7 @@ def fit_provenance(policy: RoutingPolicy) -> str:
     artifacts must share to be the same fit at different dial positions: a tuned policy and the
     as-fitted snapshot it was dialed from agree here, a refit does not.
     """
-    return (policy.fitted_from or "unknown").split(COST_QUALITY_PROVENANCE_MARK)[0]
+    return _DIAL_SUFFIX.sub("", policy.fitted_from or "unknown")
 
 
 class CostQualityKnobs(BaseModel):
