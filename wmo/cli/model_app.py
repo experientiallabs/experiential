@@ -1,20 +1,25 @@
-"""`wmo optimize harness <agent> harbor --mode distill`: the CLI face of on-policy distillation.
+"""`wmo optimize model`: train the agent MODEL, leaving its harness pinned.
 
-Kept out of `harness_app.py` the way eval's closed-loop half lives in
-`eval_closed_loop.py`: `optimize()` validates the flag surface and routes here
-early when distill mode is selected. This module owns the distill run's CLI
-lifecycle: load and pin the run inputs (config, task splits, seed harness),
-project the run cost into a confirmation table, drive `run_distillation` with
-progress rendering, and print the gate verdict plus the serving handoff. The
-optional `--promote` step writes `[models.agent]` through the settings save
-path after an explicit confirmation.
+The third member of the optimizer family, beside `wmo optimize harness`
+(prompt surfaces) and `wmo optimize route` (routing policy). Where those
+produce a `prompt` or a `routing_policy` artifact, this one produces an
+`adapter`: `run` drives one on-policy distillation of a Tinker LoRA student
+from rollouts of harbor's own terminus-2 agent, and `report` reads a finished
+run dir back.
+
+`run` owns the run's CLI lifecycle: load and pin the inputs (config, task
+splits, the harness document supplying the rollout params), project the run
+cost into a confirmation table, drive `run_distillation` with progress
+rendering, and print the gate verdict plus the serving handoff. The optional
+`--promote` step writes `[models.agent]` through the settings save path after
+an explicit confirmation.
 
 Run-dir pinning mirrors `run-config.json` in the harbor search flow: a fresh
 run records its CLI-level inputs in `distill-run.json` (task splits, backend,
-the exact seed version and doc hash), and a resume reuses that record instead
-of live flags, rejecting explicit flags that conflict with it. The distill
+the exact harness version and doc hash), and a resume reuses that record
+instead of live flags, rejecting explicit flags that conflict with it. The run
 config itself is snapshotted by the run store as `config.toml`, which is what
-a bare `--resume` (no `--distill-config`) loads.
+a bare `--resume` (no `--config`) loads.
 """
 
 from __future__ import annotations
@@ -31,12 +36,20 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.agents.default import default_agent
+from wmo.config import ARTIFACT_DIR
 from wmo.config.settings import ModelRole, load_settings, save_settings, settings_path
 from wmo.config.store import validate_name
+from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig, load_distill_config
 from wmo.distill.cost import CostEstimate, estimate_run_cost
+from wmo.distill.gate import DistillGateRecord
 from wmo.distill.loop import (
+    DEFAULT_DISTILL_HARNESS,
+    STUDENT_AFTER_EVAL,
+    STUDENT_BEFORE_EVAL,
+    TEACHER_BASELINE_EVAL,
     DistillBudgetError,
+    DistillEvalReport,
     DistillProgress,
     DistillResult,
     run_distillation,
@@ -65,6 +78,132 @@ DISTILL_RUN_RECORD = "distill-run.json"
 
 _PI_NODE_RUNTIME = "pi-node"
 
+model_app = typer.Typer(
+    help="Train the agent model itself: on-policy distillation of a Tinker LoRA student "
+    "from harbor rollouts, gated on held-out solve rates.",
+    no_args_is_help=True,
+)
+
+_console = Console()
+
+
+@model_app.command("run")
+def run(
+    ctx: typer.Context,
+    config: str = typer.Option(
+        None,
+        "--config",
+        help="The run TOML (student, teacher, harbor, rollout, train, sampling, warmup, "
+        "eval, gate, pricing, budget, tripwire, wandb sections). Required to start a run; "
+        "a resume reuses the run dir's config.toml snapshot, and passing it on a resume is "
+        "how you raise budget.max_usd.",
+    ),
+    run_dir: str = typer.Option(
+        ...,
+        "--run-dir",
+        help="Directory holding ALL durable run state (config snapshot, metrics, "
+        "checkpoints, evals, rollout artifacts). Always required.",
+    ),
+    task_ids: str = typer.Option(
+        None,
+        "--task-ids",
+        help="JSON file with the exact train task-id list; rollouts and interim evals run "
+        "here. Required to start a run.",
+    ),
+    holdout_task_ids: str = typer.Option(
+        None,
+        "--holdout-task-ids",
+        help="JSON file with the exact holdout task-id list; the baselines and the promotion "
+        "gate are measured here, disjoint from --task-ids. Required to start a run.",
+    ),
+    harness: str = typer.Option(
+        DEFAULT_DISTILL_HARNESS,
+        "--harness",
+        help="Stored harness document supplying the rollout params (temperature, max turns, "
+        "max output tokens) and the hash that keys every harbor job; the harbor agent is "
+        f"always terminus-2, never this document's runtime. The bare literal "
+        f"{DEFAULT_DISTILL_HARNESS!r} is the built-in default agent; 'name@ref' pins a stored "
+        "version. Pinned for the whole run.",
+    ),
+    backend: str = typer.Option(
+        None,
+        "--backend",
+        help="Override the run config's harbor.backend: local (docker tasks on this machine) "
+        "or e2b (tasks in E2B sandboxes; needs E2B_API_KEY).",
+    ),
+    resume: bool = typer.Option(False, "--resume", help="Continue the run recorded in --run-dir."),
+    promote: bool = typer.Option(
+        False,
+        "--promote",
+        help="After an accepted gate, offer to point the models.agent role in settings.toml "
+        "at the distilled adapter (always asks for confirmation).",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
+) -> None:
+    """Train (or resume) an agent model by on-policy distillation on harbor tasks.
+
+        wmo optimize model run --config run.toml --run-dir runs/d1 \\
+          --task-ids train.json --holdout-task-ids holdout.json --backend e2b --yes
+
+    Harbor's own terminus-2 agent rolls out on real benchmark tasks while
+    sampling from the student's current Tinker LoRA weights, a larger teacher
+    scores the exact tokens the student sampled, and each step nudges the
+    student toward the teacher with a per-token reverse-KL objective. A
+    held-out gate compares teacher, student-before, and student-after solve
+    rates, and only an adapter that closes enough of the gap is promoted.
+
+    The harness is NOT the subject here and is never edited: it is pinned for
+    the whole run. Search the scaffold with `wmo optimize harness` instead.
+    """
+    run_distill(
+        _console,
+        harness_name=harness,
+        harness_explicit=_explicit(ctx, "harness"),
+        config_path=config,
+        task_ids_path=task_ids,
+        holdout_task_ids_path=holdout_task_ids,
+        run_dir=run_dir,
+        backend=backend,
+        resume=resume,
+        yes=yes,
+        promote=promote,
+        root=root,
+    )
+
+
+@model_app.command("report")
+def report(
+    run_dir: str = typer.Option(
+        ..., "--run-dir", help="A finished (or aborted) run directory to read back."
+    ),
+) -> None:
+    """Print a run's gate verdict and its held-out before/after table.
+
+    Reads only what the run dir already persisted (`gate.json`, `evals/*.json`,
+    `metrics.jsonl`), so it is free to run and safe on a live run dir:
+
+        wmo optimize model report --run-dir runs/d1
+    """
+    store = DistillRunStore(run_dir)
+    gate = _load_gate(store)
+    color = "green" if gate.accepted else "yellow"
+    _console.print(f"[{color}]gate[/{color}] {escape(gate.reason)}")
+    _console.print(_solve_rate_table(store, gate))
+    _print_trained_artifact(_console, store)
+    _print_paired_delta(_console, store, gate)
+    _print_training_summary(_console, store)
+
+
+def _explicit(ctx: typer.Context, param: str) -> bool:
+    """Whether `param` was explicitly passed on the command line.
+
+    Compared by enum NAME: typer vendors click, so its ParameterSource enum is not
+    click.core's class and an identity check would silently never match.
+    """
+    source = ctx.get_parameter_source(param)
+    return source is not None and source.name == "COMMANDLINE"
+
 
 class DistillCliRunRecord(BaseModel):
     """The CLI inputs pinned into `distill-run.json` when a distill run starts.
@@ -78,14 +217,19 @@ class DistillCliRunRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     agent: str
-    """The AGENT argument exactly as given (may carry an @ref)."""
+    """The `--harness` value exactly as given (may carry an @ref).
+
+    Named `agent` because that is the key already written into run dirs; it is
+    the harness document supplying the rollout params, never the executing
+    agent (harbor always runs terminus-2).
+    """
 
     backend: Literal["local", "e2b"]
     seed_version: int | None
-    """The stored seed version; None means the built-in default agent."""
+    """The stored harness version; None means the built-in default agent."""
 
     seed_doc_hash: str
-    """The resolved seed document's hash; a resume must re-resolve to it."""
+    """The resolved harness document's hash; a resume must re-resolve to it."""
 
     train_task_ids: tuple[str, ...]
     holdout_task_ids: tuple[str, ...]
@@ -94,11 +238,12 @@ class DistillCliRunRecord(BaseModel):
 def run_distill(
     console: Console,
     *,
-    agent_name: str | None,
-    distill_config_path: str | None,
+    harness_name: str,
+    harness_explicit: bool,
+    config_path: str | None,
     task_ids_path: str | None,
     holdout_task_ids_path: str | None,
-    run_dir: str | None,
+    run_dir: str,
     backend: str | None,
     resume: bool,
     yes: bool,
@@ -109,12 +254,16 @@ def run_distill(
 
     Args:
         console: The CLI's rich console (product output goes through it).
-        agent_name: The AGENT argument; the literal 'pi' is the built-in
-            default agent, 'name@ref' seeds from the harness store.
-        distill_config_path: The per-run distill TOML; required to start a
-            fresh run. On resume None loads the run dir's config.toml
-            snapshot, and an explicit path wins over it (the documented
-            budget-abort recovery is editing budget.max_usd and resuming).
+        harness_name: The `--harness` value; the bare default literal is the
+            built-in default agent, 'name@ref' loads a stored version.
+        harness_explicit: Whether `--harness` was typed rather than defaulted.
+            A resume that did not type it adopts the recorded value instead of
+            conflicting with it, which is why the printed resume command may
+            omit the flag.
+        config_path: The per-run TOML; required to start a fresh run. On
+            resume None loads the run dir's config.toml snapshot, and an
+            explicit path wins over it (the documented budget-abort recovery
+            is editing budget.max_usd and resuming).
         task_ids_path: JSON array of train task ids; required to start.
         holdout_task_ids_path: JSON array of holdout task ids; required to
             start. Baselines and the gate are measured here.
@@ -134,17 +283,11 @@ def run_distill(
         typer.Exit: When the user declines a confirmation (code 0) or the
             run fails/aborts (code 1).
     """
-    # Deferred import: harness_app routes to this module at module scope, so
-    # importing its helpers back at module scope would be a circular import.
-    from wmo.cli.harness_app import DEFAULT_SEED_AGENT, _load_harbor_task_ids
+    # Deferred import: harness_app registers this module's typer app at module
+    # scope, so importing its helpers back at module scope would be a circular
+    # import.
+    from wmo.cli.harness_app import _load_harbor_task_ids
 
-    if agent_name is None:
-        raise typer.BadParameter(
-            "provide the agent NAME whose harness the pi trials run (the literal "
-            f"{DEFAULT_SEED_AGENT!r} is the built-in default agent): "
-            "`wmo optimize harness pi harbor --mode distill --distill-config run.toml "
-            "--task-ids train.json --holdout-task-ids holdout.json --run-dir <dir>`"
-        )
     backend_override: Literal["local", "e2b"] | None
     if backend is None:
         backend_override = None
@@ -154,11 +297,6 @@ def run_distill(
         backend_override = "local"
     else:
         raise typer.BadParameter(f"unknown --backend {backend!r}; choose local or e2b")
-    if run_dir is None:
-        raise typer.BadParameter(
-            "--run-dir is required for --mode distill: it holds all durable run "
-            "state (config snapshot, metrics, checkpoints, rollout artifacts)"
-        )
 
     run_path = Path(run_dir)
     record_path = run_path / DISTILL_RUN_RECORD
@@ -168,18 +306,20 @@ def run_distill(
         record = _load_record(record_path)
         _reject_resume_conflicts(
             record,
-            agent_name=agent_name,
+            # A resume that did not type --harness adopts the record rather than
+            # conflicting with the option's default, which is what lets the
+            # printed resume command omit the flag at the default value.
+            harness_name=harness_name if harness_explicit else None,
             backend=backend_override,
             task_ids_path=task_ids_path,
             holdout_task_ids_path=holdout_task_ids_path,
             load_task_ids=_load_harbor_task_ids,
         )
+        harness_name = record.agent
         train_ids = record.train_task_ids
         holdout_ids = record.holdout_task_ids
-        cfg = _load_config(
-            Path(distill_config_path) if distill_config_path is not None else store.config_path
-        )
-        base, seed_doc = _pinned_seed_doc(root, record, DEFAULT_SEED_AGENT)
+        cfg = _load_config(Path(config_path) if config_path is not None else store.config_path)
+        base, seed_doc = _pinned_seed_doc(root, record)
         seed_version = record.seed_version
         effective_backend = record.backend
     else:
@@ -200,7 +340,7 @@ def run_distill(
         missing = [
             flag
             for flag, value in (
-                ("--distill-config", distill_config_path),
+                ("--config", config_path),
                 ("--task-ids", task_ids_path),
                 ("--holdout-task-ids", holdout_task_ids_path),
             )
@@ -211,12 +351,12 @@ def run_distill(
                 f"{', '.join(missing)} required to start a distillation run "
                 "(a resume reuses the run dir's recorded inputs instead)"
             )
-        assert distill_config_path is not None  # narrowed by the missing check
+        assert config_path is not None  # narrowed by the missing check
         assert task_ids_path is not None and holdout_task_ids_path is not None
-        cfg = _load_config(Path(distill_config_path))
+        cfg = _load_config(Path(config_path))
         train_ids = _load_harbor_task_ids(Path(task_ids_path))
         holdout_ids = _load_harbor_task_ids(Path(holdout_task_ids_path))
-        base, seed_doc, seed_version = _resolve_seed_doc(root, agent_name, DEFAULT_SEED_AGENT)
+        base, seed_doc, seed_version = _resolve_seed_doc(root, harness_name)
         effective_backend = backend_override if backend_override is not None else cfg.harbor.backend
 
     overlap = sorted(set(train_ids) & set(holdout_ids))
@@ -233,9 +373,9 @@ def run_distill(
     runtime_kind = seed_doc.runtime_kind()
     if runtime_kind != _PI_NODE_RUNTIME:
         raise typer.BadParameter(
-            f"distillation rollouts drive the pi agent through harbor trials, but "
-            f"harness {agent_name!r} has runtime kind {runtime_kind!r}; seed from a "
-            f"pi-node harness (the built-in {DEFAULT_SEED_AGENT!r} agent, or a "
+            f"distillation rollouts read their params from a pi-node harness document, "
+            f"but --harness {harness_name!r} has runtime kind {runtime_kind!r}; pass a "
+            f"pi-node harness (the built-in {DEFAULT_DISTILL_HARNESS!r} agent, or a "
             "version optimized from it)"
         )
     template_path = Path(cfg.harbor.job_template)
@@ -263,7 +403,7 @@ def run_distill(
         # Recorded only now: inputs validated and the user confirmed, so a
         # declined or failed start never poisons the run dir.
         record = DistillCliRunRecord(
-            agent=agent_name,
+            agent=harness_name,
             backend=effective_backend,
             seed_version=seed_version,
             seed_doc_hash=seed_doc.doc_hash,
@@ -289,10 +429,10 @@ def run_distill(
             resume=resume,
             on_progress=_on_progress,
             adapter_store=AdapterStore(root),
-            # Resume commands must print the agent string as typed (it may carry
-            # an @ref that `base` strips), or the printed command would trip the
-            # CLI's resume conflict check.
-            cli_agent=agent_name,
+            # Resume commands must print the --harness string as typed (it may
+            # carry an @ref that `base` strips), or the printed command would
+            # trip the CLI's resume conflict check.
+            cli_agent=harness_name,
         )
     except DistillBudgetError as exc:
         console.print(f"[red]budget exhausted[/red] {escape(str(exc))}")
@@ -315,13 +455,12 @@ def run_distill(
 
 
 def _load_config(path: Path) -> DistillConfig:
-    """Load the distill TOML, turning load failures into usage errors."""
+    """Load the run TOML, turning load failures into usage errors."""
     try:
         return load_distill_config(path)
     except FileNotFoundError as exc:
         raise typer.BadParameter(
-            f"{exc} (a fresh run needs --distill-config; a resume reads the run "
-            "dir's config.toml snapshot)"
+            f"{exc} (a fresh run needs --config; a resume reads the run dir's config.toml snapshot)"
         ) from exc
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -345,16 +484,21 @@ def _load_record(path: Path) -> DistillCliRunRecord:
 def _reject_resume_conflicts(
     record: DistillCliRunRecord,
     *,
-    agent_name: str,
+    harness_name: str | None,
     backend: str | None,
     task_ids_path: str | None,
     holdout_task_ids_path: str | None,
     load_task_ids: Callable[[Path], tuple[str, ...]],
 ) -> None:
-    """Reject explicit flags that conflict with the recorded run inputs."""
+    """Reject explicit flags that conflict with the recorded run inputs.
+
+    Every flag is compared only when it was actually typed (None means it was
+    not), so a resume that carries just `--run-dir --resume` adopts the record
+    wholesale instead of colliding with an option default.
+    """
     conflicts: list[str] = []
-    if agent_name != record.agent:
-        conflicts.append(f"AGENT {agent_name!r} != recorded {record.agent!r}")
+    if harness_name is not None and harness_name != record.agent:
+        conflicts.append(f"--harness {harness_name!r} != recorded {record.agent!r}")
     if backend is not None and backend != record.backend:
         conflicts.append(f"--backend {backend!r} != recorded {record.backend!r}")
     if task_ids_path is not None and load_task_ids(Path(task_ids_path)) != record.train_task_ids:
@@ -372,35 +516,31 @@ def _reject_resume_conflicts(
         )
 
 
-def _resolve_seed_doc(
-    root: str, agent_ref: str, default_seed_name: str
-) -> tuple[str, HarnessDoc, int | None]:
-    """Resolve the AGENT positional to the harness the pi trials run.
+def _resolve_seed_doc(root: str, harness_ref: str) -> tuple[str, HarnessDoc, int | None]:
+    """Resolve `--harness` to the document the trials read their params from.
 
-    Mirrors the harbor search's seed protocol: the bare default-agent literal
-    is ALWAYS the built-in agent; 'name@ref' loads a stored version. Returns
-    the base name, the document, and the resolved store version (None for the
+    Mirrors the harbor search's seed protocol: the bare default literal is
+    ALWAYS the built-in agent; 'name@ref' loads a stored version. Returns the
+    base name, the document, and the resolved store version (None for the
     built-in seed) so a resume can pin exactly what the run started from.
     """
-    base, _, ref = agent_ref.partition("@")
+    base, _, ref = harness_ref.partition("@")
     try:
         validate_name(base)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if base == default_seed_name and not ref:
+    if base == DEFAULT_DISTILL_HARNESS and not ref:
         return base, default_agent(base), None
     try:
         doc = HarnessStore(root).load(base, ref or None)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(
-            f"{exc}; the built-in default agent is the literal {default_seed_name!r}"
+            f"{exc}; the built-in default agent is the literal {DEFAULT_DISTILL_HARNESS!r}"
         ) from exc
     return base, doc, doc.version
 
 
-def _pinned_seed_doc(
-    root: str, record: DistillCliRunRecord, default_seed_name: str
-) -> tuple[str, HarnessDoc]:
+def _pinned_seed_doc(root: str, record: DistillCliRunRecord) -> tuple[str, HarnessDoc]:
     """Re-resolve the recorded seed for a resume, never a live movable ref.
 
     The record pins the exact version and doc hash, so champion movement (or
@@ -657,3 +797,172 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
         f"[green]wrote[/green] \\[models.agent] -> {path} (set WMO_ENDPOINT_API_KEY to "
         "your Tinker API key before running the agent)"
     )
+
+
+# -- report ------------------------------------------------------------------------------------
+
+_REPORT_ROWS: tuple[tuple[str, str], ...] = (
+    ("teacher", TEACHER_BASELINE_EVAL),
+    ("student before", STUDENT_BEFORE_EVAL),
+    ("student after", STUDENT_AFTER_EVAL),
+)
+"""The three held-out measurements the gate compares, in table order, paired
+with the `evals/<key>.json` each one was written to."""
+
+
+def _load_gate(store: DistillRunStore) -> DistillGateRecord:
+    """Read the run's `gate.json`, turning a missing or corrupt file into a usage error."""
+    try:
+        text = store.gate_path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(
+            f"no {store.gate_path}: this run has not reached its gate yet (or "
+            f"{store.run_dir} is not a distillation run dir). Finish or resume it with "
+            "`wmo optimize model run --run-dir <dir> --resume`"
+        ) from exc
+    try:
+        return DistillGateRecord.model_validate_json(text)
+    except ValidationError as exc:
+        raise typer.BadParameter(f"cannot load {store.gate_path}: {exc}") from exc
+
+
+def _load_eval_report(store: DistillRunStore, key: str) -> DistillEvalReport | None:
+    """Read one `evals/<key>.json`, or None when the run never wrote it.
+
+    A missing report is normal (an imported baseline is copied in, but an
+    aborted run may have none), so the table degrades to the rates gate.json
+    already carries rather than failing.
+    """
+    try:
+        text = (store.evals_dir / f"{key}.json").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    try:
+        return DistillEvalReport.model_validate_json(text)
+    except ValidationError as exc:
+        raise typer.BadParameter(
+            f"cannot load {store.evals_dir / f'{key}.json'}: {exc}; delete the file to "
+            "report from gate.json alone"
+        ) from exc
+
+
+def _solve_rate_table(store: DistillRunStore, gate: DistillGateRecord) -> Table:
+    """The teacher / student-before / student-after held-out comparison."""
+    rates = (
+        gate.teacher_solve_rate,
+        gate.student_before_solve_rate,
+        gate.student_after_solve_rate,
+    )
+    table = Table(title=f"Held-out solve rates ({store.run_dir})")
+    table.add_column("Measurement", no_wrap=True)
+    # Fold rather than ellipsize. A tinker:// sampler path is wider than the ~22 columns
+    # this cell gets at an 80-column terminal, and rich's default would truncate it to
+    # `tinker://weights/pi...`, silently dropping the identity of the artifact. Folding
+    # keeps every character; the copyable form is printed on its own line below.
+    table.add_column("Model", overflow="fold")
+    table.add_column("Solve", justify="right")
+    table.add_column("Graded", justify="right")
+    table.add_column("Executed", justify="right")
+    table.add_column("Scaffold", justify="right")
+    for (label, key), rate in zip(_REPORT_ROWS, rates, strict=True):
+        eval_report = _load_eval_report(store, key)
+        if eval_report is None:
+            table.add_row(label, "unknown", f"{rate:.3f}", "-", "-", "-")
+            continue
+        graded = (
+            f"{eval_report.graded_solve_rate:.3f}" if eval_report.graded_trials else "unmeasured"
+        )
+        table.add_row(
+            label,
+            eval_report.provider_model,
+            f"{rate:.3f}",
+            graded,
+            f"{eval_report.executed_trials}/{eval_report.trials}",
+            f"{eval_report.scaffold_loss_rate:.0%}",
+        )
+    return table
+
+
+def _print_trained_artifact(console: Console, store: DistillRunStore) -> None:
+    """Print the sampler path the student-after numbers came from, on its own line.
+
+    The table names it too, but a `tinker://` path is wider than the cell it gets at an
+    80-column terminal, so there it folds across lines. This line is the copyable one: it
+    is what you paste into a pool entry or a follow-on run's `init_from_state`.
+
+    Args:
+        console: Where to print.
+        store: The run store to read the student-after eval report from.
+    """
+    after = _load_eval_report(store, STUDENT_AFTER_EVAL)
+    if after is None or not after.provider_model:
+        return
+    console.print(f"trained artifact: {escape(after.provider_model)}")
+
+
+def _print_paired_delta(console: Console, store: DistillRunStore, gate: DistillGateRecord) -> None:
+    """Print what training moved, on the same holdout split the gate read."""
+    binary = gate.student_after_solve_rate - gate.student_before_solve_rate
+    console.print(f"paired delta (after - before): {binary:+.3f} solve rate")
+    before = _load_eval_report(store, STUDENT_BEFORE_EVAL)
+    after = _load_eval_report(store, STUDENT_AFTER_EVAL)
+    if before is not None and after is not None and before.graded_trials and after.graded_trials:
+        graded = after.graded_solve_rate - before.graded_solve_rate
+        console.print(f"  graded (same trials at test resolution): {graded:+.3f}")
+    fraction = (
+        gate.student_after_solve_rate / gate.teacher_solve_rate
+        if gate.teacher_solve_rate > 0
+        else None
+    )
+    reached = "unmeasurable (teacher solved nothing)" if fraction is None else f"{fraction:.3f}"
+    verdict = "passed" if gate.accepted else "FAILED"
+    console.print(
+        f"  after / teacher: {reached} against gate minimum "
+        f"{gate.min_teacher_fraction:.2f}; gate {verdict}"
+    )
+
+
+def _print_training_summary(console: Console, store: DistillRunStore) -> None:
+    """Print the last training row's health metrics, or say the run trained nothing.
+
+    Turns per episode is deliberately absent: nothing in the run dir records
+    it. `mean_generation_tokens` is the per-episode series the loop does
+    measure (sampled tokens, pooled over the batch's span-bearing episodes).
+    """
+    rows = [row for row in store.read_metrics() if row.get("phase") is None]
+    if not rows:
+        console.print("no training step recorded in metrics.jsonl")
+        return
+    last = rows[-1]
+    step = _row_int(last, "step")
+    parts = [f"{len(rows)} training step(s) recorded"]
+    for label, key, spec in (
+        ("reverse KL/token", "reverse_kl_per_token", ".4f"),
+        ("entropy ratio", "entropy_ratio", ".2f"),
+        ("tokens/episode", "mean_generation_tokens", ".0f"),
+        ("tokens/episode ratio", "generation_tokens_ratio", ".2f"),
+    ):
+        value = _row_float(last, key)
+        if value is not None:
+            parts.append(f"{label} {value:{spec}}")
+    spent = _row_float(last, "cumulative_usd")
+    if spent is not None:
+        parts.append(f"${spent:.2f} spent")
+    head = "training" if step is None else f"training (last row step {step})"
+    console.print(f"{head}: {', '.join(parts)}")
+
+
+def _row_float(row: JsonObject, key: str) -> float | None:
+    """One metrics-row number, or None when absent or not numeric."""
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+def _row_int(row: JsonObject, key: str) -> int | None:
+    """One metrics-row integer, or None when absent or not an integer."""
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value

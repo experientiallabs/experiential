@@ -28,7 +28,6 @@ from rich.table import Table
 from wmo.agents.default import default_agent
 from wmo.agents.optimizer import optimizer_agent
 from wmo.agents.project import AgentProject
-from wmo.cli.harness_distill import run_distill
 from wmo.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.config.store import validate_name
@@ -131,16 +130,19 @@ def show_harness(
 
 
 optimize_app = typer.Typer(
-    help="Optimizers behind one switch: harness (agent-scaffold search) today; route "
-    "(learned inference policy) and training-type optimizers join as subcommands.",
+    help="Optimizers behind one switch, one per artifact they produce: harness "
+    "(agent-scaffold search), route (learned inference policy), model (a distilled "
+    "adapter).",
     no_args_is_help=True,
 )
 
-# Local import placement: route_app imports the optimize package; registering here keeps the
-# whole optimizer family visible in one place.
+# Local import placement: route_app imports the optimize package and model_app imports this
+# module back; registering here keeps the whole optimizer family visible in one place.
+from wmo.cli.model_app import model_app  # noqa: E402
 from wmo.cli.route_app import route_app  # noqa: E402
 
 optimize_app.add_typer(route_app, name="route")
+optimize_app.add_typer(model_app, name="model")
 
 
 @optimize_app.command("harness")
@@ -260,32 +262,6 @@ def optimize(
         help="(harbor) Stop after this many new boundaries this invocation; continue later "
         "with --resume.",
     ),
-    mode: str = typer.Option(
-        "search",
-        "--mode",
-        help="search (the default propose-and-gate optimizer) or distill (harbor only: "
-        "on-policy distillation of the agent MODEL itself; the harness stays fixed and "
-        "an accepted run produces a trained adapter).",
-    ),
-    distill_config: str = typer.Option(
-        None,
-        "--distill-config",
-        help="(distill) Per-run distillation TOML (student, teacher, harbor, train, gate, "
-        "pricing, budget sections). Required to start; a resume reuses the run dir's "
-        "config.toml snapshot.",
-    ),
-    holdout_task_ids_file: str = typer.Option(
-        None,
-        "--holdout-task-ids",
-        help="(distill) JSON file with the exact holdout task-id list; baselines and the "
-        "promotion gate are measured here, disjoint from --task-ids.",
-    ),
-    promote: bool = typer.Option(
-        False,
-        "--promote",
-        help="(distill) After an accepted gate, offer to write [models.agent] in "
-        "settings.toml pointing at the distilled adapter (always asks for confirmation).",
-    ),
 ) -> None:
     """Optimize an agent harness by searching against a world model or on harbor tasks.
 
@@ -299,33 +275,8 @@ def optimize(
     worker placement (local = docker tasks + local pi; e2b = E2B tasks + sandboxed pi), while
     the PROPOSER project always runs in E2B in this version.
 
-    `--mode distill` (harbor environment only) trains the agent model instead of editing
-    the harness: on-policy distillation of a Tinker LoRA student from pi-agent rollouts on
-    the harbor tasks, gated on holdout solve rates against the teacher.
+    To train the agent MODEL instead of its harness, use `wmo optimize model run`.
     """
-    if mode not in ("search", "distill"):
-        raise typer.BadParameter(f"unknown --mode {mode!r}; choose search or distill")
-    if mode == "search":
-        distill_only = [
-            flag
-            for flag, provided in (
-                ("--distill-config", distill_config is not None),
-                ("--holdout-task-ids", holdout_task_ids_file is not None),
-                ("--promote", promote),
-            )
-            if provided
-        ]
-        if distill_only:
-            raise typer.BadParameter(
-                f"{', '.join(distill_only)} apply only to --mode distill; add "
-                "--mode distill (harbor environment) or drop them"
-            )
-    elif model != _HARBOR_ENVIRONMENT:
-        raise typer.BadParameter(
-            "--mode distill requires the harbor environment: "
-            "`wmo optimize harness <agent> harbor --mode distill ...`; a world-model distill "
-            "backend is a documented follow-on and is not available yet"
-        )
     if model == _HARBOR_ENVIRONMENT:
         world_model_only = [
             flag
@@ -345,50 +296,14 @@ def optimize(
                 f"{', '.join(world_model_only)} apply only to a world-model environment; "
                 "drop them for `wmo optimize harness <agent> harbor ...`"
             )
-        # Shared by both modes: 'harbor' must unambiguously mean the benchmark
-        # environment, never a stored world model that happens to carry the name.
+        # 'harbor' must unambiguously mean the benchmark environment, never a
+        # stored world model that happens to carry the name.
         if WorldModelStore(root).exists(_HARBOR_ENVIRONMENT):
             raise typer.BadParameter(
                 "a stored world model is literally named 'harbor', which now selects the "
                 "harbor benchmark environment; rename that model directory under "
                 "<root>/models/ and retry"
             )
-        if mode == "distill":
-            search_only = [
-                flag
-                for param, flag in (
-                    ("iterations", "--iterations"),
-                    ("harbor_config", "--harbor-config"),
-                    ("attempts", "--attempts"),
-                    ("reward_key", "--reward-key"),
-                    ("reward_mode", "--reward-mode"),
-                    ("harbor_retries", "--harbor-retries"),
-                    ("episode_timeout", "--episode-timeout"),
-                    ("max_iterations_this_run", "--max-iterations-this-run"),
-                    ("e2b_template", "--e2b-template"),
-                )
-                if _explicit(ctx, param)
-            ]
-            if search_only:
-                raise typer.BadParameter(
-                    f"{', '.join(search_only)} apply only to --mode search; a distill "
-                    "run's harbor job template, attempts, and schedule come from "
-                    "--distill-config"
-                )
-            run_distill(
-                _console,
-                agent_name=name,
-                distill_config_path=distill_config,
-                task_ids_path=task_ids_file,
-                holdout_task_ids_path=holdout_task_ids_file,
-                run_dir=run_dir,
-                backend=backend if _explicit(ctx, "backend") else None,
-                resume=resume,
-                yes=yes,
-                promote=promote,
-                root=root,
-            )
-            return
         _optimize_harbor(
             ctx,
             name=name,

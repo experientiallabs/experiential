@@ -88,7 +88,7 @@ E2B_SANDBOXES_PER_TRIAL = 1
 One, not two: terminus-2 runs inside the harbor process and drives the task environment over
 tmux, so the only sandbox a trial holds is harbor's task environment. (The pi bridge needed a
 second, pooled sandbox to host the harness process; that path is no longer used for
-distillation rollouts.) Capacity planning (`wmo.cli.harness_distill`) multiplies by this."""
+distillation rollouts.) Capacity planning (`wmo.cli.model_app`) multiplies by this."""
 
 
 def _recorded_provider_config(config_path: Path) -> JsonObject | None:

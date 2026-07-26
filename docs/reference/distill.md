@@ -1,6 +1,7 @@
-# Distill mode (`wmo optimize harness <agent> harbor --mode distill`)
+# Model distillation (`wmo optimize model`)
 
-The other optimizer modes edit the agent's *harness*; distill mode trains the agent's *model*.
+The other optimizers edit the agent's *harness* or its *routing policy*; `wmo optimize model`
+trains the agent's *model*.
 It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
 out on real harbor benchmark tasks while sampling from the student's current weights; a larger
 teacher model scores the exact tokens the student sampled; and each training
@@ -142,18 +143,24 @@ unpriced meters and no `budget.max_usd` refuses to start non-interactively.
 ## Running it
 
 ```bash
-wmo optimize harness pi harbor --mode distill \
-  --distill-config run.toml \
+wmo optimize model run \
+  --config run.toml \
   --task-ids train-task-ids.json \
   --holdout-task-ids holdout-task-ids.json \
   --run-dir runs/distill-01
 ```
 
-The agent argument works like the other optimizer modes: the literal `pi` is the built-in
-default agent, and `name@ref` seeds from a stored harness version (the harness must be a
-pi-node harness; it is pinned for the whole run). `--backend local|e2b` overrides the config's
-`harbor.backend`. `--yes` skips the cost confirmation when the spend is accountable. Add
-`--promote` to be offered a `[models.agent]` settings write after an accepted gate.
+The harness is a dependency of the run, not its subject, so it is a flag with a default:
+`--harness pi` (the built-in default agent) or `--harness name@ref` for a stored version. It
+must be a pi-node harness and it is pinned for the whole run. What it supplies is parameters,
+not the executing agent: the rollout knobs (`sampling.temperature`, `rollout.max_turns`,
+`sampling.max_tokens`) are written into the document, which the pi runtimes read from its param
+surfaces, and its hash keys every harbor job so a config change cannot resume another config's
+trials. The agent harbor runs is always `terminus-2`.
+
+`--backend local|e2b` overrides the config's `harbor.backend`. `--yes` skips the cost
+confirmation when the spend is accountable. Add `--promote` to be offered a `[models.agent]`
+settings write after an accepted gate.
 
 Before spending anything the run preflights: renderer resolution, a student/teacher tokenizer
 fingerprint check, one-token pings, and a tokens-in-tokens-out (TITO) recompute proof that the
@@ -280,6 +287,22 @@ Tinker's OpenAI-compatible endpoint (authenticate by setting `WMO_ENDPOINT_API_K
 Tinker API key). With `[wandb] enabled = true`, steps, evals, spend, and the gate summary
 stream to a Weights & Biases run that resumes with the run dir.
 
+## Reading a run back
+
+```bash
+wmo optimize model report --run-dir runs/distill-01
+```
+
+`report` reads only files the run already wrote (`gate.json`, `evals/*.json`, `metrics.jsonl`),
+so it costs nothing and is safe against a live run dir. It prints the gate verdict, then the
+three held-out measurements the gate compared (teacher, student-before, student-after) with the
+model that produced each, its binary and graded solve rate, its executed-trial count and its
+scaffold loss rate; then the paired delta (after minus before, binary and graded) and the
+achieved teacher fraction against `gate.min_teacher_fraction`; then the last training row's
+health metrics (reverse KL/token, entropy ratio, sampled tokens per episode and its ratio) and
+the run's cumulative spend. A run dir with only `gate.json` still reports the verdict and the
+three rates; one that never reached its gate says so and names the resume command.
+
 ## Resume and budget behavior
 
 Training state checkpoints on a cadence (`train.save_state_every`) plus at every abort. If the
@@ -287,12 +310,12 @@ run hits `budget.max_usd`, it saves what it can and exits with the exact resume 
 the cap in the config and rerun with:
 
 ```bash
-wmo optimize harness pi harbor --mode distill --run-dir runs/distill-01 --resume
+wmo optimize model run --run-dir runs/distill-01 --resume
 ```
 
-A resume needs only `--run-dir`: the CLI reloads the pinned splits, backend, and seed harness
+A resume needs only `--run-dir`: the CLI reloads the pinned splits, backend, and harness
 from `distill-run.json`, the config from the `config.toml` snapshot (an explicit
-`--distill-config` wins, which is how you raise the cap), and prior spend from `spend.json`,
+`--config` wins, which is how you raise the cap), and prior spend from `spend.json`,
 so a resumed run can never spend the budget twice. Recorded baselines and a finished warmup
 are reused, the step count continues from the latest checkpoint, and conflicting explicit
 flags are rejected rather than silently changing the run. The tripwire baseline in

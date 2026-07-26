@@ -83,11 +83,15 @@ uv run pytest -q
 - Persist every proposal and verdict in `DeltaArchive`, including screened, rejected, and invalid
   deltas. `HarnessStore` writes immutable `vN` versions and moves the `champion` alias for
   promotion or rollback.
-- `wmo optimize harness <agent> harbor --mode distill` is the third optimization surface: instead
-  of editing the harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA
-  student from rollouts of harbor's OWN `terminus_2` agent on harbor tasks (measured: our pi
-  scaffold needed 2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59%
-  harness loss, and this mode measures model quality, not scaffold quality). Terminus-2 samples
+- `wmo optimize model run` is the third optimization surface, named for the artifact it produces
+  (`adapter`, beside harness's `prompt` and route's `routing_policy`): instead of editing the
+  harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA student from
+  rollouts of harbor's OWN `terminus_2` agent on harbor tasks (measured: our pi scaffold needed
+  2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59% harness loss, and
+  this command measures model quality, not scaffold quality). The harbor environment is implicit
+  and the harness is pinned, never edited: `--harness` (default `pi`) only selects the stored
+  document supplying the rollout params (`sampling.temperature`, `rollout.max_turns`,
+  `sampling.max_tokens`) and the hash that keys every harbor job. Terminus-2 samples
   the student through `llm_backend="tinker"` with `collect_rollout_details=True`, and harbor
   persists the per-turn token ids that become the training targets verbatim into each trial's
   `result.json`. The loss is per-token reverse KL against the teacher's logprobs on the sampled
@@ -95,9 +99,10 @@ uv run pytest -q
   passing trajectories), and promotion is gated on holdout solve rates: student-after must
   reach `gate.min_teacher_fraction` of the teacher and not regress against student-before;
   only then does the adapter version land in `AdapterStore` with the champion alias. Run
-  configuration is a per-run TOML passed via `--distill-config` (student, teacher, harbor,
+  configuration is a per-run TOML passed via `--config` (student, teacher, harbor,
   rollout, train, sampling, warmup, eval, gate, pricing, budget, tripwire, wandb sections),
-  snapshotted into the run dir; the CLI face lives in `wmo/cli/harness_distill.py` and the loop
+  snapshotted into the run dir; `wmo optimize model report --run-dir <dir>` reads a finished run
+  back. The CLI face lives in `wmo/cli/model_app.py` and the loop
   in `wmo/distill/`. Degeneration tripwires (`[tripwire]`, `wmo/distill/tripwire.py`) watch the
   student's own sampled tokens for the collapse a KL curve hides; their thresholds are fractions
   of a baseline each run measures at its first training step and persists in its run manifest,

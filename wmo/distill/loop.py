@@ -222,6 +222,13 @@ TEACHER_BASELINE_EVAL = "baseline-teacher"
 STUDENT_BEFORE_EVAL = "baseline-student-before"
 STUDENT_AFTER_EVAL = "student-after"
 
+DEFAULT_DISTILL_HARNESS = "pi"
+"""`wmo optimize model run --harness` default: the built-in pi agent document.
+
+Lives here rather than in the CLI because `resume_command` must know when the
+flag can be omitted, and the loop may not import the CLI.
+"""
+
 DistillPhase = Literal[
     "preflight", "baseline", "warmup", "rollouts", "training", "eval", "finalize", "gate"
 ]
@@ -1506,14 +1513,16 @@ def tito_recompute_check(
 def resume_command(name: str, run_dir: Path) -> str:
     """The CLI command that resumes a distillation run.
 
-    The CLI layer (`wmo/cli/harness_distill.py`) reuses this helper so the
-    command printed on a budget abort stays the command that actually works.
-    On resume the run's pinned config is the `config.toml` snapshot inside
-    the run dir. `name` must be the agent string as the user typed it (an
-    @ref included) or the printed command trips the CLI resume conflict
-    check.
+    The CLI layer (`wmo/cli/model_app.py`) reuses this helper so the command
+    printed on a budget abort stays the command that actually works. On resume
+    the run's pinned config is the `config.toml` snapshot inside the run dir.
+    `name` must be the `--harness` string as the user typed it (an @ref
+    included) or the printed command trips the CLI resume conflict check; at
+    the option's default the flag is omitted, because a resume that does not
+    type it adopts the recorded value.
     """
-    return f"wmo optimize harness {name} harbor --mode distill --run-dir {run_dir} --resume"
+    harness = "" if name == DEFAULT_DISTILL_HARNESS else f" --harness {name}"
+    return f"wmo optimize model run{harness} --run-dir {run_dir} --resume"
 
 
 def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:
