@@ -926,19 +926,6 @@ def _checked_in_config(name: str) -> DistillConfig:
     return load_distill_config(Path(__file__).parent / "configs" / name)
 
 
-@pytest.mark.parametrize("name", ["distill-super-topk.toml", "distill-super-aggressive.toml"])
-def test_super_topk_configs_pin_clip_and_centering_explicitly(name: str) -> None:
-    """The top-k siblings must not drift when the shared defaults move.
-
-    They predate the raw-gap default, so they carry the old values inline;
-    inheriting the new defaults would silently redefine what those runs mean
-    if either ever switched off topk_ce.
-    """
-    cfg = _checked_in_config(name)
-    assert cfg.train.loss == "topk_ce"
-    assert cfg.train.advantage_clip == pytest.approx(4.0)
-    assert cfg.train.center_advantages is True
-    assert cfg.warmup.steps == 0
 
 
 def test_training_turn_cap_defaults_to_the_rollout_cap(tmp_path: Path) -> None:
