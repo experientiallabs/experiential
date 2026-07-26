@@ -242,8 +242,11 @@ class RoutingPolicy(BaseModel):
     # tilt reweights nonparametric scores by a prior; ours multiplies cluster probabilities
     # by support^gamma so thin outlier clusters lose routing weight). 0 = off (reference).
     support_tilt_gamma: float = Field(default=0.0, ge=0.0)
-    # Fit-set mean cost per scored episode (all models): the unit the cost knob trades against
-    # one reward point. 0 when the fit carried no usable costs.
+    # The unit a cost knob trades against one reward point: "one average call". Derived per kind,
+    # each matching its own knob's reference implementation. rank: the fit set's mean cost per
+    # scored EPISODE. knn: the mean of the per-model mean cell costs, which is what
+    # `pick_lam`'s reference divides by (coverage-robust, since a model measured on few
+    # scenarios cannot drag the unit toward its own price). 0 when the fit carried no costs.
     cost_scale: float = 0.0
     # The fit-time only-replace-if-better guard, recorded so any later transform of this policy
     # (today `rerank_policy`) re-applies the SAME floor instead of quietly dropping it. None
@@ -266,12 +269,32 @@ class RoutingPolicy(BaseModel):
     # (doubled when the pick is pricier than the baseline). Higher = stricter = fewer requests
     # leave the baseline. 0 routes on any positive mean difference.
     knn_z: float = Field(default=DEFAULT_KNN_Z, ge=0.0)
+    # How the guard treats the two sides of the price comparison (R1's `stat`/`stat_asym`).
+    # "symmetric" (the champion): a pricier pick needs 2z standard errors, a cheaper one needs z,
+    # so BOTH must be positively supported. "asymmetric": a pricier pick needs z, and a cheaper
+    # one only has to clear -z, i.e. it is accepted unless the evidence says it is significantly
+    # worse. The asymmetric bar is what makes `pick_lam` able to act at all: under the symmetric
+    # bar a cost-tilted cheap pick is usually reverted straight back to the pricier baseline,
+    # which spends MORE, not less (measured; see `wmh.optimize.knn.apply_cost_quality`).
+    guard_mode: Literal["symmetric", "asymmetric"] = "symmetric"
     knn_min_pairs: int = Field(default=DEFAULT_KNN_MIN_PAIRS, ge=0)  # neighbors scored on both
     se_floor: bool = True  # small-sample variance floor (see SE_FLOOR_MAX_PAIRS)
     # Novelty floor: queries whose best bank similarity is below this abstain to the baseline
     # (None = off). Set at fit time from the floor_q quantile of bank self-NN similarities;
     # the serving-side coverage/robustness knob for task drift.
     floor_sim: float | None = None
+    # The cost knob (R1 `pick_lam`): the raw pick maximizes
+    # `profile[m] - pick_lam * mean_cost[m] / cost_scale` instead of the profile alone, so
+    # pick_lam is "reward points paid per average-call-cost unit". The guard runs AFTER, on the
+    # untilted paired evidence, so cost pressure can only ever demote a pick, never promote one
+    # the evidence rejects. 0 = off (the validated champion). Slide it with
+    # `wmh.optimize.knn.apply_cost_quality`, which maps one operator-facing dial onto this.
+    pick_lam: float = Field(default=0.0, ge=0.0)
+    # The operator dial that produced the knobs above, when one did: 0 = max quality,
+    # 1 = max savings (`wmh.optimize.knn.apply_cost_quality`). None means "as fitted", never
+    # slid. Provenance, not an input: serving reads the knobs, and the mapping is absolute, so
+    # re-applying any dial setting to any policy of this kind lands on the same knobs.
+    cost_quality: float | None = Field(default=None, ge=0.0, le=1.0)
 
     # Set by `save`/`load` so a relative `knn_bank_path` resolves against the policy file, and
     # the lazily loaded bank. Private: not part of the artifact.
@@ -307,6 +330,15 @@ class RoutingPolicy(BaseModel):
                 raise ValueError(
                     f"knn guard_model '{self.guard_model}' must equal default_model "
                     f"'{self.default_model}': the baseline and the fallback are one model"
+                )
+            if self.pick_lam > 0.0 and self.cost_scale <= 0.0:
+                # Caught here rather than per request: a policy whose cost knob has no cost
+                # unit to divide by is an unservable artifact, and finding that out inside a
+                # request would turn a config mistake into a 502 per call.
+                raise ValueError(
+                    f"pick_lam={self.pick_lam:g} needs a positive cost_scale, but this policy "
+                    "has none; refit on a matrix that carries per-episode costs "
+                    "(`wmh optimize route fit --kind knn`) before turning the cost knob"
                 )
         if self.kind == "rank":
             if not self.clusters:
@@ -500,14 +532,20 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
        best similarity. The query is L2-normalized HERE (bank rows already are), so no caller
        can skip the step and turn the similarity threshold into a magnitude test.
     2. Profile: each model's similarity-weighted mean reward over the neighbors it was scored
-       on. The argmax is the raw pick (ties break by pool order, deterministically).
+       on. The raw pick maximizes that profile minus the cost knob's price term,
+       `pick_lam * mean_cost / cost_scale` (zero at the default pick_lam=0; ties break by pool
+       order, deterministically).
     3. Guard: a non-baseline pick must beat the baseline on PAIRED per-neighbor reward
        differences, mean > `knn_z` standard errors (doubled when the pick is also pricier, the
-       asymmetry that kills confidently-wrong pricier-and-worse picks), on at least
-       `knn_min_pairs` neighbors scored on both sides. Otherwise the baseline serves.
+       asymmetry that kills confidently-wrong pricier-and-worse picks; see `guard_mode` for the
+       economic variant that only asks a cheaper pick not to be significantly worse), on at
+       least `knn_min_pairs` neighbors scored on both sides. Otherwise the baseline serves.
 
     The guard is what makes the policy safe to deploy: absent evidence, the answer is the
     baseline, so the worst case is the baseline's behavior rather than a confident stranger's.
+    It runs on the UNTILTED evidence and after the cost knob, exactly as in the research code:
+    the knob reorders candidates, and the guard then re-vetoes whatever it cannot support, so
+    turning the knob up can never talk the router into a pick the evidence rejects.
     """
     if policy.kind != "knn":
         raise ValueError(f"knn_decision needs a knn policy, got kind='{policy.kind}'")
@@ -553,7 +591,17 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             model=baseline,
             reason=f"knn: {rows.size} neighbors carry no scored reward, serving {baseline}",
         )
-    pick_index, pick = max(candidates, key=lambda item: (profile[item[0]], -pool_order[item[1]]))
+    mean_cost = bank.mean_costs()
+    # The cost knob prices each candidate in average-call units before the argmax; at
+    # pick_lam=0 the key is the bare profile, bit-identical to the validated champion. A model
+    # the bank never priced pays exactly one unit, the reference's default.
+    tilt = np.zeros(profile.shape)
+    if policy.pick_lam > 0.0:
+        priced = np.where(np.isnan(mean_cost), policy.cost_scale, mean_cost)
+        tilt = policy.pick_lam * priced / policy.cost_scale
+    pick_index, pick = max(
+        candidates, key=lambda item: (profile[item[0]] - tilt[item[0]], -pool_order[item[1]])
+    )
     if pick == baseline:
         return RoutingDecision(
             model=baseline,
@@ -569,9 +617,11 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     error = float(diffs.std(ddof=1)) / pairs**0.5 if pairs > 1 else 0.0
     if policy.se_floor and 0 < pairs < SE_FLOOR_MAX_PAIRS:
         error = max(error, (0.25 / pairs) ** 0.5)
-    mean_cost = bank.mean_costs()
     pricier = bool(mean_cost[pick_index] > mean_cost[base_index])
-    z_effective = 2 * policy.knn_z if pricier else policy.knn_z
+    if policy.guard_mode == "asymmetric":
+        z_effective = policy.knn_z if pricier else -policy.knn_z
+    else:
+        z_effective = 2 * policy.knn_z if pricier else policy.knn_z
     needed = z_effective * error
 
     if pairs < policy.knn_min_pairs or not mean_diff > needed:
@@ -585,8 +635,9 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             model=baseline,
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
         )
+    knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
     return RoutingDecision(
         model=pick,
         reason=f"knn: {rows.size} neighbors, delta={mean_diff:+.3f} > {z_effective:g}xSE"
-        f"={needed:.3f}{' (pricier, doubled z)' if pricier else ''}",
+        f"={needed:.3f}{' (pricier, doubled z)' if pricier else ''}{knob}",
     )

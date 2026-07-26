@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -317,6 +318,8 @@ def _knn_policy(
     knn_z: float = 0.5,
     knn_min_pairs: int = 8,
     se_floor: bool = True,
+    pick_lam: float = 0.0,
+    guard_mode: Literal["symmetric", "asymmetric"] = "symmetric",
 ) -> RoutingPolicy:
     """A knn policy over `bank` with fable-5 as the pinned baseline (the production contract)."""
     policy = RoutingPolicy(
@@ -329,6 +332,11 @@ def _knn_policy(
         knn_z=knn_z,
         knn_min_pairs=knn_min_pairs,
         se_floor=se_floor,
+        pick_lam=pick_lam,
+        guard_mode=guard_mode,
+        # The bank's two models cost _PRICEY and _CHEAP, so their mean is the unit the cost
+        # knob divides by (what `wmh.optimize.knn.bank_cost_scale` computes at fit time).
+        cost_scale=(_PRICEY + _CHEAP) / 2,
     )
     policy.attach_bank(bank)
     return policy
@@ -398,6 +406,61 @@ def test_knn_keeps_the_baseline_when_it_leads_the_neighborhood() -> None:
     decision = knn_decision(_knn_policy(_knn_bank([[1.0, 0.0]] * 12)), _QUERY)
     assert decision.model == "fable-5"
     assert "leads 12 neighbors" in decision.reason
+
+
+def test_cost_knob_prices_candidates_before_the_argmax() -> None:
+    # Twelve neighbors where the pricey baseline is 0.05 better on every one: on reward alone
+    # fable-5 leads and serves. The knob charges each candidate pick_lam * cost / cost_scale,
+    # and haiku is 10x cheaper, so a big enough lam makes it the raw pick instead - and the
+    # economic bar (-0.5 x SE = -0.072) tolerates a 0.05 deficit, so the pick survives.
+    bank = _knn_bank([[0.55, 0.5]] * 12)
+    assert knn_decision(_knn_policy(bank, guard_mode="asymmetric"), _QUERY).model == "fable-5"
+    tilted = knn_decision(_knn_policy(bank, pick_lam=0.2, guard_mode="asymmetric"), _QUERY)
+    assert tilted.model == "haiku-4-5"
+    assert "cost knob lam=0.2" in tilted.reason
+    assert "-0.5xSE" in tilted.reason
+
+
+def test_symmetric_guard_sends_the_cost_knobs_pick_back_to_the_baseline() -> None:
+    # The same tilt under the shipped strict bar: haiku is the raw pick and is then reverted,
+    # because there a cheaper pick must still be positively supported. This is the measured
+    # reason the dial's price leg moves the guard too - the knob alone spends MORE, not less,
+    # since every tilted pick lands back on the pricier baseline.
+    guarded = knn_decision(_knn_policy(_knn_bank([[0.55, 0.5]] * 12), pick_lam=0.2), _QUERY)
+    assert guarded.model == "fable-5"
+    assert "evidence insufficient" in guarded.reason
+    assert "delta=-0.050" in guarded.reason
+
+
+def test_cost_knob_cannot_promote_a_pick_the_evidence_rejects() -> None:
+    # Evidence that says haiku is clearly worse (delta -0.1 against a floored SE of 0.144, so
+    # below even the -0.072 economic bar). No amount of cost pressure buys that pick: the guard
+    # runs after the tilt, on the untilted paired evidence.
+    bank = _knn_bank([[0.6, 0.5]] * 12)
+    for mode in ("symmetric", "asymmetric"):
+        decision = knn_decision(_knn_policy(bank, pick_lam=0.5, guard_mode=mode), _QUERY)
+        assert decision.model == "fable-5"
+        assert "evidence insufficient" in decision.reason
+
+
+def test_asymmetric_guard_still_holds_a_pricier_pick_to_a_positive_bar() -> None:
+    # Cheap baseline, pricey challenger: the economic bar is lenient on the CHEAPER side only,
+    # so a pricier pick with thin evidence is reverted exactly as before.
+    thin = _knn_bank([[0.5, 0.55]] * 12, costs=[_CHEAP, _PRICEY])
+    decision = knn_decision(_knn_policy(thin, guard_mode="asymmetric"), _QUERY)
+    assert decision.model == "fable-5"
+    assert "evidence insufficient" in decision.reason
+
+
+def test_cost_knob_needs_a_cost_unit_to_divide_by() -> None:
+    with pytest.raises(ValidationError, match="cost_scale"):
+        RoutingPolicy(
+            kind="knn",
+            default_model="fable-5",
+            guard_model="fable-5",
+            pool=_pool(),
+            pick_lam=0.05,
+        )
 
 
 def test_knn_serves_the_baseline_when_neighbors_carry_no_scored_reward() -> None:

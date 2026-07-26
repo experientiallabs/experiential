@@ -7,7 +7,17 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from wmh.optimize.knn import best_single_on_fit, build_knn_bank, fit_knn_policy
+from wmh.optimize.knn import (
+    COST_QUALITY_ANCHORS,
+    COST_QUALITY_BALANCED,
+    apply_cost_quality,
+    bank_floor_sim,
+    best_single_on_fit,
+    build_knn_bank,
+    cost_quality_knobs,
+    cost_quality_named_point,
+    fit_knn_policy,
+)
 from wmh.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmh.optimize.policy import (
     KNN_BANK_FILENAME,
@@ -84,6 +94,30 @@ def _matrix(*, pricey_cost: float = 0.01) -> OutcomeMatrix:
                     )
                 )
     return OutcomeMatrix(pool=_pool(), outcomes=outcomes)
+
+
+def _close_matrix() -> OutcomeMatrix:
+    """Both models scored on every scenario, pricey better by 0.02: a near-tie everywhere.
+
+    The regime a cost knob is for. The 0.02 gap is inside the guard's economic bar, and small
+    enough that a 10x price difference outweighs it once the knob is priced in.
+    """
+    return OutcomeMatrix(
+        pool=_pool(),
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id=f"{group}:{index}",
+                task=task,
+                model=model,
+                reward=0.52 if model == "pricey" else 0.50,
+                success=True,
+                cost_usd=0.001 if model == "cheap" else 0.01,
+            )
+            for group, tasks in [("sql", _SQL_TASKS), ("prose", _PROSE_TASKS)]
+            for index, task in enumerate(tasks)
+            for model in ("cheap", "pricey")
+        ],
+    )
 
 
 def _fit(
@@ -312,3 +346,151 @@ def test_floor_q_on_a_single_row_bank_stays_off(tmp_path: Path) -> None:
         floor_q=0.5,
     )
     assert policy.floor_sim is None  # never NaN: a 1-row bank has no self-NN distribution
+
+
+# --- the operator dial ---------------------------------------------------------------------
+
+
+def test_fit_records_the_cost_unit_the_knob_divides_by(tmp_path: Path) -> None:
+    # cheap costs $0.001 a call and pricey $0.01, so one "average call" is $0.0055: the mean of
+    # the per-model means, not of the cells (which would tilt toward whichever model ran more).
+    assert _fit(tmp_path).cost_scale == pytest.approx(0.0055)
+
+
+def test_a_costless_matrix_leaves_the_cost_unit_at_zero(tmp_path: Path) -> None:
+    matrix = _matrix()
+    for outcome in matrix.outcomes:
+        outcome.cost_usd = 0.0
+    policy = fit_knn_policy(
+        matrix,
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        embedder=EmbedderSpec(dim=64),
+        guard_model="cheap",
+    )
+    assert policy.cost_scale == 0.0
+    with pytest.raises(ValueError, match="no cost_scale"):
+        apply_cost_quality(policy, 1.0)
+    # The coverage leg needs no prices, so it still works on a costless fit.
+    assert apply_cost_quality(policy, 0.1).pick_lam == 0.0
+
+
+def test_the_dial_endpoints_are_the_measured_knobs() -> None:
+    quality_max = cost_quality_knobs(0.0)
+    assert (quality_max.knn_z, quality_max.floor_q, quality_max.pick_lam) == (0.5, 0.5, 0.0)
+    assert quality_max.guard_mode == "symmetric"
+    balanced = cost_quality_knobs(COST_QUALITY_BALANCED)
+    assert (balanced.knn_z, balanced.floor_q, balanced.pick_lam) == (0.5, 0.05, 0.0)
+    assert balanced.guard_mode == "symmetric"  # the shipped default keeps the strict bar
+    savings_max = cost_quality_knobs(1.0)
+    assert (savings_max.knn_z, savings_max.floor_q, savings_max.pick_lam) == (0.5, 0.05, 0.03)
+    assert savings_max.guard_mode == "asymmetric"
+
+
+def test_the_dial_is_monotone_in_both_knobs() -> None:
+    dials = [index / 20 for index in range(21)]
+    knobs = [cost_quality_knobs(dial) for dial in dials]
+    floors = [knob.floor_q for knob in knobs]
+    lams = [knob.pick_lam for knob in knobs]
+    assert floors == sorted(floors, reverse=True)  # coverage opens up
+    assert lams == sorted(lams)  # price pressure only ever rises
+    assert cost_quality_named_point(0.0) == "quality-max"
+    assert cost_quality_named_point(COST_QUALITY_BALANCED) == "balanced"
+    assert cost_quality_named_point(1.0) == "savings-max"
+    assert cost_quality_named_point(0.4) == "custom"
+
+
+def test_the_anchor_table_covers_the_dial_and_reads_off_the_mapping() -> None:
+    # The table is what the endpoint hands the platform UI and what the docstring promises. Its
+    # knobs come from the mapping itself, so the only thing to pin is that the measured
+    # positions still span the dial and that cost falls across them as advertised.
+    dials = [anchor.cost_quality for anchor in COST_QUALITY_ANCHORS]
+    assert dials == sorted(dials)
+    assert (dials[0], dials[-1]) == (0.0, 1.0)
+    assert COST_QUALITY_BALANCED in dials
+    for anchor in COST_QUALITY_ANCHORS:
+        assert anchor.knobs == cost_quality_knobs(anchor.cost_quality)
+        assert anchor.named_point == cost_quality_named_point(anchor.cost_quality)
+    costs = [anchor.cost_delta_percent for anchor in COST_QUALITY_ANCHORS]
+    assert costs == sorted(costs, reverse=True)  # every step up the dial measured cheaper
+    assert all(cost < 0.0 for cost in costs)  # and every anchor beats the best single model
+
+
+def test_the_dial_rejects_settings_outside_its_range(tmp_path: Path) -> None:
+    policy = _fit(tmp_path)
+    for outside in (-0.01, 1.5):
+        with pytest.raises(ValueError, match="between 0.0"):
+            apply_cost_quality(policy, outside)
+
+
+def test_the_dial_only_applies_to_knn_policies() -> None:
+    static = RoutingPolicy(kind="static", default_model="cheap", pool=_pool())
+    with pytest.raises(ValueError, match="kind='static'"):
+        apply_cost_quality(static, 0.5)
+
+
+def test_the_dial_returns_a_copy_and_leaves_the_original_alone(tmp_path: Path) -> None:
+    fitted = _fit(tmp_path)
+    slid = apply_cost_quality(fitted, 1.0)
+    assert (fitted.pick_lam, fitted.guard_mode, fitted.cost_quality) == (0.0, "symmetric", None)
+    assert (slid.pick_lam, slid.guard_mode, slid.cost_quality) == (0.03, "asymmetric", 1.0)
+    assert slid.floor_sim is not None  # dial 1.0 keeps the shipped novelty floor
+    assert fitted.floor_sim is None
+    # Everything the fit measured travels unchanged: no refit, just a re-priced pick.
+    assert slid.pool == fitted.pool
+    assert slid.default_model == fitted.default_model == slid.guard_model
+    assert (slid.rag_num, slid.rag_thres, slid.knn_min_pairs) == (
+        fitted.rag_num,
+        fitted.rag_thres,
+        fitted.knn_min_pairs,
+    )
+    assert slid.knn_bank() is fitted.knn_bank()  # the bank is shared, never re-read
+    assert "cost_quality=1" in (slid.fitted_from or "")
+
+
+def test_the_dial_is_absolute_so_re_applying_never_compounds(tmp_path: Path) -> None:
+    fitted = _fit(tmp_path)
+    once = apply_cost_quality(fitted, 0.4)
+    twice = apply_cost_quality(apply_cost_quality(fitted, 1.0), 0.4)
+    assert once.model_dump() == twice.model_dump()
+
+
+def test_the_dial_buys_cheap_calls_where_the_models_are_close(tmp_path: Path) -> None:
+    # End to end: on a matrix where pricey is a hair better everywhere (0.52 vs 0.50) the
+    # balanced dial pays for that hair on every call, and the savings end spends the 0.02 to
+    # take the 10x cheaper model instead.
+    matrix = _close_matrix()
+    fitted = fit_knn_policy(
+        matrix,
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        embedder=EmbedderSpec(dim=256),
+        guard_model="pricey",
+        rag_num=5,
+        min_pairs=3,
+    )
+    ids = matrix.scenario_ids()
+    balanced = evaluate_policy(apply_cost_quality(fitted, COST_QUALITY_BALANCED), matrix, ids)
+    savings = evaluate_policy(apply_cost_quality(fitted, 1.0), matrix, ids)
+    assert balanced.model_mix == {"pricey": 1.0}
+    assert savings.model_mix == {"cheap": 1.0}
+    assert savings.cost_per_scenario < balanced.cost_per_scenario / 5
+
+
+def test_the_dial_cannot_flip_decisive_evidence(tmp_path: Path) -> None:
+    # The specialist matrix: cheap aces SQL 1.0 to 0.0 and pricey aces prose. No dial position
+    # may sell those calls to the wrong model, because the guard reads the untilted evidence.
+    fitted = _fit(tmp_path, guard_model="pricey")
+    matrix = _matrix()
+    ids = matrix.scenario_ids()
+    for dial in (0.0, COST_QUALITY_BALANCED, 0.5, 1.0):
+        result = evaluate_policy(apply_cost_quality(fitted, dial), matrix, ids)
+        assert result.accuracy == pytest.approx(1.0), dial
+
+
+def test_the_novelty_floor_helper_reads_the_bank_not_the_policy(tmp_path: Path) -> None:
+    # The dial recomputes the floor from the bank at every position (floor_q is a quantile of
+    # the bank's own similarities, so it cannot be interpolated from the stored threshold).
+    bank = _fit(tmp_path).knn_bank()
+    assert bank_floor_sim(bank, 0.0) is None
+    tight, loose = bank_floor_sim(bank, 0.5), bank_floor_sim(bank, 0.05)
+    assert tight is not None and loose is not None
+    assert tight > loose  # a higher quantile abstains more often
