@@ -15,6 +15,11 @@ Request log: one JSONL row per call with the D-SERVING-LOG fields (id, ts, endpo
 model, cluster, tokens incl. cached, cache-adjusted cost, latency, ttfb, status, reason).
 Provider cache CONTROLS (breakpoint placement, TTL) are not exposed yet; they land with the
 cache-aware routing model.
+
+The endpoint's one operator control lives here too: `GET`/`PUT /v1/endpoints/{name}/config`
+reads and moves the cost/quality dial (`wmh.optimize.knn.apply_cost_quality`) on the live
+runtime, no restart and no refit. It is deliberately outside the OpenAI surface: a customer's
+OpenAI client sees exactly the routes it saw before.
 """
 
 from __future__ import annotations
@@ -36,6 +41,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, JsonValue, field_validator
 from starlette.background import BackgroundTask
 
+from wmh.optimize.knn import (
+    COST_QUALITY_ANCHORS,
+    CostQualityAnchor,
+    CostQualityKnobs,
+    apply_cost_quality,
+    cost_quality_knobs,
+    cost_quality_named_point,
+)
 from wmh.optimize.policy import Embedder, RoutingDecision, RoutingPolicy, select_model
 from wmh.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -45,6 +58,7 @@ from wmh.providers.base import (
     TokenUsage,
 )
 from wmh.providers.pool import PoolEntry, pool_provider
+from wmh.serving.endpoint_config import EndpointConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -230,7 +244,14 @@ class RequestLog:
 
 
 class EndpointRuntime:
-    """One served endpoint: its policy, its providers, its affinity memory, its log."""
+    """One served endpoint: its policy, its providers, its affinity memory, its log.
+
+    `cost_quality` sets the endpoint's cost/quality dial at mount time (see
+    `wmh.optimize.knn.apply_cost_quality`); None serves the policy exactly as fitted, so
+    mounting never silently re-tunes an artifact. `config_path` is the `endpoint.toml` a live
+    dial change is persisted to, so the setting survives a restart; None keeps changes in memory
+    (injected-policy tests, and any caller that owns persistence itself).
+    """
 
     def __init__(
         self,
@@ -239,15 +260,43 @@ class EndpointRuntime:
         *,
         provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
         log: RequestLog,
+        cost_quality: float | None = None,
+        config_path: Path | None = None,
     ) -> None:
         self.name = name
         self.policy = policy
         self.log = log
+        self._base_policy = policy
+        self._config_path = config_path
         self._provider_factory = provider_factory
         self._providers: dict[str, Provider] = {}
         self._policy_embedder: Embedder | None = None
         self._affinity: OrderedDict[str, str] = OrderedDict()
         self._lock = threading.Lock()
+        if cost_quality is not None:
+            self._swap_policy(cost_quality)
+
+    @property
+    def cost_quality(self) -> float | None:
+        """The dial the served policy is currently on (None: served as fitted)."""
+        return self.policy.cost_quality
+
+    def set_cost_quality(self, cost_quality: float) -> None:
+        """Move the dial on the live endpoint, and persist it when there is a file to persist to.
+
+        In-flight requests keep the policy they started on: the swap replaces the whole policy
+        object, so no request can ever read half of one dial position and half of another. The
+        pool, baseline, and evidence bank are identical across positions, so a conversation that
+        spans a swap is still served by a model this endpoint knows.
+        """
+        self._swap_policy(cost_quality)
+        if self._config_path is not None:
+            EndpointConfig(cost_quality=cost_quality).save(self._config_path)
+
+    def _swap_policy(self, cost_quality: float) -> None:
+        adjusted = apply_cost_quality(self._base_policy, cost_quality)
+        with self._lock:
+            self.policy = adjusted
 
     def decide(self, messages: list[ChatMessage]) -> RoutingDecision:
         incumbent = None
@@ -353,12 +402,98 @@ def _chunk_payload(
     }
 
 
+class EndpointConfigResponse(BaseModel):
+    """The endpoint's cost/quality dial, everything needed to render it, and where it stands.
+
+    `cost_quality` is null when the endpoint serves its policy exactly as fitted (nobody has set
+    the dial); `named_point` is "as-fitted" then. `knobs` is what the served policy is actually
+    running, so a client can see the effect of the dial and not just its label. `anchors` are the
+    MEASURED points behind the mapping (routerbench-ours9, 5 held-out splits, quality and cost
+    both against the best single pool model), which is what a slider should show a human instead
+    of an unlabeled 0-to-1 track. `dialable` is false for policy kinds with no dial (static and
+    rank endpoints), and then the dial fields are null and PUT returns 409.
+    """
+
+    endpoint: str
+    dialable: bool
+    cost_quality: float | None
+    named_point: str
+    knobs: CostQualityKnobs | None
+    anchors: list[CostQualityAnchor]
+
+
+class EndpointConfigUpdate(BaseModel):
+    """A live dial change: the one field the platform's slider sends."""
+
+    cost_quality: float = Field(ge=0.0, le=1.0)
+
+
+def _config_response(runtime: EndpointRuntime) -> EndpointConfigResponse:
+    dialable = runtime.policy.kind == "knn"
+    dial = runtime.cost_quality if dialable else None
+    return EndpointConfigResponse(
+        endpoint=runtime.name,
+        dialable=dialable,
+        cost_quality=dial,
+        named_point=cost_quality_named_point(dial) if dial is not None else "as-fitted",
+        knobs=(
+            CostQualityKnobs(
+                knn_z=runtime.policy.knn_z,
+                # The served floor is a similarity threshold; the dial's floor_q is the quantile
+                # it came from, and only the mapping knows which quantile that was.
+                floor_q=cost_quality_knobs(dial).floor_q if dial is not None else 0.0,
+                pick_lam=runtime.policy.pick_lam,
+                guard_mode=runtime.policy.guard_mode,
+            )
+            if dialable
+            else None
+        ),
+        anchors=list(COST_QUALITY_ANCHORS),
+    )
+
+
 def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
-    """Mount `/v1/models` + `/v1/chat/completions` over the given endpoints."""
+    """Mount `/v1/models`, `/v1/chat/completions`, and the per-endpoint dial over `endpoints`."""
     router = APIRouter()
 
     def _endpoint_or_none(name: str) -> EndpointRuntime | None:
         return endpoints.get(name)
+
+    def _endpoint_or_error(name: str) -> EndpointRuntime | Response:
+        runtime = endpoints.get(name)
+        if runtime is not None:
+            return runtime
+        available = ", ".join(sorted(endpoints)) or "(none)"
+        return _error_response(
+            404,
+            f"no endpoint {name!r}; have: {available}",
+            err_type="invalid_request_error",
+            code="model_not_found",
+        )
+
+    @router.get("/v1/endpoints/{name}/config", response_model=EndpointConfigResponse)
+    def get_endpoint_config(name: str) -> EndpointConfigResponse | Response:
+        found = _endpoint_or_error(name)
+        if isinstance(found, Response):
+            return found
+        return _config_response(found)
+
+    @router.put("/v1/endpoints/{name}/config", response_model=EndpointConfigResponse)
+    def put_endpoint_config(
+        name: str, update: EndpointConfigUpdate
+    ) -> EndpointConfigResponse | Response:
+        found = _endpoint_or_error(name)
+        if isinstance(found, Response):
+            return found
+        try:
+            found.set_cost_quality(update.cost_quality)
+        except ValueError as exc:
+            # A dial the policy cannot honor: a non-knn kind, or a savings position on a policy
+            # fitted without cost evidence. Both are configuration, not transport, so say which.
+            return _error_response(
+                409, str(exc), err_type="invalid_request_error", code="dial_unavailable"
+            )
+        return _config_response(found)
 
     @router.get("/v1/models")
     def list_models() -> dict[str, object]:

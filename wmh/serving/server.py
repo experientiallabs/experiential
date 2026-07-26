@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -40,6 +40,7 @@ from wmh.serving.chat import (
     create_chat_router,
     install_openai_error_shapes,
 )
+from wmh.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
 from wmh.serving.traces_source import (
     TRACES_FILENAME,
     TracesDownloader,
@@ -184,6 +185,41 @@ def _load_models(
     return models, cards, dirs
 
 
+def _endpoint_runtimes(
+    policies: Mapping[str, RoutingPolicy],
+    model_dirs: Mapping[str, Path],
+    log: RequestLog,
+) -> dict[str, EndpointRuntime]:
+    """Turn policies into served endpoints, each on the dial its `endpoint.toml` asks for.
+
+    The dial file lives beside the model's `policy.json` (see `wmh.serving.endpoint_config`), so
+    only disk-loaded models have one. No file means "serve the policy exactly as fitted": mounting
+    must never silently re-tune an artifact. The path is handed to the runtime as well, so a live
+    `PUT /v1/endpoints/{name}/config` lands back in the same file and survives a restart.
+    """
+    runtimes: dict[str, EndpointRuntime] = {}
+    for name, policy in policies.items():
+        model_dir = model_dirs.get(name)
+        config_path = model_dir / ENDPOINT_CONFIG_FILENAME if model_dir is not None else None
+        settings = EndpointConfig.load(config_path) if config_path is not None else EndpointConfig()
+        try:
+            runtimes[name] = EndpointRuntime(
+                name,
+                policy,
+                log=log,
+                cost_quality=settings.cost_quality,
+                config_path=config_path,
+            )
+        except ValueError as exc:
+            # Fail fast and name the file: a dial the policy cannot honor (a savings position on
+            # a policy fitted without costs) must not degrade silently to the fitted knobs.
+            raise ValueError(
+                f"{config_path} sets cost_quality={settings.cost_quality} for endpoint "
+                f"{name!r}, which its policy cannot serve: {exc}"
+            ) from exc
+    return runtimes
+
+
 def create_app(
     artifact_dirs: Sequence[str] = (ARTIFACT_DIR,),
     names: list[str] | None = None,
@@ -204,7 +240,8 @@ def create_app(
 
     A model whose artifact dir carries a `policy.json` also serves as an OpenAI-compatible
     ENDPOINT: `/v1/chat/completions` (streaming included) routes each call through that policy
-    (`wmh.serving.chat`). `policies` injects them directly for tests.
+    (`wmh.serving.chat`), and an `endpoint.toml` beside it sets that endpoint's cost/quality dial
+    (`wmh.serving.endpoint_config`). `policies` injects them directly for tests.
     """
     app = FastAPI(title="World Model Harness")
     # The website (localhost:3000/6001/...) is a browser client of this API on another port.
@@ -245,12 +282,7 @@ def create_app(
     log_path = Path(artifact_dirs[0]) / "serving" / "requests.jsonl" if artifact_dirs else None
     request_log = RequestLog(log_path)
     app.include_router(
-        create_chat_router(
-            {
-                endpoint_name: EndpointRuntime(endpoint_name, policy, log=request_log)
-                for endpoint_name, policy in endpoint_policies.items()
-            }
-        )
+        create_chat_router(_endpoint_runtimes(endpoint_policies, model_dirs, request_log))
     )
     install_openai_error_shapes(app)
 

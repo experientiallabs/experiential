@@ -11,10 +11,19 @@ from wmh.config.card import CardCorpus, ModelCard, TracesSource
 from wmh.core.types import Action, ActionKind, Observation, Step, Trace
 from wmh.engine.knowledge import KnowledgeBase
 from wmh.engine.world_model import WorldModel
+from wmh.optimize.policy import RoutingPolicy
 from wmh.providers.base import Completion, Message, ProviderConfig, ProviderKind
+from wmh.providers.pool import PoolEntry
 from wmh.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmh.serving.builds import BuildManager
-from wmh.serving.server import _load_card_or_none, create_app, resolve_model_dirs
+from wmh.serving.chat import RequestLog
+from wmh.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmh.serving.server import (
+    _endpoint_runtimes,
+    _load_card_or_none,
+    create_app,
+    resolve_model_dirs,
+)
 
 
 class FakeProvider:
@@ -381,3 +390,65 @@ def test_traces_downloadable_when_card_declares_hub_source() -> None:
 def test_download_traces_400_without_source() -> None:
     resp = _client().post("/world_models/airline/traces/download")
     assert resp.status_code == 400
+
+
+def _knn_policy_dir(tmp_path: Path) -> tuple[Path, RoutingPolicy]:
+    """A model dir holding a knn policy.json plus its bank, the way a fit leaves it."""
+    import numpy as np
+
+    from wmh.optimize.policy import KNN_BANK_FILENAME, POLICY_FILENAME, EmbedderSpec, KnnBank
+
+    model_dir = tmp_path / "models" / "support"
+    model_dir.mkdir(parents=True)
+    tasks = ["SELECT count(*) FROM t", "write a friendly email"] * 6
+    KnnBank(
+        embeddings=np.asarray(HashingEmbedder(dim=32).embed(tasks), dtype=np.float32),
+        rewards=np.asarray([[1.0, 0.0], [0.0, 1.0]] * 6, dtype=np.float32),
+        costs=np.asarray([[0.01, 0.001]] * len(tasks), dtype=np.float32),
+        models=["fable-5", "haiku-4-5"],
+        scenario_ids=[f"s{index}" for index in range(len(tasks))],
+    ).save(model_dir / KNN_BANK_FILENAME)
+    policy = RoutingPolicy(
+        kind="knn",
+        default_model="haiku-4-5",
+        guard_model="haiku-4-5",
+        pool=[
+            PoolEntry(name="fable-5", kind=ProviderKind.ANTHROPIC, model="claude-fable-5"),
+            PoolEntry(name="haiku-4-5", kind=ProviderKind.ANTHROPIC, model="claude-haiku-4-5"),
+        ],
+        embedder=EmbedderSpec(dim=32),
+        rag_num=6,
+        knn_min_pairs=4,
+        cost_scale=0.0055,
+    )
+    policy.save(model_dir / POLICY_FILENAME)
+    return model_dir, RoutingPolicy.load(model_dir / POLICY_FILENAME)
+
+
+def test_endpoint_toml_sets_the_dial_at_mount_time(tmp_path: Path) -> None:
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    EndpointConfig(cost_quality=0.75).save(model_dir / ENDPOINT_CONFIG_FILENAME)
+    runtimes = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    assert runtimes["support"].cost_quality == 0.75
+    assert runtimes["support"].policy.pick_lam == pytest.approx(0.02)
+    # And the live PUT path writes back to that same file.
+    runtimes["support"].set_cost_quality(0.0)
+    assert EndpointConfig.load(model_dir / ENDPOINT_CONFIG_FILENAME).cost_quality == 0.0
+
+
+def test_no_endpoint_toml_serves_the_policy_exactly_as_fitted(tmp_path: Path) -> None:
+    # Mounting must never re-tune an artifact: an operator who fitted deliberate knobs and never
+    # asked for a dial keeps them.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    runtimes = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    assert runtimes["support"].cost_quality is None
+    assert runtimes["support"].policy.pick_lam == 0.0
+    assert runtimes["support"].policy.floor_sim is None
+
+
+def test_an_unservable_dial_setting_fails_the_mount_by_name(tmp_path: Path) -> None:
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    EndpointConfig(cost_quality=0.9).save(model_dir / ENDPOINT_CONFIG_FILENAME)
+    priceless = policy.model_copy(update={"cost_scale": 0.0})
+    with pytest.raises(ValueError, match=ENDPOINT_CONFIG_FILENAME):
+        _endpoint_runtimes({"support": priceless}, {"support": model_dir}, RequestLog(None))

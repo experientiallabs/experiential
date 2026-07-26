@@ -30,7 +30,13 @@ from wmh.providers.base import (
 )
 from wmh.providers.pool import PoolEntry
 from wmh.retrieval.embedders import HashingEmbedder
-from wmh.serving.chat import EndpointRuntime, RequestLog, create_chat_router
+from wmh.serving.chat import (
+    EndpointRuntime,
+    RequestLog,
+    create_chat_router,
+    install_openai_error_shapes,
+)
+from wmh.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -418,6 +424,8 @@ def _knn_policy(tmp_path: Path) -> RoutingPolicy:
         embedder=EmbedderSpec(dim=64),
         rag_num=6,
         knn_min_pairs=4,
+        # What the fitter persists for this bank: the mean of the per-model mean cell costs.
+        cost_scale=0.0055,
     ).save(tmp_path / POLICY_FILENAME)
     return RoutingPolicy.load(tmp_path / POLICY_FILENAME)
 
@@ -498,3 +506,161 @@ def test_static_policy_never_builds_its_embedder(
         json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 200
+
+
+# --- the cost/quality dial: GET/PUT /v1/endpoints/{name}/config -----------------------------
+
+
+def _dial_client(
+    tmp_path: Path, policy: RoutingPolicy, *, config_path: Path | None = None
+) -> tuple[TestClient, EndpointRuntime]:
+    """A client with OpenAI error shapes installed, so 400s look like the real server's."""
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        config_path=config_path,
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    install_openai_error_shapes(app)
+    return TestClient(app), runtime
+
+
+def test_config_reports_an_as_fitted_endpoint_with_the_measured_anchors(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.get("/v1/endpoints/tau-bench/config").json()
+    assert body["endpoint"] == "tau-bench"
+    assert body["dialable"] is True
+    # Nobody has set the dial, and mounting did not set one for them.
+    assert body["cost_quality"] is None
+    assert body["named_point"] == "as-fitted"
+    # The anchors are what a slider labels itself with: measured quality and cost per position.
+    assert [anchor["cost_quality"] for anchor in body["anchors"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
+    balanced = next(a for a in body["anchors"] if a["cost_quality"] == 0.25)
+    assert balanced["named_point"] == "balanced"
+    assert balanced["quality_delta_points"] == 0.99
+    assert balanced["cost_delta_percent"] == -24.7
+    assert balanced["knobs"] == {
+        "knn_z": 0.5,
+        "floor_q": 0.05,
+        "pick_lam": 0.0,
+        "guard_mode": "symmetric",
+    }
+
+
+def test_put_moves_the_dial_on_the_live_endpoint(tmp_path: Path) -> None:
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    put = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.0})
+    assert put.status_code == 200
+    body = put.json()
+    assert body["cost_quality"] == 1.0
+    assert body["named_point"] == "savings-max"
+    assert body["knobs"] == {
+        "knn_z": 0.5,
+        "floor_q": 0.05,
+        "pick_lam": 0.03,
+        "guard_mode": "asymmetric",
+    }
+    # The runtime is serving the new policy, not just reporting it.
+    assert runtime.policy.pick_lam == 0.03
+    assert runtime.policy.guard_mode == "asymmetric"
+    assert client.get("/v1/endpoints/tau-bench/config").json() == body
+    # And the routed request says the knob was in play.
+    routed = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+        },
+    )
+    assert routed.status_code == 200
+    rows = [json.loads(line) for line in (tmp_path / "requests.jsonl").read_text().splitlines()]
+    assert "cost knob lam=0.03" in rows[-1]["routing_reason"]
+
+
+def test_put_persists_the_dial_next_to_the_policy(tmp_path: Path) -> None:
+    config_path = tmp_path / ENDPOINT_CONFIG_FILENAME
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path), config_path=config_path)
+    client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.6})
+    # A restart has to come back on the same dial, so the file is the record.
+    assert EndpointConfig.load(config_path).cost_quality == 0.6
+    restarted = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        cost_quality=EndpointConfig.load(config_path).cost_quality,
+    )
+    assert restarted.cost_quality == 0.6
+    assert restarted.policy.guard_mode == "asymmetric"
+
+
+def test_mounting_a_dial_setting_applies_it_before_the_first_request(tmp_path: Path) -> None:
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        cost_quality=0.75,
+    )
+    assert runtime.cost_quality == 0.75
+    assert runtime.policy.pick_lam == pytest.approx(0.02)
+
+
+def test_put_rejects_a_dial_outside_the_range(tmp_path: Path) -> None:
+    client, runtime = _dial_client(tmp_path, _knn_policy(tmp_path))
+    response = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.5})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert "cost_quality" in response.json()["error"]["message"]
+    assert runtime.cost_quality is None  # a rejected change changes nothing
+
+
+def test_config_on_a_policy_kind_without_a_dial(tmp_path: Path) -> None:
+    static = RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool())
+    client, _ = _dial_client(tmp_path, static)
+    body = client.get("/v1/endpoints/tau-bench/config").json()
+    assert body["dialable"] is False
+    assert body["cost_quality"] is None and body["knobs"] is None
+    conflict = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.5})
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "dial_unavailable"
+    assert "kind='static'" in conflict.json()["error"]["message"]
+
+
+def test_put_409s_when_the_policy_carries_no_cost_evidence(tmp_path: Path) -> None:
+    # The coverage leg needs no prices; the price leg cannot be honored without them, and
+    # saying so beats serving a dial position that silently does nothing.
+    priceless = _knn_policy(tmp_path).model_copy(update={"cost_scale": 0.0})
+    client, _ = _dial_client(tmp_path, priceless)
+    assert (
+        client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.2}).status_code == 200
+    )
+    conflict = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.8})
+    assert conflict.status_code == 409
+    assert "cost_scale" in conflict.json()["error"]["message"]
+
+
+def test_config_404s_for_an_unknown_endpoint(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    missing = client.get("/v1/endpoints/nope/config")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "model_not_found"
+    assert "tau-bench" in missing.json()["error"]["message"]
+    assert client.put("/v1/endpoints/nope/config", json={"cost_quality": 0.5}).status_code == 404
+
+
+def test_the_openai_surface_is_untouched_by_the_dial_routes(tmp_path: Path) -> None:
+    # The customer-facing contract must not grow: /v1/models still lists endpoints only, and a
+    # chat completion still names the endpoint.
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 0.9})
+    assert [m["id"] for m in client.get("/v1/models").json()["data"]] == ["tau-bench"]
+    completion = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert completion.status_code == 200
+    assert completion.json()["model"] == "tau-bench"
+    assert "cost_quality" not in completion.text
