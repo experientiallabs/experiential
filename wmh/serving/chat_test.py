@@ -806,7 +806,7 @@ def test_moving_the_dial_refreshes_the_quality_expectation(tmp_path: Path) -> No
     _served_request(client, "draft a thank-you")
     client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.0})
     body = client.get("/v1/endpoints/tau-bench/savings").json()
-    assert body["expected_quality_delta_pt"] == -0.54  # the savings-max anchor, not a stale 0.0
+    assert body["expected_quality_delta_pt"] == -0.54  # the Max savings anchor, not a stale 0.0
 
 
 def test_savings_are_recomputed_when_the_log_grows_not_on_a_timer(tmp_path: Path) -> None:
