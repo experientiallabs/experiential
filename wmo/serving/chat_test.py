@@ -12,7 +12,17 @@ import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from llm_waterfall.types import (
+    ChatChoice,
+    ChatFunctionCall,
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ChatToolCall,
+    ChatUsage,
+)
 
+from wmo.core.types import JsonObject
 from wmo.optimize.policy import (
     KNN_BANK_FILENAME,
     POLICY_FILENAME,
@@ -31,6 +41,7 @@ from wmo.providers.base import (
 )
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval.embedders import HashingEmbedder
+from wmo.serving.chat import ChatMessage as EndpointMessage
 from wmo.serving.chat import (
     EndpointRuntime,
     RequestLog,
@@ -934,3 +945,1082 @@ def test_the_seven_day_savings_window_is_never_served_from_cache(tmp_path: Path)
         assert reads["n"] == 3  # all_time cached after the first
     finally:
         RequestLog.replay = original
+
+
+# --- tool calling: tools/tool_choice in, tool_calls out, tool results replayed ----------------
+
+
+_TOOL_ARGUMENTS = '{"table": "superheroes", "limit": 10}'
+
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "read rows from a table",
+            "parameters": {
+                "type": "object",
+                "properties": {"table": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["table"],
+            },
+        },
+    }
+]
+
+
+class _ToolProvider(_EchoProvider):
+    """Fake structured provider: calls `lookup` once, then answers from the tool result.
+
+    Every request it receives lands in `seen`, so a test can assert what actually reached the
+    provider: the tool path exists precisely so nothing is flattened away on the way there.
+    """
+
+    def __init__(
+        self,
+        entry: PoolEntry,
+        seen: list[ChatRequest],
+        *,
+        finish_reason: str | None = "tool_calls",
+        n_tool_calls: int = 1,
+    ) -> None:
+        super().__init__(entry)
+        self._seen = seen
+        self._finish_reason = finish_reason
+        self._n_tool_calls = n_tool_calls
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        self._seen.append(request)
+        results = [m for m in request.messages if m.role == "tool"]
+        if results:
+            answer = f"{self.name} read {results[-1].content}"
+            return ChatResponse(
+                choices=[
+                    ChatChoice(
+                        message=ChatMessage(role="assistant", content=answer),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=ChatUsage(prompt_tokens=13, completion_tokens=9),
+            )
+        return ChatResponse(
+            choices=[
+                ChatChoice(
+                    message=ChatMessage(
+                        role="assistant",
+                        content=None,  # the shape a tool-only turn really has on the wire
+                        tool_calls=[
+                            ChatToolCall(
+                                id=f"call_{index}",
+                                function=ChatFunctionCall(name="lookup", arguments=_TOOL_ARGUMENTS),
+                            )
+                            for index in range(1, self._n_tool_calls + 1)
+                        ],
+                    ),
+                    finish_reason=self._finish_reason,
+                )
+            ],
+            usage=ChatUsage.model_validate(
+                {
+                    "prompt_tokens": 11,
+                    "completion_tokens": 7,
+                    "prompt_tokens_details": {"cached_tokens": 4},
+                }
+            ),
+        )
+
+
+def _tool_client(
+    tmp_path: Path,
+    policy: RoutingPolicy | None = None,
+    *,
+    finish_reason: str | None = "tool_calls",
+    n_tool_calls: int = 1,
+) -> tuple[TestClient, Path, list[ChatRequest]]:
+    """A client whose pool models all speak the structured tool-calling contract."""
+    seen: list[ChatRequest] = []
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=policy or RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _ToolProvider(
+            entry, seen, finish_reason=finish_reason, n_tool_calls=n_tool_calls
+        ),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    install_openai_error_shapes(app)
+    return TestClient(app), log_path, seen
+
+
+def _rows(log_path: Path) -> list[JsonObject]:
+    """The request log's rows as raw JSON, so a test reads the on-disk field names verbatim."""
+    return [json.loads(line) for line in log_path.read_text().splitlines()]
+
+
+def _error_message(row: JsonObject) -> str:
+    """One row's `error_message`, narrowed: an error row always carries one, as a string."""
+    message = row["error_message"]
+    assert isinstance(message, str)
+    return message
+
+
+def test_a_tools_request_is_served_not_rejected(tmp_path: Path) -> None:
+    # The whole point: a tool-calling agent could not use this endpoint at all before.
+    client, log_path, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "how many superheroes are there?"}],
+            "tools": _TOOLS,
+            "tool_choice": "auto",
+        },
+    )
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert message["content"] is None  # tool-only turn: null, not an empty string
+    assert message["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+        }
+    ]
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+    assert response.json()["model"] == "tau-bench"  # still the endpoint, never the routed model
+    # The tools reached the provider as tools, and tool_choice rode along with them.
+    assert seen[0].tools is not None
+    assert [tool.function.name for tool in seen[0].tools] == ["lookup"]
+    assert seen[0].tool_choice == "auto"
+    assert seen[0].max_completion_tokens == 8192
+    # One row per request, with the provider's real usage including its cached-prompt split.
+    rows = _rows(log_path)
+    assert len(rows) == 1
+    assert (rows[0]["input_tokens"], rows[0]["output_tokens"]) == (11, 7)
+    assert rows[0]["cached_tokens"] == 4
+    assert rows[0]["status"] == "ok"
+
+
+def test_a_tool_result_message_reaches_the_provider(tmp_path: Path) -> None:
+    client, log_path, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "how many superheroes are there?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "42 rows"},
+            ],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "haiku-4-5 read 42 rows"
+    assert response.json()["choices"][0]["finish_reason"] == "stop"
+    # What the provider saw: the tool result kept its role and its tool_call_id, the assistant
+    # turn kept its call, and the system turn stayed inline and in order.
+    sent = seen[0].messages
+    assert [m.role for m in sent] == ["system", "user", "assistant", "tool"]
+    assert sent[2].content is None  # an empty content string is not sent in its place
+    assert sent[2].tool_calls is not None
+    assert sent[2].tool_calls[0].id == "call_1"
+    assert (sent[3].tool_call_id, sent[3].content) == ("call_1", "42 rows")
+    assert len(_rows(log_path)) == 1
+
+
+def test_streaming_a_tool_call_emits_reassemblable_deltas(tmp_path: Path) -> None:
+    client, log_path, _ = _tool_client(tmp_path)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "messages": [{"role": "user", "content": "how many superheroes are there?"}],
+            "tools": _TOOLS,
+        },
+    ) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        payloads = [
+            line.removeprefix("data: ") for line in response.iter_lines() if line.startswith("data")
+        ]
+    assert payloads[-1] == "[DONE]"
+    chunks = [json.loads(payload) for payload in payloads[:-1]]
+    assert all(chunk["object"] == "chat.completion.chunk" for chunk in chunks)
+    # Reassemble exactly as an OpenAI client does: concatenate function.arguments per index.
+    arguments: dict[int, str] = {}
+    names: dict[int, str] = {}
+    ids: dict[int, str] = {}
+    for chunk in chunks:
+        for choice in chunk["choices"]:
+            for call in choice["delta"].get("tool_calls") or []:
+                index = call["index"]
+                ids.setdefault(index, call["id"])
+                names.setdefault(index, call["function"]["name"])
+                arguments[index] = arguments.get(index, "") + call["function"]["arguments"]
+    assert ids == {0: "call_1"} and names == {0: "lookup"}
+    assert json.loads(arguments[0]) == {"table": "superheroes", "limit": 10}
+    assert chunks[-2]["choices"][0]["finish_reason"] == "tool_calls"
+    assert chunks[-1]["choices"] == [] and chunks[-1]["usage"]["total_tokens"] == 18
+    rows = _rows(log_path)
+    assert len(rows) == 1
+    assert rows[0]["ttfb_ms"] is not None  # a re-emitted stream still reports when it could start
+    assert rows[0]["output_tokens"] == 7
+
+
+def test_affinity_survives_a_tool_round_trip(tmp_path: Path) -> None:
+    # remember() has to store the assistant turn's tool_calls, not just its (empty) text, or the
+    # next request's prefix fingerprints to a transcript that was never sent and the conversation
+    # re-routes at exactly the point its prompt cache is warmest.
+    client, log_path, _ = _tool_client(tmp_path, policy=_cluster_policy())
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert first.headers["x-wmo-routed-model"] == "fable-5"
+    call = first.json()["choices"][0]["message"]["tool_calls"][0]
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "SELECT count(*) FROM superheroes"},
+                {"role": "assistant", "content": None, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": call["id"], "content": "42 rows"},
+            ],
+            "tools": _TOOLS,
+        },
+    )
+    assert second.headers["x-wmo-routed-model"] == "fable-5"
+    rows = _rows(log_path)
+    assert [row["routing_reason"] for row in rows] == [
+        "rank router: nearest cluster 0 (sql)",
+        "sticky: conversation affinity",
+    ]
+
+
+def test_routing_reads_the_user_turn_not_the_tool_result(tmp_path: Path) -> None:
+    # A tool result is machine output the model asked for, not the customer's request: routing on
+    # it would send one conversation to a different model on every turn. This transcript's user
+    # turn is SQL (fable-5's cluster) while its tool result is prose (haiku-4-5's), and the
+    # prefix was never remembered here, so only _routable_text decides.
+    client, log_path, _ = _tool_client(tmp_path, policy=_cluster_policy())
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "SELECT count(*) FROM superheroes"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "write a friendly email about it",
+                },
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["x-wmo-routed-model"] == "fable-5"
+    assert _rows(log_path)[0]["cluster_label"] == "sql"  # not a sticky decision: a fresh one
+
+
+def test_tools_on_a_pool_model_without_a_structured_backend(tmp_path: Path) -> None:
+    # _EchoProvider has complete/stream but no complete_chat, like the direct anthropic backend.
+    client, log_path = _client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.status_code == 501
+    error = response.json()["error"]
+    assert error["code"] == "tool_calling_unsupported"
+    assert "haiku-4-5" in error["message"]  # names the pool entry an operator has to change
+    assert "anthropic" in error["message"]
+    rows = _rows(log_path)
+    assert len(rows) == 1  # a capability gap is still one metered request
+    assert rows[0]["status"] == "error"
+    assert rows[0]["model"] == "haiku-4-5"
+    assert "cannot serve tool calls" in _error_message(rows[0])
+
+
+def test_a_tool_transcript_without_tools_still_takes_the_structured_path(tmp_path: Path) -> None:
+    # Some agents stop re-sending `tools` once the loop is under way; the transcript alone must
+    # be enough, because the text path cannot represent a tool result at all.
+    client, _, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "how many superheroes are there?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "42 rows"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert seen[0].tools is None
+    assert [m.role for m in seen[0].messages] == ["user", "assistant", "tool"]
+
+
+def test_finish_reason_length_outranks_tool_calls(tmp_path: Path) -> None:
+    # Arguments truncated at the output cap are invalid JSON; a client that reads "tool_calls"
+    # would parse them as complete, so the truncation signal wins.
+    client, _, _ = _tool_client(tmp_path, finish_reason="length")
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+    assert response.json()["choices"][0]["message"]["tool_calls"]  # still reported
+
+
+def test_finish_reason_is_derived_when_the_provider_omits_it(tmp_path: Path) -> None:
+    client, _, _ = _tool_client(tmp_path, finish_reason=None)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.json()["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_a_provider_returning_no_choices_is_a_502_with_a_log_row(tmp_path: Path) -> None:
+    class _EmptyProvider(_ToolProvider):
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return ChatResponse(choices=[])
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _EmptyProvider(entry, []),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_error"
+    rows = _rows(log_path)
+    assert len(rows) == 1
+    assert "no choices" in _error_message(rows[0])
+
+
+def test_a_tool_message_without_a_tool_call_id_is_a_400(tmp_path: Path) -> None:
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "tool", "content": "42 rows"},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    message = response.json()["error"]["message"]
+    assert "tool_call_id" in message and "messages.1" in message
+
+
+def test_a_tool_result_sent_as_an_assistant_turn_is_a_400(tmp_path: Path) -> None:
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_call_id": "call_1", "content": "42 rows"},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "role='tool'" in response.json()["error"]["message"]
+
+
+def test_tool_results_alone_are_not_a_conversation(tmp_path: Path) -> None:
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "tool", "tool_call_id": "call_1", "content": "42 rows"}],
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_messages"
+
+
+def test_the_remaining_unsupported_parameters_are_still_rejected(tmp_path: Path) -> None:
+    client, _, _ = _tool_client(tmp_path)
+    for payload, expected in (
+        ({"n": 2}, "n != 1"),
+        ({"logprobs": True}, "logprobs"),
+        ({"response_format": {"type": "json_object"}}, "response_format"),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": [{"role": "user", "content": "hi"}],
+                **payload,
+            },
+        )
+        assert response.status_code == 400, payload
+        assert response.json()["error"]["code"] == "unsupported_parameter"
+        assert expected in response.json()["error"]["message"]
+
+
+def test_fingerprints_separate_tool_branches(tmp_path: Path) -> None:
+    # Affinity is keyed on the transcript, so two different calls out of the same prefix (or two
+    # results for different calls) must not share a key: they are different conversations.
+    from wmo.serving.chat import _fingerprint
+
+    def call(name: str) -> ChatToolCall:
+        return ChatToolCall(id=f"call_{name}", function=ChatFunctionCall(name=name, arguments="{}"))
+
+    prefix = [EndpointMessage(role="user", content="hi")]
+    lookup = [*prefix, EndpointMessage(role="assistant", tool_calls=[call("lookup")])]
+    write = [*prefix, EndpointMessage(role="assistant", tool_calls=[call("write")])]
+    assert _fingerprint(lookup) != _fingerprint(write)
+    assert _fingerprint(lookup) == _fingerprint(
+        [*prefix, EndpointMessage(role="assistant", tool_calls=[call("lookup")])]
+    )
+    # Same result text, different call answered: still different conversations.
+    first = [*lookup, EndpointMessage(role="tool", tool_call_id="call_lookup", content="42")]
+    second = [*lookup, EndpointMessage(role="tool", tool_call_id="call_other", content="42")]
+    assert _fingerprint(first) != _fingerprint(second)
+    # And a text-only transcript keeps hashing to one stable key.
+    text = [*prefix, EndpointMessage(role="assistant", content="hello")]
+    assert _fingerprint(text) == _fingerprint(
+        [*prefix, EndpointMessage(role="assistant", content="hello")]
+    )
+
+
+def test_an_empty_tool_list_is_served_as_plain_chat(tmp_path: Path) -> None:
+    # A client whose tool registry is empty sends `tools: []`. That advertises nothing, so it must
+    # not demand a tool-calling backend (this pool model has none) nor reach one as an empty array.
+    client, log_path = _client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "served by haiku-4-5"
+    assert _rows(log_path)[0]["status"] == "ok"
+
+
+def test_tool_choice_without_tools_is_a_400(tmp_path: Path) -> None:
+    client, _, _ = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": "required",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_tool_choice"
+    assert "declare the tool definitions" in response.json()["error"]["message"]
+
+
+def test_a_tool_call_streams_from_a_provider_with_no_streaming_backend(tmp_path: Path) -> None:
+    # The re-emitted stream needs no native streaming surface at all (the module docstring's
+    # tradeoff), so a structured-only provider can serve a streamed tool call; a streamed request
+    # with no tools on that same provider still gets the honest 501.
+    class _NoStreamProvider(_ToolProvider):
+        stream = None  # type: ignore[assignment]  # not a StreamingProvider at all
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _NoStreamProvider(entry, []),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    client = TestClient(app)
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    ) as response:
+        assert response.status_code == 200
+        chunks = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.iter_lines()
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+    assert chunks[1]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "lookup"
+    plain = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert plain.status_code == 501
+    assert plain.json()["error"]["code"] == "streaming_unsupported"
+
+
+def test_content_is_still_required_except_on_a_tool_call_turn(tmp_path: Path) -> None:
+    # Only the assistant turn whose whole output is tool_calls may omit content; a user turn that
+    # forgot it is the client bug the old required field caught, and must keep 400ing.
+    client, _, _ = _tool_client(tmp_path)
+    missing = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user"}]},
+    )
+    assert missing.status_code == 400
+    assert "needs `content`" in missing.json()["error"]["message"]
+    allowed = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "how many superheroes are there?"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "42 rows"},
+            ],
+        },
+    )
+    assert allowed.status_code == 200
+
+
+def test_parallel_tool_calls_reaches_the_provider(tmp_path: Path) -> None:
+    # An agent whose executor answers one call per turn sends parallel_tool_calls=false. The
+    # endpoint used to declare no such field, so pydantic dropped it and the client got a
+    # multi-call turn back: a parameter the stack already carries, lost at the endpoint.
+    client, _, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "how many superheroes are there?"}],
+            "tools": _TOOLS,
+            "parallel_tool_calls": False,
+        },
+    )
+    assert response.status_code == 200
+    # On the wire, not just on the model: provider_payload is what a backend actually receives.
+    assert (seen[0].model_extra or {}).get("parallel_tool_calls") is False
+    assert seen[0].provider_payload("claude-haiku-4-5")["parallel_tool_calls"] is False
+
+
+def test_parallel_tool_calls_is_only_sent_when_the_client_sent_it(tmp_path: Path) -> None:
+    # A backend that rejects the field must never see it unasked, so an absent one stays absent.
+    client, _, seen = _tool_client(tmp_path)
+    client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert seen[0].model_extra == {}
+    assert "parallel_tool_calls" not in seen[0].provider_payload("claude-haiku-4-5")
+
+
+def test_an_upstream_tool_calls_reason_with_no_calls_reports_stop(tmp_path: Path) -> None:
+    # A self-hosted backend whose tool parser failed to extract the call reports finish_reason
+    # tool_calls on a plain text turn. Passing that through emits a response no typed client can
+    # handle: the agent loop idiom iterates message.tool_calls, which is null here.
+    class _UnparsedProvider(_ToolProvider):
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return ChatResponse(
+                choices=[
+                    ChatChoice(
+                        message=ChatMessage(role="assistant", content="I will call a tool"),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=ChatUsage(prompt_tokens=11, completion_tokens=7),
+            )
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _UnparsedProvider(entry, []),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    choice = response.json()["choices"][0]
+    assert choice["finish_reason"] == "stop"  # never a reason the message cannot back up
+    assert "tool_calls" not in choice["message"]
+
+
+def test_affinity_survives_a_parallel_tool_round_trip(tmp_path: Path) -> None:
+    # Parallel calls are OpenAI's default, and answering N of them appends N+1 messages (the
+    # assistant turn plus one result each). A lookup that strips a fixed one message matches only
+    # the single-call case, so a two-call turn re-routed mid-loop: the prompt cache is forfeited
+    # exactly when the transcript is longest, and the new model is handed tool_call ids the old
+    # one produced.
+    client, log_path, _ = _tool_client(tmp_path, policy=_cluster_policy(), n_tool_calls=2)
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+            "tools": _TOOLS,
+        },
+    )
+    calls = first.json()["choices"][0]["message"]["tool_calls"]
+    assert [call["id"] for call in calls] == ["call_1", "call_2"]
+    assert first.headers["x-wmo-routed-model"] == "fable-5"
+    messages: list[JsonObject] = [
+        {"role": "user", "content": "SELECT count(*) FROM superheroes"},
+        {"role": "assistant", "content": None, "tool_calls": calls},
+    ]
+    messages += [
+        {"role": "tool", "tool_call_id": call["id"], "content": "42 rows"} for call in calls
+    ]
+    second = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": messages, "tools": _TOOLS},
+    )
+    assert second.headers["x-wmo-routed-model"] == "fable-5"
+    assert [row["routing_reason"] for row in _rows(log_path)] == [
+        "rank router: nearest cluster 0 (sql)",
+        "sticky: conversation affinity",
+    ]
+
+
+def test_affinity_survives_a_parallel_round_trip_that_would_re_route(tmp_path: Path) -> None:
+    # The sharp version: here the routable user turn is PROSE, so a missed incumbent does not
+    # merely re-decide, it hands haiku-4-5 an assistant turn whose tool_call ids fable-5 made.
+    client, log_path, _ = _tool_client(tmp_path, policy=_cluster_policy(), n_tool_calls=2)
+    sql = {"role": "user", "content": "SELECT count(*) FROM superheroes"}
+    first = client.post("/v1/chat/completions", json={"model": "tau-bench", "messages": [sql]})
+    assert first.headers["x-wmo-routed-model"] == "fable-5"
+    turn_two: list[JsonObject] = [
+        sql,
+        {"role": "assistant", "content": first.json()["choices"][0]["message"]["content"]},
+        {"role": "user", "content": "write a friendly email about it"},
+    ]
+    second = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": turn_two, "tools": _TOOLS},
+    )
+    assert second.headers["x-wmo-routed-model"] == "fable-5"  # affinity, not the prose cluster
+    calls = second.json()["choices"][0]["message"]["tool_calls"]
+    turn_three: list[JsonObject] = [
+        *turn_two,
+        {"role": "assistant", "content": None, "tool_calls": calls},
+    ]
+    turn_three += [
+        {"role": "tool", "tool_call_id": call["id"], "content": "42 rows"} for call in calls
+    ]
+    third = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": turn_three, "tools": _TOOLS},
+    )
+    assert third.headers["x-wmo-routed-model"] == "fable-5"
+    assert [row["routing_reason"] for row in _rows(log_path)][1:] == [
+        "sticky: conversation affinity",
+        "sticky: conversation affinity",
+    ]
+
+
+def test_an_unusable_structured_response_still_meters_what_it_billed(tmp_path: Path) -> None:
+    # Zero choices is the normal shape of an upstream content filter, and a filtered response
+    # still bills the prompt it read. Recording TokenUsage() on that row reported real spend as
+    # free, the same silent usage loss the abandoned-stream path exists to prevent.
+    class _FilteredProvider(_ToolProvider):
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return ChatResponse(choices=[], usage=ChatUsage(prompt_tokens=900, completion_tokens=0))
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _FilteredProvider(entry, []),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.status_code == 502
+    row = _rows(log_path)[0]
+    assert row["status"] == "error"
+    assert (row["input_tokens"], row["output_tokens"]) == (900, 0)
+    assert row["cost_usd"] == pytest.approx(900 * 1.0 / 1_000_000)
+
+
+def test_a_failure_before_the_call_still_meters_zero(tmp_path: Path) -> None:
+    # The other half of the split: nothing reached the provider, so there is nothing to bill.
+    class _RefusingProvider(_ToolProvider):
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            raise RuntimeError("connection reset")
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _RefusingProvider(entry, []),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.status_code == 502
+    row = _rows(log_path)[0]
+    assert (row["input_tokens"], row["output_tokens"], row["cost_usd"]) == (0, 0, 0.0)
+    assert "connection reset" in _error_message(row)
+
+
+def test_an_empty_tool_calls_list_does_not_excuse_missing_content(tmp_path: Path) -> None:
+    # `tool_calls: []` advertises no call, so the turn has neither text nor calls. Accepting it
+    # sent an empty assistant turn down the text path, and most backends reject one: a client bug
+    # would arrive as a 502 naming the pool model instead of a 400 naming the message.
+    client, _, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": []},
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "needs `content`" in response.json()["error"]["message"]
+    assert seen == []
+
+
+def test_an_explicit_null_content_is_rejected_like_an_omitted_one(tmp_path: Path) -> None:
+    # `content: null` is what an SDK puts on the wire for an unset value, so it has to answer the
+    # same way as an omitted key; normalizing null to "" first made it a silent empty billed turn.
+    client, log_path, _ = _tool_client(tmp_path)
+    for role in ("user", "system", "assistant"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": [{"role": "user", "content": "hi"}, {"role": role, "content": None}],
+            },
+        )
+        assert response.status_code == 400, role
+        assert "needs `content`" in response.json()["error"]["message"]
+    assert not log_path.exists()  # nothing was billed
+    # The one turn that legitimately has none still gets through with content null.
+    allowed = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "how many superheroes are there?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "42 rows"},
+            ],
+        },
+    )
+    assert allowed.status_code == 200
+
+
+def test_a_provider_reply_with_neither_text_nor_calls_is_not_a_502(tmp_path: Path) -> None:
+    # The mandatory-content rule catches a CLIENT sending an empty turn. An upstream reply with
+    # no text is still renderable (it goes back out as content null), so refusing it here would
+    # invent a 502 for a response the client can read.
+    class _SilentProvider(_ToolProvider):
+        def complete_chat(self, request: ChatRequest) -> ChatResponse:
+            return ChatResponse(
+                choices=[
+                    ChatChoice(
+                        message=ChatMessage(role="assistant", content=None), finish_reason="stop"
+                    )
+                ],
+                usage=ChatUsage(prompt_tokens=11, completion_tokens=0),
+            )
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=RoutingPolicy(kind="static", default_model="haiku-4-5", pool=_pool()),
+        provider_factory=lambda entry: _SilentProvider(entry, []),
+        log=RequestLog(log_path),
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": _TOOLS,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] is None
+    assert _rows(log_path)[0]["status"] == "ok"
+
+
+def test_an_empty_tool_list_with_a_satisfiable_tool_choice_is_plain_chat(tmp_path: Path) -> None:
+    # `tools: []` is normalized away FOR the client whose registry is empty, and that client
+    # often sets tool_choice from config anyway. "auto" and "none" are both satisfied by not
+    # calling a tool, so refusing them defeated the normalization; "none" literally means "do not
+    # call tools", so refusing it for having none is backwards.
+    client, log_path = _client(tmp_path)
+    for tool_choice in ("auto", "none"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert response.status_code == 200, tool_choice
+        assert response.json()["choices"][0]["message"]["content"] == "served by haiku-4-5"
+    assert [row["status"] for row in _rows(log_path)] == ["ok", "ok"]
+
+
+def test_a_tool_choice_that_demands_a_call_without_tools_is_still_a_400(tmp_path: Path) -> None:
+    # The half that cannot be honored: a client that MUST get a call back would otherwise read a
+    # prose answer as the model's own choice.
+    client, _, _ = _tool_client(tmp_path)
+    for tool_choice in (
+        "required",
+        {"type": "function", "function": {"name": "lookup"}},
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert response.status_code == 400, tool_choice
+        assert response.json()["error"]["code"] == "invalid_tool_choice"
+
+
+# The transcript a mid-loop agent replays: the assistant turn it got back plus the result of the
+# one call on it. It is what makes `needs_tool_calling()` true with no `tools` array in sight.
+_REPLAYED_TOOL_TRANSCRIPT: list[JsonObject] = [
+    {"role": "user", "content": "how many superheroes are there?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": _TOOL_ARGUMENTS},
+            }
+        ],
+    },
+    {"role": "tool", "tool_call_id": "call_1", "content": "42 rows"},
+]
+
+
+def test_a_replayed_tool_transcript_does_not_bypass_tool_choice_validation(tmp_path: Path) -> None:
+    # The turn that used to slip through: an agent that stops re-sending `tools` once the loop is
+    # under way but keeps a demanding tool_choice from its config. The transcript makes this a
+    # tool-calling request, yet there is still nothing for the choice to select, so forwarding it
+    # would reach the provider as `tool_choice` with `tools: null`: an OpenAI-compatible backend
+    # rejects that pair (a 502 here, blaming the model) and Bedrock drops the required choice and
+    # answers in prose to a client that cannot use one.
+    client, log_path, seen = _tool_client(tmp_path)
+    for tool_choice in (
+        "required",
+        {"type": "function", "function": {"name": "lookup"}},
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": _REPLAYED_TOOL_TRANSCRIPT,
+                "tool_choice": tool_choice,
+            },
+        )
+        assert response.status_code == 400, tool_choice
+        assert response.json()["error"]["code"] == "invalid_tool_choice"
+        assert "declare the tool definitions" in response.json()["error"]["message"]
+    assert seen == []  # refused before the upstream call, so nothing was billed for it
+    assert not log_path.exists()
+
+
+def test_a_replayed_transcript_that_re_sends_tools_serves_a_demanding_choice(
+    tmp_path: Path,
+) -> None:
+    # The same mid-loop turn done right: `tools` re-sent, so "required" IS satisfiable and must
+    # keep being served, with the choice riding through beside the tools it selects from.
+    client, log_path, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": _REPLAYED_TOOL_TRANSCRIPT,
+            "tools": _TOOLS,
+            "tool_choice": "required",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "haiku-4-5 read 42 rows"
+    assert seen[0].tool_choice == "required"
+    assert seen[0].tools is not None
+    assert [tool.function.name for tool in seen[0].tools] == ["lookup"]
+    assert _rows(log_path)[0]["status"] == "ok"
+
+
+def test_a_named_tool_choice_must_name_a_declared_tool(tmp_path: Path) -> None:
+    # No provider can call a function it was never given, so naming one that is absent from `tools`
+    # is the same unhonorable request as naming one with no tools at all, one 400 earlier.
+    client, log_path, seen = _tool_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "drop the superheroes table"}],
+            "tools": _TOOLS,
+            "tool_choice": {"type": "function", "function": {"name": "delete_rows"}},
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_tool_choice"
+    message = response.json()["error"]["message"]
+    assert "'delete_rows'" in message  # what went wrong
+    assert "lookup" in message  # and what could be named instead
+    assert seen == []
+    assert not log_path.exists()
+
+
+def test_a_non_demanding_tool_choice_is_not_forwarded_without_tools(tmp_path: Path) -> None:
+    # "auto" and "none" are satisfied by not calling a tool, so a replayed transcript carrying one
+    # must keep serving. It still must not reach the provider as `tool_choice` with `tools: null`,
+    # the same malformed pair a demanding choice is refused for, so the choice is dropped instead:
+    # with no tools advertised there is no call for it to permit or forbid.
+    client, log_path, seen = _tool_client(tmp_path)
+    for tool_choice in ("auto", "none"):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": _REPLAYED_TOOL_TRANSCRIPT,
+                "tool_choice": tool_choice,
+            },
+        )
+        assert response.status_code == 200, tool_choice
+        assert response.json()["choices"][0]["message"]["content"] == "haiku-4-5 read 42 rows"
+    assert [request.tool_choice for request in seen] == [None, None]
+    assert [request.tools for request in seen] == [None, None]
+    assert [row["status"] for row in _rows(log_path)] == ["ok", "ok"]
