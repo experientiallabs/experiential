@@ -260,6 +260,37 @@ def test_interleaved_artifact_writes_do_not_share_a_staging_file(
     assert [entry.name for entry in tmp_path.iterdir()] == ["policy.json"]
 
 
+def test_interleaved_bank_writes_do_not_share_a_staging_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two fits racing on one `--out` derive one bank path; they must not stage through one file.
+
+    Regression: `KnnBank.save` staged through a fixed `<bank>.partial`, so one fit could publish
+    the OTHER fit's evidence under its own bank name while the loser raised `FileNotFoundError`.
+    A policy serving a competing fit's rewards is the failure this whole change is about, and
+    the derived bank name does not prevent it when both fits target the same policy path.
+    """
+    path = tmp_path / "bank.npz"
+    mine = _knn_bank([[1.0, 0.0]] * 12)  # fable-5 wins every neighbor
+    theirs = _knn_bank([[0.0, 1.0]] * 12)  # ...and haiku-4-5 wins every neighbor
+    staged: list[Path] = []
+    real_replace = Path.replace
+
+    def _replace(self: Path, target: Path) -> Path:
+        staged.append(self)
+        if len(staged) == 1:  # this fit is mid-flight: run the competing one start to finish
+            theirs.save(path)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", _replace)
+    mine.save(path)
+
+    assert len({entry.name for entry in staged}) == 2  # two fits, two staging files
+    # The bank that renamed last is the one on disk, with ITS rewards, not the competitor's.
+    assert np.array_equal(KnnBank.load(path).rewards, mine.rewards)
+    assert [entry.name for entry in tmp_path.iterdir()] == ["bank.npz"]
+
+
 def test_azure_embedder_spec_requires_backend_fields() -> None:
     with pytest.raises(ValueError, match="deployment"):
         EmbedderSpec(kind="azure", dim=3072)

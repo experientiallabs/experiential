@@ -219,19 +219,30 @@ class KnnBank:
         return np.where(counts > 0, totals / np.maximum(counts, 1), np.nan)
 
     def save(self, path: Path) -> None:
-        """Write the sidecar atomically (a half-written 10MB bank must not be loadable)."""
+        """Write the sidecar atomically (a half-written 10MB bank must not be loadable).
+
+        Staged under a name unique to this call, for the reason spelled out in
+        `write_artifact_atomically`: two fits racing on one `--out` derive the same bank path,
+        and a shared staging file would let one publish the OTHER's evidence under its own name.
+        A bank is streamed through numpy rather than buffered into bytes, so it stages itself
+        instead of going through that helper.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        staging = path.with_name(f"{path.name}.partial")
-        with staging.open("wb") as handle:
-            np.savez(
-                handle,
-                embeddings=self.embeddings.astype(np.float32),
-                rewards=self.rewards.astype(np.float32),
-                costs=self.costs.astype(np.float32),
-                models=np.asarray(self.models),
-                scenario_ids=np.asarray(self.scenario_ids),
-            )
-        staging.replace(path)
+        staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
+        try:
+            with staging.open("wb") as handle:
+                np.savez(
+                    handle,
+                    embeddings=self.embeddings.astype(np.float32),
+                    rewards=self.rewards.astype(np.float32),
+                    costs=self.costs.astype(np.float32),
+                    models=np.asarray(self.models),
+                    scenario_ids=np.asarray(self.scenario_ids),
+                )
+            staging.replace(path)
+        except BaseException:
+            staging.unlink(missing_ok=True)
+            raise
 
     @classmethod
     def load(cls, path: Path) -> KnnBank:
