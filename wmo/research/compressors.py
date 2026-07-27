@@ -6,9 +6,8 @@ module holds the other two, adapted from the track's round 0 slate to the produc
 protocol (`wmo.optimize.compression`):
 
 - `random-removal`: matched-ratio random word removal, the control every learned method must beat.
-- `truncate-protect-task`: head-keep truncation that never touches the first segment, which
-  differs from the built-in `truncate` control by exactly the task protection, so the pair
-  measures what protecting the instruction is worth.
+- `truncate-protect-task`: head-keep truncation that never touches the first segment, so pairing
+  it with the built-in `truncate` control measures what protecting the instruction is worth.
 
 Neither is a serving candidate. They register at runtime from the acceptance-benchmark runner
 (`.agents/scripts/run_acceptance_bench.py`), and nothing in the serving path references them
@@ -97,9 +96,17 @@ class TruncateProtectTaskCompressor:
     """Head-keep truncation of every segment EXCEPT the first (round 0's symbolic arm).
 
     Segment 0 carries the task and is never touched; later segments keep the leading
-    (1 - aggressiveness) fraction of their words. Differs from the seam's built-in `truncate`
-    control by exactly that protection, so running both at one matched ratio measures what
-    protecting the instruction is worth.
+    (1 - aggressiveness) fraction of their words. Running this beside the seam's built-in
+    `truncate` at one matched achieved ratio is how the track measures what protecting the
+    instruction is worth.
+
+    Two SECONDARY differences from that built-in, both inherited from round 0's implementation
+    and neither about the protection: this keeps each word's original trailing whitespace
+    (`split_words` is lossless, where `truncate` rejoins on single spaces and so flattens
+    newlines), and it rounds the keep count where `truncate` takes the ceiling. Both are small at
+    the ratios this track runs, and both are why the pair's achieved ratios differ slightly at
+    the same dial value, but a reading of the protection's effect should not treat the pair as
+    differing in one variable only.
 
     Keeping at least one word of a truncated segment is deliberate: a segment compressed to
     nothing reads to the model as an empty turn rather than as a shortened one, which is a

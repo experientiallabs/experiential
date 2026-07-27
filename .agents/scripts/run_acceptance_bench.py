@@ -41,6 +41,7 @@ from wmo.config import load_config, load_env_file
 from wmo.engine.world_model import WorldModel
 from wmo.env.base import Env, WorldModelEnv
 from wmo.env.closed_loop import evaluate_pool, scenario_id
+from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
 from wmo.ingest import get_adapter
 from wmo.optimize.compression import (
@@ -78,6 +79,10 @@ COHORT_MATRIX = ROUTING_MATRICES / "financebench-s80_matrix.json"
 
 EPISODES = 2
 MAX_STEPS = 16  # s80 cohort convention
+# How much of each observation the agent sees before its next turn. Part of a matrix's
+# capture cohort (it changes what the candidates are measured on), so it is pinned
+# explicitly here rather than left to `evaluate_pool`'s default drifting under us.
+HISTORY_CHARS = DEFAULT_HISTORY_CHARS
 COHORT_SCENARIOS = 80
 DEFAULT_MODELS = "gpt-5.4-mini,sonnet-5,gpt-5.5"
 DRY_RUN_TRANSCRIPTS = 40
@@ -287,6 +292,7 @@ def run_cells(
     spend: Spend,
     on_row: Callable[[ScenarioOutcome], None],
     label: str,
+    history_chars: int = HISTORY_CHARS,
     episode_limit: int | None = None,
     provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
 ) -> list[ScenarioOutcome]:
@@ -346,6 +352,7 @@ def run_cells(
                 episodes_per_scenario=EPISODES,
                 max_steps=MAX_STEPS,
                 tools_hint=tools_hint,
+                history_chars=history_chars,
                 on_outcome=record,
                 compression=compression,
                 provider_factory=provider_factory,
@@ -581,6 +588,7 @@ def probe_run(
     traces_path: Path,
     *,
     allow_partial: bool,
+    history_chars: int = HISTORY_CHARS,
 ) -> None:
     """Run `episodes` uncompressed episodes and recompute the grid total from what they cost."""
     scenarios, hint = cohort_scenarios(traces_path, allow_partial=allow_partial)
@@ -616,6 +624,7 @@ def probe_run(
             compression=None,
             meter=meter,
             tools_hint=hint,
+            history_chars=history_chars,
             spend=spend,
             on_row=persist,
             label="probe",
@@ -705,6 +714,7 @@ def live_run(
     traces_path: Path,
     *,
     allow_partial: bool,
+    history_chars: int = HISTORY_CHARS,
 ) -> None:
     """Run the arms in order against the pinned cohort, metering all-in spend against `cap_usd`."""
     register_arms()
@@ -759,6 +769,7 @@ def live_run(
                 compression=compression,
                 meter=meter,
                 tools_hint=hint,
+                history_chars=history_chars,
                 spend=spend,
                 on_row=persist,
                 label=arm,
@@ -819,6 +830,12 @@ def main() -> None:
         help="master-approved ALL-IN cap (candidate + compressor + env/judge); required live",
     )
     parser.add_argument("--control-aggressiveness", type=float, default=0.4)
+    parser.add_argument(
+        "--history-chars",
+        type=int,
+        default=HISTORY_CHARS,
+        help="observation chars the agent sees per turn; part of the capture cohort",
+    )
     parser.add_argument("--pool", default=str(REPO / DEFAULT_POOL_PATH))
     parser.add_argument("--traces", default=str(TRACES))
     parser.add_argument(
@@ -849,6 +866,7 @@ def main() -> None:
             Path(args.pool),
             Path(args.traces),
             allow_partial=args.allow_partial_cohort,
+            history_chars=args.history_chars,
         )
         return
     if args.cap_usd is None:
@@ -863,6 +881,7 @@ def main() -> None:
         Path(args.pool),
         Path(args.traces),
         allow_partial=args.allow_partial_cohort,
+        history_chars=args.history_chars,
     )
 
 
