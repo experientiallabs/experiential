@@ -558,6 +558,13 @@ class SamplingConfig(BaseModel):
     """Per-completion output cap for every rollout request."""
 
 
+DEFAULT_WARMUP_LEARNING_RATE = 5e-5
+"""The supervised phase's own learning rate, independent of the OPD rate.
+
+The value the reference anchor config pins for warmup while running 1e-4 for
+its on-policy steps (`wmo/distill/configs/distill-qwen-anchor.toml`)."""
+
+
 class WarmupConfig(BaseModel):
     """Supervised warmup on the teacher's own pi trajectories before OPD steps.
 
@@ -580,8 +587,18 @@ class WarmupConfig(BaseModel):
     keep: Literal["passed", "all"] = "passed"
     """Which teacher trials feed the SFT set: reward-passing only, or all."""
 
-    learning_rate: Annotated[float, Field(gt=0)] | None = None
-    """Warmup optimizer LR; None uses `train.learning_rate`."""
+    learning_rate: Annotated[float, Field(gt=0)] | None = DEFAULT_WARMUP_LEARNING_RATE
+    """Warmup optimizer LR; None falls back to `train.learning_rate`.
+
+    Defaults to `DEFAULT_WARMUP_LEARNING_RATE` rather than to the on-policy
+    rate, because the two phases are not the same optimization. An OPD step
+    trains a small batch of freshly sampled tokens; a warmup pass trains the
+    whole kept corpus at once (measured on the tau cycle: 918,869 loss tokens
+    per pass, twice), and the reference anchor config deliberately pins 5e-5
+    there while running 1e-4 for its OPD steps. Inheriting the OPD rate was
+    silent, so a warmup-only run trained an entire corpus at double the rate
+    its own reference config uses. Set this explicitly (or to None, to opt
+    back into `train.learning_rate`) when a run wants the coupling."""
 
     trajectories_from: str | None = None
     """Path to another run dir whose warmup COLLECTION completed: the warmup

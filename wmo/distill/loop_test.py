@@ -3671,3 +3671,30 @@ def test_deferred_baselines_still_run_the_warmup_phase(
     (warmup_call,) = _warmup_calls(env)
     assert warmup_call.provider_model == _TEACHER
     assert "cross_entropy" in _loss_fns(env), "the supervised passes must have trained"
+
+
+def test_a_warmup_only_run_still_gets_a_degeneration_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """train.steps = 0 arms no per-step tripwire, so the gate's own arms must report.
+
+    The warmup batch cannot substitute: those spans are the TEACHER's, and the
+    question is whether the STUDENT collapsed. The student-before and
+    student-after eval arms sample the student under the same k and
+    temperature, so they are the controlled reading this check uses.
+    """
+    env = _setup(tmp_path, monkeypatch)
+    base = _warmup_cfg()
+    cfg = base.model_copy(update={"train": base.train.model_copy(update={"steps": 0})})
+
+    with caplog.at_level(logging.INFO, logger="wmo.distill.loop"):
+        result = _run(env, cfg)
+
+    assert result.steps_completed == 0, "this is the warmup-only shape"
+    assert any("post-training health" in record.message for record in caplog.records), (
+        "a warmup-only run must still report a student before/after health reading"
+    )
+    # And the reading is persisted beside the arms it came from.
+    payload = json.loads((env.run_dir / "evals" / f"{STUDENT_AFTER_EVAL}.json").read_text())
+    assert payload["health"] is not None
+    assert payload["health"]["entropy_per_token"] is not None
