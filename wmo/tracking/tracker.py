@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from enum import StrEnum
 
@@ -60,6 +60,19 @@ class UsageTotals(BaseModel):
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    def merged(self, other: UsageTotals) -> UsageTotals:
+        """The two totals added together, as a new value; neither input is mutated."""
+        return UsageTotals(
+            calls=self.calls + other.calls,
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cached_input_tokens=self.cached_input_tokens + other.cached_input_tokens,
+            cache_write_input_tokens=(
+                self.cache_write_input_tokens + other.cache_write_input_tokens
+            ),
+            cost_usd=self.cost_usd + other.cost_usd,
+        )
 
     def _add(self, event: UsageEvent) -> None:
         self.calls += 1
@@ -153,3 +166,28 @@ class RunTracker:
             total=self.totals(),
             by_phase=self.by_phase(),
         )
+
+
+def merge_run_records(records: Sequence[RunRecord], *, run_id: str, kind: str) -> RunRecord:
+    """Roll many run records into one, summing totals, phases, and durations.
+
+    For a batch of short-lived runs that together form one logical activity: a routing sweep opens
+    one metered world-model session per episode, and what an operator wants persisted is the
+    sweep, not a thousand sessions. Phase buckets are preserved rather than flattened, so the
+    serve half and the judge half of that cost stay separable afterwards.
+
+    Durations are summed, which for sequentially run records is the activity's own wall clock and
+    for concurrent ones is total occupancy. An empty sequence gives an empty record, which is a
+    truthful "nothing was metered" rather than an error.
+    """
+    total = UsageTotals()
+    by_phase: dict[Phase, UsageTotals] = {}
+    duration = 0.0
+    for record in records:
+        total = total.merged(record.total)
+        duration += record.duration_seconds
+        for phase, bucket in record.by_phase.items():
+            by_phase[phase] = by_phase.get(phase, UsageTotals()).merged(bucket)
+    return RunRecord(
+        run_id=run_id, kind=kind, duration_seconds=duration, total=total, by_phase=by_phase
+    )

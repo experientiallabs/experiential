@@ -16,6 +16,7 @@ from wmo.tracking.tracker import (
     RunTracker,
     UsageEvent,
     UsageTotals,
+    merge_run_records,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "RunTracker",
     "UsageEvent",
     "UsageTotals",
+    "merge_run_records",
 ]

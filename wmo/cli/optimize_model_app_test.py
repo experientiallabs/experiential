@@ -25,7 +25,13 @@ from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, S
 from wmo.engine.world_model import WorldModel
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.outcomes import OutcomeMatrix
-from wmo.optimize.pipeline import MANIFEST_FILENAME, MATRIX_FILENAME, REPORT_FILENAME, RunManifest
+from wmo.optimize.pipeline import (
+    MANIFEST_FILENAME,
+    MATRIX_FILENAME,
+    REPORT_FILENAME,
+    RunManifest,
+    Stage,
+)
 from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy
 from wmo.optimize.report import ImprovementReport
 from wmo.optimize.reward import EpisodeScore
@@ -39,7 +45,7 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.serving.traces_source import TRACES_FILENAME
-from wmo.tracking import RunRecord
+from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
 
@@ -141,10 +147,13 @@ def _pool_file(tmp_path: Path, *, pricey_out: float = 20.0) -> Path:
 class _FakeWorldModel:
     """`WorldModel`-shaped stub: in-memory sessions, a canned episode score, no LLM at all."""
 
-    def __init__(self, rewards: dict[str, float] | None = None) -> None:
+    def __init__(self, rewards: dict[str, float] | None = None, session_usd: float = 0.02) -> None:
         # Per-candidate rewards keyed by the model id the episode's provider was built with, so a
         # sweep can produce a matrix where one candidate is genuinely better than another.
         self._rewards = rewards or {}
+        # What the simulator charges per episode for its OWN serve + judge calls: the
+        # world-model side of a sweep's bill, which is metered separately from the candidates.
+        self._session_usd = session_usd
         self._frozen = False
         self.tasks: list[str | None] = []
         self.current_model = "cheap-1"
@@ -171,10 +180,25 @@ class _FakeWorldModel:
         return EpisodeScore(reward=reward, success=reward >= 0.5, critique="fine")
 
     def end_session(self, session_id: str) -> RunRecord:
-        return RunRecord(run_id=session_id, kind="serve")
+        return self._usage_record(session_id)
 
     def session_usage(self, session_id: str) -> RunRecord:
-        return RunRecord(run_id=session_id, kind="serve")
+        return self._usage_record(session_id)
+
+    def _usage_record(self, session_id: str) -> RunRecord:
+        serve = UsageTotals(
+            calls=2, input_tokens=400, output_tokens=60, cost_usd=self._session_usd * 0.75
+        )
+        judge = UsageTotals(
+            calls=1, input_tokens=200, output_tokens=30, cost_usd=self._session_usd * 0.25
+        )
+        return RunRecord(
+            run_id=session_id,
+            kind="serve",
+            duration_seconds=0.5,
+            total=serve.merged(judge),
+            by_phase={Phase.SERVE: serve, Phase.JUDGE: judge},
+        )
 
 
 class _ScriptedCandidate:
@@ -225,9 +249,10 @@ def _patch_seams(
     *,
     rewards: dict[str, float] | None = None,
     modules: tuple[object, ...] = (),
+    session_usd: float = 0.02,
 ) -> _FakeWorldModel:
     """Stub the world model and every pool provider; return the fake for post-run assertions."""
-    world_model = _FakeWorldModel(rewards=rewards)
+    world_model = _FakeWorldModel(rewards=rewards, session_usd=session_usd)
 
     def _load(model_dir: Path) -> tuple[WorldModel, Provider]:
         provider = _ScriptedCandidate(
@@ -692,3 +717,95 @@ def test_the_dial_setting_reaches_the_served_policy(
     assert policy.cost_quality == 0.0
     assert policy.floor_q == 0.5  # the quality end of the measured frontier
     assert _says(result.output, "dial: 0 quality max")
+
+
+def test_the_sweep_persists_the_world_models_own_spend_beside_the_build_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The eval-infrastructure half of a sweep's bill has to land somewhere accountable.
+
+    `route sweep` has always said the simulator's cost is "metered separately" while nothing
+    persisted it: the world model opens one metered session per episode and every record died
+    with its env. They are rolled into one `kind="sweep"` record in the model's own runs dir,
+    beside the build and serve records already there.
+    """
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.02)
+    root = _project(tmp_path)
+    result = _run(tmp_path, root, "--yes")
+    assert result.exit_code == 0, result.output
+
+    runs = load_runs(root / "models" / "support" / "runs")
+    sweeps = [record for record in runs if record.kind == "sweep"]
+    assert len(sweeps) == 1
+    swept = sweeps[0]
+    # 6 episodes x $0.02, kept split by phase so the serve half and the judge half stay separable.
+    assert swept.total.cost_usd == pytest.approx(0.12)
+    assert swept.by_phase[Phase.SERVE].cost_usd == pytest.approx(0.09)
+    assert swept.by_phase[Phase.JUDGE].cost_usd == pytest.approx(0.03)
+    assert swept.total.calls == 18  # 6 sessions x (2 serve + 1 judge)
+
+
+def test_the_two_sides_of_the_bill_are_reported_but_never_blended(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Candidate spend is what serving costs; world-model spend is what measuring costs.
+
+    One number covering both would overstate the price of serving the policy and understate the
+    price of producing the evidence, so they are printed as two labeled lines and stored as two
+    fields.
+    """
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.02)
+    root = _project(tmp_path)
+    result = _run(tmp_path, root, "--yes")
+    assert result.exit_code == 0, result.output
+    assert _says(result.output, "measured candidate spend $0.0013")
+    assert _says(result.output, "measured world-model spend $0.1200 over 6 session(s)")
+    assert _says(result.output, "eval infrastructure, not serving cost")
+    assert _says(result.output, 'recorded as kind="sweep"')
+
+    _matrix, _policy, _report, manifest_path = _paths(root)
+    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    sweep = manifest.record_for(Stage.SWEEP)
+    assert sweep is not None
+    assert sweep.spend_usd == pytest.approx(0.00132)  # candidate side, unchanged
+    assert sweep.world_model_spend_usd == pytest.approx(0.12)  # its own field, never summed in
+    assert sweep.total_spend_usd == pytest.approx(0.12132)  # only the cap adds them
+
+
+def test_the_spend_cap_counts_the_world_model_side_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cap is a question about money leaving the account, and both sides do.
+
+    The candidate side of this sweep projects at $0.33 and measures at $0.0013; the world-model
+    side measures $0.12. A cap of $0.50 clears the pre-sweep projection either way, so the only
+    thing that can stop the SECOND, freshly-forced sweep is the first run's total, and it only
+    exceeds $0.50 once the world-model side is counted.
+    """
+    world_model = _patch_seams(
+        monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.05
+    )
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes", "--max-usd", "0.60").exit_code == 0
+    after_first = len(world_model.tasks)
+    # First run: $0.0013 candidate + $0.30 world model = $0.3013 recorded.
+    stopped = _run(tmp_path, root, "--yes", "--max-usd", "0.60", "--force-from", "sweep")
+    assert stopped.exit_code == 1, stopped.output
+    assert len(world_model.tasks) == after_first  # not one new episode
+    assert _says(stopped.output, "stopped at the spend cap")
+    assert _says(stopped.output, "$0.30 of its $0.60 cap")
+
+
+def test_a_candidate_only_cap_would_have_let_that_second_sweep_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control: with no world-model spend to count, the same cap does not trip."""
+    world_model = _patch_seams(
+        monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.0
+    )
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes", "--max-usd", "0.60").exit_code == 0
+    after_first = len(world_model.tasks)
+    again = _run(tmp_path, root, "--yes", "--max-usd", "0.60", "--force-from", "sweep")
+    assert again.exit_code == 0, again.output
+    assert len(world_model.tasks) > after_first

@@ -40,7 +40,7 @@ from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.providers.registry import get_provider as registry_get_provider
 from wmo.serving.traces_source import TRACES_FILENAME
-from wmo.tracking import RunRecord
+from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
 
@@ -1058,8 +1058,17 @@ def _pool_file(tmp_path: Path) -> Path:
 class _FakeWorldModel:
     """`WorldModel`-shaped stub: in-memory sessions, a canned episode score, no LLM at all."""
 
-    def __init__(self, reward: float = 0.75, judge_fails_on: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self,
+        reward: float = 0.75,
+        judge_fails_on: frozenset[str] = frozenset(),
+        session_usd: float = 0.0,
+    ) -> None:
         self._reward = reward
+        # What this fake charges per session for its OWN serve + judge calls, which is the
+        # world-model side of a sweep's bill. Zero by default so existing expectations are
+        # unchanged; a test that cares about that side sets it.
+        self._session_usd = session_usd
         self._frozen = False
         # Tasks whose judge call raises, for every candidate: a scenario the whole pool loses.
         self._judge_fails_on = judge_fails_on
@@ -1098,10 +1107,22 @@ class _FakeWorldModel:
         return EpisodeScore(reward=self._reward, success=True, critique="fine")
 
     def end_session(self, session_id: str) -> RunRecord:
-        return RunRecord(run_id=session_id, kind="serve")
+        return self._usage_record(session_id)
 
     def session_usage(self, session_id: str) -> RunRecord:
-        return RunRecord(run_id=session_id, kind="serve")
+        return self._usage_record(session_id)
+
+    def _usage_record(self, session_id: str) -> RunRecord:
+        totals = UsageTotals(
+            calls=1, input_tokens=100, output_tokens=20, cost_usd=self._session_usd
+        )
+        return RunRecord(
+            run_id=session_id,
+            kind="serve",
+            duration_seconds=0.5,
+            total=totals,
+            by_phase={Phase.SERVE: totals},
+        )
 
 
 class _ScriptedCandidate:
@@ -1170,6 +1191,7 @@ def _patch_seams(
     throttled_episodes: dict[str, tuple[bool, ...]] | None = None,
     judge_fails_on: frozenset[str] = frozenset(),
     real_kinds: frozenset[ProviderKind] = frozenset(),
+    session_usd: float = 0.0,
 ) -> _Seams:
     """Stub the world model and the pool's provider construction; return the recorder.
 
@@ -1192,7 +1214,9 @@ def _patch_seams(
             preparation are both request-free, and no real provider is ever called (the sweep must
             fail before any cell runs).
     """
-    seams = _Seams(_FakeWorldModel(reward=reward, judge_fails_on=judge_fails_on))
+    seams = _Seams(
+        _FakeWorldModel(reward=reward, judge_fails_on=judge_fails_on, session_usd=session_usd)
+    )
     episode_cycles = throttled_episodes or {}
 
     def _load(model_dir: Path) -> tuple[WorldModel, Provider]:
@@ -2181,3 +2205,31 @@ def test_route_sweep_prints_names_and_paths_rich_cannot_swallow(
     assert out.is_file()
     assert _says(result.output, str(out))
     assert _says(result.output, f"wmo optimize route fit {out} --kind knn")
+
+
+def test_route_sweep_persists_the_world_models_own_spend_as_a_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The line "metered separately" now has somewhere to point.
+
+    The world model opens one metered session per episode and `WorldModelEnv.close` leaves that
+    session's final record on the env; before this every one of them died there, so the sweep
+    said the simulator's cost was accounted for elsewhere and nothing anywhere held it. They roll
+    into one `kind="sweep"` record in the model's own runs dir, beside build and serve.
+    """
+    _patch_seams(monkeypatch, session_usd=0.03)
+    root = _project(tmp_path, traces=_corpus())
+    _out, result = _sweep(tmp_path, root, "support", "--scenarios", "2", "--yes")
+    assert result.exit_code == 0, result.output
+
+    sweeps = [r for r in load_runs(root / "models" / "support" / "runs") if r.kind == "sweep"]
+    assert len(sweeps) == 1
+    # 2 candidates x 2 scenarios x 1 episode = 4 sessions at $0.03 each.
+    assert sweeps[0].total.cost_usd == pytest.approx(0.12)
+    assert sweeps[0].by_phase[Phase.SERVE].calls == 4
+
+    # Both sides are printed, and the candidate line is untouched: they are different money and
+    # a single blended number would misprice both.
+    assert _says(result.output, "measured candidate spend")
+    assert _says(result.output, "measured world-model spend $0.1200 over 4 session(s)")
+    assert _says(result.output, "eval infrastructure, not serving cost")

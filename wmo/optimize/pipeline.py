@@ -101,7 +101,16 @@ class StageRecord(BaseModel):
     # provenance instead, so a dialed policy still reads as the fit that produced it.
     artifact_identity: str | None = None
     completed_at: str
-    spend_usd: float = 0.0  # measured, candidate-side; 0.0 for the free stages
+    # The two sides of a stage's bill, kept apart because they are different kinds of money: what
+    # the candidate models charged (the serving cost a customer would pay) and what the world
+    # model charged to run the evaluation (eval infrastructure). Both are 0.0 for the free stages.
+    spend_usd: float = 0.0
+    world_model_spend_usd: float = 0.0
+
+    @property
+    def total_spend_usd(self) -> float:
+        """Both sides together. Only the spend CAP adds them; no report ever quotes this."""
+        return self.spend_usd + self.world_model_spend_usd
 
 
 class RunManifest(BaseModel):
@@ -296,12 +305,19 @@ class BudgetExceeded(Exception):
 
 
 class SpendLedger(BaseModel):
-    """This run's metered spend against `--max-usd`, checked at every stage boundary.
+    """This run's metered spend against `--max-usd`, checked at paid stage boundaries.
 
     The cap is a stop, not a clamp: a stage either runs whole or does not start, because half a
-    sweep is not a cheaper sweep, it is an unusable matrix that was paid for anyway. Spend
-    recorded here is measured candidate-side after the fact; the estimate consulted before a
-    stage starts is the same projection the plan table showed.
+    sweep is not a cheaper sweep, it is an unusable matrix that was paid for anyway.
+
+    This is the ONE place the candidate side and the world-model side are added together, because
+    a cap is a question about total money leaving the account and both sides do. Everywhere a
+    number is reported they stay apart (see `StageRecord`). The consequence worth knowing: the
+    estimate checked BEFORE a stage is candidate-side only, since the simulator's own token use
+    per episode is not projectable, so a sweep can carry the run past the cap and the overrun is
+    caught at the next paid boundary (including a later run's, which seeds from the manifest)
+    rather than mid-sweep. Free stages are never gated: refusing to run something that costs
+    nothing saves nothing.
     """
 
     model_config = ConfigDict(extra="forbid")

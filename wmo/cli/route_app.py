@@ -60,6 +60,7 @@ from wmo.optimize.sweep import (
     DeferredRisk,
     SweepError,
     SweepPlan,
+    SweepRun,
     Unevenness,
     coverage,
     execute_sweep,
@@ -253,22 +254,23 @@ def sweep(
         f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.scenarios)} held-out "
         f"scenario(s) of [bold]{escape(model_dir.name)}[/bold], {episodes} episode(s) each…"
     )
-    matrix = execute_sweep(
+    run = execute_sweep(
         plan,
         world_model=world_model,
         env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
         on_outcome=cell_progress(_console, plan.cells),
     )
+    matrix = run.matrix
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)
-    spent = sum(outcome.cost_usd for outcome in matrix.outcomes)
     # `escape(out)`: a bracketed path segment would otherwise be read as markup and dropped, so
     # the line would print a path that does not exist (and this one is meant to be copied).
     _console.print(
         f"[green]✓[/green] {len(matrix.outcomes)} cell(s), {scored} scored -> {escape(out)}\n"
-        f"  measured candidate spend ${spent:.4f} (the world model's own serve/judge cost is "
-        "metered separately)",
+        f"  measured candidate spend ${run.candidate_usd:.4f} (the world model's own serve/judge "
+        "cost is metered separately)",
         soft_wrap=True,  # a path a user copies must not be wrapped
     )
+    print_world_model_spend(_console, run)
     rows = coverage(matrix)
     print_coverage(_console, rows)
     if scored == 0:
@@ -332,6 +334,35 @@ def print_tiny_corpus_note(console: Console, plan: SweepPlan) -> None:
         "these scenarios come from the FULL corpus: they are not leak-free, and a policy "
         "fitted on them is a smoke test, not evidence"
     )
+
+
+def print_world_model_spend(console: Console, run: SweepRun) -> None:
+    """The OTHER half of a sweep's bill: what the simulator charged to run the evaluation.
+
+    Printed as its own line, never folded into the candidate figure above it. The candidate side
+    is the serving cost a customer would pay and the policy is fitted to trade off; this side is
+    eval infrastructure that exists only because the measurement happened. One number covering
+    both would misprice both.
+    """
+    gap = run.metering_gap
+    if run.episodes_metered == 0:
+        console.print(f"  world-model spend {gap}")
+        return
+    usage = run.world_model_usage
+    phases = ", ".join(
+        f"{phase.value} ${bucket.cost_usd:.4f}" for phase, bucket in sorted(usage.by_phase.items())
+    )
+    detail = f" ({phases})" if phases else ""
+    console.print(
+        f"  measured world-model spend ${run.world_model_usd:.4f} over {run.episodes_metered} "
+        f"session(s){detail}: eval infrastructure, not serving cost"
+        + (f"\n  [yellow]note[/yellow] {gap}" if gap is not None else ""),
+        soft_wrap=True,
+    )
+    if run.usage_path is not None:
+        console.print(
+            f'  recorded as kind="sweep" -> {escape(str(run.usage_path))}', soft_wrap=True
+        )
 
 
 def cell_progress(console: Console, cells: int) -> Callable[[ScenarioOutcome], None]:

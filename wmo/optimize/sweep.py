@@ -20,13 +20,15 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Callable
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, cast
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
-from wmo.config import HarnessConfig, load_config
+from wmo.config import ArtifactPaths, HarnessConfig, load_config
 from wmo.engine import split_holdout
 from wmo.env.closed_loop import evaluate_pool
 from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
@@ -35,6 +37,7 @@ from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, load_pool, prepare_pool_provider
 from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
+from wmo.tracking import RunRecord, merge_run_records, save_run
 
 if TYPE_CHECKING:
     from wmo.core.types import Trace
@@ -263,14 +266,65 @@ def plan_sweep(
     )
 
 
+class SweepRun(BaseModel):
+    """A finished sweep: the evidence, and BOTH sides of what it cost.
+
+    The two costs are never one number. `candidate_usd` is what the pool models charged, which is
+    the customer-facing serving cost the policy is fitted to trade off. `world_model_usage` is
+    what the simulator itself charged to run the evaluation (its own serve steps plus the judge),
+    which is eval infrastructure a customer never pays. Blending them would overstate the price of
+    serving and understate the price of measuring.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    matrix: OutcomeMatrix
+    candidate_usd: float
+    world_model_usage: RunRecord
+    episodes_metered: int  # episodes whose world-model session reported usage
+    episodes_unmetered: int  # episodes whose env exposed none (see `metering_gap`)
+    usage_path: Path | None  # where the kind="sweep" record was persisted, if it was
+
+    @property
+    def world_model_usd(self) -> float:
+        return self.world_model_usage.total.cost_usd
+
+    @property
+    def metering_gap(self) -> str | None:
+        """Why the world-model figure is not the whole sweep, or None when it covers every cell.
+
+        A caller prints this INSTEAD of the number when nothing was metered: a $0.00 that means
+        "not measured" is the kind of zero the numbers-honesty rule exists to forbid.
+        """
+        if self.episodes_unmetered == 0:
+            return None
+        if self.episodes_metered == 0:
+            return (
+                "not measured: the env this sweep ran on exposes no usage record, so the world "
+                "model's own serve and judge cost is unknown rather than zero"
+            )
+        return (
+            f"partial: {self.episodes_metered} of "
+            f"{self.episodes_metered + self.episodes_unmetered} episode(s) reported usage"
+        )
+
+
+class _MeteredEnv(Protocol):
+    """The metering surface `WorldModelEnv` adds on top of `Env`, read after the episode closes."""
+
+    @property
+    def usage(self) -> RunRecord | None: ...
+
+
 def execute_sweep(
     plan: SweepPlan,
     *,
     world_model: WorldModel,
     env_factory: Callable[[], Env],
     on_outcome: Callable[[ScenarioOutcome], None] | None = None,
-) -> OutcomeMatrix:
-    """Run every cell of `plan` against a FROZEN world model and write the matrix.
+    runs_dir: Path | None = None,
+) -> SweepRun:
+    """Run every cell of `plan` against a FROZEN world model, write the matrix, meter both sides.
 
     Frozen for the whole sweep (the `wmo.evals.closed_loop` precedent): without it a candidate's
     PREDICTED steps enter the shared retrieval buffer and become demos for the next candidate, so
@@ -278,10 +332,26 @@ def execute_sweep(
 
     `env_factory` must build an env that scores on close (`score_on_close=True`): a matrix
     without verified rewards is not evidence, and `evaluate_pool` refuses one that does not score.
+
+    The world model opens one metered session per episode and `WorldModelEnv.close` leaves that
+    session's final `RunRecord` on the env. Those records used to die with the env: the sweep
+    said the simulator's cost was "metered separately" and then nothing anywhere persisted it, so
+    the eval-infrastructure half of a sweep's bill was unaccountable. They are harvested here and
+    rolled into ONE `kind="sweep"` record under `runs_dir`, beside the build and serve records the
+    same directory already holds.
+
+    Args:
+        plan: What to measure, from `plan_sweep`.
+        world_model: The model to freeze and measure against.
+        env_factory: Builds one scoring env per episode.
+        on_outcome: Per-cell progress callback.
+        runs_dir: Where to persist the run record. Defaults to the model's own `runs/`; pass a
+            path to redirect it, and nothing is written when the sweep metered no session at all.
     """
+    harvest = _SessionHarvest(env_factory)
     with world_model.frozen():
         matrix = evaluate_pool(
-            env_factory,
+            harvest,
             plan.pool,
             list(plan.scenarios),
             episodes_per_scenario=plan.episodes,
@@ -289,8 +359,64 @@ def execute_sweep(
             tools_hint=plan.tools_hint,
             on_outcome=on_outcome,
         )
+    harvest.finish()
     matrix.save(plan.out_path)
-    return matrix
+
+    usage = merge_run_records(
+        harvest.records,
+        run_id=f"sweep-{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}",
+        kind=SWEEP_RUN_KIND,
+    )
+    usage_path: Path | None = None
+    if harvest.records:
+        usage_path = save_run(usage, runs_dir or ArtifactPaths(plan.model_dir).runs)
+    return SweepRun(
+        matrix=matrix,
+        candidate_usd=sum(outcome.cost_usd for outcome in matrix.outcomes),
+        world_model_usage=usage,
+        episodes_metered=len(harvest.records),
+        episodes_unmetered=harvest.unmetered,
+        usage_path=usage_path,
+    )
+
+
+SWEEP_RUN_KIND = "sweep"
+"""`RunRecord.kind` for a sweep's world-model side, beside the existing "build" and "serve"."""
+
+
+class _SessionHarvest:
+    """An `env_factory` wrapper that collects each episode's world-model usage as it completes.
+
+    Harvesting on the NEXT call (and once more at `finish`) rather than holding every env is
+    deliberate: `run_episode` closes its env before `evaluate_pool` asks for the next one, so the
+    previous env's record is already final by then, and a sweep of thousands of cells keeps one
+    env alive at a time instead of all of them.
+
+    An env that exposes no usage is counted, not guessed at. `evaluate_pool` accepts any `Env`,
+    and a caller who supplies a non-metering one gets a stated gap rather than a fabricated $0.
+    """
+
+    def __init__(self, inner: Callable[[], Env]) -> None:
+        self._inner = inner
+        self._open: Env | None = None
+        self.records: list[RunRecord] = []
+        self.unmetered = 0
+
+    def __call__(self) -> Env:
+        self.finish()
+        self._open = self._inner()
+        return self._open
+
+    def finish(self) -> None:
+        """Take the record off the env that just finished, if it kept one."""
+        if self._open is None:
+            return
+        env, self._open = self._open, None
+        record = getattr(cast("_MeteredEnv", env), "usage", None)
+        if isinstance(record, RunRecord):
+            self.records.append(record)
+        else:
+            self.unmetered += 1
 
 
 class CandidateCoverage(BaseModel):

@@ -18,6 +18,7 @@ from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.sweep import (
     SweepError,
     SweepPlan,
+    SweepRun,
     Unevenness,
     coverage,
     plan_sweep,
@@ -28,6 +29,7 @@ from wmo.optimize.sweep import (
 from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.serving.traces_source import TRACES_FILENAME
+from wmo.tracking import RunRecord, UsageTotals
 
 
 def _traces(count: int = 30) -> list[Trace]:
@@ -229,3 +231,37 @@ def test_coverage_carries_the_first_error_of_a_candidate_that_never_scored() -> 
     assert never_scored.scored == 0
     assert never_scored.first_error is not None and "429" in never_scored.first_error
     assert never_scored.lost_scenarios == ("s1",)
+
+
+def _run(*, metered: int, unmetered: int, cost: float = 0.0) -> SweepRun:
+    """A `SweepRun` with the given metering coverage, for the reporting rules alone."""
+    return SweepRun(
+        matrix=_matrix({("a", "s1"): [0.5]}),
+        candidate_usd=0.001,
+        world_model_usage=RunRecord(
+            run_id="sweep-1", kind="sweep", total=UsageTotals(cost_usd=cost)
+        ),
+        episodes_metered=metered,
+        episodes_unmetered=unmetered,
+        usage_path=None,
+    )
+
+
+def test_full_metering_coverage_reports_no_gap() -> None:
+    assert _run(metered=6, unmetered=0, cost=0.12).metering_gap is None
+    assert _run(metered=6, unmetered=0, cost=0.12).world_model_usd == pytest.approx(0.12)
+
+
+def test_metering_nothing_says_unknown_rather_than_zero() -> None:
+    # `evaluate_pool` accepts any Env, and one that exposes no usage record leaves the world
+    # model's cost UNKNOWN. Reporting that as $0.00 is exactly the zero the numbers-honesty rule
+    # forbids: it would read as "the simulator was free".
+    gap = _run(metered=0, unmetered=6).metering_gap
+    assert gap is not None
+    assert "not measured" in gap and "unknown rather than zero" in gap
+
+
+def test_partial_metering_says_how_partial() -> None:
+    gap = _run(metered=4, unmetered=2, cost=0.08).metering_gap
+    assert gap is not None
+    assert "partial: 4 of 6 episode(s)" in gap

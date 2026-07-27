@@ -32,6 +32,7 @@ from wmo.cli.route_app import (
     print_coverage,
     print_deferred_risks,
     print_tiny_corpus_note,
+    print_world_model_spend,
     uneven_warning,
 )
 from wmo.config import ARTIFACT_DIR, WorldModelStore
@@ -174,8 +175,10 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         None,
         "--max-usd",
         min=0.0,
-        help="Stop before any stage whose projection would carry this run past this many USD. "
-        "The run stays resumable and prints the command to continue it.",
+        help="Stop before any paid stage whose projection would carry this run past this many "
+        "USD, counting what earlier runs already spent. Candidate spend and the world model's "
+        "own eval spend both count against it. The run stays resumable and prints how to "
+        "continue it.",
     ),
     allow_uneven_coverage: bool = typer.Option(
         False,
@@ -296,8 +299,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     ledger = SpendLedger(max_usd=max_usd)
     for record in manifest.stages:
         # Spend already paid for in an earlier run counts against the cap: --max-usd bounds the
-        # optimization, not one invocation of it.
-        ledger.record(record.spend_usd)
+        # optimization, not one invocation of it. Both sides count (see `SpendLedger`).
+        ledger.record(record.total_spend_usd)
     try:
         manifest = _run_stages(
             decisions,
@@ -717,13 +720,12 @@ def _run_stages(
                     pool_file=pool_file,
                     allow_uneven_coverage=allow_uneven_coverage,
                 )
-                ledger.record(record.spend_usd)
+                ledger.record(record.total_spend_usd)
             case Stage.FIT:
                 record = _stage_fit(paths, embedder=embedder, fallback=fallback)
             case Stage.TUNE:
                 record = _stage_tune(paths, cost_quality=cost_quality)
             case _:
-                ledger.check(Stage.REPORT, 0.0)
                 record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
@@ -744,21 +746,22 @@ def _stage_sweep(
     withholds the fit: re-running after fixing the pool must not buy the same cells twice.
     """
     world_model, _serve_provider = load_world_model(model_dir)
-    matrix = execute_sweep(
+    run = execute_sweep(
         plan,
         world_model=world_model,
         env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
         on_outcome=cell_progress(_console, plan.cells),
     )
+    matrix = run.matrix
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)
-    spent = sum(outcome.cost_usd for outcome in matrix.outcomes)
     _console.print(
         f"  [green]✓[/green] {len(matrix.outcomes)} cell(s), {scored} scored -> "
         f"{escape(str(plan.out_path))}\n"
-        f"  measured candidate spend ${spent:.4f} (the world model's own serve/judge cost is "
-        "metered separately)",
+        f"  measured candidate spend ${run.candidate_usd:.4f} (the world model's own serve/judge "
+        "cost is metered separately)",
         soft_wrap=True,
     )
+    print_world_model_spend(_console, run)
     record = StageRecord(
         stage=Stage.SWEEP,
         fingerprint={
@@ -770,7 +773,8 @@ def _stage_sweep(
         artifact_path=str(plan.out_path),
         artifact_identity=file_sha256(plan.out_path),
         completed_at=_now(),
-        spend_usd=spent,
+        spend_usd=run.candidate_usd,
+        world_model_spend_usd=run.world_model_usd,
     )
     rows = coverage(matrix)
     print_coverage(_console, rows)

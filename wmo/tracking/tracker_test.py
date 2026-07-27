@@ -5,7 +5,13 @@ from __future__ import annotations
 import pytest
 
 from wmo.providers.base import TokenUsage
-from wmo.tracking.tracker import Phase, RunTracker
+from wmo.tracking.tracker import (
+    Phase,
+    RunRecord,
+    RunTracker,
+    UsageTotals,
+    merge_run_records,
+)
 
 
 class FakeClock:
@@ -99,3 +105,67 @@ def test_record_summary_carries_id_kind_and_breakdown() -> None:
     assert record.duration_seconds == 1.0
     assert record.total.calls == 1
     assert Phase.GEPA in record.by_phase
+
+
+def _totals(cost: float, calls: int = 1) -> UsageTotals:
+    return UsageTotals(
+        calls=calls,
+        input_tokens=100 * calls,
+        output_tokens=10 * calls,
+        cached_input_tokens=5 * calls,
+        cache_write_input_tokens=2 * calls,
+        cost_usd=cost,
+    )
+
+
+def test_merged_totals_add_every_column_without_mutating_either_side() -> None:
+    left, right = _totals(1.0), _totals(0.5, calls=3)
+    combined = left.merged(right)
+    assert combined.calls == 4
+    assert combined.input_tokens == 400 and combined.output_tokens == 40
+    assert combined.cached_input_tokens == 20 and combined.cache_write_input_tokens == 8
+    assert combined.cost_usd == pytest.approx(1.5)
+    assert left.calls == 1 and right.calls == 3  # values, not accumulators
+
+
+def test_merging_run_records_sums_totals_and_keeps_the_phases_apart() -> None:
+    # A sweep opens one metered session per episode; what an operator wants persisted is the
+    # sweep. Phase buckets survive the roll-up, so the serve half and the judge half of that
+    # cost stay separable afterwards.
+    records = [
+        RunRecord(
+            run_id=f"s{index}",
+            kind="serve",
+            duration_seconds=0.5,
+            total=_totals(0.03).merged(_totals(0.01)),
+            by_phase={Phase.SERVE: _totals(0.03), Phase.JUDGE: _totals(0.01)},
+        )
+        for index in range(4)
+    ]
+    merged = merge_run_records(records, run_id="sweep-1", kind="sweep")
+    assert merged.run_id == "sweep-1" and merged.kind == "sweep"
+    assert merged.duration_seconds == pytest.approx(2.0)
+    assert merged.total.cost_usd == pytest.approx(0.16)
+    assert merged.by_phase[Phase.SERVE].cost_usd == pytest.approx(0.12)
+    assert merged.by_phase[Phase.JUDGE].cost_usd == pytest.approx(0.04)
+    assert merged.by_phase[Phase.SERVE].calls == 4
+
+
+def test_merging_nothing_is_an_empty_record_rather_than_an_error() -> None:
+    # "Nothing was metered" is a truthful answer a caller can print; raising would make the
+    # caller invent a number or swallow the case.
+    merged = merge_run_records([], run_id="sweep-0", kind="sweep")
+    assert merged.total.cost_usd == 0.0 and merged.total.calls == 0
+    assert merged.by_phase == {}
+
+
+def test_records_with_disjoint_phases_keep_both() -> None:
+    merged = merge_run_records(
+        [
+            RunRecord(run_id="a", kind="serve", by_phase={Phase.SERVE: _totals(1.0)}),
+            RunRecord(run_id="b", kind="serve", by_phase={Phase.EMBED: _totals(2.0)}),
+        ],
+        run_id="sweep-2",
+        kind="sweep",
+    )
+    assert set(merged.by_phase) == {Phase.SERVE, Phase.EMBED}
