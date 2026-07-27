@@ -8,6 +8,7 @@ models are named (`--name`), stored under `<root>/models/<name>/`, and listed wi
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import random
@@ -41,7 +42,10 @@ import wmo.providers as providers
 from wmo.cli.agent_session import register as register_agent_session_commands
 from wmo.cli.e2b_cmds import register as register_e2b_commands
 from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
-from wmo.cli.harness_app import harness_app, optimize_app
+
+# `_explicit` is package-private to wmo.cli, not module-private: `wmo eval` rejects
+# mode-inapplicable flags exactly the way `wmo optimize harness` already does.
+from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
 from wmo.cli.model_roles import configured_role_configs
 from wmo.cli.platform_cmds import register as register_platform_commands
@@ -82,6 +86,7 @@ from wmo.engine.build import DEFAULT_TRAIN_SPLIT, ingest, split_traces
 from wmo.engine.build import build as run_build
 from wmo.engine.demo import run_demo
 from wmo.engine.eval_suites import (
+    EvalSuite,
     discover_eval_suites,
     list_eval_results,
     resolve_eval_suite,
@@ -158,9 +163,14 @@ _console = Console()
 _CHECK = "[green]✓[/green]"
 
 # Module-level singleton: a typer.Argument call can't be a default inline (ruff B008).
+# Every dispatched flow is listed: the `grid*` family owns six of this command's options
+# (--val-frac, --models, --gepa-prompts, --dataset-label, --limit-traces, --judge-model), so
+# leaving its tokens out of the help made those flags reference an undiscoverable subcommand.
 _EVAL_TOKENS = typer.Argument(
     None,
-    help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
+    help="Trace files to score, or eval flow: list | run <suite> | results optional-suite | "
+    "grid <suite> | grid-plot <result.json>... | grid-heatmap <result.json>... | "
+    "agreement <a.json> <b.json>.",
 )
 # Repeatable option default hoisted out of the signature (ruff B008 forbids the call inline).
 _RESEARCH_REAL_ARG = typer.Option(
@@ -1071,8 +1081,74 @@ def serve(
     uvicorn.run(server_app, host="127.0.0.1", port=port)
 
 
+# Charting deps ship in the optional `viz` extra, so `wmo.evals.grid_plot` /
+# `wmo.research.concurrency_plot` import them lazily. Every chart-writing flow probes for them
+# UP FRONT instead: `wmo eval grid` otherwise spent the whole (paid) grid and only then died on
+# `import matplotlib` with a raw traceback that never named the extra.
+_VIZ_MODULES = ("matplotlib", "seaborn")
+
+
+def _require_viz_extra() -> None:
+    """Usage error naming the `viz` extra when the charting deps are not installed."""
+    missing = [name for name in _VIZ_MODULES if importlib.util.find_spec(name) is None]
+    if missing:
+        raise typer.BadParameter(
+            f"charts need the `viz` extra ({', '.join(missing)} not installed); run "
+            "`uv sync --extra viz` (or `pip install 'world-model-optimizer[viz]'`) and retry"
+        )
+
+
+def _prepare_out_path(out: str | None) -> None:
+    """Validate `--out` and create its parent directory BEFORE any (paid) eval work runs.
+
+    Reports are written last, so a `--out` under a missing directory used to surface as a raw
+    FileNotFoundError that discarded a finished run. `_eval_run_suite`/`_eval_run_grid` already
+    created the parent at write time; doing it here makes every eval flow behave the same and
+    fail before it spends anything.
+    """
+    if out is None:
+        return
+    path = Path(out)
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"--out {path} is a directory; pass the file to write (e.g. `--out {path}/report.json`)"
+        )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        raise typer.BadParameter(f"cannot create --out directory {path.parent}: {err}") from None
+
+
+def _resolve_eval_suite_or_usage(selector: str, examples_roots: list[str]) -> EvalSuite:
+    """Resolve a suite name, turning the unknown/ambiguous `ValueError` into a usage error.
+
+    Same contract as `_resolve_example`: a typo prints a clean box listing the available suites,
+    never a traceback.
+    """
+    try:
+        return resolve_eval_suite(selector, examples_roots)
+    except ValueError as err:
+        raise typer.BadParameter(str(err)) from None
+
+
+# Options only the closed-loop mode reads. In open-loop they used to be accepted and silently
+# dropped, so the README's closed-loop command minus `--mode closed-loop` quietly ran a different
+# (paid) evaluation. Same guard shape as `wmo optimize harness`'s world-model/harbor flag split.
+_CLOSED_LOOP_ONLY_FLAGS = (
+    ("name", "--name"),
+    ("root", "--root"),
+    ("k", "--k"),
+    ("max_turns", "--max-turns"),
+    ("harness", "--harness"),
+    ("harness_backend", "--harness-backend"),
+    ("eval_concurrency", "--eval-concurrency"),
+    ("e2b_template", "--e2b-template"),
+)
+
+
 @app.command("eval")
 def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin isn't used here
+    ctx: typer.Context,
     tokens: list[str] | None = _EVAL_TOKENS,
     mode: str = typer.Option(
         "open-loop",
@@ -1125,7 +1201,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     ),
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
-        None, help="Directory containing example eval suites. Default: repo-local examples/."
+        None,
+        help="Directory containing eval suites. Default: repo-local examples/ AND "
+        "packages/environment-capture/ (where the shipped suites live).",
     ),
     results_root: str = typer.Option(
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
@@ -1199,9 +1277,15 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
-    - `wmo eval list`: list named suites under `examples/<task>/evals/`.
+    - `wmo eval list`: list named suites under `packages/environment-capture/<task>/evals/`.
     - `wmo eval run <suite>`: run a suite and save a local JSON result.
     - `wmo eval results optional-suite`: summarize local suite results.
+    - `wmo eval grid <suite>`: run the model x condition grid for a suite and chart it (needs the
+      `viz` extra; consumes --models/--gepa-prompts/--dataset-label/--limit-traces/--judge-model
+      and --val-frac).
+    - `wmo eval grid-plot <result.json>...`: re-chart saved grid results, merged (`viz` extra).
+    - `wmo eval grid-heatmap <result.json>...`: chart saved grid results as one cross-benchmark
+      heatmap (`viz` extra).
     - `wmo eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
       (e.g. world-model vs real environment) — the outcome-agreement validity check.
     """
@@ -1211,6 +1295,21 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
     if mode not in ("open-loop", "closed-loop"):
         raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
+    # Reject flags this flow will never read, before anything runs — a silently dropped
+    # --harness/--k means the user paid for an open-loop run they did not ask for.
+    if mode != "closed-loop":
+        inapplicable = [flag for param, flag in _CLOSED_LOOP_ONLY_FLAGS if _explicit(ctx, param)]
+        if inapplicable:
+            raise typer.BadParameter(
+                f"{', '.join(inapplicable)} apply only to `--mode closed-loop`; add that flag "
+                "or drop them"
+            )
+    if (not args or args[0] != "agreement") and _explicit(ctx, "threshold"):
+        raise typer.BadParameter(
+            "--threshold applies only to `wmo eval agreement <a.json> <b.json>`; drop it"
+        )
+    # --out is written last (after the paid work); make sure it is writable first.
+    _prepare_out_path(out)
     if mode == "closed-loop":
         if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
             raise typer.BadParameter("usage: wmo eval <tasks.jsonl> --mode closed-loop")
@@ -1303,7 +1402,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     if not args:
         raise typer.BadParameter(
             "provide trace files, or use `wmo eval list`, `wmo eval run <suite>`, "
-            "or `wmo eval results`"
+            "`wmo eval results`, `wmo eval grid <suite>`, `wmo eval grid-plot <result.json>`, "
+            "`wmo eval grid-heatmap <result.json>`, or `wmo eval agreement <a.json> <b.json>`"
         )
 
     options = _eval_options(
@@ -1325,6 +1425,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         chain=chain,
         region=region,
     )
+    _require_scorable_steps(report, args)
     _print_eval_report(report)
     if out:
         _write_ad_hoc_eval_report(Path(out), report)
@@ -1471,7 +1572,9 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     out: str | None,
 ) -> None:
     """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
-    suite = resolve_eval_suite(selector, examples_roots)
+    suite = _resolve_eval_suite_or_usage(selector, examples_roots)
+    # The chart is the last thing written, so probe its deps before the grid spends anything.
+    _require_viz_extra()
     specs = _parse_model_specs(models)
     prompt_dir = Path(gepa_prompts) if gepa_prompts else None
     prompt_map: dict[str, str] | None = None
@@ -1529,6 +1632,7 @@ def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | N
     process-global) be combined with the API-model grid into one chart - and re-plots any saved
     result without re-running the eval.
     """
+    _require_viz_extra()
     results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
     merged = merge_results(results)
     for cell in merged.cells:
@@ -1555,6 +1659,7 @@ def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
     Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
     set, then all suites become the heatmap's columns (rows = model x condition).
     """
+    _require_viz_extra()
     by_suite: dict[str, list[GridResult]] = {}
     for p in paths:
         res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
@@ -1584,7 +1689,7 @@ def _eval_run_suite(
     reasoning: bool | None,
     out: str | None,
 ) -> None:
-    suite = resolve_eval_suite(selector, examples_roots)
+    suite = _resolve_eval_suite_or_usage(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -1693,8 +1798,18 @@ def _run_eval_files(
     for path in files:
         if not path.exists():
             raise typer.BadParameter(f"trace file not found: {path}")
+        if not path.is_file():
+            raise typer.BadParameter(
+                f"not a trace file: {path} is a directory; pass the export itself "
+                f"(e.g. `wmo eval {path}/traces.otel.jsonl`)"
+            )
     provider_config = _provider_config(provider, model, region)
-    llm = providers.provider_or_chain(provider_config, chain=chain)
+    # A missing/unknown chain, or a multi-chain fallback.toml with no `default`, is a usage
+    # error: the message already names the file, so it must not arrive as a traceback.
+    try:
+        llm = providers.provider_or_chain(provider_config, chain=chain)
+    except (ValueError, FileNotFoundError) as err:
+        raise typer.BadParameter(str(err)) from None
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmo/fallback.toml) — world-model calls only")
     prompt = (
@@ -1721,6 +1836,27 @@ def _run_eval_files(
         reasoning=options.reasoning,
     )
     return evaluation.run()
+
+
+def _require_scorable_steps(report: EvalReport, args: list[str]) -> None:
+    """Refuse to print a 0.000 scorecard for input that held nothing to score.
+
+    `evaluate_files` skips a file that yields no OTel GenAI traces, so a wrong file type, a
+    tasks.jsonl missing `--mode closed-loop`, or a train_split that leaves no holdout all used to
+    render as a plausible `OVERALL fidelity=0.000 over 0 held-out steps` at exit 0.
+    """
+    if report.total_steps:
+        return
+    files = ", ".join(args)
+    if not report.per_file:
+        raise typer.BadParameter(
+            f"no OTel GenAI traces in {files}; check the export with "
+            f"`wmo ingest --file {args[0]}`, or add `--mode closed-loop` for a tasks file"
+        )
+    raise typer.BadParameter(
+        f"no held-out steps to score in {files}; lower `--train-split` (currently reserving "
+        "every trace for training) or pass a larger corpus"
+    )
 
 
 def _print_eval_report(report: EvalReport) -> None:
@@ -2517,9 +2653,11 @@ def research_plot_concurrency(
     ideal-linear, and the T_real/T_world differential when the report has both sides.
 
     `concurrency_plot` is imported here (not at module scope) because it pulls in matplotlib/pandas
-    from the optional `viz` extra — the harness runtime must not require them. A missing extra
-    raises a plain ImportError naming the module (`uv sync --extra viz`); it is not caught.
+    from the optional `viz` extra — the harness runtime must not require them. `_require_viz_extra`
+    turns a missing extra into a usage error naming `uv sync --extra viz`, so the import itself
+    never surfaces a raw ModuleNotFoundError traceback.
     """
+    _require_viz_extra()
     from wmo.research.concurrency_plot import render_report
 
     try:
@@ -2547,8 +2685,10 @@ def research_plot_concurrency_combined(
     explains it). Pass the per-benchmark report JSONs (`wmo research concurrency <suite> --out ...`)
     in the order you want them coloured.
 
-    Imported lazily for the same reason as `plot-concurrency` (the optional matplotlib viz extra).
+    Imported lazily for the same reason as `plot-concurrency` (the optional matplotlib viz extra),
+    and guarded by the same `_require_viz_extra` pre-flight.
     """
+    _require_viz_extra()
     from wmo.research.concurrency_plot import render_cost, render_speedup
 
     try:

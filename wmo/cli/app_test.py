@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import json
 import os
 import subprocess
 import time
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -39,6 +41,11 @@ from wmo.tracking.pricing import ModelPrice
 cli_app_module = importlib.import_module("wmo.cli.app")
 
 runner = CliRunner()
+
+
+def _flat(text: str) -> str:
+    """Collapse rich wrapping (and typer's error-box borders) for substring asserts."""
+    return " ".join(text.replace("│", " ").split())
 
 
 class FakeProvider:
@@ -1059,6 +1066,154 @@ def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  #
     assert summarized.exit_code == 0, summarized.output
     assert "tiny-task/default" in summarized.output
     assert "0.500" in summarized.output
+
+
+def test_eval_out_parent_is_created_before_the_eval_runs(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # The report is written last; a missing parent used to blow up with FileNotFoundError AFTER
+    # the (paid) eval had finished, discarding it.
+    destination = tmp_path / "nodir" / "deeper" / "report.json"
+
+    result = runner.invoke(
+        app, ["eval", _traces_file(tmp_path), "--no-rag", "--out", str(destination)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert destination.exists()
+    assert "Traceback" not in result.output
+
+
+def test_eval_out_pointing_at_a_directory_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app, ["eval", _traces_file(tmp_path), "--no-rag", "--out", str(tmp_path)]
+    )
+
+    assert result.exit_code == 2  # usage error, not an IsADirectoryError traceback
+    assert "is a directory" in _flat(result.output)
+
+
+def test_eval_on_a_directory_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    corpus_dir = tmp_path / "benchmark"
+    corpus_dir.mkdir()
+
+    result = runner.invoke(app, ["eval", str(corpus_dir)])
+
+    assert result.exit_code == 2  # usage error, not an IsADirectoryError traceback
+    flat = _flat(result.output)
+    assert "is a directory" in flat
+    assert "traces.otel.jsonl" in flat  # names the file to pass instead
+
+
+def test_eval_file_with_no_traces_fails_instead_of_scoring_zero(tmp_path) -> None:  # noqa: ANN001
+    # A tasks.jsonl (or any non-OTel export) used to print a plausible
+    # "OVERALL fidelity=0.000 over 0 held-out steps" scorecard and exit 0.
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text('{"task_id": "t1", "instruction": "do it"}\n', encoding="utf-8")
+
+    result = runner.invoke(app, ["eval", str(tasks)])
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "no OTel GenAI traces" in flat
+    assert "--mode closed-loop" in flat
+    assert "OVERALL" not in flat
+
+
+def test_eval_run_unknown_suite_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    examples_root = tmp_path / "examples"
+    examples_root.mkdir()
+
+    for tokens in (["run", "nosuite"], ["grid", "nosuite"]):
+        result = runner.invoke(app, ["eval", *tokens, "--examples-root", str(examples_root)])
+        assert result.exit_code == 2, result.output  # usage error, not a ValueError traceback
+        assert "unknown eval suite 'nosuite'" in _flat(result.output)
+
+
+def test_eval_unknown_chain_is_a_usage_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.chdir(tmp_path)  # no .wmo/fallback.toml here
+
+    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--chain", "nope"])
+
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "fallback.toml does not exist" in _flat(result.output)
+
+
+def test_eval_rejects_closed_loop_only_flags_in_open_loop(tmp_path) -> None:  # noqa: ANN001
+    # The README's closed-loop command minus `--mode closed-loop` used to silently drop every
+    # closed-loop flag and run a different (paid) evaluation.
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            _traces_file(tmp_path),
+            "--harness",
+            "nosuchharness",
+            "--k",
+            "7",
+            "--harness-backend",
+            "e2b",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "--k, --harness, --harness-backend" in flat
+    assert "--mode closed-loop" in flat
+
+
+def test_eval_threshold_belongs_to_the_agreement_flow(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--threshold", "0.9"])
+
+    assert result.exit_code == 2, result.output
+    assert "wmo eval agreement" in _flat(result.output)
+
+
+def _hide_viz_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make only matplotlib/seaborn look uninstalled, as on a core `pip install`."""
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name: str, package: str | None = None) -> ModuleSpec | None:
+        if name in cli_app_module._VIZ_MODULES:
+            return None
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(cli_app_module.importlib.util, "find_spec", find_spec)
+
+
+def test_eval_grid_flows_name_the_viz_extra_when_it_is_missing(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    # matplotlib/seaborn ship in the optional [viz] extra; the plotting import used to escape as a
+    # raw ModuleNotFoundError that never named it — for `eval grid`, after the whole paid grid.
+    _hide_viz_extra(monkeypatch)
+    result_json = tmp_path / "grid.json"
+    result_json.write_text("{}", encoding="utf-8")
+
+    for tokens in (["grid-plot", str(result_json)], ["grid-heatmap", str(result_json)]):
+        result = runner.invoke(app, ["eval", *tokens])
+        assert result.exit_code == 2, result.output
+        assert "uv sync --extra viz" in _flat(result.output)
+
+
+def test_research_plot_commands_name_the_viz_extra_when_it_is_missing(monkeypatch) -> None:  # noqa: ANN001
+    _hide_viz_extra(monkeypatch)
+
+    for argv in (
+        ["research", "plot-concurrency", "missing.json"],
+        ["research", "plot-concurrency-combined", "a.json", "b.json"],
+    ):
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 2, result.output
+        assert "uv sync --extra viz" in _flat(result.output)
+
+
+def test_eval_help_lists_every_dispatched_flow() -> None:
+    result = runner.invoke(app, ["eval", "--help"])
+
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    # The grid family owns six of this command's options, so its tokens must be discoverable.
+    for token in ("grid <suite>", "grid-plot", "grid-heatmap", "agreement"):
+        assert token in flat
+    # Suites moved out of examples/ long ago; the help must not send readers to the wrong dir.
+    assert "packages/environment-capture" in flat
 
 
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
