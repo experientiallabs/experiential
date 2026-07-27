@@ -55,7 +55,13 @@ from wmo.optimize.knn import (
     fit_knn_artifact,
     tune_policy_dial,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, load_matrix_with_digest
+from wmo.optimize.outcomes import (
+    ROUTER_SPLIT_VERSION,
+    OutcomeMatrix,
+    ScenarioOutcome,
+    load_matrix_with_digest,
+    split_router_scenarios,
+)
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DIM,
     AZURE_EMBEDDER_ENV,
@@ -925,6 +931,11 @@ def fit(
             "`wmo optimize route sweep <model> --compressor <id> --aggressiveness <a>` writes a "
             "matrix whose episodes actually ran that way (one matrix per arm)."
         )
+    try:
+        router_split = split_router_scenarios(matrix.scenario_ids())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    fit_ids = list(router_split.fit_ids)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -937,6 +948,7 @@ def fit(
             out_path=out_path,
             matrix_source=source,
             embedder=spec,
+            fit_ids=fit_ids,
             fallback=fallback,
             z=z,
             rag_num=rag_num,
@@ -956,13 +968,15 @@ def fit(
         built = CompressingEmbedder(built, compression)
     policy = fit_rank_policy(
         matrix,
+        fit_ids=fit_ids,
         embedder=spec,
         n_clusters=clusters,
         seed=seed,
         top_k_clusters=top_k_clusters,
         beta=beta,
         fitted_from=(
-            f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
+            f"{source} split={ROUTER_SPLIT_VERSION} "
+            f"rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
             f"cost_weight={cost_weight:g} {embedder_provenance(spec)}"
         ),
     )
@@ -977,7 +991,7 @@ def fit(
             update={"compression": compression, "fit_compression": compression}
         )
     policy.save(out_path)
-    result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
+    result = evaluate_policy(policy, matrix, fit_ids, embedder=built)
     _console.print(
         f"[green]✓[/green] fitted {len(policy.clusters)} clusters over "
         f"{result.scenarios} scenarios -> {out}\n"

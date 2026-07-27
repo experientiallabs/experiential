@@ -22,6 +22,47 @@ from wmo.providers.pool import PoolEntry
 # is 64 bits, far past collision risk for the handful of matrices one artifact directory sees.
 MATRIX_DIGEST_CHARS = 16
 
+# Router fitting and reporting share one paid outcome matrix, but they must not share scenarios.
+# Hash ordering makes the partition stable across machines and independent of matrix row order.
+ROUTER_FIT_FRACTION = 0.7
+ROUTER_SPLIT_VERSION = "scenario-hash-70-30-v1"
+
+
+class RouterScenarioSplit(BaseModel):
+    """Disjoint scenario ids used to fit a router and report its generalization."""
+
+    fit_ids: tuple[str, ...]
+    report_ids: tuple[str, ...]
+
+
+def split_router_scenarios(scenario_ids: list[str]) -> RouterScenarioSplit:
+    """Deterministically reserve 30% of scenarios for router evaluation.
+
+    At least two scenarios are required because a router trained and evaluated on one scenario
+    cannot produce a held-out claim. Returned ids retain the matrix's original order; hashing is
+    used only to assign membership.
+    """
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise ValueError("router split requires unique scenario ids")
+    if len(scenario_ids) < 2:
+        raise ValueError(
+            "router fitting needs at least 2 scenarios so one can remain held out for reporting"
+        )
+    ranked = sorted(
+        scenario_ids,
+        key=lambda scenario_id: (
+            hashlib.sha256(scenario_id.encode("utf-8")).digest(),
+            scenario_id,
+        ),
+    )
+    fit_count = round(len(ranked) * ROUTER_FIT_FRACTION)
+    fit_count = min(len(ranked) - 1, max(1, fit_count))
+    fit_set = set(ranked[:fit_count])
+    return RouterScenarioSplit(
+        fit_ids=tuple(sid for sid in scenario_ids if sid in fit_set),
+        report_ids=tuple(sid for sid in scenario_ids if sid not in fit_set),
+    )
+
 
 class ScenarioOutcome(BaseModel):
     """One episode of one candidate model on one scenario.

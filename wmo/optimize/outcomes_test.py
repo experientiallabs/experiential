@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, split_router_scenarios
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -52,6 +52,25 @@ def test_matrix_accessors() -> None:
     assert matrix.mean_reward("fable-5") == pytest.approx(0.8)
     assert matrix.mean_reward("haiku-4-5") == pytest.approx(0.6)
     assert [o.model for o in matrix.for_scenario("s1")] == ["fable-5", "haiku-4-5"]
+
+
+def test_router_split_is_deterministic_disjoint_and_order_preserving() -> None:
+    ids = [f"scenario-{index}" for index in range(10)]
+    split = split_router_scenarios(ids)
+
+    assert len(split.fit_ids) == 7
+    assert len(split.report_ids) == 3
+    assert set(split.fit_ids).isdisjoint(split.report_ids)
+    assert [sid for sid in ids if sid in split.fit_ids] == list(split.fit_ids)
+    reordered = list(reversed(ids))
+    rerun = split_router_scenarios(reordered)
+    assert set(rerun.fit_ids) == set(split.fit_ids)
+    assert set(rerun.report_ids) == set(split.report_ids)
+
+
+def test_router_split_refuses_a_claim_with_no_holdout() -> None:
+    with pytest.raises(ValueError, match="at least 2 scenarios"):
+        split_router_scenarios(["only-one"])
 
 
 def test_matrix_round_trips_through_json(tmp_path: Path) -> None:
