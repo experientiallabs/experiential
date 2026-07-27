@@ -53,15 +53,16 @@ documents each block inline, including which ones are optional and which single 
 them. Bedrock or Anthropic direct is enough to get through steps 1 through 3; `TINKER_API_KEY` is
 step 4 only, and the `WMO_COMPRESSOR_*` block is step 5 only.
 
-Confirm what resolved before spending anything:
+There is nothing to verify yet, and that is fine. Credentials are exercised at first use, and the
+two places that spend money check theirs before they spend it. Step 2 live-pings every candidate
+it registers over that candidate's own route, and refuses to write a roster it could not call, so
+a wrong key surfaces there rather than inside a paid sweep. Step 3's preflight then re-resolves
+every candidate's backend as far as it can without making a request, before it asks you to confirm
+any spend.
 
-```bash
-uv run wmo providers verify
-```
-
-That pings every configured provider on both the completion and the embedding path and prints a
-row per provider. A credential that is present but wrong is much cheaper to find here than in the
-middle of step 3.
+(`wmo providers verify` is worth knowing about from step 1 onward: it reads the providers a
+**built** world model recorded and pings them on both the completion and the embedding path. On a
+fresh project it has nothing to read, so run it after a build, not before one.)
 
 ## Step 1: build the world model
 
@@ -180,8 +181,13 @@ model = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 model_type = "claude-haiku-4-5"
 ```
 
-Four things to know about the roster:
+Five things to know about the roster:
 
+- **Every candidate is proved before anything is written.** Each one is live-pinged over its own
+  route, not the worker's: a candidate can differ from the verified worker in model, deployment,
+  endpoint, and credential, so the worker's ping proves nothing about it. The whole batch is built
+  and called first, so a bad third id cannot leave half a roster behind, and a candidate that
+  cannot be called is a loud failure here instead of a 401 inside a paid sweep.
 - **One provider kind per invocation.** Pool entries inherit the `--provider` of the call that
   registered them. Re-run the command per backend; later runs add entries beside the existing
   ones rather than replacing them.

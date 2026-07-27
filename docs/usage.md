@@ -60,7 +60,7 @@ JSONL. The two formats are not interchangeable.
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo providers verify` | Ping every configured provider on the completion and embedding paths. | nothing (prints a row per provider) |
+| `wmo providers verify` | Ping the providers that **built** world models recorded, on the completion and embedding paths (deduped by kind and model). A project with nothing built has nothing to verify. | nothing (prints a row per provider) |
 | `wmo harness list` / `show` / `init` | Inspect stored harness versions and aliases, or write the baseline as `v1` with `champion` pointed at it. | a `HarnessDoc` version in the store |
 | `wmo config telemetry` | View or change project-local usage telemetry settings. | `.wmo/settings.toml` |
 | `wmo e2b` | Inspect and reclaim E2B sandbox capacity. | nothing (prints, or reclaims) |
