@@ -1,8 +1,6 @@
 # World Model Optimizer
 
-`wmo` turns agent traces you already collect into continuous improvement. Start with a model
-endpoint at frontier quality with 40%+ lower cost. Keep improving it with world model simulations,
-meta-harness optimization, and model distillation.
+`wmo optimize` turns collected agent traces into smaller open-source models using the Tinker API, with optional closed-loop simulation training. `wmo serve` exposes an endpoint that routes requests between frontier and smaller models; on RouterBench, it maintains frontier quality at 27% lower cost. Rerun the pipeline as new traces arrive to continually improve a model you own.
 
 ![World model, runtime agent, and optimizer connected in a continuous improvement loop](assets/world-model-agent-loop.svg)
 
@@ -29,10 +27,10 @@ Re-run it to add another provider's models beside the ones already registered.
 **2. Tune a router on your OTel traces.**
 
 ```bash
-wmo build --file traces.jsonl --name my-endpoint
+wmo build --file traces.jsonl --name my-model
 
 # Score every registered model on held-out tasks from your traces
-wmo optimize route sweep my-endpoint --traces traces.otel.jsonl
+wmo optimize route sweep my-model --traces traces.otel.jsonl
 
 # Turn those measurements into a routing policy
 wmo optimize route fit matrix.json --kind knn \
@@ -42,13 +40,13 @@ wmo optimize route fit matrix.json --kind knn \
 **3. Serve it.**
 
 ```bash
-wmo serve --name my-endpoint
+wmo serve --name my-model
 ```
 
 See what it bought you against the model you were using before:
 
 ```bash
-wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
+wmo optimize route report matrix.json .wmo/models/my-model/policy.json \
   --baseline gpt-5.5
 ```
 
