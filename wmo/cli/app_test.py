@@ -643,27 +643,27 @@ def test_benchmark_roots_include_the_download_destination(tmp_path, monkeypatch)
     # The wheel ships no benchmark dirs, so the only root a pip user can ever populate is the
     # one `wmo download` writes to. Discovery must consult it, not just the checkout paths.
     bundles = tmp_path / "environment-capture-data"
-    monkeypatch.setattr(cli_app_module, "data_root", lambda: bundles)
+    monkeypatch.setattr(cli_app_module, "_bundle_root", lambda: bundles)
     assert bundles in cli_app_module._benchmark_roots()
 
 
 def test_benchmark_roots_do_not_repeat_the_checkout_dir(monkeypatch) -> None:  # noqa: ANN001
-    # In a checkout data_root() IS the capture member dir; listing it twice would make every
+    # In a checkout the download dir IS the capture member dir; listing it twice would make every
     # task dir look like it "exists in multiple roots".
     repo = Path(cli_app_module.__file__).resolve().parents[2]
     capture = repo / "packages" / "environment-capture"
-    monkeypatch.setattr(cli_app_module, "data_root", lambda: capture)
+    monkeypatch.setattr(cli_app_module, "_bundle_root", lambda: capture)
     roots = cli_app_module._benchmark_roots()
     assert len(roots) == len({root.resolve() for root in roots})
 
 
 def test_examples_list_finds_a_downloaded_bundle(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    # The regression this PR exists for: `wmo download <b>` lands a corpus in data_root(), and
-    # that name must then show up in `wmo examples list` instead of "no examples found".
+    # The regression this PR exists for: `wmo download <b>` lands a corpus in the bundle root,
+    # and that name must then show up in `wmo examples list`, not "no examples found".
     bundles = tmp_path / "environment-capture-data"
     (bundles / "bird-sql").mkdir(parents=True)
     (bundles / "bird-sql" / "traces.otel.jsonl").write_text("", encoding="utf-8")
-    monkeypatch.setattr(cli_app_module, "data_root", lambda: bundles)
+    monkeypatch.setattr(cli_app_module, "_bundle_root", lambda: bundles)
     monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (bundles,))
 
     listed = runner.invoke(app, ["examples", "list"])
@@ -687,7 +687,7 @@ def test_examples_list_with_nothing_installed_names_the_download_command(  # noq
     monkeypatch,  # noqa: ANN001
 ) -> None:
     bundles = tmp_path / "environment-capture-data"
-    monkeypatch.setattr(cli_app_module, "data_root", lambda: bundles)
+    monkeypatch.setattr(cli_app_module, "_bundle_root", lambda: bundles)
     monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (bundles,))
 
     listed = runner.invoke(app, ["examples", "list"])

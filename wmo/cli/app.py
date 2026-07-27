@@ -29,8 +29,6 @@ import uvicorn
 from environment_capture.hub import (
     CORPORA,
     corpus_path,
-    data_root,
-    downloadable_benchmarks,
     fetch_corpus,
     published_corpora,
 )
@@ -1192,7 +1190,7 @@ def download(
         try:
             selected = sorted(corpus.benchmark for corpus in published_corpora())
         except urllib.error.URLError:
-            selected = downloadable_benchmarks()
+            selected = sorted(CORPORA)
     if not selected:
         try:
             published = published_corpora()
@@ -1719,11 +1717,10 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
         )
     missing = [path for path in files if not path.exists()]
     if missing:
-        spec = CORPORA.get(suite.example)
         remedy = (
             f"fetch the bundle with `wmo download {suite.example}`"
-            if spec is not None and spec.published
-            else f"capture or copy the corpus into {data_root() / suite.example}"
+            if suite.example in CORPORA
+            else f"capture or copy the corpus into {_bundle_root() / suite.example}"
         )
         raise typer.BadParameter(
             f"suite {suite.id!r} has no trace corpus at {missing or files}; {remedy}"
@@ -2976,17 +2973,29 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _bundle_root() -> Path:
+    """The dir `wmo download` lands benchmark bundles in (`<root>/<benchmark>/...`).
+
+    Read off `corpus_path`, environment-capture's published "is it local, and where" resolver,
+    which already handles `$ENVCAP_DATA_ROOT`, a repo checkout, and an installed wheel (bundles
+    land in `./environment-capture-data/`, never inside site-packages). Deriving it keeps one
+    source of truth and stays inside the API the PUBLISHED member exposes: outside this
+    workspace `environment-capture` resolves from PyPI, so `wmo` cannot reach for a helper that
+    only exists in the checkout's copy of it.
+    """
+    return corpus_path("any-benchmark").parent.parent
+
+
 def _benchmark_roots() -> tuple[Path, ...]:
     """Every root holding self-contained task dirs, in a checkout AND after `pip install`.
 
     In a checkout that is `examples/` plus the capture member's benchmark dirs, both relative to
     this file. Neither exists inside a wheel (the wheel ships `wmo` and `llm_waterfall` only), so
-    the third root is the one `wmo download` actually writes to: `environment_capture.data_root()`,
-    which is `./environment-capture-data/` for a pip install and honours `$ENVCAP_DATA_ROOT`
-    everywhere. Deduped, because in a checkout that IS the capture member dir.
+    the third root is the one `wmo download` actually writes to (`_bundle_root`). Deduped,
+    because in a checkout that IS the capture member dir.
     """
     repo = Path(__file__).resolve().parents[2]
-    roots = (repo / "examples", repo / "packages" / "environment-capture", data_root())
+    roots = (repo / "examples", repo / "packages" / "environment-capture", _bundle_root())
     unique: list[Path] = []
     for root in roots:
         if not any(root.resolve() == kept.resolve() for kept in unique):
@@ -3031,7 +3040,7 @@ def _no_benchmarks_hint() -> str:
     return (
         "benchmark bundles are Hub-hosted, not shipped with the package: run `wmo download "
         "tau-bench` (or `wmo download` with no arguments to pick from the published list) to "
-        f"fetch one into {data_root()}. Searched: {_describe_roots(_benchmark_roots())}"
+        f"fetch one into {_bundle_root()}. Searched: {_describe_roots(_benchmark_roots())}"
     )
 
 

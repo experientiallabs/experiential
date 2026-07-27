@@ -266,7 +266,7 @@ def corpus_path(benchmark: str) -> Path:
     This is the "is it local, and where" resolver every front-end shares: check
     ``corpus_path(b).exists()`` before deciding to download or to serve from disk.
     """
-    return data_root() / benchmark / _CORPUS_FILE
+    return _data_root() / benchmark / _CORPUS_FILE
 
 
 def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
@@ -341,7 +341,7 @@ def fetch_corpus(
             f"published to the Hub yet, so there is nothing to download; pick one of: {available}"
         )
     token = token if token is not None else _default_token()
-    root = data_root()
+    root = _data_root()
     target = dest or corpus_path(benchmark)
 
     # One recursive tree call covers the whole repo; sizes make the total known up front so a
@@ -430,7 +430,7 @@ def _resolve_repo(
     raise CorpusRepoUnavailable(benchmark, revision, failures)
 
 
-def data_root() -> Path:
+def _data_root() -> Path:
     """Where benchmark data dirs live (``<root>/<benchmark>/traces.otel.jsonl``).
 
     Resolution order: the ``ENVCAP_DATA_ROOT`` env var; a repo checkout (the dir holding
@@ -438,9 +438,8 @@ def data_root() -> Path:
     ``environment-capture-data/`` under the current directory — a pip user's bundles land in
     their project, never inside site-packages.
 
-    Public because it is the ONLY correct spelling of that location: a front-end that hardcodes
-    the checkout path instead (as ``wmo``'s benchmark discovery used to) goes blind to every
-    bundle a pip user downloads, and ignores ``ENVCAP_DATA_ROOT`` for everyone.
+    Private on purpose: ``corpus_path`` is the published spelling of this location, so a
+    front-end asking "where would this bundle be" goes through that and cannot drift.
     """
     override = os.environ.get("ENVCAP_DATA_ROOT")
     if override:

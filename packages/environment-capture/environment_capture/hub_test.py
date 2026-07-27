@@ -25,7 +25,7 @@ from environment_capture.hub import (
 
 @pytest.fixture()
 def data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setattr(hub, "data_root", lambda: tmp_path)
+    monkeypatch.setattr(hub, "_data_root", lambda: tmp_path)
     return tmp_path
 
 
@@ -318,7 +318,7 @@ def test_published_corpora_lists_a_double_published_benchmark_once(
 def test_every_committed_corpus_is_publishable_or_documented_local_only() -> None:
     """Manifest coverage: every benchmark dir with a local corpus must either be in the
     publish manifest or be appworld (the documented local-only exception)."""
-    root = hub.data_root()
+    root = hub._data_root()
     dirs = {p.parent.name for p in root.glob("*/traces.otel.jsonl")}
     if not dirs:  # standalone package install: data dirs don't ship
         pytest.skip("no sibling benchmark data dirs")
@@ -359,7 +359,7 @@ def test_fetch_names_a_repo_missing_its_corpus(
 def test_gitignore_covers_every_declared_data_dir() -> None:
     """The package .gitignore must shadow CORPORA's data_dirs: a spec dir with no matching
     ignore pattern means `git add -A` can commit license-restricted payload."""
-    gitignore = hub.data_root() / ".gitignore"
+    gitignore = hub._data_root() / ".gitignore"
     if not gitignore.exists():  # standalone package install
         pytest.skip("no package .gitignore shipped")
     patterns = {
@@ -381,7 +381,7 @@ def test_license_tags_match_the_provenance_readmes() -> None:
         "mit": ("MIT",),
         "apache-2.0": ("Apache",),
     }
-    root = hub.data_root()
+    root = hub._data_root()
     checked = 0
     for spec in CORPORA.values():
         readme = root / spec.benchmark / "README.md"
@@ -427,13 +427,13 @@ def test_data_root_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     """Env override wins; a repo checkout uses the package's sibling dirs; an installed wheel
     (no sibling pyproject) lands bundles under the CWD, never inside site-packages."""
     monkeypatch.setenv("ENVCAP_DATA_ROOT", str(tmp_path / "override"))
-    assert hub.data_root() == tmp_path / "override"
+    assert hub._data_root() == tmp_path / "override"
 
     monkeypatch.delenv("ENVCAP_DATA_ROOT")
-    assert (hub.data_root() / "pyproject.toml").exists()  # repo checkout: the member dir
+    assert (hub._data_root() / "pyproject.toml").exists()  # repo checkout: the member dir
 
     site = tmp_path / "venv" / "site-packages" / "environment_capture"
     site.mkdir(parents=True)
     monkeypatch.setattr(hub, "__file__", str(site / "hub.py"))
     monkeypatch.chdir(tmp_path)
-    assert hub.data_root() == tmp_path / "environment-capture-data"
+    assert hub._data_root() == tmp_path / "environment-capture-data"
