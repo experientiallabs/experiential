@@ -572,7 +572,17 @@ def examples_run(
         raise typer.BadParameter(
             f"example {name!r} has a run.sh that is not executable; run `chmod +x {runner}`"
         )
-    result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
+    try:
+        result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
+    except OSError as exc:
+        # The exec itself failed, so there is no exit code to forward: the launcher has no
+        # shebang (ENOEXEC), or names an interpreter that is not installed (ENOENT, whose
+        # "No such file or directory" reads as a lie about a run.sh we just stat'd). Say which
+        # line to look at instead of letting the errno out as a traceback.
+        raise typer.BadParameter(
+            f"example {name!r} could not start {runner} ({exc.strerror or exc}); "
+            f"check its interpreter line with `head -1 {runner}`"
+        ) from exc
     raise typer.Exit(result.returncode)
 
 

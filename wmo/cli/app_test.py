@@ -440,6 +440,36 @@ def test_examples_run_rejects_a_non_executable_launcher(tmp_path, monkeypatch) -
     assert "chmod +x" in _flat(result.output)
 
 
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param("echo hi\n", id="no-shebang"),  # execve -> ENOEXEC
+        pytest.param("#!/nonexistent/interp\n", id="missing-interpreter"),  # execve -> ENOENT
+    ],
+)
+def test_examples_run_reports_a_launcher_that_cannot_be_started(
+    tmp_path,  # noqa: ANN001
+    monkeypatch,  # noqa: ANN001
+    script: str,
+) -> None:
+    # X_OK passes but the kernel still refuses to exec, so `subprocess.run` raises before there
+    # is any exit code to forward. That must not surface as an OSError traceback either.
+    example = tmp_path / "unstartable"
+    example.mkdir()
+    launcher = example / "run.sh"
+    launcher.write_text(script, encoding="utf-8")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    result = runner.invoke(app, ["examples", "run", "unstartable"])
+
+    assert result.exit_code == 2, result.output  # usage error, not a traceback
+    assert not isinstance(result.exception, OSError), result.exception
+    output = _flat(result.output)
+    assert "could not start" in output
+    assert "head -1" in output
+
+
 def test_config_help_does_not_reuse_the_harness_group_name() -> None:
     # `wmo harness` is a different group managing a different object; `wmo config` manages the
     # project's own settings file.
