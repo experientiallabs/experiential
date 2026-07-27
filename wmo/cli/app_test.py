@@ -19,7 +19,15 @@ from typer.testing import CliRunner
 from wmo.cli import app, pool_registry
 from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmo.cli.pool_registry import read_pool_entries
-from wmo.config import HarnessConfig, ModelRole, load_config, load_settings, save_settings
+from wmo.config import (
+    FIDELITY_TIERS,
+    FidelityTier,
+    HarnessConfig,
+    ModelRole,
+    load_config,
+    load_settings,
+    save_settings,
+)
 from wmo.core.types import Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 from wmo.engine.eval_suites import EvalSuiteConfig
@@ -1748,3 +1756,38 @@ def test_default_eval_holdout_contains_no_build_training_trace() -> None:
     assert holdout, "sanity: the corpus must actually produce a holdout"
     leaked = {t.trace_id for t in gepa_train} & {t.trace_id for t in holdout}
     assert leaked == set(), f"{len(leaked)} GEPA training traces scored as held-out"
+
+
+def test_build_defaults_to_the_free_fidelity_tier(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    """A plain `wmo build` must not spend on search.
+
+    The default was `medium`, which runs GEPA plus a cheap-lever config search; in one observed
+    build that was 73% of total spend. `low` is `estimate_only` with `gepa_budget=0` and no
+    config search, so the documented quickstart no longer bills a first-time user by default.
+    `auto_fidelity.json` records the difference: the low tier writes a signature estimate with
+    no `scores`, while every searching tier writes the scores it paid for.
+    """
+    spec = FIDELITY_TIERS[FidelityTier.LOW]
+    assert spec.gepa_budget == 0 and spec.config_search is False, "low is no longer the free tier"
+
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "defaulted",
+            "--file",
+            _traces_file(tmp_path),
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    auto = json.loads(
+        (root / "models" / "defaulted" / "auto_fidelity.json").read_text(encoding="utf-8")
+    )
+    assert not auto.get("scores"), f"default build paid for a config search: {auto['scores']}"

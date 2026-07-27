@@ -589,11 +589,13 @@ def build(
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     fidelity: str = typer.Option(
-        "medium",
+        "low",
         help="Build effort (all searching tiers are floored at low's estimate — more effort "
-        "never ships worse than low): low (free; the estimated-best config, no search) | "
-        "medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | max (deep "
-        "GEPA + full config search). The chosen config serves under `--max-fidelity`.",
+        "never ships worse than low): low (default; free — the estimated-best config, no "
+        "search) | medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | "
+        "max (deep GEPA + full config search). Searching tiers cost real money: one observed "
+        "medium build spent 73% of its total on GEPA. The chosen config serves under "
+        "`--max-fidelity`.",
     ),
     chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."

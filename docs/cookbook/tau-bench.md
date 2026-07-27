@@ -83,10 +83,10 @@ same command with `--source <name>`, or through `wmo ingest` first.
 
 The two flags above are the free configuration: `--fidelity low` takes the estimated-best config
 with no search, and `--embed-provider hashing` indexes with an offline embedder. That is what
-produced the transcript below, at a measured `$0.0000`. The default is `--fidelity medium`, which
-adds light prompt optimization and a cheap-lever search and does cost money; `high` and `max`
-search harder. Every searching tier is floored at low's estimate, so more effort never ships a
-worse config than low.
+produced the transcript below, at a measured `$0.0000`. `low` is also the default, so a plain
+`wmo build` does not spend on search. Opt into `--fidelity medium` for light prompt optimization
+and a cheap-lever search, or `high`/`max` to search harder; those tiers cost real money. Every
+searching tier is floored at low's estimate, so more effort never ships a worse config than low.
 
 ```
 ✓ ingested 1033 traces → normalized 5289 steps
