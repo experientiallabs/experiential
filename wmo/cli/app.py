@@ -1937,7 +1937,10 @@ def _ingest_scenario_corpus(file: str) -> list[Trace]:
             f"--file {file} does not exist; pass an exported OTel-GenAI corpus, or fetch a "
             "benchmark one with `wmo download <benchmark>`"
         )
-    return get_adapter("otel-genai").from_file(file)
+    try:
+        return get_adapter("otel-genai").from_file(file)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _unreadable_input(f"--file {file}", path, exc) from exc
 
 
 def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
@@ -1966,6 +1969,26 @@ def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
             f"({exc.error_count()} validation error(s), first: {exc.errors()[0]['msg']}); "
             f"{build_hint}"
         ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _unreadable_input(f"scenario set {scenarios_file}", path, exc) from exc
+
+
+def _unreadable_input(label: str, path: Path, exc: OSError | UnicodeDecodeError) -> Exception:
+    """Report the two read failures an exists/is-dir check cannot predict as a usage error.
+
+    A path that passes the shape checks can still fail inside the read: no permission on it, or
+    bytes that are not UTF-8 (a compressed or binary export). Both otherwise reach the user as a
+    stdlib traceback, which is the thing these guards exist to prevent.
+    """
+    if isinstance(exc, UnicodeDecodeError):
+        return typer.BadParameter(
+            f"{label} is not UTF-8 text; pass the decompressed JSON/JSONL export "
+            f"(`file {path}` says what it actually is)"
+        )
+    return typer.BadParameter(
+        f"{label} could not be read ({exc.strerror or exc}); "
+        f"`ls -l {path}` shows its owner and mode"
+    )
 
 
 def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
@@ -2443,11 +2466,16 @@ def research_concurrency(
         [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
     )
     # An unresolvable suite is a bad argument, like every other input validated above; the
-    # ValueError carries the available names, so only the next command has to be added.
+    # ValueError carries the available names, so only the next command has to be added. A direct
+    # `.toml` selector that exists resolves past name lookup and fails on its own contents, so
+    # listing the discoverable suites there would point away from the file that needs repairing.
+    direct_suite_file = Path(suite)
     try:
         resolved = resolve_eval_suite(suite, suite_roots)
     except ValueError as exc:
-        raise typer.BadParameter(f"{exc}; `wmo eval list` prints the suites") from exc
+        by_name = not (direct_suite_file.suffix == ".toml" and direct_suite_file.exists())
+        hint = "; `wmo eval list` prints the suites" if by_name else ""
+        raise typer.BadParameter(f"{exc}{hint}") from exc
     files = resolved.resolve_files()
     missing = [f for f in files if not f.exists()]
     if not files or missing:

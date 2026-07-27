@@ -1591,6 +1591,59 @@ def test_scenarios_verify_malformed_scenario_set_is_clean_error(tmp_path) -> Non
     assert "errors.pydantic.dev" not in flat
 
 
+def test_scenarios_verify_non_utf8_scenario_set_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P1): `ScenarioSet.load` reads with encoding="utf-8", so binary bytes
+    # raise UnicodeDecodeError *before* pydantic and slipped past the ValidationError handler.
+    scenarios_file = tmp_path / "scenarios.json"
+    scenarios_file.write_bytes(b"\xff\xfe\x00binary")
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    result = runner.invoke(app, ["scenarios", "verify", str(scenarios_file), "--file", str(corpus)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, UnicodeDecodeError)
+    assert "is not UTF-8 text" in _framed(result.output)
+
+
+def test_scenarios_build_non_utf8_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P1): a path that exists still fails inside the adapter's read.
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_bytes(b"\xff\xfe\x00binary")
+    result = runner.invoke(app, ["scenarios", "build", "--file", str(corpus)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, UnicodeDecodeError)
+    flat = _framed(result.output)
+    assert "--file" in flat and "is not UTF-8 text" in flat
+
+
+def test_scenarios_build_unreadable_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P1): chmod-000 raised PermissionError out of Path.read_text.
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    corpus.chmod(0)
+    try:
+        result = runner.invoke(app, ["scenarios", "build", "--file", str(corpus)])
+    finally:
+        corpus.chmod(0o644)
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, PermissionError)
+    flat = _framed(result.output)
+    assert "could not be read" in flat
+    assert "shows its owner and mode" in flat
+
+
+def test_research_concurrency_malformed_suite_file_omits_the_listing_hint(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P2): a direct `.toml` selector that exists resolves past name lookup
+    # and fails on its own contents, so `wmo eval list` would point away from the broken file.
+    suite_file = tmp_path / "broken.toml"
+    suite_file.write_text("this is not = toml [[[\n", encoding="utf-8")
+    result = runner.invoke(app, ["research", "concurrency", str(suite_file)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValueError)
+    flat = _framed(result.output)
+    assert "is not valid TOML" in flat
+    assert "wmo eval list" not in flat
+
+
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
     from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
