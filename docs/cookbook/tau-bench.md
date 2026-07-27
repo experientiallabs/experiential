@@ -407,10 +407,10 @@ uv run wmo optimize route report matrix.json .wmo/models/tau-bench/policy.json \
   --baseline claude-opus-4-8 --endpoint tau-bench --out report.json
 ```
 
-One difference worth knowing before scripting these: `route sweep` does **not** share the staged
-command's consent refusal. On a non-interactive session it prints that it is proceeding without
-confirmation and buys the sweep. So pass `--yes` there because you mean it, and treat an unattended
-`route sweep` as spending by default; `--dry-run` is the staged command's flag, not this one's.
+One thing worth knowing before scripting these: `route sweep` shares the staged command's consent
+refusal. Consent is said, never inferred, so on a non-interactive session (CI, cron, piped output,
+`| tee`) it prints what it would have spent and exits 2 instead of buying the sweep. Pass `--yes`
+there because you mean it. `--dry-run` is the staged command's flag, not this one's.
 
 Reach for these when you want a knob the staged command does not expose: `--kind rank` for
 Avengers cluster ranks instead of kNN evidence, `--z` for a stricter or looser confidence bar,

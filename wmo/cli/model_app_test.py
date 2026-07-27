@@ -358,6 +358,25 @@ def test_distill_runtime_error_exits_nonzero_with_the_message(
 # -- cost confirmation -------------------------------------------------------------------------
 
 
+def test_distill_non_interactive_without_yes_refuses_and_prices_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: exit 2, naming the projected spend and the flag that authorizes it."""
+    _write_inputs(tmp_path, extra_toml=_PRICING_TOML + _BUDGET_TOML)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result)
+    assert "cannot ask for spend consent" in flat
+    assert "wmo optimize distill run would spend ~$" in flat
+    assert "budget.max_usd cap" in flat
+    assert "--yes" in flat
+    assert recorder.calls == []  # no training started
+
+
 def test_distill_unpriced_meters_without_budget_reject_yes_non_interactively(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

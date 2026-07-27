@@ -20,15 +20,15 @@ Three optimizers, named for the artifact each produces.
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. | `matrix.json` (an `OutcomeMatrix`) |
+| `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. A non-interactive run needs `--yes`, or it prints the projected spend and exits 2. | `matrix.json` (an `OutcomeMatrix`) |
 | `wmo optimize route fit` | Fit a routing policy on a matrix: `--kind knn` guarded neighbor evidence (the default), or `--kind rank` cluster ranks. | `policy.json` + its evidence bank |
 | `wmo optimize route tune` | Set a fitted policy's cost/quality dial in place, no refit. | the policy, rewritten; `policy.base.json` snapshot |
 | `wmo optimize route report` | Build the three-objective improvement report for a policy over a matrix. | `report.json` (an `ImprovementReport`) |
 | `wmo optimize route pin` | Serve one pool model as an endpoint, with no matrix and no fit. | a `kind="static"` `policy.json` |
 | `wmo optimize route student` | Add a distilled student to the candidate pool as a priced entry. | a `[[model]]` entry in `pool.toml` |
-| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
+| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. A non-interactive run needs `--yes` in either environment. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
 | `wmo optimize distill probe` | Ask a measured outcome matrix whether this workload has a teacher gap worth distilling at all, and which model is the cheapest sufficient teacher. Free. Exits 0 (distill), 3 (no gap), 4 (too thin to say). | nothing (prints) |
-| `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
+| `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. A non-interactive run needs `--yes`. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
 | `wmo optimize distill report` | Read a finished or aborted run back: gate verdict and held-out before/after table. Free. | nothing (prints) |
 
 `wmo optimize model` is the staged path over the four `route` commands and calls the same library

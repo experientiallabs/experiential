@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 import typer
 from llm_waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage
+from rich.console import Console
 from typer.testing import CliRunner
 
 import wmo.cli.agent_session as mod
@@ -205,6 +206,52 @@ def test_build_driver_uses_configured_local_worker(
     [config] = configs
     assert config.kind is ProviderKind.OPENAI
     assert config.model == "gpt-5.4-mini"
+
+
+class _UnpreparedProvider(_FakeProvider):
+    """A `PreparableProvider` whose backend cannot be resolved locally."""
+
+    def prepare(self) -> None:
+        raise ValueError("no AWS region configured (set AWS_REGION)")
+
+
+def test_build_driver_names_the_worker_it_picked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare `wmo run` with nothing configured says which model it silently defaulted to."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    _patch_local_provider(monkeypatch)
+    console = Console(file=io.StringIO(), width=200)
+    monkeypatch.setattr(mod, "_console", console)
+
+    mod._build_driver(target=None, jail_root=tmp_path, provider=None, model=None, task=None)
+
+    printed = cast(io.StringIO, console.file).getvalue()
+    assert f"worker: {mod._DEFAULT_PROVIDER}/" in printed
+    assert "built-in default" in printed
+
+
+def test_build_driver_preflights_the_worker_before_the_harness_boots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that cannot be prepared is a boundary error, not a mid-session failure.
+
+    Without this the run downloads the pi Node runtime, reaches "session ready", and only then
+    fails on a provider the user never chose, with nothing pointing at `wmo providers set`.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    monkeypatch.setattr(mod, "get_provider", lambda _config: _UnpreparedProvider())
+    monkeypatch.setattr(mod, "_console", Console(file=io.StringIO(), width=200))
+
+    with pytest.raises(typer.BadParameter) as caught:
+        mod._build_driver(target=None, jail_root=tmp_path, provider=None, model=None, task=None)
+
+    message = " ".join(str(caught.value).split())
+    assert "no AWS region configured" in message
+    assert f"worker provider {mod._DEFAULT_PROVIDER}/" in message
+    assert "wmo providers set --provider <provider> --model <model>" in message
 
 
 def test_build_driver_logged_in_agent_uses_hosted_e2b_without_local_workspace(

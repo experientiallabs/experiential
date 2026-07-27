@@ -31,9 +31,9 @@ import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Confirm
 from rich.table import Table
 
+from wmo.cli.consent import require_spend_consent
 from wmo.cli.route_app import (
     BIAS_ACCEPTED_NOTE,
     NO_EVIDENCE_WARNING,
@@ -249,7 +249,12 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         "biased; the coverage table prints either way.",
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir holding the built models."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the one spend confirmation."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output), where a spending run otherwise refuses to start.",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -442,7 +447,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except BudgetExceeded as exc:
         _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
-    if not _confirm(decisions, yes=yes):
+    if not _confirm(decisions, plan, yes=yes):
         _console.print("nothing was run and nothing was spent")
         raise typer.Exit(0)
 
@@ -1074,7 +1079,7 @@ def _status_text(decision: StageDecision) -> str:
     return f"will run [dim]({escape(decision.reason)})[/dim]"
 
 
-def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
+def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> bool:
     """The run's single spend confirmation. One question, before the first paid call.
 
     Asked whenever the SWEEP will run, rather than whenever the candidate projection is nonzero.
@@ -1085,9 +1090,10 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
 
     A non-interactive session cannot answer, so a spending run REFUSES rather than proceeding:
     consent must be said (`--yes`), never inferred from the absence of a terminal. Every spend
-    surface (`route sweep`, `optimize distill`, the harbor search) shares this rule; all of
-    them originally shipped proceed-silently-or-note, and the proceed branch here cost a
-    scripted caller real money it never agreed to.
+    surface (`route sweep`, `optimize distill`, both harness environments) shares the one
+    implementation in `wmo.cli.consent`; all of them originally shipped
+    proceed-silently-or-note, and the proceed branch here cost a scripted caller real money it
+    never agreed to.
 
     Raises:
         typer.Exit: code 2 when a spending run cannot ask and was not told `--yes`.
@@ -1096,13 +1102,13 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
         return False
     if yes or not _will_sweep(decisions):
         return True
-    if not _console.is_terminal:
-        _console.print(
-            "\nnon-interactive session: cannot ask for spend consent. Re-run with --yes to "
-            "consent explicitly, or --dry-run to see the plan without spending."
-        )
-        raise typer.Exit(2)
-    return Confirm.ask("\nProceed?", default=True)
+    return require_spend_consent(
+        _console,
+        yes=yes,
+        spend=f"~${_projected_total(decisions, plan):.2f} across {plan.cells} sweep cell(s)",
+        command="wmo optimize model",
+        alternative="--dry-run to see the plan without spending",
+    )
 
 
 # ------------------------------------------------------------------------------ stage execution

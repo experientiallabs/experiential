@@ -199,6 +199,11 @@ than the unique context size. The CLI prints the per-meter projection and asks f
 confirmation before anything is spent; unpriced meters print as `unknown`, and a run with
 unpriced meters and no `budget.max_usd` refuses to start non-interactively.
 
+Consent is said, never inferred. There is nobody to ask on a non-interactive session (CI, cron,
+piped output), so the run refuses there with exit code 2 unless `--yes` was passed, printing what
+it would have spent and the flag that authorizes it. A bounded `budget.max_usd` caps the damage
+but is not permission, so it does not change that.
+
 ## Running it
 
 ```bash
@@ -217,9 +222,9 @@ not the executing agent: the rollout knobs (`sampling.temperature`, `rollout.max
 surfaces, and its hash keys every harbor job so a config change cannot resume another config's
 trials. The agent harbor runs is always `terminus-2`.
 
-`--backend local|e2b` overrides the config's `harbor.backend`. `--yes` skips the cost
-confirmation when the spend is accountable. Add `--promote` to be offered a `[models.agent]`
-settings write after an accepted gate.
+`--backend local|e2b` overrides the config's `harbor.backend`. `--yes` consents to the cost
+when the spend is accountable, and is required on a non-interactive session. Add `--promote` to
+be offered a `[models.agent]` settings write after an accepted gate.
 
 Before spending anything the run preflights: renderer resolution, a student/teacher tokenizer
 fingerprint check, one-token pings, and a tokens-in-tokens-out (TITO) recompute proof that the

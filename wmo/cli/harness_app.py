@@ -22,12 +22,13 @@ import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 
 from wmo.agents.default import default_agent
 from wmo.agents.optimizer import optimizer_agent
 from wmo.agents.project import AgentProject
+from wmo.cli.consent import require_spend_consent
 from wmo.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.config.store import validate_name
@@ -227,7 +228,12 @@ def optimize(
     archive_out: str = typer.Option(
         None, "--archive", help="Also write the full delta archive JSON here."
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output), where the run otherwise refuses to start.",
+    ),
     harbor_config: str = typer.Option(
         None,
         "--harbor-config",
@@ -429,7 +435,15 @@ def optimize(
         f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
         f"{meta_note}{agent_note}{backend_note}"
     )
-    if interactive and not yes and not Confirm.ask("Proceed?", default=True):
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=(
+            f"up to ~{rollouts} rollout(s){holdout_note} + {candidate_count} proposal(s) "
+            f"against world model {model_name}"
+        ),
+        command="wmo optimize harness",
+    ):
         raise typer.Exit(0)
 
     def _progress(iteration: int, variant: str, score: float, changed: bool) -> None:
@@ -709,16 +723,16 @@ def _optimize_harbor(
         f"{config.attempts} attempt(s), reward mode {config.reward_mode}, "
         f"worker backend {config.backend} (proposer project: E2B) -> {run_dir}"
     )
-    if not yes:
-        if not _console.is_terminal:
-            # Consent is said, never inferred (the shared spend-surface rule).
-            _console.print(
-                "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-                "consent explicitly"
-            )
-            raise typer.Exit(2)
-        if not Confirm.ask("Proceed?", default=True):
-            raise typer.Exit(0)
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=(
+            f"1 seed + {config.iterations} proposal slot(s) over {len(config.task_ids)} task(s) "
+            f"x {config.attempts} attempt(s) on backend {config.backend}"
+        ),
+        command="wmo optimize harness",
+    ):
+        raise typer.Exit(0)
 
     scorer, task_pins = _build_harbor_scorer(config, run_dir=run_dir, provider_config=agent_config)
     if resume:

@@ -19,6 +19,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
@@ -605,7 +606,7 @@ def test_declining_the_confirmation_spends_nothing(
     world_model = _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root)
     assert result.exit_code == 0, result.output
@@ -621,7 +622,7 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root)
     flat = _flat(result.output)
@@ -644,7 +645,7 @@ def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
     provider, and how much of the grid a previous attempt already paid for."""
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
-    monkeypatch.setattr(optimize_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(False))
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     paced = _run(tmp_path, root, "--concurrency", "6")
     assert "2candidate(s)x3scenario(s)x1episode(s),6atatime" in _flat(paced.output)
@@ -1013,7 +1014,7 @@ def test_the_first_sweep_says_the_world_model_side_is_not_projectable(
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root)
     assert result.exit_code == 0, result.output
@@ -1174,7 +1175,7 @@ def test_the_cap_refuses_before_asking_rather_than_after(
     world_model = _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(True)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root, "--max-usd", "0.01")
     assert result.exit_code == 1, result.output
@@ -1205,7 +1206,7 @@ def test_a_zero_priced_pool_is_still_confirmed_because_the_simulator_is_not_free
         encoding="utf-8",
     )
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root, pool=free_pool)
     assert result.exit_code == 0, result.output

@@ -17,6 +17,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
@@ -1707,7 +1708,7 @@ def test_route_sweep_declining_the_confirmation_spends_nothing(
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     monkeypatch.setattr(route_module, "_console", Console(force_terminal=True))
-    monkeypatch.setattr(route_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(False))
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "3")
     assert result.exit_code == 0, result.output
     assert not out.exists()  # nothing written
@@ -1725,7 +1726,7 @@ def test_route_sweep_confirming_at_a_tty_runs_the_sweep(
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     monkeypatch.setattr(route_module, "_console", Console(force_terminal=True))
-    monkeypatch.setattr(route_module, "Confirm", _Answer(True))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(True))
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "1")
     assert result.exit_code == 0, result.output
     assert len(OutcomeMatrix.load(out).outcomes) == 2

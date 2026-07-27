@@ -35,6 +35,7 @@ from rich.markup import escape
 from rich.prompt import Confirm
 from rich.table import Table
 
+from wmo.cli.consent import require_spend_consent
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
 from wmo.engine import load_world_model
@@ -178,7 +179,12 @@ def sweep(
         DEFAULT_MATRIX_FILENAME, "--out", help="Where to write the OutcomeMatrix JSON."
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output), where the run otherwise refuses to start.",
+    ),
     allow_uneven_coverage: bool = typer.Option(
         False,
         "--allow-uneven-coverage",
@@ -235,11 +241,13 @@ def sweep(
     one-hour grid; it is not part of what the sweep measures, so a run interrupted at one value
     resumes at another.
 
-    Spend is confirmed before the first episode runs (`--yes` skips, as in
-    `wmo optimize harness --mode distill`). What that estimate multiplies is ASSUMED tokens per
-    policy call by the real cell and call counts, so it is a projection, never a measurement;
-    the measured candidate spend is printed when the sweep finishes. Before that question is asked,
-    every candidate's backend is resolved as far as it goes without a request: its kind's static
+    Spend is confirmed before the first episode runs, and consent is said, never inferred: at a
+    terminal the projected cost is a question, and with no terminal to ask at (CI, cron, piped
+    output, `| tee`) the run REFUSES with exit code 2 unless `--yes` was passed, naming what it
+    would have spent. What that estimate multiplies is ASSUMED tokens per policy call by the real
+    cell and call counts, so it is a projection, never a measurement; the measured candidate spend
+    is printed when the sweep finishes. Before that question is asked, every candidate's backend
+    is resolved as far as it goes without a request: its kind's static
     requirements from the entry alone, then its lazy SDK client forced to BUILD, which imports the
     SDK and resolves credentials locally. So a candidate that could never be called is a usage
     error at the boundary, not a mid-sweep abort with earlier candidates already paid for. Two
@@ -333,7 +341,7 @@ def sweep(
     world_model, _serve_provider = load_world_model(model_dir)
 
     print_cost_estimate(_console, plan, already_measured=already_measured)
-    _confirm_cost(yes=yes)
+    _confirm_cost(plan, yes=yes)
 
     _console.print(
         f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.scenarios)} held-out "
@@ -617,27 +625,25 @@ def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: 
     )
 
 
-def _confirm_cost(*, yes: bool) -> None:
+def _confirm_cost(plan: SweepPlan, *, yes: bool) -> None:
     """Confirm the projected spend before any episode runs.
 
     Consent is said, never inferred: a non-interactive session cannot answer a prompt, so a
     spending run REFUSES unless `--yes` was passed. This command shipped proceed-and-note for
     its first day, and the equivalent branch in `wmo optimize model` spent a scripted caller's
-    real money it never agreed to; every spend surface now shares the refusal.
+    real money it never agreed to; every spend surface now shares one refusal
+    (`wmo.cli.consent.require_spend_consent`).
 
     Raises:
         typer.Exit: The user declined (exit code 0), or a non-interactive session was not told
             `--yes` (exit code 2).
     """
-    if yes:
-        return
-    if not _console.is_terminal:
-        _console.print(
-            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-            "consent explicitly"
-        )
-        raise typer.Exit(2)
-    if not Confirm.ask("Proceed?", default=True):
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=f"~${plan.total_usd:.2f} across {plan.cells} cell(s)",
+        command="wmo optimize route sweep",
+    ):
         raise typer.Exit(0)
 
 

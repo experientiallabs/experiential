@@ -104,9 +104,51 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
             "2",
             "--root",
             str(tmp_path / ".wmo"),
+            # Consent is explicit on every spend surface: a non-TTY search without --yes
+            # refuses (exit 2), and CliRunner is never a TTY. Consent semantics have their own
+            # test below; every other world-model test consents up front.
+            "--yes",
             *extra,
         ],
     )
+
+
+def test_world_model_search_non_interactive_without_yes_refuses_to_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: the search refuses before `create_harness` is ever called.
+
+    The harbor mode of this same command grew the refusal first; this branch kept inferring
+    consent from `interactive`, so a piped or CI run started a paid propose-and-gate search
+    with no prompt and no notice.
+    """
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--iterations",
+            "2",
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+
+    flat = " ".join(result.output.split())  # rich wraps to the console width
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in flat
+    # The refusal quotes the size of what it declined to authorize and the flag that authorizes
+    # it, so a scripted caller can act on the message alone.
+    assert "up to ~9 rollout(s) + 2 proposal(s)" in flat
+    assert "--yes" in flat
+    assert recorder.calls == []  # no paid search started
 
 
 def _patch_load(
@@ -246,6 +288,7 @@ def test_optimize_accepts_world_model_as_second_argument(
             "1",
             "--root",
             str(tmp_path / ".wmo"),
+            "--yes",
         ],
     )
 

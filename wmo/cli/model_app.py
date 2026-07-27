@@ -43,6 +43,7 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.agents.default import default_agent
+from wmo.cli.consent import require_spend_consent
 from wmo.cli.model_roles import load_settings_or_abort
 from wmo.config import ARTIFACT_DIR
 from wmo.config.settings import ModelRole, save_settings, settings_path
@@ -163,7 +164,12 @@ def run(
         help="After an accepted gate, offer to point the models.agent role in settings.toml "
         "at the distilled adapter (always asks for confirmation).",
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output), where the run otherwise refuses to start.",
+    ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
 ) -> None:
     """Train (or resume) an agent model by distillation on real benchmark tasks.
@@ -920,9 +926,13 @@ def _confirm_cost(
     with `--yes`; a non-interactive invocation in that state is rejected with
     instructions (price the meters or set the cap).
 
+    Everything else goes through the shared spend boundary
+    (`wmo.cli.consent.require_spend_consent`), so consent is said, never inferred.
+
     Raises:
         typer.BadParameter: Unbounded spend in a non-interactive session.
-        typer.Exit: The user declined (exit code 0).
+        typer.Exit: The user declined (exit code 0), or a non-interactive session was not
+            told `--yes` (exit code 2).
     """
     if estimate.unpriced_meters and max_usd is None:
         meters = ", ".join(estimate.unpriced_meters)
@@ -941,17 +951,21 @@ def _confirm_cost(
         if not Confirm.ask("Proceed with unbounded spend?", default=False):
             raise typer.Exit(0)
         return
-    if yes:
-        return
-    if not console.is_terminal:
-        # Consent is said, never inferred: a bounded budget caps the damage but does not
-        # grant permission, and this used to start six-figure-token training runs silently.
-        console.print(
-            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-            "consent explicitly"
-        )
-        raise typer.Exit(2)
-    if not Confirm.ask("Proceed?", default=True):
+    # Consent is said, never inferred: a bounded budget caps the damage but does not grant
+    # permission, and this used to start six-figure-token training runs silently.
+    cap = f" under the ${max_usd:.2f} budget.max_usd cap" if max_usd is not None else ""
+    episodes = (
+        estimate.train_episodes
+        + estimate.warmup_episodes
+        + estimate.eval_episodes
+        + estimate.baseline_episodes
+    )
+    if not require_spend_consent(
+        console,
+        yes=yes,
+        spend=f"~${estimate.priced_usd:.2f} over {episodes} episode(s){cap}",
+        command="wmo optimize distill run",
+    ):
         raise typer.Exit(0)
 
 
