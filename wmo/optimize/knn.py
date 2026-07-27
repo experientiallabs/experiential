@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression import CompressingEmbedder, CompressionConfig
 from wmo.optimize.policy import (
     DEFAULT_KNN_MIN_PAIRS,
     DEFAULT_KNN_Z,
@@ -315,6 +315,14 @@ def fit_knn_artifact(
     if rag_thres <= 0.0:
         raise ValueError("rag_thres must be greater than 0")
     built = embedder.build()
+    if compression is not None:
+        # Representation consistency, the C2 rule that makes or breaks a compressed arm: the
+        # bank rows and the novelty-floor quantile have to live in the geometry of the text
+        # SERVING will embed, which is the compressed text. One wrapped embedder covers the fit
+        # and the replay below. Serving does not wrap, because its compression stage runs ahead
+        # of the router. Fitting the bank uncompressed while serving compresses is the failure
+        # this exists to prevent: the floor abstains, and routing silently stops happening.
+        built = CompressingEmbedder(built, compression)
     embed_tag = embedder_provenance(embedder)
     policy = fit_knn_policy(
         matrix,
@@ -336,9 +344,14 @@ def fit_knn_artifact(
     )
     if compression is not None:
         # Stamped BEFORE the save, because the artifact on disk is what serving mounts and what
-        # the mount gate compares. `model_copy` skips validators, so the caller has already
-        # resolved the compressor id (an unknown one must fail before anything is written).
-        policy = policy.model_copy(update={"compression": compression})
+        # the mount gate compares. Both halves: what this endpoint serves, and what its evidence
+        # was fitted under. They are the same config here by construction, since the fit just
+        # embedded through it, and that identity is what the mount gate re-checks.
+        # `model_copy` skips validators, so the caller has already resolved the compressor id
+        # (an unknown one must fail before anything is written).
+        policy = policy.model_copy(
+            update={"compression": compression, "fit_compression": compression}
+        )
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     return KnnFitOutcome(

@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from wmo.optimize.compression import (
+    CompressingEmbedder,
     CompressionConfig,
+    CompressionResult,
     Compressor,
     IdentityCompressor,
     TruncateCompressor,
     estimate_tokens,
     get_compressor,
+    register_compressor,
+    same_compression,
+    servable_compressor,
 )
 
 
@@ -84,3 +91,83 @@ def test_estimate_tokens_is_ceil_of_quarter_chars() -> None:
     assert estimate_tokens("") == 0
     assert estimate_tokens("abcd") == 1
     assert estimate_tokens("abcde") == 2
+
+
+class _CountingEmbedder:
+    """Records exactly which texts it was asked to embed."""
+
+    def __init__(self) -> None:
+        self.seen: list[list[str]] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.seen.append(list(texts))
+        return [[float(len(text))] for text in texts]
+
+
+class _Churny:
+    """A compressor that admits it rewrites already-emitted bytes (C1's percentile family)."""
+
+    id = "churny-compression-test"
+    version = "1"
+    append_stable = False
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        del config
+        raw = sum(estimate_tokens(segment) for segment in segments)
+        return CompressionResult(
+            segments=list(segments), tokens_in_raw=raw, tokens_in_compressed=raw, latency_s=0.0
+        )
+
+
+_CHURNY = _Churny()
+
+
+def test_the_reference_compressors_attest_append_stability() -> None:
+    # Both are servable in v1: identity changes nothing, and truncate is head-absolute per
+    # segment (C1 round 0 measured churn 0.000 on all five corpora for head-keep truncation).
+    assert IdentityCompressor.append_stable is True
+    assert TruncateCompressor.append_stable is True
+    assert servable_compressor(CompressionConfig(compressor_id="truncate")) is not None
+    assert servable_compressor(None) is None
+
+
+def test_a_churny_compressor_is_not_servable() -> None:
+    register_compressor(_CHURNY)
+    with pytest.raises(ValueError, match="not attested append-stable"):
+        servable_compressor(CompressionConfig(compressor_id=_CHURNY.id))
+
+
+def test_register_compressor_refuses_to_rebind_an_id() -> None:
+    register_compressor(_CHURNY)
+    register_compressor(_CHURNY)  # idempotent for the same object
+    assert get_compressor(_CHURNY.id) is _CHURNY
+
+    class _Impostor:
+        id = _CHURNY.id
+        version = "2"
+        append_stable = True
+
+        def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+            raise NotImplementedError
+
+    with pytest.raises(ValueError, match="already registered"):
+        register_compressor(cast("Compressor", _Impostor()))
+
+
+def test_same_compression_compares_the_whole_triple() -> None:
+    base = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    assert same_compression(base, base.model_copy())
+    assert same_compression(None, None)
+    assert not same_compression(base, None)
+    assert not same_compression(base, base.model_copy(update={"aggressiveness": 0.25}))
+    # A version bump changes the emitted bytes exactly as a different id would.
+    assert not same_compression(base, base.model_copy(update={"compressor_version": "2"}))
+
+
+def test_compressing_embedder_embeds_the_compressed_text() -> None:
+    # The fit-side half of representation consistency: the bank rows must be the geometry of
+    # what serving will send, not of the raw task text.
+    inner = _CountingEmbedder()
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    CompressingEmbedder(inner, config).embed(["one two three four", "alpha beta"])
+    assert inner.seen == [["one two", "alpha"]]

@@ -2302,3 +2302,33 @@ def test_route_fit_rejects_orphan_aggressiveness(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "--compressor" in result.output
+
+
+def test_route_fit_stamps_what_the_evidence_was_fitted_under(tmp_path: Path) -> None:
+    # D-COMPRESS requirement A: --compressor does not just switch serving on, it moves the FIT
+    # onto the compressed representation and records that on the artifact, which is what makes
+    # the resulting policy mountable at all.
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_knn_matrix_file(tmp_path)),
+            "--kind",
+            "knn",
+            "--out",
+            str(policy_file),
+            "--dim",
+            "64",
+            "--compressor",
+            "truncate",
+            "--aggressiveness",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    policy = RoutingPolicy.load(policy_file)  # loads, so the mount gate is satisfied
+    assert policy.fit_compression is not None
+    assert policy.fit_compression == policy.compression

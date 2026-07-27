@@ -40,7 +40,11 @@ from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_en
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
-from wmo.optimize.compression import CompressionConfig, get_compressor
+from wmo.optimize.compression import (
+    CompressingEmbedder,
+    CompressionConfig,
+    servable_compressor,
+)
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     DialResult,
@@ -836,8 +840,11 @@ def fit(
         raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
     compression = None
     if compressor is not None:
+        compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
         try:
-            get_compressor(compressor)  # model_copy below skips validators; check here
+            # Fail before the fit spends anything: model_copy below skips validators, and an
+            # unservable compressor would otherwise only surface when serving mounts the result.
+            servable_compressor(compression)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
         compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
@@ -865,6 +872,11 @@ def fit(
         print_knn_fit(_console, fitted, out=out, z=z)
         return
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
+    if compression is not None:
+        # Representation consistency: the cluster centroids have to live in the geometry of the
+        # text serving will embed, which is the COMPRESSED text (see `fit_knn_artifact`, which
+        # applies the same rule to the bank on the knn path).
+        built = CompressingEmbedder(built, compression)
     policy = fit_rank_policy(
         matrix,
         embedder=spec,
@@ -880,9 +892,13 @@ def fit(
     if cost_weight > 0.0:
         policy = rerank_policy(policy, cost_weight=cost_weight)
     if compression is not None:
-        # Validated above (unknown ids fail before anything is written). The knn path stamps
-        # inside `fit_knn_artifact`, which saves its own artifact and returns before this line.
-        policy = policy.model_copy(update={"compression": compression})
+        # Stamped as BOTH halves of the contract: what this endpoint serves, and what its
+        # evidence was fitted under. They are the same config here by construction (the fit just
+        # embedded through it), which is exactly what the mount gate re-checks. The knn path
+        # stamps inside `fit_knn_artifact`, which saves and returns before this line.
+        policy = policy.model_copy(
+            update={"compression": compression, "fit_compression": compression}
+        )
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     _console.print(

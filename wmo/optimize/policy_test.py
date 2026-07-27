@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression import (
+    CompressionConfig,
+    CompressionResult,
+    Compressor,
+    estimate_tokens,
+    register_compressor,
+)
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DEPLOYMENT,
     AZURE_EMBEDDER_DIM,
@@ -35,6 +41,38 @@ from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval.embedders import HashingEmbedder
 from wmo.tracking.pricing import ModelPrice
+
+
+class _ChurnyCompressor:
+    """A compressor that admits it rewrites its own emitted prefix (C1's percentile family).
+
+    Registered by the requirement-B tests to prove the mount gate refuses it. It never runs: the
+    policy is rejected before a request can reach `compress`.
+    """
+
+    id = "churny-for-tests"
+    version = "1"
+    append_stable = False
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        del config
+        raw = sum(estimate_tokens(segment) for segment in segments)
+        return CompressionResult(
+            segments=list(segments), tokens_in_raw=raw, tokens_in_compressed=raw, latency_s=0.0
+        )
+
+
+_CHURNY = _ChurnyCompressor()
+
+
+def _register_churny() -> str:
+    """Put the churny stand-in in the registry and hand back its id.
+
+    One shared instance: registration is idempotent for the same object but refuses to rebind an
+    id to a different one, so a fresh instance per test would be the rebinding it forbids.
+    """
+    register_compressor(_CHURNY)
+    return _CHURNY.id
 
 
 def _pool() -> list[PoolEntry]:
@@ -306,31 +344,32 @@ def test_pre_compression_policy_json_loads_with_compression_off(tmp_path: Path) 
     path = tmp_path / "policy.json"
     raw = policy.model_dump_json(indent=2)
     assert '"compression"' in raw  # sanity: the field serializes
+    dropped = ("compression", "fit_compression")
     stripped = {
-        key: value for key, value in policy.model_dump(mode="json").items() if key != "compression"
+        key: value for key, value in policy.model_dump(mode="json").items() if key not in dropped
     }
     stripped["clusters"] = [
-        {k: v for k, v in cluster.items() if k != "compression"} for cluster in stripped["clusters"]
+        {k: v for k, v in cluster.items() if k not in dropped} for cluster in stripped["clusters"]
     ]
     path.write_text(json.dumps(stripped), encoding="utf-8")
     loaded = RoutingPolicy.load(path)
     assert loaded.compression is None
+    assert loaded.fit_compression is None  # an old artifact reads as fitted on raw text
     assert all(cluster.compression is None for cluster in loaded.clusters)
 
 
 def test_policy_with_compression_round_trips(tmp_path: Path) -> None:
-    policy = _rank_policy()
-    policy = policy.model_copy(
-        update={
-            "compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
-        }
-    )
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    # Both halves: what the endpoint serves, and what its clusters were fitted under. A rank
+    # policy carrying only the first is the mismatch the next test rejects.
+    policy = _rank_policy().model_copy(update={"compression": config, "fit_compression": config})
     path = tmp_path / "policy.json"
     policy.save(path)
     loaded = RoutingPolicy.load(path)
     assert loaded.compression is not None
     assert loaded.compression.compressor_id == "truncate"
     assert loaded.compression.aggressiveness == 0.5
+    assert loaded.fit_compression == loaded.compression
 
 
 def test_policy_rejects_unknown_compressor_at_load() -> None:
@@ -342,6 +381,111 @@ def test_policy_rejects_unknown_compressor_at_load() -> None:
             pool=_pool(),
             compression=CompressionConfig(compressor_id="nope"),
         )
+
+
+# --- D-COMPRESS requirement A: representation consistency (C2 Q2) ---
+
+
+def test_routing_policy_refuses_to_serve_compression_it_was_not_fitted_under(
+    tmp_path: Path,
+) -> None:
+    # C2 Q2: compressed queries against a raw-fit bank sit farther from every row, so the
+    # novelty floor trips 10-13x more often and the router abstains to the expensive fallback
+    # (+11-41% cost, accuracy flat to negative). A broken policy, so it must not mount.
+    policy = _rank_policy().model_copy(
+        update={"compression": CompressionConfig(compressor_id="truncate")}
+    )
+    path = tmp_path / "policy.json"
+    policy.save(path)
+    with pytest.raises(ValidationError, match="fitted on raw text"):
+        RoutingPolicy.load(path)
+    # And the mount path refuses the same object even though model_copy skipped the validator.
+    with pytest.raises(ValueError, match="fitted on raw text"):
+        policy.serving_compressor()
+
+
+def test_a_compressed_fit_refuses_to_serve_raw_queries(tmp_path: Path) -> None:
+    # The inverse hole, and just as broken: a bank whose rows are compressed text cannot be
+    # queried with raw text either.
+    policy = _rank_policy().model_copy(
+        update={"fit_compression": CompressionConfig(compressor_id="truncate")}
+    )
+    path = tmp_path / "policy.json"
+    policy.save(path)
+    with pytest.raises(ValidationError, match="would serve raw text"):
+        RoutingPolicy.load(path)
+
+
+def test_a_mismatched_aggressiveness_is_a_mismatched_representation(tmp_path: Path) -> None:
+    # Same compressor, different level = different bytes = different geometry.
+    policy = _rank_policy().model_copy(
+        update={
+            "compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+            "fit_compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.25),
+        }
+    )
+    path = tmp_path / "policy.json"
+    policy.save(path)
+    with pytest.raises(ValidationError, match="aggressiveness 0.25"):
+        RoutingPolicy.load(path)
+
+
+def test_a_static_policy_may_compress_without_a_fit_stamp() -> None:
+    # A static policy embeds nothing, so it has no geometry to be inconsistent with. This is the
+    # path the demo endpoint and the seam walk use.
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+    )
+    assert policy.fit_compression is None
+    assert policy.serving_compressor() is not None
+
+
+# --- D-COMPRESS requirement B: append-stability attestation (C2 Q4) ---
+
+
+def test_a_churny_compressor_is_refused_at_mount() -> None:
+    # C2 Q4 measured churny full recompression at up to 2.65x the input cost of compressing
+    # NOTHING on cached providers. v1 has no turn-local-commit path, so it does not mount.
+    churny = _register_churny()
+    with pytest.raises(ValidationError, match="not attested append-stable"):
+        RoutingPolicy(
+            kind="static",
+            default_model="haiku-4-5",
+            pool=_pool(),
+            compression=CompressionConfig(compressor_id=churny),
+        )
+
+
+def test_a_churny_per_cluster_override_is_refused_too(tmp_path: Path) -> None:
+    churny = _register_churny()
+    policy = _rank_policy()
+    clusters = [
+        policy.clusters[0].model_copy(
+            update={"compression": CompressionConfig(compressor_id=churny)}
+        ),
+        *policy.clusters[1:],
+    ]
+    path = tmp_path / "policy.json"
+    policy.model_copy(update={"clusters": clusters}).save(path)
+    with pytest.raises(ValidationError, match="not attested append-stable"):
+        RoutingPolicy.load(path)
+
+
+def test_an_unattested_compressor_cannot_be_registered() -> None:
+    class _Forgetful:
+        id = "forgetful"
+        version = "1"
+
+        def compress(
+            self, segments: list[str], config: CompressionConfig
+        ) -> CompressionResult:  # pragma: no cover - never reached
+            raise NotImplementedError
+
+    with pytest.raises(ValueError, match="does not declare `append_stable`"):
+        register_compressor(cast("Compressor", _Forgetful()))
 
 
 def test_azure_embedder_spec_requires_backend_fields() -> None:

@@ -27,6 +27,8 @@ from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
+from wmo.providers.base import Embedder
+
 # The proxy tokenizer: ~4 chars per token, the industry rule of thumb. Deterministic and
 # provider-agnostic; used only for the compressor's own raw-vs-compressed accounting.
 _CHARS_PER_TOKEN = 4
@@ -86,10 +88,21 @@ class CompressionStats(BaseModel):
 
 @runtime_checkable
 class Compressor(Protocol):
-    """The pluggable compressor seam. Implementations must be deterministic and 0.0-safe."""
+    """The pluggable compressor seam. Implementations must be deterministic and 0.0-safe.
+
+    `append_stable` is the implementation's ATTESTATION that appending a segment never rewrites
+    the bytes of the segments already emitted (C1's audit calls this append-only; the selection
+    rule decides it, not the scorer). It is a serving admission ticket, not a hint: C2's cache
+    simulation measured churny full recompression at up to 2.65x the input cost of no
+    compression at all on cached providers, because every turn forfeits the whole prompt-cache
+    prefix to save a fraction of the tokens. v1 serves append-stable compressors only; a churny
+    method needs turn-local-commit support that does not exist yet, so it is refused at mount
+    rather than silently allowed to lose money.
+    """
 
     id: str
     version: str
+    append_stable: bool
 
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
         """Compress the mutable segments; never sees the cached prefix by construction."""
@@ -101,6 +114,7 @@ class IdentityCompressor:
 
     id = "identity"
     version = "1"
+    append_stable = True  # it changes nothing, so it cannot churn anything
 
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
         del config
@@ -121,10 +135,17 @@ class TruncateCompressor:
     segment. Deterministic per segment, so an unchanged segment always compresses to the same
     bytes (append-stability). This is a CONTROL, not a method: a learned compressor that does
     not beat it at equal ratio has learned nothing (the track's mandatory baseline).
+
+    Append-stable by C1's round-0 semantics: head-keep truncation is head-absolute per segment,
+    the kept prefix of a segment depends on nothing outside that segment, and a segment already
+    emitted is never revisited. (C1's correction to the lit review applies here: the "ratio
+    budgets are never append-only" rule is a fact about percentile SELECTION, not about
+    head-keep truncation, whose kept prefix only ever extends.)
     """
 
     id = "truncate"
     version = "1"
+    append_stable = True
 
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
         start = time.monotonic()
@@ -147,6 +168,104 @@ _COMPRESSORS: dict[str, Compressor] = {
 }
 
 
+def register_compressor(compressor: Compressor) -> None:
+    """Register a compressor implementation under its `id` (research-track entry point).
+
+    The module docstring's contract: real compressors are chosen by the research track and
+    register here. Registration is idempotent for the same object and refuses to silently
+    replace a DIFFERENT implementation under an existing id, because a policy artifact
+    referencing that id must always resolve to the bytes it was fitted against.
+
+    The `append_stable` attestation is required at registration rather than at mount, so an
+    implementation that forgot to state it fails in the researcher's own process instead of on
+    the first served request.
+    """
+    if not isinstance(getattr(compressor, "append_stable", None), bool):
+        raise ValueError(
+            f"compressor '{compressor.id}' does not declare `append_stable`; a compressor must "
+            "attest whether appending a segment rewrites already-emitted bytes (see the "
+            "Compressor protocol). Measure it with the append-stability audit, then set the "
+            "attribute."
+        )
+    existing = _COMPRESSORS.get(compressor.id)
+    if existing is not None and existing is not compressor:
+        raise ValueError(
+            f"compressor id '{compressor.id}' is already registered by "
+            f"{type(existing).__name__}; ids are stable policy references and cannot be "
+            "silently rebound"
+        )
+    _COMPRESSORS[compressor.id] = compressor
+
+
+class CompressingEmbedder:
+    """Embeds the COMPRESSED form of each text, so a fit sees what serving will see.
+
+    The fit-side half of representation consistency (C2's Q2 result). A routing bank and its
+    novelty floor are geometry: fit them on raw task text and then query them with compressed
+    text and the queries land farther from every bank row, the floor trips 10-13x more often,
+    and the router abstains to the expensive fallback on 20-30% more requests. Wrapping the fit's
+    embedder is all it takes to move the bank and the floor onto the served representation.
+
+    Serving does NOT wrap its embedder: the compression stage has already rewritten the request
+    by the time the router embeds it, so wrapping there would compress twice.
+    """
+
+    def __init__(self, inner: Embedder, config: CompressionConfig) -> None:
+        self._inner = inner
+        self._config = config
+        self._compressor = get_compressor(config.compressor_id)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._inner.embed(self._compressor.compress(list(texts), self._config).segments)
+
+
+def compression_signature(config: CompressionConfig | None) -> str:
+    """How a compression config reads in an error message; None is spelled out as raw text."""
+    if config is None:
+        return "raw text (no compression)"
+    return (
+        f"compressor '{config.compressor_id}' version {config.compressor_version} "
+        f"at aggressiveness {config.aggressiveness:g}"
+    )
+
+
+def same_compression(left: CompressionConfig | None, right: CompressionConfig | None) -> bool:
+    """Whether two configs produce the same representation: same compressor, version, and level.
+
+    None (raw) equals only None. Anything else is compared on the whole triple, because a
+    version bump changes the emitted bytes exactly as a different id would.
+    """
+    if left is None or right is None:
+        return left is None and right is None
+    return (
+        left.compressor_id == right.compressor_id
+        and left.compressor_version == right.compressor_version
+        and left.aggressiveness == right.aggressiveness
+    )
+
+
+def servable_compressor(config: CompressionConfig | None) -> Compressor | None:
+    """The compressor `config` names, checked against the v1 serving rule (None: compress off).
+
+    Raises when the id is unknown, or when the implementation does not attest append stability:
+    a churny compressor recompresses the cached prefix on every turn, which C2 measured as a net
+    LOSS of up to 2.65x on cached providers. Serving it would quietly cost more than compressing
+    nothing, so the mount is refused instead.
+    """
+    if config is None:
+        return None
+    compressor = get_compressor(config.compressor_id)
+    if not compressor.append_stable:
+        raise ValueError(
+            f"compressor '{config.compressor_id}' is not attested append-stable, so it cannot be "
+            "served in v1: it rewrites the already-compressed prefix on every turn, which "
+            "forfeits the provider prompt cache and measured as a net cost INCREASE (up to 2.65x) "
+            "against no compression at all. Serve an append-stable compressor (identity, "
+            "truncate), or wait for turn-local-commit support."
+        )
+    return compressor
+
+
 def get_compressor(compressor_id: str) -> Compressor:
     """Resolve a compressor by id, or raise naming the known ids (fail at mount, not mid-call)."""
     compressor = _COMPRESSORS.get(compressor_id)
@@ -154,7 +273,7 @@ def get_compressor(compressor_id: str) -> Compressor:
         known = ", ".join(sorted(_COMPRESSORS))
         raise ValueError(
             f"unknown compressor '{compressor_id}'; known compressors: {known}. "
-            "Register new compressors in wmo.optimize.compression before referencing them "
-            "in a policy's compression config."
+            "Register new compressors with wmo.optimize.compression.register_compressor "
+            "before referencing them in a policy's compression config."
         )
     return compressor

@@ -2394,6 +2394,7 @@ class _SpyCompressor:
         self.inner = inner
         self.id = inner.id
         self.version = inner.version
+        self.append_stable = inner.append_stable
         self.calls: list[list[str]] = []
 
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
@@ -2555,8 +2556,12 @@ def test_uncompressed_rows_keep_default_compression_fields(tmp_path: Path) -> No
 def test_dial_swap_keeps_the_compressor_matched_to_the_live_policy(tmp_path: Path) -> None:
     # #270's dial replaces the whole policy object at runtime (_install_policy); the resolved
     # compressor must follow it, not stay pinned to the mount-time object.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    # Both stamps, as a real `route fit --compressor` writes them: a knn bank is only servable
+    # under the representation it was fitted on, so a policy carrying one without the other
+    # would not mount at all (see the requirement-A tests in policy_test.py).
     policy = _knn_policy(tmp_path).model_copy(
-        update={"compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5)}
+        update={"compression": config, "fit_compression": config}
     )
     client, runtime = _dial_client(tmp_path, policy)
 
@@ -2600,3 +2605,20 @@ def test_compression_leaves_tool_calls_and_tool_results_verbatim(tmp_path: Path)
     assert served[1].tool_calls[0].function.arguments == _TOOL_ARGUMENTS  # verbatim
     assert served[2].content == "42 rows"  # the tool result, verbatim
     assert _rows(log_path)[-1]["compressor_id"] == "truncate"
+
+
+def test_mounting_a_mismatched_compression_artifact_fails_loudly(tmp_path: Path) -> None:
+    # D-COMPRESS requirement A at the serving boundary: an endpoint whose bank was fitted on raw
+    # text must not come up compressing. It would still answer every request, just with routing
+    # quietly collapsed to the expensive fallback, which is the failure C2 measured and the one
+    # nothing downstream would notice.
+    policy = _knn_policy(tmp_path).model_copy(
+        update={"compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5)}
+    )
+    with pytest.raises(ValueError, match="fitted on raw text"):
+        EndpointRuntime(
+            name="tau-bench",
+            policy=policy,
+            provider_factory=_EchoProvider,
+            log=RequestLog(tmp_path / "requests.jsonl"),
+        )

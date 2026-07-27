@@ -81,7 +81,6 @@ from wmo.optimize.compression import (
     CompressionStats,
     Compressor,
     estimate_tokens,
-    get_compressor,
 )
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
@@ -634,10 +633,11 @@ class EndpointRuntime:
         # fingerprint as _affinity: the affinity state decides compression segment boundaries.
         # Only populated when the policy carries a compression config.
         self._compressed: OrderedDict[str, list[ChatMessage]] = OrderedDict()
-        # Resolved at mount and re-resolved on every dial-driven policy install (policy
-        # validation already proved the id is known and servable), mirroring the embedder-once
-        # pattern: no per-request registry lookups.
-        self._compressor: Compressor | None = _resolve_compressor(policy.compression)
+        # Resolved at mount and re-resolved on every dial-driven policy install, mirroring the
+        # embedder-once pattern: no per-request registry lookups. Resolving through the policy
+        # re-runs the D-COMPRESS mount gates, so an artifact that was assembled in memory
+        # (`model_copy`, which skips validators) cannot serve an unservable compressor either.
+        self._compressor: Compressor | None = policy.serving_compressor()
         self._lock = threading.Lock()
         # Serializes dial changes end to end (persist + install); _lock alone only protects
         # the in-memory swap and would let two PUTs interleave file writes and installs.
@@ -683,7 +683,7 @@ class EndpointRuntime:
             # Keep the resolved compressor matched to the policy object requests will read;
             # apply_cost_quality carries `compression` through, but the invariant should not
             # depend on that staying true.
-            self._compressor = _resolve_compressor(adjusted.compression)
+            self._compressor = adjusted.serving_compressor()
             self._savings.clear()  # the dial changed, so the quality expectation did too
 
     def savings(self, window: SavingsWindow = "all_time") -> EndpointSavings:
@@ -852,11 +852,6 @@ class EndpointRuntime:
             with self._lock:
                 provider = self._providers.setdefault(pool_name, provider)
         return entry, provider
-
-
-def _resolve_compressor(config: CompressionConfig | None) -> Compressor | None:
-    """The compressor a policy's config names, or None when the policy compresses nothing."""
-    return None if config is None else get_compressor(config.compressor_id)
 
 
 def _compress_user_turns(
