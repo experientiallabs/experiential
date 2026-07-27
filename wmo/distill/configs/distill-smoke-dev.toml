@@ -63,7 +63,8 @@ require_no_regression = true
 [budget]
 max_usd = 15.0
 
-# Optional Weights & Biases tracking; needs `uv sync --extra distill` plus
+# Optional Weights & Biases tracking; needs `uv sync --extra distill`
+# (or `pip install 'world-model-optimizer[distill]'`) plus
 # WANDB_API_KEY (or a prior `wandb login`). Uncomment to enable.
 [wandb]
 enabled = true

@@ -69,6 +69,11 @@ class CorpusSpec:
     # Data payload dirs published alongside the trace corpus (task indexes, gold sidecars,
     # evidence docs, ...). Same license as the corpus — they ARE the upstream-derived data.
     data_dirs: tuple[str, ...] = ()
+    # Whether a dataset repo for this bundle actually exists on the Hub yet. False means
+    # "registered here so the write side knows how to publish it, but nothing to download":
+    # reads must never advertise it, or `wmo download <name>` sends the user at a repo that
+    # can only answer 401. Flipping this to True is part of the push that publishes it.
+    published: bool = True
 
 
 # The publishable corpora. appworld is deliberately ABSENT: its protected data may only be
@@ -172,6 +177,9 @@ CORPORA: dict[str, CorpusSpec] = {
         ),
         CorpusSpec(
             benchmark="kimi-gui-control",
+            # Captured but never pushed: both candidate repo ids 401. Until the push lands,
+            # listing it as downloadable is a dead end, so reads hide it.
+            published=False,
             license_id="mit",
             upstream="mediar-ai/screenpipe gui-control (MIT); trajectories captured with "
             "Kimi-K2.6 via Azure AI Foundry",
@@ -258,7 +266,7 @@ def corpus_path(benchmark: str) -> Path:
     This is the "is it local, and where" resolver every front-end shares: check
     ``corpus_path(b).exists()`` before deciding to download or to serve from disk.
     """
-    return _data_root() / benchmark / _CORPUS_FILE
+    return data_root() / benchmark / _CORPUS_FILE
 
 
 def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
@@ -290,6 +298,16 @@ def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
     return sorted(by_benchmark.values(), key=lambda c: c.last_modified, reverse=True)
 
 
+def downloadable_benchmarks() -> list[str]:
+    """Registered benchmarks whose bundle really is on the Hub, sorted.
+
+    The offline answer to "what can I pass to ``wmo download``": every error that offers a list
+    of names uses this rather than ``CORPORA``, so it can never advertise a benchmark whose only
+    possible reply is a 401.
+    """
+    return sorted(name for name, spec in CORPORA.items() if spec.published)
+
+
 def fetch_corpus(
     benchmark: str,
     *,
@@ -314,10 +332,16 @@ def fetch_corpus(
     """
     spec = CORPORA.get(benchmark)
     if spec is None:
-        publishable = ", ".join(sorted(CORPORA))
-        raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
+        available = ", ".join(downloadable_benchmarks())
+        raise ValueError(f"{benchmark!r} has no published corpus (available: {available})")
+    if not spec.published:
+        available = ", ".join(downloadable_benchmarks())
+        raise ValueError(
+            f"{benchmark!r} is a registered benchmark but its data bundle has not been "
+            f"published to the Hub yet, so there is nothing to download; pick one of: {available}"
+        )
     token = token if token is not None else _default_token()
-    root = _data_root()
+    root = data_root()
     target = dest or corpus_path(benchmark)
 
     # One recursive tree call covers the whole repo; sizes make the total known up front so a
@@ -406,13 +430,17 @@ def _resolve_repo(
     raise CorpusRepoUnavailable(benchmark, revision, failures)
 
 
-def _data_root() -> Path:
+def data_root() -> Path:
     """Where benchmark data dirs live (``<root>/<benchmark>/traces.otel.jsonl``).
 
     Resolution order: the ``ENVCAP_DATA_ROOT`` env var; a repo checkout (the dir holding
     this package — its sibling benchmark dirs); else, for an installed wheel,
     ``environment-capture-data/`` under the current directory — a pip user's bundles land in
     their project, never inside site-packages.
+
+    Public because it is the ONLY correct spelling of that location: a front-end that hardcodes
+    the checkout path instead (as ``wmo``'s benchmark discovery used to) goes blind to every
+    bundle a pip user downloads, and ignores ``ENVCAP_DATA_ROOT`` for everyone.
     """
     override = os.environ.get("ENVCAP_DATA_ROOT")
     if override:
@@ -557,7 +585,9 @@ def main() -> None:
     push.add_argument("--private", action="store_true")
 
     fetch = sub.add_parser("fetch", help="Download full data bundles into the benchmark dirs.")
-    fetch.add_argument("benchmark", help=f"Benchmark name, or 'all' ({', '.join(sorted(CORPORA))})")
+    fetch.add_argument(
+        "benchmark", help=f"Benchmark name, or 'all' ({', '.join(downloadable_benchmarks())})"
+    )
     fetch.add_argument(
         "--force", action="store_true", help="Overwrite existing local corpus/data files."
     )
@@ -569,7 +599,7 @@ def main() -> None:
             "`uv run python -m environment_capture.hub_push <benchmark>|all [--private]` "
             "(needs the fetch extra + a write token)"
         )
-    names = sorted(CORPORA) if args.benchmark == "all" else [args.benchmark]
+    names = downloadable_benchmarks() if args.benchmark == "all" else [args.benchmark]
     for name in names:
         existing = corpus_path(name).exists()
         path = fetch_corpus(name, force=args.force)

@@ -17,6 +17,7 @@ import subprocess
 import time
 import urllib.error
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,8 @@ import uvicorn
 from environment_capture.hub import (
     CORPORA,
     corpus_path,
+    data_root,
+    downloadable_benchmarks,
     fetch_corpus,
     published_corpora,
 )
@@ -564,6 +567,7 @@ def examples_list() -> None:
     examples = _discover_examples()
     if not examples:
         _console.print("[yellow]no examples found[/yellow]")
+        _console.print(f"  {_no_benchmarks_hint()}")
         return
     for example in examples:
         # Data-only bundles (what `wmo download` fetches) have no launcher, so say so here
@@ -585,13 +589,24 @@ def examples_run(
     runner = example_dir / "run.sh"
     if not runner.exists():
         # A data-only bundle (`wmo download`) is listed but not runnable; name what it IS for.
+        # The launcher scripts live in the git checkout only, so a downloaded bundle always
+        # lands here.
         traces = example_dir / "traces.otel.jsonl"
-        hint = (
-            "; it is a data-only bundle — build a world model from it with "
-            f"`wmo build --file {traces} --name {name}`"
-            if traces.exists()
-            else ""
-        )
+        if not traces.exists():
+            hint = f"; nothing runnable was found in {example_dir}"
+        else:
+            # Only offer the suite path when a suite TOML is actually here: from a wheel the
+            # corpus arrives without one, and pointing at `wmo eval run` would be a second
+            # dead end.
+            scoring = (
+                f", or score it with `wmo eval run {name}`"
+                if any((example_dir / "evals").glob("*.toml"))
+                else ""
+            )
+            hint = (
+                "; it is a data-only bundle — build a world model from it with "
+                f"`wmo build --file {traces} --name {name}`{scoring}"
+            )
         raise typer.BadParameter(f"example {name!r} has no run.sh launcher{hint}")
     if not os.access(runner, os.X_OK):
         raise typer.BadParameter(
@@ -1166,8 +1181,9 @@ def download(
     """Download benchmark data bundles (trace corpus + task data) from the Hub.
 
     With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
-    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
-    are kept unless `--force`.
+    picker. Bundles land in `environment-capture-data/<benchmark>/` under the current directory
+    (in a git checkout, in `packages/environment-capture/<benchmark>/` instead); set
+    `ENVCAP_DATA_ROOT` to put them somewhere else. Existing local files are kept unless `--force`.
     """
     selected = list(benchmarks or [])
     if selected == ["all"]:
@@ -1176,7 +1192,7 @@ def download(
         try:
             selected = sorted(corpus.benchmark for corpus in published_corpora())
         except urllib.error.URLError:
-            selected = sorted(CORPORA)
+            selected = downloadable_benchmarks()
     if not selected:
         try:
             published = published_corpora()
@@ -1328,12 +1344,21 @@ def _resolve_eval_suite_or_usage(selector: str, examples_roots: list[str]) -> Ev
     """Resolve a suite name, turning the unknown/ambiguous `ValueError` into a usage error.
 
     Same contract as `_resolve_example`: a typo prints a clean box listing the available suites,
-    never a traceback.
+    never a traceback. A direct `.toml` selector that exists resolves past name lookup and fails
+    on its own contents, so listing the discoverable suites there would point away from the file
+    that needs repairing. When the catalogue is empty the library's "(available: )" hint names
+    nothing, so add the reason there is nothing to name.
     """
     try:
         return resolve_eval_suite(selector, examples_roots)
     except ValueError as err:
-        raise typer.BadParameter(str(err)) from None
+        direct = Path(selector)
+        if direct.suffix == ".toml" and direct.exists():
+            raise typer.BadParameter(str(err)) from None
+        hint = "`wmo eval list` prints the suites"
+        if not discover_eval_suites(examples_roots):
+            hint = f"{hint}; {_no_suites_hint(examples_roots)}"
+        raise typer.BadParameter(f"{err}; {hint}") from None
 
 
 # Options only the closed-loop mode reads. In open-loop they used to be accepted and silently
@@ -1416,8 +1441,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
         None,
-        help="Directory containing eval suites. Default: repo-local examples/ AND "
-        "packages/environment-capture/ (where the shipped suites live).",
+        help="Dir of `<task>/evals/*.toml` suites. Default: the repo-local benchmark dirs "
+        "(examples/ AND packages/environment-capture/, where the shipped suites live) plus "
+        "wherever `wmo download` puts bundles.",
     ),
     results_root: str = typer.Option(
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
@@ -1491,7 +1517,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
-    - `wmo eval list`: list named suites under `packages/environment-capture/<task>/evals/`.
+    - `wmo eval list`: list named suites, which live beside the benchmark they score
+      (`packages/environment-capture/<task>/evals/*.toml` in a git checkout).
     - `wmo eval run <suite>`: run a suite and save a local JSON result.
     - `wmo eval results optional-suite`: summarize local suite results.
     - `wmo eval grid <suite>`: run the model x condition grid for a suite and chart it (needs the
@@ -1659,10 +1686,56 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
 
 
+def _no_suites_hint(examples_roots: list[str]) -> str:
+    """Why no suite was found under `examples_roots`, and what to do about it.
+
+    Suite TOMLs sit beside the benchmark they score (`<task>/evals/*.toml`) and are committed to
+    the git checkout; they are NOT in the wheel and `wmo download` does not fetch them (a suite
+    without its corpus scores nothing). So from a pip install the honest answer is "clone the
+    repo, or point at your own suite dir", never a bare empty list.
+    """
+    return (
+        "eval suites are `<task>/evals/*.toml` files that live in the git checkout "
+        "(packages/environment-capture/<task>/evals/); they are not shipped with the package, and "
+        "`wmo download` does not fetch them. Clone "
+        "https://github.com/experientiallabs/world-model-optimizer and run from there, or point "
+        "`--examples-root <dir>` at a dir of your own `<task>/evals/*.toml`. "
+        f"Searched: {_describe_roots(examples_roots)}"
+    )
+
+
+def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
+    """The suite's trace files, or a usage error naming the command that fetches them.
+
+    No benchmark ships its corpus (they are Hub-hosted, gitignored here), so this is the normal
+    first-run failure for every shipped suite: it must name `wmo download <benchmark>`. A suite
+    that lists no files at all is a different defect — the TOML itself — so it keeps its own
+    message pointing at the file to edit.
+    """
+    files = suite.resolve_files()
+    if not files:
+        raise typer.BadParameter(
+            f"eval suite {suite.id} lists no trace files; set `files` in {suite.path}"
+        )
+    missing = [path for path in files if not path.exists()]
+    if missing:
+        spec = CORPORA.get(suite.example)
+        remedy = (
+            f"fetch the bundle with `wmo download {suite.example}`"
+            if spec is not None and spec.published
+            else f"capture or copy the corpus into {data_root() / suite.example}"
+        )
+        raise typer.BadParameter(
+            f"suite {suite.id!r} has no trace corpus at {missing or files}; {remedy}"
+        )
+    return files
+
+
 def _eval_list(examples_roots: list[str]) -> None:
     suites = discover_eval_suites(examples_roots)
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
+        _console.print(f"  {_no_suites_hint(examples_roots)}")
         return
     table = Table(title="Eval suites")
     table.add_column("Suite", no_wrap=True)
@@ -1791,6 +1864,7 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
 ) -> None:
     """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
+    files = _suite_corpus_files(suite)
     # The chart is the last thing written, so probe its deps before the grid spends anything.
     _require_viz_extra()
     specs = _parse_model_specs(models)
@@ -1805,7 +1879,7 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     cfg = suite.config
     result = run_grid(
         suite_name=suite.id,
-        files=[str(p) for p in suite.resolve_files()],
+        files=[str(path) for path in files],
         models=specs,
         gepa_prompts=prompt_map,
         base_prompt=BASE_ENV_PROMPT,
@@ -1906,6 +1980,7 @@ def _eval_run_suite(
     out: str | None,
 ) -> None:
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
+    files = _suite_corpus_files(suite)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -1918,11 +1993,6 @@ def _eval_run_suite(
         knowledge=knowledge if knowledge is not None else suite.config.knowledge,
         reasoning=reasoning if reasoning is not None else suite.config.reasoning,
     )
-    files = suite.resolve_files()
-    if not files:
-        raise typer.BadParameter(
-            f"eval suite {suite.id} lists no trace files; set `files` in {suite.path}"
-        )
     report = _run_eval_files(files, options, provider_config=provider_config)
     # A suite run is saved under --results-root and resurfaces in `wmo eval results`, so a
     # zero-step scorecard must fail here rather than persist as a real 0.000 measurement.
@@ -2907,14 +2977,27 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
 
 
 def _benchmark_roots() -> tuple[Path, ...]:
-    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
+    """Every root holding self-contained task dirs, in a checkout AND after `pip install`.
+
+    In a checkout that is `examples/` plus the capture member's benchmark dirs, both relative to
+    this file. Neither exists inside a wheel (the wheel ships `wmo` and `llm_waterfall` only), so
+    the third root is the one `wmo download` actually writes to: `environment_capture.data_root()`,
+    which is `./environment-capture-data/` for a pip install and honours `$ENVCAP_DATA_ROOT`
+    everywhere. Deduped, because in a checkout that IS the capture member dir.
+    """
     repo = Path(__file__).resolve().parents[2]
-    return (repo / "examples", repo / "packages" / "environment-capture")
+    roots = (repo / "examples", repo / "packages" / "environment-capture", data_root())
+    unique: list[Path] = []
+    for root in roots:
+        if not any(root.resolve() == kept.resolve() for kept in unique):
+            unique.append(root)
+    return tuple(unique)
 
 
-def _discover_examples() -> list[Path]:
+def _discover_examples(roots: Sequence[Path] | None = None) -> list[Path]:
+    """Task dirs under `roots` (default: every benchmark root) that hold a corpus or a launcher."""
     found: list[Path] = []
-    for root in _benchmark_roots():
+    for root in roots if roots is not None else _benchmark_roots():
         if not root.exists():
             continue
         found.extend(
@@ -2927,6 +3010,31 @@ def _discover_examples() -> list[Path]:
     return sorted(found)
 
 
+def _describe_roots(roots: Sequence[Path | str]) -> str:
+    """`roots` for an error message, flagging the ones that are not there.
+
+    The checkout-relative roots simply do not exist inside a wheel, and saying so is the whole
+    point: an unannotated list of site-packages paths reads like a broken install.
+    """
+    return ", ".join(
+        f"{root}" if Path(root).exists() else f"{root} (does not exist here)" for root in roots
+    )
+
+
+def _no_benchmarks_hint() -> str:
+    """Why discovery came up empty here, and the command that fixes it.
+
+    Benchmark bundles are Hub-hosted, never shipped in the wheel or committed to the checkout, so
+    an empty listing is the NORMAL first-run state rather than a broken install. Name the roots
+    that were searched (they differ between a checkout and a pip install) and the fetch step.
+    """
+    return (
+        "benchmark bundles are Hub-hosted, not shipped with the package: run `wmo download "
+        "tau-bench` (or `wmo download` with no arguments to pick from the published list) to "
+        f"fetch one into {data_root()}. Searched: {_describe_roots(_benchmark_roots())}"
+    )
+
+
 def _is_safe_example_name(name: str) -> bool:
     """Whether `name` would resolve via `wmo examples run` — keeps list/hint/run in agreement."""
     try:
@@ -2936,7 +3044,14 @@ def _is_safe_example_name(name: str) -> bool:
     return True
 
 
-def _resolve_example(name: str) -> Path:
+def _resolve_example(name: str, roots: Sequence[Path] | None = None) -> Path:
+    """The task dir named `name`, searching `roots` (default: every benchmark root).
+
+    `roots` exists so a caller that already narrowed discovery to a user-supplied
+    `--examples-root` resolves the task dir out of the SAME root, instead of re-scanning the
+    repo-local ones and reporting an "available:" list from somewhere the user never named.
+    """
+    search = tuple(roots) if roots is not None else _benchmark_roots()
     # An unsafe segment (spaces, path separators, ...) is simply not an example name; fall
     # through to the same "unknown example" usage error instead of a ValueError traceback.
     try:
@@ -2944,14 +3059,14 @@ def _resolve_example(name: str) -> Path:
     except ValueError:
         safe = None
     if safe is not None:
-        matches = [root / safe for root in _benchmark_roots() if (root / safe).is_dir()]
+        matches = [root / safe for root in search if (root / safe).is_dir()]
         if len(matches) > 1:
             found = ", ".join(str(path) for path in matches)
             raise typer.BadParameter(f"example {name!r} exists in multiple roots: {found}")
         if matches:
             return matches[0]
-    available = ", ".join(path.name for path in _discover_examples())
-    hint = f" (available: {available})" if available else ""
+    available = ", ".join(path.name for path in _discover_examples(search))
+    hint = f" (available: {available})" if available else f"; {_no_benchmarks_hint()}"
     raise typer.BadParameter(f"unknown example {name!r}{hint}")
 
 
@@ -2996,7 +3111,11 @@ def research_concurrency(
         None, "--real-timeout", help="Abort a real sandbox run after N seconds."
     ),
     out: str | None = typer.Option(None, help="Path to write the ConcurrencyScalingReport JSON."),
-    examples_root: str | None = typer.Option(None, help="Examples dir. Default: repo-local."),
+    examples_root: str | None = typer.Option(
+        None,
+        help="Dir of `<task>/evals/*.toml` suites. Default: the repo-local benchmark dirs plus "
+        "wherever `wmo download` puts bundles.",
+    ),
 ) -> None:
     """Measure the concurrency scaling law: batch wall-clock vs. how many scenarios run at once.
 
@@ -3048,21 +3167,11 @@ def research_concurrency(
     suite_roots = (
         [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
     )
-    # An unresolvable suite is a bad argument, like every other input validated above; the
-    # ValueError carries the available names, so only the next command has to be added. A direct
-    # `.toml` selector that exists resolves past name lookup and fails on its own contents, so
-    # listing the discoverable suites there would point away from the file that needs repairing.
-    try:
-        resolved = resolve_eval_suite(suite, suite_roots)
-    except ValueError as exc:
-        direct = Path(suite)
-        resolved_by_name = not (direct.suffix == ".toml" and direct.exists())
-        hint = "; `wmo eval list` prints the suites" if resolved_by_name else ""
-        raise typer.BadParameter(f"{exc}{hint}") from exc
-    files = resolved.resolve_files()
-    missing = [f for f in files if not f.exists()]
-    if not files or missing:
-        raise typer.BadParameter(f"suite {suite!r} has no trace corpus at {missing or files}")
+    # An unresolvable suite is a bad argument, like every other input validated above, and a
+    # missing corpus must name the command that fetches it: both live in the shared helpers so
+    # `wmo eval run` and this command answer the same failure the same way.
+    resolved = _resolve_eval_suite_or_usage(suite, suite_roots)
+    files = _suite_corpus_files(resolved)
     adapter = get_adapter("otel-genai")
     traces = [t for f in files for t in adapter.from_file(str(f))]
     if not traces:
@@ -3107,7 +3216,17 @@ def research_concurrency(
     world_runner = build_world_runner(provider_factory, prompt, demos, selected)
     real_runner = None
     if which in (Side.BOTH, Side.REAL):
-        example_dir = _resolve_example(resolved.example)
+        # Same roots the suite came from: with `--examples-root`, re-scanning the repo-local
+        # roots here would look for the task dir somewhere the user never named.
+        example_dir = _resolve_example(resolved.example, [Path(root) for root in suite_roots])
+        if not (example_dir / "run.sh").exists():
+            # build_real_runner would raise a bare FileNotFoundError here. Only the checkout
+            # carries launchers, so a downloaded bundle always lands in this branch.
+            raise typer.BadParameter(
+                f"the real side shells {example_dir / 'run.sh'}, which does not exist "
+                f"({resolved.example} is a data-only bundle here); re-run with `--side world` to "
+                "time the world model alone"
+            )
         real_extra = list(real_arg or [])
         # Force each runner's cold-standup + isolation flags so the real side pays its TRUE from-
         # source standup and concurrent sandboxes don't clobber each other's docker state (see
@@ -3176,8 +3295,9 @@ def research_plot_concurrency(
     `concurrency_plot` is imported here (not at module scope) because it pulls in matplotlib/pandas
     from the optional `viz` extra, and the harness runtime must not require them.
     `_require_viz_extra`
-    turns a missing extra into a usage error naming `uv sync --extra viz`, so the import itself
-    never surfaces a raw ModuleNotFoundError traceback.
+    turns a missing extra into a usage error naming `uv sync --extra viz` (or
+    `pip install 'world-model-optimizer[viz]'`), so the import itself never surfaces a raw
+    ModuleNotFoundError traceback.
     """
     _require_viz_extra()
     from wmo.research.concurrency_plot import render_report

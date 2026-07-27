@@ -70,7 +70,8 @@ def e2b_sdk_version() -> str:
         return version("e2b")
     except PackageNotFoundError as error:
         raise RuntimeError(
-            "the harbor E2B task backend needs the e2b extra; run `uv sync --extra e2b`"
+            "the harbor E2B task backend needs the e2b extra; run `uv sync --extra e2b` "
+            "(or `pip install 'world-model-optimizer[e2b]'`)"
         ) from error
 
 

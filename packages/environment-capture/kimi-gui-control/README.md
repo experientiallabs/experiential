@@ -9,8 +9,9 @@ agent reads the accessibility tree, takes a single targeted action, and re-reads
 
 - `traces.otel.jsonl` - the trace corpus (**Hub-hosted, not committed**; see § Data & license):
   ~60 trajectories, one Step per agent tool call, enough for the 30 train / 8 val / 8 test benchmark
-  split. Materialize it with `uv run wmo download kimi-gui-control` (or
-  `uv run python -m environment_capture.hub fetch kimi-gui-control`).
+  split. **Not published yet**: the dataset repo has not been pushed, so `wmo download
+  kimi-gui-control` refuses up front rather than sending you at a repo that answers 401. Until the
+  push lands the corpus is team-local; regenerate it with `convert_to_wmo.py` (see § Regenerate).
 - `convert_to_wmo.py` - the converter that produced the corpus (see § Regenerate).
 - `evals/default.toml` - fidelity suite; run with
   `uv run wmo eval run kimi-gui-control/default --examples-root packages/environment-capture`.
@@ -42,9 +43,11 @@ OTel-GenAI span JSONL that `wmo.ingest.otel_genai` reads directly.
   real macOS apps; the observations are the verbatim tool outputs the agent saw. These are our own
   captures, published under MIT alongside the harness attribution above.
 - **Payload is not committed.** Per this package's `.gitignore`, `traces.otel.jsonl` is not tracked
-  in git; it lives in the public dataset `experiential-labs/wmo-kimi-gui-control-traces` on the
-  Hugging Face Hub and is fetched on demand (see § Contents). This keeps the repo free of large
-  binary blobs and follows the same contract as every other corpus here (`../README.md`).
+  in git. It is destined for the public dataset `experiential-labs/wmo-kimi-gui-control-traces` on
+  the Hugging Face Hub, but that repo does not exist yet, so this corpus is the one entry in
+  `environment_capture.hub.CORPORA` marked `published=False` (see § Contents). Publishing it means
+  pushing the bundle and flipping that flag; everything else follows the same contract as every
+  other corpus here (`../README.md`).
 
 ## Regenerate
 

@@ -917,7 +917,8 @@ class TripwireConfig(BaseModel):
 class WandbConfig(BaseModel):
     """Optional Weights & Biases run tracking (off by default).
 
-    Enabling it requires the wandb SDK (`uv sync --extra distill`) and
+    Enabling it requires the wandb SDK (`uv sync --extra distill`, or
+    `pip install 'world-model-optimizer[distill]'`) and
     credentials (WANDB_API_KEY or a prior `wandb login`); both are checked
     before the run spends anything (see `wmo.distill.tracking`).
     """

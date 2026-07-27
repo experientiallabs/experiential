@@ -54,7 +54,7 @@ class _StubApi:
 
 @pytest.fixture()
 def data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    monkeypatch.setattr(hub, "_data_root", lambda: tmp_path)
+    monkeypatch.setattr(hub, "data_root", lambda: tmp_path)
     return tmp_path
 
 

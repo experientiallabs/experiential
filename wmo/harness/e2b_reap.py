@@ -70,7 +70,8 @@ DEFAULT_E2B_SANDBOX_CAP = 100
 """E2B's default concurrent-sandbox limit per account."""
 
 MISSING_E2B_EXTRA = (
-    "the e2b SDK is not installed; run `uv sync --extra e2b` to manage E2B sandbox capacity"
+    "the e2b SDK is not installed; run `uv sync --extra e2b` (or "
+    "`pip install 'world-model-optimizer[e2b]'`) to manage E2B sandbox capacity"
 )
 
 _HARBOR_ENVIRONMENT_METADATA_KEY = "environment_name"

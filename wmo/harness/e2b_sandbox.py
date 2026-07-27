@@ -258,8 +258,8 @@ def default_sandbox_factory(
             from e2b import Sandbox
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
             raise ImportError(
-                "the e2b SDK is not installed; run `uv sync --extra e2b` to use the "
-                "e2b harness backend"
+                "the e2b SDK is not installed; run `uv sync --extra e2b` (or "
+                "`pip install 'world-model-optimizer[e2b]'`) to use the e2b harness backend"
             ) from exc
         key = api_key or os.environ.get(E2B_API_KEY_ENV)
         if not key:

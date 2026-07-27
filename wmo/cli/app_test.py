@@ -639,6 +639,70 @@ def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
     assert "packages/environment-capture/tau-bench" in output
 
 
+def test_benchmark_roots_include_the_download_destination(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The wheel ships no benchmark dirs, so the only root a pip user can ever populate is the
+    # one `wmo download` writes to. Discovery must consult it, not just the checkout paths.
+    bundles = tmp_path / "environment-capture-data"
+    monkeypatch.setattr(cli_app_module, "data_root", lambda: bundles)
+    assert bundles in cli_app_module._benchmark_roots()
+
+
+def test_benchmark_roots_do_not_repeat_the_checkout_dir(monkeypatch) -> None:  # noqa: ANN001
+    # In a checkout data_root() IS the capture member dir; listing it twice would make every
+    # task dir look like it "exists in multiple roots".
+    repo = Path(cli_app_module.__file__).resolve().parents[2]
+    capture = repo / "packages" / "environment-capture"
+    monkeypatch.setattr(cli_app_module, "data_root", lambda: capture)
+    roots = cli_app_module._benchmark_roots()
+    assert len(roots) == len({root.resolve() for root in roots})
+
+
+def test_examples_list_finds_a_downloaded_bundle(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The regression this PR exists for: `wmo download <b>` lands a corpus in data_root(), and
+    # that name must then show up in `wmo examples list` instead of "no examples found".
+    bundles = tmp_path / "environment-capture-data"
+    (bundles / "bird-sql").mkdir(parents=True)
+    (bundles / "bird-sql" / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli_app_module, "data_root", lambda: bundles)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (bundles,))
+
+    listed = runner.invoke(app, ["examples", "list"])
+    assert listed.exit_code == 0, listed.output
+    flat = " ".join(listed.output.split())
+    assert "bird-sql" in flat
+    # A downloaded bundle carries no launcher, and the listing must say so up front rather than
+    # letting `wmo examples run` be the only place that discloses it.
+    assert "data only" in flat
+
+    ran = runner.invoke(app, ["examples", "run", "bird-sql"])
+    assert ran.exit_code == 2, ran.output
+    flat_run = " ".join(ran.output.split())
+    assert "wmo build --file" in flat_run
+    # No suite TOML came down with the bundle, so `wmo eval run` would be a second dead end.
+    assert "wmo eval run" not in flat_run
+
+
+def test_examples_list_with_nothing_installed_names_the_download_command(  # noqa: ANN001
+    tmp_path,  # noqa: ANN001
+    monkeypatch,  # noqa: ANN001
+) -> None:
+    bundles = tmp_path / "environment-capture-data"
+    monkeypatch.setattr(cli_app_module, "data_root", lambda: bundles)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (bundles,))
+
+    listed = runner.invoke(app, ["examples", "list"])
+    assert listed.exit_code == 0, listed.output
+    flat = " ".join(listed.output.split())
+    assert "no examples found" in flat
+    # A bare "no examples found" is the defect: say why, and name the command that fixes it.
+    assert "wmo download tau-bench" in flat
+    assert str(bundles) in _squashed(listed.output)
+
+    unknown = runner.invoke(app, ["examples", "run", "tau-bench"])
+    assert unknown.exit_code == 2
+    assert "wmo download tau-bench" in " ".join(unknown.output.split())
+
+
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     # The persistence half of the wizard's credential flow: keys saved to .env must be back in
     # os.environ on the next `wmo` invocation (main), and importing the module must NOT load.
@@ -1871,6 +1935,102 @@ def test_eval_help_lists_every_dispatched_flow() -> None:
         assert token in flat
     # Suites moved out of examples/ long ago; the help must not send readers to the wrong dir.
     assert "packages/environment-capture" in flat
+
+
+def test_eval_list_with_no_suites_says_where_suites_live(tmp_path) -> None:  # noqa: ANN001
+    # From a wheel this is the permanent state: no suite TOML ships and `wmo download` does not
+    # fetch one, so a bare "no eval suites found" is a dead end.
+    empty = tmp_path / "roots"
+    empty.mkdir()
+    listed = runner.invoke(app, ["eval", "list", "--examples-root", str(empty)])
+    assert listed.exit_code == 0, listed.output
+    flat = " ".join(listed.output.split())
+    assert "no eval suites found" in flat
+    assert "evals/*.toml" in flat
+    assert "--examples-root" in flat
+    assert str(empty) in _squashed(listed.output)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["eval", "run", "tau-bench"],
+        ["eval", "grid", "tau-bench"],
+        ["research", "concurrency", "tau-bench", "--scenarios", "1", "--levels", "1"],
+    ],
+)
+def test_unknown_suite_is_a_usage_error_not_a_traceback(tmp_path, argv: list[str]) -> None:  # noqa: ANN001
+    # resolve_eval_suite raises a bare ValueError; every one of these call sites used to let it
+    # escape as a rich traceback, and from a wheel the "(available: )" hint named nothing at all.
+    empty = tmp_path / "roots"
+    empty.mkdir()
+    result = runner.invoke(app, [*argv, "--examples-root", str(empty)])
+    assert result.exit_code == 2, result.output  # usage error, not a ValueError traceback
+    flat = " ".join(result.output.split())
+    assert "unknown eval suite 'tau-bench'" in flat
+    assert "evals/*.toml" in flat
+
+
+def test_missing_suite_corpus_names_the_download_command(tmp_path) -> None:  # noqa: ANN001
+    # No benchmark ships its corpus, so this is the first-run failure for every shipped suite.
+    examples_root = tmp_path / "examples"
+    evals_dir = examples_root / "tau-bench" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir / "default.toml").write_text('files = ["../traces.otel.jsonl"]\n', encoding="utf-8")
+
+    for argv in (
+        ["eval", "run", "tau-bench"],
+        ["research", "concurrency", "tau-bench", "--scenarios", "1", "--levels", "1"],
+    ):
+        result = runner.invoke(app, [*argv, "--examples-root", str(examples_root)])
+        assert result.exit_code == 2, result.output
+        flat = " ".join(result.output.split())
+        assert "has no trace corpus" in flat
+        assert "wmo download tau-bench" in flat
+
+
+def test_resolve_example_searches_the_roots_it_is_given(tmp_path) -> None:  # noqa: ANN001
+    # `--examples-root` used to be honoured for suite discovery but ignored by the real-sandbox
+    # lookup, so the "available:" hint named repo-local examples the user never pointed at.
+    task = tmp_path / "mysuite"
+    task.mkdir()
+    (task / "traces.otel.jsonl").write_text("", encoding="utf-8")
+
+    assert cli_app_module._resolve_example("mysuite", [tmp_path]) == task
+    with pytest.raises(typer.BadParameter, match="available: mysuite"):
+        cli_app_module._resolve_example("nope", [tmp_path])
+
+
+def test_research_concurrency_real_side_uses_the_examples_root(tmp_path) -> None:  # noqa: ANN001
+    # The real side resolves its task dir out of --examples-root now, so the failure names the
+    # root the user passed (and stops before any provider call) instead of listing repo examples
+    # or raising a bare FileNotFoundError out of build_real_runner.
+    task = tmp_path / "mysuite"
+    (task / "evals").mkdir(parents=True)
+    (task / "traces.otel.jsonl").write_text(
+        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (task / "evals" / "default.toml").write_text(
+        'files = ["../traces.otel.jsonl"]\n', encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "concurrency",
+            "mysuite",
+            "--examples-root",
+            str(tmp_path),
+            "--scenarios",
+            "1",
+            "--levels",
+            "1",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "--side world" in " ".join(result.output.split())
+    assert str(task / "run.sh") in _squashed(result.output)
 
 
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
