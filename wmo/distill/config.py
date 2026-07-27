@@ -202,6 +202,16 @@ class Tau2Config(BaseModel):
     max_errors: int = Field(default=10, ge=1)
     """tau2's per-episode tool/format error budget (`--max-errors`); its default."""
 
+    episode_retries: int = Field(default=1, ge=0)
+    """Fresh-episode retries after an infrastructure failure (no verifier evidence).
+
+    The retry lives HERE, not in tau2's runner (`--max-retries` is pinned to 0):
+    tau2's own retry re-runs the simulation into the same span sink, so training
+    datums would carry an abandoned attempt's tokens under another attempt's
+    reward. Each wmo-level retry starts a fresh sink and a fresh recorder. One
+    retry absorbs the transient user-sim API blips observed in practice; an
+    episode that still ends without evidence stays an `infra_failed` record."""
+
 
 class RolloutConfig(BaseModel):
     """Per-episode rollout limits."""

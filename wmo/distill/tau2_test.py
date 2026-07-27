@@ -10,8 +10,8 @@ import pytest
 from wmo.distill.config import DistillConfig
 from wmo.distill.rollouts import collect_rollouts
 from wmo.distill.tau2 import (
-    _EpisodeSpec,
     _assemble_record,
+    _EpisodeSpec,
     _tau2_command,
     _wipe_stale_episode_dir,
     collect_tau2_rollouts,
@@ -85,6 +85,10 @@ class TestCommand:
         assert agent_args["max_tokens"] == cfg.sampling.max_tokens
         # airline uses tau2's default split; only telecom carries an override
         assert "--task-split-name" not in text
+        # tau2-internal retries are pinned OFF: a runner-level retry would re-run
+        # the simulation into the same span sink, splicing an abandoned attempt's
+        # tokens under another attempt's reward. Retries are episode-level.
+        assert command[command.index("--max-retries") + 1] == "0"
 
     def test_telecom_needs_the_full_split(self, tmp_path: Path) -> None:
         spec = _EpisodeSpec("telecom/900", 1, tmp_path / "step-0000")
@@ -225,3 +229,48 @@ class TestDispatch:
             0, ["airline/0"], _cfg(), HarnessDoc.baseline(), _provider_config(), tmp_path
         )
         assert calls == ["tau2"]
+
+
+class TestEpisodeRetry:
+    def test_a_failed_attempt_retries_fresh_and_a_graded_one_stops(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # First attempt dies without evidence, second lands a graded simulation;
+        # the third would fail the test by over-running the retry budget.
+        cfg = _cfg(episode_retries=1)
+        cfg = cfg.model_copy(update={"train": cfg.train.model_copy(update={"group_size": 1})})
+        attempts: list[int] = []
+
+        async def _fake_subprocess(spec: _EpisodeSpec, *_args: object) -> None:
+            attempts.append(1)
+            if len(attempts) == 2:
+                _write_results(spec.episode_dir, reward=1.0, termination="user_stop")
+
+        monkeypatch.setattr("wmo.distill.tau2._run_episode_subprocess", _fake_subprocess)
+        records, stats = collect_tau2_rollouts(
+            0, ["airline/0"], cfg, HarnessDoc.baseline(), _provider_config(), tmp_path
+        )
+        assert len(attempts) == 2
+        [record] = records
+        assert record.infra_failed is False
+        assert record.passed is True
+        assert stats.executed_trials == 1
+
+    def test_exhausted_retries_leave_an_infra_failed_record(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _cfg(episode_retries=1)
+        cfg = cfg.model_copy(update={"train": cfg.train.model_copy(update={"group_size": 1})})
+        attempts: list[int] = []
+
+        async def _never_lands(*_args: object) -> None:
+            attempts.append(1)
+
+        monkeypatch.setattr("wmo.distill.tau2._run_episode_subprocess", _never_lands)
+        records, stats = collect_tau2_rollouts(
+            0, ["airline/0"], cfg, HarnessDoc.baseline(), _provider_config(), tmp_path
+        )
+        assert len(attempts) == 2  # the original try plus one retry
+        [record] = records
+        assert record.infra_failed is True
+        assert stats.infra_failed_trials == 1

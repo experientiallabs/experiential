@@ -246,6 +246,15 @@ def _tau2_command(spec: _EpisodeSpec, cfg: DistillConfig, proxy_base_url: str) -
         json.dumps(cfg.tau2.user_llm_args),
         "--save-to",
         spec.save_name,
+        # ZERO tau2-internal retries, deliberately. tau2's runner-level retry
+        # re-runs the whole simulation, which (a) multiplies the episode wall
+        # clock past the collector's hard deadline, and (b) would append the
+        # abandoned attempt's turns into the SAME span sink, so training datums
+        # would carry tokens from an attempt whose recorded reward is another
+        # attempt's. Transient failures retry at the episode level instead
+        # (`Tau2Config.episode_retries`), each attempt on a fresh sink.
+        "--max-retries",
+        "0",
         # Headless reruns must never block on tau2's interactive resume prompt.
         "--auto-resume",
     ]
@@ -451,6 +460,50 @@ async def _run_batch(
     """Run the batch's episodes under the configured concurrency."""
     semaphore = asyncio.Semaphore(cfg.train.trial_concurrency)
 
+    assert cfg.tau2 is not None  # validated by the caller
+
+    async def _one_attempt(spec: _EpisodeSpec) -> None:
+        """One fresh simulation attempt: fresh sink, fresh recorder, fresh provider."""
+        spec.episode_dir.mkdir(parents=True, exist_ok=True)
+        spec.sink_dir.mkdir(parents=True, exist_ok=True)
+        sink_path = spec.sink_dir / f"{spec.name}.jsonl"
+        # A leftover sink from a wiped, crashed, or retried earlier attempt would
+        # break load_trial_spans' contiguous call_index contract, and worse,
+        # would splice an abandoned attempt's turns into this attempt's datums.
+        sink_path.unlink(missing_ok=True)
+        (spec.episode_dir / RESULTS_FILENAME).unlink(missing_ok=True)
+        # The explicit tool-calling wrapper (not `wrap_provider_with_retries`)
+        # because the proxy's registry is typed to the structured seam; same
+        # retry contract as the harbor agent bridge.
+        provider = RetryingToolCallingProvider(
+            TinkerChatProvider(provider_config, recorder=TokenRecorder(jsonl_path=sink_path))
+        )
+        (spec.episode_dir / PROVIDER_SNAPSHOT_FILENAME).write_text(
+            json.dumps(_provider_snapshot(provider_config), sort_keys=True),
+            encoding="utf-8",
+        )
+        proxy.register(spec.name, provider)
+        try:
+            await _run_episode_subprocess(spec, cfg, proxy.base_url)
+        except RuntimeError as error:
+            # No results file this attempt; the retry loop (or, on the last
+            # attempt, the assembled infra_failed record) owns what happens next.
+            logger.warning("%s", error)
+        finally:
+            proxy.release(spec.name)
+
+    def _has_verifier_evidence(spec: _EpisodeSpec) -> bool:
+        """Whether the episode dir now holds a graded simulation (retry decider)."""
+        simulation = _read_simulation(spec)
+        if simulation is None:
+            return False
+        if simulation.get("termination_reason") == "infrastructure_error":
+            return False
+        reward_info = simulation.get("reward_info")
+        return isinstance(reward_info, dict) and isinstance(reward_info.get("reward"), int | float)
+
+    episode_retries = cfg.tau2.episode_retries
+
     async def _one(spec: _EpisodeSpec) -> None:
         async with semaphore:
             if should_cancel is not None and should_cancel():
@@ -460,31 +513,18 @@ async def _run_batch(
             if _episode_complete(spec):
                 logger.info("episode %s already complete; reusing its evidence", spec.name)
                 return
-            spec.episode_dir.mkdir(parents=True, exist_ok=True)
-            spec.sink_dir.mkdir(parents=True, exist_ok=True)
-            sink_path = spec.sink_dir / f"{spec.name}.jsonl"
-            # A leftover sink from a wiped or crashed earlier attempt would break
-            # load_trial_spans' contiguous call_index contract.
-            sink_path.unlink(missing_ok=True)
-            # The explicit tool-calling wrapper (not `wrap_provider_with_retries`)
-            # because the proxy's registry is typed to the structured seam; same
-            # retry contract as the harbor agent bridge.
-            provider = RetryingToolCallingProvider(
-                TinkerChatProvider(provider_config, recorder=TokenRecorder(jsonl_path=sink_path))
-            )
-            (spec.episode_dir / PROVIDER_SNAPSHOT_FILENAME).write_text(
-                json.dumps(_provider_snapshot(provider_config), sort_keys=True),
-                encoding="utf-8",
-            )
-            proxy.register(spec.name, provider)
-            try:
-                await _run_episode_subprocess(spec, cfg, proxy.base_url)
-            except RuntimeError as error:
-                # The episode stays an infra_failed record (no results file);
-                # the batch goes on. Mirrors harbor's missing_reward="zero".
-                logger.warning("%s", error)
-            finally:
-                proxy.release(spec.name)
+            for attempt in range(1 + episode_retries):
+                await _one_attempt(spec)
+                if _has_verifier_evidence(spec):
+                    return
+                if attempt < episode_retries:
+                    logger.warning(
+                        "episode %s produced no verifier evidence; retrying with a fresh "
+                        "simulation and a fresh span sink (%d retr%s left)",
+                        spec.name,
+                        episode_retries - attempt,
+                        "y" if episode_retries - attempt == 1 else "ies",
+                    )
 
     await asyncio.gather(*(_one(spec) for spec in specs))
 
