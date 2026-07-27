@@ -1295,7 +1295,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
     if mode not in ("open-loop", "closed-loop"):
         raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
-    # Reject flags this flow will never read, before anything runs — a silently dropped
+    # Reject flags this flow will never read, before anything runs: a silently dropped
     # --harness/--k means the user paid for an open-loop run they did not ask for.
     if mode != "closed-loop":
         inapplicable = [flag for param, flag in _CLOSED_LOOP_ONLY_FLAGS if _explicit(ctx, param)]
@@ -1425,7 +1425,12 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
         chain=chain,
         region=region,
     )
-    _require_scorable_steps(report, args)
+    _require_scorable_steps(
+        report,
+        args,
+        next_step=f"check the export with `wmo ingest --file {args[0]}`, or add "
+        "`--mode closed-loop` for a tasks file",
+    )
     _print_eval_report(report)
     if out:
         _write_ad_hoc_eval_report(Path(out), report)
@@ -1703,7 +1708,18 @@ def _eval_run_suite(
         reasoning=reasoning if reasoning is not None else suite.config.reasoning,
     )
     files = suite.resolve_files()
+    if not files:
+        raise typer.BadParameter(
+            f"eval suite {suite.id} lists no trace files; set `files` in {suite.path}"
+        )
     report = _run_eval_files(files, options, provider=provider, model=model, region=region)
+    # A suite run is saved under --results-root and resurfaces in `wmo eval results`, so a
+    # zero-step scorecard must fail here rather than persist as a real 0.000 measurement.
+    _require_scorable_steps(
+        report,
+        [str(path) for path in files],
+        next_step=f"check the corpus `files` in {suite.path} with `wmo ingest --file {files[0]}`",
+    )
     _print_eval_report(report)
 
     run_id = uuid4().hex
@@ -1838,23 +1854,25 @@ def _run_eval_files(
     return evaluation.run()
 
 
-def _require_scorable_steps(report: EvalReport, args: list[str]) -> None:
-    """Refuse to print a 0.000 scorecard for input that held nothing to score.
+def _require_scorable_steps(report: EvalReport, paths: list[str], *, next_step: str) -> None:
+    """Refuse to print (or persist) a 0.000 scorecard for input that held nothing to score.
 
     `evaluate_files` skips a file that yields no OTel GenAI traces, so a wrong file type, a
     tasks.jsonl missing `--mode closed-loop`, or a train_split that leaves no holdout all used to
-    render as a plausible `OVERALL fidelity=0.000 over 0 held-out steps` at exit 0.
+    render as a plausible `OVERALL fidelity=0.000 over 0 held-out steps` at exit 0. `wmo eval run
+    <suite>` additionally saved that scorecard as a durable result, so it resurfaced later in
+    `wmo eval results`; both flows now stop here instead.
+
+    `next_step` is the caller's flow-specific remedy, since the ad-hoc path can suggest
+    `--mode closed-loop` for a tasks file and the suite path cannot.
     """
     if report.total_steps:
         return
-    files = ", ".join(args)
+    listed = ", ".join(paths)
     if not report.per_file:
-        raise typer.BadParameter(
-            f"no OTel GenAI traces in {files}; check the export with "
-            f"`wmo ingest --file {args[0]}`, or add `--mode closed-loop` for a tasks file"
-        )
+        raise typer.BadParameter(f"no OTel GenAI traces in {listed}; {next_step}")
     raise typer.BadParameter(
-        f"no held-out steps to score in {files}; lower `--train-split` (currently reserving "
+        f"no held-out steps to score in {listed}; lower `--train-split` (currently reserving "
         "every trace for training) or pass a larger corpus"
     )
 
@@ -2653,7 +2671,8 @@ def research_plot_concurrency(
     ideal-linear, and the T_real/T_world differential when the report has both sides.
 
     `concurrency_plot` is imported here (not at module scope) because it pulls in matplotlib/pandas
-    from the optional `viz` extra — the harness runtime must not require them. `_require_viz_extra`
+    from the optional `viz` extra, and the harness runtime must not require them.
+    `_require_viz_extra`
     turns a missing extra into a usage error naming `uv sync --extra viz`, so the import itself
     never surfaces a raw ModuleNotFoundError traceback.
     """

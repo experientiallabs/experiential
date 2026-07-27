@@ -1118,6 +1118,50 @@ def test_eval_file_with_no_traces_fails_instead_of_scoring_zero(tmp_path) -> Non
     assert "OVERALL" not in flat
 
 
+def test_eval_run_suite_with_no_traces_fails_instead_of_persisting_zero(tmp_path) -> None:  # noqa: ANN001
+    # A suite result is durable: a zero-step run used to be saved and then resurface in
+    # `wmo eval results` as a real 0.000 measurement.
+    evals_dir = tmp_path / "examples" / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir.parent / "traces.otel.jsonl").write_text(
+        '{"task_id": "t1", "instruction": "do it"}\n', encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text('files = ["../traces.otel.jsonl"]\n', encoding="utf-8")
+    results_root = tmp_path / ".wmo" / "evals"
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "run",
+            "tiny-task",
+            "--examples-root",
+            str(tmp_path / "examples"),
+            "--results-root",
+            str(results_root),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "no OTel GenAI traces" in flat
+    assert "OVERALL" not in flat
+    assert not list(results_root.rglob("*.json"))  # nothing persisted
+
+
+def test_eval_run_suite_listing_no_files_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    evals_dir = tmp_path / "examples" / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir / "default.toml").write_text("files = []\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["eval", "run", "tiny-task", "--examples-root", str(tmp_path / "examples")]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "lists no trace files" in _flat(result.output)
+
+
 def test_eval_run_unknown_suite_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
     examples_root = tmp_path / "examples"
     examples_root.mkdir()
@@ -1181,7 +1225,7 @@ def _hide_viz_extra(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_eval_grid_flows_name_the_viz_extra_when_it_is_missing(monkeypatch, tmp_path) -> None:  # noqa: ANN001
     # matplotlib/seaborn ship in the optional [viz] extra; the plotting import used to escape as a
-    # raw ModuleNotFoundError that never named it — for `eval grid`, after the whole paid grid.
+    # raw ModuleNotFoundError that never named it (for `eval grid`, after the whole paid grid).
     _hide_viz_extra(monkeypatch)
     result_json = tmp_path / "grid.json"
     result_json.write_text("{}", encoding="utf-8")
