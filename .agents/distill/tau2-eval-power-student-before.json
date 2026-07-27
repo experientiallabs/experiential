@@ -3,28 +3,25 @@
  "k": 3,
  "tasks": 20,
  "measured": 20,
- "interior": 5,
- "floor": 11,
- "ceiling": 4,
+ "interior": 10,
+ "floor": 1,
+ "ceiling": 9,
  "batch_stats": {
   "trials": 60,
-  "trials_with_spans": 57,
-  "solve_rate": 0.3050847457627119,
+  "trials_with_spans": 59,
+  "solve_rate": 0.6833333333333333,
   "graded_solve_rate": 0.0,
   "graded_trials": 0,
-  "raw_solve_rate": 0.3,
-  "executed_trials": 59,
-  "infra_failed_trials": 1,
-  "empty_span_trials": 3,
-  "truncated_spans": 1,
-  "truncated_span_trials": 1,
+  "raw_solve_rate": 0.6833333333333333,
+  "executed_trials": 60,
+  "infra_failed_trials": 0,
+  "empty_span_trials": 1,
+  "truncated_spans": 0,
+  "truncated_span_trials": 0,
   "stop_reason_counts": {
-   "max_turns": 15,
-   "submitted": 37,
-   "unknown": 1,
-   "unparsed_tool_call": 7
+   "submitted": 60
   },
-  "scaffold_loss_rate": 0.3728813559322034
+  "scaffold_loss_rate": 0.0
  },
  "rows": [
   {
@@ -37,7 +34,7 @@
    "task_id": "airline/12",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.6666666666666666
+   "pass_rate": 0.3333333333333333
   },
   {
    "task_id": "airline/22",
@@ -49,7 +46,7 @@
    "task_id": "airline/4",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.3333333333333333
+   "pass_rate": 1.0
   },
   {
    "task_id": "airline/40",
@@ -61,55 +58,55 @@
    "task_id": "airline/44",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.6666666666666666
   },
   {
    "task_id": "airline/6",
-   "attempts": 2,
-   "infra_failed": 1,
+   "attempts": 3,
+   "infra_failed": 0,
    "pass_rate": 1.0
   },
   {
    "task_id": "retail/100",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.3333333333333333
   },
   {
    "task_id": "retail/102",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.3333333333333333
   },
   {
    "task_id": "retail/33",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.6666666666666666
   },
   {
    "task_id": "retail/52",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 1.0
   },
   {
    "task_id": "retail/8",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.3333333333333333
   },
   {
    "task_id": "retail/86",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.3333333333333333
   },
   {
    "task_id": "retail/88",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 1.0
   },
   {
    "task_id": "retail/92",
@@ -121,13 +118,13 @@
    "task_id": "telecom/[mms_issue]break_apn_mms_setting|user_abroad_roaming_disabled_off[PERSONA:Hard]",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 0.6666666666666666
   },
   {
    "task_id": "telecom/[mms_issue]break_app_both_permissions|unseat_sim_card[PERSONA:Hard]",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.0
+   "pass_rate": 1.0
   },
   {
    "task_id": "telecom/[mobile_data_issue]airplane_mode_on|data_usage_exceeded[PERSONA:Easy]",
@@ -139,13 +136,13 @@
    "task_id": "telecom/[mobile_data_issue]bad_vpn|user_abroad_roaming_disabled_on[PERSONA:None]",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.6666666666666666
+   "pass_rate": 1.0
   },
   {
    "task_id": "telecom/[service_issue]break_apn_settings|lock_sim_card_pin|overdue_bill_suspension[PERSONA:Easy]",
    "attempts": 3,
    "infra_failed": 0,
-   "pass_rate": 0.3333333333333333
+   "pass_rate": 0.6666666666666666
   }
  ]
 }

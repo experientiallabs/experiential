@@ -60,7 +60,10 @@ def main() -> int:
             # finished in minutes; retail runs long conversations over growing
             # prompts, and tau2's graceful --timeout does not interrupt a
             # running turn, so the hard kill was what fired).
-            "rollout": {"max_turns": 40, "episode_timeout_s": 1800.0},
+            # max_turns 100: the Opus capture that produced these splits ran
+            # tau2's default 200-step budget and needed p90 22-28 TOOL CALLS
+            # (roughly 50-70 messages); 40 provably chopped telecom episodes.
+            "rollout": {"max_turns": 100, "episode_timeout_s": 1800.0},
             # 8192: at 4096 the loop smoke truncated a turn in 1 of 4 episodes,
             # and a truncated turn reads as a broken action to the environment.
             "sampling": {"temperature": 1.0, "max_tokens": 8192},
