@@ -47,11 +47,26 @@ names a decision a user actually owns (spend cap, dial point, training config, r
 | sweep     | `route sweep`               | `<model_dir>/optimize/matrix.json`            | $$   |
 | distill?  | `optimize distill run` + `route student` + student-only sweep + matrix merge | run dir + adapter + pool entry + merged matrix | $$$ |
 | fit       | `route fit --kind knn`      | `<model_dir>/policy.json` (+ bank sidecar)    | free |
-| tune      | `route tune`                | `<model_dir>/endpoint.toml`                   | free |
+| tune      | `route tune`                | `<model_dir>/policy.json` (+ `policy.base.json`) | free |
 | report    | `route report` + scorecard  | `<model_dir>/optimize/report.json`            | ~$0  |
 
 - Artifacts land exactly where `wmo serve` and the manual commands already read/write them; a
   user can drop to any manual command mid-flow and the orchestrator resumes around it.
+- CORRECTION (2026-07-27, as built): the tune row above originally named
+  `<model_dir>/endpoint.toml`. That file is real (`wmo/serving/endpoint_config.py`,
+  `ENDPOINT_CONFIG_FILENAME`; `wmo/serving/server.py:193-210` mounts every policy on the dial its
+  `endpoint.toml` asks for), but it is the SERVING-side override, for a policy an operator does
+  not want to rewrite: the platform's slider writes it, and `PUT /v1/endpoints/{name}/config`
+  persists to it. `wmo optimize route tune` dials the OPTIMIZER's own output instead, rewriting
+  `policy.json` in place and preserving the as-fitted bytes in `policy.base.json`. The
+  orchestrator's tune stage calls that same function, so the stage single-sources the manual
+  command rather than growing a second way to set the same dial.
+  The two compose without corrupting each other: `apply_cost_quality` is absolute, not relative
+  (it sets all four knobs from the dial alone, recomputes `floor_sim` off the bank, and strips any
+  existing dial suffix through `fit_provenance`), and `EndpointRuntime` keeps the on-disk policy
+  as `_base_policy`. So an `endpoint.toml` beside a policy this command already dialed lands on
+  exactly the artifact it would have produced from the as-fitted one. Migrating the orchestrator's
+  dial to write `endpoint.toml` instead is a possible follow-up, not a defect in what shipped.
 - A compaction stage slot is RESERVED between sweep and fit (compress-aware sweep + bank refit
   per the representation-consistency seam) and activates when the D-COMPRESS seam (#265) lands;
   designed now so its arrival is additive.
