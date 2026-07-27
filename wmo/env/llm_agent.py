@@ -32,7 +32,7 @@ efficiently: no redundant calls, finish as soon as the task is done."""
 # `get_user_details` payloads exceed it several-fold), and an agent that cannot see what it just
 # fetched re-fetches it: verbatim re-fetch loops appeared in 12-18 of 30 sim2real episodes.
 # Callers with bigger observations raise it further through `history_chars`.
-_MAX_HISTORY_CHARS = 2000
+DEFAULT_HISTORY_CHARS = 2000
 
 # Extra attempts when a provider returns a blank completion. Measured on kimi-k2.6, where 24% of
 # replies were empty strings: without a retry each blank becomes an empty MESSAGE action that
@@ -90,7 +90,7 @@ class LLMAgent:
         *,
         temperature: float = 0.0,
         tools_hint: str | None = None,
-        history_chars: int = _MAX_HISTORY_CHARS,
+        history_chars: int = DEFAULT_HISTORY_CHARS,
     ) -> None:
         self._provider = provider
         self._temperature = temperature
@@ -141,6 +141,16 @@ class LLMAgent:
         cheap next to losing the episode (see `_EMPTY_RETRIES` for what that cost). After the
         last retry the blank is returned and handled as before, so a provider that only ever
         answers empty still terminates.
+
+        LIMITATION, stated because the retry depends on it and it is not verified: the retry
+        sends the IDENTICAL prompt at the agent's temperature, which is 0.0 by default, so it
+        only helps if the blanks are provider-side nondeterminism rather than a deterministic
+        response to this prompt. The 24% blank rate that motivated this was measured on the
+        original transcripts, and the retry's effect on that rate was NOT re-measured; the
+        diagnosis that excluding blank-affected episodes closed the model's gap is what is
+        evidenced, not that re-asking recovers them. If a future capture shows blanks surviving
+        all three attempts at the same rate, the fix is a nonzero retry temperature or a
+        provider-side report, not more retries.
         """
         completion = self._complete_once(prompt)
         for _retry in range(_EMPTY_RETRIES):
@@ -159,7 +169,10 @@ class LLMAgent:
 
 
 def _render_turn(
-    task: str | None, state: EnvState, history: list[Step], history_chars: int = _MAX_HISTORY_CHARS
+    task: str | None,
+    state: EnvState,
+    history: list[Step],
+    history_chars: int = DEFAULT_HISTORY_CHARS,
 ) -> str:
     lines = [f"TASK: {task or '(none)'}"]
     if state.scratchpad:

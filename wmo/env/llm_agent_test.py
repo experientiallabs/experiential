@@ -109,11 +109,11 @@ def test_prose_tool_call_is_not_a_finish_signal() -> None:
     # fix was "do not read it as done". It is now EXECUTED as the call it plainly is
     # (`_parse_bare_call`), which is strictly better and measured: the same failure cost glm 56%
     # of its real tau-bench retail episodes. The regression this test exists to catch is
-    # unchanged and still asserted below: whatever else happens, this reply must never terminate
-    # the episode.
+    # unchanged: whatever else happens, this reply must never terminate the episode, and a
+    # TOOL_CALL is that guarantee. (An `action.content != DONE_SIGNAL` assertion alongside it
+    # could never fail, because a TOOL_CALL's content is None, so it is gone.)
     agent = LLMAgent(FakeProvider('get_user_details({"user_id": "chen_silva_2201"})'))
     action = agent.act("task", EnvState(), [])
-    assert action.content != DONE_SIGNAL
     assert action.kind is ActionKind.TOOL_CALL
     assert action.name == "get_user_details"
     assert action.arguments == {"user_id": "chen_silva_2201"}

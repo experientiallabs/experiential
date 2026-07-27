@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from wmo.env.base import Env
 from wmo.env.episode import run_episode
-from wmo.env.llm_agent import LLMAgent
+from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS, LLMAgent
 from wmo.env.scenarios import Scenario
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
@@ -156,6 +156,7 @@ def evaluate_pool(
     max_steps: int = 20,
     agent_temperature: float = 0.0,
     tools_hint: str | None = None,
+    history_chars: int = DEFAULT_HISTORY_CHARS,
     provider_factory: Callable[[PoolEntry], Provider] = pool_provider,
     on_outcome: Callable[[ScenarioOutcome], None] | None = None,
 ) -> OutcomeMatrix:
@@ -167,6 +168,12 @@ def evaluate_pool(
     and never abort the sweep. `on_outcome` fires after each cell for progress display; a
     callback that raises is logged and ignored, since a broken progress pipe must not throw away
     the cells already paid for.
+
+    `history_chars` is how much of each observation the agent gets to see before the next turn
+    (`LLMAgent`). It is exposed here because it is environment-dependent, not a constant: the
+    default was raised to 2000 after 500 truncated tau-bench payloads into verbatim re-fetch
+    loops, and a corpus with larger observations needs more still. It changes what the candidates
+    are measured on, so it is part of a matrix's capture cohort.
     """
     outcomes: list[ScenarioOutcome] = []
     for entry in pool.models:
@@ -174,7 +181,12 @@ def evaluate_pool(
             sid = scenario_id(scenario)
             for episode in range(episodes_per_scenario):
                 timed = _TimedProvider(provider_factory(entry))
-                agent = LLMAgent(timed, temperature=agent_temperature, tools_hint=tools_hint)
+                agent = LLMAgent(
+                    timed,
+                    temperature=agent_temperature,
+                    tools_hint=tools_hint,
+                    history_chars=history_chars,
+                )
                 env = env_factory()
                 result = run_episode(env, agent, scenario.task, max_steps=max_steps)
                 score, score_error = _read_episode_score(env)
