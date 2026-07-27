@@ -11,6 +11,8 @@ from __future__ import annotations
 import socket
 import tempfile
 import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -22,7 +24,13 @@ from wmo.config.store import WorldModelStore
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmo.platform.auth import BrowserLogin
-from wmo.platform.client import PlatformClient, PlatformError, WhoAmI, fetch_cli_config
+from wmo.platform.client import (
+    PlatformClient,
+    PlatformError,
+    PlatformUnreachable,
+    WhoAmI,
+    fetch_cli_config,
+)
 from wmo.platform.credentials import (
     DEFAULT_WEB_URL,
     PlatformCredentials,
@@ -74,20 +82,28 @@ def login(
 ) -> None:
     """Connect this machine to a platform account."""
     credentials = load_credentials()
-    web_url = (url or credentials.web_url or DEFAULT_WEB_URL).rstrip("/")
+    web_url: str | None
 
     if api_url is None:
+        web_url = (url or credentials.web_url or DEFAULT_WEB_URL).rstrip("/")
         try:
             api_url = fetch_cli_config(web_url)
+        except PlatformUnreachable as error:
+            raise typer.BadParameter(str(error)) from error
         except PlatformError as error:
             raise typer.BadParameter(f"{web_url} does not look like a platform: {error}") from error
         if api_url is None:
             raise typer.BadParameter(f"{web_url} did not advertise a backend URL; is it deployed?")
     else:
         api_url = api_url.rstrip("/")
+        # --api-url names a backend directly; only --url can say which web app
+        # fronts it. Recording the hosted default here would misreport every
+        # later "connected to ..." line, so leave it unset — the API URL is
+        # what gets displayed then.
+        web_url = url.rstrip("/") if url else None
 
     if token is None:
-        token = _browser_login(web_url, open_browser=not no_browser)
+        token = _browser_login(web_url or DEFAULT_WEB_URL, open_browser=not no_browser)
     if token is None or not token.strip():
         _console.print("[red]No key received; nothing saved.[/red]")
         raise typer.Exit(code=1)
@@ -96,9 +112,14 @@ def login(
     with PlatformClient(api_url, token) as client:
         try:
             identity = client.whoami()
+        except PlatformUnreachable as error:
+            raise _platform_failure(error, "Connection failed") from error
         except PlatformError as error:
-            _console.print(f"[red]The key was rejected:[/red] {error}")
-            raise typer.Exit(code=1) from error
+            # Only an auth status means the key itself is bad; a login wall or a
+            # deploy that is not a platform must not be blamed on the key.
+            rejected = error.status_code in (401, 403)
+            headline = "The key was rejected" if rejected else "Login failed"
+            raise _platform_failure(error, headline) from error
 
     # A relogin may land on a different account: keep the saved default
     # organization only if the new identity can still see it.
@@ -144,9 +165,11 @@ def status() -> None:
         try:
             identity = client.whoami()
         except PlatformError as error:
-            _console.print(f"[red]Connection check failed:[/red] {error}")
-            raise typer.Exit(code=1) from error
-    _console.print(f"{_CHECK} Connected to [bold]{credentials.web_url}[/bold]")
+            raise _platform_failure(error, "Connection check failed") from error
+    # Env-var credentials (the headless path) carry no web_url; show the host
+    # requests actually went to rather than "None".
+    home = credentials.web_url or credentials.api_url
+    _console.print(f"{_CHECK} Connected to [bold]{home}[/bold]")
     _console.print(f"  acting as: {identity.actor.kind} {identity.actor.id}")
     _print_orgs(identity, credentials.default_org)
 
@@ -162,11 +185,13 @@ def push(
     """Publish a local world model or harness to the platform registry."""
     model_dir = WorldModelStore(root).dir_for(name)
     harness_exists = HarnessStore(root).exists(name)
-    resolved_kind = _resolve_kind(kind, model=model_dir is not None, harness=harness_exists)
+    resolved_kind = _resolve_kind(
+        kind, name=name, root=root, model=model_dir is not None, harness=harness_exists
+    )
     remote_name = push_as or name
 
     credentials, org_id = _require_connection(org)
-    with _client(credentials) as client:
+    with _connected(credentials, "Push failed") as client:
         if resolved_kind == "model" and model_dir is not None:
             _push_model(client, org_id, remote_name, model_dir)
         else:
@@ -185,7 +210,7 @@ def pull(
     if kind is not None and kind not in ("model", "harness"):
         raise typer.BadParameter("--kind must be 'model' or 'harness'")
     credentials, org_id = _require_connection(org)
-    with _client(credentials) as client:
+    with _connected(credentials, "Pull failed") as client:
         resolved_kind = kind or _detect_remote_kind(client, org_id, name)
         if resolved_kind == "model":
             _pull_model(client, org_id, name, root, force=force)
@@ -221,6 +246,26 @@ def _client(credentials: PlatformCredentials) -> PlatformClient:
     return PlatformClient(credentials.api_url, credentials.token)
 
 
+@contextmanager
+def _connected(credentials: PlatformCredentials, headline: str) -> Iterator[PlatformClient]:
+    """Open a client whose request failures end the command without a traceback.
+
+    `PlatformClient` reports every failure as a `PlatformError` (unreachable
+    hosts included), so this one handler covers every request the body makes.
+    """
+    with _client(credentials) as client:
+        try:
+            yield client
+        except PlatformError as error:
+            raise _platform_failure(error, headline) from error
+
+
+def _platform_failure(error: PlatformError, headline: str) -> typer.Exit:
+    """Render a failed platform request as a clean error; the message carries the next step."""
+    _console.print(f"[red]{headline}:[/red] {error}")
+    return typer.Exit(code=1)
+
+
 def _require_connection(org: str | None) -> tuple[PlatformCredentials, str]:
     credentials = load_credentials()
     if not credentials.is_complete():
@@ -233,14 +278,14 @@ def _require_connection(org: str | None) -> tuple[PlatformCredentials, str]:
     return credentials, org_id
 
 
-def _resolve_kind(kind: str | None, *, model: bool, harness: bool) -> str:
+def _resolve_kind(kind: str | None, *, name: str, root: str, model: bool, harness: bool) -> str:
     if kind is not None:
         if kind not in ("model", "harness"):
             raise typer.BadParameter("--kind must be 'model' or 'harness'")
         if kind == "model" and not model:
-            raise typer.BadParameter("no local world model has this name")
+            raise typer.BadParameter(_nothing_local(name, root, kind="model"))
         if kind == "harness" and not harness:
-            raise typer.BadParameter("no local harness has this name")
+            raise typer.BadParameter(_nothing_local(name, root, kind="harness"))
         return kind
     if model and harness:
         raise typer.BadParameter("both a model and a harness have this name locally; pass --kind")
@@ -248,7 +293,23 @@ def _resolve_kind(kind: str | None, *, model: bool, harness: bool) -> str:
         return "model"
     if harness:
         return "harness"
-    raise typer.BadParameter("no local world model or harness has this name")
+    raise typer.BadParameter(_nothing_local(name, root, kind=None))
+
+
+def _nothing_local(name: str, root: str, *, kind: str | None) -> str:
+    """Say what was looked for, where, what is actually there, and what to run next."""
+    if kind == "model":
+        label, have = "world model", WorldModelStore(root).list_names()
+        hint = f"`wmo build --name {name}` builds one"
+    elif kind == "harness":
+        label, have = "harness", HarnessStore(root).list_names()
+        hint = f"`wmo harness init {name}` creates one"
+    else:
+        label = "world model or harness"
+        have = [*WorldModelStore(root).list_names(), *HarnessStore(root).list_names()]
+        hint = "`wmo list` and `wmo harness list` show what is here"
+    found = f"have: {', '.join(have)}" if have else "nothing is built there"
+    return f"no local {label} named {name!r} under {root} ({found}); {hint}, or pass --root <dir>"
 
 
 def _detect_remote_kind(client: PlatformClient, org_id: str, name: str) -> str:
@@ -296,7 +357,14 @@ def _push_harness(
     ref: str | None,
     root: str,
 ) -> None:
-    doc = HarnessStore(root).load(local_name, ref)
+    try:
+        doc = HarnessStore(root).load(local_name, ref)
+    except (FileNotFoundError, ValueError) as error:
+        # A typo'd --ref is user input, not a bug: same treatment as
+        # `wmo harness show <name>@<ref>`.
+        raise typer.BadParameter(
+            f"{error}; `wmo harness list --root {root}` shows the versions and aliases"
+        ) from error
     if remote_name != local_name:
         doc = doc.model_copy(update={"name": remote_name})
     pushed = client.push_harness_version(

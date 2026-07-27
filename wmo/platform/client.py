@@ -4,6 +4,13 @@ Every call carries the org API key as a bearer credential; the platform scopes
 reads and writes to that key's organization at member strength. Error payloads
 are the platform's uniform ``{"error": message}`` shape, surfaced as
 :class:`PlatformError` with the HTTP status attached.
+
+Every failure leaves this module as a :class:`PlatformError`: a host that
+answers nothing becomes :class:`PlatformUnreachable`, and a host that answers
+something other than JSON becomes a plain :class:`PlatformError`. Callers
+therefore handle one exception type instead of httpx internals, which is what
+keeps ``wmo login``/``status``/``run``/``push``/``pull`` from printing
+tracebacks when the platform is down or the URL is not a platform at all.
 """
 
 from __future__ import annotations
@@ -18,7 +25,7 @@ import httpx
 from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import BaseModel
 
-from wmo.core.types import Action, JsonValue, Observation
+from wmo.core.types import Action, JsonObject, JsonValue, Observation
 
 _TIMEOUT_SECONDS = 120.0
 _WORKSPACE_TIMEOUT_SECONDS = 300.0
@@ -30,6 +37,68 @@ class PlatformError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class PlatformUnreachable(PlatformError):
+    """No response at all: DNS failure, refused connection, timeout, bad scheme.
+
+    Distinct from an HTTP error because the remedy is different — the host or
+    the network is wrong, not the credential — and `status_code` is None.
+    """
+
+
+class _GuardedTransport(httpx.BaseTransport):
+    """Maps httpx transport failures to :class:`PlatformUnreachable`.
+
+    Every request in this module goes through one transport, so this is the
+    single place a connection failure has to be translated; wrapping here also
+    covers the injected test transports unchanged.
+    """
+
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return self._inner.handle_request(request)
+        except httpx.RequestError as error:
+            # Connect timeouts stringify to "", so name the class instead. The
+            # remedy is the same wherever this surfaces, so it travels with the
+            # message: every caller re-raises it as its own clean CLI error.
+            detail = str(error) or type(error).__name__
+            raise PlatformUnreachable(
+                f"cannot reach {request.url}: {detail}; check your connection, "
+                "or re-run `wmo login --url <platform url>`"
+            ) from error
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def _guarded(transport: httpx.BaseTransport | None) -> _GuardedTransport:
+    """Wrap an injected transport, or the default one, in the failure mapping."""
+    return _GuardedTransport(transport if transport is not None else httpx.HTTPTransport())
+
+
+def _decode_json(response: httpx.Response) -> JsonObject:
+    """Read a JSON object body, reporting anything else as a platform error.
+
+    A 200 carrying HTML is how a marketing site, a login-walled preview, or a
+    captive portal answers: "this is not a platform", not a crash.
+    """
+    try:
+        payload = response.json()
+    except ValueError as error:
+        content_type = response.headers.get("content-type", "no content type").split(";")[0]
+        msg = (
+            f"{response.request.url} answered HTTP {response.status_code} "
+            f"with {content_type}, not JSON"
+        )
+        raise PlatformError(msg, status_code=response.status_code) from error
+    if not isinstance(payload, dict):
+        msg = f"{response.request.url} answered with a JSON {type(payload).__name__}, not an object"
+        raise PlatformError(msg, status_code=response.status_code)
+    return payload
 
 
 class ActorInfo(BaseModel):
@@ -181,12 +250,12 @@ def fetch_cli_config(web_url: str, *, transport: httpx.BaseTransport | None = No
     secret (every Endpoints page shows it) and everything behind it is
     bearer-gated.
     """
-    with httpx.Client(timeout=30.0, transport=transport) as client:
+    with httpx.Client(timeout=30.0, transport=_guarded(transport)) as client:
         response = client.get(f"{web_url.rstrip('/')}/api/cli/config")
         if response.status_code != 200:
             msg = f"platform discovery failed with HTTP {response.status_code} at {web_url}"
             raise PlatformError(msg, status_code=response.status_code)
-        api_url = response.json().get("apiUrl")
+        api_url = _decode_json(response).get("apiUrl")
         return str(api_url).rstrip("/") if api_url else None
 
 
@@ -211,14 +280,14 @@ class PlatformClient:
                 "User-Agent": f"wmo/{version}",
             },
             timeout=_TIMEOUT_SECONDS,
-            transport=transport,
+            transport=_guarded(transport),
         )
         # Bundle bytes move directly against storage's signed URLs; that
         # client carries no platform credential.
         self._transfer = httpx.Client(
             headers={"User-Agent": f"wmo/{version}"},
             timeout=_TIMEOUT_SECONDS,
-            transport=transport,
+            transport=_guarded(transport),
         )
 
     def __enter__(self) -> PlatformClient:
@@ -236,7 +305,10 @@ class PlatformClient:
     def whoami(self) -> WhoAmI:
         response = self._client.get("/api/whoami")
         self._raise_for_error(response)
-        return WhoAmI.model_validate(response.json())
+        # The identity call doubles as "is this host a platform?": `login
+        # --api-url` and `status` reach it before anything else, so a non-JSON
+        # 200 has to read as a verdict rather than a decoder traceback.
+        return WhoAmI.model_validate(_decode_json(response))
 
     # -- unified runs --------------------------------------------------------------------------
 

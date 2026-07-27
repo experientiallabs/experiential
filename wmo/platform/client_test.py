@@ -15,6 +15,7 @@ from wmo.core.types import Action, ActionKind
 from wmo.platform.client import (
     PlatformClient,
     PlatformError,
+    PlatformUnreachable,
     RemoteAgentSession,
     fetch_cli_config,
 )
@@ -494,3 +495,54 @@ def test_fetch_cli_config_maps_failures() -> None:
 
     with pytest.raises(PlatformError, match="discovery failed"):
         fetch_cli_config("https://platform.test", transport=httpx.MockTransport(handler))
+
+
+def test_fetch_cli_config_maps_an_unreachable_host() -> None:
+    """A refused connection is a platform verdict, not an httpx traceback."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[Errno 61] Connection refused", request=request)
+
+    with pytest.raises(PlatformUnreachable, match="cannot reach") as info:
+        fetch_cli_config("https://platform.test", transport=httpx.MockTransport(handler))
+    assert "wmo login --url" in str(info.value)
+    assert info.value.status_code is None
+
+
+def test_fetch_cli_config_maps_a_non_json_200() -> None:
+    """A login-walled preview answers 200 with HTML; that is 'not a platform'."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html>Authentication Required</html>")
+
+    with pytest.raises(PlatformError, match="not JSON") as info:
+        fetch_cli_config("https://platform.test", transport=httpx.MockTransport(handler))
+    assert not isinstance(info.value, PlatformUnreachable)
+    assert "text/html" in str(info.value)
+
+
+def test_requests_map_an_unreachable_host() -> None:
+    """Every request goes through the guarded transport, whichever endpoint it hits."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("", request=request)
+
+    with _client(handler) as client:
+        with pytest.raises(PlatformUnreachable, match="cannot reach") as info:
+            client.whoami()
+        # An empty-message timeout must still name what happened.
+        assert "ConnectTimeout" in str(info.value)
+        with pytest.raises(PlatformUnreachable):
+            client.resolve_run_target("wm_1")
+        with pytest.raises(PlatformUnreachable):
+            client.list_harnesses("org-1")
+
+
+def test_whoami_maps_a_non_json_200() -> None:
+    """`login --api-url`/`status` reach whoami first: a captive portal is not a crash."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html>Sign in</html>")
+
+    with _client(handler) as client, pytest.raises(PlatformError, match="not JSON"):
+        client.whoami()
