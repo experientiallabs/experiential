@@ -8,7 +8,13 @@ import pytest
 
 from wmo.config import ArtifactPaths, HarnessConfig
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.engine.build import build, split_holdout, split_traces, split_traces_3way
+from wmo.engine.build import (
+    EmptyCorpusError,
+    build,
+    split_holdout,
+    split_traces,
+    split_traces_3way,
+)
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.retrieval import HashingEmbedder
 
@@ -757,3 +763,50 @@ def test_build_records_disjoint_false_when_recheck_falls_back_to_selection(tmp_p
     assert metrics["base_fresh"] is not None
     assert metrics["best_fresh"] is not None
     assert metrics["fresh_recheck_disjoint"] is False
+
+
+def _low_tier_config() -> HarnessConfig:
+    return HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,
+        train_split=0.5,
+    )
+
+
+def test_build_limit_caps_a_file_corpus(tmp_path) -> None:  # noqa: ANN001
+    # `limit` is cost control for a first build over a large export, so it must cap a FILE
+    # ingest and not only a vendor pull (the same contract as `wmo ingest --limit`).
+    seen: dict[str, int] = {}
+
+    class _CountingEmbedder(HashingEmbedder):
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            seen["steps"] = seen.get("steps", 0) + len(texts)
+            return super().embed(texts)
+
+    build(
+        _low_tier_config(),
+        file=_multi_trace_file(tmp_path, 6),
+        root=str(tmp_path / ".wmo"),
+        serve_provider=FakeProvider(),
+        embedder=_CountingEmbedder(dim=64),
+        limit=2,
+    )
+    assert seen["steps"] == 2  # one step per trace, capped at 2 of 6
+
+
+def test_build_empty_corpus_raises_the_typed_error(tmp_path) -> None:  # noqa: ANN001
+    # `EmptyCorpusError` is the seam the CLI catches to turn "your --source does not match this
+    # export" into a usage error; it stays a ValueError for existing library callers.
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(EmptyCorpusError) as excinfo:
+        build(
+            _low_tier_config(),
+            file=str(empty),
+            root=str(tmp_path / ".wmo"),
+            serve_provider=FakeProvider(),
+            embedder=HashingEmbedder(dim=64),
+        )
+    assert isinstance(excinfo.value, ValueError)

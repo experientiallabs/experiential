@@ -99,6 +99,17 @@ def judge_model_default(provider: str | None, serve_model: str) -> str:
     return _JUDGE_MODEL_DEFAULTS.get(provider or "", serve_model)
 
 
+def serve_model_default(provider: str | None) -> str | None:
+    """The serve model when none was chosen: the provider's suggested (first) model id.
+
+    Mirrors what the wizard offers, so the scriptable flag path and the interactive path agree.
+    Returns None for a provider with no curated list (openai_responses, openrouter, tinker):
+    there is no id worth guessing, so the caller must ask for `--model`.
+    """
+    models = _PROVIDER_MODELS.get(provider or "")
+    return models[0] if models else None
+
+
 # Embedders offered in the wizard, with the embeddings-model ids each provider-backed one supports
 # (None = the offline hashing embedder, no model). First entry is the suggested default.
 _EMBEDDERS: dict[str, list[str] | None] = {

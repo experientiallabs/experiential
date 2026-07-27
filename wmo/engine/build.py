@@ -40,6 +40,15 @@ from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 DEFAULT_TRAIN_SPLIT = 0.8
 
 
+class EmptyCorpusError(ValueError):
+    """Ingest produced no traces, so there is nothing to build.
+
+    A `ValueError` subclass so existing library callers keep working, but a distinct type so the
+    CLI can turn the most common cause (an export the pinned `--source` adapter cannot read) into
+    a usage error naming `--source` instead of letting a traceback escape.
+    """
+
+
 def _count_steps(traces: list[Trace]) -> int:
     return sum(len(trace.steps) for trace in traces)
 
@@ -151,6 +160,7 @@ def build(
     estimate_only: bool = False,
     drop_degenerate: bool = False,
     gepa_val_cap: int | None = None,
+    limit: int | None = None,
 ) -> OptimizeResult:
     """Ingest traces and run the full build, creating + persisting the artifact under `root`.
 
@@ -169,6 +179,11 @@ def build(
     artifact will serve, and the result lands in `auto_fidelity.json`. The search never changes
     the serve DEFAULTS (plain RAG unless flags were set explicitly): the winner activates at
     runtime via `--max-fidelity`.
+
+    `limit` caps the corpus at the first N normalized traces for BOTH transports, matching
+    `wmo ingest --limit` (`wmo.ingest.stream`) rather than only bounding a vendor pull: a first
+    cheap build over a large export is the whole point of the flag. The cap runs after the
+    degenerate-trace filter, so `--limit N --drop-degenerate` yields N usable traces.
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)
@@ -180,8 +195,10 @@ def build(
         # (run_trace_scaling / run_fidelity_tiers, via their own --drop-degenerate) apply.
         traces, dropped = drop_degenerate_traces(traces)
         report.activity(f"dropped {dropped} degenerate (all-empty-observation) traces")
+    if limit is not None:
+        traces = traces[:limit]
     if not traces:
-        raise ValueError("no traces ingested; nothing to build")
+        raise EmptyCorpusError("no traces ingested; nothing to build")
     report.ingest_done(len(traces), _count_steps(traces))
 
     # Three disjoint sets: train seeds GEPA's reflection minibatches, val (capped) selects
