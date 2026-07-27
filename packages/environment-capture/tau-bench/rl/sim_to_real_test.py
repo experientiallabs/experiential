@@ -6,13 +6,14 @@ import json
 from pathlib import Path
 
 import pytest
-from real_episodes import RealEpisodeRow
+from real_episodes import ProtocolPins, RealEpisodeRow
 from sim_to_real import (
     RankAgreement,
     has_inline_call,
     main,
     paired_scores,
     report,
+    require_one_cohort,
     scenario_clustered_stats,
 )
 
@@ -33,7 +34,16 @@ _POOL = [
 ]
 
 
-def _real_row(model: str, scenario: str, reward: float | None, episode: int = 0) -> RealEpisodeRow:
+_CANONICAL_COHORT = ProtocolPins().label
+
+
+def _real_row(
+    model: str,
+    scenario: str,
+    reward: float | None,
+    episode: int = 0,
+    cohort: str = _CANONICAL_COHORT,
+) -> RealEpisodeRow:
     return RealEpisodeRow(
         scenario_id=scenario,
         domain=scenario.split(":")[0],
@@ -58,6 +68,7 @@ def _real_row(model: str, scenario: str, reward: float | None, episode: int = 0)
         call_seconds=[0.5],
         replies=[],
         user_sim="gpt-5.4-mini",
+        cohort=cohort,
     )
 
 
@@ -159,6 +170,56 @@ def test_report_headline_agreement() -> None:
     assert "spearman  +1.000" in text
     assert "8 real rows" in text
     assert "paired overlap (2 scenarios" in text
+
+
+def test_report_names_the_cohort_it_measured() -> None:
+    rows, matrix = _agreeing_corpus()
+    text = "\n".join(report(rows, matrix, glm_clean=False))
+    assert f"cohort {_CANONICAL_COHORT}" in text
+
+
+def test_pairing_across_capture_cohorts_is_refused() -> None:
+    # A 100-turn episode and a 200-turn episode are not two draws of one measurement, so mixing
+    # them is a category error rather than a noisier estimate.
+    rows, matrix = _agreeing_corpus()
+    rows.append(_real_row("alpha", "airline:0", 0.9, episode=1, cohort="turns200-t0-tok0-r3-sim-x"))
+    with pytest.raises(SystemExit, match="capture cohorts"):
+        report(rows, matrix, glm_clean=False)
+
+
+def test_mixed_cohorts_can_be_forced_but_say_so(caplog: pytest.LogCaptureFixture) -> None:
+    rows, matrix = _agreeing_corpus()
+    rows.append(_real_row("alpha", "airline:0", 0.9, episode=1, cohort="turns200-t0-tok0-r3-sim-x"))
+    with caplog.at_level("WARNING", logger="sim-to-real"):
+        text = "\n".join(report(rows, matrix, glm_clean=False, allow_mixed_cohorts=True))
+    assert "different environments" in caplog.text
+    assert "+" in text.splitlines()[0]  # the header names both cohorts
+
+
+def test_unlabeled_rows_are_their_own_cohort() -> None:
+    # Rows captured before the pins were forwarded ran on tau2's defaults: a different
+    # environment, and the label says only that it is unknown.
+    labeled = _real_row("alpha", "airline:0", 0.5)
+    unlabeled = _real_row("beta", "airline:0", 0.5, cohort="unlabeled")
+    assert require_one_cohort([unlabeled], allow_mixed=False) == "unlabeled"
+    with pytest.raises(SystemExit, match="capture cohorts"):
+        require_one_cohort([labeled, unlabeled], allow_mixed=False)
+
+
+def test_an_empty_row_set_has_no_cohort_to_refuse() -> None:
+    assert require_one_cohort([], allow_mixed=False) == "unlabeled"
+
+
+def test_main_refuses_mixed_cohorts_before_reporting(tmp_path: Path) -> None:
+    rows, matrix = _agreeing_corpus()
+    rows.append(_real_row("alpha", "airline:0", 0.9, episode=1, cohort="turns200-t0-tok0-r3-sim-x"))
+    rows_path = tmp_path / "rows.jsonl"
+    rows_path.write_text("\n".join(row.model_dump_json() for row in rows) + "\n", encoding="utf-8")
+    matrix_path = tmp_path / "matrix.json"
+    matrix.save(matrix_path)
+    with pytest.raises(SystemExit, match="capture cohorts"):
+        main(["--real", str(rows_path), "--wm", str(matrix_path)])
+    assert main(["--real", str(rows_path), "--wm", str(matrix_path), "--allow-mixed-cohorts"]) == 0
 
 
 def test_report_flags_disagreement() -> None:

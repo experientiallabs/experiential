@@ -13,6 +13,11 @@ The headline is rank agreement over MODEL MEANS. When both legs run the same pin
 number; when they do not, tasks are matched on a normalized `reason_for_call` and the paired
 overlap is reported as a secondary check.
 
+One cohort per report: every real row carries the protocol pins it ran under
+(`real_episodes.ProtocolPins.label`), and rows whose labels differ are refused rather than pooled.
+Different pins are different environments, so a mixed set is not a noisier estimate of one number,
+it is two numbers averaged by accident. `--allow-mixed-cohorts` overrides it, loudly.
+
 Sampling unit is the SCENARIO, not the episode: a model is scored several times on each scenario,
 so the SE over per-scenario means (rather than over all episodes) is the one that does not pretend
 two trials of one task are independent draws.
@@ -64,7 +69,7 @@ import statistics as st
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from real_episodes import RealEpisodeRow, load_rows
+from real_episodes import UNLABELED_COHORT, RealEpisodeRow, load_rows
 from scipy import stats  # present in every wmo install: scikit-learn requires it
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -82,6 +87,51 @@ INLINE_CALL = re.compile(
 
 def has_inline_call(outcome: ScenarioOutcome) -> bool:
     return any(INLINE_CALL.search(reply or "") for reply in outcome.replies)
+
+
+def require_one_cohort(real: Sequence[RealEpisodeRow], allow_mixed: bool) -> str:
+    """The single capture cohort every real row must share, or a hard error.
+
+    A cohort label (`real_episodes.ProtocolPins.label`) records the turn cap, the per-episode
+    timeout, the completion cap, tau2's retry setting, and the user simulator. Rows with different
+    labels ran in different environments, so averaging or pairing them is a category error rather
+    than a noisier estimate: a 200-turn episode and a 100-turn episode are not two draws of the
+    same measurement. Rows captured before the pins were forwarded carry no label and are their own
+    cohort for exactly that reason.
+
+    Args:
+        real: The real-episode rows about to be reported on.
+        allow_mixed: Proceed anyway, loudly. For an operator who has established that the mix is
+            harmless for the question being asked, never for a quoted headline.
+
+    Returns:
+        The shared cohort label, or the joined labels when the mix was allowed.
+
+    Raises:
+        SystemExit: When the rows span more than one cohort and the override was not passed.
+    """
+    present = sorted({row.cohort for row in real})
+    if not present:
+        return UNLABELED_COHORT
+    if len(present) == 1:
+        return present[0]
+    counts = {label: sum(1 for row in real if row.cohort == label) for label in present}
+    if allow_mixed:
+        logger.warning(
+            "pairing rows across %d capture cohorts because --allow-mixed-cohorts was passed: "
+            "%s. These episodes ran in different environments; do not quote the result as one "
+            "measurement.",
+            len(present),
+            counts,
+        )
+        return "+".join(present)
+    raise SystemExit(
+        f"the real rows span {len(present)} capture cohorts {counts}, which measure different "
+        "environments (turn cap, episode timeout, completion cap, tau2 retries, user simulator). "
+        "Report each cohort separately by filtering rows.jsonl, recapture the odd cohort under the "
+        "canonical pins, or pass --allow-mixed-cohorts if the mix is genuinely harmless for the "
+        "question you are asking."
+    )
 
 
 def scenario_clustered_stats(
@@ -235,8 +285,14 @@ def paired_scores(
     return real_means, wm_means, len(shared)
 
 
-def report(real: Sequence[RealEpisodeRow], matrix: OutcomeMatrix, glm_clean: bool) -> list[str]:
+def report(
+    real: Sequence[RealEpisodeRow],
+    matrix: OutcomeMatrix,
+    glm_clean: bool,
+    allow_mixed_cohorts: bool = False,
+) -> list[str]:
     """Build the whole report as lines, so callers (and tests) can assert on it."""
+    cohort = require_one_cohort(real, allow_mixed_cohorts)
     scored = [row for row in real if row.reward is not None]
     # Both sides must be SCORED, not merely present. `wmo.env.closed_loop` leaves a cell
     # unscored on a provider throttle or an agent crash, so a candidate that was rate-limited
@@ -251,7 +307,7 @@ def report(real: Sequence[RealEpisodeRow], matrix: OutcomeMatrix, glm_clean: boo
         logger.warning("world-model models with no scored episode, excluded: %s", silent)
 
     lines = [
-        f"== REAL (tau2 reward, {len(scored)} rows) vs WM (LLM judge), per model",
+        f"== REAL (tau2 reward, {len(scored)} rows, cohort {cohort}) vs WM (LLM judge), per model",
         f"{'model':16} {'real':>16} {'eps':>5} {'wm':>16} {'inline%':>8}",
     ]
     real_mean: dict[str, float] = {}
@@ -325,12 +381,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--real", type=Path, default=Path(".wmo/evals/tau-bench-real/rows.jsonl"))
     parser.add_argument("--wm", type=Path, required=True, help="world-model OutcomeMatrix json")
     parser.add_argument("--glm-clean", action="store_true", help="add the format-corrected arm")
+    parser.add_argument(
+        "--allow-mixed-cohorts",
+        action="store_true",
+        help="report rows captured under different protocol pins together (refused by default: "
+        "they measure different environments)",
+    )
     args = parser.parse_args(argv)
 
     rows = load_rows(args.real)
     if not rows:
         parser.error(f"no real episodes at {args.real}; run real_episodes.py first")
-    for line in report(rows, OutcomeMatrix.load(args.wm), args.glm_clean):
+    lines = report(rows, OutcomeMatrix.load(args.wm), args.glm_clean, args.allow_mixed_cohorts)
+    for line in lines:
         print(line)  # noqa: T201 - operator-run CLI, this report IS the product output
     return 0
 

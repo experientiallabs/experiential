@@ -12,18 +12,29 @@ from pathlib import Path
 
 import pytest
 from real_episodes import (
+    CANONICAL_EPISODE_TIMEOUT_S,
+    CANONICAL_MAX_TOKENS,
+    CANONICAL_MAX_TURNS,
+    CANONICAL_TAU2_MAX_RETRIES,
     EVAL_SCENARIOS,
+    UNLABELED_COHORT,
+    ProtocolPins,
     RealEpisodeRow,
     Tau2Results,
+    agent_llm_args,
     append_rows,
     batch_command,
+    batch_timeout_s,
     build_env,
     domains_dir,
+    latest_per_cell,
     litellm_route,
     load_pinned_scenarios,
     load_rows,
     main,
+    next_save_to,
     price_order,
+    resume_keys,
     rows_from_results,
     save_to_name,
     spend_usd,
@@ -210,12 +221,25 @@ def test_build_env_names_the_missing_credential(tmp_path: Path) -> None:
         build_env(tmp_path, _AZURE_AI, _AZURE_OPENAI, {"AZURE_GOOGLE_SHEETS_API_KEY": "k"})
 
 
+def _command(tmp_path: Path, pins: ProtocolPins | None = None) -> list[str]:
+    return batch_command(
+        tmp_path,
+        _AZURE_AI,
+        _AZURE_OPENAI,
+        "airline",
+        ["0", "3"],
+        "s",
+        4,
+        pins or ProtocolPins(),
+    )
+
+
 def test_batch_command_pins_the_environment(tmp_path: Path) -> None:
-    command = batch_command(tmp_path, _AZURE_AI, _AZURE_OPENAI, "airline", ["0", "3"], "s", 4)
+    command = _command(tmp_path)
     assert command[command.index("--user-llm") + 1] == "azure/gpt-5.4-mini"
     assert command[command.index("--agent-llm") + 1] == "azure_ai/FW-GLM-5.2"
-    # Empty LLM args drop tau2's default temperature for BOTH streams.
-    assert command[command.index("--agent-llm-args") + 1] == "{}"
+    # No temperature on either stream; the agent stream carries only the token pin.
+    assert command[command.index("--agent-llm-args") + 1] == '{"max_tokens": 8192}'
     assert command[command.index("--user-llm-args") + 1] == "{}"
     assert command[command.index("--num-trials") + 1] == "1"
     assert command[command.index("--task-ids") + 1 : command.index("--max-concurrency")] == [
@@ -224,9 +248,98 @@ def test_batch_command_pins_the_environment(tmp_path: Path) -> None:
     ]
 
 
-def test_save_to_name_is_unique_per_cell() -> None:
-    assert save_to_name(_AZURE_AI, "airline", 0) == "real_glm_5_2_airline_e0"
+def test_canonical_pins_are_the_decisions_values() -> None:
+    # DECISIONS.md 2026-07-27 "cross-lane weave" ack 2: max_turns=100, episode_timeout_s=1800,
+    # max_tokens=8192, user sim azure/gpt-5.4-mini, tau2 --max-retries 0. Every real-tau2 leg in
+    # the project runs these exact values, so a drift here silently splits the cohort.
+    assert (CANONICAL_MAX_TURNS, CANONICAL_MAX_TOKENS, CANONICAL_TAU2_MAX_RETRIES) == (100, 8192, 0)
+    assert CANONICAL_EPISODE_TIMEOUT_S == 1800.0
+    pins = ProtocolPins()
+    assert pins.user_sim == "gpt-5.4-mini"
+    assert pins.is_canonical
+    assert pins.label == "turns100-t1800-tok8192-r0-sim-gpt-5.4-mini"
+
+
+def test_canonical_pins_reach_the_tau2_argv(tmp_path: Path) -> None:
+    # tau2's own defaults are 200 steps, no timeout, and 3 retries, so an absent flag is not a
+    # neutral choice: it is a different capture cohort.
+    command = _command(tmp_path)
+    assert command[command.index("--max-steps") + 1] == "100"
+    assert command[command.index("--timeout") + 1] == "1800"
+    assert command[command.index("--max-retries") + 1] == "0"
+    # A headless batch must not block on tau2's interactive resume prompt.
+    assert "--auto-resume" in command
+
+
+def test_moved_pins_reach_the_argv_and_rename_the_cohort(tmp_path: Path) -> None:
+    pins = ProtocolPins(max_turns=200, episode_timeout_s=600, max_tokens=4096, tau2_max_retries=3)
+    command = _command(tmp_path, pins)
+    assert command[command.index("--max-steps") + 1] == "200"
+    assert command[command.index("--timeout") + 1] == "600"
+    assert command[command.index("--max-retries") + 1] == "3"
+    assert command[command.index("--agent-llm-args") + 1] == '{"max_tokens": 4096}'
+    assert not pins.is_canonical
+    assert pins.label == "turns200-t600-tok4096-r3-sim-gpt-5.4-mini"
+
+
+def test_a_different_user_simulator_is_a_different_cohort() -> None:
+    # The user simulator IS the environment, so it belongs in the label even though it is also
+    # recorded per row.
+    assert not ProtocolPins(user_sim="gpt-5.5").is_canonical
+    assert ProtocolPins(user_sim="gpt-5.5").label.endswith("-sim-gpt-5.5")
+
+
+def test_max_tokens_zero_omits_the_key_for_a_strict_deployment() -> None:
+    # litellm rewrites max_tokens to max_completion_tokens only for reasoning models its table
+    # knows; an unrecognized deployment rejects the key outright, and a grid that cannot start is
+    # worse than a labelled second cohort.
+    assert agent_llm_args(ProtocolPins(max_tokens=0)) == "{}"
+    assert ProtocolPins(max_tokens=0).label == "turns100-t1800-tok0-r0-sim-gpt-5.4-mini"
+
+
+def test_an_impossible_pin_is_refused_not_run(tmp_path: Path) -> None:
+    _fake_capture_from_pinned_split(tmp_path)
+    assert (
+        main(
+            [
+                "--capture-dir",
+                str(tmp_path),
+                "--pool",
+                str(_pool_file(tmp_path / "pool.toml")),
+                "--out-dir",
+                str(tmp_path / "out"),
+                "--max-turns",
+                "0",  # an episode with no turns is not a cohort, it is a typo
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+
+
+def test_batch_deadline_covers_every_wave_of_the_episode_pin() -> None:
+    # A hard kill forfeits the episodes tau2 has not written yet, so the deadline has to cover the
+    # whole batch, not one episode: 20 tasks at concurrency 4 is five 1800s waves.
+    assert batch_timeout_s(20, 4, 1800.0) == 5 * 1800.0 + 300.0
+    assert batch_timeout_s(3, 4, 1800.0) == 1800.0 + 300.0
+    assert batch_timeout_s(0, 0, 1800.0) == 1800.0 + 300.0
+
+
+def test_save_to_name_is_unique_per_cell_and_attempt() -> None:
+    assert save_to_name(_AZURE_AI, "airline", 0) == "real_glm_5_2_airline_e0_a0"
     assert save_to_name(_AZURE_AI, "airline", 1) != save_to_name(_AZURE_AI, "airline", 0)
+    assert save_to_name(_AZURE_AI, "airline", 0, 1) == "real_glm_5_2_airline_e0_a1"
+
+
+def test_next_save_to_skips_a_cells_used_attempts(tmp_path: Path) -> None:
+    # Sharing a save directory across attempts makes the retry impossible: tau2 reads the old one
+    # as a checkpoint and refuses a task list that is a subset of it, which is exactly what a
+    # resumed cell asks for.
+    simulations = tmp_path / "tau2-bench" / "data" / "simulations"
+    (simulations / save_to_name(_AZURE_AI, "airline", 0, 0)).mkdir(parents=True)
+    assert next_save_to(tmp_path, _AZURE_AI, "airline", 0) == "real_glm_5_2_airline_e0_a1"
+    # A different cell is untouched by another cell's attempts.
+    assert next_save_to(tmp_path, _AZURE_AI, "airline", 1) == "real_glm_5_2_airline_e1_a0"
 
 
 def _results_payload(reward: float | None) -> Tau2Results:
@@ -331,6 +444,78 @@ def test_load_rows_on_a_fresh_run() -> None:
     assert load_rows(Path("/nonexistent/rows.jsonl")) == []
 
 
+def test_cohort_label_round_trips_through_rows_jsonl(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    label = ProtocolPins().label
+    rows = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI, label)
+    assert [row.cohort for row in rows] == [label]
+    path = tmp_path / "rows.jsonl"
+    append_rows(path, rows)
+    assert [row.cohort for row in load_rows(path)] == [label]
+
+
+def test_rows_written_before_the_pins_still_load(tmp_path: Path) -> None:
+    # A row with no cohort field is readable evidence of a DIFFERENT cohort (it ran on tau2's
+    # defaults); dropping it as unreadable would lose episodes that were paid for.
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    payload = json.loads(row.model_dump_json())
+    del payload["cohort"]
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    assert [r.cohort for r in load_rows(path)] == [UNLABELED_COHORT]
+
+
+def test_a_run_refuses_to_append_to_another_cohorts_rows(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    index = _scenario_index(tmp_path)
+    _fake_capture_from_pinned_split(tmp_path)
+    append_rows(
+        out / "rows.jsonl",
+        rows_from_results(
+            _results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI, "turns200-t0-tok0-r3-sim-x"
+        ),
+    )
+    assert (
+        main(
+            [
+                "--capture-dir",
+                str(tmp_path),
+                "--pool",
+                str(_pool_file(tmp_path / "pool.toml")),
+                "--out-dir",
+                str(out),
+                "--only",
+                "glm-5.2",
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+
+
+def test_retry_failed_re_runs_only_the_unscored_cells(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    scored = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    unscored = rows_from_results(_results_payload(None), _ANTHROPIC, 0, index, _AZURE_OPENAI)
+    rows = scored + unscored
+    assert resume_keys(rows, retry_failed=False) == {row.key for row in rows}
+    # Without tau2's own retries, this flag is the only second chance a dead episode gets.
+    assert resume_keys(rows, retry_failed=True) == {row.key for row in scored}
+
+
+def test_a_retried_cell_counts_as_one_episode_but_two_purchases(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    failed = rows_from_results(_results_payload(None), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    retried = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    rows = failed + retried
+    assert [row.reward for row in latest_per_cell(rows)] == [1.0]  # the retry supersedes
+    [outcome] = to_matrix(rows, [_AZURE_AI]).outcomes
+    assert outcome.reward == 1.0
+    # Both attempts were billed, so the spend meter counts both.
+    assert spend_usd(rows) == pytest.approx(2 * spend_usd(retried))
+
+
 def test_price_order_is_cheapest_first() -> None:
     ordered = price_order([_ANTHROPIC, _AZURE_AI, _AZURE_OPENAI])
     assert [entry.name for entry in ordered] == ["gpt-5.4-mini", "glm-5.2", "fable-5"]
@@ -375,6 +560,9 @@ def test_dry_run_resolves_the_split_and_spends_nothing(
     assert "pinned eval split: 20 scenarios" in printed
     assert "azure_ai/FW-GLM-5.2" in printed
     assert "--user-llm azure/gpt-5.4-mini" in printed
+    # The cohort the operator is about to buy is stated before anything is bought.
+    assert f"protocol pins: cohort '{ProtocolPins().label}' (canonical)" in printed
+    assert "--max-steps 100 --timeout 1800 --max-retries 0" in printed
     # The user simulator is environment, so it is never also run as a candidate.
     assert "--agent-llm azure/gpt-5.4-mini" not in printed
 
@@ -565,7 +753,7 @@ def test_telecom_task_ids_survive_argv_construction(tmp_path: Path) -> None:
         "[mobile_data_issue]airplane_mode_on|bad_network_preference|data_mode_off[PERSONA:Hard]"
     )
     command = batch_command(
-        tmp_path, _AZURE_AI, _AZURE_OPENAI, "telecom", [telecom_id], "s", 4
+        tmp_path, _AZURE_AI, _AZURE_OPENAI, "telecom", [telecom_id], "s", 4, ProtocolPins()
     )
     assert command[command.index("--task-ids") + 1] == telecom_id
 

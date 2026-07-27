@@ -177,8 +177,18 @@ What makes it a validation leg rather than a second, differently-shaped experime
 - **`scenario_id` is `"<domain>:<task_id>"`.** Airline and retail both number tasks from "0" and
   all 50 airline ids collide with retail ids, so bare ids would merge two tasks into one cell.
 - **One environment for every candidate.** The user simulator is part of the environment, so it
-  is pinned (`--user-sim`, default `gpt-5.4-mini`) and both streams pass `{}` LLM args, which
-  drops tau2's default temperature for candidates that reject sampling params.
+  is pinned (`--user-sim`, default `gpt-5.4-mini`). Neither stream is given a temperature, which
+  keeps candidates that reject sampling params on the same footing as the rest.
+- **The protocol pins are forwarded, and the pin set is recorded.** `max_turns=100` (tau2
+  `--max-steps`), `episode_timeout_s=1800` (`--timeout`), `max_tokens=8192` (candidate stream
+  only), user simulator `gpt-5.4-mini`, and tau2's own retries off (`--max-retries 0`), which is
+  the canonical protocol every real-tau2 leg in the project runs. tau2's defaults are different
+  (200 steps, no per-episode timeout, no token cap, 3 retries), so each pin is passed explicitly.
+  Every row records the pin set as a `cohort` label, each pin has a flag for moving it
+  deliberately, and `rl/sim_to_real.py` refuses to pair rows whose labels differ (override:
+  `--allow-mixed-cohorts`). With tau2's retries off, retry is the runner's job: `--retry-failed`
+  re-buys the cells whose latest row has no reward, and each attempt gets its own tau2 save
+  directory so it never collides with the previous attempt's checkpoint.
 - **tau2's reward, never a wmo judge.** Rewards are read from `reward_info.reward` in tau2's
   `results.json`. Caveat worth carrying into any writeup: tau2's reward is not uniformly
   deterministic. 7 of the 20 pinned tasks carry `NL_ASSERTION` in their `reward_basis` and tau2
@@ -196,6 +206,7 @@ leaves a usable partial grid and a rerun buys only what is missing.
 # from the repo root; needs the Setup venv above (or --capture-dir pointing at an existing clone)
 uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --dry-run
 uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --episodes 2
+uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --retry-failed
 uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --write-matrix-only
 ```
 

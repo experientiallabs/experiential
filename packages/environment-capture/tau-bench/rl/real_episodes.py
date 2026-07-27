@@ -17,9 +17,22 @@ What makes this the validation leg rather than a second, differently-shaped expe
 - **One environment for every candidate.** The user simulator is part of the environment, so it is
   pinned to one cheap model (`--user-sim`, default `gpt-5.4-mini`) for every run. Letting it vary
   per candidate would change the environment per candidate and make the rewards incomparable.
-  Empty LLM args (`{}`) for both streams drop tau2's default temperature: several pool models
-  reject sampling params, and dropping it everywhere removes a source of cross-model variation
-  rather than only working around the strict ones.
+  Neither stream is given a temperature: several pool models reject sampling params, and dropping
+  it everywhere removes a source of cross-model variation rather than only working around the
+  strict ones.
+
+Protocol pins and capture cohort: what an episode IS here is fixed by five values, adopted as
+canonical for every real-tau2 leg (joint-tau master, 2026-07-27 "cross-lane weave" ack 2):
+`max_turns=100`, `episode_timeout_s=1800`, `max_tokens=8192`, user simulator `azure/gpt-5.4-mini`,
+and tau2's own retries OFF with retry owned by this runner. All five are forwarded explicitly
+because tau2's defaults are different (200 steps, no per-episode timeout, no token cap, 3 retries),
+so inheriting them would quietly produce rows from a different environment than the training lane's
+runs. Every row records the pin set as a `cohort` label, and `sim_to_real.py` refuses to pair rows
+whose labels differ. The flags exist so the pins can be moved deliberately; any move is a NEW
+cohort, not a variation of this one. The one knowing difference from the training lane
+(`wmo/distill/tau2.py`, which shells the same clone with the same pins) is sampling temperature:
+that lane pins its Tinker student to 1.0, while pool candidates here run at each provider's own
+default for the reason above. Temperature is not part of the canonical pin set.
 
 Reward provenance: this leg NEVER runs a wmo judge. It reads `reward_info.reward` out of tau2's
 `results.json` and nothing else. Note that tau2's own reward is not uniformly deterministic:
@@ -38,7 +51,11 @@ to this benchmark dir, so the README's setup block is all that is needed.
 
 Resumable and budgeted: rows are appended to `rows.jsonl` after every batch and keyed by
 (scenario, model, episode), so a stop or a crash leaves a usable partial grid and a rerun picks up
-exactly what is missing. `--budget-usd` is checked between batches, and models run cheapest-first
+exactly what is missing. Every attempt at a cell gets its own tau2 save directory, because tau2
+treats an existing one as a checkpoint and refuses a run whose task list is a subset of it, which
+is precisely what a resumed cell asks for. `--retry-failed` re-buys the cells whose latest row
+carries no reward: with tau2's own retries pinned off, that is where a transiently dead episode
+gets its second chance. `--budget-usd` is checked between batches, and models run cheapest-first
 for the same reason.
 
 Run from the repo root:
@@ -53,12 +70,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import subprocess
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from wmo.core.types import JsonObject, JsonValue
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -76,7 +94,28 @@ DEFAULT_OUT_DIR = Path(".wmo/evals/tau-bench-real")
 DEFAULT_USER_SIM = "gpt-5.4-mini"
 DEFAULT_BUDGET_USD = 140.0
 DEFAULT_MAX_CONCURRENCY = 4
-BATCH_TIMEOUT_S = 5400
+
+# The CANONICAL real-tau2 protocol pins (joint-tau master, DECISIONS.md 2026-07-27 "cross-lane
+# weave" ack 2). Every real-tau2 leg in the project runs these exact values; the training lane
+# carries the same numbers as its `rollout`/`sampling` config defaults.
+CANONICAL_MAX_TURNS = 100
+CANONICAL_EPISODE_TIMEOUT_S = 1800.0
+CANONICAL_MAX_TOKENS = 8192
+CANONICAL_TAU2_MAX_RETRIES = 0
+
+# Rows written before the pins were forwarded carry no label. They are their own cohort: their
+# episodes ran on tau2's defaults, which is a different environment, not a noisier sample of this
+# one.
+UNLABELED_COHORT = "unlabeled"
+
+# Wall clock granted past the batch's own graceful per-episode budget before the subprocess is
+# killed. A kill forfeits every episode tau2 had not yet written, so this covers tau2's startup,
+# its evaluation pass, and its save, not a second wave of episodes.
+BATCH_KILL_MARGIN_S = 300.0
+
+# How many attempts one cell may make before its save-directory search gives up. Reaching this
+# means something is failing every time, and silently piling up directories would hide it.
+MAX_ATTEMPTS_PER_CELL = 100
 
 # A realistic agent-side episode mix, used only to order the pool cheapest-first. Ordering by
 # input price alone would let a model with a cheap input rate and an expensive output rate look
@@ -88,6 +127,67 @@ _EPISODE_MIX = TokenUsage(input_tokens=30_000, output_tokens=1_000)
 # against a silen-resource candidate inside one tau2 process without either clobbering the other.
 _AZURE_OPENAI_HOST = ".openai.azure.com"
 _AZURE_AI_HOST = ".services.ai.azure.com"
+
+
+class ProtocolPins(BaseModel):
+    """The five values that define what a real-tau2 episode is, plus the cohort label they name.
+
+    Defaults are the canonical pins. Constructing this with anything else is legal and explicit:
+    it produces a different `label`, which is how every downstream consumer learns that those rows
+    are a separate capture cohort.
+    """
+
+    max_turns: int = Field(default=CANONICAL_MAX_TURNS, ge=1)
+    episode_timeout_s: float = Field(default=CANONICAL_EPISODE_TIMEOUT_S, gt=0)
+    # 0 means "send no cap at all"; see agent_llm_args.
+    max_tokens: int = Field(default=CANONICAL_MAX_TOKENS, ge=0)
+    tau2_max_retries: int = Field(default=CANONICAL_TAU2_MAX_RETRIES, ge=0)
+    user_sim: str = DEFAULT_USER_SIM
+
+    @property
+    def label(self) -> str:
+        """The cohort label recorded on every row: short, greppable, and complete."""
+        return (
+            f"turns{self.max_turns}-t{self.episode_timeout_s:.0f}-tok{self.max_tokens}"
+            f"-r{self.tau2_max_retries}-sim-{self.user_sim}"
+        )
+
+    @property
+    def is_canonical(self) -> bool:
+        """Whether these are the canonical pins every other real-tau2 leg runs."""
+        return self.label == ProtocolPins().label
+
+
+def agent_llm_args(pins: ProtocolPins) -> str:
+    """The `--agent-llm-args` JSON for the candidate stream: the token cap, and nothing else.
+
+    `max_tokens=0` drops the key entirely. That escape hatch is deliberate: litellm rewrites
+    `max_tokens` to `max_completion_tokens` only for the reasoning models its table knows, so a
+    deployment name it has never seen is rejected outright by Azure, and a grid that cannot start
+    at all is worse than a second cohort that says so in its label.
+    """
+    args: JsonObject = {} if pins.max_tokens <= 0 else {"max_tokens": pins.max_tokens}
+    return json.dumps(args)
+
+
+def batch_timeout_s(task_count: int, max_concurrency: int, episode_timeout_s: float) -> float:
+    """Hard-kill deadline for one batch subprocess, derived from the per-episode pin.
+
+    tau2's own `--timeout` ends each episode gracefully and still scores it, so this deadline is
+    only for a wedged runner, and firing it forfeits every episode in the batch tau2 had not
+    written yet. It therefore has to cover the whole batch: as many waves of the per-episode
+    budget as the concurrency needs, plus the margin.
+
+    Args:
+        task_count: Tasks in this batch.
+        max_concurrency: Episodes tau2 runs at once.
+        episode_timeout_s: The per-episode pin handed to tau2.
+
+    Returns:
+        Seconds to allow the subprocess before killing it.
+    """
+    waves = max(1, math.ceil(task_count / max(1, max_concurrency)))
+    return waves * episode_timeout_s + BATCH_KILL_MARGIN_S
 
 
 def _zero_if_null(value: JsonValue) -> JsonValue:
@@ -185,6 +285,10 @@ class RealEpisodeRow(BaseModel):
     call_seconds: list[float]
     replies: list[str]
     user_sim: str
+    # The protocol pins this episode ran under (`ProtocolPins.label`). Rows from before the pins
+    # were forwarded have no label and default to UNLABELED_COHORT rather than failing to load:
+    # they are readable evidence of a different cohort, and consumers refuse to pair across them.
+    cohort: str = UNLABELED_COHORT
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -424,8 +528,9 @@ def batch_command(
     task_ids: Sequence[str],
     save_to: str,
     max_concurrency: int,
+    pins: ProtocolPins,
 ) -> list[str]:
-    """The exact tau2 CLI invocation for one (candidate, domain) batch."""
+    """The exact tau2 CLI invocation for one (candidate, domain) batch, pins included."""
     return [
         str(capture_dir / ".venv" / "bin" / "tau2"),
         "run",
@@ -434,9 +539,11 @@ def batch_command(
         "--agent-llm",
         litellm_route(entry),
         "--agent-llm-args",
-        "{}",
+        agent_llm_args(pins),
         "--user-llm",
         litellm_route(user_sim),
+        # The user stream carries no args at all, matching the training lane's `user_llm_args`
+        # default, so both legs' user simulators are the same environment.
         "--user-llm-args",
         "{}",
         "--num-trials",
@@ -447,13 +554,65 @@ def batch_command(
         str(max_concurrency),
         "--save-to",
         save_to,
+        # The canonical pins. tau2's own defaults are 200 steps, no per-episode timeout, and 3
+        # retries, so every one of these has to be argv: inheriting a default would silently
+        # capture a different environment than the training lane measures.
+        "--max-steps",
+        str(pins.max_turns),
+        "--timeout",
+        f"{pins.episode_timeout_s:.0f}",
+        # tau2's internal retry re-runs the whole simulation inside this subprocess, which
+        # multiplies the batch wall clock past its deadline and appends the abandoned attempt's
+        # episodes to the same results.json. Retry is the runner's job instead (--retry-failed),
+        # one fresh save directory per attempt.
+        "--max-retries",
+        str(pins.tau2_max_retries),
+        # A headless batch must never block on tau2's interactive resume prompt: it reads the
+        # parent's stdin and would hang until the hard-kill deadline. `next_save_to` already keeps
+        # every attempt on an unused directory, so there should be nothing to resume.
+        "--auto-resume",
     ]
 
 
-def save_to_name(entry: PoolEntry, domain: str, episode: int) -> str:
-    """tau2 `--save-to` slug, unique per candidate, domain, and episode index."""
+def save_to_name(entry: PoolEntry, domain: str, episode: int, attempt: int = 0) -> str:
+    """tau2 `--save-to` slug, unique per candidate, domain, episode index, and attempt."""
     safe = "".join(ch if ch.isalnum() else "_" for ch in entry.name)
-    return f"real_{safe}_{domain}_e{episode}"
+    return f"real_{safe}_{domain}_e{episode}_a{attempt}"
+
+
+def next_save_to(capture_dir: Path, entry: PoolEntry, domain: str, episode: int) -> str:
+    """The first unused `--save-to` slug for a cell, so an attempt never lands on a checkpoint.
+
+    tau2 reads an existing save directory as a checkpoint to resume: it prompts on stdin, and then
+    refuses the run outright when the new task list is a subset of the checkpointed one. A resumed
+    cell asks for exactly that subset (only the tasks with no row yet), so sharing a directory
+    across attempts makes the second attempt impossible, which matters much more now that tau2's
+    own retries are pinned off. Each attempt therefore gets its own directory and its own
+    results.json, and the previous attempt's evidence stays on disk.
+
+    Args:
+        capture_dir: Directory holding the `tau2-bench/` clone.
+        entry: The candidate this batch measures.
+        domain: tau2 domain for this batch.
+        episode: Episode index.
+
+    Returns:
+        A slug whose simulations directory does not exist yet.
+
+    Raises:
+        SystemExit: When the cell has already used every attempt slot.
+    """
+    simulations = capture_dir / "tau2-bench" / "data" / "simulations"
+    for attempt in range(MAX_ATTEMPTS_PER_CELL):
+        name = save_to_name(entry, domain, episode, attempt)
+        if not (simulations / name).exists():
+            return name
+    raise SystemExit(
+        f"candidate '{entry.name}' has used all {MAX_ATTEMPTS_PER_CELL} attempt slots for "
+        f"{domain} episode {episode}. Something is failing on every attempt: read the newest "
+        f"{simulations / save_to_name(entry, domain, episode, MAX_ATTEMPTS_PER_CELL - 1)} before "
+        "clearing the older directories."
+    )
 
 
 def _stream_tokens(messages: Sequence[Tau2Message], role: str) -> tuple[int, int]:
@@ -472,11 +631,23 @@ def rows_from_results(
     episode: int,
     by_task_id: dict[str, RealScenario],
     user_sim: PoolEntry,
+    cohort: str = UNLABELED_COHORT,
 ) -> list[RealEpisodeRow]:
     """Turn one tau2 `results.json` into metered sidecar rows.
 
     Simulations of tasks outside the pinned split are dropped rather than recorded: tau2 filters
     by task id already, so their presence would mean the run drifted off the split.
+
+    Args:
+        results: The batch's parsed `results.json`.
+        entry: The candidate this batch measured.
+        episode: Episode index.
+        by_task_id: The pinned scenarios this batch requested, keyed by tau2 task id.
+        user_sim: The pinned user simulator, part of the environment.
+        cohort: `ProtocolPins.label` for the pins the batch ran under.
+
+    Returns:
+        One row per on-split simulation.
     """
     rows: list[RealEpisodeRow] = []
     for sim in results.simulations:
@@ -518,6 +689,7 @@ def rows_from_results(
                 ],
                 replies=[m.text() for m in assistant if m.text()],
                 user_sim=user_sim.name,
+                cohort=cohort,
             )
         )
     return rows
@@ -562,13 +734,43 @@ def append_rows(path: Path, rows: Iterable[RealEpisodeRow]) -> None:
 
 
 def spend_usd(rows: Iterable[RealEpisodeRow]) -> float:
-    """Total run cost: our priced candidate side plus tau2's figure for the user simulator."""
+    """Total run cost: our priced candidate side plus tau2's figure for the user simulator.
+
+    Counts EVERY row, including an attempt a later retry superseded: both were bought.
+    """
     return sum(row.cost_usd_pool + (row.cost_usd_tau2_user or 0.0) for row in rows)
+
+
+def latest_per_cell(rows: Sequence[RealEpisodeRow]) -> list[RealEpisodeRow]:
+    """One row per (scenario, candidate, episode): the last one written wins.
+
+    Only a `--retry-failed` pass writes a second row for a cell, and the retry is what supersedes
+    the attempt that failed. Collapsing here is what keeps a retried cell from being counted as two
+    episodes; `spend_usd` still counts both attempts, because both were paid for.
+    """
+    latest: dict[tuple[str, str, int], RealEpisodeRow] = {}
+    for row in rows:
+        latest[row.key] = row
+    return list(latest.values())
+
+
+def resume_keys(rows: Sequence[RealEpisodeRow], retry_failed: bool) -> set[tuple[str, str, int]]:
+    """The cells resume treats as already bought.
+
+    With `retry_failed`, a cell whose latest row has no reward (tau2 could not score it: an
+    infrastructure failure, a killed batch) counts as unrun, so this pass buys it once more. One
+    pass, one retry: a cell that fails again simply stays unscored, and the operator decides
+    whether to run the flag again.
+    """
+    return {
+        row.key for row in latest_per_cell(rows) if not (retry_failed and row.reward is None)
+    }
 
 
 def to_matrix(rows: Sequence[RealEpisodeRow], pool: Sequence[PoolEntry]) -> OutcomeMatrix:
     """Sidecar rows -> OutcomeMatrix. Rows with no reward stay unscored, never zeroed."""
     named = {entry.name for entry in pool}
+    rows = latest_per_cell(rows)
     outcomes = [
         ScenarioOutcome(
             scenario_id=row.scenario_id,
@@ -598,7 +800,11 @@ def price_order(pool: Sequence[PoolEntry]) -> list[PoolEntry]:
 
 
 def _run_batch(
-    command: Sequence[str], capture_dir: Path, save_to: str, env: dict[str, str]
+    command: Sequence[str],
+    capture_dir: Path,
+    save_to: str,
+    env: dict[str, str],
+    timeout_s: float,
 ) -> Tau2Results | None:
     """Run one tau2 batch and read its results.json back, or None when it produced none.
 
@@ -620,11 +826,11 @@ def _run_batch(
             env=env,
             capture_output=True,
             text=True,
-            timeout=BATCH_TIMEOUT_S,
+            timeout=timeout_s,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        logger.error("  tau2 exceeded %ds and was killed; skipping this batch", BATCH_TIMEOUT_S)
+        logger.error("  tau2 exceeded %.0fs and was killed; skipping this batch", timeout_s)
         return None
     except OSError as error:
         raise SystemExit(
@@ -691,14 +897,58 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help="restrict to these '<domain>:<task_id>' scenario ids (smokes and single-cell reruns)",
     )
-    parser.add_argument("--user-sim", default=DEFAULT_USER_SIM, help="pool name of the user sim")
     parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
     parser.add_argument("--budget-usd", type=float, default=DEFAULT_BUDGET_USD)
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="re-run the cells whose latest row has no reward, once (tau2's own retries are off)",
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="resolve the split and print the tau2 commands"
     )
     parser.add_argument(
         "--write-matrix-only", action="store_true", help="rebuild the matrix from rows.jsonl"
+    )
+    pins = parser.add_argument_group(
+        "protocol pins",
+        "The canonical real-tau2 protocol, shared with the training lane. Changing ANY of these "
+        "defines a NEW capture cohort: the rows get a different cohort label, and sim_to_real.py "
+        "refuses to pair them with canonical rows.",
+    )
+    pins.add_argument(
+        "--max-turns",
+        type=int,
+        default=CANONICAL_MAX_TURNS,
+        help=f"tau2 --max-steps; PIN {CANONICAL_MAX_TURNS} (tau2's own default is 200). "
+        "Changing it is a new capture cohort.",
+    )
+    pins.add_argument(
+        "--episode-timeout-s",
+        type=float,
+        default=CANONICAL_EPISODE_TIMEOUT_S,
+        help=f"tau2 --timeout, per episode; PIN {CANONICAL_EPISODE_TIMEOUT_S:.0f} (tau2 has no "
+        "timeout by default). Changing it is a new capture cohort.",
+    )
+    pins.add_argument(
+        "--max-tokens",
+        type=int,
+        default=CANONICAL_MAX_TOKENS,
+        help=f"candidate completion cap; PIN {CANONICAL_MAX_TOKENS}. 0 omits the key entirely, "
+        "for a deployment that rejects max_tokens. Changing it is a new capture cohort.",
+    )
+    pins.add_argument(
+        "--tau2-max-retries",
+        type=int,
+        default=CANONICAL_TAU2_MAX_RETRIES,
+        help=f"tau2 --max-retries; PIN {CANONICAL_TAU2_MAX_RETRIES} (tau2's own default is 3), "
+        "because retry belongs to --retry-failed. Changing it is a new capture cohort.",
+    )
+    pins.add_argument(
+        "--user-sim",
+        default=DEFAULT_USER_SIM,
+        help=f"pool name of the user simulator; PIN {DEFAULT_USER_SIM}. It is the environment, "
+        "not a candidate. Changing it is a new capture cohort.",
     )
     return parser.parse_args(argv)
 
@@ -714,6 +964,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     rows = load_rows(rows_path)
 
     if args.write_matrix_only:
+        # A run refuses to append across cohorts, so a mixed file here was merged by hand. Salvage
+        # is still the right default (the episodes were bought), but the matrix must say so.
+        present = sorted({row.cohort for row in rows})
+        if len(present) > 1:
+            logger.warning(
+                "these %d rows span %d capture cohorts %s, which measure different environments. "
+                "The matrix will pool them; split rows.jsonl by cohort if that is not what you "
+                "want.",
+                len(rows),
+                len(present),
+                present,
+            )
         to_matrix(rows, pool).save(matrix_path)
         logger.info("wrote %s from %d rows", matrix_path, len(rows))
         return 0
@@ -722,6 +984,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("user simulator '%s' is not in the pool %s", args.user_sim, sorted(by_name))
         return 2
     user_sim = by_name[args.user_sim]
+
+    try:
+        pins = ProtocolPins(
+            max_turns=args.max_turns,
+            episode_timeout_s=args.episode_timeout_s,
+            max_tokens=args.max_tokens,
+            tau2_max_retries=args.tau2_max_retries,
+            user_sim=args.user_sim,
+        )
+    except ValidationError as error:
+        logger.error("protocol pins are out of range: %s", error)
+        return 2
+    if pins.is_canonical:
+        logger.info("protocol pins: cohort '%s' (canonical)", pins.label)
+    else:
+        logger.warning(
+            "NON-CANONICAL protocol pins: cohort '%s', canonical is '%s'. These rows are a "
+            "separate capture cohort; sim_to_real.py will refuse to pair them with canonical rows.",
+            pins.label,
+            ProtocolPins().label,
+        )
+    foreign = sorted({row.cohort for row in rows} - {pins.label})
+    if foreign:
+        logger.error(
+            "%s already holds rows from cohort(s) %s, but this run is cohort '%s'. One rows.jsonl "
+            "holds one cohort: point --out-dir at a new directory for this pin set, or match the "
+            "pins that produced the existing rows.",
+            rows_path,
+            foreign,
+            pins.label,
+        )
+        return 2
 
     # A typo in --only would otherwise be silently ignored and quietly buy a smaller grid than
     # the operator asked for, which is only discovered after the spend.
@@ -748,7 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sum(1 for s in scenarios if s.nl_assertion_reward),
     )
 
-    done = {row.key for row in rows}
+    done = resume_keys(rows, args.retry_failed)
     spent = spend_usd(rows)
     logger.info(
         "resume: %d rows on disk, $%.2f already spent, budget stop $%.0f",
@@ -756,6 +1050,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         spent,
         args.budget_usd,
     )
+    if args.retry_failed:
+        logger.info(
+            "--retry-failed: %d cell(s) whose latest row is unscored will be bought again",
+            len(latest_per_cell(rows)) - len(done),
+        )
 
     # The user simulator is the environment, so it is never also measured as a candidate.
     candidates = [
@@ -781,7 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ]
                 if not missing:
                     continue
-                save_to = save_to_name(entry, domain, episode)
+                save_to = next_save_to(args.capture_dir, entry, domain, episode)
                 command = batch_command(
                     args.capture_dir,
                     entry,
@@ -790,6 +1089,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     [s.task_id for s in missing],
                     save_to,
                     args.max_concurrency,
+                    pins,
                 )
                 if args.dry_run:
                     logger.info("  would run: %s", " ".join(command))
@@ -807,11 +1107,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     save_to,
                 )
                 env = build_env(args.capture_dir, entry, user_sim, dict(os.environ))
-                payload = _run_batch(command, args.capture_dir, save_to, env)
+                payload = _run_batch(
+                    command,
+                    args.capture_dir,
+                    save_to,
+                    env,
+                    batch_timeout_s(len(missing), args.max_concurrency, pins.episode_timeout_s),
+                )
                 if payload is None:
                     continue
                 batch = rows_from_results(
-                    payload, entry, episode, {s.task_id: s for s in missing}, user_sim
+                    payload,
+                    entry,
+                    episode,
+                    {s.task_id: s for s in missing},
+                    user_sim,
+                    pins.label,
                 )
                 append_rows(rows_path, batch)
                 done.update(row.key for row in batch)
