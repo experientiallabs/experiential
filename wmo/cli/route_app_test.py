@@ -23,7 +23,7 @@ from wmo.distill.store import DistillModelCard
 from wmo.engine.world_model import WorldModel
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.optimize.policy import POLICY_FILENAME, EmbedderSpec, RoutingPolicy, select_model
+from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing import evaluate_policy
 from wmo.providers import pool as pool_module
