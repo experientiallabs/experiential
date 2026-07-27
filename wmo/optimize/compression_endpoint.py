@@ -3,33 +3,39 @@
 The learned compressor runs on a GPU box, not in the serving process: a 177M token classifier
 needs a GPU to be worth its latency (C1 measured 0.197 s/10k tokens on an H100 against 4.5 s on
 a laptop CPU), and one warm copy serves the whole team. This module is the thin client side of
-that: it implements the same segment-aware `Compressor` shape as `identity` and `truncate`, so
-a policy can name it without anything else in the harness knowing a network hop exists.
+that, registered into the D-COMPRESS seam like any other compressor, so a policy can name it
+without anything else in the harness knowing a network hop exists.
 
 Configuration is two environment variables, `WMO_COMPRESSOR_URL` and `WMO_COMPRESSOR_API_KEY`.
 There is no fallback. If the endpoint is unreachable this raises: a compressor that silently
-serves uncompressed text on failure would make cost and accuracy results depend on the health
+served uncompressed text on failure would make cost and accuracy results depend on the health
 of a box nobody was watching, and would quietly invalidate any grid that hit a bad minute.
 
-PIN (temporary, remove when PR #265 lands): the D-COMPRESS seam types live in
-`wmo/optimize/compression.py` on branch `compress/c3`, which is not on main yet. The
-`CompressionConfig`, `CompressionResult`, and `estimate_tokens` definitions below are
-field-identical mirrors of that module at commit 7f0b0efa. When the seam merges, delete them,
-import the real ones, and register this compressor with the seam's `register_compressor()`.
-Nothing else in this file changes.
+Registration is explicit (`register_endpoint_compressor()`) rather than on import, because
+building the client needs credentials and the seam's own rule is to fail at mount rather than
+mid-call. Registration also VERIFIES the live endpoint's selection rule before attesting
+`append_stable`, so the admission ticket the seam checks is a measured fact about the server
+that is actually answering, not a claim this file makes about a server it never contacted.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 import ssl
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
-from pydantic import BaseModel, Field, JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
+
+from wmo.optimize.compression import (
+    CompressionConfig,
+    CompressionResult,
+    estimate_tokens,
+    register_compressor,
+)
 
 log = logging.getLogger(__name__)
 
@@ -45,30 +51,21 @@ DEFAULT_CERT_PATH = (
     Path(__file__).resolve().parents[2] / "deploy" / "compressor-endpoint" / "compressor-cert.pem"
 )
 
-_CHARS_PER_TOKEN = 4
+# The only selection rule whose output is append-stable. The server hard-codes it and publishes
+# it on /healthz; this client refuses to register against anything else (see `append_stable`).
+REQUIRED_SELECTION_RULE = "fixed-absolute-threshold"
 
+# Generous by default: a routing bank fit compresses every fit scenario in ONE embed batch
+# (CompressingEmbedder), so an 800-scenario fit arrives here as a single 800-segment call and
+# should stay a single round trip. These bounds only split batches bigger than the server will
+# accept, and they split on fixed boundaries so the same input always splits the same way.
+MAX_SEGMENTS_PER_REQUEST = 1024
+MAX_CHARS_PER_REQUEST = 8_000_000
 
-def estimate_tokens(text: str) -> int:
-    """Deterministic proxy token count of `text` (ceil of chars/4; 0 only for empty text)."""
-    return math.ceil(len(text) / _CHARS_PER_TOKEN)
-
-
-class CompressionConfig(BaseModel):
-    """Per-cluster compression choice carried on the policy artifact (D-COMPRESS shape)."""
-
-    compressor_id: str = Field(min_length=1)
-    compressor_version: str = "1"
-    aggressiveness: float = Field(default=0.0, ge=0.0, le=1.0)
-
-
-class CompressionResult(BaseModel):
-    """What one compress() call did: the output segments plus its own accounting."""
-
-    segments: list[str]
-    tokens_in_raw: int
-    tokens_in_compressed: int
-    latency_s: float
-    cost_usd: float = 0.0
+# Compressing a whole fit corpus in one call is seconds of GPU work, so the default read budget
+# is minutes rather than seconds. An endpoint that is DOWN still fails immediately (the
+# connection is refused); this only bounds a server that has gone quiet mid-request.
+DEFAULT_TIMEOUT_S = 120.0
 
 
 class CompressorEndpointError(RuntimeError):
@@ -95,17 +92,24 @@ class EndpointReply(BaseModel):
 class LLMLingua2EndpointCompressor:
     """Remote LLMLingua-2 compression at a fixed absolute keep-probability threshold.
 
-    `aggressiveness` is passed through as that threshold, which is a DEVIATION from the seam's
-    documented "fraction of content the compressor may remove" reading, and a deliberate one:
-    hitting an exact removal fraction requires per-input percentile selection, the rule C1
-    measured rewriting 45-81% of the already-emitted compressed prefix on every appended turn.
-    A fixed threshold decides each word locally and keeps the prompt cache intact. Removal
-    fraction is therefore an outcome, reported per call, not an input. 0.0 remains a strict
-    no-op (returned bit-for-bit, without a network call), so the seam's 0.0 contract holds.
+    This compressor's reading of the seam's `aggressiveness` dial is the absolute keep
+    probability a word must clear to survive. It satisfies both of the dial's invariants: 0.0 is
+    a strict bit-for-bit no-op (returned locally, without a network call), and the dial is
+    monotone, since raising the bar can only drop more words. It cannot hit an exact removal
+    fraction, which is the general case the seam documents for learned compressors: the achieved
+    ratio is an outcome, read per call off `CompressionResult`.
+
+    `append_stable` is True because selection is per-word and local: whether a word survives
+    depends on its own keep probability against a fixed bar, never on the rest of the input, so
+    appending a segment cannot rewrite bytes already emitted. That is a property of the SERVER's
+    selection rule, so `register_endpoint_compressor` verifies the live server is running it
+    before the attestation reaches the seam. The percentile rule it replaces rewrote 45-81% of
+    the emitted prefix per appended turn (C1 round 0).
     """
 
     id = "llmlingua2-endpoint"
     version = "1"
+    append_stable = True
 
     def __init__(
         self,
@@ -113,12 +117,16 @@ class LLMLingua2EndpointCompressor:
         api_key: str,
         *,
         cert_path: str | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
         client: httpx.Client | None = None,
+        max_segments_per_request: int = MAX_SEGMENTS_PER_REQUEST,
+        max_chars_per_request: int = MAX_CHARS_PER_REQUEST,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._timeout_s = timeout_s
+        self._max_segments = max_segments_per_request
+        self._max_chars = max_chars_per_request
         if client is not None:
             self._client = client
         else:
@@ -130,7 +138,7 @@ class LLMLingua2EndpointCompressor:
             self._client = httpx.Client(timeout=timeout_s, verify=verify)
 
     @classmethod
-    def from_env(cls, *, timeout_s: float = 30.0) -> LLMLingua2EndpointCompressor:
+    def from_env(cls, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> LLMLingua2EndpointCompressor:
         """Build from `WMO_COMPRESSOR_URL` / `WMO_COMPRESSOR_API_KEY`, or say what is missing."""
         base_url = os.environ.get(URL_ENV, "").strip()
         api_key = os.environ.get(KEY_ENV, "").strip()
@@ -148,6 +156,24 @@ class LLMLingua2EndpointCompressor:
             cert_path = str(DEFAULT_CERT_PATH)
         return cls(base_url, api_key, cert_path=cert_path, timeout_s=timeout_s)
 
+    def verify_selection_rule(self) -> None:
+        """Check the live endpoint really runs the rule this client attests append stability for.
+
+        Serving admission turns on `append_stable`, and that attribute is only honest while the
+        server selects on an absolute per-word threshold. Reading the rule off the running server
+        makes the attestation verifiable instead of assumed, and means a box redeployed with
+        different selection is refused at registration rather than quietly serving churn.
+        """
+        rule = self.health().get("selection_rule", "<absent>")
+        if rule != REQUIRED_SELECTION_RULE:
+            raise CompressorEndpointError(
+                f"compressor endpoint at {self.base_url} reports selection rule '{rule}', not "
+                f"'{REQUIRED_SELECTION_RULE}'. This client attests append stability, which only "
+                "holds for absolute-threshold selection; a percentile rule rewrites the "
+                "already-compressed prefix on every appended turn and must not be served. "
+                "Redeploy the box from deploy/compressor-endpoint/ before using this compressor."
+            )
+
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
         """Compress the mutable segments remotely; raise rather than degrade to no compression."""
         raw = sum(estimate_tokens(segment) for segment in segments)
@@ -159,34 +185,60 @@ class LLMLingua2EndpointCompressor:
                 latency_s=0.0,
             )
         start = time.monotonic()
-        reply = self._post({"segments": segments, "threshold": config.aggressiveness})
-        # Wall clock, not the endpoint's compute time: the round trip is what the serving path
-        # actually waits for, and effective-cost accounting has to see the real latency. The
-        # endpoint's own compute latency is logged separately.
-        latency_s = time.monotonic() - start
-        if len(reply.segments) != len(segments):
-            raise CompressorEndpointError(
-                f"compressor endpoint returned {len(reply.segments)} "
-                f"segments for {len(segments)} inputs; a compressor may not merge, split, or "
-                "reorder segments. Check that the endpoint version matches this client."
+        out: list[str] = []
+        cost = 0.0
+        for begin, end in self._batches(segments):
+            reply = self._post(
+                {"segments": segments[begin:end], "threshold": config.aggressiveness}
             )
+            if len(reply.segments) != end - begin:
+                raise CompressorEndpointError(
+                    f"compressor endpoint returned {len(reply.segments)} segments for "
+                    f"{end - begin} inputs; a compressor may not merge, split, or reorder "
+                    "segments. Check that the endpoint version matches this client."
+                )
+            out.extend(reply.segments)
+            cost += reply.cost_usd
+        # Wall clock, not the endpoint's compute time: the round trip is what the serving path
+        # actually waits for, and effective-cost accounting has to see the real latency.
+        latency_s = time.monotonic() - start
         log.debug(
-            "compressed %d segments via %s (server %.1fms, round trip %.1fms, $%.6f)",
+            "compressed %d segments via %s (round trip %.1fms, $%.6f)",
             len(segments),
             self.base_url,
-            reply.latency_ms,
             latency_s * 1000,
-            reply.cost_usd,
+            cost,
         )
         return CompressionResult(
-            segments=reply.segments,
+            segments=out,
             # Seam proxy counts, not the endpoint's own tokenizer counts, so this compressor's
             # accounting is comparable with identity and truncate in the same grid.
             tokens_in_raw=raw,
-            tokens_in_compressed=sum(estimate_tokens(segment) for segment in reply.segments),
+            tokens_in_compressed=sum(estimate_tokens(segment) for segment in out),
             latency_s=latency_s,
-            cost_usd=reply.cost_usd,
+            cost_usd=cost,
         )
+
+    def _batches(self, segments: list[str]) -> Iterator[tuple[int, int]]:
+        """Split an oversized call into request-sized index ranges.
+
+        Normally yields exactly one range: the seam hands a compressor a whole request at once
+        and the endpoint is sized to take it. Splitting matters for bank fits, which compress
+        every fit scenario in a single call. Boundaries depend only on the segment list, so the
+        same input always splits identically, and per-segment output is unchanged either way
+        because the server is batch-invariant (asserted at its startup).
+        """
+        begin = 0
+        chars = 0
+        for index, segment in enumerate(segments):
+            too_many = index - begin >= self._max_segments
+            too_long = chars + len(segment) > self._max_chars
+            if index > begin and (too_many or too_long):
+                yield begin, index
+                begin = index
+                chars = 0
+            chars += len(segment)
+        yield begin, len(segments)
 
     def health(self) -> dict[str, str]:
         """Fetch the endpoint's unauthenticated health document (version, fingerprint, uptime)."""
@@ -228,6 +280,14 @@ class LLMLingua2EndpointCompressor:
                     f"(retry after {response.headers.get('Retry-After', '?')}s). Lower "
                     "concurrency or ask for a raised limit on the box."
                 )
+            if response.status_code == 413:
+                raise CompressorEndpointError(
+                    f"compressor endpoint at {self.base_url} rejected the request as too large: "
+                    f"{response.text[:200]}. This client splits at {self._max_segments} segments "
+                    f"and {self._max_chars} chars per request, so the box is configured below "
+                    "that; raise WMO_COMPRESSOR_MAX_SEGMENTS / WMO_COMPRESSOR_MAX_CHARS there, "
+                    "or lower max_segments_per_request here to match."
+                )
             if response.status_code >= 400:
                 raise CompressorEndpointError(
                     f"compressor endpoint at {self.base_url} returned HTTP "
@@ -247,3 +307,22 @@ class LLMLingua2EndpointCompressor:
             f"{KEY_ENV}, and the pinned certificate ({CERT_ENV}), or select the 'identity' "
             "compressor to run without compression."
         ) from last_error
+
+
+def register_endpoint_compressor(
+    *, timeout_s: float = DEFAULT_TIMEOUT_S
+) -> LLMLingua2EndpointCompressor:
+    """Build the endpoint compressor from the environment and register it into the seam.
+
+    Explicit rather than import-time: constructing it needs credentials, and the seam's rule is
+    that a misconfiguration fails at mount. Contacts the endpoint once to verify its selection
+    rule before registering, so `append_stable` is never attested on this client's say-so.
+
+        from wmo.optimize.compression_endpoint import register_endpoint_compressor
+
+        register_endpoint_compressor()   # then policies may name 'llmlingua2-endpoint'
+    """
+    compressor = LLMLingua2EndpointCompressor.from_env(timeout_s=timeout_s)
+    compressor.verify_selection_rule()
+    register_compressor(compressor)
+    return compressor

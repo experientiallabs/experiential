@@ -23,8 +23,26 @@ WMO_COMPRESSOR_URL=https://40.80.93.150:8443
 WMO_COMPRESSOR_API_KEY=<ask whoever administers the box>
 ```
 
+Register it into the D-COMPRESS seam once, then policies may name `llmlingua2-endpoint` like
+any other compressor:
+
 ```python
-from wmo.optimize.compression_endpoint import CompressionConfig, LLMLingua2EndpointCompressor
+from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression_endpoint import register_endpoint_compressor
+
+register_endpoint_compressor()
+result = ...  # anything that resolves a compressor by id now finds it
+```
+
+Registration is explicit rather than on import, because building the client needs credentials
+and the seam's rule is that a misconfiguration fails at mount. It also contacts `/healthz` once
+to confirm the box really is running absolute-threshold selection before attesting
+`append_stable`, so the serving admission ticket is verified against the running server rather
+than asserted by the client. To use it directly without the registry:
+
+```python
+from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression_endpoint import LLMLingua2EndpointCompressor
 
 client = LLMLingua2EndpointCompressor.from_env()
 result = client.compress(
@@ -59,20 +77,37 @@ locally, so an unchanged segment always compresses to the same bytes and the cac
 Compression ratio is therefore an outcome, not a setting. At threshold 0.5 the measured keep
 ratio on the C1 audit corpus is 0.64 (36% of tokens removed). Threshold 0.0 is a strict no-op.
 
+The threshold is a per-request VALUE; the selection RULE is not reachable from the API. There
+is no percentile, top-k, or quantile code path in the server at all, the comparison is a
+literal `p >= threshold`, and `/healthz` publishes `selection_rule` so a client can verify it.
+That matters because the seam admits a compressor to serving only if it attests
+`append_stable`, and the attestation is true only for absolute-threshold selection.
+
 ## Measured baseline
 
 Through the endpoint, from a laptop in the US, over the 120-transcript C1 audit corpus
 (135,859 GPT-2 tokens), threshold 0.5. Reproduce with
 `uv run python .agents/scripts/verify_compressor_endpoint.py`.
 
+Ranges are across three runs, because the network leg varies while the model does not: the keep
+ratio came out byte-identical (0.641614) every time, so treat the spread as network and GPU
+scheduling, not as compressor variance.
+
 | | through the endpoint | C1 on-box bench |
 | --- | --- | --- |
-| $/10k tokens | $0.000796 | $0.000534 |
-| s/10k tokens (wall, incl. network) | 0.684 | 0.197 |
-| s/10k tokens (server compute only) | 0.293 | 0.197 |
-| p50 per request, ~9k-token batch | 0.460 s | n/a |
-| p50 per request, ~1.1k-token single transcript | 0.248 s | n/a |
+| $/10k tokens | $0.00080 to $0.00100 | $0.000534 |
+| s/10k tokens (wall, incl. network) | 0.68 to 0.74 | 0.197 |
+| s/10k tokens (server compute only) | 0.29 to 0.37 | 0.197 |
+| p50 per request, ~9k-token batch | 0.46 to 0.52 s | n/a |
+| p50 per request, ~1.1k-token single transcript | 0.25 s | n/a |
 | keep ratio | 0.642 | 0.596 (GPT-2 basis) |
+
+An 800-scenario routing bank fit (the seam's `CompressingEmbedder` compresses every fit
+scenario in one `compress` call) goes through as a SINGLE round trip in 1.7 to 2.0 s.
+The request caps are sized for that: 1024 segments and 8M chars, both published on `/healthz`
+so a client can check them rather than trust a constant. The client splits anything larger on
+fixed boundaries, which preserves append stability because boundaries depend only on the
+segment list and the server is batch-invariant.
 
 Read those two rows together before optimizing anything: for small requests the round trip to
 centralindia dominates, not the GPU. A 1.1k-token call spends ~0.25 s almost entirely on the
@@ -112,6 +147,12 @@ One more rule in the same spirit: a word the model did not score (a chunk trunca
 ssh h100-dev-box-6 sudo systemctl status wmo-compressor
 ssh h100-dev-box-6 sudo journalctl -u wmo-compressor -f
 ```
+
+Redeploying does NOT rotate the certificate: `deploy.sh` copies four files and leaves `tls/`,
+`venv/`, and `hf/` on the box alone, so the pinned cert every client verifies against survives.
+(It did rotate them briefly: an `rsync --delete-excluded` was deleting everything it was not
+explicitly told to copy, which regenerated TLS and rebuilt the venv on every deploy. Fixed, and
+verified by deploying twice and diffing the fingerprint.)
 
 `deploy.sh` pushes this directory to the box and runs `bootstrap.sh` there, which builds the
 venv (from the pip cache C1's bench already populated, so torch is a local unpack), copies the

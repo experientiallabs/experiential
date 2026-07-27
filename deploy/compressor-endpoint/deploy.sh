@@ -25,13 +25,16 @@ fi
 
 echo "[deploy] rsync -> ${HOST}:${ROOT}"
 ssh "${HOST}" "mkdir -p ${ROOT}"
-rsync -az --delete-excluded \
-  --include='server.py' \
-  --include='requirements.txt' \
-  --include='wmo-compressor.service' \
-  --include='bootstrap.sh' \
-  --exclude='*' \
-  "${HERE}/" "${HOST}:${ROOT}/"
+# Copy exactly these four files and touch nothing else in the service root. Do NOT add
+# --delete or --delete-excluded here: the destination also holds tls/, venv/, and hf/, which
+# are generated on the box and must survive a redeploy. Deleting them regenerates the TLS
+# certificate, which silently invalidates the pinned cert every client verifies against.
+rsync -az \
+  "${HERE}/server.py" \
+  "${HERE}/requirements.txt" \
+  "${HERE}/wmo-compressor.service" \
+  "${HERE}/bootstrap.sh" \
+  "${HOST}:${ROOT}/"
 
 echo "[deploy] bootstrap on ${HOST}"
 ssh "${HOST}" "chmod +x ${ROOT}/bootstrap.sh && ${ROOT}/bootstrap.sh"

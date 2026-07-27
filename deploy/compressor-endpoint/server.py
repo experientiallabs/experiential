@@ -114,6 +114,10 @@ class HealthResponse(BaseModel):
     dtype: str
     selection_rule: str
     self_test: str
+    # Published so a client can size its batches against the box's real configuration instead
+    # of a constant that could drift out of sync with it.
+    max_segments: int
+    max_chars: int
 
 
 class TokenBucket:
@@ -313,8 +317,12 @@ def build_app(compressor: LLMLingua2FixedThreshold, token: str, self_test: str) 
     """Wire the routes, auth, and rate limit around a loaded compressor."""
     rate_per_min = float(os.environ.get("WMO_COMPRESSOR_RATE_PER_MIN", "60"))
     burst = float(os.environ.get("WMO_COMPRESSOR_BURST", "120"))
-    max_segments = int(os.environ.get("WMO_COMPRESSOR_MAX_SEGMENTS", "256"))
-    max_chars = int(os.environ.get("WMO_COMPRESSOR_MAX_CHARS", "2000000"))
+    # Sized for the largest legitimate caller, not the typical one: fitting a routing bank
+    # compresses every fit scenario in ONE call (the seam's CompressingEmbedder batches per
+    # embed, not per text), so an 800-scenario fit arrives as a single 800-segment request and
+    # has to stay a single round trip. These are caps against abuse, not a batching policy.
+    max_segments = int(os.environ.get("WMO_COMPRESSOR_MAX_SEGMENTS", "1024"))
+    max_chars = int(os.environ.get("WMO_COMPRESSOR_MAX_CHARS", "8000000"))
     bucket = TokenBucket(rate_per_min, burst)
     started = time.monotonic()
     app = FastAPI(title="WMO compressor endpoint", version=compressor.version)
@@ -352,6 +360,8 @@ def build_app(compressor: LLMLingua2FixedThreshold, token: str, self_test: str) 
             dtype="float32",
             selection_rule=SELECTION_RULE,
             self_test=self_test,
+            max_segments=max_segments,
+            max_chars=max_chars,
         )
 
     @app.post("/v1/compress", response_model=CompressResponse)

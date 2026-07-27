@@ -16,17 +16,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
+from pydantic import BaseModel
 
+from wmo.optimize import compression
+from wmo.optimize.compression import (
+    CompressionConfig,
+    CompressionResult,
+    Compressor,
+    estimate_tokens,
+    get_compressor,
+    servable_compressor,
+)
 from wmo.optimize.compression_endpoint import (
     KEY_ENV,
+    REQUIRED_SELECTION_RULE,
     URL_ENV,
-    CompressionConfig,
     CompressorEndpointError,
     LLMLingua2EndpointCompressor,
-    estimate_tokens,
+    register_endpoint_compressor,
 )
 
 SEGMENTS = ["the quarterly revenue report shows growth", "tool output: {'ok': true}"]
+
+
+class SeenRequest(BaseModel):
+    """One request the fake server received, parsed so assertions read typed fields."""
+
+    segments: list[str]
+    threshold: float
 
 
 class FakeEndpointState:
@@ -43,8 +60,12 @@ class FakeEndpointState:
             "compressor_version": "llmlingua2-fixed-absolute-threshold-fp32/1",
             "model_fingerprint": "9a9d3f98bfb65abc",
         }
-        self.requests: list[dict[str, object]] = []
+        self.requests: list[SeenRequest] = []
         self.auth_headers: list[str] = []
+        self.selection_rule = "fixed-absolute-threshold"
+        # When set, the fake echoes back one output segment per input instead of `body`, which
+        # is what the batch-splitting tests need.
+        self.echo = False
 
 
 def _make_handler(state: FakeEndpointState) -> type[BaseHTTPRequestHandler]:
@@ -63,14 +84,26 @@ def _make_handler(state: FakeEndpointState) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(encoded)
 
         def do_GET(self) -> None:  # noqa: N802
-            self._respond(200, {"status": "ok", "model_fingerprint": "9a9d3f98bfb65abc"})
+            self._respond(
+                200,
+                {
+                    "status": "ok",
+                    "model_fingerprint": "9a9d3f98bfb65abc",
+                    "selection_rule": state.selection_rule,
+                },
+            )
 
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers.get("Content-Length", "0"))
-            state.requests.append(json.loads(self.rfile.read(length)))
+            body = json.loads(self.rfile.read(length))
+            state.requests.append(SeenRequest.model_validate(body))
             state.auth_headers.append(self.headers.get("Authorization", ""))
             if state.status != 200:
                 self._respond(state.status, {"detail": "nope"})
+                return
+            if state.echo:
+                segments = [f"c:{segment}" for segment in body["segments"]]
+                self._respond(200, dict(state.body, segments=segments))
                 return
             self._respond(200, state.body)
 
@@ -93,6 +126,17 @@ def endpoint() -> Iterator[tuple[LLMLingua2EndpointCompressor, FakeEndpointState
         server.server_close()
 
 
+@pytest.fixture
+def clean_registry() -> Iterator[None]:
+    """Snapshot and restore the seam's process-global compressor registry around a test."""
+    saved = dict(compression._COMPRESSORS)
+    try:
+        yield
+    finally:
+        compression._COMPRESSORS.clear()
+        compression._COMPRESSORS.update(saved)
+
+
 def test_compress_returns_segments_and_propagates_metering(
     endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
 ) -> None:
@@ -108,8 +152,8 @@ def test_compress_returns_segments_and_propagates_metering(
     # Seam-proxy counts, so this compressor is comparable with identity/truncate in one grid.
     assert result.tokens_in_raw == sum(estimate_tokens(segment) for segment in SEGMENTS)
     assert result.tokens_in_compressed < result.tokens_in_raw
-    assert state.requests[0]["threshold"] == pytest.approx(0.5)
-    assert state.requests[0]["segments"] == SEGMENTS
+    assert state.requests[0].threshold == pytest.approx(0.5)
+    assert state.requests[0].segments == SEGMENTS
 
 
 def test_bearer_token_is_sent(
@@ -265,6 +309,126 @@ def test_from_env_builds_a_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(KEY_ENV, "x" * 64)
     client = LLMLingua2EndpointCompressor.from_env()
     assert client.base_url == "https://40.80.93.150:8443"
+
+
+def test_satisfies_the_seam_protocol(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """The client is a Compressor as the seam defines it, attesting append stability."""
+    client, _ = endpoint
+    assert isinstance(client, Compressor)
+    assert client.append_stable is True
+    assert client.id == "llmlingua2-endpoint"
+
+
+def test_compress_returns_the_seam_result_type(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """Accounting comes back in the seam's own model, not a look-alike."""
+    client, _ = endpoint
+    result = client.compress(SEGMENTS, CompressionConfig(compressor_id="x", aggressiveness=0.5))
+    assert isinstance(result, CompressionResult)
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registration_publishes_the_compressor_and_it_is_servable(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After registering, a policy can name the id and the v1 serving gate admits it."""
+    client, _ = endpoint
+    monkeypatch.setenv(URL_ENV, client.base_url)
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.delenv("WMO_COMPRESSOR_CERT", raising=False)
+
+    registered = register_endpoint_compressor()
+
+    assert get_compressor("llmlingua2-endpoint") is registered
+    config = CompressionConfig(compressor_id="llmlingua2-endpoint", aggressiveness=0.5)
+    assert servable_compressor(config) is registered
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_registration_refuses_a_server_running_another_selection_rule(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """append_stable is only true for absolute-threshold selection, so it is verified live.
+
+    A box redeployed with percentile selection must be refused at registration rather than
+    silently admitted to serving, where it would churn the cached prefix every turn.
+    """
+    client, state = endpoint
+    state.selection_rule = "per-input-percentile"
+    monkeypatch.setenv(URL_ENV, client.base_url)
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+
+    with pytest.raises(CompressorEndpointError) as caught:
+        register_endpoint_compressor()
+    assert "per-input-percentile" in str(caught.value)
+    assert REQUIRED_SELECTION_RULE in str(caught.value)
+    with pytest.raises(ValueError, match="unknown compressor"):
+        get_compressor("llmlingua2-endpoint")
+
+
+def test_bank_fit_batch_stays_one_round_trip(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """An 800-scenario bank fit arrives as one call and must not be split (seam expectation)."""
+    client, state = endpoint
+    state.echo = True
+    scenarios = [f"scenario {index} text" for index in range(800)]
+
+    result = client.compress(scenarios, CompressionConfig(compressor_id="x", aggressiveness=0.5))
+
+    assert len(state.requests) == 1
+    assert result.segments == [f"c:{scenario}" for scenario in scenarios]
+
+
+def test_oversized_batches_split_on_fixed_boundaries_preserving_order(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """Beyond the per-request cap the client splits rather than letting the box 413 it."""
+    client, state = endpoint
+    client._max_segments = 100  # exercise the split without a 2000-item payload
+    state.echo = True
+    scenarios = [f"scenario {index}" for index in range(250)]
+
+    result = client.compress(scenarios, CompressionConfig(compressor_id="x", aggressiveness=0.5))
+
+    assert [len(request.segments) for request in state.requests] == [100, 100, 50]
+    assert result.segments == [f"c:{scenario}" for scenario in scenarios]
+    # Cost is summed across the split, not taken from the last response.
+    assert result.cost_usd == pytest.approx(0.000034 * 3)
+
+
+def test_split_boundaries_do_not_depend_on_later_segments(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """Append stability: adding a segment must not move an earlier segment into another batch."""
+    client, state = endpoint
+    client._max_segments = 10
+    state.echo = True
+    base = [f"s{index}" for index in range(25)]
+
+    client.compress(base, CompressionConfig(compressor_id="x", aggressiveness=0.5))
+    first_pass = [request.segments for request in state.requests]
+    state.requests.clear()
+    client.compress(base + ["appended"], CompressionConfig(compressor_id="x", aggressiveness=0.5))
+    second_pass = [request.segments for request in state.requests]
+
+    # The full batches are byte-identical; only the trailing partial batch grew.
+    assert second_pass[:2] == first_pass[:2]
+
+
+def test_payload_too_large_names_both_sides_of_the_cap(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """A 413 means client and box disagree on limits, so say which knob to move."""
+    client, state = endpoint
+    state.status = 413
+    with pytest.raises(CompressorEndpointError, match="WMO_COMPRESSOR_MAX_SEGMENTS"):
+        client.compress(SEGMENTS, CompressionConfig(compressor_id="x", aggressiveness=0.5))
 
 
 def test_health_reports_the_endpoint_identity(

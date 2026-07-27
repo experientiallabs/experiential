@@ -98,6 +98,44 @@ def check_auth(base_url: str, cert: str) -> bool:
     return ok
 
 
+def check_bank_fit_batch(client: LLMLingua2EndpointCompressor) -> bool:
+    """An 800-scenario bank fit must go through as ONE round trip, not a 413 and not a split.
+
+    The seam's CompressingEmbedder compresses every fit scenario in a single `compress` call, so
+    the endpoint's request caps have to clear a realistic fit batch. This sends one.
+    """
+    scenarios = [
+        f"Scenario {index}: the user asks the agent to reconcile an invoice against the "
+        f"quarterly ledger and explain any discrepancy in plain language."
+        for index in range(800)
+    ]
+    config = CompressionConfig(compressor_id="llmlingua2-endpoint", aggressiveness=THRESHOLD)
+    start = time.perf_counter()
+    result = client.compress(scenarios, config)
+    elapsed = time.perf_counter() - start
+    ok = len(result.segments) == len(scenarios)
+    log.info(
+        "BANK FIT %s: 800 scenarios in one call, %.2fs, %d -> %d proxy tokens, $%.6f",
+        "PASS" if ok else "FAIL",
+        elapsed,
+        result.tokens_in_raw,
+        result.tokens_in_compressed,
+        result.cost_usd,
+    )
+    return ok
+
+
+def check_selection_rule(client: LLMLingua2EndpointCompressor) -> bool:
+    """The append-stability attestation is only valid for absolute-threshold selection."""
+    try:
+        client.verify_selection_rule()
+    except CompressorEndpointError as error:
+        log.info("SELECTION RULE FAIL: %s", error)
+        return False
+    log.info("SELECTION RULE PASS: endpoint reports fixed-absolute-threshold")
+    return True
+
+
 def wait_for_capacity(base_url: str, api_key: str, cert: str, need: int = 50) -> None:
     """Idle until the rate limiter has refilled enough budget for the measurement run.
 
@@ -216,8 +254,10 @@ def main() -> None:
     api_key = os.environ["WMO_COMPRESSOR_API_KEY"]
 
     check_health(client)
+    rule_ok = check_selection_rule(client)
     deterministic = check_determinism(client, transcripts)
     authorized = check_auth(base_url, cert)
+    bank_fit = check_bank_fit_batch(client)
     wait_for_capacity(base_url, api_key, cert)
     measure(client, transcripts)
     rate_limited = check_rate_limit(base_url, api_key, cert)
@@ -233,7 +273,9 @@ def main() -> None:
     log.info("HONEST FAILURE %s: a down endpoint raises", "PASS" if honest_failure else "FAIL")
 
     checks = {
+        "selection_rule": rule_ok,
         "determinism": deterministic,
+        "bank_fit_one_round_trip": bank_fit,
         "auth": authorized,
         "rate_limit": rate_limited,
         "honest_failure": honest_failure,
