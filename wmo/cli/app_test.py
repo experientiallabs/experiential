@@ -1332,6 +1332,96 @@ def test_providers_verify_pings_a_role_shared_with_a_built_model_once(
     assert "(airline, models.worker)" in result.output
 
 
+def test_providers_verify_does_not_collapse_two_regions_of_one_model(
+    patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Same kind and model, different region: two different backends that fail independently.
+    # Collapsing them would ping one and report the OTHER as verified, which is a false pass on
+    # exactly the credential question this command exists to answer.
+    root = tmp_path / ".wmo"
+    _build(root, "airline", tmp_path)
+    built = load_config(str(root / "models" / "airline")).providers[0]
+    assert built.region is None
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(
+        provider=built.kind.value, model=built.model, region="eu-west-1"
+    )
+    save_settings(settings, root)
+    pinged: list[ProviderConfig] = []
+    _record_verify_all(monkeypatch, pinged)
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert [c.region for c in pinged] == [None, "eu-west-1"]
+
+
+def test_providers_verify_does_not_collapse_two_azure_deployments(
+    patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Two roles on one Azure model, each behind its own operator-named deployment and endpoint.
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(
+        provider="azure", model="gpt-5.5", endpoint="https://a.example", deployment="dep-a"
+    )
+    settings.models.judge = ModelRole(
+        provider="azure", model="gpt-5.5", endpoint="https://b.example", deployment="dep-b"
+    )
+    save_settings(settings, root)
+    pinged: list[ProviderConfig] = []
+    _record_verify_all(monkeypatch, pinged)
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert [(c.endpoint, c.deployment) for c in pinged] == [
+        ("https://a.example", "dep-a"),
+        ("https://b.example", "dep-b"),
+    ]
+
+
+def test_providers_verify_checks_both_embed_models_on_one_backend(
+    patched_provider: None, tmp_path: Path
+) -> None:
+    # Two world models sharing a completion backend but embedding through different models: one
+    # completion ping, and BOTH embed paths checked (embed_model is what the embed call sends).
+    root = tmp_path / ".wmo"
+    for model_name, embed_model in (
+        ("a", "amazon.titan-embed-text-v1"),
+        ("b", "amazon.titan-embed-text-v2:0"),
+    ):
+        built = runner.invoke(
+            app,
+            [
+                "build",
+                "--name",
+                model_name,
+                "--file",
+                _traces_file(tmp_path),
+                "--root",
+                str(root),
+                "--provider",
+                "bedrock",
+                "--embed-provider",
+                "bedrock",
+                "--embed-model",
+                embed_model,
+                "--fidelity",
+                "low",
+            ],
+        )
+        assert built.exit_code == 0, built.output
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "embed:bedrock (amazon.titan-embed-text-v1)" in result.output
+    assert "embed:bedrock (amazon.titan-embed-text-v2:0)" in result.output
+    # The shared completion provider is still pinged once, under both model names.
+    assert result.output.count("ok bedrock (") == 1
+
+
 def test_providers_verify_name_scopes_the_report_to_one_world_model(
     patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

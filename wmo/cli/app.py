@@ -447,9 +447,9 @@ def providers_verify(
             raise typer.BadParameter(str(exc)) from exc
         configs.append(load_config(model_dir))
 
-    # Dedup completion providers by kind+model across all selected models, then across the
-    # settings roles. World models come FIRST so a pair configured in both is pinged with the
-    # built artifact's own config, exactly as before roles were a source.
+    # Dedup identical completion calls across all selected models, then across the settings
+    # roles. World models come FIRST so a config present in both is pinged with the built
+    # artifact's own copy, exactly as before roles were a source.
     labelled = [
         (model_name, pc)
         for model_name, cfg in zip(names, configs, strict=True)
@@ -459,11 +459,11 @@ def providers_verify(
     # question the caller did not ask (and bill for it).
     if name is None:
         labelled += [(f"models.{role}", pc) for role, pc in configured_role_configs(root)]
-    index: dict[tuple[str, str], int] = {}
+    index: dict[str, int] = {}
     provider_configs: list[ProviderConfig] = []
     sources: list[list[str]] = []
     for label, pc in labelled:
-        key = (pc.kind.value, pc.model)
+        key = _completion_identity(pc)
         if key not in index:
             index[key] = len(provider_configs)
             provider_configs.append(pc)
@@ -489,17 +489,30 @@ def providers_verify(
         return
 
     # Verify each distinct provider-backed embed path (skip the offline hashing embedder).
-    embed_seen: set[tuple[str, str]] = set()
+    embed_seen: set[str] = set()
     for model_name, config in zip(names, configs, strict=True):
         if config.embed_provider is EmbedderKind.HASHING:
             continue
         embed_config = config.embed_provider_config()
-        key = (embed_config.kind.value, embed_config.model)
+        key = embed_config.model_dump_json()
         if key in embed_seen:
             continue
         embed_seen.add(key)
         result = verify_embedder(embed_config)
         _print_verify_result(result, [model_name], prefix="embed:")
+
+
+def _completion_identity(config: ProviderConfig) -> str:
+    """What makes two provider configs the SAME completion call, for `providers verify` dedup.
+
+    Everything the config carries except the embed-only fields, which do not reach a completion
+    request. Keying on kind+model alone would collapse one model served from two Bedrock regions,
+    or one Azure model behind two deployments or endpoints, into a single ping, and then report
+    the config that was never called as verified on the other one's result. Deriving the key
+    from the whole config rather than a hand-listed subset means a field added later splits the
+    key by default instead of silently widening that collapse.
+    """
+    return config.model_copy(update={"embed_model": None, "embed_dim": None}).model_dump_json()
 
 
 def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: str = "") -> None:
