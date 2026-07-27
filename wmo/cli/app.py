@@ -106,7 +106,7 @@ from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmo.providers import ProviderConfig, ProviderKind, VerifyResult, verify_all, verify_embedder
 from wmo.providers.base import Embedder, EmbedderKind, Provider
-from wmo.providers.models import resolve_provider_model
+from wmo.providers.models import model_types_for_provider, resolve_provider_model
 from wmo.providers.pool import Tier
 from wmo.providers.retry import wrap_provider_with_retries
 from wmo.research import Side, run_concurrency_scaling
@@ -1200,8 +1200,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     ),
     model: str | None = typer.Option(
         None,
-        help="Canonical model type. Default: the configured worker role's model, else "
-        "claude-opus-4-8.",
+        help="Canonical model type. Default: the configured worker role's model, else the "
+        "flagship of whichever provider is in play (bedrock/claude-opus-4-8).",
     ),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     chain: str | None = typer.Option(
@@ -2191,12 +2191,16 @@ def _unreadable_input(
     )
 
 
-def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+def _provider_kind(provider: str) -> ProviderKind:
     try:
-        kind = ProviderKind(provider)
+        return ProviderKind(provider)
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+
+
+def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+    kind = _provider_kind(provider)
     spec = resolve_provider_model(kind, model)
     return ProviderConfig(
         kind=kind,
@@ -2210,6 +2214,24 @@ def _provider_config(provider: str, model: str, region: str | None) -> ProviderC
 # `[models.worker]` role at all. Never a substitute for a configured role.
 _DEFAULT_WORKER_PROVIDER = "bedrock"
 _DEFAULT_WORKER_MODEL = "claude-opus-4-8"
+
+
+def _default_model_for_provider(kind: ProviderKind) -> str:
+    """`kind`'s flagship: the model to run when neither a flag nor a role named one.
+
+    A default model belongs to ONE backend — pairing `--provider openai` with bedrock's
+    `claude-opus-4-8` sends a model OpenAI has never heard of. `openrouter` and `tinker` publish
+    no built-in rows (nothing can derive an operator's route or weights path), so they must be
+    told which model to run.
+    """
+    catalog = model_types_for_provider(kind)
+    if not catalog:
+        raise typer.BadParameter(
+            f"provider {kind.value!r} has no default model; pass --model <model>, or run "
+            f"`wmo providers set --provider {kind.value} --model <model>` to configure the "
+            f"worker role"
+        )
+    return catalog[0]
 
 
 def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
@@ -2238,17 +2260,25 @@ def _worker_role_provider_config(
     path, so a command that ignored it would run against a provider the user never configured.
     Each field falls back independently, and a `--provider` naming a DIFFERENT backend than the
     configured role drops that role's model and connection fields, which belong to the backend it
-    replaced.
+    replaced — the model then comes from the NEW backend's catalog, never from bedrock's.
     """
     configured = _role_provider_config("worker", region)
     if configured is None or (provider is not None and provider != configured.kind.value):
-        return _provider_config(
-            provider or _DEFAULT_WORKER_PROVIDER, model or _DEFAULT_WORKER_MODEL, region
-        )
+        kind = _provider_kind(provider or _DEFAULT_WORKER_PROVIDER)
+        return _provider_config(kind.value, model or _default_model_for_provider(kind), region)
     if model is None:
         return configured
     spec = resolve_provider_model(configured.kind, model)
-    return configured.model_copy(update={"model_type": spec.model_type, "model": spec.model_id})
+    if spec.model_id == configured.model:
+        return configured
+    update: dict[str, object] = {"model_type": spec.model_type, "model": spec.model_id}
+    if configured.kind is ProviderKind.AZURE_OPENAI:
+        # On Azure the wire `model` IS the deployment name (AzureOpenAIProvider._deployment), so
+        # the role's deployment names the model we are replacing. Carrying it over would call the
+        # old model and report the new one — the misattribution this whole path exists to stop.
+        # Re-derive it from the requested model, as `_worker_provider_config` already does.
+        update["deployment"] = spec.model_type
+    return configured.model_copy(update=update)
 
 
 def _scenario_role_llms(
@@ -2639,8 +2669,8 @@ def research_concurrency(
     ),
     model: str | None = typer.Option(
         None,
-        help="Model id (environment LLM). Default: the configured worker role's model, else "
-        "claude-opus-4-8.",
+        help="Model id (environment LLM). Default: the configured worker role's model, else the "
+        "flagship of whichever provider is in play (bedrock/claude-opus-4-8).",
     ),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     deployment: str | None = typer.Option(None, help="Azure OpenAI deployment name."),

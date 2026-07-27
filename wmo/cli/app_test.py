@@ -2174,9 +2174,7 @@ def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:
     assert config.model == "us.anthropic.claude-opus-4-8"
 
 
-def test_worker_role_provider_config_model_flag_keeps_the_role_connection(monkeypatch) -> None:  # noqa: ANN001
-    # Swapping the model on the configured backend must keep that backend's endpoint/deployment:
-    # they describe the connection, not the model.
+def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str) -> None:
     from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
     monkeypatch.setattr(
@@ -2188,16 +2186,86 @@ def test_worker_role_provider_config_model_flag_keeps_the_role_connection(monkey
                     provider="azure",
                     model="gpt-5.4",
                     endpoint="https://azure.example/v1",
-                    deployment="configured-deployment",
+                    deployment=deployment,
                 )
             )
         ),
     )
+
+
+def test_worker_role_provider_config_model_flag_keeps_the_role_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The endpoint describes the BACKEND, not the model, so swapping the model keeps it.
+    _azure_worker_settings(monkeypatch, "gpt-5.4")
+
     config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
     assert config.kind is ProviderKind.AZURE_OPENAI
     assert config.model == "gpt-5.5"
     assert config.endpoint == "https://azure.example/v1"
-    assert config.deployment == "configured-deployment"
+
+
+def test_worker_role_provider_config_model_flag_moves_the_azure_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On Azure the wire `model` IS the deployment name, so the role's deployment names the model
+    # being replaced. Carrying it over would call gpt-5.4 while reporting gpt-5.5.
+    _azure_worker_settings(monkeypatch, "gpt-5.4")
+
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
+    assert config.deployment == "gpt-5.5"
+
+
+def test_worker_role_provider_config_keeps_a_custom_deployment_for_the_same_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Re-stating the role's own model is not a model change: an operator's deployment name is not
+    # derivable from the model id, so re-deriving it here would break a working config.
+    _azure_worker_settings(monkeypatch, "prod-54-canary")
+
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.4", None)
+
+    assert config.deployment == "prod-54-canary"
+
+
+def test_worker_role_provider_config_provider_flag_uses_that_backends_flagship(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A --provider naming another backend must take its model from THAT backend's catalog:
+    # pairing --provider openai with bedrock's claude-opus-4-8 sends OpenAI a model it has never
+    # heard of, so the command fails instead of running on the backend the user selected.
+    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings",
+        lambda: ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="bedrock", model="claude-sonnet-4-6"))
+        ),
+    )
+
+    config = cli_app_module._worker_role_provider_config("openai", None, None)
+
+    assert config.kind is ProviderKind.OPENAI
+    assert config.model == "gpt-5.5"
+
+
+def test_worker_role_provider_config_demands_a_model_for_a_catalog_less_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # openrouter/tinker publish no built-in rows — nothing can derive an operator's route or
+    # weights path — so the fix is to say which model, not to guess one.
+    from wmo.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        cli_app_module._worker_role_provider_config("openrouter", None, None)
+
+    assert "pass --model <model>" in str(excinfo.value)
+    assert "wmo providers set --provider openrouter --model <model>" in str(excinfo.value)
 
 
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
