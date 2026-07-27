@@ -40,6 +40,16 @@ from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_en
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
+from wmo.optimize.compaction_fit import (
+    COMPACTION_SIDECAR_FILENAME,
+    ArmMatrices,
+    aa_report,
+    apply_compaction,
+    assign_to_clusters,
+    fit_compaction,
+    overlay_clusters,
+    save_compaction_sidecar,
+)
 from wmo.optimize.compression import (
     CompressingEmbedder,
     compression_signature,
@@ -1096,6 +1106,207 @@ def fit(
         f"{result.scenarios} scenarios -> {out}\n"
         f"  fit-set accuracy {result.accuracy:.4f}, cost/scenario ${result.cost_per_scenario:.5f}"
     )
+
+
+@route_app.command("fit-compaction")
+def fit_compaction_cmd(
+    off_matrix: str = typer.Argument(
+        ..., help="The uncompressed OFF arm's OutcomeMatrix JSON (the grid's baseline)."
+    ),
+    arm: list[str] = typer.Option(
+        [],
+        "--arm",
+        help="A compressed arm's OutcomeMatrix JSON, repeatable; the arm's compression config "
+        "is read from the matrix itself (one matrix per arm, same scenario cohort as off).",
+    ),
+    control: list[str] = typer.Option(
+        [],
+        "--control",
+        help="Like --arm but a CONTROL (random removal, matched-ratio truncation): evaluated "
+        "and reported, never chosen. A control that would have won a cluster fails the run.",
+    ),
+    kind: str = typer.Option(
+        "rank",
+        "--kind",
+        help="rank (gates run on the policy's own routing clusters) | knn (routing untouched; "
+        "the map is written as a policy_compaction.json sidecar overlay).",
+    ),
+    out: str = typer.Option(
+        POLICY_FILENAME, "--out", help="Where to write the fitted policy JSON."
+    ),
+    clusters: int = typer.Option(
+        8,
+        "--clusters",
+        min=1,
+        help="Compaction cluster count (also the rank kind's routing cluster count, so the "
+        "gates run on THE clusters the policy routes with). Pre-registered default for s80 "
+        "cohorts: 8 (about 30 paired cells per cluster with 3 models).",
+    ),
+    seed: int = typer.Option(42, "--seed", help="Clustering seed."),
+    z: float = typer.Option(
+        0.5,
+        "--z",
+        min=0.0,
+        help="Quality-gate confidence bar: a cluster deviates from uncompressed only when the "
+        "paired per-cell reward delta clears mean - z*SE >= 0 (small-sample SE floor applied). "
+        "Raise it if the A/A bar reports deviations.",
+    ),
+    min_pairs: int = typer.Option(
+        8, "--min-pairs", min=1, help="Paired cells a cluster needs before it may deviate."
+    ),
+    fallback: str = typer.Option(
+        None, "--fallback", help="(knn) Baseline model, as in `route fit`."
+    ),
+    floor_q: float = typer.Option(0.05, "--floor-q", min=0.0, max=1.0),
+    embedder: str = typer.Option(
+        "auto",
+        "--embedder",
+        help="As in `route fit`. The base policy is fitted RAW (per-cluster mode routes on "
+        "uncompressed text; DECISIONS 2026-07-27), so no --compressor exists here.",
+    ),
+    dim: int = typer.Option(None, "--dim", min=1),
+    deployment: str = typer.Option(None, "--deployment"),
+    endpoint: str = typer.Option(None, "--endpoint"),
+    api_key_env: str = typer.Option(None, "--api-key-env"),
+    allow_uneven_coverage: bool = typer.Option(
+        False,
+        "--allow-uneven-coverage",
+        help="Pair on the cell intersection when an arm does not cover the off cohort (an "
+        "interim fit on a mid-flight grid); the result is a CANDIDATE, labeled in the "
+        "evidence file.",
+    ),
+) -> None:
+    """Fit per-cluster compression from measured per-arm matrices (C2 round 2).
+
+    UNCOMPRESSED IS THE FALLBACK: a cluster receives a compressed config only on paired
+    statistical evidence it does not lose quality (mean - z*SE >= 0 on >= min-pairs cells,
+    the routing guard's shape) AND a measured effective-cost-per-completed-task win on the
+    same cells, choosing among MEASURED arms only. The A/A kill bar (off arm split by episode
+    parity fed through the same gates) runs first and must be clean at the shipped z; a
+    deviation there means the gates would compress on noise, and the command refuses to fit.
+
+    The base policy is fitted RAW and the exclusivity rule is enforced (per-cluster mode
+    never mixes with an endpoint-level --compressor config). Evidence behind every decision
+    lands next to the policy as <out>.compaction-evidence.json.
+    """
+    if kind not in ("rank", "knn"):
+        raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
+    if not arm and not control:
+        raise typer.BadParameter("nothing to fit: pass at least one --arm or --control matrix")
+    off, off_source = load_matrix_with_digest(Path(off_matrix))
+    if off.measured_compression() is not None:
+        raise typer.BadParameter(
+            f"{off_matrix} is a compressed arm, not the off arm; pass it via --arm"
+        )
+    arms: list[ArmMatrices] = []
+    for path, is_control in [(p, False) for p in arm] + [(p, True) for p in control]:
+        matrix, _source = load_matrix_with_digest(Path(path))
+        config = matrix.measured_compression()
+        if config is None:
+            raise typer.BadParameter(
+                f"{path} carries no compression arm (its rows ran uncompressed); an arm "
+                "matrix must have been measured through a compressor"
+            )
+        arms.append(ArmMatrices(matrix=matrix, config=config, control=is_control))
+    try:
+        spec, resolution = resolve_embedder(
+            embedder, dim=dim, deployment=deployment, endpoint=endpoint, api_key_env=api_key_env
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _console.print(resolution)
+    try:
+        probe_embedder(spec)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    out_path = Path(out)
+    built = spec.build()  # ONE embedder: base fit, overlay, and assignment share it
+
+    if kind == "knn":
+        fitted = fit_knn_artifact(
+            off,
+            out_path=out_path,
+            matrix_source=off_source,
+            embedder=spec,
+            fallback=fallback,
+            floor_q=floor_q,
+            compression=None,  # per-cluster mode routes on raw text (exclusivity rule)
+        )
+        policy = fitted.policy
+        policy_clusters, assignment = overlay_clusters(
+            off,
+            embed_with=built,
+            n_clusters=clusters,
+            seed=seed,
+            default_model=policy.default_model,
+        )
+    else:
+        policy = fit_rank_policy(
+            off,
+            embedder=spec,
+            n_clusters=clusters,
+            seed=seed,
+            fitted_from=f"{off_source} rank seed={seed} k={clusters} {embedder_provenance(spec)}",
+        )
+        policy_clusters = policy.clusters
+        assignment = assign_to_clusters(policy_clusters, off, embed_with=built)
+
+    deviations = aa_report(assignment, off, z=z, min_pairs=min_pairs)
+    if deviations:
+        for row in deviations:
+            _console.print(
+                f"[red]A/A deviation[/red] cluster {row.cluster_id}: mean_diff "
+                f"{row.mean_diff:+.4f}, se {row.se:.4f}, n_pairs {row.n_pairs}"
+            )
+        _console.print(
+            "[red]A/A kill bar failed[/red]: the gates deviate on pure episode noise at "
+            f"z={z:g}. Raise --z until this bar is clean; do not weaken it after results."
+        )
+        raise typer.Exit(1)
+    _console.print(f"[green]✓[/green] A/A bar clean at z={z:g} (no cluster deviates on noise)")
+
+    fit = fit_compaction(
+        assignment,
+        off,
+        arms,
+        z=z,
+        min_pairs=min_pairs,
+        allow_uneven=allow_uneven_coverage,
+    )
+    evidence_path = out_path.with_suffix(".compaction-evidence.json")
+    evidence_path.write_text(fit.model_dump_json(indent=2))
+
+    if kind == "knn":
+        sidecar = out_path.parent / COMPACTION_SIDECAR_FILENAME
+        save_compaction_sidecar(policy_clusters, fit, sidecar, fitted_from=off_source)
+        target = f"sidecar {sidecar}"
+    else:
+        policy = apply_compaction(policy, fit)
+        policy.save(out_path)
+        target = out
+
+    for note in fit.coverage:
+        _console.print(f"[yellow]coverage[/yellow] {note}")
+    for row in sorted(fit.evidence, key=lambda r: (r.cluster_id, r.signature)):
+        verdict = "CHOSEN" if row.chosen else ("would win" if row.would_win else "")
+        _console.print(
+            f"  cluster {row.cluster_id} {row.signature}: n={row.n_pairs} "
+            f"delta {row.mean_diff:+.4f}+-{row.se:.4f} "
+            f"quality {'pass' if row.quality_pass else 'fail'} "
+            f"cost {'pass' if row.cost_pass else 'fail'} {verdict}"
+        )
+    label = " [CANDIDATE: uneven coverage]" if fit.coverage else ""
+    _console.print(
+        f"[green]✓[/green] {fit.compressed_clusters()}/{len(fit.per_cluster)} clusters "
+        f"compressed -> {target}{label}\n  evidence: {evidence_path}"
+    )
+    if fit.controls_would_win:
+        _console.print(
+            f"[red]INVESTIGATION GATE[/red]: control arms would have won clusters: "
+            f"{fit.controls_would_win}. A control beating the learned arms through the full "
+            "gate is a finding to investigate, not a policy to ship."
+        )
+        raise typer.Exit(1)
 
 
 def print_knn_fit(console: Console, fitted: KnnFitOutcome, *, out: str, z: float) -> None:
