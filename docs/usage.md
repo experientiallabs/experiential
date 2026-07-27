@@ -11,7 +11,7 @@ Run `wmo <command> --help` for the full option list; each one documents its own 
 |---|---|---|
 | `wmo build` | Ingest traces and build a named world model: normalize, split, index, optimize prompts, write. | `.wmo/models/<name>/` (`config.toml`, `card.json`, `index/`, `prompts/`, `metrics.json`) |
 | `wmo providers set` | Choose the local worker model, and register the models the router may choose between. | `.wmo/settings.toml` (worker role) and `.wmo/pool.toml` (candidate roster) |
-| `wmo optimize model` | The staged one-command routing workflow: preflight, sweep, fit, tune, report, with one plan table and one confirmation. | `policy.json` + `policy.json.bank.npz` in the model dir; `matrix.json`, `report.json`, `optimize-run.json` under `<model>/optimize/` |
+| `wmo optimize model` | The staged one-command routing workflow: preflight, sweep, fit, tune, report, with one plan table and one confirmation. `--dry-run` previews the plan and spends nothing; a non-interactive spending run needs `--yes`; `--max-usd` caps. | `policy.json` + `policy.json.bank.npz` in the model dir; `matrix.json`, `report.json`, `optimize-run.json` under `<model>/optimize/` |
 | `wmo serve` | Run the local backend: the OpenAI-compatible endpoint plus the world-model step API. | a live server (`/v1/chat/completions`, `/v1/endpoints/<name>/config`, `/v1/endpoints/<name>/savings`) |
 
 ## The optimizers

@@ -243,17 +243,30 @@ and are not in it, and on a real tau corpus they measured seven times the candid
 halves are measured and printed when the sweep finishes, and the next run forecasts the second
 one from what this one observed.
 
-**Cap the spend rather than relying on the prompt.** In a non-interactive session (a pipe, a CI
-job, anything without a TTY) the command announces that it is proceeding without confirmation and
-starts the sweep. The guardrail that works everywhere is the cap:
+### Running it unattended
+
+Three flags, three different jobs. They compose, and none substitutes for another.
 
 ```bash
-uv run wmo optimize model tau-bench --traces ... --yes --max-usd 25
+uv run wmo optimize model tau-bench --traces ... --dry-run             # preview
+uv run wmo optimize model tau-bench --traces ... --yes --max-usd 25    # consent, bounded
 ```
 
-`--max-usd` stops before any paid stage whose projection would carry the run past that total,
-counting what earlier runs already spent, and counting both the candidate and world-model sides.
-The run stays resumable and prints how to continue it.
+**`--dry-run` previews.** It prints the same plan table and exits 0 having spent nothing, run no
+episode, and written no artifact, not even resume state. It is the honest way to see what a run
+would cost, in a script or at a terminal, and it prints the table even when `--max-usd` would have
+refused the real run.
+
+**`--yes` consents.** Consent has to be said, never inferred from the absence of a terminal: a
+non-interactive session (a pipe, a CI job) that would buy a sweep and was not told `--yes` exits 2
+with `cannot ask for spend consent`, naming both honest ways forward. Nothing is bought. A run
+with no sweep left to buy needs no consent at all, so a resume down to fit, tune, and report
+proceeds unattended.
+
+**`--max-usd` bounds.** It is a cap, not consent, and the two are independent. It stops before any
+paid stage whose projection would carry the run past that total, counting what earlier runs already
+spent and counting the candidate and world-model sides both. The run stays resumable and prints how
+to continue it.
 
 ### The four stages
 
@@ -368,6 +381,11 @@ uv run wmo optimize route tune .wmo/models/tau-bench/policy.json --cost-quality 
 uv run wmo optimize route report matrix.json .wmo/models/tau-bench/policy.json \
   --baseline claude-opus-4-8 --endpoint tau-bench --out report.json
 ```
+
+One difference worth knowing before scripting these: `route sweep` does **not** share the staged
+command's consent refusal. On a non-interactive session it prints that it is proceeding without
+confirmation and buys the sweep. So pass `--yes` there because you mean it, and treat an unattended
+`route sweep` as spending by default; `--dry-run` is the staged command's flag, not this one's.
 
 Reach for these when you want a knob the staged command does not expose: `--kind rank` for
 Avengers cluster ranks instead of kNN evidence, `--z` for a stricter or looser confidence bar,
