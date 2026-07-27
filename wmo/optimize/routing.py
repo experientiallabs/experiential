@@ -242,6 +242,7 @@ def fit_rank_policy(
         min_support=min_support if guard_model is not None else None,
         guard_margin=guard_margin if guard_model is not None else None,
         fitted_from=fitted_from,
+        fit_scenario_ids=list(scenario_ids),
     )
 
 

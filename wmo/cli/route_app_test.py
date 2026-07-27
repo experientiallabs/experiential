@@ -155,7 +155,8 @@ def test_route_fit_and_report(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     report = json.loads(report_file.read_text())
     assert report["baseline"]["model_id"] == "a"
-    assert report["headline"]["baseline_accuracy"] == 0.5
+    assert set(policy.fit_scenario_ids).isdisjoint(report["scenario_ids"])
+    assert len(policy.fit_scenario_ids) + report["scenario_count"] == 4
     assert report["cost_assumptions"]
 
 
@@ -261,7 +262,8 @@ def test_route_fit_knn_writes_policy_and_sidecar(tmp_path: Path) -> None:
     assert policy.knn_bank_path == "policy.json.bank.npz"
     assert policy.bank_path() == tmp_path / "policy.json.bank.npz"
     assert policy.bank_path().is_file()  # sidecar beside the policy
-    assert len(policy.knn_bank().scenario_ids) == 12
+    assert len(policy.knn_bank().scenario_ids) == 8
+    assert policy.fit_scenario_ids == policy.knn_bank().scenario_ids
     assert "routed away from the fallback" in result.output
     # The prose neighborhoods carry unanimous evidence for b, so that traffic leaves the
     # fallback while the SQL half stays on it.

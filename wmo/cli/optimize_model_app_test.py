@@ -363,7 +363,9 @@ def test_one_command_lands_every_artifact_where_serving_reads_it(
     assert RoutingPolicy.load(policy_path.parent / "policy.base.json").cost_quality is None
     report = ImprovementReport.model_validate_json(report_path.read_text(encoding="utf-8"))
     assert report.endpoint_id == "support"
-    assert report.headline.scenarios_compared == 3
+    assert report.headline.scenarios_compared == 1
+    assert set(policy.fit_scenario_ids).isdisjoint(report.scenario_ids)
+    assert len(policy.fit_scenario_ids) + report.scenario_count == 3
 
     manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     assert [record.stage.value for record in manifest.stages] == ["sweep", "fit", "tune", "report"]

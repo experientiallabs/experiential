@@ -390,6 +390,10 @@ class RoutingPolicy(BaseModel):
     min_support: int | None = None  # scored episodes a challenger needs to lead its cluster
     guard_margin: float | None = None  # reward the challenger must beat the guard by
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
+    # Scenario-level provenance for evaluation integrity. Reports exclude these ids when they
+    # appear in the supplied matrix; an entirely separate matrix has no overlap and is all held
+    # out. Empty is retained for static and legacy artifacts that learned no recorded split.
+    fit_scenario_ids: list[str] = Field(default_factory=list)
     # D-COMPRESS: the endpoint-level compression choice, applied by the serving compress stage
     # BEFORE routing (the router embeds what the model will see), so it cannot vary by cluster
     # at serve time; per-cluster overrides live on ClusterRanking for the joint fit and eval

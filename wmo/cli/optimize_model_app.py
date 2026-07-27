@@ -64,7 +64,12 @@ from wmo.optimize.knn import (
     fit_provenance,
     tune_policy_dial,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, load_matrix_with_digest
+from wmo.optimize.outcomes import (
+    ROUTER_SPLIT_VERSION,
+    OutcomeMatrix,
+    load_matrix_with_digest,
+    split_router_scenarios,
+)
 from wmo.optimize.pipeline import (
     BUILT_STAGES,
     CONFIGURED_STAGES,
@@ -126,7 +131,7 @@ ASSUMED_OUTPUT_TOKENS = 250
 
 _KNN_KNOBS = (
     f"z={DEFAULT_KNN_Z:g} k={DEFAULT_RAG_NUM} thres={DEFAULT_RAG_THRES:g} "
-    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05"
+    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05 split={ROUTER_SPLIT_VERSION}"
 )
 """The knn fit this command performs. Fixed: the validated champion, dialed after the fact."""
 
@@ -358,6 +363,10 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         # attempt already bought, and so a sidecar from a different plan is refused for free.
         already_measured = resumable_cells(plan)
     except SweepError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    try:
+        split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
+    except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
     # Both flags name a pool candidate, and the pool is loaded by the pre-flight above, so a typo
@@ -861,6 +870,9 @@ def _stage_plan_text(
     already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
+    router_split = split_router_scenarios(
+        [scenario_id(scenario) for scenario in plan.scenarios]
+    )
     match stage:
         case Stage.PREFLIGHT:
             return f"resolve {len(plan.pool.models)} backend(s), check prices"
@@ -882,11 +894,17 @@ def _stage_plan_text(
             # Says what it IS rather than implying a step: the arm plus the two stages it sets up.
             return f"{escape(compression_signature(compression))}, configures sweep and fit"
         case Stage.FIT:
-            return f"knn (guarded, fallback {escape(fallback or 'best single on the sweep')})"
+            return (
+                f"knn over {len(router_split.fit_ids)} fit scenario(s) "
+                f"(guarded, fallback {escape(fallback or 'best single on the fit split')})"
+            )
         case Stage.TUNE:
             return f"cost_quality {cost_quality:g} ({cost_quality_named_point(cost_quality)})"
         case _:
-            return f"3-objective headline vs {escape(anchor)}"
+            return (
+                f"3-objective headline vs {escape(anchor)} over "
+                f"{len(router_split.report_ids)} router-held-out scenario(s)"
+            )
 
 
 def _report_estimate(policy_path: Path, fitting_with: EmbedderSpec) -> str:
@@ -1313,11 +1331,17 @@ def _stage_fit(
     """
     matrix, source = load_matrix_with_digest(paths.matrix)
     try:
+        router_split = split_router_scenarios(matrix.scenario_ids())
+    except ValueError as exc:
+        _console.print(f"[red]fit failed[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    try:
         fitted = fit_knn_artifact(
             matrix,
             out_path=paths.policy,
             matrix_source=source,
             embedder=embedder,
+            fit_ids=list(router_split.fit_ids),
             fallback=fallback,
             compression=compression,
         )
