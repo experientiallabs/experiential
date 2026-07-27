@@ -571,7 +571,8 @@ class PlatformClient:
         self._raise_for_error(response)
         payload = _decode_json(response)
         harness = RemoteHarness.model_validate(payload["harness"])
-        versions = [RemoteHarnessVersion.model_validate(r) for r in _rows(payload, "versions")]
+        rows = _rows(payload, "versions")
+        versions = [RemoteHarnessVersion.model_validate(row) for row in rows]
         return harness, versions
 
     def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
