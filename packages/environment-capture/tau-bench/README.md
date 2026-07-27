@@ -161,6 +161,60 @@ blake2b train/holdout split inline so trace selection matches the world-model si
 standup 1.74s + 10 tool calls, 1.74s total. tau2's env is an in-memory DB, so the comparison here is
 less about speed than about not needing to stand up Sierra's stack at all.
 
+## The real-episode leg (sim-to-real validation)
+
+Everything above compares ONE scenario at a time. `rl/real_episodes.py` is the full leg: it runs
+the whole pinned eval split through real tau2 for every candidate in `.wmo/pool.toml`, so a
+world-model matrix can be checked against the benchmark it is supposed to stand in for.
+
+What makes it a validation leg rather than a second, differently-shaped experiment:
+
+- **Same scenarios as every other tau arm.** Selection comes from `rl/scenarios_eval.jsonl` (the
+  pinned split from `rl/pin_scenarios.py`, seed 4405, ALL of the test split: 20 scenarios, 7
+  airline / 8 retail / 5 telecom). Each pinned line stores the tau2 `user_scenario.instructions`
+  blob verbatim, so it resolves back to a tau2 task id by exact match against the domain's
+  `tasks.json`. A scenario that fails to resolve aborts the run.
+- **`scenario_id` is `"<domain>:<task_id>"`.** Airline and retail both number tasks from "0" and
+  all 50 airline ids collide with retail ids, so bare ids would merge two tasks into one cell.
+- **One environment for every candidate.** The user simulator is part of the environment, so it
+  is pinned (`--user-sim`, default `gpt-5.4-mini`) and both streams pass `{}` LLM args, which
+  drops tau2's default temperature for candidates that reject sampling params.
+- **tau2's reward, never a wmo judge.** Rewards are read from `reward_info.reward` in tau2's
+  `results.json`. Caveat worth carrying into any writeup: tau2's reward is not uniformly
+  deterministic. 7 of the 20 pinned tasks carry `NL_ASSERTION` in their `reward_basis` and tau2
+  scores those with its own NL-assertion judge; every row records `nl_assertion_reward` so the
+  fully deterministic rows (DB / ACTION / COMMUNICATE / ENV_ASSERTION) can be split out.
+- **Our prices, not litellm's.** `cost_usd_pool` prices the recorded token usage at pool rates.
+  litellm does not know our Azure MaaS deployments and reported `agent_cost` 0.0 for FW-GLM-5.2
+  on the verification run; tau2's figures are kept beside ours for audit.
+
+Runs are resumable (rows are appended per batch and keyed by scenario, model, and episode) and
+budgeted (`--budget-usd`, checked between batches, candidates run cheapest-first), so a stop
+leaves a usable partial grid and a rerun buys only what is missing.
+
+```bash
+# from the repo root; needs the Setup venv above (or --capture-dir pointing at an existing clone)
+uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --dry-run
+uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --episodes 2
+uv run python packages/environment-capture/tau-bench/rl/real_episodes.py --write-matrix-only
+```
+
+Outputs land under `.wmo/evals/tau-bench-real/`: `rows.jsonl` (one metered row per episode, with
+per-call latency and both cost figures) and `matrix.json` (an `OutcomeMatrix`, unscored episodes
+left as `reward: null` rather than zeroed).
+
+`rl/sim_to_real.py` then compares that matrix against a world-model one:
+
+```bash
+uv run python packages/environment-capture/tau-bench/rl/sim_to_real.py \
+    --real .wmo/evals/tau-bench-real/rows.jsonl --wm .wmo/evals/tau-bench/matrix.json
+```
+
+It reports rank agreement (Spearman, Kendall, Pearson) over model means, clustered on scenarios
+rather than episodes, plus the paired overlap. **Quote the row count with any correlation**: the
+widely repeated Spearman +0.639 was a 630-row snapshot taken mid-capture, and the finished 720-row
+corpus gives +0.630 raw, +0.743 excluding glm-5.2.
+
 ## License — read before redistributing
 
 [tau²-bench](https://github.com/sierra-research/tau2-bench) is published under **MIT**. The

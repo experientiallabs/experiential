@@ -1,4 +1,17 @@
-# RL smoke harness (tau-bench)
+# tau-bench RL arms: pinned split, smoke harness, real-episode leg
+
+What lives here:
+
+- `pin_scenarios.py` + `scenarios_train.jsonl` / `scenarios_eval.jsonl` / `tools.json`: the
+  pinned split every arm trains and evaluates on (seed 4405). Load the FILES, never re-derive.
+- `smoke.py`: the wmo-side data-path smoke described below.
+- `icl.py`: the in-context-learning arm.
+- `real_episodes.py`: the REAL tau2 leg, running the same pinned eval scenarios through Sierra's
+  benchmark for every pool candidate, scored by tau2's own reward. See
+  [`../README.md`](../README.md) § The real-episode leg.
+- `sim_to_real.py`: rank agreement between a world-model `OutcomeMatrix` and those real rows.
+
+## RL smoke harness (tau-bench)
 
 `smoke.py` exercises every wmo-side data path each downstream training chat will consume
 end-to-end against the real tau-bench world model on Bedrock, at tiny scale (~30 haiku calls,
