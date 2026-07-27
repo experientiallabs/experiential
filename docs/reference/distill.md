@@ -1,6 +1,6 @@
-# Model distillation (`wmo optimize model`)
+# Model distillation (`wmo optimize distill`)
 
-The other optimizers edit the agent's *harness* or its *routing policy*; `wmo optimize model`
+The other optimizers edit the agent's *harness* or its *routing policy*; `wmo optimize distill`
 trains the agent's *model*.
 It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
 out on real harbor benchmark tasks while sampling from the student's current weights; a larger
@@ -143,7 +143,7 @@ unpriced meters and no `budget.max_usd` refuses to start non-interactively.
 ## Running it
 
 ```bash
-wmo optimize model run \
+wmo optimize distill run \
   --config run.toml \
   --task-ids train-task-ids.json \
   --holdout-task-ids holdout-task-ids.json \
@@ -290,7 +290,7 @@ stream to a Weights & Biases run that resumes with the run dir.
 ## Reading a run back
 
 ```bash
-wmo optimize model report --run-dir runs/distill-01
+wmo optimize distill report --run-dir runs/distill-01
 ```
 
 `report` reads only files the run already wrote (`gate.json`, `evals/*.json`, `metrics.jsonl`),
@@ -310,7 +310,7 @@ run hits `budget.max_usd`, it saves what it can and exits with the exact resume 
 the cap in the config and rerun with:
 
 ```bash
-wmo optimize model run --run-dir runs/distill-01 --resume
+wmo optimize distill run --run-dir runs/distill-01 --resume
 ```
 
 A resume needs only `--run-dir`: the CLI reloads the pinned splits, backend, and harness

@@ -52,7 +52,7 @@ wmo optimize route report matrix.json .wmo/models/my-endpoint/policy.json \
   --baseline gpt-5.5
 ```
 
-Distill your own small model into the pool with [`wmo optimize model`](wmo/distill/README.md),
+Distill your own small model into the pool with [`wmo optimize distill`](wmo/distill/README.md),
 serve a single model with no routing via `wmo optimize route pin`, or build an optimized harness
 for your agent with `wmo optimize harness`.
 

@@ -1,4 +1,4 @@
-"""`wmo optimize model`: train the agent MODEL, leaving its harness pinned.
+"""`wmo optimize distill`: train the agent MODEL, leaving its harness pinned.
 
 The third member of the optimizer family, beside `wmo optimize harness`
 (prompt surfaces) and `wmo optimize route` (routing policy). Where those
@@ -144,7 +144,7 @@ def run(
 ) -> None:
     """Train (or resume) an agent model by on-policy distillation on harbor tasks.
 
-        wmo optimize model run --config run.toml --run-dir runs/d1 \\
+        wmo optimize distill run --config run.toml --run-dir runs/d1 \\
           --task-ids train.json --holdout-task-ids holdout.json --backend e2b --yes
 
     Harbor's own terminus-2 agent rolls out on real benchmark tasks while
@@ -184,7 +184,7 @@ def report(
     Reads only what the run dir already persisted (`gate.json`, `evals/*.json`,
     `metrics.jsonl`), so it is free to run and safe on a live run dir:
 
-        wmo optimize model report --run-dir runs/d1
+        wmo optimize distill report --run-dir runs/d1
     """
     store = DistillRunStore(run_dir)
     gate = _load_gate(store)
@@ -822,7 +822,7 @@ def _load_gate(store: DistillRunStore) -> DistillGateRecord:
         raise typer.BadParameter(
             f"no {store.gate_path}: this run has not reached its gate yet (or "
             f"{store.run_dir} is not a distillation run dir). Finish or resume it with "
-            "`wmo optimize model run --run-dir <dir> --resume`"
+            "`wmo optimize distill run --run-dir <dir> --resume`"
         ) from exc
     try:
         return DistillGateRecord.model_validate_json(text)

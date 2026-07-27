@@ -887,7 +887,7 @@ def test_harbor_scorer_receives_the_local_backend_episode_timeout(
 
 
 def test_optimize_harness_no_longer_offers_any_distill_flag(tmp_path: Path) -> None:
-    """`--mode distill` moved out to `wmo optimize model run` as a hard rename.
+    """`--mode distill` moved out to `wmo optimize distill run` as a hard rename.
 
     The command it left behind must not keep the flags that described it: an
     alias would preserve a command whose own name says it optimizes a harness

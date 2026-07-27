@@ -1,4 +1,4 @@
-"""CLI tests for `wmo optimize model`, driven via CliRunner.
+"""CLI tests for `wmo optimize distill`, driven via CliRunner.
 
 `run_distillation` is monkeypatched to a recorder (no real tinker or harbor):
 these tests pin the `run` command's CLI lifecycle around it (input loading and
@@ -189,7 +189,7 @@ def _invoke(
         app,
         [
             "optimize",
-            "model",
+            "distill",
             "run",
             "--config",
             str(tmp_path / "distill.toml"),
@@ -330,7 +330,7 @@ def test_distill_budget_abort_prints_the_resume_command(
     flat = _flat(result)
     assert "budget exhausted" in flat
     assert "resume with:" in flat
-    assert f"wmo optimize model run --run-dir {tmp_path / 'run'} --resume" in flat
+    assert f"wmo optimize distill run --run-dir {tmp_path / 'run'} --resume" in flat
 
 
 def test_distill_runtime_error_exits_nonzero_with_the_message(
@@ -440,7 +440,7 @@ def test_distill_requires_its_input_flags_to_start(
         app,
         [
             "optimize",
-            "model",
+            "distill",
             "run",
             "--run-dir",
             str(tmp_path / "run"),
@@ -465,7 +465,7 @@ def test_distill_requires_a_run_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         app,
         [
             "optimize",
-            "model",
+            "distill",
             "run",
             "--config",
             str(tmp_path / "distill.toml"),
@@ -600,7 +600,7 @@ def test_distill_resume_reuses_the_pinned_splits(
         app,
         [
             "optimize",
-            "model",
+            "distill",
             "run",
             "--resume",
             "--config",
@@ -947,7 +947,7 @@ def test_resume_without_harness_adopts_the_recorded_one(
         app,
         [
             "optimize",
-            "model",
+            "distill",
             "run",
             "--run-dir",
             str(tmp_path / "run"),
@@ -1096,7 +1096,7 @@ def _step_metrics() -> StepMetrics:
 
 
 def _report(run_dir: Path) -> Result:
-    return runner.invoke(app, ["optimize", "model", "report", "--run-dir", str(run_dir)])
+    return runner.invoke(app, ["optimize", "distill", "report", "--run-dir", str(run_dir)])
 
 
 def test_report_prints_the_verdict_and_the_before_after_table(tmp_path: Path) -> None:
@@ -1160,4 +1160,4 @@ def test_report_on_a_run_that_never_gated_says_how_to_finish_it(tmp_path: Path) 
     assert result.exit_code == 2
     flat = _flat(result)
     assert "has not reached its gate yet" in flat
-    assert "wmo optimize model run --run-dir <dir> --resume" in flat
+    assert "wmo optimize distill run --run-dir <dir> --resume" in flat

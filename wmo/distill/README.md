@@ -11,7 +11,7 @@ The student samples episodes, the teacher scores the student's own sampled token
 `compute_logprobs`, and the per-token gap drives the update. Shipped and measured.
 
 ```bash
-wmo optimize model run --config run.toml --run-dir runs/d1 \
+wmo optimize distill run --config run.toml --run-dir runs/d1 \
   --task-ids train.json --holdout-task-ids holdout.json --backend e2b --yes
 ```
 

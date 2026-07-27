@@ -223,7 +223,7 @@ STUDENT_BEFORE_EVAL = "baseline-student-before"
 STUDENT_AFTER_EVAL = "student-after"
 
 DEFAULT_DISTILL_HARNESS = "pi"
-"""`wmo optimize model run --harness` default: the built-in pi agent document.
+"""`wmo optimize distill run --harness` default: the built-in pi agent document.
 
 Lives here rather than in the CLI because `resume_command` must know when the
 flag can be omitted, and the loop may not import the CLI.
@@ -1522,7 +1522,7 @@ def resume_command(name: str, run_dir: Path) -> str:
     type it adopts the recorded value.
     """
     harness = "" if name == DEFAULT_DISTILL_HARNESS else f" --harness {name}"
-    return f"wmo optimize model run{harness} --run-dir {run_dir} --resume"
+    return f"wmo optimize distill run{harness} --run-dir {run_dir} --resume"
 
 
 def pin_rollout_params(harness: HarnessDoc, cfg: DistillConfig) -> HarnessDoc:
