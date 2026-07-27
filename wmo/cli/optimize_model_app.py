@@ -1063,9 +1063,12 @@ def build_endpoint_scorecard(
     """THE SCORECARD SEAM: the one call the report stage makes to produce its numbers.
 
     Today this is `wmo.optimize.report.build_report`, the paired held-out comparison the endpoint
-    already cites. The richer three-objective scorecard (effective cost per COMPLETED task, the
-    cache-aware cost model, the ladder artifact) is being built separately and replaces the body
-    of this function without touching the stage, the manifest, or the ending that renders it.
+    already cites. The richer three-objective scorecard has since landed as
+    `wmo.optimize.scorecard` (effective cost per COMPLETED task, the cache-aware accounting rule,
+    the ablation ladder); wiring it in is a deliberate follow-up rather than part of this command's
+    first release, because its `Arm`/`ConditionLabel` inputs describe a grid this stage does not
+    yet build. When that happens only the body of this function changes: the stage, the manifest
+    fingerprints, and the ending that renders the result all stay as they are.
     """
     return build_report(matrix, policy, baseline=baseline, endpoint=endpoint, generated_at=_now())
 
