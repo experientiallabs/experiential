@@ -180,10 +180,14 @@ def build(
     the serve DEFAULTS (plain RAG unless flags were set explicitly): the winner activates at
     runtime via `--max-fidelity`.
 
-    `limit` caps the corpus at the first N normalized traces for BOTH transports, matching
-    `wmo ingest --limit` (`wmo.ingest.stream`) rather than only bounding a vendor pull: a first
-    cheap build over a large export is the whole point of the flag. The cap runs after the
-    degenerate-trace filter, so `--limit N --drop-degenerate` yields N usable traces.
+    `limit` caps the corpus at the first N normalized traces, so a first cheap build over a large
+    file export does not have to read the whole thing into GEPA. It is applied AFTER the
+    degenerate-trace filter, so `limit=N` with `drop_degenerate` yields N *usable* traces — which
+    is why it is not the same knob as `VendorPull.limit`. A pull is bounded vendor-side at fetch
+    time (`wmo.ingest.base.from_vendor` slices to `pull.limit`), before this function can see
+    which traces are degenerate; combining the two therefore yields *at most* N. Callers that
+    want exactly N usable traces from a pull must over-fetch: pass a larger `VendorPull.limit`
+    than `limit`.
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)

@@ -31,9 +31,10 @@ from wmo.config import (
     load_settings,
     save_settings,
 )
-from wmo.core.types import Trace
+from wmo.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 from wmo.engine.eval_suites import EvalSuiteConfig
+from wmo.ingest import VendorPull
 from wmo.providers.base import (
     Completion,
     EmbedderKind,
@@ -1490,6 +1491,20 @@ def _flat(output: str) -> str:
     return " ".join(output.replace("│", " ").split())
 
 
+def _pull_trace(trace_id: str, *, usable: bool) -> Trace:
+    """One single-step trace. `usable=False` makes it degenerate (empty observation)."""
+    return Trace(
+        trace_id=trace_id,
+        source="otel-genai:vendor",
+        steps=[
+            Step(
+                action=Action(kind=ActionKind.TOOL_CALL, name="get_user", arguments={"id": "u1"}),
+                observation=Observation(content="found u1" if usable else ""),
+            )
+        ],
+    )
+
+
 def _many_traces_file(tmp_path, count: int) -> str:  # noqa: ANN001 - pytest fixture path
     """`count` copies of the single-trace export, each under its own trace id."""
     base = Path(_traces_file(tmp_path)).read_text(encoding="utf-8").splitlines()
@@ -1674,6 +1689,72 @@ def test_build_limit_caps_a_file_corpus(patched_provider, tmp_path) -> None:  # 
     card = load_card(root / "models" / "capped")
     assert card is not None
     assert card.corpus.traces == 2
+
+
+def test_build_pull_limit_is_a_fetch_cap_applied_once(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture path
+) -> None:
+    """A pull spends `--limit` vendor-side, so `--drop-degenerate` can leave fewer than N.
+
+    `wmo.ingest.base.from_vendor` slices to `pull.limit` before `build` ever sees the corpus,
+    so re-applying the same cap after the degenerate filter cannot restore the dropped traces —
+    it would only read as a promise of N usable traces that this transport cannot keep. Pinning
+    both halves: the adapter receives the cap, and `build` is not handed it a second time.
+    """
+    import sys
+
+    from wmo.config.card import load_card
+
+    seen: list[VendorPull] = []
+    passed_to_build: dict[str, object] = {}
+
+    class _CappingAdapter:
+        """Mimics `base.from_vendor`: alternating junk/usable traces, sliced at `pull.limit`."""
+
+        name = "otel-genai"
+
+        def from_vendor(self, pull: VendorPull) -> list[Trace]:
+            seen.append(pull)
+            traces = [_pull_trace(f"{i:032d}", usable=bool(i % 2)) for i in range(6)]
+            return traces if pull.limit is None else traces[: pull.limit]
+
+    real_run_build = cli_app_module.run_build
+
+    def _spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - passthrough spy
+        passed_to_build.update(kwargs)
+        return real_run_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sys.modules["wmo.engine.build"], "get_adapter", lambda name: _CappingAdapter()
+    )
+    monkeypatch.setattr(cli_app_module, "run_build", _spy)
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "pulled",
+            "--pull",
+            "--limit",
+            "4",
+            "--drop-degenerate",
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert [p.limit for p in seen] == [4]  # spent at fetch…
+    assert passed_to_build["limit"] is None  # …and not a second time after the filter
+    card = load_card(root / "models" / "pulled")
+    assert card is not None
+    assert card.corpus.traces == 2  # 4 fetched, 2 of them degenerate; the cap cannot refill
 
 
 def test_build_rejects_a_limit_below_one(tmp_path) -> None:  # noqa: ANN001

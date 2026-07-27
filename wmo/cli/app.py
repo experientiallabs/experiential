@@ -699,8 +699,9 @@ def build(
     limit: int = typer.Option(
         None,
         "--limit",
-        help="Only use the first N traces (caps a --file export too, not just "
-        "--pull); cost control for a first build over a large corpus.",
+        help="Only use the first N traces (caps a --file export too, not just --pull); cost "
+        "control for a first build over a large corpus. A --pull is capped at fetch time, so "
+        "with --drop-degenerate it can yield fewer than N; a --file export yields N usable.",
     ),
     vendor: str = typer.Option(
         None, "--vendor", help="\\[deprecated] alias for --source <name> --pull."
@@ -975,7 +976,11 @@ def build(
                 estimate_only=spec.estimate_only,
                 drop_degenerate=drop_degenerate,
                 gepa_val_cap=spec.gepa_val_cap or None,
-                limit=params.limit,
+                # One cap per build, never both: a pull is already sliced to `--limit` inside
+                # `from_vendor`, so repeating it post-filter cannot restore what
+                # `--drop-degenerate` removed and would only read as a promise of N usable
+                # traces that the pull transport cannot keep.
+                limit=None if params.pull else params.limit,
             )
         except EmptyCorpusError:
             # The one ingest outcome a user causes and can fix: the export does not parse under
