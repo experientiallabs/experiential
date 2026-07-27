@@ -48,13 +48,23 @@ Savings behind an optimized endpoint can come from four places. Their current sh
    the pool, so no served token is cheaper today because of training. The distill-only rung
    reads "no measurable effect at this sample size", never a lift and never a regression.
    The student's share stays zero until a cycle gates (K3 teacher escalation is the live
-   candidate, probe authorized, leg gated on Silen). Teacher-selection economics (which
-   teacher is the cheapest sufficient one, and what a cycle costs to run) are OWNED by the
-   jt/teacher-gate repo function, which consumes the sweep matrix + pool prices: this page
-   cites its verdict once that PR lands and never hand-computes teacher economics. Its
-   price-ordering gets reviewed against the scorecard conventions here (cache-adjusted,
-   per completed unit, chatty-teacher and unscored-spend effects included) when the PR
-   opens.
+   candidate, probe authorized, leg gated on Silen). Teacher-selection economics are OWNED
+   by `wmo.optimize.teacher.select_teacher` (#329, merged): this page cites its verdict and
+   never hand-computes teacher economics. PRICE-ORDERING REVIEW against this corner's
+   scorecard conventions (2026-07-27, cost chat): ALIGNED. The primary ladder IS
+   `scorecard.effective_cost_per_completed_task` over each model's own rows, so it inherits
+   cache-adjusted pricing, the per-completed-task denominator (a chatty teacher that fails
+   tasks ranks expensive), unscored-row exclusion, and measured-$0-is-missing-not-free; the
+   fallback is a LIST-price ordering key (input+output per Mtok), used only when any model
+   lacks a measured figure, applied to the WHOLE ladder (one basis, never mixed) and stamped
+   on the verdict as `price_basis`. One caveat worth carrying: the list-price fallback is
+   not cache-adjusted, so on cache-dominated workloads two adjacent models could in
+   principle order differently than their real serving cost; any verdict quoted here with
+   `price_basis="list"` says so. The z=1.96-at-n=8 nit is the master's logged note; it
+   matches the program-wide convention. Current live verdict (grid-c2 partial, cited
+   verbatim in numbers.json): INSUFFICIENT EVIDENCE, leading candidate opus-5 at +32.0
+   points over gpt-5.4-mini on only 5 shared scored scenarios, below the 8 the gate
+   requires: the gate refusing on thin evidence is the mechanism working.
 4. **Cheap-model-was-already-fine share (the anchor's weakness)**: the share of "savings"
    that any cheap model would have delivered because the anchor is overkill for part of the
    workload. This is real money but not an optimizer achievement, which is why every delta
