@@ -49,10 +49,14 @@ from wmo.optimize.knn import (
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, load_matrix_with_digest
 from wmo.optimize.policy import (
+    AZURE_EMBEDDER_DIM,
+    AZURE_EMBEDDER_ENV,
+    HASHING_EMBEDDER_DIM,
     POLICY_FILENAME,
-    EmbedderSpec,
     RoutingPolicy,
     embedder_provenance,
+    probe_embedder,
+    resolve_embedder,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
@@ -90,198 +94,6 @@ _console = Console()
 
 DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
-
-# What `--embedder auto` looks for. The project's standard Azure OpenAI convention, the same pair
-# `wmo.config` requires of an AZURE_OPENAI provider and that `.env.example` documents; auto does
-# not invent a new variable, it notices the one an operator has already set up.
-AZURE_EMBEDDER_ENV = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT")
-AZURE_EMBEDDER_DEPLOYMENT = "text-embedding-3-large"
-AZURE_EMBEDDER_DIM = 3072  # the deployment's native width, and what the champion was measured at
-HASHING_EMBEDDER_DIM = 512
-
-# Quoted verbatim in the downgrade notice: the measured cost of routing on hashed features instead
-# of semantic ones. Both numbers are accuracy points over the best single model on
-# routerbench-ours9, so the gap is what auto is telling the operator they are leaving on the table.
-HASHING_DOWNGRADE_NOTICE = (
-    "hashing-512 measured +0.60pt (4/5 seeds) vs the semantic champion's +1.04pt (5/5) on the "
-    "full-power benchmark"
-)
-
-# Native output widths of the embedding models WMO knows about, matched as a SUBSTRING of the
-# deployment name because an Azure deployment is operator-named and usually carries the model
-# family in it. `dim` is not bookkeeping: it becomes the `dimensions` parameter of the embeddings
-# request, so asking a model for more than it has is an API error, and asking for less silently
-# truncates the vectors the policy is then fitted and served on.
-_NATIVE_EMBEDDING_DIMS: tuple[tuple[str, int], ...] = (
-    ("text-embedding-3-large", 3072),
-    ("text-embedding-3-small", 1536),
-    ("text-embedding-ada-002", 1536),
-)
-
-
-def _native_dim(deployment: str) -> tuple[int, bool]:
-    """(native width, whether the deployment name identified the model) for an azure deployment.
-
-    An unrecognized name assumes `text-embedding-3-large`, which is the deployment `auto`
-    provisions and the one the champion was measured on. The assumption is stated in the
-    resolution line rather than buried, and `--dim` overrides it, so the cost of guessing wrong
-    is one visible flag rather than a policy quietly fitted on truncated vectors.
-    """
-    for family, width in _NATIVE_EMBEDDING_DIMS:
-        if family in deployment:
-            return width, True
-    return AZURE_EMBEDDER_DIM, False
-
-
-def resolve_embedder(
-    choice: str,
-    *,
-    dim: int | None,
-    deployment: str | None,
-    endpoint: str | None,
-    api_key_env: str | None,
-) -> tuple[EmbedderSpec, str]:
-    """Turn `--embedder` into the spec to fit with, plus the one line explaining the choice.
-
-    `auto` is the default because the two backends are not equivalent and the difference is not
-    visible in the artifact: a policy fitted on hashed features routes on lexical overlap, and one
-    fitted on `text-embedding-3-large` routes on meaning. An operator who has already configured
-    an Azure resource should get the better one without having to know that, and one who has not
-    should be told what they are getting instead. So the resolution is ALWAYS printed, and the
-    downgrade quotes the measured gap rather than a vague warning.
-
-    Resolving to azure makes the fit BILL an embedding API, which is spend nobody typed a flag
-    for, so the resolution line says so. It also makes the fit depend on that resource actually
-    hosting an embedding deployment, which the env variables do not promise; `probe_embedder`
-    is what turns that from a mid-fit traceback into a usage error.
-
-    `--dim` defaults to the RESOLVED backend's native width on every path: 512 for hashing, and
-    the embedding model's own width for azure (see `_native_dim`). It used to default to 512
-    everywhere, which meant `--embedder azure --deployment text-embedding-3-large` silently
-    requested 512-dimensional vectors from a 3072-dimensional model and fitted the policy on the
-    truncation. An explicit `--dim` is still honored verbatim, including a deliberate reduction.
-
-    Returns:
-        The `EmbedderSpec` to fit with, and the resolution line to print.
-
-    Raises:
-        typer.BadParameter: An unknown `--embedder`, or an explicit azure spec missing a flag.
-    """
-    if choice not in ("auto", "hashing", "azure"):
-        raise typer.BadParameter(f"unknown embedder '{choice}'; use auto, hashing or azure")
-
-    if choice == "auto":
-        present = all(os.environ.get(name) for name in AZURE_EMBEDDER_ENV)
-        if not present:
-            missing = [name for name in AZURE_EMBEDDER_ENV if not os.environ.get(name)]
-            spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
-            return spec, (
-                f"embedder: hashing-{spec.dim} (auto; {', '.join(missing)} unset). "
-                f"[yellow]{HASHING_DOWNGRADE_NOTICE}[/yellow]. Set "
-                f"{' and '.join(AZURE_EMBEDDER_ENV)} to fit on semantic embeddings instead."
-            )
-        resolved_endpoint = endpoint or os.environ["AZURE_OPENAI_ENDPOINT"]
-        resolved_deployment = deployment or AZURE_EMBEDDER_DEPLOYMENT
-        return _azure_spec(
-            deployment=resolved_deployment,
-            endpoint=resolved_endpoint,
-            api_key_env=api_key_env or AZURE_EMBEDDER_ENV[0],
-            dim=dim,
-            how=f"auto; {' and '.join(AZURE_EMBEDDER_ENV)} present",
-        )
-
-    if choice == "hashing":
-        spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
-        return spec, f"embedder: hashing-{spec.dim} (explicit). {HASHING_DOWNGRADE_NOTICE}"
-
-    if not (deployment and endpoint):
-        # EmbedderSpec would reject this too, but only after the matrix has been read; say which
-        # flag is missing, at the boundary, in the vocabulary the operator typed.
-        raise typer.BadParameter(
-            "--embedder azure needs --deployment and --endpoint (or use --embedder auto, which "
-            f"reads {' and '.join(AZURE_EMBEDDER_ENV)})"
-        )
-    return _azure_spec(
-        deployment=deployment,
-        endpoint=endpoint,
-        api_key_env=api_key_env,
-        dim=dim,
-        how="explicit",
-    )
-
-
-def _azure_spec(
-    *, deployment: str, endpoint: str, api_key_env: str | None, dim: int | None, how: str
-) -> tuple[EmbedderSpec, str]:
-    """One azure spec plus its resolution line, shared by the auto and explicit paths.
-
-    Shared so the two paths cannot drift on the thing that matters here, which is how the
-    embedding width is chosen when the operator did not name one.
-    """
-    native, recognized = _native_dim(deployment)
-    spec = EmbedderSpec(
-        kind="azure",
-        dim=native if dim is None else dim,
-        deployment=deployment,
-        endpoint=endpoint,
-        api_key_env=api_key_env,
-    )
-    hint = ""
-    if dim is not None:
-        width = f"{spec.dim}d as asked"
-    elif recognized:
-        width = f"{spec.dim}d native"
-    else:
-        width = f"{spec.dim}d assumed"
-        hint = (
-            f". Unrecognized deployment name, so the width is a guess: pass --dim if "
-            f"{deployment} is not {spec.dim}-dimensional"
-        )
-    # Stated because it is spend the operator did not type a flag for: `auto` reaching the azure
-    # branch means this fit BILLS an embedding API, and the probe below bills the first call.
-    return spec, (
-        f"embedder: azure {deployment} ({width}) at {endpoint} ({how}){hint}. "
-        "This calls the embedding API and is billed to that resource."
-    )
-
-
-def probe_embedder(spec: EmbedderSpec) -> None:
-    """Embed one short text before the fit does, so a broken backend fails cleanly and early.
-
-    `--embedder auto` turns the mere PRESENCE of `AZURE_OPENAI_*` into a network dependency, and
-    those variables routinely point at a resource that serves chat but hosts no embedding
-    deployment. Without this, the first thing an operator sees is a traceback wall from inside
-    the fit, after the matrix has been read and (for a large corpus) after real spend. One
-    throwaway embedding turns that into a usage error at the boundary, which is rule 9's bar:
-    say what went wrong and what to do about it.
-
-    Hashing specs are checked too. It costs nothing, and it keeps the failure shape identical on
-    both branches rather than leaving one path with a different error surface.
-
-    Raises:
-        typer.BadParameter: The embedder could not produce a vector, naming what was tried and
-            the escape hatch.
-    """
-    try:
-        vectors = spec.build().embed(["routing embedder probe"])
-    except Exception as exc:  # noqa: BLE001 - any backend failure here is a usage error
-        raise typer.BadParameter(_probe_failure(spec, str(exc) or type(exc).__name__)) from exc
-    if not vectors or not vectors[0]:
-        raise typer.BadParameter(_probe_failure(spec, "it returned an empty vector"))
-
-
-def _probe_failure(spec: EmbedderSpec, detail: str) -> str:
-    """What to tell an operator whose embedder does not work, in the vocabulary they typed."""
-    if spec.kind == "hashing":
-        return f"the hashing embedder failed to embed a probe text: {detail}"
-    return (
-        f"embedding deployment '{spec.deployment}' at {spec.endpoint} could not embed a probe "
-        f"text: {detail}. That resource may serve chat models without hosting an embedding "
-        f"deployment, or '{spec.deployment}' may be named differently there. Deploy "
-        f"{AZURE_EMBEDDER_DEPLOYMENT} on it, point --deployment/--endpoint at one that has it, "
-        "or fit on offline features with --embedder hashing (which needs no credentials and no "
-        "network, at the accuracy cost this command printed above)."
-    )
 
 
 @route_app.command("sweep")
@@ -443,6 +255,7 @@ def sweep(
             max_steps=max_steps,
             assume_input_tokens=assume_input_tokens,
             assume_output_tokens=assume_output_tokens,
+            history_chars=history_chars,
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -983,9 +796,12 @@ def fit(
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
     matrix, source = load_matrix_with_digest(Path(matrix_file))
-    spec, resolution = resolve_embedder(
-        embedder, dim=dim, deployment=deployment, endpoint=endpoint, api_key_env=api_key_env
-    )
+    try:
+        spec, resolution = resolve_embedder(
+            embedder, dim=dim, deployment=deployment, endpoint=endpoint, api_key_env=api_key_env
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     # Printed before the fit, not after: the embedder decides what the policy can route on, and an
     # operator who meant to fit on semantic vectors should see that it fell back BEFORE paying for
     # the fit and reading an accuracy number that quietly came from hashed features.
@@ -997,7 +813,10 @@ def fit(
         raise typer.BadParameter("--rag-thres must be greater than 0")
     # One throwaway embedding BEFORE the bulk work: an unreachable or embedding-less resource is
     # a usage error at the boundary here, instead of a traceback from inside the fit.
-    probe_embedder(spec)
+    try:
+        probe_embedder(spec)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(

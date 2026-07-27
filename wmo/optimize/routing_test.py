@@ -329,6 +329,8 @@ def test_route_scenarios_rejects_repeated_ids() -> None:
     ids = matrix.scenario_ids()
     with pytest.raises(ValueError, match="scenario ids repeat"):
         route_scenarios(policy, matrix, [*ids, ids[0]])
+
+
 def _prefixless_matrix() -> OutcomeMatrix:
     """The same corpus keyed by trace hash, which is what a real-trace build produces."""
     outcomes: list[ScenarioOutcome] = []

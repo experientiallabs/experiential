@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict
 from wmo.config import ArtifactPaths, HarnessConfig, load_config
 from wmo.engine import split_holdout
 from wmo.env.closed_loop import evaluate_pool
+from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
 from wmo.ingest import get_adapter
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -118,6 +119,10 @@ class SweepPlan(BaseModel):
     episodes: int
     max_steps: int
     tools_hint: str | None
+    # How much of each observation the agent sees on later turns. Part of the plan because it
+    # changes what the candidates are measured on, so two matrices swept at different values are
+    # not comparable and the value has to travel with the run that produced them.
+    history_chars: int = DEFAULT_HISTORY_CHARS
     trace_count: int  # traces the corpus ingested, which is what decides `tiny_corpus`
     tiny_corpus: bool  # too small for a held-out band, so the scenarios are not leak-free
     assume_input_tokens: int
@@ -217,6 +222,7 @@ def plan_sweep(
     max_steps: int,
     assume_input_tokens: int,
     assume_output_tokens: int,
+    history_chars: int = DEFAULT_HISTORY_CHARS,
 ) -> SweepPlan:
     """Cut the held-out scenario set and project the spend, without touching the filesystem.
 
@@ -250,6 +256,7 @@ def plan_sweep(
         episodes=episodes,
         max_steps=max_steps,
         tools_hint=tools_hint_from_traces(train) or None,
+        history_chars=history_chars,
         trace_count=len(traces),
         tiny_corpus=tiny_corpus,
         assume_input_tokens=assume_input_tokens,
@@ -353,6 +360,7 @@ def execute_sweep(
                 episodes_per_scenario=plan.episodes,
                 max_steps=plan.max_steps,
                 tools_hint=plan.tools_hint,
+                history_chars=plan.history_chars,
                 on_outcome=on_outcome,
             )
     finally:

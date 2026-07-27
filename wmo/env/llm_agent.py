@@ -28,14 +28,17 @@ Each turn, respond with ONLY a JSON object, no prose around it — one of:
 Choose tool names and arguments consistent with the environment's responses so far. Work
 efficiently: no redundant calls, finish as soon as the task is done."""
 
-# Observation/history truncation. 500 chars starved tool-heavy environments (a tau-bench
-# `get_user_details` payload is several times that), so the agent never saw the answer it had
-# just fetched and re-fetched it verbatim until the step budget died. Callers with even bigger
-# observations can raise it per instance via `history_chars`.
-_MAX_HISTORY_CHARS = 2000
+# Observation/history truncation. 500 starved tool-heavy environments (a tau-bench
+# `get_user_details` payload exceeds it several-fold), and an agent that cannot see what it just
+# fetched re-fetches it: verbatim re-fetch loops appeared in 12-18 of 30 sim2real episodes.
+# Callers with bigger observations raise it further through `history_chars`.
+DEFAULT_HISTORY_CHARS = 2000
 
-# How many extra completions to buy when a provider returns blank text. Measured at 24% of
-# replies for one pool model; without the retry every blank burns a step as an empty message.
+# Extra attempts when a provider returns a blank completion. Measured on kimi-k2.6, where 24% of
+# replies were empty strings: without a retry each blank becomes an empty MESSAGE action that
+# burns a step, and the episode loops to its step cap having done nothing. Excluding the affected
+# episodes closed 71% (s80) and 100% (25-cohort) of that model's sim-to-real gap, so the blanks
+# were the defect, not the model.
 _EMPTY_RETRIES = 2
 
 
@@ -66,10 +69,17 @@ _CALL_HEAD = re.compile(r"(?<![\w.\-])([A-Za-z_][\w\-]*)\(\s*\{")
 def _parse_bare_call(text: str) -> _BareCall | None:
     """Parse `tool_name({...})` syntax, bare or fused with prose.
 
-    Some models emit function-call syntax instead of the JSON envelope the system prompt asks
-    for. Without this the turn is wasted: the call never executes and the argument object gets
-    echoed back as a message. Returns the FIRST well-formed call, which is the one a sequential
-    executor would have run when a reply stacks several.
+    Some models answer with function-call syntax rather than the envelope this agent asks for.
+    That reply is a perfectly clear intention to call a tool, and executing it is strictly better
+    than echoing the argument object back as a message: measured on glm-5.2, 56% of its real
+    tau-bench retail episodes ended at step 1-3 because the harness could not read a bare or
+    prose-fused call (mean reward 0.14 against 0.47 for the episodes that survived). Real
+    tau-bench uses native structured tool calling, so the model pays nothing there and the whole
+    gap was ours.
+
+    Returns the FIRST well-formed call, which is sequential execution order when a reply stacks
+    several. The closing `)` is required, so an arguments object that merely follows a word is
+    not mistaken for a call.
 
     Args:
         text: The raw completion text.
@@ -131,7 +141,7 @@ class LLMAgent:
         *,
         temperature: float = 0.0,
         tools_hint: str | None = None,
-        history_chars: int = _MAX_HISTORY_CHARS,
+        history_chars: int = DEFAULT_HISTORY_CHARS,
         empty_retries: int = _EMPTY_RETRIES,
     ) -> None:
         self._provider = provider
@@ -180,6 +190,16 @@ class LLMAgent:
         step doing nothing; retrying converts an intermittent provider hiccup into a real turn
         instead of a slow death by step budget. Returns the last completion either way, so a
         persistently blank provider still yields an (empty) message action rather than raising.
+
+        LIMITATION, stated because the retry depends on it and it is not verified: the retry
+        sends the IDENTICAL prompt at the agent's temperature, which is 0.0 by default, so it
+        only helps if the blanks are provider-side nondeterminism rather than a deterministic
+        response to this prompt. The 24% blank rate that motivated this was measured on the
+        original transcripts, and the retry's effect on that rate was NOT re-measured; the
+        diagnosis that excluding blank-affected episodes closed the model's gap is what is
+        evidenced, not that re-asking recovers them. If a future capture shows blanks surviving
+        all three attempts at the same rate, the fix is a nonzero retry temperature or a
+        provider-side report, not more retries.
         """
         completion = self._provider.complete(
             self._system,
@@ -200,7 +220,10 @@ class LLMAgent:
 
 
 def _render_turn(
-    task: str | None, state: EnvState, history: list[Step], history_chars: int = _MAX_HISTORY_CHARS
+    task: str | None,
+    state: EnvState,
+    history: list[Step],
+    history_chars: int = DEFAULT_HISTORY_CHARS,
 ) -> str:
     lines = [f"TASK: {task or '(none)'}"]
     if state.scratchpad:

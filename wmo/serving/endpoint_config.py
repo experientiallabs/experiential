@@ -12,14 +12,7 @@ fit). At mount time the file wins; with no file the policy is served exactly as 
 
     # .wmo/models/support-endpoint/endpoint.toml
     cost_quality = 0.6
-<<<<<<< HEAD
-=======
     log_query_embeddings = false
-
-    [representation]
-    compressor_id = "llmlingua2"
-    aggressiveness = 0.4
->>>>>>> 44224b7c (Stop a dial PUT deleting endpoint.toml, and bound the query-embedding store)
 """
 
 from __future__ import annotations
@@ -48,13 +41,6 @@ class EndpointConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cost_quality: float | None = Field(default=None, ge=0.0, le=1.0)
-<<<<<<< HEAD
-=======
-    # The compression this endpoint puts requests through before they reach a model, when it
-    # compresses at all. Declared here rather than derived, because it is a property of the
-    # serving stack in front of the policy, not of the artifact; `check_representation` is what
-    # makes the declaration load-bearing. Absent means uncompressed.
-    representation: Representation | None = None
     # Whether this endpoint records the vector each request was routed on
     # (`wmo.serving.query_embeddings`). On by default because the store is what makes offline
     # counterfactual analysis possible at all, and bounded by rotation so leaving it on is safe;
@@ -62,7 +48,6 @@ class EndpointConfig(BaseModel):
     # denied, and because the one legitimate reason to refuse it (query text is derivable from an
     # embedding, so it is request content at rest) is a tenancy decision, not ours.
     log_query_embeddings: bool = True
->>>>>>> 44224b7c (Stop a dial PUT deleting endpoint.toml, and bound the query-embedding store)
 
     @classmethod
     def load(cls, path: Path) -> EndpointConfig:
@@ -74,12 +59,8 @@ class EndpointConfig(BaseModel):
         except tomllib.TOMLDecodeError as error:
             raise ValueError(
                 f"invalid endpoint config at {path}: {error}. Expected TOML with at most a "
-<<<<<<< HEAD
-                "`cost_quality` key between 0.0 and 1.0, and no other keys"
-=======
-                "`cost_quality` key between 0.0 and 1.0, a `log_query_embeddings` boolean, and a "
-                "`[representation]` table (compressor_id, aggressiveness), and no other keys"
->>>>>>> 44224b7c (Stop a dial PUT deleting endpoint.toml, and bound the query-embedding store)
+                "`cost_quality` key between 0.0 and 1.0 and a `log_query_embeddings` "
+                "boolean, and no other keys"
             ) from error
         return cls.model_validate(data)
 
