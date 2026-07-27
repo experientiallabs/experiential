@@ -21,6 +21,14 @@ copy of it. The only thing this script owns is durability:
   deterministic cut (`plan_sweep`), sliced; nothing here decides which scenarios are measured.
 - RESUME. A chunk whose matrix file loads clean is skipped, so re-running continues where the
   last process stopped, and three staggered `--arm` processes can share one grid directory.
+- CONCURRENCY. `--chunks A:B` narrows a process to a half-open chunk-index range, so ONE arm can
+  also be driven by several processes at once. Chunk matrices, per-chunk retry records, and
+  world-model usage records are all keyed per chunk index, so disjoint ranges never touch the same
+  file and no lock is needed. The ledger is append-only (one `open(..., "a")` and one
+  newline-terminated JSON line per write, no read-modify-write), and the spend cap is evaluated by
+  RE-READING it before each chunk so every process sees its siblings' bills. The documented cost of
+  going lock-free: N concurrent processes can each pass the cap check and then each buy a chunk, so
+  the grid may overshoot the cap by up to one chunk per running process.
 - RETRY. After an arm's chunks, cells left unscored by a TRANSIENT fault (the Bedrock
   InternalServerExceptions the calibration probe saw, throttles, 5xx, timeouts) are re-executed
   once, individually. A cell that fails twice keeps its error row: an unscored cell is evidence
@@ -49,6 +57,14 @@ substituted ratio would silently make the control and the method incomparable.
     uv run python .agents/scripts/run_tau_grid.py --arm identity
     uv run python .agents/scripts/run_tau_grid.py --arm truncate --env-file <compressor-env>
     uv run python .agents/scripts/run_tau_grid.py --arm llmlingua2-endpoint --env-file <env>
+
+    # escalating one arm to two processes, only while the Bedrock error rate stays clean
+    uv run python .agents/scripts/run_tau_grid.py --arm identity --chunks :2
+    uv run python .agents/scripts/run_tau_grid.py --arm identity --chunks 2:
+
+Concurrency has a ceiling that is not this script's: the world model's own serve and judge calls
+are ONE Bedrock model (opus) and throttle as one bucket, so past roughly 4-6 processes the extra
+parallelism converts into throttles, which land as unscored cells and turn into retry-pass work.
 
 Credentials come from the gitignored `.env` plus the ambient environment: Azure keys and the
 Tinker token from `.env`, Anthropic from `ANTHROPIC_API_KEY`, Bedrock from the AWS credential
@@ -189,7 +205,7 @@ MERGED_META = "matrix.meta.json"
 LEDGER_FILE = "ledger.jsonl"
 COHORT_FILE = "cohort.json"
 CALIBRATION_FILE = "calibration.json"
-RETRIED_FILE = "retried.json"
+RETRIED_FILE = "retried-{chunk}.json"
 
 
 class GridStopped(RuntimeError):
@@ -281,6 +297,14 @@ class LedgerLine(BaseModel):
     calibration: Calibration | None = None
 
 
+# `from __future__ import annotations` makes the `Calibration` above a string, and pydantic resolves
+# it against the module in `sys.modules`. Running this file as a script registers it as `__main__`
+# so that works, but loading it through `importlib` under any other name does not, and the failure
+# is a confusing "not fully defined" the first time a ledger line is parsed. Resolving eagerly here
+# means an analysis script can `import` this module and read a ledger without knowing that.
+LedgerLine.model_rebuild()
+
+
 class GridConfig(BaseModel):
     """Everything one invocation of this runner was told to do."""
 
@@ -297,6 +321,10 @@ class GridConfig(BaseModel):
     max_steps: int
     history_chars: int
     cap_usd: float
+    # Half-open chunk-index slice this process owns, or None for every chunk. The unit of
+    # cross-process concurrency: chunk files are keyed by index and so are collision-free, so two
+    # processes on disjoint ranges of ONE arm never touch the same file.
+    chunk_range: tuple[int, int] | None
     only_models: tuple[str, ...]
     inject_fake_error: bool
     retry: bool
@@ -352,7 +380,7 @@ class GridState:
         self._dir = grid_dir
         self._dir.mkdir(parents=True, exist_ok=True)
         self.cohort = self._reconcile_cohort(cohort)
-        self.cumulative_usd = self._replay_spend()
+        log.info("ledger to date: $%.4f already spent in this grid", self.spend_to_date())
 
     def _reconcile_cohort(self, cohort: Cohort) -> Cohort:
         """Adopt the recorded cohort, or refuse to append this run's cells to a different one."""
@@ -403,37 +431,53 @@ class GridState:
             )
         return pinned
 
-    def _replay_spend(self) -> float:
-        """Cumulative measured spend from the ledger, so the cap survives a restart.
+    def ledger_lines(self) -> list[LedgerLine]:
+        """Every readable ledger line, re-read from disk.
 
-        Summed from the per-line halves rather than read off the last line's running total: a
-        truncated final line then costs the run one line of history instead of its whole budget
-        state.
+        Re-read rather than cached, because the grid's spend is written by SEVERAL processes: one
+        per arm, and optionally several per arm on disjoint chunk ranges. A cached total would only
+        ever see this process's own cells, so each writer would believe the grid had spent a third
+        of what it had.
+
+        A line that does not parse is skipped with a warning instead of stopping the run: the one
+        way to lose a line is a process dying mid-write, which costs one line of history, and
+        refusing to read the rest would turn that into a lost budget state.
         """
-        total = 0.0
         path = self._dir / LEDGER_FILE
         if not path.exists():
-            return total
+            return []
+        lines: list[LedgerLine] = []
         for index, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if not raw.strip():
                 continue
             try:
-                line = LedgerLine.model_validate_json(raw)
+                lines.append(LedgerLine.model_validate_json(raw))
             except ValueError:
-                log.warning(
-                    "ledger line %d of %s is unreadable; skipping it in the spend replay",
-                    index,
-                    path,
-                )
-                continue
-            total += line.candidate_usd + line.wm_usd
-        log.info("ledger replay: $%.4f already spent in this grid", total)
-        return total
+                log.warning("ledger line %d of %s is unreadable; skipping it", index, path)
+        return lines
+
+    def spend_to_date(self) -> float:
+        """The grid's cumulative measured spend, across every process, as of right now.
+
+        Summed from the per-line halves rather than read off the last line's running total: with
+        concurrent writers the last line's total is only that writer's view, and after a crash a
+        truncated line would otherwise take the whole budget state with it.
+        """
+        return sum(line.candidate_usd + line.wm_usd for line in self.ledger_lines())
 
     def append(self, line: LedgerLine) -> None:
-        """Append one ledger line, its cumulative total filled in from the running spend."""
-        self.cumulative_usd += line.candidate_usd + line.wm_usd
-        stamped = line.model_copy(update={"cumulative_usd": self.cumulative_usd})
+        """Append one ledger line atomically enough for several processes to share the file.
+
+        One `open(..., "a")` per line and one `write` of a single newline-terminated JSON line. On
+        every platform this runner targets, an append-mode write below the pipe buffer size does
+        not interleave with another process's, so concurrent writers produce whole lines in some
+        order rather than shredded ones. The stamped `cumulative_usd` is this writer's view at
+        write time and is therefore ADVISORY under concurrency; the authoritative total is
+        `spend_to_date`, which re-reads and sums the halves.
+        """
+        stamped = line.model_copy(
+            update={"cumulative_usd": self.spend_to_date() + line.candidate_usd + line.wm_usd}
+        )
         with (self._dir / LEDGER_FILE).open("a", encoding="utf-8") as handle:
             handle.write(stamped.model_dump_json() + "\n")
 
@@ -449,16 +493,23 @@ class GridState:
             calibration.model_dump_json(indent=2), encoding="utf-8"
         )
 
-    def retried(self, arm: str) -> set[str]:
-        """Cells this grid has already spent a retry on, so the one-retry cap survives a restart."""
-        path = self._dir / arm / RETRIED_FILE
+    def retried(self, arm: str, chunk: int) -> set[str]:
+        """Cells this grid already spent a retry on for one chunk, so one-retry survives a restart.
+
+        Keyed per CHUNK, not per arm. Two processes driving disjoint chunk ranges of the same arm
+        would otherwise read-modify-write one shared file and each drop the other's entries, which
+        would hand a still-failing cell a second and third retry. Per-chunk files are
+        collision-free for the same reason the chunk matrices are: only one process owns an index.
+        """
+        path = self._dir / arm / RETRIED_FILE.format(chunk=chunk)
         if not path.exists():
             return set()
         keys = json.loads(path.read_text(encoding="utf-8"))
         return {str(key) for key in keys}
 
-    def mark_retried(self, arm: str, keys: set[str]) -> None:
-        path = self._dir / arm / RETRIED_FILE
+    def mark_retried(self, arm: str, chunk: int, keys: set[str]) -> None:
+        """Record this chunk's spent retries before the retry runs, so a crash cannot lose them."""
+        path = self._dir / arm / RETRIED_FILE.format(chunk=chunk)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(sorted(keys), indent=2), encoding="utf-8")
 
@@ -775,6 +826,30 @@ class ArmRunner:
         cut = len(self.base_plan.scenarios)
         return -(-cut // self.config.chunk_size) if cut else 0
 
+    def owned_chunks(self) -> list[int]:
+        """The chunk indices THIS process runs: `--chunks A:B`, else every chunk of the arm.
+
+        Only the running and retrying halves narrow. Merging always considers every chunk, so
+        whichever process finishes last assembles the arm and the earlier ones say what is still
+        missing.
+
+        Raises:
+            GridStopped: The requested range lies entirely outside the arm's chunks, which is
+                almost always a launch-plan arithmetic error rather than an empty job.
+        """
+        if self.config.chunk_range is None:
+            return list(range(self.chunk_count))
+        begin, end = self.config.chunk_range
+        owned = [index for index in range(self.chunk_count) if begin <= index < end]
+        if not owned:
+            raise GridStopped(
+                f"--chunks {begin}:{end} selects no chunk of arm '{self.arm}', which has "
+                f"{self.chunk_count} chunk(s) (indices 0..{max(self.chunk_count - 1, 0)}). Check "
+                "the launch plan's ranges: the cut is smaller than a 45-scenario grid would be "
+                "(see the scenario warning above)."
+            )
+        return owned
+
     def chunk_path(self, index: int) -> Path:
         return self.dir / f"chunk-{index}.json"
 
@@ -801,26 +876,19 @@ class ArmRunner:
         this corpus. Before any cell of this grid has been measured there is nothing to average,
         so the guard falls back to the probe's measured all-in figure.
         """
-        measured_cells = 0
-        measured_usd = 0.0
-        path = self.config.grid_dir / LEDGER_FILE
-        if path.exists():
-            for raw in path.read_text(encoding="utf-8").splitlines():
-                if not raw.strip():
-                    continue
-                try:
-                    line = LedgerLine.model_validate_json(raw)
-                except ValueError:
-                    continue
-                if line.event in {"chunk", "retry"} and line.cells:
-                    measured_cells += line.cells
-                    measured_usd += line.candidate_usd + line.wm_usd
+        paid = [
+            line
+            for line in self.state.ledger_lines()
+            if line.event in {"chunk", "retry"} and line.cells
+        ]
+        measured_cells = sum(line.cells for line in paid)
+        measured_usd = sum(line.candidate_usd + line.wm_usd for line in paid)
         per_cell = measured_usd / measured_cells if measured_cells else PROBE_USD_PER_CELL
         return per_cell * cells
 
     def run_chunks(self) -> None:
-        """Every chunk of this arm, skipping the ones already on disk, stopping at the cap."""
-        for index in range(self.chunk_count):
+        """This process's chunks, skipping the ones already on disk, stopping at the cap."""
+        for index in self.owned_chunks():
             scenarios = self.chunk_scenarios(index)
             if not scenarios:
                 continue
@@ -851,12 +919,18 @@ class ArmRunner:
                 continue
             cells = len(self.base_plan.pool.models) * len(scenarios) * self.config.episodes
             forecast = self.forecast_usd(cells)
-            if self.state.cumulative_usd + forecast > self.config.cap_usd:
+            # Re-read before every chunk, so a process sees what its SIBLINGS have spent. Under
+            # concurrency the check is therefore approximate in one direction only: N processes can
+            # each pass it and then each buy a chunk, so the grid may overshoot the cap by up to
+            # one chunk per running process. Documented and accepted (a launch plan's worth of
+            # chunks, not a launch plan's worth of arms); the alternative is a lock file that
+            # would serialize the very concurrency this flag exists to buy.
+            spent = self.state.spend_to_date()
+            if spent + forecast > self.config.cap_usd:
                 self.stop(
                     f"{self.arm} chunk {index} would take the grid past its "
-                    f"${self.config.cap_usd:.0f} cap (spent "
-                    f"${self.state.cumulative_usd:.2f}, this chunk forecast ${forecast:.2f} "
-                    "from measured cells)"
+                    f"${self.config.cap_usd:.0f} cap (spent ${spent:.2f} across all processes, "
+                    f"this chunk forecast ${forecast:.2f} from measured cells)"
                 )
             self.run_one_chunk(index, scenarios)
 
@@ -911,10 +985,11 @@ class ArmRunner:
                 note=gap or "",
             )
         )
-        if self.state.cumulative_usd > self.config.cap_usd:
+        spent = self.state.spend_to_date()
+        if spent > self.config.cap_usd:
             self.stop(
-                f"the ${self.config.cap_usd:.0f} cap is spent (${self.state.cumulative_usd:.2f} "
-                "measured all-in)"
+                f"the ${self.config.cap_usd:.0f} cap is spent (${spent:.2f} measured all-in "
+                "across every process in this grid)"
             )
 
     def execute(self, plan: SweepPlan) -> SweepRun:
@@ -950,11 +1025,16 @@ class ArmRunner:
                 note=reason,
             )
         )
+        chunks = (
+            ""
+            if self.config.chunk_range is None
+            else f" --chunks {self.config.chunk_range[0]}:{self.config.chunk_range[1]}"
+        )
         raise GridStopped(
             f"{reason}. Nothing was left half-written: every finished chunk is on disk. "
             "Resume (after raising --cap, if that is what stopped it) with:\n"
-            f"  uv run python {Path(__file__).relative_to(REPO_ROOT)} --arm {self.arm} "
-            f"--grid-dir {self.config.grid_dir}"
+            f"  uv run python {Path(__file__).relative_to(REPO_ROOT)} --arm {self.arm}{chunks} "
+            f"--episodes {self.config.episodes} --grid-dir {self.config.grid_dir}"
         )
 
     # -- retry pass
@@ -966,9 +1046,15 @@ class ArmRunner:
         path that has never run is not proven. This deliberately destroys one real result in the
         smoke's throwaway grid so the retry can be watched end to end.
         """
-        matrix = self.loaded_chunk(0)
+        owned = self.owned_chunks()
+        if not owned:
+            return
+        # The first chunk THIS process owns, so a `--chunks` slice that excludes 0 still exercises
+        # the retry rather than silently skipping it.
+        chunk = owned[0]
+        matrix = self.loaded_chunk(chunk)
         if matrix is None or not matrix.outcomes:
-            log.warning("no chunk 0 row to inject a fake error into; retry pass unexercised")
+            log.warning("no chunk %d row to inject a fake error into; retry unexercised", chunk)
             return
         target = matrix.outcomes[0]
         log.warning(
@@ -983,16 +1069,21 @@ class ArmRunner:
                 "error": "InternalServerException: smoke-injected transient error",
             }
         )
-        matrix.save(self.chunk_path(0))
+        matrix.save(self.chunk_path(chunk))
 
     def retry_pass(self) -> None:
-        """Re-execute this arm's transiently-failed cells once each, in place."""
-        already = self.state.retried(self.arm)
+        """Re-execute the transiently-failed cells of THIS process's chunks, once each, in place.
+
+        Scoped to the owned chunks for the same reason the runs are: two processes sharing an arm
+        must not both decide to retry the same chunk's cells, which would double-buy them and race
+        on the chunk file.
+        """
         by_id = {scenario_id(scenario): scenario for scenario in self.base_plan.scenarios}
-        for index in range(self.chunk_count):
+        for index in self.owned_chunks():
             matrix = self.loaded_chunk(index)
             if matrix is None:
                 continue
+            already = self.state.retried(self.arm, index)
             targets = [
                 (position, outcome)
                 for position, outcome in enumerate(matrix.outcomes)
@@ -1025,7 +1116,7 @@ class ArmRunner:
             )
             for position, outcome in targets:
                 already.add(cell_key(outcome))
-                self.state.mark_retried(self.arm, already)
+                self.state.mark_retried(self.arm, index, already)
                 replacement = self.retry_cell(index, outcome, by_id)
                 if replacement is not None:
                     matrix.outcomes[position] = replacement
@@ -1052,10 +1143,11 @@ class ArmRunner:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         plan = single_cell_plan(self.base_plan, ModelPool(models=[entry]), scenario, out_path)
         forecast = self.forecast_usd(1)
-        if self.state.cumulative_usd + forecast > self.config.cap_usd:
+        spent = self.state.spend_to_date()
+        if spent + forecast > self.config.cap_usd:
             self.stop(
                 f"the retry of {cell_key(outcome)} would take the grid past its "
-                f"${self.config.cap_usd:.0f} cap"
+                f"${self.config.cap_usd:.0f} cap (spent ${spent:.2f} across all processes)"
             )
         started = time.monotonic()
         run = self.execute(plan)
@@ -1208,6 +1300,37 @@ class ArmRunner:
 # ------------------------------------------------------------------------------------------- main
 
 
+def parse_chunk_range(spec: str | None) -> tuple[int, int] | None:
+    """`A:B` as a half-open chunk-index range; None for every chunk.
+
+    `A:` runs from A to the end and `:B` from the start, so a two-process split of one arm reads as
+    `--chunks :2` and `--chunks 2:` without either side having to know the arm's chunk count.
+
+    Raises:
+        GridStopped: The spec is not `A:B`, or the range is empty or negative. A typo here silently
+            costs a launch plan a whole range of chunks, so it is a hard stop rather than a warning.
+    """
+    if spec is None:
+        return None
+    if ":" not in spec:
+        raise GridStopped(
+            f"--chunks {spec!r} must be a half-open range 'A:B' (also 'A:' or ':B'), for example "
+            "--chunks 0:2 for the first two chunks and --chunks 2: for the rest"
+        )
+    raw_begin, _, raw_end = spec.partition(":")
+    try:
+        begin = int(raw_begin) if raw_begin.strip() else 0
+        end = int(raw_end) if raw_end.strip() else 1 << 30
+    except ValueError as exc:
+        raise GridStopped(f"--chunks {spec!r} has a non-integer bound: {exc}") from exc
+    if begin < 0 or end <= begin:
+        raise GridStopped(
+            f"--chunks {spec!r} is empty or negative: the range is half-open, so A must be >= 0 "
+            "and strictly less than B"
+        )
+    return (begin, end)
+
+
 def build_config(args: argparse.Namespace) -> GridConfig:
     """Turn parsed arguments into the run's pins, applying the smoke's overrides."""
     smoke = bool(args.smoke)
@@ -1237,6 +1360,7 @@ def build_config(args: argparse.Namespace) -> GridConfig:
         else (SMOKE_MAX_STEPS if smoke else DEFAULT_MAX_STEPS),
         history_chars=args.history_chars,
         cap_usd=args.cap if args.cap else (SMOKE_CAP_USD if smoke else DEFAULT_CAP_USD),
+        chunk_range=parse_chunk_range(args.chunks),
         only_models=tuple(args.only_model) if args.only_model else (SMOKE_MODELS if smoke else ()),
         inject_fake_error=smoke and not args.no_inject,
         retry=not args.no_retry,
@@ -1330,6 +1454,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Merge whatever chunks are on disk and exit, spending nothing.",
     )
     parser.add_argument(
+        "--chunks",
+        default=None,
+        help="Half-open chunk-index range this process runs, e.g. 0:2 or 2: . Lets several OS "
+        "processes drive ONE arm on disjoint ranges (chunk files are keyed by index, so they never "
+        "collide). Default: every chunk of the arm. Merging always considers every chunk, so "
+        "whichever process finishes last assembles the arm.",
+    )
+    parser.add_argument(
         "--env-file",
         action="append",
         default=None,
@@ -1382,9 +1514,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
     log.info(
-        "grid: arms=%s, up to %d scenario(s) in chunks of %d, %d candidate(s), max_steps=%d, "
-        "episodes=%d, cap $%.0f, dir %s",
+        "grid: arms=%s, chunks=%s, up to %d scenario(s) in chunks of %d, %d candidate(s), "
+        "max_steps=%d, episodes=%d, cap $%.0f, dir %s",
         ",".join(config.arms),
+        "all" if config.chunk_range is None else f"{config.chunk_range[0]}:{config.chunk_range[1]}",
         config.scenarios,
         config.chunk_size,
         len(pool.models),
@@ -1460,7 +1593,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runner.retry_pass()
         runner.merge()
 
-    log.info("grid spend so far: $%.4f all-in (cap $%.0f)", state.cumulative_usd, config.cap_usd)
+    log.info(
+        "grid spend so far: $%.4f all-in across every process (cap $%.0f)",
+        state.spend_to_date(),
+        config.cap_usd,
+    )
     return 0
 
 
