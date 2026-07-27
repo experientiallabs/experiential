@@ -242,6 +242,11 @@ def test_optimize_with_zero_budget_returns_base_prompt() -> None:
     )
     assert result.prompt == "BASE"
     assert result.frontier == ["BASE"]
+    # GEPA never ran (zero budget): the fresh base-vs-winner comparison must read as "did not
+    # run" (None), never a misleading 0.0 that would look like a measured tie.
+    assert result.metrics.base_fresh is None
+    assert result.metrics.best_fresh is None
+    assert result.metrics.fresh_delta is None
 
 
 def test_optimize_with_no_traces_returns_base_prompt() -> None:
@@ -320,6 +325,14 @@ def test_optimize_reverts_to_base_when_fresh_recheck_contradicts(monkeypatch) ->
     assert result.metrics.reverted_to_base is True
     # held-out accuracy reflects the fresh base score, not the discarded winner's search score.
     assert abs(result.metrics.held_out_accuracy - 0.9) < 1e-9
+    # The comparison that DROVE the revert decision survives on the result: base beat the
+    # winner by 0.8 on the fresh paired sample, not just a bare "it was reverted" boolean.
+    assert result.metrics.base_fresh is not None
+    assert result.metrics.best_fresh is not None
+    assert result.metrics.fresh_delta is not None
+    assert abs(result.metrics.base_fresh - 0.9) < 1e-9
+    assert abs(result.metrics.best_fresh - 0.1) < 1e-9
+    assert abs(result.metrics.fresh_delta - (-0.8)) < 1e-9
     # The returned prompt leads the frontier - the rejected winner must not be presented as the
     # top validated candidate (frontier.json consumers pick from the front).
     assert result.frontier[0] == "BASE"
@@ -364,6 +377,14 @@ def test_optimize_keeps_winner_when_fresh_recheck_confirms(monkeypatch) -> None:
     assert result.prompt == "EVOLVED"
     assert result.metrics.reverted_to_base is False
     assert abs(result.metrics.held_out_accuracy - 0.8) < 1e-9
+    # The kept winner's margin over base on the fresh paired sample is recorded, not discarded:
+    # this is the "did GEPA actually help" number the boolean alone cannot give.
+    assert result.metrics.base_fresh is not None
+    assert result.metrics.best_fresh is not None
+    assert result.metrics.fresh_delta is not None
+    assert abs(result.metrics.base_fresh - 0.2) < 1e-9
+    assert abs(result.metrics.best_fresh - 0.8) < 1e-9
+    assert abs(result.metrics.fresh_delta - 0.6) < 1e-9
 
 
 def test_optimize_recheck_raises_on_total_judge_outage(monkeypatch) -> None:  # noqa: ANN001
@@ -465,6 +486,11 @@ def test_optimize_skips_recheck_when_base_wins_the_search(monkeypatch) -> None: 
     assert result.prompt == "BASE"
     assert result.metrics.reverted_to_base is False
     assert provider.rollout_calls == 0  # no fresh eval spent when there is nothing to re-check
+    # No acceptance re-check ran (the search's own winner was already base): the fresh
+    # comparison fields must stay None, not a fabricated 0.0-vs-0.0 "tie".
+    assert result.metrics.base_fresh is None
+    assert result.metrics.best_fresh is None
+    assert result.metrics.fresh_delta is None
 
 
 def _eval_batch(trace: Trace) -> list[_EvalStep]:

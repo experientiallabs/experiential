@@ -591,3 +591,88 @@ def test_build_default_runs_no_search(tmp_path) -> None:  # noqa: ANN001
         embedder=HashingEmbedder(dim=64),
     )
     assert not (root / "auto_fidelity.json").exists()  # default stays plain RAG, no search
+
+
+def test_build_low_tier_records_no_gepa_sentinel_not_zero(tmp_path) -> None:  # noqa: ANN001
+    """`--fidelity low` (gepa_budget<=0) never runs the acceptance re-check, so `metrics.json`
+    must record base_fresh/best_fresh/fresh_delta as `null`, never a `0.0` a reader could mistake
+    for "GEPA ran and measured a tie". Without `OptimizeMetrics` carrying these fields at all,
+    this key lookup fails outright."""
+    root = tmp_path / ".wmo"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,  # the low fidelity tier: RAG only, GEPA never runs
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    metrics = json.loads(ArtifactPaths(root).metrics.read_text(encoding="utf-8"))
+    assert metrics["base_fresh"] is None
+    assert metrics["best_fresh"] is None
+    assert metrics["fresh_delta"] is None
+
+
+def test_build_gepa_recheck_is_disjoint_from_the_selection_valset(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The build must not re-check GEPA's winner on the same steps it was selected on: that
+    would test selection, not generalization, and is exactly why `held_out_accuracy` could not
+    answer whether GEPA helps. Regression for `optimize()` being called without `recheck=` at
+    all, which silently fell back to the selection valset itself."""
+    import sys
+
+    from wmo.optimize import OptimizeResult
+
+    build_mod = sys.modules["wmo.engine.build"]
+    # Plenty of one-step traces so the val split comfortably exceeds the GEPA valset step cap
+    # (16 by default), leaving a real disjoint remainder to recheck against.
+    traces_file = _multi_trace_file(tmp_path, 150)
+
+    captured: dict[str, list[Trace] | None] = {}
+
+    class _RecordingOptimizer:
+        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def optimize(  # noqa: ANN202
+            self,
+            train,  # noqa: ANN001
+            test,  # noqa: ANN001
+            base_prompt,  # noqa: ANN001
+            budget,  # noqa: ANN001
+            *,
+            recheck=None,  # noqa: ANN001
+            **kwargs,  # noqa: ANN003
+        ):
+            captured["gepa_val"] = test
+            captured["recheck"] = recheck
+            return OptimizeResult(prompt=base_prompt, frontier=[base_prompt])
+
+    monkeypatch.setattr(build_mod, "GEPAOptimizer", _RecordingOptimizer)
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=2,
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=traces_file,
+        root=str(tmp_path / ".wmo"),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+
+    gepa_val = captured["gepa_val"]
+    recheck = captured["recheck"]
+    assert gepa_val  # the selection valset itself was non-empty
+    assert recheck  # a real disjoint sample was found, not an empty no-op fallback
+    gepa_val_ids = {t.trace_id for t in gepa_val}
+    recheck_ids = {t.trace_id for t in recheck}
+    assert not (gepa_val_ids & recheck_ids)

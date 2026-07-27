@@ -256,8 +256,25 @@ def build(
         # the whole valset, and steps (not traces) are what bound cost — a long-trace corpus once
         # turned a 4-iteration tier into $131. The default ceiling applies always; a fidelity
         # tier may widen it (`gepa_val_cap`, in steps).
-        gepa_val = _cap_gepa_valset(val or train, gepa_val_cap or _GEPA_VAL_STEP_CAP)
-        result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
+        gepa_val_size = gepa_val_cap or _GEPA_VAL_STEP_CAP
+        gepa_val = _cap_gepa_valset(val or train, gepa_val_size)
+        # The acceptance re-check (inside `optimizer.optimize`) must not grade base-vs-winner on
+        # the very steps GEPA selected candidates against: that would test selection, not
+        # generalization, and is exactly what made `metrics.held_out_accuracy` unable to answer
+        # whether GEPA helps. `val` is the SAME validation split `gepa_val` was capped from
+        # (never test: the build's data boundary keeps test untouched for `wmo eval`), so its
+        # leftover traces past the cap are a genuinely disjoint, still leak-free sample. Capping
+        # that remainder at the same `gepa_val_size` keeps the re-check's cost the same order of
+        # magnitude as before: the two fresh eval passes already happened every GEPA build
+        # (`recheck_rollouts = 2 * len(recheck_steps)`), just against the selection data; this
+        # only repoints them. Empty (never None, falsy either way) exactly when `val` was too
+        # small to leave anything past the cap; `GEPAOptimizer.optimize` then falls back to the
+        # selection valset itself, so `metrics.base_fresh`/`best_fresh` stay populated (not a
+        # leak-free comparison in that corner case, but never silently mislabeled as one).
+        recheck = _cap_gepa_valset(val[len(gepa_val) :], gepa_val_size)
+        result = optimizer.optimize(
+            train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget, recheck=recheck
+        )
         # A GEPA candidate can be empty - a weak reflection LM (e.g. a self-reflecting open model)
         # sometimes proposes a blank env prompt that still scores acceptably on easy steps and
         # gets selected. An empty env prompt is never a valid artifact, so fall back to base.

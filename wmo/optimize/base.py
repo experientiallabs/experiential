@@ -99,6 +99,22 @@ class OptimizeMetrics(BaseModel):
     # and the base prompt was restored (see `GEPAOptimizer.optimize`). Surfaced so research runs
     # can report how often GEPA's search wins fail to survive an independent evaluation.
     reverted_to_base: bool = False
+    # The base-vs-winner acceptance re-check's fresh paired scores (see `GEPAOptimizer.optimize`):
+    # `base_fresh` is the base prompt's mean judge score and `best_fresh` the search's winning
+    # candidate's mean judge score, both measured in the SAME pass over the SAME (ideally
+    # selection-disjoint) sample - the exact comparison the revert decision is made from. This is
+    # the answer to "did GEPA actually help", which the boolean `reverted_to_base` alone cannot
+    # give: `reverted_to_base=False` is ambiguous between "the winner beat base and was kept" and
+    # "GEPA's own search already picked base, nothing to re-check" and "GEPA never ran at all"
+    # (`--fidelity low`, budget<=0). `base_fresh`/`best_fresh` stay `None` (never a misleading 0.0)
+    # in the two cases where no fresh comparison happened - a `--fidelity low` build and a GEPA
+    # pass whose search-time winner was already the base prompt - and are both populated (even
+    # when they tie, `fresh_delta == 0.0`) whenever the acceptance re-check actually ran.
+    base_fresh: float | None = None
+    best_fresh: float | None = None
+    # `best_fresh - base_fresh`: positive means the accepted/rejected winner beat base on the
+    # fresh sample; `None` exactly when `base_fresh`/`best_fresh` are `None`.
+    fresh_delta: float | None = None
     # Reserved: judge self-consistency / human-agreement proxy. Populating it needs repeated or
     # independent judging (not yet implemented); `None` until then so it never reads as a real 0.0.
     judge_agreement: float | None = None
