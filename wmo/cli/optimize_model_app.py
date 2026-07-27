@@ -15,7 +15,10 @@ candidate spend.
 
 Not in this build: the `--distill` stage (train a student, gate it, add it to the pool, re-sweep).
 It is named in `wmo.optimize.pipeline.STAGE_ORDER` so its arrival is additive; passing `--distill`
-today is a usage error that names the manual command instead.
+today is a usage error that names the manual command instead. Its PREFLIGHT already exists,
+though (`wmo.optimize.teacher`), and that refusal carries the teacher-search verdict on whatever
+matrix this model has: usually there is no teacher gap, and the cheapest run is the one the
+evidence says to skip.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import typer
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.prompt import Confirm
@@ -106,6 +109,7 @@ from wmo.optimize.sweep import (
     resolve_config,
 )
 from wmo.optimize.sweep import preflight_pool as run_preflight
+from wmo.optimize.teacher import TeacherSearchVerdict, select_teacher
 from wmo.providers.pool import DEFAULT_POOL_PATH
 
 _console = Console()
@@ -208,7 +212,9 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         None,
         "--distill",
         help="NOT IN THIS BUILD. Reserved for the distillation stage (train a student, gate it, "
-        "add it to the pool, re-sweep it). Use `wmo optimize distill run` for now.",
+        "add it to the pool, re-sweep it). Use `wmo optimize distill run` for now, and "
+        "`wmo optimize distill probe <matrix.json>` to find out whether you should at all: "
+        "passing this flag prints that verdict for this model's own matrix.",
     ),
     force_from: str = typer.Option(
         None,
@@ -269,13 +275,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     manifest under `<model>/optimize/`. Deleting that directory resets resume and breaks nothing.
     """
     if distill is not None:
-        raise typer.BadParameter(
-            "--distill is reserved and not implemented in this build: the distillation stage "
-            "(train a student, gate it, add it to the pool, re-sweep it, merge the matrix) is "
-            "still a separate workflow. Run `wmo optimize distill run --config <toml>`, then "
-            "`wmo optimize route student <run-dir> --input-per-mtok ... --output-per-mtok ...` "
-            "to put the student in the pool, then re-run this command without --distill."
-        )
+        raise typer.BadParameter(_distill_reserved_message(world_model=world_model, root=root))
     if compressor is None and aggressiveness > 0.0:
         raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
     compression: CompressionConfig | None = None
@@ -454,6 +454,53 @@ class _RunPaths(BaseModel):
     matrix: Path
     policy: Path
     report: Path
+
+
+def _distill_reserved_message(*, world_model: str | None, root: str) -> str:
+    """Why `--distill` is refused, plus this model's teacher-search verdict when one is readable.
+
+    The stage is not wired, but its PREFLIGHT is (`wmo.optimize.teacher`), and the preflight is
+    the half that decides whether the stage should run at all. Printing the verdict here means
+    the product surface already answers the real question ("should I distill?") in the same place
+    an operator asked for it, and usually answers no, which is the cheapest possible outcome.
+
+    Everything about the lookup is best effort: an unresolvable model, an absent matrix, or a
+    matrix too small to compare adds nothing to the message rather than replacing a usage error
+    with an unrelated one.
+    """
+    base = (
+        "--distill is reserved and not implemented in this build: the distillation stage "
+        "(train a student, gate it, add it to the pool, re-sweep it, merge the matrix) is "
+        "still a separate workflow. Run `wmo optimize distill run --config <toml>`, then "
+        "`wmo optimize route student <run-dir> --input-per-mtok ... --output-per-mtok ...` "
+        "to put the student in the pool, then re-run this command without --distill."
+    )
+    found = _teacher_verdict(world_model=world_model, root=root)
+    if found is None:
+        return base
+    matrix_path, verdict = found
+    return (
+        f"{base} Worth knowing before you spend anything, the teacher-search verdict on this "
+        f"model's current matrix: {verdict.reason} "
+        f"(`wmo optimize distill probe {matrix_path}` prints the full table.)"
+    )
+
+
+def _teacher_verdict(
+    *, world_model: str | None, root: str
+) -> tuple[Path, TeacherSearchVerdict] | None:
+    """This model's teacher search over the matrix already on disk, or None when unavailable."""
+    try:
+        model_dir = WorldModelStore(root).resolve(world_model)
+    except (FileNotFoundError, ValueError):
+        return None
+    matrix_path = model_dir / MANIFEST_DIRNAME / MATRIX_FILENAME
+    if not matrix_path.is_file():
+        return None
+    try:
+        return matrix_path, select_teacher(OutcomeMatrix.load(matrix_path))
+    except (ValidationError, ValueError, OSError):
+        return None
 
 
 def _resolve_embedder_choice(choice: str) -> tuple[EmbedderSpec, str]:

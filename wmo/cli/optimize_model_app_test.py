@@ -500,6 +500,36 @@ def test_distill_is_rejected_with_the_command_that_does_work(
     assert not _paths(root)[0].exists()  # nothing ran
 
 
+def test_distill_refusal_carries_the_teacher_verdict_on_the_matrix_it_finds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stage is unwired, but its preflight is not: the refusal answers "should I?" anyway."""
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.42})
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes", "--scenarios", "4").exit_code == 0
+
+    result = _run(tmp_path, root, "--yes", "--distill", "distill.toml")
+
+    assert result.exit_code != 0
+    assert _says(result.output, "the teacher-search verdict on this model's current matrix")
+    # Four scenarios is under the gate's evidence bar, and it says so rather than guessing.
+    assert _says(result.output, "INSUFFICIENT EVIDENCE")
+    assert _says(result.output, "wmo optimize distill probe")
+
+
+def test_distill_refusal_without_a_matrix_is_just_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing has been measured yet, so there is no verdict to quote and none is invented."""
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+
+    result = _run(tmp_path, root, "--yes", "--distill", "distill.toml")
+
+    assert result.exit_code != 0
+    assert not _says(result.output, "teacher-search verdict")
+
+
 def test_force_from_a_reserved_stage_says_it_is_not_built(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
