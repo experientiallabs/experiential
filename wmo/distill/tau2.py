@@ -166,9 +166,28 @@ def _provider_snapshot(provider_config: ProviderConfig) -> JsonObject:
     return provider_config.model_dump(mode="json")
 
 
-def _episode_complete(spec: _EpisodeSpec) -> bool:
-    """Whether an episode dir already holds complete, reusable evidence."""
-    return (spec.episode_dir / RESULTS_FILENAME).exists()
+def _episode_complete(spec: _EpisodeSpec, provider_config: ProviderConfig) -> bool:
+    """Whether an episode dir holds complete evidence reusable under THIS provider.
+
+    Reuse demands more than file existence, or a crash-resumed step inherits
+    junk permanently: the results file must PARSE to a simulation (a copy torn
+    mid-write would otherwise be re-read as a silent `infra_failed` record on
+    every resume), and the recorded provider snapshot must parse AND equal the
+    current provider (an unreadable snapshot cannot prove which weights sampled
+    the episode, so it re-runs). A missing span sink is deliberately NOT a
+    reuse blocker: the sink is written before the results copy, so a valid
+    results file with no sink means the episode genuinely made no successful
+    completion, which is the recorded `empty_span_trials` shape.
+    """
+    if _read_simulation(spec) is None:
+        return False
+    try:
+        recorded = json.loads(
+            (spec.episode_dir / PROVIDER_SNAPSHOT_FILENAME).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    return recorded == _provider_snapshot(provider_config)
 
 
 def _wipe_stale_episode_dir(spec: _EpisodeSpec, provider_config: ProviderConfig) -> bool:
@@ -176,8 +195,10 @@ def _wipe_stale_episode_dir(spec: _EpisodeSpec, provider_config: ProviderConfig)
 
     Mirrors the harbor collector's `_wipe_stale_policy_dir`: a dir left by a
     previous session under other weights would resume another policy's
-    episode. A matching or unreadable snapshot leaves the dir alone (matching
-    dirs resume; unreadable ones re-run and overwrite).
+    episode. A MATCHING snapshot leaves the dir for `_episode_complete` to
+    reuse. An unreadable snapshot also leaves the dir in place, but such a dir
+    never passes `_episode_complete`, so the episode re-runs and its fresh
+    attempt overwrites the evidence rather than destroying it here.
 
     Args:
         spec: The episode's resolved identities.
@@ -514,7 +535,7 @@ async def _run_batch(
                 logger.warning("cancellation requested; skipping episode %s", spec.name)
                 return
             _wipe_stale_episode_dir(spec, provider_config)
-            if _episode_complete(spec):
+            if _episode_complete(spec, provider_config):
                 logger.info("episode %s already complete; reusing its evidence", spec.name)
                 return
             for attempt in range(1 + episode_retries):

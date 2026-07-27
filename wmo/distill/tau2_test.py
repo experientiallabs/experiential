@@ -275,3 +275,59 @@ class TestEpisodeRetry:
         [record] = records
         assert record.infra_failed is True
         assert stats.infra_failed_trials == 1
+
+
+class TestEpisodeReuse:
+    """Reuse requires parseable results AND a matching, readable provider snapshot."""
+
+    def test_matching_snapshot_and_valid_results_are_reused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg = _cfg()
+        cfg = cfg.model_copy(update={"train": cfg.train.model_copy(update={"group_size": 1})})
+        provider = _provider_config()
+        spec = _EpisodeSpec("airline/0", 1, tmp_path / "tau2" / "step-0000")
+        _write_results(spec.episode_dir, reward=1.0)
+        (spec.episode_dir / "provider.json").write_text(
+            json.dumps(provider.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
+        )
+        launches: list[int] = []
+
+        async def _never_launches(*_args: object) -> None:
+            launches.append(1)
+
+        monkeypatch.setattr("wmo.distill.tau2._run_episode_subprocess", _never_launches)
+        records, _ = collect_tau2_rollouts(
+            0, ["airline/0"], cfg, HarnessDoc.baseline(), provider, tmp_path
+        )
+        assert launches == []
+        assert records[0].passed is True
+
+    @pytest.mark.parametrize("corruption", ["torn_results", "missing_snapshot"])
+    def test_incomplete_evidence_re_runs_instead_of_reusing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str
+    ) -> None:
+        cfg = _cfg()
+        cfg = cfg.model_copy(update={"train": cfg.train.model_copy(update={"group_size": 1})})
+        provider = _provider_config()
+        spec = _EpisodeSpec("airline/0", 1, tmp_path / "tau2" / "step-0000")
+        if corruption == "torn_results":
+            spec.episode_dir.mkdir(parents=True)
+            (spec.episode_dir / "results.json").write_text('{"simulations": [{"tr', "utf-8")
+            (spec.episode_dir / "provider.json").write_text(
+                json.dumps(provider.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
+            )
+        else:
+            _write_results(spec.episode_dir, reward=1.0)  # results fine, snapshot absent
+        launches: list[int] = []
+
+        async def _fresh_attempt(spec_arg: _EpisodeSpec, *_args: object) -> None:
+            launches.append(1)
+            _write_results(spec_arg.episode_dir, reward=0.0, termination="user_stop")
+
+        monkeypatch.setattr("wmo.distill.tau2._run_episode_subprocess", _fresh_attempt)
+        records, _ = collect_tau2_rollouts(
+            0, ["airline/0"], cfg, HarnessDoc.baseline(), provider, tmp_path
+        )
+        assert launches == [1], f"{corruption} evidence must re-run, never be reused"
+        assert records[0].infra_failed is False
