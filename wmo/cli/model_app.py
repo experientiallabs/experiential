@@ -431,8 +431,10 @@ def run_distill(
         backend: An explicit `--backend` override for the rollout source's
             backend (harbor or tau2), or None when the flag was not given.
         resume: Continue the run recorded in `run_dir`.
-        yes: Skip the cost confirmation (see `_confirm_cost` for the one
-            case where confirmation is forced anyway).
+        yes: Consent to the projected spend up front, and required on a
+            non-interactive session where there is nobody to ask (see
+            `_confirm_cost` for the one case where confirmation is forced
+            anyway).
         promote: After an accepted gate, offer to write `[models.agent]`
             pointing at the distilled adapter (explicit confirmation).
         root: The project dir (harness store, adapter store, settings).
