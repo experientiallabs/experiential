@@ -56,8 +56,14 @@ noise-floor band is a neutral gray fill with a direct label.
   `sign_agreement`, `spearman_model_means` (descriptive only, self-caveating). Pure
   stdlib + pydantic, no viz dependency.
 - `data.py` - read-only loaders for the charter's data sources: grid arm matrices
-  (`.wmo/jt/grid/<arm>/matrix.json` in the MAIN checkout, landing as arms merge), cycle-1
-  per-task rows (`episode-rows.jsonl`, 180 rows), arm metadata. Never regenerates anything.
+  (`.wmo/jt/grid/<arm>/matrix.json` in the MAIN checkout, landing as arms merge;
+  `load_arm_snapshot` falls back to pre-retry `chunk-*.json` files with completeness
+  labeled, per the master's grid-timing entry), cycle-1 per-task rows
+  (`episode-rows.jsonl`, 180 rows), arm metadata. Never regenerates anything.
+- `latency.py` - the two latency clocks in code form (owned by the latency chat): per-task
+  model seconds (scorecard contract, compressor wall included), the #295 productive-call
+  rule for per-call stats, inclusive p50/p95, first-vs-warm cold-start split, and
+  `config_points` aggregating every (model x arm) on all three objectives. Viz-free.
 - `ablation_chart.py` - the canonical training-stage-vs-quality chart (charter deliverable 1).
   Each corner chat renders it through its lens into its own `figures/` directory.
 - `palette.py` - brand palette constants and the matplotlib style (needs the viz extra).

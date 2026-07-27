@@ -23,12 +23,13 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+# JsonObject is a runtime import (not TYPE_CHECKING) because ArmSnapshot uses it as a pydantic
+# field annotation, which pydantic must resolve when the model class is built.
+from wmo.core.types import JsonObject
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
-
-    from wmo.core.types import JsonObject
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,66 @@ def load_cycle1_rows(*, run_dir: Path | None = None) -> list[Cycle1Row]:
         )
     with path.open(encoding="utf-8") as handle:
         return [Cycle1Row.model_validate_json(line) for line in handle if line.strip()]
+
+
+class ArmSnapshot(BaseModel):
+    """One grid arm's rows plus how complete they are.
+
+    `status` travels onto every figure footnote: a chart rendered from two of four chunks
+    must say so, because the runner's scenario cut is deterministic and a partial read is a
+    BIASED subset (earlier scenarios only), not a random sample. Pre-retry chunk reads can
+    only overcount unscored cells, never invent scored ones (the retry pass re-executes
+    transient failures individually before the merge).
+    """
+
+    name: str
+    matrix: OutcomeMatrix
+    status: str  # "merged" | "partial (k chunk file(s), pre-retry)"
+    meta: JsonObject | None = None
+
+
+def load_arm_snapshot(arm: str, *, root: Path | None = None) -> ArmSnapshot | None:
+    """This arm's merged matrix, else its pre-retry chunk files concatenated, else None.
+
+    The chunk path exists because the master's grid-timing entry (2026-07-27) has merged
+    matrices landing ~12-16h after relaunch while per-chunk matrices appear along the way:
+    corner pipelines render what has landed and label completeness. Chunk pool snapshots
+    must agree (the runner's merge enforces full equality; this loader checks the names row
+    selection keys on).
+    """
+    matrix = load_arm_matrix(arm, root=root)
+    if matrix is not None:
+        return ArmSnapshot(
+            name=arm, matrix=matrix, status="merged", meta=load_arm_meta(arm, root=root)
+        )
+    arm_dir = (root or grid_dir()) / arm
+    chunks = sorted(
+        arm_dir.glob("chunk-*.json"), key=lambda p: int(p.stem.removeprefix("chunk-"))
+    )
+    if not chunks:
+        logger.info("grid arm %r has no chunk files yet under %s", arm, arm_dir)
+        return None
+    matrices = [
+        OutcomeMatrix.model_validate_json(path.read_text(encoding="utf-8")) for path in chunks
+    ]
+    if len({tuple(m.model_names()) for m in matrices}) > 1:
+        raise ValueError(f"{arm}: chunk files disagree on the pool; refusing to concatenate")
+    return ArmSnapshot(
+        name=arm,
+        matrix=OutcomeMatrix(
+            pool=matrices[0].pool, outcomes=[o for m in matrices for o in m.outcomes]
+        ),
+        status=f"partial ({len(chunks)} chunk file(s), pre-retry)",
+    )
+
+
+def all_arm_snapshots(*, root: Path | None = None) -> list[ArmSnapshot]:
+    """Every canonical arm with any data on disk, in the consumer contract's order."""
+    return [
+        snapshot
+        for arm in GRID_ARMS
+        if (snapshot := load_arm_snapshot(arm, root=root)) is not None
+    ]
 
 
 def rewards_by_scenario(
