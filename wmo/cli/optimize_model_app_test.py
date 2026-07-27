@@ -1081,3 +1081,38 @@ def test_the_cap_counts_spend_from_runs_whose_records_were_superseded(
     assert sweep is not None
     # One sweep's record survives, but both sweeps' spend does.
     assert manifest.lifetime_spend_usd == pytest.approx(sweep.total_spend_usd * 2, rel=1e-6)
+
+
+def test_a_non_tty_spending_run_without_yes_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consent is said, never inferred: no terminal + no --yes + a sweep to buy = exit 2.
+
+    This command briefly shipped the opposite (proceed-and-note), which spent a scripted
+    caller's money without agreement; the refusal message names both honest paths out.
+    """
+    world_model = _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    # CliRunner's stdin is not a terminal, and _console is left at its non-terminal default.
+    result = _run(tmp_path, root)
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in result.output
+    assert "--yes" in result.output and "--dry-run" in result.output
+    assert world_model.tasks == []  # no episode ran
+    assert not _paths(root)[0].exists()  # no matrix bought
+
+
+def test_dry_run_prints_the_plan_and_spends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run is the read-only view of the plan table: exit 0, no episodes, no artifacts."""
+    world_model = _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    result = _run(tmp_path, root, "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert "sweep" in result.output  # the plan table rendered
+    assert "dry run: nothing was run and nothing was spent" in result.output
+    assert world_model.tasks == []
+    matrix_path, manifest_path = _paths(root)[0], _paths(root)[1]
+    assert not matrix_path.exists()
+    assert not manifest_path.exists()  # a dry run leaves no resume state behind

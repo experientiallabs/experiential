@@ -192,6 +192,12 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir holding the built models."),
     yes: bool = typer.Option(False, "--yes", help="Skip the one spend confirmation."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the plan table (what would run, what it is projected to cost) and exit "
+        "without spending anything or touching any artifact.",
+    ),
 ) -> None:
     """Measure, fit, tune, and report a routing policy for a world model, in one command.
 
@@ -312,6 +318,13 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         projection=projection,
         paths=paths,
     )
+    # After the plan, before any consent or spend question: the whole point of a dry run is
+    # reading the table above without committing to anything, so it exits here even when the
+    # budget check below would have refused the real run (the table already shows the numbers).
+    if dry_run:
+        _console.print("\ndry run: nothing was run and nothing was spent")
+        raise typer.Exit(0)
+
     # Seeded from every dollar this model's optimization has already spent, both sides:
     # --max-usd bounds the optimization, not one invocation of it (see `SpendLedger`).
     ledger = SpendLedger(max_usd=max_usd, spent_usd=manifest.lifetime_spend_usd)
@@ -779,8 +792,13 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
     number would skip it precisely when it matters most. Fit, tune, and report cost nothing, so a
     run of only those does not need permission to happen.
 
-    A non-interactive session cannot answer, so it proceeds and says so rather than hanging (the
-    `route sweep` rule: every pool entry is priced, so the spend is accountable).
+    A non-interactive session cannot answer, so a spending run REFUSES rather than proceeding:
+    consent must be said (`--yes`), never inferred from the absence of a terminal. This is
+    `route sweep`'s own rule, and this command briefly shipped the opposite, which cost a
+    scripted caller real money it never agreed to.
+
+    Raises:
+        typer.Exit: code 2 when a spending run cannot ask and was not told `--yes`.
     """
     if not any(decision.will_run for decision in decisions):
         return False
@@ -788,10 +806,10 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
         return True
     if not _console.is_terminal:
         _console.print(
-            "\nnon-interactive session: proceeding without confirmation (pass --yes to say so "
-            "explicitly)"
+            "\nnon-interactive session: cannot ask for spend consent. Re-run with --yes to "
+            "consent explicitly, or --dry-run to see the plan without spending."
         )
-        return True
+        raise typer.Exit(2)
     return Confirm.ask("\nProceed?", default=True)
 
 
