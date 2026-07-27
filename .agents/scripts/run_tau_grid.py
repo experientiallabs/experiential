@@ -40,7 +40,15 @@ copy of it. The only thing this script owns is durability:
   `.wmo/pool.toml` is live local state other lanes edit (it gained two candidates during this
   runner's own smoke).
 - SPEND. Both halves of each chunk's bill (candidate side, world-model serve/judge side) land in
-  the ledger, and the run stops cleanly between chunks at the $850 cap Silen set.
+  the ledger, and the run stops cleanly between chunks at the $850 cap Silen set. Reaching the cap
+  stops the run and reports; it never trims an arm to fit.
+
+NO HANG DETECTION, deliberately. Nothing here imposes a per-call, per-episode or per-chunk
+deadline: the only clock is a `time.monotonic()` bracket around each `execute_sweep` whose result
+goes into the ledger's `wall_s` and nowhere else. So a serverless candidate's cold start (kimi-k3
+was measured at 51 seconds on its first call) is recorded as wall time, never mistaken for a stall
+and never killed. If a backend's own SDK gives up and reports a timeout, that surfaces as the
+cell's error and the retry pass gives it one more attempt, by which point the model is warm.
 
 TRUNCATE CALIBRATION. `truncate` is the control the learned compressor has to beat, so it is
 matched on the endpoint's ACHIEVED keep ratio, not on a nominal dial (`CompressionConfig`: the
@@ -1505,7 +1513,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         created=now_iso(),
     )
     state = GridState(config.grid_dir, cohort)
+    # ZERO-EPISODE PREFLIGHT over the WHOLE pinned roster, before a cell is bought and even when
+    # --only-model narrows what this process will run: `preflight_pool` builds every candidate's
+    # SDK client and resolves its credentials locally, without a single request. So a bad entry is
+    # a boundary error here rather than a mid-grid abort with earlier candidates already paid for,
+    # and the smoke checks all 11 candidates while spending on 2.
     preflight = preflight_pool(state.pinned_pool_file(config.pool_file))
+    log.info(
+        "preflight: all %d pinned candidate(s) resolved without a request (%s)",
+        len(preflight.pool.models),
+        ", ".join(entry.name for entry in preflight.pool.models),
+    )
     pool = restrict(preflight.pool, config.only_models)
     for risk in preflight.deferred:
         if risk.candidate in {entry.name for entry in pool.models}:
