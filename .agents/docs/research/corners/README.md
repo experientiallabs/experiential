@@ -40,3 +40,15 @@ simultaneously; the joint-tau master coordinates and merges.
 Envelope-pushing research on each axis is FORBIDDEN until the full report is done and
 Silen unlocks it in ~/Desktop/Projects/wmh-plan/DECISIONS.md. Do not start, scope, or
 spend on phase 2.
+
+## AMENDMENT (2026-07-27, Silen directive): ONE shared runner
+
+Per-corner pipelines are retired. There is ONE runner, `common/build_corners.py`, owned by
+the QUALITY chat (it already owns the stats and the canonical chart): it loads matrices,
+fits, and episode rows ONCE, computes the full three-objective dataset ONCE (through
+wmo.optimize.scorecard only), and renders per-lens figures from declarative lens specs.
+Each corner's subdirectory holds ONLY its lens spec (which figures, which topline framing)
+and its findings prose. The cost and latency chats refactor any standalone build scripts
+onto the shared runner and delete them; a number that appears in two corners must come from
+the same computation. Divergent aggregation = the two-truths bug this program kills on
+sight everywhere else.
