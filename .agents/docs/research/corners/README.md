@@ -52,3 +52,11 @@ and its findings prose. The cost and latency chats refactor any standalone build
 onto the shared runner and delete them; a number that appears in two corners must come from
 the same computation. Divergent aggregation = the two-truths bug this program kills on
 sight everywhere else.
+
+## AMENDMENT 2 (2026-07-27, Silen): quality + latency SUSPENDED; cost drives
+
+The quality and latency chats are suspended; their directories, lens specs, findings, and
+common/ contributions are FROZEN (do not delete, do not rewrite). The COST chat inherits
+common/ ownership, builds common/build_corners.py (cost lens first, the frozen quality and
+latency lens specs must remain renderable), and is joined by the TB2 full-pipeline cost chat
+in corners/tb2-cost/. All charts continue to report all three objectives.
