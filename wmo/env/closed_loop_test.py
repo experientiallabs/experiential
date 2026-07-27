@@ -14,6 +14,7 @@ from wmo.optimize.reward import EpisodeScore
 from wmo.providers.base import (
     Completion,
     Message,
+    ProviderConfig,
     ProviderKind,
     TokenUsage,
     VerifyResult,
@@ -32,6 +33,21 @@ class _FakeEnv:
 
     def step(self, action: Action) -> Observation:
         return Observation(content="ok")
+
+    def close(self) -> None:
+        return None
+
+
+class _LongObservationEnv:
+    """Env whose observations are far larger than any history budget under test."""
+
+    last_score = EpisodeScore(reward=1.0, success=True, critique="")
+
+    def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
+        return EnvState()
+
+    def step(self, action: Action) -> Observation:
+        return Observation(content="z" * 5000)
 
     def close(self) -> None:
         return None
@@ -263,3 +279,60 @@ def test_wrong_typed_score_yields_unscored_row_with_reason() -> None:
     outcome = matrix.outcomes[0]
     assert outcome.reward is None
     assert outcome.error is not None and "not EpisodeScore" in outcome.error
+
+
+def test_history_chars_reaches_the_agent_from_evaluate_pool() -> None:
+    """The knob must be real, not decorative.
+
+    `history_chars` existed on `LLMAgent` but nothing that drives episodes could set it, so the
+    only reachable value was the default. This pins the wiring: what `evaluate_pool` is given is
+    what truncates the observation the agent sees on its next turn.
+    """
+    seen: list[str] = []
+
+    class _Recorder:
+        def __init__(self, entry: PoolEntry) -> None:
+            self.config = ProviderConfig(kind=ProviderKind.ANTHROPIC, model=entry.model)
+
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Completion:
+            seen.append(messages[0].content)
+            # Act once so there IS a later turn carrying an observation, then finish.
+            if len(seen) == 1:
+                return Completion(text='{"tool": "fetch", "arguments": {}}')
+            return Completion(text='{"done": true}')
+
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[0.0] for _ in texts]
+
+        def verify(self) -> VerifyResult:
+            raise NotImplementedError
+
+    evaluate_pool(
+        lambda: _LongObservationEnv(),
+        ModelPool(
+            models=[
+                PoolEntry(
+                    name="m",
+                    kind=ProviderKind.ANTHROPIC,
+                    model="claude-x",
+                    input_per_mtok=1.0,
+                    output_per_mtok=1.0,
+                )
+            ]
+        ),
+        [Scenario(task="fetch the thing")],
+        max_steps=2,
+        history_chars=77,
+        provider_factory=_Recorder,
+    )
+    later_turns = [prompt for prompt in seen if "EPISODE SO FAR" in prompt]
+    assert later_turns, seen
+    assert "z" * 77 in later_turns[0]
+    assert "z" * 78 not in later_turns[0]
