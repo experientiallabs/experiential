@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from wmo.config.card import CardCorpus, ModelCard, TracesSource
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.core.types import Action, ActionKind, Observation, Representation, Step, Trace
 from wmo.engine.knowledge import KnowledgeBase
 from wmo.engine.world_model import WorldModel
 from wmo.optimize.policy import RoutingPolicy
@@ -464,3 +464,40 @@ def test_a_malformed_endpoint_toml_names_the_endpoint_and_the_file(tmp_path: Pat
     assert "support" in str(error.value)
     assert ENDPOINT_CONFIG_FILENAME in str(error.value)
     assert "cost_qualty" in str(error.value)
+
+
+def test_a_policy_fitted_in_another_representation_fails_the_mount(tmp_path: Path) -> None:
+    # The silent failure this exists to stop: the endpoint compresses, the policy's evidence was
+    # measured uncompressed, and every request would still get a routed model back.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    EndpointConfig(
+        representation=Representation(compressor_id="llmlingua2", aggressiveness=0.4)
+    ).save(model_dir / ENDPOINT_CONFIG_FILENAME)
+    with pytest.raises(ValueError) as caught:
+        _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    message = str(caught.value)
+    assert "support" in message and "llmlingua2" in message
+    assert str(model_dir / ENDPOINT_CONFIG_FILENAME) in message
+
+
+def test_matching_representations_mount_normally(tmp_path: Path) -> None:
+    model_dir, fitted = _knn_policy_dir(tmp_path)
+    policy = fitted.model_copy(
+        update={"rep_compressor_id": "llmlingua2", "rep_aggressiveness": 0.4}
+    )
+    EndpointConfig(
+        representation=Representation(compressor_id="llmlingua2", aggressiveness=0.4)
+    ).save(model_dir / ENDPOINT_CONFIG_FILENAME)
+    runtimes = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    assert runtimes["support"].policy.rep_compressor_id == "llmlingua2"
+
+
+def test_an_injected_policy_mismatch_names_the_endpoint_not_a_missing_file(tmp_path: Path) -> None:
+    # No endpoint.toml exists for an injected policy, so the failure must not point at "None".
+    _, policy = _knn_policy_dir(tmp_path)
+    compressed = policy.model_copy(
+        update={"rep_compressor_id": "llmlingua2", "rep_aggressiveness": 0.4}
+    )
+    with pytest.raises(ValueError) as caught:
+        _endpoint_runtimes({"support": compressed}, {}, RequestLog(None))
+    assert str(caught.value).startswith("endpoint 'support' cannot be served")

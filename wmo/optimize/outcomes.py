@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
+from wmo.core.types import Representation
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -55,6 +56,11 @@ class OutcomeMatrix(BaseModel):
 
     pool: list[PoolEntry]
     outcomes: list[ScenarioOutcome]
+    # The representation these episodes ran in (see `wmo.core.types.Representation`). None means
+    # uncompressed, which is what every matrix written before this field existed reads as. A fit
+    # copies it onto the policy, so an endpoint can refuse to serve a policy against text that is
+    # not what the policy was measured on.
+    representation: Representation | None = None
 
     @model_validator(mode="after")
     def _outcomes_name_pool_models(self) -> OutcomeMatrix:

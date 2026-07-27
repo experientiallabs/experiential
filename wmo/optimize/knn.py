@@ -246,6 +246,13 @@ def fit_knn_policy(
         # a property of the fit evidence, and a serve-time recompute would make the same dial
         # setting mean different things on different processes.
         cost_scale=bank_cost_scale(bank),
+        # Carried from the matrix, never inferred: the policy has to be able to say which
+        # representation its evidence was measured in, so serving can refuse to route requests in
+        # a different one (`wmo.core.types.Representation`).
+        rep_compressor_id=matrix.representation.compressor_id if matrix.representation else None,
+        rep_aggressiveness=(
+            matrix.representation.aggressiveness if matrix.representation else None
+        ),
         fitted_from=fitted_from,
     )
     policy.attach_bank(bank)

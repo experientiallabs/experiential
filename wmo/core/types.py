@@ -8,11 +8,36 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 # Tool arguments, env config, and span metadata are user-defined JSON. `JsonValue` is pydantic's
 # concrete recursive JSON type — honest about the shape without falling back to `Any`.
 JsonObject = dict[str, JsonValue]
+
+
+class Representation(BaseModel):
+    """Which compressor the text behind an artifact was passed through, if any.
+
+    Prompt compression changes what a model reads, so it changes what was measured. A routing
+    policy fitted on compressed prompts scores its neighbors in one representation, and an
+    endpoint serving uncompressed prompts asks it about another; the numbers still come back, and
+    they are meaningless. Compression research measured this directly: refitting the evidence bank
+    after a representation change is what repairs routing, which only works if both sides can say
+    which representation they are on.
+
+    So this is the shared name for that. It rides on the `OutcomeMatrix` a fit consumes, is copied
+    onto the `RoutingPolicy` a fit emits, and is declared by the endpoint serving it; the mount
+    refuses a pair that disagrees rather than serving a policy against text it was not fitted for.
+    None everywhere means uncompressed, which is the only combination that needs no coordination.
+
+    `aggressiveness` is on the named compressor's OWN scale (there is no cross-compressor unit),
+    which is why it is only ever compared between two sides that already agree on `compressor_id`.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    compressor_id: str = Field(min_length=1)
+    aggressiveness: float = Field(ge=0.0)
 
 
 class ActionKind(StrEnum):

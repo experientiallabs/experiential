@@ -43,6 +43,7 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from wmo.core.types import Representation
 from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
@@ -361,6 +362,13 @@ class RoutingPolicy(BaseModel):
     # re-applying any dial setting to any policy of this kind lands on the same knobs.
     cost_quality: float | None = Field(default=None, ge=0.0, le=1.0)
 
+    # The representation this policy was FITTED in, copied off the outcome matrix (see
+    # `wmo.core.types.Representation`). Flat rather than nested so the artifact stays one level
+    # deep and an older policy.json still loads; `representation()` reassembles them. Both None
+    # means uncompressed, which is what every policy written before these fields reads as.
+    rep_compressor_id: str | None = None
+    rep_aggressiveness: float | None = Field(default=None, ge=0.0)
+
     # Set by `save`/`load` so a relative `knn_bank_path` resolves against the policy file, and
     # the lazily loaded bank. Private: not part of the artifact.
     _source_dir: Path | None = PrivateAttr(default=None)
@@ -381,6 +389,14 @@ class RoutingPolicy(BaseModel):
             )
         if self.kind != "rank" and self.clusters:
             raise ValueError(f"a {self.kind} policy carries no clusters; use kind='rank'")
+        if (self.rep_compressor_id is None) != (self.rep_aggressiveness is None):
+            # Half a representation cannot be compared against anything: an endpoint could not
+            # tell whether it matched, so the mount check would have to guess.
+            raise ValueError(
+                "rep_compressor_id and rep_aggressiveness are one setting and must be set or "
+                f"unset together (got compressor_id={self.rep_compressor_id!r}, "
+                f"aggressiveness={self.rep_aggressiveness!r})"
+            )
         if self.kind == "knn":
             # The whole algorithm is "leave the baseline only on evidence", so a knn policy
             # without a baseline is not a weaker policy, it is an undefined one. default_model
@@ -432,6 +448,14 @@ class RoutingPolicy(BaseModel):
         policy = cls.model_validate_json(path.read_text(encoding="utf-8"))
         policy._source_dir = path.parent
         return policy
+
+    def representation(self) -> Representation | None:
+        """The representation this policy was fitted in, or None when it was uncompressed."""
+        if self.rep_compressor_id is None or self.rep_aggressiveness is None:
+            return None
+        return Representation(
+            compressor_id=self.rep_compressor_id, aggressiveness=self.rep_aggressiveness
+        )
 
     def bank_path(self) -> Path:
         """Where this policy's kNN sidecar lives (see `knn_bank_path`)."""

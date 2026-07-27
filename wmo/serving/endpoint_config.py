@@ -12,6 +12,10 @@ fit). At mount time the file wins; with no file the policy is served exactly as 
 
     # .wmo/models/support-endpoint/endpoint.toml
     cost_quality = 0.6
+
+    [representation]
+    compressor_id = "llmlingua2"
+    aggressiveness = 0.4
 """
 
 from __future__ import annotations
@@ -22,7 +26,19 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.core.types import Representation
+
 ENDPOINT_CONFIG_FILENAME = "endpoint.toml"
+
+
+def _describe(representation: Representation | None) -> str:
+    """One side of a representation comparison, in words an operator can act on."""
+    if representation is None:
+        return "uncompressed requests"
+    return (
+        f"compressor '{representation.compressor_id}' at aggressiveness "
+        f"{representation.aggressiveness:g}"
+    )
 
 
 class EndpointConfig(BaseModel):
@@ -40,6 +56,11 @@ class EndpointConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cost_quality: float | None = Field(default=None, ge=0.0, le=1.0)
+    # The compression this endpoint puts requests through before they reach a model, when it
+    # compresses at all. Declared here rather than derived, because it is a property of the
+    # serving stack in front of the policy, not of the artifact; `check_representation` is what
+    # makes the declaration load-bearing. Absent means uncompressed.
+    representation: Representation | None = None
 
     @classmethod
     def load(cls, path: Path) -> EndpointConfig:
@@ -51,9 +72,36 @@ class EndpointConfig(BaseModel):
         except tomllib.TOMLDecodeError as error:
             raise ValueError(
                 f"invalid endpoint config at {path}: {error}. Expected TOML with at most a "
-                "`cost_quality` key between 0.0 and 1.0, and no other keys"
+                "`cost_quality` key between 0.0 and 1.0 and a `[representation]` table "
+                "(compressor_id, aggressiveness), and no other keys"
             ) from error
         return cls.model_validate(data)
+
+    def check_representation(self, fitted: Representation | None, *, endpoint: str) -> None:
+        """Refuse to serve a policy fitted in a different representation than this endpoint uses.
+
+        The failure this prevents is silent: a policy fitted on compressed prompts and served
+        uncompressed (or the reverse) still returns a model for every request, and the evidence it
+        returns it from was measured over text the request no longer resembles. Nothing downstream
+        can detect that, so it is caught here, at the one point where both sides are known.
+
+        Both absent is the uncompressed case and always valid. Anything else has to match on both
+        the compressor and its setting, since the same compressor at two aggressiveness levels
+        produces two different representations.
+
+        Raises:
+            ValueError: The two sides disagree, naming what each one says.
+        """
+        if fitted == self.representation:
+            return
+        raise ValueError(
+            f"endpoint {endpoint!r} is configured for {_describe(self.representation)} but its "
+            f"policy was fitted on {_describe(fitted)}. The policy's evidence was measured over "
+            "text this endpoint does not produce, so its routing would be read off neighbors the "
+            "request cannot be compared with. Refit the policy on a matrix captured in this "
+            "endpoint's representation, or change the endpoint's `[representation]` to match the "
+            "policy."
+        )
 
     def save(self, path: Path) -> None:
         """Write the config atomically (a half-written dial must not be loadable)."""

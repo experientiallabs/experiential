@@ -208,6 +208,10 @@ def _endpoint_runtimes(
             # leaves an operator hunting for which model directory it came from.
             if config_path is not None:
                 settings = EndpointConfig.load(config_path)
+            # Before anything is mounted: a policy fitted in one representation and served in
+            # another routes off evidence the request cannot be compared with, and nothing
+            # downstream can detect it (see `EndpointConfig.check_representation`).
+            settings.check_representation(policy.representation(), endpoint=name)
             # A dial setting resolves the novelty floor against the evidence bank, so an endpoint
             # WITH a dial file loads its `.npz` sidecar here at mount instead of lazily on the
             # first request. That is the better trade for a served endpoint (the cost lands before
@@ -223,10 +227,11 @@ def _endpoint_runtimes(
             )
         except ValueError as exc:
             # Fail fast and name the file: a dial the policy cannot honor (a savings position on
-            # a policy fitted without costs) must not degrade silently to the fitted knobs.
-            raise ValueError(
-                f"{config_path} for endpoint {name!r} cannot be served: {exc}"
-            ) from exc
+            # a policy fitted without costs) must not degrade silently to the fitted knobs. An
+            # injected policy has no file to name, and saying "None" would send an operator
+            # looking for one, so those report the endpoint alone.
+            where = f"{config_path} for endpoint" if config_path is not None else "endpoint"
+            raise ValueError(f"{where} {name!r} cannot be served: {exc}") from exc
     return runtimes
 
 

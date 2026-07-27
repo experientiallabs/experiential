@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from wmo.core.types import Representation
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     COST_QUALITY_BALANCED,
@@ -545,3 +546,19 @@ def test_the_dial_records_the_coverage_quantile_it_applied(tmp_path: Path) -> No
         slid = apply_cost_quality(fitted, dial)
         assert slid.floor_q == pytest.approx(cost_quality_knobs(dial).floor_q)
         assert (slid.floor_sim is None) == (slid.floor_q == 0.0)
+
+
+def test_fit_copies_the_matrix_representation_onto_the_policy(tmp_path: Path) -> None:
+    # The policy has to be able to say which representation its evidence was measured in, or the
+    # serving mount has nothing to compare against.
+    matrix = _matrix().model_copy(
+        update={"representation": Representation(compressor_id="llmlingua2", aggressiveness=0.4)}
+    )
+    policy = fit_knn_policy(matrix, bank_path=tmp_path / KNN_BANK_FILENAME)
+    assert policy.representation() == Representation(compressor_id="llmlingua2", aggressiveness=0.4)
+
+
+def test_fit_on_an_uncompressed_matrix_leaves_the_representation_unset(tmp_path: Path) -> None:
+    policy = fit_knn_policy(_matrix(), bank_path=tmp_path / KNN_BANK_FILENAME)
+    assert policy.representation() is None
+    assert policy.rep_compressor_id is None and policy.rep_aggressiveness is None

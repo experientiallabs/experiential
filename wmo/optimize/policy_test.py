@@ -11,8 +11,10 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from wmo.core.types import Representation
 from wmo.optimize.policy import (
     KNN_BANK_FILENAME,
+    POLICY_FILENAME,
     ClusterRanking,
     EmbedderSpec,
     KnnBank,
@@ -754,3 +756,30 @@ def test_a_genuine_baseline_win_still_says_the_baseline_led() -> None:
     assert decision.model == "fable-5"
     assert "leads 12 neighbors" in decision.reason
     assert "cost knob" not in decision.reason
+
+
+def test_half_a_representation_is_rejected() -> None:
+    # An endpoint could not tell whether a half-stated representation matched its own, so the
+    # mount check would have to guess; the artifact is refused instead.
+    with pytest.raises(ValidationError) as caught:
+        RoutingPolicy(
+            kind="static",
+            default_model="haiku-4-5",
+            pool=_pool(),
+            rep_compressor_id="llmlingua2",
+        )
+    assert "set or unset together" in str(caught.value)
+
+
+def test_a_representation_round_trips_through_the_artifact(tmp_path: Path) -> None:
+    path = tmp_path / POLICY_FILENAME
+    RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        rep_compressor_id="llmlingua2",
+        rep_aggressiveness=0.4,
+    ).save(path)
+    assert RoutingPolicy.load(path).representation() == Representation(
+        compressor_id="llmlingua2", aggressiveness=0.4
+    )
