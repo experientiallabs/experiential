@@ -2000,6 +2000,9 @@ def test_missing_suite_corpus_names_the_download_command(
     flat = _flat(result.output)
     assert "has no trace corpus" in flat
     assert "wmo download tau-bench" in flat
+    # The registry can outrun the Hub push, so the picker rides along: a name that turns out to
+    # be unpublished still leaves the user somewhere useful.
+    assert "`wmo download` with no arguments" in flat
 
 
 def test_missing_corpus_outside_the_bundle_root_does_not_promise_a_download(

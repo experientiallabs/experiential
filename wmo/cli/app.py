@@ -1712,6 +1712,11 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     reads a path no download will ever write, and sending the user there would fail twice. A
     suite that lists no files at all is a different defect — the TOML itself — so it keeps its
     own message pointing at the file to edit.
+
+    Whether that benchmark's bundle is PUBLISHED is deliberately not second-guessed here: the
+    registry entry can outrun the Hub push, and only `wmo download` (in environment-capture,
+    which the wheel resolves from PyPI) holds the current answer. Naming the picker alongside
+    the direct command means an unpublished name still lands somewhere useful.
     """
     files = suite.resolve_files()
     if not files:
@@ -1723,7 +1728,8 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
         fetched = corpus_path(suite.example) if suite.example in CORPORA else None
         downloadable = fetched is not None and fetched.resolve() in {p.resolve() for p in missing}
         remedy = (
-            f"fetch the bundle with `wmo download {suite.example}`"
+            f"fetch the bundle with `wmo download {suite.example}` (or `wmo download` with no "
+            "arguments to pick from what is published)"
             if downloadable
             else f"the suite resolves `files` relative to {suite.path.parent}; put a corpus there "
             "(or edit `files` to point at one)"
