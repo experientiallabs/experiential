@@ -1973,7 +1973,9 @@ def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
         raise _unreadable_input(f"scenario set {scenarios_file}", path, exc) from exc
 
 
-def _unreadable_input(label: str, path: Path, exc: OSError | UnicodeDecodeError) -> Exception:
+def _unreadable_input(
+    label: str, path: Path, exc: OSError | UnicodeDecodeError
+) -> typer.BadParameter:
     """Report the two read failures an exists/is-dir check cannot predict as a usage error.
 
     A path that passes the shape checks can still fail inside the read: no permission on it, or
@@ -2469,12 +2471,12 @@ def research_concurrency(
     # ValueError carries the available names, so only the next command has to be added. A direct
     # `.toml` selector that exists resolves past name lookup and fails on its own contents, so
     # listing the discoverable suites there would point away from the file that needs repairing.
-    direct_suite_file = Path(suite)
     try:
         resolved = resolve_eval_suite(suite, suite_roots)
     except ValueError as exc:
-        by_name = not (direct_suite_file.suffix == ".toml" and direct_suite_file.exists())
-        hint = "; `wmo eval list` prints the suites" if by_name else ""
+        direct = Path(suite)
+        resolved_by_name = not (direct.suffix == ".toml" and direct.exists())
+        hint = "; `wmo eval list` prints the suites" if resolved_by_name else ""
         raise typer.BadParameter(f"{exc}{hint}") from exc
     files = resolved.resolve_files()
     missing = [f for f in files if not f.exists()]
