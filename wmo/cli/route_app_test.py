@@ -3058,3 +3058,17 @@ def test_route_tune_names_the_fit_when_there_is_no_policy(tmp_path: Path) -> Non
     assert result.exit_code != 0
     assert _says(result.output, "no policy file at")
     assert _says(result.output, "wmo optimize route fit <matrix.json> --kind knn")
+
+
+# ------------------------------------------- rich markup in help text
+
+
+def test_route_student_help_keeps_the_pool_table_name() -> None:
+    """The paragraph exists to name the TOML table `student` writes, so it must survive rich.
+
+    Typer renders help through rich markup, which swallowed the unescaped `[[model]]` and left
+    an empty pair of backticks where the identifier should be.
+    """
+    result = runner.invoke(app, ["optimize", "route", "student", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "[[model]]" in _flat(result.output)

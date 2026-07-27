@@ -1051,3 +1051,54 @@ def test_harness_show_unknown_ref_names_list(tmp_path: Path, ref: str) -> None:
 
     assert result.exit_code == 2, result.output
     assert "wmo harness list" in _flat(result.output)
+
+
+# --- rich markup: brackets in surface bodies and progress lines are content, not style tags ---
+
+
+def test_harness_list_keeps_the_bracketed_half_of_a_broken_dir_reason(tmp_path: Path) -> None:
+    """Pydantic puts its diagnosis in `[type=..., input_value=...]`, which rich ate whole."""
+    version_dir = tmp_path / ".wmo" / "harnesses" / "x" / "v1"
+    version_dir.mkdir(parents=True)
+    (version_dir / "doc.json").write_text("not json", encoding="utf-8")
+
+    result = runner.invoke(app, ["harness", "list", "--root", str(tmp_path / ".wmo")])
+    assert result.exit_code == 0, result.exception
+    assert "[type=json_invalid" in " ".join(result.output.split())
+
+
+def test_harness_show_prints_bracketed_surface_content_verbatim(tmp_path: Path) -> None:
+    """Surface bodies are prompts and code: rich must print their brackets, not parse them.
+
+    Unescaped, an unmatched `[/tool]` raised MarkupError and `list[str]` lost its type argument.
+    """
+    from wmo.harness.doc import Surface, SurfaceKind
+
+    body = "Close every block with [/tool].\nReturn list[str] from `plan`."
+    doc = HarnessDoc(
+        name="pi", surfaces=[Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content=body)]
+    )
+    HarnessStore(str(tmp_path / ".wmo")).save_version(doc)
+
+    result = runner.invoke(app, ["harness", "show", "pi", "--root", str(tmp_path / ".wmo")])
+    assert result.exit_code == 0, result.exception
+    assert "[/tool]" in result.output
+    assert "list[str]" in result.output
+
+
+def test_harbor_progress_lines_show_which_slot_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`[seed]` / `[slot 1]` is the only thing identifying a progress line's candidate.
+
+    Rich reads a lowercase bracketed word as a style tag, so unescaped these rendered as an
+    empty string and every line started with a bare candidate id.
+    """
+    _harbor_project(tmp_path, monkeypatch)
+
+    result = _invoke_harbor(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.split())
+    assert "[seed] candidate-0000" in flat
+    assert "[slot 1] candidate-0001" in flat

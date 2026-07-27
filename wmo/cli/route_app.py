@@ -692,7 +692,7 @@ def student(
     """Add a distilled student to the candidate pool, so the router can select it.
 
     The keystone step between training and serving: a run produces a `tinker://` adapter, and this
-    turns it into a `[[model]]` entry the sweep measures, the fitter routes to, and the endpoint
+    turns it into a `\\[\\[model]]` entry the sweep measures, the fitter routes to, and the endpoint
     calls, with no hand-edited TOML in between:
 
         wmo optimize route student .wmo/distill/support --input-per-mtok 0.1 --output-per-mtok 0.4

@@ -343,6 +343,33 @@ def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN
     assert "gate: auth required" in result.output
 
 
+def test_knowledge_command_prints_bracketed_markdown_verbatim(tmp_path) -> None:  # noqa: ANN001
+    """Knowledge is hand-edited markdown, so rich must not read its brackets as style tags.
+
+    Unescaped, `[/items]` raised MarkupError (the command died on ordinary content) and both
+    `list[str]` and the link text were silently deleted from the rendered output.
+    """
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmo"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file(
+        "schemas.md",
+        "Use the XML close marker [/items] to end a list.\n"
+        "reservations: list[str]\n"
+        "See [the docs](https://example.com) for details.",
+    )
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.exception
+    assert "[/items]" in result.output
+    assert "list[str]" in result.output
+    assert "[the docs](https://example.com)" in result.output
+
+
 def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
@@ -352,6 +379,31 @@ def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # n
     result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
     assert result.exit_code == 0, result.output
     assert "empty" in result.output.lower()
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["build", "--help"], "[deprecated] alias for --source"),
+        (["eval", "--help"], "`[models.agent]` selects a distinct agent provider"),
+        (["providers", "set", "--help"], "settings.toml` as `[models.worker]`"),
+        (["providers", "verify", "--help"], "the `[models.<role>]` roles in"),
+        (["scenarios", "build", "--help"], "settings.toml [models.worker|judge|summary]."),
+    ],
+)
+def test_help_keeps_the_bracketed_pointer_it_exists_to_teach(
+    argv: list[str], expected: str
+) -> None:
+    """Typer renders help through rich markup, which swallows an unescaped `[...]` whole.
+
+    Each of these is the only pointer in that help text to where the setting lives (or, for
+    `--vendor`, the only sign that the option is deprecated), so a swallowed pair is silent
+    misinformation.
+    """
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    rendered = " ".join(result.output.replace("│", " ").split())
+    assert expected in rendered
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])

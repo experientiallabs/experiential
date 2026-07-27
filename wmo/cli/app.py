@@ -302,7 +302,7 @@ def providers_set(
     """Choose the local worker's provider, and register the models the router can choose from.
 
     Two things a project needs, in one command. The worker provider lands in
-    `<root>/settings.toml` as `[models.worker]`, exactly as before. Then, on a terminal, this
+    `<root>/settings.toml` as `\\[models.worker]`, exactly as before. Then, on a terminal, this
     offers to register models as ROUTING CANDIDATES in `<root>/pool.toml`, the roster
     `wmo optimize route` selects over: pick a backend, search its catalog, and answer only what
     that backend needs (an Azure deployment; a price for a model with no published one, never
@@ -441,7 +441,7 @@ def providers_verify(
     """Ping every configured provider (completion + embed path) and report status.
 
     Two sources count as "configured", because checking that credentials work is what you do
-    BEFORE spending anything on `wmo build`: the `[models.<role>]` roles in
+    BEFORE spending anything on `wmo build`: the `\\[models.<role>]` roles in
     `<root>/settings.toml` (what `wmo providers set` writes), and the providers persisted inside
     every built world model. Completion providers are deduped by kind+model across both, so a
     role naming the same backend as a built model costs one ping, not two. The phi embed path
@@ -615,7 +615,7 @@ def build(
     since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
     limit: int = typer.Option(None, "--limit", help="Max number of traces to pull."),
     vendor: str = typer.Option(
-        None, "--vendor", help="[deprecated] alias for --source <name> --pull."
+        None, "--vendor", help="\\[deprecated] alias for --source <name> --pull."
     ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
     provider: str = typer.Option(
@@ -1306,7 +1306,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmo eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
       default mode).
     - `wmo eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
-      as its environment. `[models.agent]` selects a distinct agent provider when configured;
+      as its environment. `\\[models.agent]` selects a distinct agent provider when configured;
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
@@ -1953,16 +1953,19 @@ def knowledge_(
     store = WorldModelStore(root)
     resolved = _resolve_name(store, name)
     kb = KnowledgeBase(ArtifactPaths(store.resolve(resolved)).knowledge)
-    _console.print(f"[bold]{kb.directory}[/bold]")
+    _console.print(f"[bold]{escape(str(kb.directory))}[/bold]")
     if kb.is_empty:
         _console.print(
             "(empty — enable knowledge at build, drop *.md files in this folder, "
             "or PUT files via the serving API)"
         )
         return
+    # Knowledge is hand-edited markdown: `[/items]`, `list[str]` and `[text](url)` are ordinary
+    # content, so it is escaped rather than parsed as rich markup (which would crash on the
+    # first, and silently delete the other two).
     for file_name, content in kb.files().items():
-        _console.print(f"\n[bold]## {file_name}[/bold]")
-        _console.print(content.strip())
+        _console.print(f"\n[bold]## {escape(file_name)}[/bold]")
+        _console.print(escape(content.strip()))
 
 
 @scenarios_app.command("build")
@@ -1977,7 +1980,7 @@ def scenarios_build(
         "--provider",
         help=(
             "Pin ONE LLM for every role (facets/naming/synthesis/validation). When omitted, "
-            "roles resolve from .wmo/settings.toml [models.worker|judge|summary]."
+            "roles resolve from .wmo/settings.toml \\[models.worker|judge|summary]."
         ),
     ),
     model: str = typer.Option(None, help="Model id (pins all roles, like --provider)."),

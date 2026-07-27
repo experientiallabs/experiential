@@ -105,7 +105,7 @@ def list_harnesses(root: str = typer.Option(ARTIFACT_DIR, help="Project dir.")) 
             broken.append((name, str(exc)))
     _console.print(table)
     for name, reason in broken:
-        _console.print(f"[red]broken[/red] {name}: {reason}")
+        _console.print(f"[red]broken[/red] {escape(name)}: {escape(reason)}")
 
 
 @harness_app.command("show")
@@ -127,14 +127,16 @@ def show_harness(
         raise typer.BadParameter(
             f"{exc}; run `wmo harness list` to see its versions and aliases"
         ) from exc
-    _console.print(f"[bold]{doc.name}[/bold] v{doc.version}  doc_hash={doc.doc_hash[:12]}")
+    _console.print(f"[bold]{escape(doc.name)}[/bold] v{doc.version}  doc_hash={doc.doc_hash[:12]}")
+    # Surface bodies are prompts, skills and code: brackets are ordinary content, so they are
+    # escaped rather than read as rich markup (which crashes on an unmatched closing tag).
     for surface in doc.surfaces:
         budget = f"  budget={surface.budget}" if surface.budget is not None else ""
         _console.print(
-            f"\n[bold]{surface.id}[/bold]  ({surface.kind.value}, "
+            f"\n[bold]{escape(surface.id)}[/bold]  ({surface.kind.value}, "
             f"hash={surface.content_hash[:12]}{budget})"
         )
-        _console.print(surface.content)
+        _console.print(escape(surface.content))
 
 
 optimize_app = typer.Typer(
@@ -429,7 +431,7 @@ def optimize(
             if changed
             else "[yellow]unchanged[/yellow]"
         )
-        _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {state}")
+        _console.print(f"  \\[{tag}] {escape(variant)}: success_rate={score:.3f} {state}")
 
     def _note(message: str) -> None:
         # Dead proposals narrate here; scored proposals use the structured callback below.
@@ -447,8 +449,8 @@ def optimize(
             else "[yellow]rejected by gate[/yellow]"
         )
         _console.print(
-            f"  [iteration {record.iteration} proposal {record.proposal_index}] "
-            f"{record.candidate}: success_rate={record.score:.3f} {state}"
+            f"  \\[iteration {record.iteration} proposal {record.proposal_index}] "
+            f"{escape(record.candidate)}: success_rate={record.score:.3f} {state}"
         )
 
     result = create_harness(
@@ -729,12 +731,14 @@ def _optimize_harbor(
     def _on_boundary(outcome: SlotOutcome) -> None:
         if outcome.evaluated is None:
             _console.print(
-                f"  [slot {outcome.slot}] {outcome.candidate_id}: "
+                f"  \\[slot {outcome.slot}] {escape(outcome.candidate_id)}: "
                 f"[yellow]invalid[/yellow] ({escape(outcome.reason)})"
             )
         else:
             tag = "seed" if outcome.slot == 0 else f"slot {outcome.slot}"
-            _console.print(f"  [{tag}] {outcome.candidate_id}: score={outcome.evaluated.score:.3f}")
+            _console.print(
+                f"  \\[{tag}] {escape(outcome.candidate_id)}: score={outcome.evaluated.score:.3f}"
+            )
 
     result = optimize_population(
         seed_tree,
