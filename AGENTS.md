@@ -168,8 +168,11 @@ uv run pytest -q
    do not force it into an unrelated directory merely to preserve the current list. What each
    surface is for:
    - `docs/`: **reviewed public documentation** in `docs/research/` (completed research writeups
-     and their rendered figures under `docs/research/figures/`) and `docs/reference/` (how-to
-     references verified against main). Nothing else: raw result JSONs, vector sources, design
+     and their rendered figures under `docs/research/figures/`), `docs/reference/` (how-to
+     references verified against main), and `docs/cookbook/` (end-to-end walks through the whole
+     pipeline on one benchmark, each step one real CLI command plus the artifact it creates),
+     plus the single root page `docs/usage.md` (the terse map of the CLI surface: one line of
+     purpose and one artifact per command). Nothing else: raw result JSONs, vector sources, design
      notes, drafts, and proposals all live in `.agents/docs/`. `docs/README.md` indexes every
      doc and records its purpose. Update or remove superseded material only after checking
      references and retaining durable evidence. `docs/`

@@ -81,21 +81,24 @@ def test_no_bytecode_or_caches_are_tracked() -> None:
 
 
 def test_docs_layout_is_exactly_readme_research_reference() -> None:
-    """docs/ is the manifest, writeups with their rendered figures, and how-to references.
+    """docs/ is the manifest, the CLI map, writeups with their figures, references, and cookbooks.
 
-    Anything else (top-level pages, stray dirs, figures outside figures/) is clutter that rule 5
-    says gets relocated or deleted.
+    Anything else (other top-level pages, stray dirs, figures outside figures/) is clutter that
+    rule 5 says gets relocated or deleted.
     """
     allowed = re.compile(
         r"^docs/(README\.md"
+        r"|usage\.md"
         r"|research/[^/]+\.md"
         r"|research/figures/[^/]+\.png"
-        r"|reference/[^/]+\.md)$"
+        r"|reference/[^/]+\.md"
+        r"|cookbook/[^/]+\.md)$"
     )
     offenders = [p for p in _tracked_files() if p.startswith("docs/") and not allowed.match(p)]
     assert not offenders, (
         f"files outside the docs/ layout: {offenders}; writeups go in docs/research/*.md with "
-        "figures in docs/research/figures/, references in docs/reference/*.md (AGENTS.md rule 5)"
+        "figures in docs/research/figures/, references in docs/reference/*.md, end-to-end walks "
+        "in docs/cookbook/*.md, and docs/usage.md is the only other root page (AGENTS.md rule 5)"
     )
 
 

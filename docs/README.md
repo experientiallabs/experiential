@@ -10,12 +10,18 @@ here must justify its existence in the table below; a doc that can't gets delete
   `research/figures/`. Raw result JSONs, vector sources, and experiment logs are not docs.
 - **`reference/`** — how-to references for user-facing systems, verified against current `main`
   at promotion time.
+- **`cookbook/`**: end-to-end walks through the whole pipeline on one benchmark, each step one
+  real CLI command plus the artifact it creates. One file per benchmark.
+- **`usage.md`**: the only root page besides this one. The terse map of the CLI surface, one line
+  of purpose and one artifact per command.
 
 ## Why each doc exists
 
 | File | Justification |
 |---|---|
 | `README.md` | The manifest that makes the justification rule enforceable. |
+| `usage.md` | The one-page map of the CLI surface: every command's purpose and the artifact it leaves behind, grouped by pipeline / optimizers / traces / platform. The reference-style counterpart to the cookbook's narrative order, and the page that keeps every other doc from re-explaining what a command is. |
+| `cookbook/tau-bench.md` | The canonical end-to-end example: one pass through the whole pipeline (setup, build, pool, optimize, optional distill and compression, serve) told on tau-bench, each step one real CLI command plus the artifact it creates. Commands verified against `main`; the provenance rules (world-model simulated vs real-episode, cache-adjusted effective cost per completed task, savings as estimates) are stated once here and inherited by every number in the walk. |
 | `research/world_model_findings.md` | The single research record: six layered studies (data, retrieval, optimization, test-time compute, self-knowledge, economics; PRs #72, #97, #55, #120, #41, with #83/#98 as instruments) with shared protocol and judge provenance stated once. Every product claim about world-model fidelity and cost traces to a section of this document. |
 | `research/figures/trace_scaling_law.png` | The trace-scaling figure (fidelity vs trace count, n=0 anchored) the record's data layer renders; also the brand-system visual reference cited by AGENTS.md rule 15. |
 | `research/figures/rag_optimization.png` | The retrieval-optimization figure: optimized vs unoptimized retrieval curves per benchmark. |
