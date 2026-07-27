@@ -12,6 +12,29 @@ student-after solve rates, and only an adapter that closes enough of the gap to 
 promoted. The result is a small model that behaves like the big one inside your agent, plus a
 ready-to-paste serving snippet.
 
+## First: is there a teacher at all? (`wmo optimize distill probe`)
+
+Distillation is the most expensive thing the optimizer can do, and most workloads do not need it.
+The routing sweep has already measured every pool model on your own held-out scenarios, so that
+matrix answers the question for free:
+
+```bash
+wmo optimize distill probe .wmo/models/<model>/optimize/matrix.json
+```
+
+It compares each candidate with the cheapest measured model, paired per scenario (unscored
+episodes excluded, an interval that has to exclude zero), and prints one verdict: `distill` with
+the cheapest sufficient teacher named, `do_not_distill` when no model clears the gap, or
+`insufficient_evidence` when the matrix is too thin to say. Exit codes 0, 3 and 4 match those
+three, so a script can branch on them. `--student NAME` probes a model other than the cheapest
+one, and `--min-gap` moves the bar (default 0.10, i.e. 10 reward points).
+
+Two rules worth knowing before reading a verdict. A gain whose confidence interval includes zero
+is not a gap, however large the point estimate. And among the models that do clear the gap, the
+teacher is the cheapest one that keeps 80% of the best measured gain, preferring open weights: a
+frontier model can prove the gap exists, but the model you train on should be one you are
+permitted to train on.
+
 ## Rollout sources
 
 Where episodes come from is config-selected: exactly one of `[harbor]` or `[tau2]`.

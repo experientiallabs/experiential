@@ -407,7 +407,14 @@ step 4's keystone.
 
 ## Step 4 (optional): train the agent model
 
-The first three optimizers change the harness around a model. This one changes the model.
+The first three optimizers change the harness around a model. This one changes the model. Before
+spending on it, ask the matrix step 3 already bought whether there is anything to learn: the
+pipeline refuses to distill when the measured matrix shows no teacher gap, and
+`wmo optimize distill probe .wmo/models/tau-bench/optimize/matrix.json` prints that verdict (with
+the cheapest sufficient teacher when there is one) for free. On this corpus the answer is no: the
+27B scored +1.6 points over the 9B and Kimi K3 scored below both, so the cheap model already
+serves the workload.
+
 `wmo optimize distill run` does on-policy distillation of a Tinker LoRA student from rollouts of
 harbor's own `terminus_2` agent on harbor tasks: the student samples, a larger teacher scores the
 exact tokens the student sampled, and each step nudges the student toward the teacher under a
