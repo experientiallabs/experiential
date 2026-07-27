@@ -1,0 +1,56 @@
+job_name: tb2-repro-base
+jobs_dir: /scratch/repro-tb2/jobs-base
+n_attempts: 8
+n_concurrent_trials: 17
+install_only: false
+
+retry:
+  max_retries: 1
+
+environment:
+  type: e2b
+  delete: true
+
+agents:
+- name: terminus-2
+  override_timeout_sec: 2700
+  max_timeout_sec: null
+  model_name: hosted_vllm/base-student
+  kwargs:
+    api_base: http://127.0.0.1:8000/v1
+    temperature: 1.0
+    max_turns: 100
+    enable_summarize: true
+    collect_rollout_details: true
+    store_all_messages: true
+    model_info:
+      max_input_tokens: 53240
+      max_output_tokens: 12288
+      input_cost_per_token: 0.0
+      output_cost_per_token: 0.0
+    llm_call_kwargs:
+      top_p: 1.0
+      max_tokens: 12288
+
+datasets:
+- name: terminal-bench/terminal-bench-2-1
+  ref: sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a
+  download_dir: /scratch/repro-tb2/tbcache-base
+  task_names:
+  - terminal-bench/build-pov-ray
+  - terminal-bench/constraints-scheduling
+  - terminal-bench/distribution-search
+  - terminal-bench/dna-assembly
+  - terminal-bench/fix-ocaml-gc
+  - terminal-bench/gcode-to-text
+  - terminal-bench/kv-store-grpc
+  - terminal-bench/make-mips-interpreter
+  - terminal-bench/merge-diff-arc-agi-task
+  - terminal-bench/nginx-request-logging
+  - terminal-bench/path-tracing-reverse
+  - terminal-bench/pytorch-model-cli
+  - terminal-bench/raman-fitting
+  - terminal-bench/schemelike-metacircular-eval
+  - terminal-bench/sparql-university
+  - terminal-bench/winning-avg-corewars
+  - terminal-bench/write-compressor
