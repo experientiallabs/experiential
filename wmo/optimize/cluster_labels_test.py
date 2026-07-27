@@ -45,11 +45,14 @@ def test_one_label_per_cluster_in_order() -> None:
     assert len(label_clusters([["cancel order"], ["camera exchange"], ["flight booking"]])) == 3
 
 
-def test_labels_are_deterministic_across_fits() -> None:
-    # A label lands in a persisted artifact, so two fits of the same matrix must agree; ties
-    # break alphabetically rather than by dict ordering.
-    texts = [["alpha beta", "beta alpha"], ["gamma delta", "delta gamma"]]
-    assert label_clusters(texts) == label_clusters(texts)
+def test_a_tie_breaks_alphabetically_not_by_encounter_order() -> None:
+    # A label lands in a persisted artifact, so two fits of one matrix must agree. "alpha" and
+    # "beta" have identical frequency and identical document frequency here, so the ONLY thing
+    # that can order them is the tie-break; feeding the two texts in either order must still
+    # name the cluster "alpha". Comparing one input against itself would pass on any
+    # implementation, tie-break or not, which is what this test used to do.
+    assert label_clusters([["alpha beta", "beta alpha"]], max_terms=1) == ["alpha"]
+    assert label_clusters([["beta alpha", "alpha beta"]], max_terms=1) == ["alpha"]
 
 
 def test_majority_prefix_wins_when_ids_carry_one() -> None:

@@ -25,8 +25,13 @@ import math
 import re
 from collections import Counter
 
-# Three characters or more, starting with a letter: shorter tokens are noise at this scale.
-_TOKEN = re.compile(r"[a-z][a-z0-9_-]{2,}")
+# Three characters or more, starting with a letter. `\w` under Python's default unicode
+# semantics, so a CJK or accented corpus yields real tokens instead of "": an ASCII-only class
+# silently matched nothing on the first and truncated "echange" out of "exchange" on the second,
+# which is a wrong label rather than a missing one. Deliberately still one regex and no word
+# segmentation, so an unspaced script yields one token per run rather than per word; that is a
+# coarse label, which beats the empty one it used to produce.
+_TOKEN = re.compile(r"[^\W\d_][\w-]{2,}", re.UNICODE)
 
 # Function words plus the JSON-scaffolding vocabulary of world-model task payloads. Anything this
 # generic would otherwise label every cluster identically, which is worse than no label: it looks
