@@ -58,6 +58,23 @@ harbor run -c arm-distill.yaml --yes
 python score.py --base-jobs <dir> --distill-jobs <dir>
 ```
 
+## Condition an attrition rate on winnability before calling it a bias
+
+`score.py` reports errored counts per arm, and it is tempting to read a large asymmetry as a
+large bias. Don't, without checking *where* the losses fall. On this run the distilled arm
+errored on 55.1% of trials against the base arm's 14.0% — every one of them an
+`AgentTimeoutError` at the episode wall, in both arms, with no other mechanism. That looks like
+it must dominate the result. It did not: **68 of those 75 timeouts landed on the 12 tasks that
+score 0.000 in both arms**, so the truncation happened where there was nothing to win.
+Conditioning on winnability, the distilled arm lost at most 7 trials and the base arm 1, worth
+roughly +0.04 on the paired delta rather than the "this is only a floor" reading the raw rate
+invites.
+
+The same crosstab is what separates capability from speed. A task where one arm times out 8/8
+and the other 4/8 produces a solve-rate delta that is substantially "finishes inside the
+budget", not "solves better" — a real advantage for a deployed agent, but a different claim.
+Cross timeouts against per-task rates before attributing any mover.
+
 ## Environment notes
 
 These bit a real run; they are cheap to pre-empt.
