@@ -32,6 +32,28 @@ class FakeProvider:
         raise NotImplementedError
 
 
+class ScriptedProvider(FakeProvider):
+    """Returns a fixed sequence of replies (last one repeats) and counts the calls it served."""
+
+    def __init__(self, replies: list[str]) -> None:
+        super().__init__(replies[0])
+        self._replies = replies
+        self.calls = 0
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        self.last_user = messages[0].content
+        index = min(self.calls, len(self._replies) - 1)
+        self.calls += 1
+        return Completion(text=self._replies[index])
+
+
 def test_agent_parses_tool_call() -> None:
     agent = LLMAgent(FakeProvider('{"tool": "search", "arguments": {"q": "x"}}'))
     action = agent.act("find x", EnvState(), [])
@@ -100,20 +122,107 @@ def test_tools_hint_lands_in_the_system_prompt() -> None:
     assert bare is not None  # no hint -> unchanged system (covered by existing tests)
 
 
-def test_prose_tool_call_is_not_a_finish_signal() -> None:
-    # glm-5.2 sometimes writes `get_user_details({"user_id": "x"})`: extract_json_object
-    # grabs the bare ARGUMENT object, which validates with tool=None and done unset. That
-    # must fall through to a message action (the env answers, the episode recovers) - the
-    # old `tool is None -> DONE` read ended 34% of glm's episodes unexecuted at step 1.
+def test_prose_tool_call_executes_instead_of_stalling() -> None:
+    # glm-5.2 sometimes writes `get_user_details({"user_id": "x"})` instead of the envelope.
+    # Reading that as done ended 34% of glm's wm episodes unexecuted at step 1; falling
+    # through to a message action merely wasted the turn. Run the call the model meant.
     agent = LLMAgent(FakeProvider('get_user_details({"user_id": "chen_silva_2201"})'))
     action = agent.act("task", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "get_user_details"
+    assert action.arguments == {"user_id": "chen_silva_2201"}
+
+
+def test_prose_tool_call_fused_with_prose_is_recovered() -> None:
+    reply = 'Let me look them up first. get_user_details({"user_id": "x"}) and then decide.'
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "get_user_details"
+
+
+def test_first_of_several_prose_calls_wins() -> None:
+    reply = 'search({"q": "a"}) then update_order({"id": "b"})'
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
+    assert action.name == "search"
+
+
+def test_envelope_wins_over_a_later_prose_call() -> None:
+    reply = '{"tool": "search", "arguments": {"q": "x"}} (not get_user_details({"id": "y"}))'
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
+    assert action.name == "search"
+
+
+def test_call_arguments_are_never_read_as_the_envelope() -> None:
+    # The envelope guard: `book_trip({"tool": "train"})` extracts an object carrying a "tool"
+    # key, which would otherwise validate as an envelope and run a tool named "train".
+    action = LLMAgent(FakeProvider('book_trip({"tool": "train", "seats": 2})')).act(
+        "task", EnvState(), []
+    )
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "book_trip"
+    assert action.arguments == {"tool": "train", "seats": 2}
+
+
+def test_unclosed_prose_call_still_falls_back_to_a_message() -> None:
+    action = LLMAgent(FakeProvider('get_user_details({"user_id": "x"')).act("task", EnvState(), [])
     assert action.kind is ActionKind.MESSAGE
-    assert action.content is not None
-    assert action.content != DONE_SIGNAL
-    assert "chen_silva_2201" in action.content
 
 
 def test_explicit_done_still_terminates() -> None:
     agent = LLMAgent(FakeProvider('{"done": true}'))
     action = agent.act("task", EnvState(), [])
     assert action.content == DONE_SIGNAL
+
+
+def test_empty_completion_is_retried() -> None:
+    provider = ScriptedProvider(["", "   ", '{"tool": "search", "arguments": {}}'])
+    action = LLMAgent(provider).act("task", EnvState(), [])
+    assert provider.calls == 3
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "search"
+
+
+def test_empty_completion_retries_are_bounded() -> None:
+    provider = ScriptedProvider([""])
+    action = LLMAgent(provider).act("task", EnvState(), [])
+    assert provider.calls == 3  # the first call plus two retries, then give up
+    assert action.kind is ActionKind.MESSAGE
+    assert action.content == ""
+
+
+def test_a_good_first_completion_is_not_retried() -> None:
+    provider = ScriptedProvider(['{"done": true}'])
+    LLMAgent(provider).act("task", EnvState(), [])
+    assert provider.calls == 1
+
+
+def test_history_observations_survive_a_tau_sized_payload() -> None:
+    # The 500-char cap truncated `get_user_details` payloads before their useful fields, so
+    # the agent re-fetched the same record verbatim until the step budget died.
+    payload = "x" * 900 + "MEMBERSHIP=gold"
+    provider = FakeProvider('{"done": true}')
+    history = [
+        Step(
+            action=Action(kind=ActionKind.TOOL_CALL, name="get_user_details", arguments={}),
+            observation=Observation(content=payload),
+        )
+    ]
+    LLMAgent(provider).act("task", EnvState(), history)
+    assert "MEMBERSHIP=gold" in (provider.last_user or "")
+
+
+def test_history_chars_bounds_the_rendered_observation() -> None:
+    provider = FakeProvider('{"done": true}')
+    history = [
+        Step(
+            action=Action(kind=ActionKind.TOOL_CALL, name="get_user_details", arguments={}),
+            observation=Observation(content="y" * 50 + "TAIL"),
+        )
+    ]
+    LLMAgent(provider, history_chars=10).act("task", EnvState(), history)
+    assert "TAIL" not in (provider.last_user or "")
+
+
+def test_history_chars_bounds_the_message_fallback() -> None:
+    action = LLMAgent(FakeProvider("z" * 40), history_chars=10).act("task", EnvState(), [])
+    assert action.content == "z" * 10
