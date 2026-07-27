@@ -1192,8 +1192,17 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     prompt_file: str | None = typer.Option(
         None, "--prompt", help="Prompt file; default=BASE_ENV_PROMPT."
     ),
-    provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
-    model: str = typer.Option("claude-opus-4-8", help="Canonical model type."),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Provider running the model. Default: the worker role `wmo providers set` wrote to "
+        "`.wmo/settings.toml`, else bedrock.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        help="Canonical model type. Default: the configured worker role's model, else "
+        "claude-opus-4-8.",
+    ),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     chain: str | None = typer.Option(
         None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."
@@ -1321,6 +1330,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
       heatmap (`viz` extra).
     - `wmo eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
       (e.g. world-model vs real environment) — the outcome-agreement validity check.
+
+    Open-loop scoring runs on the worker role `wmo providers set` writes to `.wmo/settings.toml`
+    (bedrock/claude-opus-4-8 when no role is configured); `--provider`/`--model` override it.
     """
     args = tokens or []
     suite_roots = (
@@ -1418,9 +1430,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             examples_roots=suite_roots,
             results_root=results_root,
             prompt_file=prompt_file,
-            provider=provider,
-            model=model,
-            region=region,
+            provider_config=_worker_role_provider_config(provider, model, region),
             train_split=train_split,
             embed_dim=embed_dim,
             rag=rag,
@@ -1453,10 +1463,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     report = _run_eval_files(
         [Path(f) for f in args],
         options,
-        provider=provider,
-        model=model,
+        provider_config=_worker_role_provider_config(provider, model, region),
         chain=chain,
-        region=region,
     )
     _require_scorable_steps(
         report,
@@ -1714,9 +1722,7 @@ def _eval_run_suite(
     examples_roots: list[str],
     results_root: str,
     prompt_file: str | None,
-    provider: str,
-    model: str,
-    region: str | None,
+    provider_config: ProviderConfig,
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
@@ -1745,7 +1751,7 @@ def _eval_run_suite(
         raise typer.BadParameter(
             f"eval suite {suite.id} lists no trace files; set `files` in {suite.path}"
         )
-    report = _run_eval_files(files, options, provider=provider, model=model, region=region)
+    report = _run_eval_files(files, options, provider_config=provider_config)
     # A suite run is saved under --results-root and resurfaces in `wmo eval results`, so a
     # zero-step scorecard must fail here rather than persist as a real 0.000 measurement.
     _require_scorable_steps(
@@ -1765,10 +1771,13 @@ def _eval_run_suite(
         "suite": suite.id,
         "suite_path": str(suite.path),
         "suite_config": suite.config.model_dump(mode="json"),
+        # The RESOLVED backend, not the raw flags: with the flags omitted these come from the
+        # configured worker role, and a result JSON that recorded `null` could not say which
+        # model produced the fidelity number.
         "config": {
-            "provider": provider,
-            "model": model,
-            "region": region,
+            "provider": provider_config.kind.value,
+            "model": provider_config.model_type or provider_config.model,
+            "region": provider_config.region,
             "prompt": options.prompt_file,
             "files": [str(path) for path in files],
             "train_split": options.train_split,
@@ -1839,9 +1848,7 @@ def _run_eval_files(
     files: list[Path],
     options: _EvalOptions,
     *,
-    provider: str,
-    model: str,
-    region: str | None,
+    provider_config: ProviderConfig,
     chain: str | None = None,
 ) -> EvalReport:
     for path in files:
@@ -1852,7 +1859,12 @@ def _run_eval_files(
                 f"not a trace file: {path} is a directory; pass the export itself "
                 f"(e.g. `wmo eval {path}/traces.otel.jsonl`)"
             )
-    provider_config = _provider_config(provider, model, region)
+    # Name the backend: the number below is only comparable against runs on the same model, and
+    # with no flags the model comes from settings rather than the command line.
+    _console.print(
+        f"scoring with {provider_config.kind.value} "
+        f"({provider_config.model_type or provider_config.model})"
+    )
     # A missing/unknown chain, or a multi-chain fallback.toml with no `default`, is a usage
     # error: the message already names the file, so it must not arrive as a traceback.
     try:
@@ -2053,7 +2065,7 @@ def scenarios_verify(
     if provider is not None or model is not None:
         store = WorldModelStore(root)
         model_dir = store.resolve(_resolve_name(store, name))
-        override = _provider_config(provider or "bedrock", model or "claude-opus-4-8", region)
+        override = _worker_role_provider_config(provider, model, region)
         llm = wrap_provider_with_retries(providers.get_provider(override))
         world_model = WorldModel.load(str(model_dir), llm)
     else:
@@ -2194,8 +2206,10 @@ def _provider_config(provider: str, model: str, region: str | None) -> ProviderC
     )
 
 
-_SCENARIO_DEFAULT_PROVIDER = "bedrock"
-_SCENARIO_DEFAULT_MODEL = "claude-opus-4-8"
+# The backend a worker-role command falls back to when the project configured no
+# `[models.worker]` role at all. Never a substitute for a configured role.
+_DEFAULT_WORKER_PROVIDER = "bedrock"
+_DEFAULT_WORKER_MODEL = "claude-opus-4-8"
 
 
 def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
@@ -2215,23 +2229,43 @@ def _role_provider_config(role: str, region: str | None) -> ProviderConfig | Non
     )
 
 
+def _worker_role_provider_config(
+    provider: str | None, model: str | None, region: str | None
+) -> ProviderConfig:
+    """The backend for a worker-role call: explicit flags, then the worker role, then the default.
+
+    `wmo providers set` writes `[models.worker]` and is step 1 of the documented getting-started
+    path, so a command that ignored it would run against a provider the user never configured.
+    Each field falls back independently, and a `--provider` naming a DIFFERENT backend than the
+    configured role drops that role's model and connection fields, which belong to the backend it
+    replaced.
+    """
+    configured = _role_provider_config("worker", region)
+    if configured is None or (provider is not None and provider != configured.kind.value):
+        return _provider_config(
+            provider or _DEFAULT_WORKER_PROVIDER, model or _DEFAULT_WORKER_MODEL, region
+        )
+    if model is None:
+        return configured
+    spec = resolve_provider_model(configured.kind, model)
+    return configured.model_copy(update={"model_type": spec.model_type, "model": spec.model_id})
+
+
 def _scenario_role_llms(
     provider: str | None, model: str | None, region: str | None
 ) -> tuple[Provider, Provider, Provider]:
     """(summary, worker, judge) providers for scenario construction.
 
     Explicit `--provider`/`--model` flags pin ALL roles to that one model (the pre-roles
-    behavior). Otherwise each role resolves from `.wmo/settings.toml`, falling back to worker,
-    then to the built-in default. Judging benefits from a different family than the worker —
-    a same-family judge carries self-preference bias toward the generator's outputs.
+    behavior); half a pair completes from the configured worker role rather than from bedrock.
+    Otherwise each role resolves from `.wmo/settings.toml`, falling back to worker, then to the
+    built-in default. Judging benefits from a different family than the worker: a same-family
+    judge carries self-preference bias toward the generator's outputs.
     """
     if provider is not None or model is not None:
-        config = _provider_config(
-            provider or _SCENARIO_DEFAULT_PROVIDER, model or _SCENARIO_DEFAULT_MODEL, region
-        )
-        llm = providers.get_provider(config)
+        llm = providers.get_provider(_worker_role_provider_config(provider, model, region))
         return llm, llm, llm
-    default = _provider_config(_SCENARIO_DEFAULT_PROVIDER, _SCENARIO_DEFAULT_MODEL, region)
+    default = _provider_config(_DEFAULT_WORKER_PROVIDER, _DEFAULT_WORKER_MODEL, region)
     cache: dict[str, Provider] = {}
     by_role: dict[str, Provider] = {}
     for role in ("summary", "worker", "judge"):
@@ -2597,8 +2631,17 @@ def research_concurrency(
     side: str = typer.Option(
         "both", "--side", help="both = differential | world = WM-only | real = sandbox-only."
     ),
-    provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id (environment LLM)."),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Provider running the model. Default: the worker role `wmo providers set` wrote to "
+        "`.wmo/settings.toml`, else bedrock.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        help="Model id (environment LLM). Default: the configured worker role's model, else "
+        "claude-opus-4-8.",
+    ),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     deployment: str | None = typer.Option(None, help="Azure OpenAI deployment name."),
     api_version: str | None = typer.Option(None, help="Azure OpenAI API version."),
@@ -2624,12 +2667,20 @@ def research_concurrency(
     except ValueError:
         allowed = ", ".join(s.value for s in Side)
         raise typer.BadParameter(f"--side must be one of: {allowed}") from None
-    # Validate the provider up front, not lazily inside a worker thread mid-sweep.
-    try:
-        provider_kind = ProviderKind(provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+    # Resolve (and so validate) the environment LLM up front, not lazily inside a worker thread
+    # mid-sweep. Omitted flags come from the configured worker role.
+    env_config = _worker_role_provider_config(provider, model, region)
+    connection = {
+        field: value
+        for field, value in (
+            ("deployment", deployment),
+            ("api_version", api_version),
+            ("endpoint", endpoint),
+        )
+        if value is not None
+    }
+    if connection:
+        env_config = env_config.model_copy(update=connection)
     if select not in ("simplest", "longest", "random"):
         raise typer.BadParameter("--select must be one of: simplest, longest, random")
     try:
@@ -2708,16 +2759,7 @@ def research_concurrency(
     )
 
     def provider_factory() -> Provider:
-        return providers.get_provider(
-            ProviderConfig(
-                kind=provider_kind,
-                model=model,
-                region=region,
-                deployment=deployment,
-                api_version=api_version,
-                endpoint=endpoint,
-            )
-        )
+        return providers.get_provider(env_config)
 
     world_runner = build_world_runner(provider_factory, prompt, demos, selected)
     real_runner = None

@@ -1091,8 +1091,11 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
 
     monkeypatch.setattr(providers_pkg, "provider_or_chain", provider_or_chain)
     monkeypatch.setattr(providers_pkg, "get_provider", get_provider)
+    traces = _traces_file(tmp_path)
+    # No settings.toml here, so the asserted bedrock ids are the no-role-configured fallback.
+    monkeypatch.chdir(tmp_path)
 
-    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--no-rag"])
+    result = runner.invoke(app, ["eval", traces, "--no-rag"])
 
     assert result.exit_code == 0, result.output
     judge_systems_chain = [s for s in chain.systems if "grade a world model" in s]
@@ -1106,6 +1109,101 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
         "us.anthropic.claude-opus-4-8",
     ]
     assert all(config.model_type == "claude-opus-4-8" for config in configs)
+
+
+def _record_eval_providers(monkeypatch: pytest.MonkeyPatch) -> list[ProviderConfig]:
+    """Capture every ProviderConfig `wmo eval` builds, and answer with the fake provider."""
+    seen: list[ProviderConfig] = []
+    fake = FakeProvider()
+
+    def record(config: ProviderConfig, **_kwargs: object) -> FakeProvider:
+        seen.append(config)
+        return fake
+
+    monkeypatch.setattr(cli_app_module.providers, "provider_or_chain", record)
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", record)
+    return seen
+
+
+def _write_worker_role(root: Path, provider: str, model: str) -> None:
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider=provider, model=model)
+    save_settings(settings, root)
+
+
+def test_eval_uses_configured_worker_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `wmo providers set` (step 1 of getting started) writes [models.worker]. eval used to score
+    # against a hardcoded bedrock/claude-opus-4-8 regardless, so an OpenAI-only project got a
+    # 0.000 fidelity at exit 0 from a provider it never configured.
+    traces = _traces_file(tmp_path)
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    seen = _record_eval_providers(monkeypatch)
+
+    result = runner.invoke(app, ["eval", traces, "--no-rag"])
+
+    assert result.exit_code == 0, result.output
+    assert {config.kind for config in seen} == {ProviderKind.OPENAI}
+    assert {config.model for config in seen} == {"gpt-5.4-mini"}
+    # The report is only comparable across runs on the same model, so eval names the backend.
+    assert "scoring with openai (gpt-5.4-mini)" in result.output
+
+
+def test_eval_provider_flag_overrides_the_configured_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    traces = _traces_file(tmp_path)
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    seen = _record_eval_providers(monkeypatch)
+
+    result = runner.invoke(app, ["eval", traces, "--no-rag", "--provider", "bedrock"])
+
+    assert result.exit_code == 0, result.output
+    assert {config.kind for config in seen} == {ProviderKind.BEDROCK}
+    # A --provider naming another backend drops the role's model: gpt-5.4-mini is not on bedrock.
+    assert {config.model for config in seen} == {"us.anthropic.claude-opus-4-8"}
+
+
+def test_eval_suite_run_records_the_resolved_worker_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The result JSON must name the model that produced the number, which with no flags is the
+    # configured role rather than anything on the command line.
+    examples_root = tmp_path / "examples"
+    evals_dir = examples_root / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
+        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text(
+        'files = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n', encoding="utf-8"
+    )
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    seen = _record_eval_providers(monkeypatch)
+    results_root = tmp_path / ".wmo" / "evals"
+
+    ran = runner.invoke(
+        app,
+        [
+            "eval",
+            "run",
+            "tiny-task",
+            "--examples-root",
+            str(examples_root),
+            "--results-root",
+            str(results_root),
+        ],
+    )
+
+    assert ran.exit_code == 0, ran.output
+    assert {config.kind for config in seen} == {ProviderKind.OPENAI}
+    payload = json.loads(next(iter(results_root.glob("tiny-task/default/*.json"))).read_text())
+    assert payload["config"]["provider"] == "openai"
+    assert payload["config"]["model"] == "gpt-5.4-mini"
 
 
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -1744,6 +1842,58 @@ def test_providers_verify_name_scopes_the_report_to_one_world_model(
     assert "models.worker" not in result.output
 
 
+def test_research_concurrency_uses_the_configured_worker_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The environment LLM is the same worker-role call every other command makes; it used to be
+    # pinned to bedrock/claude-opus-4-8 whatever the project configured.
+    examples_root = tmp_path / "examples"
+    evals_dir = examples_root / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
+        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text(
+        'files = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n', encoding="utf-8"
+    )
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    # get_provider is the identity here, so calling the runner's factory yields its config.
+    built: list[ProviderConfig] = []
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(
+        cli_app_module,
+        "build_world_runner",
+        lambda factory, prompt, demos, selected: built.append(factory()),
+    )
+    monkeypatch.setattr(
+        cli_app_module,
+        "run_concurrency_scaling",
+        lambda *a, **kw: SimpleNamespace(benchmark="", best_speedup=lambda: None),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "concurrency",
+            "tiny-task",
+            "--examples-root",
+            str(examples_root),
+            "--side",
+            "world",
+            "--scenarios",
+            "1",
+            "--levels",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert built[0].kind is ProviderKind.OPENAI
+    assert built[0].model == "gpt-5.4-mini"
+
+
 def test_research_concurrency_rejects_level_above_scenarios_fixed_n() -> None:
     # Fixed-N: a level above --scenarios would silently cap concurrency at N and duplicate the
     # N-worker point, so it must fail fast (guard fires before any suite/corpus resolution).
@@ -1976,11 +2126,32 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
 
 
 def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
+    from wmo.config.settings import ProjectSettings
+
     monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
     assert summary is worker
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "some-model"
+
+
+def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch) -> None:  # noqa: ANN001
+    # Half a flag pair used to complete from bedrock, so `--model gpt-5.5` on an OpenAI project
+    # asked bedrock for an OpenAI model id.
+    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings",
+        lambda: ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="openai", model="gpt-5.4-mini"))
+        ),
+    )
+    _summary, worker, _judge = cli_app_module._scenario_role_llms(None, "gpt-5.5", None)
+    assert cast(ProviderConfig, worker).kind is ProviderKind.OPENAI
+    assert cast(ProviderConfig, worker).model == "gpt-5.5"
 
 
 def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
@@ -1992,6 +2163,41 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
     assert summary is worker
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
+
+
+def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:  # noqa: ANN001
+    from wmo.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    config = cli_app_module._worker_role_provider_config(None, None, None)
+    assert config.kind is ProviderKind.BEDROCK
+    assert config.model == "us.anthropic.claude-opus-4-8"
+
+
+def test_worker_role_provider_config_model_flag_keeps_the_role_connection(monkeypatch) -> None:  # noqa: ANN001
+    # Swapping the model on the configured backend must keep that backend's endpoint/deployment:
+    # they describe the connection, not the model.
+    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings",
+        lambda: ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(
+                    provider="azure",
+                    model="gpt-5.4",
+                    endpoint="https://azure.example/v1",
+                    deployment="configured-deployment",
+                )
+            )
+        ),
+    )
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+    assert config.kind is ProviderKind.AZURE_OPENAI
+    assert config.model == "gpt-5.5"
+    assert config.endpoint == "https://azure.example/v1"
+    assert config.deployment == "configured-deployment"
 
 
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
