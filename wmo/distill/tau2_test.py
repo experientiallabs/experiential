@@ -331,3 +331,29 @@ class TestEpisodeReuse:
         )
         assert launches == [1], f"{corruption} evidence must re-run, never be reused"
         assert records[0].infra_failed is False
+
+    def test_recorded_infrastructure_failure_is_retried_on_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A parseable results file whose termination is infrastructure_error is
+        # NOT reusable evidence: resume must retry it fresh, not inherit a zero.
+        cfg = _cfg()
+        cfg = cfg.model_copy(update={"train": cfg.train.model_copy(update={"group_size": 1})})
+        provider = _provider_config()
+        spec = _EpisodeSpec("airline/0", 1, tmp_path / "tau2" / "step-0000")
+        _write_results(spec.episode_dir, reward=None, termination="infrastructure_error")
+        (spec.episode_dir / "provider.json").write_text(
+            json.dumps(provider.model_dump(mode="json"), sort_keys=True), encoding="utf-8"
+        )
+        launches: list[int] = []
+
+        async def _fresh_attempt(spec_arg: _EpisodeSpec, *_args: object) -> None:
+            launches.append(1)
+            _write_results(spec_arg.episode_dir, reward=1.0, termination="user_stop")
+
+        monkeypatch.setattr("wmo.distill.tau2._run_episode_subprocess", _fresh_attempt)
+        records, _ = collect_tau2_rollouts(
+            0, ["airline/0"], cfg, HarnessDoc.baseline(), provider, tmp_path
+        )
+        assert launches == [1]
+        assert records[0].passed is True

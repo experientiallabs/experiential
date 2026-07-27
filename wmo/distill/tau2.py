@@ -166,20 +166,38 @@ def _provider_snapshot(provider_config: ProviderConfig) -> JsonObject:
     return provider_config.model_dump(mode="json")
 
 
+def _has_verifier_evidence(spec: _EpisodeSpec) -> bool:
+    """Whether the episode dir holds a GRADED simulation.
+
+    The shared predicate behind both the retry decider and resume reuse: the
+    results must parse to a simulation whose termination is not an
+    infrastructure error and whose reward is a number. Anything less is an
+    absent measurement, never evidence.
+    """
+    simulation = _read_simulation(spec)
+    if simulation is None:
+        return False
+    if simulation.get("termination_reason") == "infrastructure_error":
+        return False
+    reward_info = simulation.get("reward_info")
+    return isinstance(reward_info, dict) and isinstance(reward_info.get("reward"), int | float)
+
+
 def _episode_complete(spec: _EpisodeSpec, provider_config: ProviderConfig) -> bool:
     """Whether an episode dir holds complete evidence reusable under THIS provider.
 
     Reuse demands more than file existence, or a crash-resumed step inherits
-    junk permanently: the results file must PARSE to a simulation (a copy torn
-    mid-write would otherwise be re-read as a silent `infra_failed` record on
-    every resume), and the recorded provider snapshot must parse AND equal the
-    current provider (an unreadable snapshot cannot prove which weights sampled
-    the episode, so it re-runs). A missing span sink is deliberately NOT a
-    reuse blocker: the sink is written before the results copy, so a valid
-    results file with no sink means the episode genuinely made no successful
-    completion, which is the recorded `empty_span_trials` shape.
+    junk permanently: the episode must carry VERIFIER evidence (the same bar
+    the retry loop uses, so a recorded infrastructure failure is retried fresh
+    on resume instead of being reused as a permanent zero), and the recorded
+    provider snapshot must parse AND equal the current provider (an unreadable
+    snapshot cannot prove which weights sampled the episode, so it re-runs).
+    A missing span sink is deliberately NOT a reuse blocker: the sink is
+    written before the results copy, so a valid results file with no sink
+    means the episode genuinely made no successful completion, which is the
+    recorded `empty_span_trials` shape.
     """
-    if _read_simulation(spec) is None:
+    if not _has_verifier_evidence(spec):
         return False
     try:
         recorded = json.loads(
@@ -516,16 +534,6 @@ async def _run_batch(
             logger.warning("%s", error)
         finally:
             proxy.release(spec.name)
-
-    def _has_verifier_evidence(spec: _EpisodeSpec) -> bool:
-        """Whether the episode dir now holds a graded simulation (retry decider)."""
-        simulation = _read_simulation(spec)
-        if simulation is None:
-            return False
-        if simulation.get("termination_reason") == "infrastructure_error":
-            return False
-        reward_info = simulation.get("reward_info")
-        return isinstance(reward_info, dict) and isinstance(reward_info.get("reward"), int | float)
 
     episode_retries = cfg.tau2.episode_retries
 
