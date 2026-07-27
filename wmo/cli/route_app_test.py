@@ -2254,7 +2254,7 @@ def test_embedder_auto_resolves_to_azure_when_the_standard_env_is_present(
     assert spec.dim == AZURE_EMBEDDER_DIM  # the champion's width, not the hashing default
     assert spec.endpoint == "https://sheets.openai.azure.com"
     assert spec.api_key_env == "AZURE_OPENAI_API_KEY"
-    assert "azure text-embedding-3-large (3072d)" in line
+    assert "azure text-embedding-3-large (3072d native)" in line
 
 
 def test_embedder_auto_falls_back_to_hashing_and_quotes_the_measured_gap(
@@ -2298,19 +2298,66 @@ def test_explicit_hashing_is_unchanged_even_with_the_azure_env_set(
     assert "explicit" in line
 
 
-def test_explicit_azure_keeps_its_flags_and_its_dim_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Unchanged on purpose: only an auto-resolved spec adopts the deployment's native width,
-    # because nobody typed a dimension there to be overridden.
+def test_explicit_azure_keeps_its_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
     spec, line = resolve_embedder(
-        "azure", dim=None, deployment="embed-3", endpoint="https://x", api_key_env="MY_KEY"
+        "azure",
+        dim=None,
+        deployment="text-embedding-3-large",
+        endpoint="https://x",
+        api_key_env="MY_KEY",
     )
-    assert (spec.kind, spec.deployment, spec.endpoint) == ("azure", "embed-3", "https://x")
-    assert spec.dim == HASHING_EMBEDDER_DIM
-    assert spec.api_key_env == "MY_KEY"
+    assert (spec.kind, spec.endpoint, spec.api_key_env) == ("azure", "https://x", "MY_KEY")
     assert "explicit" in line
+
+
+def test_explicit_azure_gets_the_models_native_width_not_the_hashing_default() -> None:
+    # The footgun this closes: `--dim` used to default to 512 everywhere, so an explicit azure
+    # fit asked a 3072-dimensional model for 512-dimensional vectors and fitted on the
+    # truncation. `dim` is the request's `dimensions` parameter, not bookkeeping.
+    spec, line = resolve_embedder(
+        "azure",
+        dim=None,
+        deployment="text-embedding-3-large",
+        endpoint="https://x",
+        api_key_env=None,
+    )
+    assert spec.dim == AZURE_EMBEDDER_DIM
+    assert "3072d native" in line
+
+
+def test_a_smaller_model_resolves_to_its_own_native_width() -> None:
+    spec, _ = resolve_embedder(
+        "azure",
+        dim=None,
+        deployment="text-embedding-3-small",
+        endpoint="https://x",
+        api_key_env=None,
+    )
+    assert spec.dim == 1536
+
+
+def test_an_unrecognized_deployment_name_assumes_3_large_and_says_so() -> None:
+    # Azure deployment names are operator-chosen, so this is common; the guess is stated in the
+    # line and one flag overrides it.
+    spec, line = resolve_embedder(
+        "azure", dim=None, deployment="prod-embeddings", endpoint="https://x", api_key_env=None
+    )
+    assert spec.dim == AZURE_EMBEDDER_DIM
+    assert "assumed" in line and "--dim" in line
+
+
+def test_an_explicit_dim_is_honored_verbatim_on_the_azure_path() -> None:
+    # A deliberate reduction is still available; it is just no longer the silent default.
+    spec, line = resolve_embedder(
+        "azure",
+        dim=256,
+        deployment="text-embedding-3-large",
+        endpoint="https://x",
+        api_key_env=None,
+    )
+    assert spec.dim == 256
+    assert "256d as asked" in line
 
 
 def test_an_explicit_dim_wins_over_the_auto_resolved_width(

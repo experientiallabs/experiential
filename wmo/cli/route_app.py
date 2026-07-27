@@ -106,6 +106,31 @@ HASHING_DOWNGRADE_NOTICE = (
     "full-power benchmark"
 )
 
+# Native output widths of the embedding models WMO knows about, matched as a SUBSTRING of the
+# deployment name because an Azure deployment is operator-named and usually carries the model
+# family in it. `dim` is not bookkeeping: it becomes the `dimensions` parameter of the embeddings
+# request, so asking a model for more than it has is an API error, and asking for less silently
+# truncates the vectors the policy is then fitted and served on.
+_NATIVE_EMBEDDING_DIMS: tuple[tuple[str, int], ...] = (
+    ("text-embedding-3-large", 3072),
+    ("text-embedding-3-small", 1536),
+    ("text-embedding-ada-002", 1536),
+)
+
+
+def _native_dim(deployment: str) -> tuple[int, bool]:
+    """(native width, whether the deployment name identified the model) for an azure deployment.
+
+    An unrecognized name assumes `text-embedding-3-large`, which is the deployment `auto`
+    provisions and the one the champion was measured on. The assumption is stated in the
+    resolution line rather than buried, and `--dim` overrides it, so the cost of guessing wrong
+    is one visible flag rather than a policy quietly fitted on truncated vectors.
+    """
+    for family, width in _NATIVE_EMBEDDING_DIMS:
+        if family in deployment:
+            return width, True
+    return AZURE_EMBEDDER_DIM, False
+
 
 def resolve_embedder(
     choice: str,
@@ -124,9 +149,11 @@ def resolve_embedder(
     should be told what they are getting instead. So the resolution is ALWAYS printed, and the
     downgrade quotes the measured gap rather than a vague warning.
 
-    Explicit `hashing` and `azure` are unchanged, including their `--dim` default: only an
-    auto-resolved azure spec adopts the deployment's native width, because that is the
-    configuration the champion was measured in and nobody typed a dimension to be overridden.
+    `--dim` defaults to the RESOLVED backend's native width on every path: 512 for hashing, and
+    the embedding model's own width for azure (see `_native_dim`). It used to default to 512
+    everywhere, which meant `--embedder azure --deployment text-embedding-3-large` silently
+    requested 512-dimensional vectors from a 3072-dimensional model and fitted the policy on the
+    truncation. An explicit `--dim` is still honored verbatim, including a deliberate reduction.
 
     Returns:
         The `EmbedderSpec` to fit with, and the resolution line to print.
@@ -149,16 +176,12 @@ def resolve_embedder(
             )
         resolved_endpoint = endpoint or os.environ["AZURE_OPENAI_ENDPOINT"]
         resolved_deployment = deployment or AZURE_EMBEDDER_DEPLOYMENT
-        spec = EmbedderSpec(
-            kind="azure",
-            dim=dim or AZURE_EMBEDDER_DIM,
+        return _azure_spec(
             deployment=resolved_deployment,
             endpoint=resolved_endpoint,
             api_key_env=api_key_env or AZURE_EMBEDDER_ENV[0],
-        )
-        return spec, (
-            f"embedder: azure {resolved_deployment} ({spec.dim}d) at {resolved_endpoint} "
-            f"(auto; {' and '.join(AZURE_EMBEDDER_ENV)} present)"
+            dim=dim,
+            how=f"auto; {' and '.join(AZURE_EMBEDDER_ENV)} present",
         )
 
     if choice == "hashing":
@@ -172,14 +195,43 @@ def resolve_embedder(
             "--embedder azure needs --deployment and --endpoint (or use --embedder auto, which "
             f"reads {' and '.join(AZURE_EMBEDDER_ENV)})"
         )
+    return _azure_spec(
+        deployment=deployment,
+        endpoint=endpoint,
+        api_key_env=api_key_env,
+        dim=dim,
+        how="explicit",
+    )
+
+
+def _azure_spec(
+    *, deployment: str, endpoint: str, api_key_env: str | None, dim: int | None, how: str
+) -> tuple[EmbedderSpec, str]:
+    """One azure spec plus its resolution line, shared by the auto and explicit paths.
+
+    Shared so the two paths cannot drift on the thing that matters here, which is how the
+    embedding width is chosen when the operator did not name one.
+    """
+    native, recognized = _native_dim(deployment)
     spec = EmbedderSpec(
         kind="azure",
-        dim=dim or HASHING_EMBEDDER_DIM,
+        dim=dim or native,
         deployment=deployment,
         endpoint=endpoint,
         api_key_env=api_key_env,
     )
-    return spec, f"embedder: azure {deployment} ({spec.dim}d) at {endpoint} (explicit)"
+    hint = ""
+    if dim is not None:
+        width = f"{spec.dim}d as asked"
+    elif recognized:
+        width = f"{spec.dim}d native"
+    else:
+        width = f"{spec.dim}d assumed"
+        hint = (
+            f". Unrecognized deployment name, so the width is a guess: pass --dim if "
+            f"{deployment} is not {spec.dim}-dimensional"
+        )
+    return spec, f"embedder: azure {deployment} ({width}) at {endpoint} ({how}){hint}"
 
 
 @route_app.command("sweep")
@@ -856,8 +908,9 @@ def fit(
     dim: int = typer.Option(
         None,
         "--dim",
-        help="Embedding dimension. Default: the resolved backend's native width "
-        f"({HASHING_EMBEDDER_DIM} hashing, {AZURE_EMBEDDER_DIM} text-embedding-3-large).",
+        help="Embedding dimension, sent as the request's `dimensions`. Default: the resolved "
+        f"model's native width ({HASHING_EMBEDDER_DIM} hashing, {AZURE_EMBEDDER_DIM} "
+        "text-embedding-3-large). Set it only to reduce a model's output deliberately.",
     ),
     deployment: str = typer.Option(None, "--deployment", help="(azure) embedding deployment."),
     endpoint: str = typer.Option(None, "--endpoint", help="(azure) resource endpoint."),
