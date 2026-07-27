@@ -102,9 +102,13 @@ within a small tolerance".
 
 ## Artifacts
 
-- `build_cost_corner.py`: the pipeline (scorecard-only cost aggregation, paired-delta
-  evidence on every quality claim; rerun it as matrices land; routed rungs attach via
-  `rows_for_policy` when the master's per-arm fits are delivered).
+- `lens.py`: this corner's declarative figure spec, rendered by the ONE shared runner
+  (`common/build_corners.py`, charter Amendment): scorecard-only cost aggregation,
+  paired-delta evidence on every quality claim, the distillation verdict cited verbatim
+  from `wmo.optimize.teacher.select_teacher`. Rerun
+  `uv run python .agents/docs/research/corners/common/build_corners.py --lens cost` as
+  grid-c2 cells land (live #330 sidecars load before any matrix merges); routed rungs
+  attach via `rows_for_policy` when the master's per-arm fits are delivered.
 - `figures/dial_cost_curve.png`: ours9 dial anchors as measured (tau panel pending fits).
 - `figures/training_stage_cost_lens.png`: the shared training-stage chart, cost lens
   (cycle 1 as measured, real_episode; cost deltas attach when the grid's student cells

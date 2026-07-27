@@ -1,16 +1,1822 @@
 {
-  "grid_dir": "/Users/silen/Desktop/Projects/world-model-harness/.wmo/jt/grid",
-  "arms_present": [],
-  "arms_pending": [
-    "identity",
-    "truncate",
-    "llmlingua2-endpoint"
-  ],
+  "status": "identity: partial (1 live sidecar(s), 104 cell(s), pre-retry); truncate: partial (1 live sidecar(s), 68 cell(s), pre-retry); llmlingua2-endpoint: partial (1 chunk file(s), 1 live sidecar(s), 22 cell(s), pre-retry)",
+  "pending_arms": [],
   "anchor": "fable-5",
-  "best_single": null,
-  "vs_fable5": {},
-  "vs_best_single": {},
+  "best_single": "opus-5",
+  "teacher_verdict": {
+    "decision": "insufficient_evidence",
+    "student": "gpt-5.4-mini",
+    "teacher": null,
+    "n_scenarios": 5,
+    "gains": [
+      {
+        "model": "opus-5",
+        "tier": "frontier",
+        "n_scenarios": 5,
+        "mean_reward": 0.55,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": 0.32,
+        "standard_error": 0.1941970648593845,
+        "ci_low": -0.06062624712439363,
+        "ci_high": 0.7006262471243936,
+        "price": 30.0,
+        "clears_gap": false
+      },
+      {
+        "model": "kimi-k3",
+        "tier": "frontier",
+        "n_scenarios": 3,
+        "mean_reward": 0.48333333333333334,
+        "student_mean_reward": 0.23333333333333336,
+        "mean_gain": 0.25,
+        "standard_error": 0.3055050463303894,
+        "ci_low": -0.3487898908075632,
+        "ci_high": 0.8487898908075632,
+        "price": 18.0,
+        "clears_gap": false
+      },
+      {
+        "model": "gpt-5.5",
+        "tier": "frontier",
+        "n_scenarios": 5,
+        "mean_reward": 0.44000000000000006,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": 0.21000000000000002,
+        "standard_error": 0.10741275529470418,
+        "ci_low": -0.0005290003776201591,
+        "ci_high": 0.4205290003776202,
+        "price": 35.0,
+        "clears_gap": false
+      },
+      {
+        "model": "fable-5",
+        "tier": "frontier",
+        "n_scenarios": 5,
+        "mean_reward": 0.295,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": 0.06499999999999999,
+        "standard_error": 0.16019519343600794,
+        "ci_low": -0.24898257913457555,
+        "ci_high": 0.37898257913457556,
+        "price": 60.0,
+        "clears_gap": false
+      },
+      {
+        "model": "sonnet-5",
+        "tier": "frontier",
+        "n_scenarios": 5,
+        "mean_reward": 0.225,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": -0.004999999999999996,
+        "standard_error": 0.17667059744054753,
+        "ci_low": -0.35127437098347314,
+        "ci_high": 0.34127437098347313,
+        "price": 18.0,
+        "clears_gap": false
+      },
+      {
+        "model": "kimi-k2.6",
+        "tier": "open",
+        "n_scenarios": 5,
+        "mean_reward": 0.145,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": -0.08500000000000002,
+        "standard_error": 0.18398369492974095,
+        "ci_low": -0.44560804206229226,
+        "ci_high": 0.2756080420622922,
+        "price": 5.445,
+        "clears_gap": false
+      },
+      {
+        "model": "glm-5.2",
+        "tier": "open",
+        "n_scenarios": 5,
+        "mean_reward": 0.13,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": -0.1,
+        "standard_error": 0.1015504800579495,
+        "ci_low": -0.299038940913581,
+        "ci_high": 0.09903894091358101,
+        "price": 6.38,
+        "clears_gap": false
+      },
+      {
+        "model": "haiku-4-5",
+        "tier": "frontier",
+        "n_scenarios": 5,
+        "mean_reward": 0.11000000000000001,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": -0.12,
+        "standard_error": 0.10410331406828506,
+        "ci_low": -0.3240424955738387,
+        "ci_high": 0.08404249557383872,
+        "price": 6.0,
+        "clears_gap": false
+      },
+      {
+        "model": "opus-4-8",
+        "tier": "frontier",
+        "n_scenarios": 5,
+        "mean_reward": 0.11000000000000001,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": -0.12000000000000002,
+        "standard_error": 0.11629703349613009,
+        "ci_low": -0.34794218565241497,
+        "ci_high": 0.10794218565241495,
+        "price": 30.0,
+        "clears_gap": false
+      },
+      {
+        "model": "deepseek-v4-pro",
+        "tier": "open",
+        "n_scenarios": 5,
+        "mean_reward": 0.065,
+        "student_mean_reward": 0.22999999999999998,
+        "mean_gain": -0.16499999999999998,
+        "standard_error": 0.10234744745229359,
+        "ci_low": -0.3656009970064954,
+        "ci_high": 0.03560099700649544,
+        "price": 5.753,
+        "clears_gap": false
+      }
+    ],
+    "unmeasured_models": [],
+    "price_basis": "list",
+    "min_gap": 0.1,
+    "min_scenarios": 8,
+    "sufficiency": 0.8,
+    "reason": "INSUFFICIENT EVIDENCE: the leading candidate 'opus-5' is +32.0 points over 'gpt-5.4-mini' but shares only 5 scored scenario(s) with it, below the 8 this gate requires before it calls a 10.0-point gap real or absent. Sweep more scenarios, then probe again."
+  },
+  "teacher_unavailable_reason": null,
+  "records": {
+    "identity/gpt-5.5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": 14.5,
+        "quality_delta_paired": {
+          "mean": 0.145,
+          "ci95": [
+            -0.035,
+            0.34
+          ],
+          "sign_test_p": 0.625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -72.9,
+        "latency_p50_delta_percent": 17.8,
+        "cost_per_completed_task_usd": 0.4854075,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.4,
+        "mean_reward": 0.44,
+        "latency_p50_model_s": 64.76,
+        "latency_p95_model_s": 104.23,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'gpt-5.5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -11.0,
+        "quality_delta_paired": {
+          "mean": -0.11,
+          "ci95": [
+            -0.275,
+            0.04
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 9.9,
+        "latency_p50_delta_percent": 52.3,
+        "cost_per_completed_task_usd": 0.4854075,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.4,
+        "mean_reward": 0.44,
+        "latency_p50_model_s": 64.76,
+        "latency_p95_model_s": 104.23,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'gpt-5.5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/gpt-5.4-mini": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -6.5,
+        "quality_delta_paired": {
+          "mean": -0.065,
+          "ci95": [
+            -0.325,
+            0.245
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -95.4,
+        "latency_p50_delta_percent": -89.1,
+        "cost_per_completed_task_usd": 0.08182350000000001,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.23,
+        "latency_p50_model_s": 5.99,
+        "latency_p95_model_s": 53.24,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'gpt-5.4-mini [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -32.0,
+        "quality_delta_paired": {
+          "mean": -0.32,
+          "ci95": [
+            -0.675,
+            0.0
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -81.5,
+        "latency_p50_delta_percent": -85.9,
+        "cost_per_completed_task_usd": 0.08182350000000001,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.23,
+        "latency_p50_model_s": 5.99,
+        "latency_p95_model_s": 53.24,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'gpt-5.4-mini [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/deepseek-v4-pro": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -23.0,
+        "quality_delta_paired": {
+          "mean": -0.23,
+          "ci95": [
+            -0.415,
+            -0.055
+          ],
+          "sign_test_p": 0.125,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -73.3,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.065,
+        "latency_p50_model_s": 14.67,
+        "latency_p95_model_s": 32.11,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'deepseek-v4-pro [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -48.5,
+        "quality_delta_paired": {
+          "mean": -0.485,
+          "ci95": [
+            -0.715,
+            -0.255
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -65.5,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.065,
+        "latency_p50_model_s": 14.67,
+        "latency_p95_model_s": 32.11,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'deepseek-v4-pro [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/kimi-k2.6": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -15.0,
+        "quality_delta_paired": {
+          "mean": -0.15,
+          "ci95": [
+            -0.44,
+            0.19
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 35.2,
+        "latency_p50_delta_percent": 584.8,
+        "cost_per_completed_task_usd": 2.4249642450000004,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.145,
+        "latency_p50_model_s": 376.33,
+        "latency_p95_model_s": 437.14,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'kimi-k2.6 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -40.5,
+        "quality_delta_paired": {
+          "mean": -0.405,
+          "ci95": [
+            -0.745,
+            0.045
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 449.1,
+        "latency_p50_delta_percent": 785.3,
+        "cost_per_completed_task_usd": 2.4249642450000004,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.145,
+        "latency_p50_model_s": 376.33,
+        "latency_p95_model_s": 437.14,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'kimi-k2.6 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/glm-5.2": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -16.5,
+        "quality_delta_paired": {
+          "mean": -0.165,
+          "ci95": [
+            -0.36,
+            0.02
+          ],
+          "sign_test_p": 0.625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 184.2,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.13,
+        "latency_p50_model_s": 156.18,
+        "latency_p95_model_s": 234.74,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'glm-5.2 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -42.0,
+        "quality_delta_paired": {
+          "mean": -0.42,
+          "ci95": [
+            -0.66,
+            -0.19
+          ],
+          "sign_test_p": 0.125,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 267.4,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.13,
+        "latency_p50_model_s": 156.18,
+        "latency_p95_model_s": 234.74,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'glm-5.2 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/sonnet-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -7.0,
+        "quality_delta_paired": {
+          "mean": -0.07,
+          "ci95": [
+            -0.3,
+            0.07
+          ],
+          "sign_test_p": 0.625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 63.1,
+        "latency_p50_delta_percent": 151.2,
+        "cost_per_completed_task_usd": 2.924808,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.225,
+        "latency_p50_model_s": 138.05,
+        "latency_p95_model_s": 335.47,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 9,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'sonnet-5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -32.5,
+        "quality_delta_paired": {
+          "mean": -0.325,
+          "ci95": [
+            -0.455,
+            -0.15
+          ],
+          "sign_test_p": 0.125,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 562.3,
+        "latency_p50_delta_percent": 224.8,
+        "cost_per_completed_task_usd": 2.924808,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.225,
+        "latency_p50_model_s": 138.05,
+        "latency_p95_model_s": 335.47,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 9,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'sonnet-5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/haiku-4-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -18.5,
+        "quality_delta_paired": {
+          "mean": -0.185,
+          "ci95": [
+            -0.385,
+            -0.01
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -70.2,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.11,
+        "latency_p50_model_s": 16.38,
+        "latency_p95_model_s": 25.78,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'haiku-4-5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -44.0,
+        "quality_delta_paired": {
+          "mean": -0.44,
+          "ci95": [
+            -0.665,
+            -0.225
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -61.5,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.11,
+        "latency_p50_model_s": 16.38,
+        "latency_p95_model_s": 25.78,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'haiku-4-5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/opus-4-8": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -18.5,
+        "quality_delta_paired": {
+          "mean": -0.185,
+          "ci95": [
+            -0.325,
+            -0.07
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -43.5,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.11,
+        "latency_p50_model_s": 31.06,
+        "latency_p95_model_s": 42.66,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'opus-4-8 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -44.0,
+        "quality_delta_paired": {
+          "mean": -0.44,
+          "ci95": [
+            -0.76,
+            -0.12
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -26.9,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.11,
+        "latency_p50_model_s": 31.06,
+        "latency_p95_model_s": 42.66,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'opus-4-8 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/opus-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": 25.5,
+        "quality_delta_paired": {
+          "mean": 0.255,
+          "ci95": [
+            -0.02,
+            0.5
+          ],
+          "sign_test_p": 0.625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -75.4,
+        "latency_p50_delta_percent": -22.6,
+        "cost_per_completed_task_usd": 0.44158875,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.4,
+        "mean_reward": 0.55,
+        "latency_p50_model_s": 42.51,
+        "latency_p95_model_s": 81.41,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'opus-5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": 0.0,
+        "quality_delta_paired": {
+          "mean": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "sign_test_p": null,
+          "n_pairs": 5,
+          "within_noise_floor": true
+        },
+        "cost_delta_percent": 0.0,
+        "latency_p50_delta_percent": 0.0,
+        "cost_per_completed_task_usd": 0.44158875,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.4,
+        "mean_reward": 0.55,
+        "latency_p50_model_s": 42.51,
+        "latency_p95_model_s": 81.41,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'opus-5 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/kimi-k3": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": 24.17,
+        "quality_delta_paired": {
+          "mean": 0.2417,
+          "ci95": [
+            0.0,
+            0.375
+          ],
+          "sign_test_p": 0.5,
+          "n_pairs": 3,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -84.7,
+        "latency_p50_delta_percent": 72.5,
+        "cost_per_completed_task_usd": 0.29443020000000003,
+        "anchor_cost_per_completed_task_usd": 1.92659,
+        "task_success_rate": 0.5,
+        "mean_reward": 0.4833,
+        "latency_p50_model_s": 94.78,
+        "latency_p95_model_s": 243.16,
+        "scenarios_compared": 3,
+        "scenarios_excluded": 2,
+        "n_scored": 5,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'kimi-k3 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 2 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $1.6607 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -3.33,
+        "quality_delta_paired": {
+          "mean": -0.0333,
+          "ci95": [
+            -0.075,
+            0.0
+          ],
+          "sign_test_p": 0.5,
+          "n_pairs": 3,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -20.5,
+        "latency_p50_delta_percent": 145.4,
+        "cost_per_completed_task_usd": 0.29443020000000003,
+        "anchor_cost_per_completed_task_usd": 0.37031,
+        "task_success_rate": 0.5,
+        "mean_reward": 0.4833,
+        "latency_p50_model_s": 94.78,
+        "latency_p95_model_s": 243.16,
+        "scenarios_compared": 3,
+        "scenarios_excluded": 2,
+        "n_scored": 5,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'kimi-k3 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 2 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $0.6554 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "truncate/gpt-5.5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": 1.5,
+        "quality_delta_paired": {
+          "mean": 0.015,
+          "ci95": [
+            -0.225,
+            0.38
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": true
+        },
+        "cost_delta_percent": -42.3,
+        "latency_p50_delta_percent": 122.1,
+        "cost_per_completed_task_usd": 1.0349983333333335,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.3,
+        "mean_reward": 0.31,
+        "latency_p50_model_s": 122.05,
+        "latency_p95_model_s": 710.0,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -24.0,
+        "quality_delta_paired": {
+          "mean": -0.24,
+          "ci95": [
+            -0.565,
+            0.06
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 134.4,
+        "latency_p50_delta_percent": 187.1,
+        "cost_per_completed_task_usd": 1.0349983333333335,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.3,
+        "mean_reward": 0.31,
+        "latency_p50_model_s": 122.05,
+        "latency_p95_model_s": 710.0,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "truncate/gpt-5.4-mini": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -25.0,
+        "quality_delta_paired": {
+          "mean": -0.25,
+          "ci95": [
+            -0.435,
+            -0.08
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -69.7,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.045,
+        "latency_p50_model_s": 16.65,
+        "latency_p95_model_s": 21.11,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.4-mini [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -50.5,
+        "quality_delta_paired": {
+          "mean": -0.505,
+          "ci95": [
+            -0.725,
+            -0.275
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -60.8,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.045,
+        "latency_p50_model_s": 16.65,
+        "latency_p95_model_s": 21.11,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.4-mini [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "truncate/deepseek-v4-pro": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -27.0,
+        "quality_delta_paired": {
+          "mean": -0.27,
+          "ci95": [
+            -0.415,
+            -0.125
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -47.9,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.025,
+        "latency_p50_model_s": 28.63,
+        "latency_p95_model_s": 50.58,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'deepseek-v4-pro [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -52.5,
+        "quality_delta_paired": {
+          "mean": -0.525,
+          "ci95": [
+            -0.78,
+            -0.27
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -32.6,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.025,
+        "latency_p50_model_s": 28.63,
+        "latency_p95_model_s": 50.58,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'deepseek-v4-pro [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "truncate/kimi-k2.6": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -20.0,
+        "quality_delta_paired": {
+          "mean": -0.2,
+          "ci95": [
+            -0.455,
+            0.085
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -0.2,
+        "latency_p50_delta_percent": 466.0,
+        "cost_per_completed_task_usd": 1.7897004840000001,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.095,
+        "latency_p50_model_s": 311.04,
+        "latency_p95_model_s": 331.68,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 9,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'kimi-k2.6 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -45.5,
+        "quality_delta_paired": {
+          "mean": -0.455,
+          "ci95": [
+            -0.785,
+            -0.025
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 305.3,
+        "latency_p50_delta_percent": 631.7,
+        "cost_per_completed_task_usd": 1.7897004840000001,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.095,
+        "latency_p50_model_s": 311.04,
+        "latency_p95_model_s": 331.68,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 9,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'kimi-k2.6 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "truncate/glm-5.2": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -14.3,
+        "quality_delta_paired": {
+          "mean": -0.143,
+          "ci95": [
+            -0.349,
+            0.095
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -59.4,
+        "latency_p50_delta_percent": 114.6,
+        "cost_per_completed_task_usd": 0.72868021,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.152,
+        "latency_p50_model_s": 117.92,
+        "latency_p95_model_s": 181.2,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'glm-5.2 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -39.8,
+        "quality_delta_paired": {
+          "mean": -0.398,
+          "ci95": [
+            -0.776,
+            -0.005
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 65.0,
+        "latency_p50_delta_percent": 177.4,
+        "cost_per_completed_task_usd": 0.72868021,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.152,
+        "latency_p50_model_s": 117.92,
+        "latency_p95_model_s": 181.2,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'glm-5.2 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "truncate/fable-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -5.0,
+        "quality_delta_paired": {
+          "mean": -0.05,
+          "ci95": [
+            -0.3,
+            0.195
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 62.9,
+        "latency_p50_delta_percent": 107.0,
+        "cost_per_completed_task_usd": 2.92244,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.2,
+        "mean_reward": 0.245,
+        "latency_p50_model_s": 113.73,
+        "latency_p95_model_s": 147.44,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'fable-5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -30.5,
+        "quality_delta_paired": {
+          "mean": -0.305,
+          "ci95": [
+            -0.645,
+            -0.0
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 561.8,
+        "latency_p50_delta_percent": 167.5,
+        "cost_per_completed_task_usd": 2.92244,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.2,
+        "mean_reward": 0.245,
+        "latency_p50_model_s": 113.73,
+        "latency_p95_model_s": 147.44,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'fable-5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "truncate/sonnet-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -12.5,
+        "quality_delta_paired": {
+          "mean": -0.125,
+          "ci95": [
+            -0.35,
+            0.0375
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 4,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 108.9,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 3.19846,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.1,
+        "latency_p50_model_s": 131.56,
+        "latency_p95_model_s": 183.43,
+        "scenarios_compared": 4,
+        "scenarios_excluded": 1,
+        "n_scored": 7,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'sonnet-5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 1 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $0.3888 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -48.75,
+        "quality_delta_paired": {
+          "mean": -0.4875,
+          "ci95": [
+            -0.7562,
+            -0.2188
+          ],
+          "sign_test_p": 0.125,
+          "n_pairs": 4,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 233.1,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.36626375,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.1,
+        "latency_p50_model_s": 131.56,
+        "latency_p95_model_s": 183.43,
+        "scenarios_compared": 4,
+        "scenarios_excluded": 1,
+        "n_scored": 7,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'sonnet-5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 1 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $0.3013 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "truncate/haiku-4-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -15.0,
+        "quality_delta_paired": {
+          "mean": -0.15,
+          "ci95": [
+            -0.15,
+            -0.15
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 1,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -44.3,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": null,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.0,
+        "latency_p50_model_s": 42.01,
+        "latency_p95_model_s": 43.12,
+        "scenarios_compared": 1,
+        "scenarios_excluded": 4,
+        "n_scored": 2,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'haiku-4-5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $2.7132 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -57.5,
+        "quality_delta_paired": {
+          "mean": -0.575,
+          "ci95": [
+            -0.575,
+            -0.575
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 1,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -37.3,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.54214,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.0,
+        "latency_p50_model_s": 42.01,
+        "latency_p95_model_s": 43.12,
+        "scenarios_compared": 1,
+        "scenarios_excluded": 4,
+        "n_scored": 2,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'haiku-4-5 [truncate]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $1.2242 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/gpt-5.5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -12.5,
+        "quality_delta_paired": {
+          "mean": -0.125,
+          "ci95": [
+            -0.285,
+            -0.01
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 29.9,
+        "latency_p50_delta_percent": 61.2,
+        "cost_per_completed_task_usd": 2.3307097715623906,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.17,
+        "latency_p50_model_s": 88.61,
+        "latency_p95_model_s": 544.66,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 4,
+        "n_scored": 9,
+        "n_excluded_episodes": 1,
+        "excluded_cost_usd": 0.2925,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.5 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 1 unscored episode(s) were excluded, along with $0.2925 of spend that no completed task is charged for. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.9462 of arm spend and $0.0000 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -38.0,
+        "quality_delta_paired": {
+          "mean": -0.38,
+          "ci95": [
+            -0.53,
+            -0.22
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 427.8,
+        "latency_p50_delta_percent": 108.5,
+        "cost_per_completed_task_usd": 2.3307097715623906,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.1,
+        "mean_reward": 0.17,
+        "latency_p50_model_s": 88.61,
+        "latency_p95_model_s": 544.66,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 4,
+        "n_scored": 9,
+        "n_excluded_episodes": 1,
+        "excluded_cost_usd": 0.2925,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.5 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 1 unscored episode(s) were excluded, along with $0.2925 of spend that no completed task is charged for. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.9462 of arm spend and $0.0000 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/gpt-5.4-mini": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -27.5,
+        "quality_delta_paired": {
+          "mean": -0.275,
+          "ci95": [
+            -0.46,
+            -0.115
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -87.9,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.02,
+        "latency_p50_model_s": 6.67,
+        "latency_p95_model_s": 22.29,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 5,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.4-mini [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 5 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0504 of arm spend and $0.0000 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -53.0,
+        "quality_delta_paired": {
+          "mean": -0.53,
+          "ci95": [
+            -0.75,
+            -0.29
+          ],
+          "sign_test_p": 0.0625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -84.3,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.02,
+        "latency_p50_model_s": 6.67,
+        "latency_p95_model_s": 22.29,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 5,
+        "n_scored": 10,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'gpt-5.4-mini [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 5 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0504 of arm spend and $0.0000 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/deepseek-v4-pro": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -26.88,
+        "quality_delta_paired": {
+          "mean": -0.2687,
+          "ci95": [
+            -0.4875,
+            -0.05
+          ],
+          "sign_test_p": 0.625,
+          "n_pairs": 4,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -61.5,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.65473,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.075,
+        "latency_p50_model_s": 24.23,
+        "latency_p95_model_s": 36.52,
+        "scenarios_compared": 4,
+        "scenarios_excluded": 4,
+        "n_scored": 6,
+        "n_excluded_episodes": 2,
+        "excluded_cost_usd": 0.0308,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'deepseek-v4-pro [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 2 unscored episode(s) were excluded, along with $0.0308 of spend that no completed task is charged for. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0735 of arm spend and $0.2778 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -58.75,
+        "quality_delta_paired": {
+          "mean": -0.5875,
+          "ci95": [
+            -0.825,
+            -0.35
+          ],
+          "sign_test_p": 0.125,
+          "n_pairs": 4,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -48.7,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.41109375,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.075,
+        "latency_p50_model_s": 24.23,
+        "latency_p95_model_s": 36.52,
+        "scenarios_compared": 4,
+        "scenarios_excluded": 4,
+        "n_scored": 6,
+        "n_excluded_episodes": 2,
+        "excluded_cost_usd": 0.0308,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'deepseek-v4-pro [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 2 unscored episode(s) were excluded, along with $0.0308 of spend that no completed task is charged for. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0735 of arm spend and $0.1220 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/glm-5.2": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -45.0,
+        "quality_delta_paired": {
+          "mean": -0.45,
+          "ci95": [
+            -0.45,
+            -0.45
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 1,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 71.1,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.7746999999999999,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.025,
+        "latency_p50_model_s": 106.86,
+        "latency_p95_model_s": 168.36,
+        "scenarios_compared": 1,
+        "scenarios_excluded": 4,
+        "n_scored": 2,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'glm-5.2 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0089 of arm spend and $2.8125 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -85.0,
+        "quality_delta_paired": {
+          "mean": -0.85,
+          "ci95": [
+            -0.85,
+            -0.85
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 1,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 108.4,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.22340500000000002,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.025,
+        "latency_p50_model_s": 106.86,
+        "latency_p95_model_s": 168.36,
+        "scenarios_compared": 1,
+        "scenarios_excluded": 4,
+        "n_scored": 2,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'glm-5.2 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0089 of arm spend and $1.3195 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/opus-4-8": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -17.5,
+        "quality_delta_paired": {
+          "mean": -0.175,
+          "ci95": [
+            -0.175,
+            -0.175
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 1,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": -59.7,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": null,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.0,
+        "latency_p50_model_s": 43.33,
+        "latency_p95_model_s": 43.33,
+        "scenarios_compared": 1,
+        "scenarios_excluded": 4,
+        "n_scored": 1,
+        "n_excluded_episodes": 1,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'opus-4-8 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 1 unscored episode(s) were excluded, along with $0.0000 of spend that no completed task is charged for. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $2.3154 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -80.0,
+        "quality_delta_paired": {
+          "mean": -0.8,
+          "ci95": [
+            -0.8,
+            -0.8
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 1,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 3.6,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.354125,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.0,
+        "latency_p50_model_s": 43.33,
+        "latency_p95_model_s": 43.33,
+        "scenarios_compared": 1,
+        "scenarios_excluded": 4,
+        "n_scored": 1,
+        "n_excluded_episodes": 1,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'opus-4-8 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 1 unscored episode(s) were excluded, along with $0.0000 of spend that no completed task is charged for. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 4 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0000 of arm spend and $1.4122 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/opus-5": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -16.25,
+        "quality_delta_paired": {
+          "mean": -0.1625,
+          "ci95": [
+            -0.4,
+            0.075
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 4,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 58.2,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 1.15769,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.1625,
+        "latency_p50_model_s": 77.38,
+        "latency_p95_model_s": 159.26,
+        "scenarios_compared": 4,
+        "scenarios_excluded": 1,
+        "n_scored": 4,
+        "n_excluded_episodes": 4,
+        "excluded_cost_usd": 0.0205,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'opus-5 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 4 unscored episode(s) were excluded, along with $0.0205 of spend that no completed task is charged for. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 1 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0424 of arm spend and $1.2719 of anchor spend with them; that money bought no comparable measurement."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -32.5,
+        "quality_delta_paired": {
+          "mean": -0.325,
+          "ci95": [
+            -0.6438,
+            -0.0687
+          ],
+          "sign_test_p": 0.25,
+          "n_pairs": 4,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": null,
+        "latency_p50_delta_percent": 72.3,
+        "cost_per_completed_task_usd": null,
+        "anchor_cost_per_completed_task_usd": 0.4707433333333333,
+        "task_success_rate": 0.0,
+        "mean_reward": 0.1625,
+        "latency_p50_model_s": 77.38,
+        "latency_p95_model_s": 159.26,
+        "scenarios_compared": 4,
+        "scenarios_excluded": 1,
+        "n_scored": 4,
+        "n_excluded_episodes": 4,
+        "excluded_cost_usd": 0.0205,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'opus-5 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 4 unscored episode(s) were excluded, along with $0.0205 of spend that no completed task is charged for. No task completed, so there is no cost per completed task to quote and the figure is reported as undefined rather than as zero. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. 1 scenario(s) were held out of this comparison because one side left them unscored, taking $0.0424 of arm spend and $0.3541 of anchor spend with them; that money bought no comparable measurement."
+      }
+    },
+    "llmlingua2-endpoint/kimi-k3": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -4.5,
+        "quality_delta_paired": {
+          "mean": -0.045,
+          "ci95": [
+            -0.37,
+            0.365
+          ],
+          "sign_test_p": 0.625,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 21.1,
+        "latency_p50_delta_percent": 487.0,
+        "cost_per_completed_task_usd": 2.171618597548854,
+        "anchor_cost_per_completed_task_usd": 1.793625,
+        "task_success_rate": 0.2,
+        "mean_reward": 0.25,
+        "latency_p50_model_s": 322.58,
+        "latency_p95_model_s": 606.45,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 8,
+        "n_excluded_episodes": 2,
+        "excluded_cost_usd": 0.0047,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'kimi-k3 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 2 unscored episode(s) were excluded, along with $0.0047 of spend that no completed task is charged for. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "quality_delta_points": -30.0,
+        "quality_delta_paired": {
+          "mean": -0.3,
+          "ci95": [
+            -0.64,
+            0.05
+          ],
+          "sign_test_p": 0.375,
+          "n_pairs": 5,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": 391.8,
+        "latency_p50_delta_percent": 658.9,
+        "cost_per_completed_task_usd": 2.171618597548854,
+        "anchor_cost_per_completed_task_usd": 0.44158875,
+        "task_success_rate": 0.2,
+        "mean_reward": 0.25,
+        "latency_p50_model_s": 322.58,
+        "latency_p95_model_s": 606.45,
+        "scenarios_compared": 5,
+        "scenarios_excluded": 0,
+        "n_scored": 8,
+        "n_excluded_episodes": 2,
+        "excluded_cost_usd": 0.0047,
+        "overhead_components": [
+          "compressor"
+        ],
+        "cost_assumptions": "Arm 'kimi-k3 [llmlingua2-endpoint]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. Optimizer-side inference recorded here covers: compressor. 2 unscored episode(s) were excluded, along with $0.0047 of spend that no completed task is charged for. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    }
+  },
   "notes": [
-    "identity matrix (or its anchor rows) not landed yet: grid charts pending"
+    "truncate/opus-4-8: no scored rows yet, skipped",
+    "truncate/opus-5: no scored rows yet, skipped",
+    "truncate/kimi-k3: no scored rows yet, skipped",
+    "llmlingua2-endpoint/kimi-k2.6: no scored rows yet, skipped",
+    "llmlingua2-endpoint/fable-5: no scored rows yet, skipped",
+    "llmlingua2-endpoint/sonnet-5: no scored rows yet, skipped",
+    "llmlingua2-endpoint/haiku-4-5: no scored rows yet, skipped"
   ]
 }
