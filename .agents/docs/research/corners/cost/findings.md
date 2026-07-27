@@ -48,7 +48,13 @@ Savings behind an optimized endpoint can come from four places. Their current sh
    the pool, so no served token is cheaper today because of training. The distill-only rung
    reads "no measurable effect at this sample size", never a lift and never a regression.
    The student's share stays zero until a cycle gates (K3 teacher escalation is the live
-   candidate, probe authorized, leg gated on Silen).
+   candidate, probe authorized, leg gated on Silen). Teacher-selection economics (which
+   teacher is the cheapest sufficient one, and what a cycle costs to run) are OWNED by the
+   jt/teacher-gate repo function, which consumes the sweep matrix + pool prices: this page
+   cites its verdict once that PR lands and never hand-computes teacher economics. Its
+   price-ordering gets reviewed against the scorecard conventions here (cache-adjusted,
+   per completed unit, chatty-teacher and unscored-spend effects included) when the PR
+   opens.
 4. **Cheap-model-was-already-fine share (the anchor's weakness)**: the share of "savings"
    that any cheap model would have delivered because the anchor is overkill for part of the
    workload. This is real money but not an optimizer achievement, which is why every delta
