@@ -15,7 +15,7 @@ the name and the same six commands apply.
 | 2 | `wmo providers set --pool-model ...` | `.wmo/pool.toml`, the routing candidate roster |
 | 3 | `wmo optimize model tau-bench` | `optimize/matrix.json`, `policy.json` + bank, `optimize/report.json` |
 | 4 (optional) | `wmo optimize distill run --config run.toml` | a run dir, a gate verdict, an adapter |
-| 5 (optional) | `wmo optimize route sweep --compressor ...` | per-arm matrices, a policy stamped with its fit geometry |
+| 5 (optional) | `wmo optimize model --compressor ...` (or the `route sweep`/`route fit` pair) | per-arm matrices, a policy stamped with its fit geometry |
 | 6 | `wmo serve --name tau-bench` | a live endpoint, plus its savings and dial routes |
 
 ## How to read the numbers in this walk
@@ -461,6 +461,10 @@ uv run wmo optimize route fit matrix-c04.json --kind knn \
   --compressor llmlingua2-endpoint --aggressiveness 0.4 \
   --out .wmo/models/tau-bench/policy.json
 ```
+
+`wmo optimize model tau-bench --compressor llmlingua2-endpoint --aggressiveness 0.4` runs that same
+pair end to end (the arm configures its sweep and its fit, and the compact row in the plan table
+names it), which is the one-command way to measure an arm once you know which one you want.
 
 One sweep per arm, one matrix per arm. `--aggressiveness` is a dial in `[0, 1]` where 0.0 is a
 no-op and higher never removes less, but it is not an exact removal fraction: the achieved ratio
