@@ -64,10 +64,12 @@ from wmo.optimize.pipeline import (
     StageDecision,
     StageRecord,
     StageStatus,
+    SweepSpendProjection,
     decide_stage,
     file_sha256,
     forced_stages,
     load_manifest,
+    project_sweep_spend,
 )
 from wmo.optimize.policy import (
     DEFAULT_KNN_Z,
@@ -269,6 +271,10 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     print_tiny_corpus_note(_console, plan)
 
     embedder = EmbedderSpec()
+    # The world-model side of a sweep is not projectable from arithmetic, but once this model has
+    # been swept once its OWN measured ratio is, and it is far too big to leave out of a cap
+    # (7.0x the candidate side on a real tau corpus).
+    projection = project_sweep_spend(plan.total_usd, manifest.record_for(Stage.SWEEP))
     decisions = _plan_stages(
         manifest=manifest,
         paths=paths,
@@ -291,6 +297,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         fallback=fallback,
         anchor=_report_anchor(paths.policy, baseline=baseline, fallback=fallback),
         embedder=embedder,
+        projection=projection,
     )
     if not _confirm(decisions, plan, yes=yes):
         _console.print("nothing was run and nothing was spent")
@@ -308,6 +315,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             ledger=ledger,
             paths=paths,
             plan=plan,
+            projection=projection,
             model_dir=model_dir,
             pool_file=Path(pool_file),
             embedder=embedder,
@@ -576,6 +584,7 @@ def _print_plan(
     fallback: str | None,
     anchor: str,
     embedder: EmbedderSpec,
+    projection: SweepSpendProjection,
 ) -> None:
     """The whole run in one table, printed before anything spends.
 
@@ -626,10 +635,44 @@ def _print_plan(
         )
         return
     console.print(
-        f"\n  estimated total ~${total:.2f} (a projection: {ASSUMED_INPUT_TOKENS:,} input + "
-        f"{ASSUMED_OUTPUT_TOKENS:,} assumed output token(s) per call, times the real cell and "
-        f"call counts, at each candidate's own pool price. The world model's own serve and judge "
-        f"calls are metered separately and are NOT in this figure.)"
+        f"\n  estimated candidate spend ~${total:.2f} (a projection: {ASSUMED_INPUT_TOKENS:,} "
+        f"input + {ASSUMED_OUTPUT_TOKENS:,} assumed output token(s) per call, times the real cell "
+        f"and call counts, at each candidate's own pool price)"
+    )
+    console.print(_world_model_forecast(projection, sweeping=_will_sweep(decisions)))
+
+
+def _will_sweep(decisions: list[StageDecision]) -> bool:
+    return any(decision.stage is Stage.SWEEP and decision.will_run for decision in decisions)
+
+
+def _world_model_forecast(projection: SweepSpendProjection, *, sweeping: bool) -> str:
+    """What to say about the OTHER side of the bill before the operator authorizes the run.
+
+    Two honest answers, never a zero. With a prior sweep of this model there is a measured ratio
+    to forecast from, and the line quotes both the number and the single observation it rests on.
+    Without one the side is simply not projectable, and saying so has to include how large it can
+    be, or "not in this figure" reads as "not much" and the operator plans against the wrong
+    number.
+    """
+    if not sweeping:
+        return (
+            "  the world model's own serve and judge calls are metered separately; no sweep will "
+            "run, so this run adds none of that cost"
+        )
+    if projection.projected:
+        return (
+            f"  plus a projected ~${projection.world_model_usd:.2f} world-model side "
+            f"({projection.basis}), so ~${projection.total_usd:.2f} total is what --max-usd is "
+            "checked against. That half is a forecast from one prior sweep, not arithmetic."
+        )
+    return (
+        "  the world model's own serve and judge calls are NOT in that figure and are not "
+        "projectable before this model's first sweep: nothing predicts the simulator's and the "
+        "judge's token use per episode in advance. It is not a rounding error either, measuring "
+        "7.0x the candidate side on one real tau corpus, so treat the number above as a lower "
+        "bound. Both sides are measured and reported when the sweep finishes, and the next run "
+        "forecasts this line from them."
     )
 
 
@@ -689,6 +732,7 @@ def _run_stages(
     ledger: SpendLedger,
     paths: _RunPaths,
     plan: SweepPlan,
+    projection: SweepSpendProjection,
     model_dir: Path,
     pool_file: Path,
     embedder: EmbedderSpec,
@@ -713,7 +757,7 @@ def _run_stages(
         )
         match decision.stage:
             case Stage.SWEEP:
-                ledger.check(Stage.SWEEP, plan.total_usd)
+                ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
                 record = _stage_sweep(
                     plan,
                     model_dir=model_dir,

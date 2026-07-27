@@ -336,7 +336,7 @@ def test_one_command_lands_every_artifact_where_serving_reads_it(
     assert _says(result.output, "optimize model: support")
     for stage in ("preflight", "sweep", "fit", "tune", "report"):
         assert stage in _flat(result.output)
-    assert _says(result.output, "estimated total")
+    assert _says(result.output, "estimated candidate spend")
     assert _says(result.output, "serve it:   wmo serve --name support")
     assert _says(result.output, 'POST /v1/chat/completions  (model="support")')
     assert "quality" in _flat(result.output) and "latency" in _flat(result.output)
@@ -362,7 +362,7 @@ def test_a_second_run_skips_every_stage_and_says_why(
     assert _says(again.output, "report.json is current")
     assert "everystageiscurrent" in flat
     # A run with nothing to do asks nothing and spends nothing.
-    assert "estimatedtotal" not in flat
+    assert "estimatedcandidatespend" not in flat
 
 
 def test_force_from_sweep_redoes_the_sweep_and_everything_after_it(
@@ -547,7 +547,7 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     assert _says(result.output, "knn (guarded, fallback best single on the sweep)")
     assert _says(result.output, "cost_quality 0.25 (Balanced (default))")
     assert "aprojection" in flat and "assumedoutputtoken" in flat
-    assert _says(result.output, "are NOT in this figure")
+    assert _says(result.output, "are NOT in that figure")
 
 
 def test_an_unscored_sweep_withholds_the_fit_and_keeps_the_matrix(
@@ -807,5 +807,84 @@ def test_a_candidate_only_cap_would_have_let_that_second_sweep_through(
     assert _run(tmp_path, root, "--yes", "--max-usd", "0.60").exit_code == 0
     after_first = len(world_model.tasks)
     again = _run(tmp_path, root, "--yes", "--max-usd", "0.60", "--force-from", "sweep")
+    assert again.exit_code == 0, again.output
+    assert len(world_model.tasks) > after_first
+
+
+def test_the_first_sweep_says_the_world_model_side_is_not_projectable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before a model's first sweep there is nothing to forecast from, and silence would mislead.
+
+    "Not in this figure" reads as "not much" unless the line says how large that side can get:
+    measured 7.0x the candidate side on a real tau corpus. So the caveat states both that it is
+    unprojectable and that the printed total is a lower bound.
+    """
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    answer = _Answer(False)
+    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    result = _run(tmp_path, root)
+    assert result.exit_code == 0, result.output
+    assert _says(result.output, "not projectable before this model's first sweep")
+    assert _says(result.output, "7.0x the candidate side")
+    assert _says(result.output, "treat the number above as a lower bound")
+    # No forecast is invented, and the run still proceeds to the confirmation.
+    assert "projected~$" not in _flat(result.output)
+    assert answer.asked
+
+
+def test_a_second_sweep_forecasts_the_world_model_side_from_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once this model has been swept, its OWN measured ratio is the honest basis for a forecast."""
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.02)
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 0
+    # First sweep: $0.00132 candidate, $0.12 world model, a ratio of ~90.9x.
+    forced = _run(tmp_path, root, "--yes", "--force-from", "sweep")
+    assert forced.exit_code == 0, forced.output
+    assert _says(forced.output, "plus a projected ~$30.00 world-model side")
+    assert _says(forced.output, "measured $0.1200 world-model against $0.0013 candidate")
+    assert _says(forced.output, "90.9x")
+    assert _says(forced.output, "a forecast from one prior sweep, not arithmetic")
+
+
+def test_the_forecast_stops_a_sweep_a_candidate_only_cap_would_have_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the allowance: the cap sees the money before it is spent, not after.
+
+    The candidate projection alone is $0.33, so a $5 cap clears it easily and the sweep would
+    start. The first sweep measured a 90.9x world-model ratio, which forecasts ~$30 for the same
+    grid, so the run stops BEFORE buying any of it and says what the forecast rests on.
+    """
+    world_model = _patch_seams(
+        monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.02
+    )
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 0
+    after_first = len(world_model.tasks)
+
+    stopped = _run(tmp_path, root, "--yes", "--max-usd", "5", "--force-from", "sweep")
+    assert stopped.exit_code == 1, stopped.output
+    assert len(world_model.tasks) == after_first  # not one episode bought
+    assert _says(stopped.output, "stopped at the spend cap")
+    assert _says(stopped.output, "projection basis: the last sweep of this model measured")
+    assert _says(stopped.output, "wmo optimize model support --max-usd <more>")
+
+
+def test_without_the_forecast_that_same_cap_would_not_have_stopped_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control: with no world-model spend to learn a ratio from, $5 clears $0.33."""
+    world_model = _patch_seams(
+        monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.0
+    )
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 0
+    after_first = len(world_model.tasks)
+    again = _run(tmp_path, root, "--yes", "--max-usd", "5", "--force-from", "sweep")
     assert again.exit_code == 0, again.output
     assert len(world_model.tasks) > after_first

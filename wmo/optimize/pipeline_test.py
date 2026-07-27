@@ -22,6 +22,7 @@ from wmo.optimize.pipeline import (
     file_sha256,
     forced_stages,
     load_manifest,
+    project_sweep_spend,
 )
 
 
@@ -230,3 +231,76 @@ def test_the_reserved_slots_are_named_but_not_built() -> None:
     order = list(STAGE_ORDER)
     assert order.index(Stage.SWEEP) < order.index(Stage.COMPACT) < order.index(Stage.FIT)
     assert order.index(Stage.SWEEP) < order.index(Stage.DISTILL)
+
+
+def _sweep_record(*, candidate: float, world_model: float) -> StageRecord:
+    return StageRecord(
+        stage=Stage.SWEEP,
+        fingerprint={"pool": "abc"},
+        completed_at="2026-07-27T00:00:00+00:00",
+        spend_usd=candidate,
+        world_model_spend_usd=world_model,
+    )
+
+
+def test_with_no_prior_sweep_the_world_model_side_is_not_projected() -> None:
+    # Not projected is not "projected to be zero": the caller prints a caveat instead of adding
+    # a number it cannot justify. Nothing predicts the simulator's token use before it runs.
+    projection = project_sweep_spend(4.0, None)
+    assert projection.candidate_usd == 4.0
+    assert projection.world_model_usd == 0.0
+    assert projection.basis is None and not projection.projected
+    assert projection.total_usd == 4.0
+
+
+def test_a_prior_sweep_projects_the_world_model_side_from_its_measured_ratio() -> None:
+    # The drive's real numbers: $1.8076 world-model against $0.2581 candidate is 7.0x, so a
+    # second sweep of the same size is forecast at ~8x the candidate figure in total. A cap that
+    # counted only the candidate side would miss almost all of that.
+    projection = project_sweep_spend(0.2581, _sweep_record(candidate=0.2581, world_model=1.8076))
+    assert projection.world_model_usd == pytest.approx(1.8076)
+    assert projection.total_usd == pytest.approx(2.0657)
+    assert projection.basis is not None
+    assert "7.0x" in projection.basis
+    # Four decimals: a sub-cent side must not render as "$0.00" beside a nonzero ratio.
+    assert "$1.8076" in projection.basis and "$0.2581" in projection.basis
+
+
+def test_the_projection_scales_with_the_size_of_the_sweep_being_planned() -> None:
+    # The ratio is the transferable part, not the absolute: a sweep twice the size is forecast
+    # at twice the world-model cost.
+    prior = _sweep_record(candidate=1.0, world_model=7.0)
+    assert project_sweep_spend(2.0, prior).world_model_usd == pytest.approx(14.0)
+
+
+def test_a_prior_whose_candidate_side_measured_zero_supplies_no_ratio() -> None:
+    # Dividing by it is undefined, and carrying its world-model figure over as an absolute would
+    # forecast this sweep from another sweep's SIZE rather than its shape.
+    projection = project_sweep_spend(4.0, _sweep_record(candidate=0.0, world_model=9.0))
+    assert projection.basis is None and projection.world_model_usd == 0.0
+
+
+def test_a_prior_record_for_another_stage_is_not_a_sweep_basis() -> None:
+    fit = StageRecord(
+        stage=Stage.FIT, fingerprint={}, completed_at="2026-07-27T00:00:00+00:00", spend_usd=1.0
+    )
+    assert project_sweep_spend(4.0, fit).basis is None
+
+
+def test_the_cap_message_names_the_basis_of_a_forecast_it_stopped_on() -> None:
+    # An operator told a run cannot start is owed the reasoning, especially when half the figure
+    # is a forecast from one prior observation rather than arithmetic.
+    ledger = SpendLedger(max_usd=1.0)
+    with pytest.raises(BudgetExceeded) as caught:
+        ledger.check(Stage.SWEEP, 2.07, basis="the last sweep measured 7.0x")
+    assert "projection basis: the last sweep measured 7.0x" in str(caught.value)
+
+
+def test_a_sub_cent_candidate_side_is_not_rendered_as_zero_in_the_basis() -> None:
+    # A basis reading "$0.12 world-model against $0.00 candidate (90.9x)" contradicts itself and
+    # reads as the divide-by-zero case this function refuses to do, so an operator would take a
+    # working forecast for a bug.
+    basis = project_sweep_spend(1.0, _sweep_record(candidate=0.00132, world_model=0.12)).basis
+    assert basis is not None
+    assert "$0.00 candidate" not in basis
+    assert "$0.0013 candidate" in basis

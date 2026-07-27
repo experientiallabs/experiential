@@ -300,6 +300,66 @@ def _short(value: str) -> str:
     return value if len(value) <= _SHOWN else f"{value[:_SHOWN]}…"
 
 
+class SweepSpendProjection(BaseModel):
+    """What a sweep is projected to spend on BOTH sides, and what that projection rests on.
+
+    The candidate side is projectable from arithmetic: real cell and call counts times an assumed
+    per-call token budget at each entry's own price. The world-model side is not, because nothing
+    predicts how many tokens the simulator and its judge will spend on an episode before the
+    episode runs. It is also not small: measured on a real tau corpus it was 7.0x the candidate
+    side ($1.81 against $0.26), so treating it as zero makes a spend cap that misses most of the
+    money.
+
+    What IS available, once a model has been swept even once, is that model's own measured ratio.
+    Projecting this sweep's world-model side as `candidate x (prior world-model / prior candidate)`
+    is a forecast from one prior observation, so `basis` says exactly which one and a caller
+    quotes it wherever the number appears. With no usable prior the world-model side is 0.0 and
+    `basis` is None, which means "not projected", never "projected to be free".
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    candidate_usd: float
+    world_model_usd: float
+    basis: str | None
+
+    @property
+    def total_usd(self) -> float:
+        return self.candidate_usd + self.world_model_usd
+
+    @property
+    def projected(self) -> bool:
+        """Whether the world-model side rests on evidence rather than being left out."""
+        return self.basis is not None
+
+
+def project_sweep_spend(candidate_usd: float, prior: StageRecord | None) -> SweepSpendProjection:
+    """Project a sweep's total spend, using a prior sweep's measured ratio when there is one.
+
+    `prior` is the manifest's own record of the last completed sweep OF THIS MODEL, which is the
+    only place both sides of that sweep were recorded together (the persisted `kind="sweep"` run
+    record holds the world-model side alone, so it cannot supply a ratio by itself).
+
+    A prior whose candidate side measured zero cannot supply a ratio at all: dividing by it would
+    be undefined, and treating the world-model figure as an absolute carry-over would forecast
+    this sweep from another sweep's size rather than its shape. That case reports "not projected".
+    """
+    if prior is None or prior.stage is not Stage.SWEEP or prior.spend_usd <= 0.0:
+        return SweepSpendProjection(candidate_usd=candidate_usd, world_model_usd=0.0, basis=None)
+    ratio = prior.world_model_spend_usd / prior.spend_usd
+    return SweepSpendProjection(
+        candidate_usd=candidate_usd,
+        world_model_usd=candidate_usd * ratio,
+        # Four decimals, not two: a candidate side under a cent rounds to "$0.00" at two, and a
+        # line reading "measured $0.12 world-model against $0.00 candidate (90.9x)" contradicts
+        # itself and looks exactly like the divide-by-zero this function refuses to do.
+        basis=(
+            f"the last sweep of this model measured ${prior.world_model_spend_usd:.4f} "
+            f"world-model against ${prior.spend_usd:.4f} candidate ({ratio:.1f}x)"
+        ),
+    )
+
+
 class BudgetExceeded(Exception):
     """The run's spend cap would be crossed by the next stage, so the run stops cleanly."""
 
@@ -329,8 +389,12 @@ class SpendLedger(BaseModel):
         """Add a completed stage's measured spend to the run's total."""
         self.spent_usd += amount
 
-    def check(self, stage: Stage, estimate_usd: float) -> None:
+    def check(self, stage: Stage, estimate_usd: float, *, basis: str | None = None) -> None:
         """Refuse to start `stage` when its projection would carry the run past the cap.
+
+        `basis` names where a projection that is not pure arithmetic came from, and is quoted in
+        the stop message: an operator told a run cannot start is owed the reasoning, especially
+        when part of the figure is a forecast from one prior observation.
 
         Raises:
             BudgetExceeded: The cap is set and would be crossed, with the arithmetic quoted.
@@ -341,5 +405,5 @@ class SpendLedger(BaseModel):
             raise BudgetExceeded(
                 f"stage '{stage.value}' is projected at ${estimate_usd:.2f} and this run has "
                 f"spent ${self.spent_usd:.2f} of its ${self.max_usd:.2f} cap, so starting it "
-                "would cross the cap"
+                "would cross the cap" + (f" (projection basis: {basis})" if basis else "")
             )
