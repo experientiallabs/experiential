@@ -2008,24 +2008,44 @@ def test_missing_suite_corpus_names_the_download_command(
 def test_missing_corpus_names_the_files_the_download_will_not_produce(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A suite may list several `files`. `wmo download` writes the corpus and its data dirs into
-    # the bundle dir and nowhere else, so a second file outside it survives the fetch: naming the
-    # download alone would send the user back to the identical error.
+    # A suite may list several `files`. A fetch writes the canonical corpus and the payloads under
+    # the benchmark's registered `data_dirs` — nothing else, not even a sibling in the bundle dir —
+    # so naming the download alone would send the user back to the identical error.
     examples_root = tmp_path / "environment-capture-data"
-    evals_dir = examples_root / "tau-bench" / "evals"
+    evals_dir = examples_root / "bird-sql" / "evals"
     evals_dir.mkdir(parents=True)
-    outside = tmp_path / "extra" / "more.otel.jsonl"
+    sibling = examples_root / "bird-sql" / "extra.otel.jsonl"
     (evals_dir / "default.toml").write_text(
-        f'files = ["../traces.otel.jsonl", "{outside}"]\n', encoding="utf-8"
+        'files = ["../traces.otel.jsonl", "../extra.otel.jsonl"]\n', encoding="utf-8"
     )
     monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
 
-    result = runner.invoke(app, ["eval", "run", "tau-bench", "--examples-root", str(examples_root)])
+    result = runner.invoke(app, ["eval", "run", "bird-sql", "--examples-root", str(examples_root)])
     assert result.exit_code == 2, result.output
     flat = _flat(result.output)
-    assert "wmo download tau-bench" in flat
+    assert "wmo download bird-sql" in flat
     assert "will not produce" in flat
-    assert str(outside) in _squashed(result.output)
+    assert str(sibling) in _squashed(result.output)
+
+
+def test_missing_corpus_under_a_registered_data_dir_keeps_the_plain_download_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The flip side: `wmo download bird-sql` really does write its `gold/` payload, so a suite
+    # listing a file there is fully repaired by the fetch and must not be talked out of running it.
+    examples_root = tmp_path / "environment-capture-data"
+    evals_dir = examples_root / "bird-sql" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir / "default.toml").write_text(
+        'files = ["../traces.otel.jsonl", "../gold/answers.jsonl"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
+
+    result = runner.invoke(app, ["eval", "run", "bird-sql", "--examples-root", str(examples_root)])
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "wmo download bird-sql" in flat
+    assert "will not produce" not in flat
 
 
 def test_missing_corpus_for_an_unpublished_bundle_does_not_promise_a_download(

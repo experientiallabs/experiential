@@ -1702,6 +1702,24 @@ def _no_suites_hint(examples_roots: list[str]) -> str:
     )
 
 
+def _fetch_writes(path: Path, spec: object | None, fetched: Path | None) -> bool:
+    """Would `wmo download <benchmark>` put a file at `path`?
+
+    `fetch_corpus` writes the canonical corpus file plus whatever lives under the benchmark's
+    registered `data_dirs`, and nothing else — not every path in the bundle dir. `data_dirs` is
+    read defensively for the same reason as `published`: the wheel resolves environment-capture
+    from PyPI, so the installed member may predate the field, and guessing "nothing but the
+    corpus" errs toward naming a file the fetch would have produced rather than promising one
+    it never will.
+    """
+    if fetched is None:
+        return False
+    if path == fetched.resolve():
+        return True
+    bundle = fetched.parent.resolve()
+    return any(path.is_relative_to(bundle / name) for name in getattr(spec, "data_dirs", ()))
+
+
 def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     """The suite's trace files, or a usage error naming the command that fetches them.
 
@@ -1720,10 +1738,11 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     that predates the field keeps the old assume-downloadable behaviour instead of raising
     `AttributeError` inside the error path.
 
-    A suite may list several `files`, and a fetch writes the corpus and its data dirs into the
-    bundle dir and nowhere else, so any missing path outside that dir survives the download. Those
-    are named too: `wmo download` is still the right first step, but on its own it would leave the
-    suite failing on exactly the same line.
+    A suite may list several `files`, and a fetch writes exactly two things: the canonical corpus
+    file, and the payloads under the benchmark's registered `data_dirs`. Anything else the suite
+    asks for survives the download — including a sibling in the bundle dir that is not one of
+    those payloads — so those paths are named too. `wmo download` is still the right first step;
+    on its own it would leave the suite failing on exactly the same line.
     """
     files = suite.resolve_files()
     if not files:
@@ -1736,11 +1755,7 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
         fetched = corpus_path(suite.example) if spec is not None else None
         resolved = [path.resolve() for path in missing]
         on_path = fetched is not None and fetched.resolve() in resolved
-        elsewhere = (
-            [p for p in resolved if not p.is_relative_to(fetched.parent.resolve())]
-            if fetched is not None
-            else resolved
-        )
+        elsewhere = [p for p in resolved if not _fetch_writes(p, spec, fetched)]
         if on_path and getattr(spec, "published", True):
             remedy = (
                 f"fetch the bundle with `wmo download {suite.example}` (or `wmo download` with "
