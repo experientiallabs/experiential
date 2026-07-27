@@ -32,6 +32,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
@@ -173,17 +174,30 @@ class EpisodeProxy:
 
     host: str = "127.0.0.1"
     _providers: dict[str, ToolCallingProvider] = field(default_factory=dict)
+    _prompt_sinks: dict[str, Path] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _server: uvicorn.Server | None = None
     _thread: threading.Thread | None = None
     _port: int | None = None
 
-    def register(self, alias: str, provider: ToolCallingProvider) -> None:
+    def register(
+        self,
+        alias: str,
+        provider: ToolCallingProvider,
+        *,
+        system_prompt_sink: Path | None = None,
+    ) -> None:
         """Route requests for model `alias` to `provider`.
 
         Args:
             alias: The episode's model alias (sent by tau2 as the request `model`).
             provider: The episode's span-recording provider.
+            system_prompt_sink: Optional file to write the episode's system
+                prompt to, verbatim, on the first request that carries one. The
+                agent scaffold's system prompt is not recorded in tau2's own
+                results (only the domain policy is), and off-policy replay of
+                this episode's TEXT needs the exact prompt its turns were
+                conditioned on, so it is captured here where it is exact.
 
         Raises:
             ValueError: If the alias is empty or already registered; alias reuse
@@ -198,11 +212,34 @@ class EpisodeProxy:
                     "needs its own alias so its spans land on its own recorder"
                 )
             self._providers[alias] = provider
+            if system_prompt_sink is not None:
+                self._prompt_sinks[alias] = system_prompt_sink
 
     def release(self, alias: str) -> None:
         """Drop the provider routed as `alias` (idempotent)."""
         with self._lock:
             self._providers.pop(alias, None)
+            self._prompt_sinks.pop(alias, None)
+
+    def _capture_system_prompt(self, alias: str, request: ChatRequest) -> None:
+        """Write this episode's system prompt to its sink, once, best effort.
+
+        A capture failure must never cost the episode: the prompt is provenance
+        for later off-policy replay, not something the rollout depends on.
+        """
+        with self._lock:
+            sink = self._prompt_sinks.pop(alias, None)
+        if sink is None:
+            return
+        system = next((m for m in request.messages if m.role == "system"), None)
+        content = system.content if system is not None else None
+        if not isinstance(content, str) or not content:
+            return
+        try:
+            sink.parent.mkdir(parents=True, exist_ok=True)
+            sink.write_text(content, encoding="utf-8")
+        except OSError as error:  # pragma: no cover - defensive
+            logger.warning("could not record %s's system prompt to %s: %s", alias, sink, error)
 
     @property
     def base_url(self) -> str:
@@ -220,9 +257,10 @@ class EpisodeProxy:
         # not serialize behind one event loop.
         @app.post("/v1/chat/completions")
         def chat_completions(payload: JsonObject) -> JSONResponse:
-            alias = payload.get("model")
+            raw_alias = payload.get("model")
+            alias = raw_alias if isinstance(raw_alias, str) else ""
             with self._lock:
-                provider = self._providers.get(alias) if isinstance(alias, str) else None
+                provider = self._providers.get(alias) if alias else None
             if provider is None:
                 return JSONResponse(
                     status_code=404,
@@ -238,6 +276,7 @@ class EpisodeProxy:
                 )
             try:
                 chat_request = ChatRequest.model_validate(payload)
+                self._capture_system_prompt(alias, chat_request)
                 response = provider.complete_chat(chat_request)
                 realign_tool_argument_types(response, chat_request.tools)
             except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502

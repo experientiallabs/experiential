@@ -54,11 +54,15 @@ from collections.abc import Callable, Sequence
 from hashlib import blake2s
 from pathlib import Path
 
+from llm_waterfall.types import ChatFunctionCall, ChatMessage, ChatToolCall
+from pydantic import JsonValue
+
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig
 from wmo.distill.data import CONTEXT_OVERFLOW_STOP_REASON
 from wmo.distill.rollouts import RolloutStats, rollout_stats
 from wmo.distill.tau2_proxy import EpisodeProxy
+from wmo.distill.text_episodes import TAU2_TERMINATION_STOP_REASONS, TeacherEpisode
 from wmo.distill.tokens import TrialRecord, load_trial_spans
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.runtime import StopReason
@@ -82,6 +86,12 @@ split raises on the missing ids (see
 RESULTS_FILENAME = "results.json"
 SPANS_SINK_DIR = "spans"
 PROVIDER_SNAPSHOT_FILENAME = "provider.json"
+SYSTEM_PROMPT_FILENAME = "system-prompt.txt"
+"""The episode's exact agent system prompt, captured by the proxy.
+
+tau2's own results record the domain POLICY but not the scaffold's assembled
+system prompt, and off-policy replay of an episode's text needs the exact
+prompt its turns were conditioned on (see `episodes_from_tau2_results`)."""
 RUNNER_LOG_FILENAME = "tau2.log"
 
 _SUBPROCESS_KILL_MARGIN_S = 120.0
@@ -543,7 +553,11 @@ async def _run_batch(
             json.dumps(_provider_snapshot(provider_config), sort_keys=True),
             encoding="utf-8",
         )
-        proxy.register(spec.name, provider)
+        proxy.register(
+            spec.name,
+            provider,
+            system_prompt_sink=spec.episode_dir / SYSTEM_PROMPT_FILENAME,
+        )
         try:
             await _run_episode_subprocess(spec, cfg, proxy.base_url)
         except asyncio.CancelledError:
@@ -626,3 +640,177 @@ def _log_batch_health(step_name: str, stats: RolloutStats) -> None:
             step_name,
             stats.stop_reason_counts,
         )
+
+
+def episodes_from_tau2_results(
+    results_path: Path,
+    *,
+    teacher_model: str,
+    task_id: str,
+    attempt: int = 1,
+    system_prompt: str | None = None,
+) -> list[TeacherEpisode]:
+    """Read a tau2 `results.json` back as text episodes for off-policy training.
+
+    The reverse direction of this module: instead of driving episodes, this
+    reads ones that already ran (by ANY provider, including ones with no
+    logprob surface) so their transcripts can train a student through the text
+    bridge (`wmo.distill.text_episodes`). That is what makes a hosted teacher
+    like Kimi K3 usable as a distillation teacher at all.
+
+    tau2's recorded message shape is close to OpenAI's but not identical, and
+    the differences are load-bearing: its tool calls are flat
+    (`{id, name, arguments}` with arguments as an OBJECT, not a JSON string
+    inside `function`), and its tool results key the call by `id` rather than
+    `tool_call_id`. Both are converted here so the renderer sees canonical
+    chat messages.
+
+    Args:
+        results_path: A tau2 `results.json` (one simulation per file, as this
+            collector writes them).
+        teacher_model: The model that produced the assistant turns; recorded as
+            provenance and checked against the manifest's teacher identity.
+        task_id: The composite `domain/task_id` this episode ran.
+        attempt: 1-based attempt index within the task.
+        system_prompt: The agent system prompt these turns were conditioned on.
+            Required in substance, not in form: when omitted, the episode dir's
+            captured `system-prompt.txt` is used (exact, written by the proxy
+            for episodes this collector ran), else tau2's recorded domain
+            policy wrapped in its own `<policy>` framing, which is the policy
+            without the scaffold's instruction block. An episode with none of
+            the three is SKIPPED rather than trained with no policy context: a
+            student taught to act without its policy would be trained on
+            prompts it will never see at serving time.
+
+    Returns:
+        One episode per graded simulation in the file (empty when the file
+        holds no simulation, the simulation has no verifier evidence, its
+        transcript carries no assistant turn, or no system prompt could be
+        resolved: none of those are training material).
+
+    Raises:
+        ValueError: If the file is unreadable or not tau2 results JSON.
+    """
+    try:
+        payload = json.loads(results_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read tau2 results from {results_path}: {error}") from error
+    simulations = payload.get("simulations") if isinstance(payload, dict) else None
+    if not isinstance(simulations, list):
+        raise ValueError(f"{results_path} is not tau2 results JSON (no simulations list)")
+
+    episodes: list[TeacherEpisode] = []
+    for simulation in simulations:
+        if not isinstance(simulation, dict):
+            continue
+        reward_info = simulation.get("reward_info")
+        reward = reward_info.get("reward") if isinstance(reward_info, dict) else None
+        termination = simulation.get("termination_reason")
+        if not isinstance(reward, int | float) or termination == "infrastructure_error":
+            logger.debug("skipping ungraded simulation in %s", results_path)
+            continue
+        messages = _chat_messages_from_tau2(simulation.get("messages"))
+        if not any(message.role == "assistant" for message in messages):
+            logger.debug("skipping transcript with no assistant turn in %s", results_path)
+            continue
+        resolved_prompt = system_prompt or _resolve_system_prompt(results_path, simulation)
+        if resolved_prompt is None:
+            logger.warning(
+                "skipping %s attempt %d: no system prompt could be resolved (no captured "
+                "%s beside the results, and the simulation records no policy), and "
+                "training on prompts missing the agent's policy context would teach the "
+                "student a task it never faces at serving time",
+                task_id,
+                attempt,
+                SYSTEM_PROMPT_FILENAME,
+            )
+            continue
+        if messages and messages[0].role != "system":
+            messages.insert(0, ChatMessage(role="system", content=resolved_prompt))
+        episodes.append(
+            TeacherEpisode(
+                task_id=task_id,
+                attempt=attempt,
+                messages=messages,
+                reward=max(0.0, min(1.0, float(reward))),
+                passed=float(reward) >= 1.0 - 1e-9,
+                teacher_model=teacher_model,
+                source=f"tau2:{results_path.name}",
+                stop_reason=(
+                    TAU2_TERMINATION_STOP_REASONS.get(termination)
+                    if isinstance(termination, str)
+                    else None
+                ),
+            )
+        )
+    return episodes
+
+
+def _resolve_system_prompt(results_path: Path, simulation: JsonObject) -> str | None:
+    """The episode's system prompt: captured if available, else the recorded policy.
+
+    The captured file is exact (the proxy wrote what the scaffold actually
+    sent). The recorded `policy` is tau2's domain policy only, so it is wrapped
+    in the same `<policy>` framing tau2's own template uses and is honestly a
+    reconstruction: it lacks the instruction block.
+    """
+    captured = results_path.parent / SYSTEM_PROMPT_FILENAME
+    try:
+        text = captured.read_text(encoding="utf-8").strip()
+    except OSError:
+        text = ""
+    if text:
+        return text
+    policy = simulation.get("policy")
+    if isinstance(policy, str) and policy.strip():
+        return f"<policy>\n{policy.strip()}\n</policy>"
+    return None
+
+
+def _chat_messages_from_tau2(messages: JsonValue) -> list[ChatMessage]:
+    """Convert tau2's recorded messages into canonical chat messages.
+
+    Drops nothing and invents nothing: every recorded turn becomes a message,
+    with tau2's flat tool calls nested under `function` (arguments JSON-encoded,
+    as the chat format requires) and tool results keyed by `tool_call_id`.
+    """
+    if not isinstance(messages, list):
+        return []
+    out: list[ChatMessage] = []
+    for raw in messages:
+        if not isinstance(raw, dict):
+            continue
+        role = raw.get("role")
+        if role not in ("system", "user", "assistant", "tool"):
+            continue
+        content = raw.get("content")
+        tool_calls: list[ChatToolCall] = []
+        for call in raw.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            arguments = call.get("arguments")
+            tool_calls.append(
+                ChatToolCall(
+                    id=str(call.get("id") or f"call_{len(tool_calls)}"),
+                    function=ChatFunctionCall(
+                        name=str(call.get("name") or ""),
+                        # The chat format carries arguments as a JSON STRING;
+                        # tau2 records them as an object.
+                        arguments=(
+                            arguments
+                            if isinstance(arguments, str)
+                            else json.dumps(arguments if arguments is not None else {})
+                        ),
+                    ),
+                )
+            )
+        out.append(
+            ChatMessage(
+                role=role,
+                content=content if isinstance(content, str) else None,
+                tool_calls=tool_calls or None,
+                # tau2 keys a tool result by the call's own `id`.
+                tool_call_id=str(raw["id"]) if role == "tool" and raw.get("id") else None,
+            )
+        )
+    return out

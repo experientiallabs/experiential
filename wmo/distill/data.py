@@ -111,6 +111,17 @@ class TrainDatum(BaseModel):
     topk-CE replicas: the renormalized teacher probability of this replica's
     candidate at each loss position, 0.0 everywhere else."""
 
+    hard_targets_only: bool = False
+    """True when this datum's `sampled_logprobs` are placeholders, not real ones.
+
+    Carried up from any contributing span's `TokenSpan.logprobs_are_placeholders`
+    (the text bridge re-encodes a teacher's recorded text under the student's
+    template, so its token ids are real targets that no sampler scored). The
+    tokens are sound supervision for hard-target cross_entropy, which never
+    sends logprobs; the advantage losses derive `teacher_lp - sampled_lp` from
+    them, so `attach_advantages` refuses these datums instead of quietly
+    training against a fabricated baseline."""
+
     @model_validator(mode="after")
     def _check_alignment(self) -> TrainDatum:
         """Reject any misalignment between the token sequence and its per-token lists."""
@@ -259,6 +270,9 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
     tokens: list[int] = []
     mask: list[float] = []
     logprobs: list[float] = []
+    # One flag per fragment: any contributing span with placeholder logprobs
+    # taints the whole datum, because a fragment is trained as one sequence.
+    placeholders = [False]
 
     def flush() -> None:
         if not tokens:
@@ -277,11 +291,13 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
                     model_input_tokens=list(tokens),
                     loss_mask=list(mask),
                     sampled_logprobs=list(logprobs),
+                    hard_targets_only=placeholders[0],
                 )
             )
         tokens.clear()
         mask.clear()
         logprobs.clear()
+        placeholders[0] = False
 
     for span in sorted(spans, key=lambda item: item.call_index):
         prompt = span.prompt_token_ids
@@ -296,6 +312,8 @@ def _merge_trial_spans(trial_name: str, spans: Sequence[TokenSpan]) -> list[Trai
         tokens.extend(span.sampled_token_ids)
         mask.extend([1.0] * len(span.sampled_token_ids))
         logprobs.extend(span.sampled_logprobs)
+        if span.logprobs_are_placeholders:
+            placeholders[0] = True
     flush()
     return datums
 
@@ -450,6 +468,20 @@ def attach_advantages(
         raise ValueError(
             f"got {len(teacher_logprobs)} teacher logprob list(s) for {len(datums)} "
             "datum(s); pass exactly one per-position list per datum, in datum order"
+        )
+    hard_target_datums = [datum for datum in datums if datum.hard_targets_only]
+    if hard_target_datums:
+        # These datums' sampled_logprobs are placeholders (text-derived spans),
+        # so `teacher_lp - sampled_lp` below would measure the gap against a
+        # fabricated baseline. Refusing is the point of the flag: hard-target
+        # cross_entropy is the only sound consumer of re-encoded teacher text.
+        names = sorted({datum.trial_name for datum in hard_target_datums})
+        raise ValueError(
+            f"{len(hard_target_datums)} datum(s) carry placeholder logprobs "
+            f"(trial(s) {', '.join(names[:5])}); they came from re-encoded teacher TEXT "
+            "and no sampler scored their tokens, so an advantage loss would train "
+            "against a fabricated baseline. Train them with cross_entropy (the warmup "
+            "or off-policy phase), or collect real sampled spans for on-policy steps"
         )
     clip = cfg.train.advantage_clip
     kept: list[TrainDatum] = []
