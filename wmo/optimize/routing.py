@@ -13,9 +13,10 @@ github.com/ZhangYiqun018/Avengers, core/generate_rank_router.py), stage by stage
 
 Deliberate deltas from the reference, both recorded here so the post-hoc comparison audit has
 the list in one place: (a) rewards may be graded, not just 0/1; (b) clusters get a
-human-readable label (majority scenario-id prefix) for the request log; the reference has no
-labels. Cost plays NO part in fitting, exactly like the reference; the cost-aware variant
-(Avengers-Pro's alpha) is the first planned variation AFTER replication is validated.
+human-readable label for the request log (the majority scenario-id prefix, or the cluster's
+distinctive c-TF-IDF terms when the ids carry no prefix; see `wmo.optimize.cluster_labels`); the
+reference has no labels. Cost plays NO part in fitting, exactly like the reference; the cost-aware
+variant (Avengers-Pro's alpha) is the first planned variation AFTER replication is validated.
 
 `evaluate_policy` replays a policy of ANY kind (static, rank, knn) over a matrix through the same
 decision code serving uses, so benchmark numbers measure the deployed selection path, not a
@@ -34,6 +35,7 @@ from pydantic import BaseModel
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import Normalizer
 
+from wmo.optimize.cluster_labels import label_clusters
 from wmo.optimize.policy import (
     DEFAULT_BETA,
     DEFAULT_RANK,
@@ -158,9 +160,15 @@ def fit_rank_policy(
     sums: dict[int, dict[str, tuple[float, float, int]]] = {c: {} for c in range(k)}
     counts: Counter[int] = Counter(cluster_of.values())
     prefix_counts: dict[int, Counter[str]] = {c: Counter() for c in range(k)}
+    member_texts: dict[int, list[str]] = {c: [] for c in range(k)}
     for sid, cluster in cluster_of.items():
+        member_texts[cluster].append(scenario_tasks[sid])
         if ":" in sid:
             prefix_counts[cluster][sid.split(":", 1)[0]] += 1
+    # Fallback labels for prefix-less ids, which is what a corpus built from real traces has
+    # (scenarios are keyed by trace hash): the distinctive c-TF-IDF terms of each cluster's task
+    # texts. A majority prefix still wins where one exists. Labels never affect selection.
+    text_labels = label_clusters([member_texts[c] for c in range(k)])
     pool_order = {entry.name: index for index, entry in enumerate(matrix.pool)}
     total_cost = 0.0
     total_count = 0
@@ -203,7 +211,7 @@ def fit_rank_policy(
                 min_support=min_support,
                 guard_margin=guard_margin,
             )
-        label = ""
+        label = text_labels[cluster]
         if prefix_counts[cluster]:
             label = prefix_counts[cluster].most_common(1)[0][0]
         clusters.append(

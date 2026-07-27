@@ -329,3 +329,37 @@ def test_route_scenarios_rejects_repeated_ids() -> None:
     ids = matrix.scenario_ids()
     with pytest.raises(ValueError, match="scenario ids repeat"):
         route_scenarios(policy, matrix, [*ids, ids[0]])
+def _prefixless_matrix() -> OutcomeMatrix:
+    """The same corpus keyed by trace hash, which is what a real-trace build produces."""
+    outcomes: list[ScenarioOutcome] = []
+    for group, tasks in [("sql", _SQL_TASKS), ("prose", _PROSE_TASKS)]:
+        for index, task in enumerate(tasks):
+            for model in ["sql-model", "prose-model"]:
+                wins = (model == "sql-model") == (group == "sql")
+                outcomes.append(
+                    ScenarioOutcome(
+                        # No `prefix:`, so the majority-prefix label finds nothing.
+                        scenario_id=f"{group}{index:04x}",
+                        task=task,
+                        model=model,
+                        reward=1.0 if wins else 0.0,
+                        success=wins,
+                        cost_usd=0.001,
+                    )
+                )
+    return OutcomeMatrix(pool=_entries(), outcomes=outcomes)
+
+
+def test_prefix_less_clusters_get_c_tf_idf_labels_instead_of_nothing() -> None:
+    # Before the fallback every cluster of a real-trace corpus was labeled "", which made the
+    # request log's "why did it go there" column useless on exactly the corpora WMO builds from.
+    policy = fit_rank_policy(_prefixless_matrix(), n_clusters=2, embedder=EmbedderSpec(dim=64))
+    labels = [cluster.label for cluster in policy.clusters]
+    assert all(labels), labels
+    # Labels never affect selection, only what the log calls the cluster.
+    assert len(set(labels)) == len(labels)
+
+
+def test_a_majority_prefix_still_wins_over_the_text_fallback() -> None:
+    policy = fit_rank_policy(_matrix(), n_clusters=2, embedder=EmbedderSpec(dim=64))
+    assert {cluster.label for cluster in policy.clusters} == {"sql", "prose"}
