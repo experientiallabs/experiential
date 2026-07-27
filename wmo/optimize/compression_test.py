@@ -79,8 +79,14 @@ def test_registry_resolves_known_ids_and_satisfies_the_protocol() -> None:
 
 
 def test_registry_rejects_unknown_id_with_guidance() -> None:
-    with pytest.raises(ValueError, match="unknown compressor 'llmzip'.*identity, truncate"):
+    # The known-ids list is open: importing `wmo.optimize` registers a factory for the endpoint
+    # client, and any research compressor may register another. So assert the reference
+    # implementations are named, rather than pinning the exact set and breaking on every
+    # legitimate registration.
+    with pytest.raises(ValueError, match="unknown compressor 'llmzip'") as caught:
         get_compressor("llmzip")
+    assert "identity" in str(caught.value)
+    assert "truncate" in str(caught.value)
 
 
 def test_aggressiveness_is_bounded() -> None:

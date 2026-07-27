@@ -25,6 +25,7 @@ from wmo.optimize.compression import (
     Compressor,
     estimate_tokens,
     get_compressor,
+    segment_batch_limit,
     servable_compressor,
 )
 from wmo.optimize.compression_endpoint import (
@@ -132,13 +133,20 @@ def endpoint() -> Iterator[tuple[LLMLingua2EndpointCompressor, FakeEndpointState
 
 @pytest.fixture
 def clean_registry() -> Iterator[None]:
-    """Snapshot and restore the seam's process-global compressor registry around a test."""
+    """Snapshot and restore the seam's process-global registries around a test.
+
+    Both of them: importing this module registers a factory for the real id, so a test that
+    resolves or registers must not leave a constructed instance behind for the next one.
+    """
     saved = dict(compression._COMPRESSORS)
+    saved_factories = dict(compression._COMPRESSOR_FACTORIES)
     try:
         yield
     finally:
         compression._COMPRESSORS.clear()
         compression._COMPRESSORS.update(saved)
+        compression._COMPRESSOR_FACTORIES.clear()
+        compression._COMPRESSOR_FACTORIES.update(saved_factories)
 
 
 def test_compress_returns_segments_and_propagates_metering(
@@ -334,6 +342,60 @@ def test_compress_returns_the_seam_result_type(
     assert isinstance(result, CompressionResult)
 
 
+def test_importing_registers_a_factory_and_builds_nothing() -> None:
+    """Import must cost nothing: a factory for the id, no credentials read, no network."""
+    assert "llmlingua2-endpoint" in compression._COMPRESSOR_FACTORIES
+    assert "llmlingua2-endpoint" not in compression._COMPRESSORS
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_first_resolution_builds_through_the_factory(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`route fit --compressor llmlingua2-endpoint` needs the id to resolve from env vars alone."""
+    client, state = endpoint
+    state.max_segments = 512
+    monkeypatch.setenv(URL_ENV, client.base_url)
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.delenv("WMO_COMPRESSOR_CERT", raising=False)
+
+    built = get_compressor("llmlingua2-endpoint")
+
+    assert built.id == "llmlingua2-endpoint"
+    assert built.append_stable is True
+    # The handshake ran during construction, so the seam's chunking cap is the box's.
+    assert segment_batch_limit(built) == 512
+    # Resolution is cached, so a grid does not re-handshake per lookup.
+    assert get_compressor("llmlingua2-endpoint") is built
+
+
+@pytest.mark.usefixtures("clean_registry")
+def test_factory_failure_is_actionable_and_retryable(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A down endpoint must not poison the id for the life of the process.
+
+    The seam wraps the factory's failure in ValueError so the CLI renders it as a usage error
+    instead of a traceback; what matters here is that the guidance survives the wrapping and
+    that fixing the environment makes the next resolution succeed.
+    """
+    client, _ = endpoint
+    monkeypatch.delenv(URL_ENV, raising=False)
+    monkeypatch.delenv(KEY_ENV, raising=False)
+
+    with pytest.raises(ValueError) as caught:
+        get_compressor("llmlingua2-endpoint")
+    assert URL_ENV in str(caught.value)
+    assert KEY_ENV in str(caught.value)
+    assert isinstance(caught.value.__cause__, CompressorEndpointError)
+
+    monkeypatch.setenv(URL_ENV, client.base_url)
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+    assert get_compressor("llmlingua2-endpoint").id == "llmlingua2-endpoint"
+
+
 @pytest.mark.usefixtures("clean_registry")
 def test_registration_publishes_the_compressor_and_it_is_servable(
     endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
@@ -371,8 +433,9 @@ def test_registration_refuses_a_server_running_another_selection_rule(
         register_endpoint_compressor()
     assert "per-input-percentile" in str(caught.value)
     assert REQUIRED_SELECTION_RULE in str(caught.value)
-    with pytest.raises(ValueError, match="unknown compressor"):
-        get_compressor("llmlingua2-endpoint")
+    # Nothing was registered, so the id still resolves through the factory (which will fail the
+    # same way against this box) rather than handing back an unverified compressor.
+    assert "llmlingua2-endpoint" not in compression._COMPRESSORS
 
 
 def test_handshake_adopts_the_boxs_published_caps(

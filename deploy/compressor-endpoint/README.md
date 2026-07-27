@@ -23,25 +23,31 @@ WMO_COMPRESSOR_URL=https://40.80.93.150:8443
 WMO_COMPRESSOR_API_KEY=<ask whoever administers the box>
 ```
 
-Register it into the D-COMPRESS seam once, then policies may name `llmlingua2-endpoint` like
-any other compressor:
+Nothing to register by hand. `wmo.optimize` registers a lazy FACTORY for
+`llmlingua2-endpoint`, so with the two variables set the id just resolves:
 
-```python
-from wmo.optimize.compression import CompressionConfig
-from wmo.optimize.compression_endpoint import register_endpoint_compressor
-
-register_endpoint_compressor()
-result = ...  # anything that resolves a compressor by id now finds it
+```bash
+wmo optimize route fit <matrix> --compressor llmlingua2-endpoint --aggressiveness 0.5
 ```
 
-Registration is explicit rather than on import, because building the client needs credentials
-and the seam's rule is that a misconfiguration fails at mount. It also contacts `/healthz` once
-to confirm the box really is running absolute-threshold selection before attesting
-`append_stable`, so the serving admission ticket is verified against the running server rather
-than asserted by the client. The same handshake adopts the box's published request caps as
-`max_segments_per_call`, the attribute the seam chunks against, so that limit tracks the
-running server instead of a constant compiled into the client. To use it directly without the
-registry:
+The factory runs on the first policy that names the id, never at import: building the client
+reads credentials and calls the box, and neither belongs in `import wmo`. Construction contacts
+`/healthz` once to confirm the box really is running absolute-threshold selection before
+attesting `append_stable`, so the serving admission ticket is verified against the running
+server rather than asserted by the client, and it adopts the box's published request cap as
+`max_segments_per_call`, the attribute the seam chunks against. A construction failure names
+the missing environment variables and is not cached, so fixing the environment and retrying
+works without restarting the process.
+
+Scripts that would rather fail immediately than at first use can force it:
+
+```python
+from wmo.optimize.compression_endpoint import register_endpoint_compressor
+
+register_endpoint_compressor()   # raises here if the endpoint is not usable
+```
+
+To use the client directly, without the registry:
 
 ```python
 from wmo.optimize.compression import CompressionConfig

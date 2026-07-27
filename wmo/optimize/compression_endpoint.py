@@ -11,11 +11,16 @@ There is no fallback. If the endpoint is unreachable this raises: a compressor t
 served uncompressed text on failure would make cost and accuracy results depend on the health
 of a box nobody was watching, and would quietly invalidate any grid that hit a bad minute.
 
-Registration is explicit (`register_endpoint_compressor()`) rather than on import, because
-building the client needs credentials and the seam's own rule is to fail at mount rather than
-mid-call. Registration also VERIFIES the live endpoint's selection rule before attesting
-`append_stable`, so the admission ticket the seam checks is a measured fact about the server
-that is actually answering, not a claim this file makes about a server it never contacted.
+Importing this module registers a FACTORY for `llmlingua2-endpoint`, not the compressor: the
+compressor is built on the first policy that names it. That split is the point. Building it
+reads credentials and calls the box, and neither belongs in `import wmo`, but a policy naming
+the id has to resolve without the caller remembering to register anything first. So
+`wmo optimize route fit --compressor llmlingua2-endpoint` works with only the two env vars set.
+
+Construction VERIFIES the live endpoint's selection rule before attesting `append_stable`, so
+the admission ticket the seam checks is a measured fact about the server that is actually
+answering, not a claim this file makes about a server it never contacted. It also adopts the
+box's published request cap as `max_segments_per_call`, which is what the seam chunks against.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from wmo.optimize.compression import (
     CompressionResult,
     estimate_tokens,
     register_compressor,
+    register_compressor_factory,
 )
 
 log = logging.getLogger(__name__)
@@ -329,20 +335,41 @@ class LLMLingua2EndpointCompressor:
         ) from last_error
 
 
+def build_endpoint_compressor() -> LLMLingua2EndpointCompressor:
+    """Construct the endpoint compressor from the environment and handshake with the box.
+
+    The factory body behind the lazy registration below. Reads the credentials, then makes one
+    call to the box to verify its selection rule and adopt its request caps. Deliberately does
+    NOT register the result: `get_compressor` registers what a factory returns, and registering
+    here too would just be a second path to the same registry entry.
+    """
+    compressor = LLMLingua2EndpointCompressor.from_env()
+    compressor.handshake()
+    return compressor
+
+
 def register_endpoint_compressor(
     *, timeout_s: float = DEFAULT_TIMEOUT_S
 ) -> LLMLingua2EndpointCompressor:
-    """Build the endpoint compressor from the environment and register it into the seam.
+    """Build and register the endpoint compressor NOW, instead of at first use.
 
-    Explicit rather than import-time: constructing it needs credentials, and the seam's rule is
-    that a misconfiguration fails at mount. Contacts the endpoint once to verify its selection
-    rule before registering, so `append_stable` is never attested on this client's say-so.
+    The eager path, for a script that would rather find out immediately that the box is
+    unreachable than discover it partway into a grid. Ordinary callers do not need this: the
+    factory registered at import resolves `llmlingua2-endpoint` on demand.
 
         from wmo.optimize.compression_endpoint import register_endpoint_compressor
 
-        register_endpoint_compressor()   # then policies may name 'llmlingua2-endpoint'
+        register_endpoint_compressor()   # raises here if the endpoint is not usable
     """
     compressor = LLMLingua2EndpointCompressor.from_env(timeout_s=timeout_s)
     compressor.handshake()
     register_compressor(compressor)
     return compressor
+
+
+# The module's ONE import side effect, and deliberately a cheap one: it registers the FACTORY,
+# never the compressor. Building the compressor reads credentials and calls the box, which must
+# not happen on `import wmo`. The cost and the failure mode move to the first policy that
+# actually names 'llmlingua2-endpoint', which is what makes
+# `wmo optimize route fit --compressor llmlingua2-endpoint` work with nothing but env vars set.
+register_compressor_factory(LLMLingua2EndpointCompressor.id, build_endpoint_compressor)
