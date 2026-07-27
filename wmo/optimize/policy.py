@@ -43,6 +43,7 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from wmo.optimize.drift_gate import DRIFT_GATE_P_WIN, DriftGate
 from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
@@ -360,11 +361,17 @@ class RoutingPolicy(BaseModel):
     # slid. Provenance, not an input: serving reads the knobs, and the mapping is absolute, so
     # re-applying any dial setting to any policy of this kind lands on the same knobs.
     cost_quality: float | None = Field(default=None, ge=0.0, le=1.0)
+    # The containment gate's sidecar (`wmo.optimize.drift_gate`), when the fit built one: a
+    # per-model global win-vs-baseline classifier that can VETO a neighborhood's pick back to the
+    # baseline. Resolved next to policy.json exactly like `knn_bank_path`. None = no gate, which
+    # is what every policy fitted before this field existed reads as, and the fit is unchanged.
+    drift_gate_path: str | None = None
 
     # Set by `save`/`load` so a relative `knn_bank_path` resolves against the policy file, and
-    # the lazily loaded bank. Private: not part of the artifact.
+    # the lazily loaded bank and gate. Private: not part of the artifact.
     _source_dir: Path | None = PrivateAttr(default=None)
     _bank: KnnBank | None = PrivateAttr(default=None)
+    _drift_gate: DriftGate | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _validate(self) -> RoutingPolicy:
@@ -381,6 +388,11 @@ class RoutingPolicy(BaseModel):
             )
         if self.kind != "rank" and self.clusters:
             raise ValueError(f"a {self.kind} policy carries no clusters; use kind='rank'")
+        if self.kind != "knn" and self.drift_gate_path is not None:
+            raise ValueError(
+                f"a {self.kind} policy has nothing for the containment gate to veto (it gates "
+                "the kNN router's non-baseline picks); drop drift_gate_path"
+            )
         if self.kind == "knn":
             # The whole algorithm is "leave the baseline only on evidence", so a knn policy
             # without a baseline is not a weaker policy, it is an undefined one. default_model
@@ -503,6 +515,65 @@ class RoutingPolicy(BaseModel):
                 "or pin a baseline it did measure"
             )
 
+    def gate_path(self) -> Path:
+        """Where this policy's containment sidecar lives (see `drift_gate_path`)."""
+        if self.drift_gate_path is None:
+            raise ValueError("this policy was fitted without a containment gate")
+        candidate = Path(self.drift_gate_path)
+        if candidate.is_absolute():
+            return candidate
+        return (self._source_dir or Path()) / candidate
+
+    def attach_drift_gate(self, gate: DriftGate) -> None:
+        """Use `gate` as this policy's containment evidence instead of reading the sidecar.
+
+        The fitter primes a freshly fitted policy with the gate it just built, so fit-then-
+        evaluate does not round trip through disk. Validated exactly like a loaded one.
+        """
+        self._validate_drift_gate(gate, source="the attached gate")
+        self._drift_gate = gate
+
+    def drift_gate(self) -> DriftGate | None:
+        """Load (once, then cached) the containment gate, or None when the fit built none."""
+        if self.drift_gate_path is None:
+            return None
+        with _BANK_LOAD_LOCK:
+            if self._drift_gate is None:
+                path = self.gate_path()
+                if not path.is_file():
+                    raise FileNotFoundError(
+                        f"containment gate not found at {path}: this policy.json records a "
+                        f"'{self.drift_gate_path}' sidecar, so it is served together with one. "
+                        f"Copy the sidecar next to the policy file, or refit with "
+                        f"`wmo optimize route fit --kind knn --drift-gate on`."
+                    )
+                try:
+                    gate = DriftGate.load(path)
+                    self._validate_drift_gate(gate, source=str(path))
+                except (ValueError, KeyError) as error:
+                    raise ValueError(f"invalid containment gate at {path}: {error}") from error
+                self._drift_gate = gate
+            return self._drift_gate
+
+    def _validate_drift_gate(self, gate: DriftGate, *, source: str) -> None:
+        """Check a gate against this policy: same embedding space, and the same pool."""
+        if gate.dim and gate.dim != self.embedder.dim:
+            # A gate whose models were all constant or unfitted carries no support vectors and so
+            # has no dimension to check; anything else must match the space the query is embedded
+            # into, or `p_win` would score a request against vectors from another embedder.
+            raise ValueError(
+                f"{source} holds {gate.dim}-dimensional support vectors but the policy's "
+                f"embedder spec is {self.embedder.dim}-dimensional; the gate was fitted with a "
+                "different embedder than this policy would embed requests with"
+            )
+        names = {entry.name for entry in self.pool}
+        unknown = [model for model in gate.models if model not in names]
+        if unknown:
+            raise ValueError(
+                f"{source} carries models {unknown} that are not in the policy pool "
+                f"(available: {sorted(names)})"
+            )
+
 
 def select_model(
     policy: RoutingPolicy,
@@ -591,7 +662,8 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     """The kNN reward-profile core with its paired guard, on an already-embedded query.
 
     Shared by `select_model` (one live request) and batch evaluation, so the served path and the
-    measured path cannot diverge. Three stages, each of which the returned `reason` accounts for:
+    measured path cannot diverge. Four stages, each of which the returned `reason` accounts for
+    (the fourth only when the policy was fitted with a containment gate):
 
     1. Neighbors: the fit scenarios whose similarity beats `rag_thres` times the `rag_num`-th
        best similarity. The query is L2-normalized HERE (bank rows already are), so no caller
@@ -605,6 +677,9 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
        asymmetry that kills confidently-wrong pricier-and-worse picks; see `guard_mode` for the
        economic variant that only asks a cheaper pick not to be significantly worse), on at
        least `knn_min_pairs` neighbors scored on both sides. Otherwise the baseline serves.
+    4. Containment: a surviving pick must ALSO clear `DRIFT_GATE_P_WIN` under the fit split's
+       global win-vs-baseline classifier for that model (`wmo.optimize.drift_gate`). This is a
+       veto only, so it can never route a request the first three stages did not already route.
 
     The guard is what makes the policy safe to deploy: absent evidence, the answer is the
     baseline, so the worst case is the baseline's behavior rather than a confident stranger's.
@@ -716,6 +791,23 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             model=baseline,
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
         )
+
+    gate = policy.drift_gate()
+    if gate is not None:
+        # Stage 4, and only ever a veto (see `wmo.optimize.drift_gate`): the neighborhood has
+        # already certified this pick, and the gate asks whether the WHOLE fit split agrees that
+        # a query like this one is a win for it. A thin bank can hand a confident neighborhood to
+        # a model that loses globally, which is the failure this catches.
+        probability = gate.p_win(pick, vector)
+        if not probability > DRIFT_GATE_P_WIN:
+            return RoutingDecision(
+                model=baseline,
+                reason=(
+                    f"containment gate: global evidence disagrees with neighbors "
+                    f"(P(win) {probability:.2f} <= {DRIFT_GATE_P_WIN:g} for {pick}), "
+                    f"serving {baseline}"
+                ),
+            )
     knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
     # Only the symmetric bar doubles z for a pricier pick; the asymmetric one holds it at z.
     price_note = ""

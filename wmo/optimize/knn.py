@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from pydantic import BaseModel, Field
 
+from wmo.optimize.drift_gate import DRIFT_GATE_AUTO_MAX_SCENARIOS, fit_drift_gate
 from wmo.optimize.policy import (
     DEFAULT_KNN_MIN_PAIRS,
     DEFAULT_KNN_Z,
@@ -179,6 +180,7 @@ def fit_knn_policy(
     se_floor: bool = True,
     floor_q: float = 0.0,
     pick_lam: float = 0.0,
+    drift_gate_path: Path | None = None,
     fitted_from: str | None = None,
 ) -> RoutingPolicy:
     """Fit a kNN policy on `matrix` (restricted to `fit_ids` when given) and write its sidecar.
@@ -198,6 +200,17 @@ def fit_knn_policy(
     research code) and must be the function that spec describes. `pick_lam` is the cost knob
     (0 = the champion); operators slide it through `apply_cost_quality` rather than refitting,
     since it changes nothing the fit measured.
+
+    `drift_gate_path` both turns the containment gate on and says where its sidecar goes (None
+    leaves it off, which is the exact validated champion). Write it beside the bank, the way the
+    CLI does:
+
+        policy = fit_knn_policy(matrix, bank_path=knn_bank_path_for(out),
+                                drift_gate_path=drift_gate_path_for(out), guard_model="fable-5")
+
+    One parameter rather than a flag plus a path, because a gate that is on but has nowhere to
+    live is not a state this fit can produce. See `wmo.optimize.drift_gate` for what it measures,
+    and `drift_gate_enabled` for the bank-size rule the CLI's `auto` setting resolves through.
     """
     spec = embedder or EmbedderSpec()
     scenario_ids = fit_ids if fit_ids is not None else matrix.scenario_ids()
@@ -246,16 +259,24 @@ def fit_knn_policy(
         # a property of the fit evidence, and a serve-time recompute would make the same dial
         # setting mean different things on different processes.
         cost_scale=bank_cost_scale(bank),
+        drift_gate_path=drift_gate_path.name if drift_gate_path is not None else None,
         fitted_from=fitted_from,
     )
     policy.attach_bank(bank)
+    if drift_gate_path is not None:
+        # Fitted from the bank that was just built, so the gate's features and the router's
+        # neighbor search are the same vectors by construction rather than by convention.
+        gate = fit_drift_gate(bank, baseline)
+        gate.save(drift_gate_path)
+        policy.attach_drift_gate(gate)
     logger.info(
-        "knn fit: %d fit scenarios x %d models, baseline %s%s, z=%g -> %s",
+        "knn fit: %d fit scenarios x %d models, baseline %s%s, z=%g%s -> %s",
         len(bank.scenario_ids),
         len(bank.models),
         baseline,
         " (pinned)" if guard_model else " (best single on fit)",
         z,
+        ", containment gate on" if drift_gate_path is not None else "",
         bank_path,
     )
     return policy
@@ -492,4 +513,9 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
     # Hand the copy the bank it was just measured against: a serving swap must not re-read a
     # 10MB sidecar, and a research caller may have attached a bank that is not on disk at all.
     adjusted.attach_bank(bank)
+    gate = policy.drift_gate()
+    if gate is not None:
+        # Same reason, and the dial does not touch containment: every dial position serves the
+        # same gate, so re-reading (or re-fitting) it per slide would be pure cost.
+        adjusted.attach_drift_gate(gate)
     return adjusted
