@@ -328,6 +328,10 @@ class GridConfig(BaseModel):
     episodes: int
     max_steps: int
     history_chars: int
+    # Cells one execute_sweep runs at once. NOT a cohort pin and NOT in the plan identity (the
+    # library excludes it on purpose): concurrency changes when a row is bought, never what it
+    # measures, so raising it mid-grid re-buys nothing.
+    concurrency: int
     cap_usd: float
     # Half-open chunk-index slice this process owns, or None for every chunk. The unit of
     # cross-process concurrency: chunk files are keyed by index and so are collision-free, so two
@@ -1367,6 +1371,7 @@ def build_config(args: argparse.Namespace) -> GridConfig:
         if args.max_steps
         else (SMOKE_MAX_STEPS if smoke else DEFAULT_MAX_STEPS),
         history_chars=args.history_chars,
+        concurrency=args.concurrency,
         cap_usd=args.cap if args.cap else (SMOKE_CAP_USD if smoke else DEFAULT_CAP_USD),
         chunk_range=parse_chunk_range(args.chunks),
         only_models=tuple(args.only_model) if args.only_model else (SMOKE_MODELS if smoke else ()),
@@ -1419,6 +1424,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Scenarios per chunk (default {DEFAULT_CHUNK}).",
     )
     parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES, help="Episodes per cell.")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Cells each chunk's execute_sweep runs at once (default 1, the sequential loop).",
+    )
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -1572,6 +1583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             assume_output_tokens=250,
             history_chars=config.history_chars,
             compression=compression,
+            max_concurrency=config.concurrency,
         )
         runner = ArmRunner(
             arm=arm,
