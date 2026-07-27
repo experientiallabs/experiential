@@ -387,7 +387,13 @@ class TrainConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    steps: int = Field(default=40, ge=1)
+    steps: int = Field(default=40, ge=0)
+    """On-policy optimizer steps. 0 makes the run WARMUP-ONLY: the supervised
+    phase is the whole training run (teacher rollouts -> keep-filter -> CE),
+    then the student-after eval and the gate run as usual. Rejected unless
+    `warmup.steps > 0`, since a run with neither phase trains nothing and
+    would put a no-op behind the gate."""
+
     tasks_per_batch: int = Field(default=8, ge=1)
     group_size: int = Field(default=4, ge=1)
     learning_rate: float = Field(default=1e-4, gt=0)
@@ -944,6 +950,24 @@ class DistillConfig(BaseModel):
     wandb: WandbConfig = Field(default_factory=WandbConfig)
 
     @model_validator(mode="after")
+    def _check_some_training_phase(self) -> DistillConfig:
+        """Reject a run that would train nothing (no OPD steps, no warmup).
+
+        Returns:
+            This config, unchanged, when at least one phase trains.
+
+        Raises:
+            ValueError: If `train.steps` and `warmup.steps` are both 0.
+        """
+        if self.train.steps == 0 and self.warmup.steps == 0:
+            raise ValueError(
+                "train.steps = 0 makes the run warmup-only, but warmup.steps is also 0, "
+                "so nothing would train and the gate would measure a no-op; set "
+                "warmup.steps > 0 for a warmup-only run or train.steps > 0 for OPD"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _check_rollout_source(self) -> DistillConfig:
         """Require exactly one rollout source section.
 
@@ -960,6 +984,24 @@ class DistillConfig(BaseModel):
                 "harness on real tau2 tasks), not "
                 + ("both" if self.harbor is not None else "neither")
             )
+        if self.tau2 is not None:
+            # Both knobs steer harbor's terminus-2 agent and would be silently
+            # ignored here, which is exactly the trap this config forbids. The
+            # tau2 proxy path renders through each model's auto-discovered
+            # cookbook renderer and keeps history verbatim by splicing exact
+            # sampled ids, so neither knob has a tau2 meaning.
+            if self.rollout.renderers:
+                raise ValueError(
+                    "[rollout.renderers] is a terminus-2 (harbor) knob and has no effect "
+                    "under the [tau2] source, whose proxy renders through each model's "
+                    "auto-discovered cookbook renderer; remove the table"
+                )
+            if self.rollout.compaction:
+                raise ValueError(
+                    "rollout.compaction is terminus-2's summarizer and has no effect under "
+                    "the [tau2] source (tau2's own agent keeps its full history); set it "
+                    "false or leave it unset"
+                )
         return self
 
     @property

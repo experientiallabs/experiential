@@ -2,8 +2,8 @@
 
 The other optimizers edit the agent's *harness* or its *routing policy*; `wmo optimize distill`
 trains the agent's *model*.
-It runs on-policy distillation of a Tinker LoRA student: harbor's own `terminus-2` agent rolls
-out on real harbor benchmark tasks while sampling from the student's current weights; a larger
+It runs on-policy distillation of a Tinker LoRA student: an agent rolls out on real benchmark
+tasks while sampling from the student's current weights; a larger
 teacher model scores the exact tokens the student sampled; and each training
 step nudges the student toward the teacher with a per-token reverse-KL objective (the
 teacher-minus-student logprob gap as the advantage, trained under Tinker's `importance_sampling`
@@ -11,6 +11,35 @@ or `ppo` loss). A holdout gate at the end compares teacher, student-before, and
 student-after solve rates, and only an adapter that closes enough of the gap to the teacher is
 promoted. The result is a small model that behaves like the big one inside your agent, plus a
 ready-to-paste serving snippet.
+
+## Rollout sources
+
+Where episodes come from is config-selected: exactly one of `[harbor]` or `[tau2]`.
+
+- **`[harbor]`** (the original source): harbor's own `terminus-2` agent on harbor benchmark
+  tasks (e.g. TerminalBench-2), sampling the student through `harbor.llms.tinker.TinkerLLM`
+  with per-turn token ids recorded into each trial's `result.json`. Everything below about job
+  templates, renderers, compaction, and E2B sandboxes belongs to this source.
+- **`[tau2]`**: Sierra's real tau2-bench, unmodified - tau2's own `llm_agent`, its LLM user
+  simulator, its orchestrator, and its deterministic evaluator (`results.json`
+  `reward_info.reward`). tau2 lives in its own Python 3.13 venv (`tau2_bin` points into it;
+  see `packages/environment-capture/tau-bench/README.md` for the one-time setup) and each
+  episode runs as its own `tau2 run` subprocess whose agent LLM calls a loopback
+  OpenAI-compatible proxy inside the wmo process. A PER-EPISODE `TinkerChatProvider` behind
+  that proxy samples the current weights and records the episode's exact token spans; its
+  prompt state splices `prompt(N) + sampled(N) + suffix`, so the ids are never re-encoded from
+  the text tau2 echoes back and a clean episode stays one training datum. Task ids are
+  composite `"domain/task_id"` strings (`airline/12`); the user simulator is part of the
+  environment and stays pinned (`tau2.user_llm`, default `azure/gpt-5.4-mini`, which needs
+  `AZURE_API_KEY`/`AZURE_API_BASE`/`AZURE_API_VERSION` in the environment).
+  `[rollout.renderers]` and `rollout.compaction` are terminus-2 knobs and are rejected under
+  this source. `rollout.max_turns` maps to tau2's `--max-steps` and `rollout.episode_timeout_s`
+  to its graceful per-simulation `--timeout`. The reference config is
+  `wmo/distill/configs/distill-tau2-smoke.toml`.
+
+Training phases are also composable per run: `train.steps = 0` makes the run **warmup-only**
+(the supervised phase - teacher rollouts, keep-filter, cross-entropy - is the whole run, then
+the student-after eval and the gate run as usual); it is rejected unless `warmup.steps > 0`.
 
 ## Prerequisites
 

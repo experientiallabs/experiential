@@ -855,6 +855,11 @@ def test_checked_in_run_configs_name_a_verbatim_renderer_for_every_tinker_model(
     assert paths, "the reference configs that ship with the package are missing"
     for path in paths:
         cfg = load_distill_config(path)
+        if cfg.rollout_source != "harbor":
+            # The requirement is terminus-2's (its parsers die on the stock
+            # reasoning renderers); the tau2 proxy path auto-discovers and the
+            # config validator rejects a renderers table there outright.
+            continue
         # An openai_compat teacher is served outside Tinker and renders with its own
         # template, so it never reaches terminus-2's renderer.
         sampled = [cfg.student.base_model]
@@ -942,3 +947,46 @@ def test_training_turn_cap_is_separate_from_the_eval_cap(tmp_path: Path) -> None
     cfg = load_distill_config(_write(tmp_path, text))
     assert cfg.train.rollout_max_turns == 20
     assert cfg.rollout.max_turns == 100, "the eval-side cap must not move"
+
+
+TAU2_TOML = """
+[student]
+base_model = "Qwen/Qwen3.5-9B"
+
+[teacher]
+model = "Qwen/Qwen3.6-27B"
+
+[tau2]
+tau2_bin = "/opt/tau2/.venv/bin/tau2"
+data_dir = "/opt/tau2/tau2-bench/data"
+"""
+
+
+def test_tau2_source_parses_with_pinned_defaults(tmp_path: Path) -> None:
+    cfg = load_distill_config(_write(tmp_path, TAU2_TOML))
+    assert cfg.rollout_source == "tau2"
+    assert cfg.harbor is None
+    assert cfg.tau2 is not None
+    assert cfg.tau2.user_llm == "azure/gpt-5.4-mini", "the user simulator pin is the default"
+    assert cfg.tau2.user_llm_args == {}
+    assert cfg.tau2.backend == "local"
+    assert cfg.tau2.max_errors == 10
+
+
+def test_exactly_one_rollout_source_is_required(tmp_path: Path) -> None:
+    neither = MINIMAL_TOML.replace('[harbor]\njob_template = "jobs/tb2.yaml"\n', "")
+    with pytest.raises(ValueError, match="exactly one rollout source"):
+        load_distill_config(_write(tmp_path, neither))
+    both = MINIMAL_TOML + '\n[tau2]\ntau2_bin = "/x/tau2"\ndata_dir = "/x/data"\n'
+    with pytest.raises(ValueError, match="exactly one rollout source"):
+        load_distill_config(_write(tmp_path, both))
+
+
+def test_warmup_only_run_is_valid_but_needs_a_warmup(tmp_path: Path) -> None:
+    warmup_only = TAU2_TOML + "\n[train]\nsteps = 0\n\n[warmup]\nsteps = 2\n"
+    cfg = load_distill_config(_write(tmp_path, warmup_only))
+    assert cfg.train.steps == 0
+    assert cfg.warmup.steps == 2
+    trains_nothing = TAU2_TOML + "\n[train]\nsteps = 0\n"
+    with pytest.raises(ValueError, match="nothing would train"):
+        load_distill_config(_write(tmp_path, trains_nothing))

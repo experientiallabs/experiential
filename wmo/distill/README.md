@@ -60,6 +60,7 @@ copy the closest reference config and edit it. They ship in the package, in
 | `distill-smoke-dev.toml` | cheapest same-family pair, `backend = "local"`, 3 steps. Start here. |
 | `distill-qwen-anchor.toml` | the run in section 1: Qwen3.5-9B from a Qwen3.6-27B teacher |
 | `distill-headline.toml` | a full-size Nemotron run |
+| `distill-tau2-smoke.toml` | the `[tau2]` rollout source (real tau2-bench episodes), warmup-only |
 
 Each pairs with a train/holdout split passed separately as `--task-ids` and `--holdout-task-ids`:
 plain JSON arrays of benchmark task names. The TerminalBench-2 split those configs were run against
@@ -67,7 +68,9 @@ is 72 train and 17 holdout, the 89-task set cut in two. Rollouts and interim eva
 baselines and the promotion gate are measured on holdout, so the two must stay disjoint. They are
 separate files rather than config keys so one config can be run against different splits.
 
-Three sections are required and have no defaults: `[student]`, `[teacher]`, `[harbor]`. Everything
+Required with no defaults: `[student]`, `[teacher]`, and exactly ONE rollout source, `[harbor]`
+(terminus-2 on harbor tasks) or `[tau2]` (real tau2-bench episodes through the loopback proxy;
+see `docs/reference/distill.md` for how token exactness works there). Everything
 else defaults: `[rollout]`, `[train]`, `[sampling]`, `[warmup]`, `[eval]`, `[gate]`, `[pricing]`,
 `[budget]`, `[tripwire]`, `[wandb]`. The schema is `DistillConfig` in
 [`config.py`](config.py), and it is `extra="forbid"`, so a typo in a key is an error at load
