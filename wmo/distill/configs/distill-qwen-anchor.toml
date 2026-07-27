@@ -56,8 +56,8 @@ context_budget_tokens = 53240
 compaction = true
 
 # Terminus-2 cannot use the stock reasoning renderers: they hand harbor's response parser a
-# LIST and kill the trial. The wmh wrappers fix that; the choice between them is the
-# reasoning-in-history trade (wmh/distill/renderers.py).
+# LIST and kill the trial. The wmo wrappers fix that; the choice between them is the
+# reasoning-in-history trade (wmo/distill/renderers.py).
 #
 # strip_history, NOT verbatim. The model still reasons every turn and every one of those
 # reasoning tokens is inside the loss mask -- what changes is only that a turn is not shown its
@@ -141,5 +141,5 @@ max_usd = 1200.0
 
 [wandb]
 enabled = true
-project = "wmh-distill"
+project = "wmo-distill"
 run_name = "distill-qwen-anchor"
