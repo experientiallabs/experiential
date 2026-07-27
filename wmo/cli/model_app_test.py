@@ -1258,6 +1258,28 @@ def test_report_on_metrics_damaged_above_the_last_line_is_a_usage_error(tmp_path
     assert "Traceback" not in result.output
 
 
+def test_report_refuses_a_last_metrics_line_that_parses_into_a_non_object(tmp_path: Path) -> None:
+    """The tail excuse is for a line that fails to parse, which is all a torn append leaves.
+
+    A whole `[]`/`null` at the end was written intact, so skipping it would report the previous
+    step as the run's latest state while hiding that the file had been damaged.
+    """
+    run_dir = _finished_run(tmp_path)
+    store = DistillRunStore(run_dir)
+    store.append_metrics(0, _step_metrics())
+    with store.metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write("[]\n")
+
+    result = _report(run_dir)
+
+    assert result.exit_code == 2
+    flat = _flat(result)
+    assert "corrupt metrics row on line 2" in flat
+    assert "expected a JSON object" in flat
+    assert "ignoring a half-written last line" not in flat
+    assert "Traceback" not in result.output
+
+
 # -- `probe`: the teacher-search gate over a measured matrix ------------------------------------
 
 

@@ -212,6 +212,22 @@ def test_a_tolerant_read_still_refuses_damage_above_the_last_line(tmp_path: Path
         store.read_metrics(tolerate_partial_tail=True)
 
 
+@pytest.mark.parametrize("tail", ["[]", "null", '"step 1"', "[1, 2, 3]"])
+def test_a_tolerant_read_still_refuses_a_last_line_that_parses(tmp_path: Path, tail: str) -> None:
+    """A whole non-object value is not a torn append: every prefix of `{...}` fails to PARSE.
+
+    So a final line json.loads accepts was written whole, and dropping it would hide real
+    corruption while reporting an older step as the run's latest state.
+    """
+    store = DistillRunStore(tmp_path / "run")
+    store.append_metrics(0, _MetricsRow(solve_rate=0.1, reverse_kl_per_token=2.0, usd=1.0))
+    with store.metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{tail}\n")
+
+    with pytest.raises(ValueError, match="line 2.*expected a JSON object"):
+        store.read_metrics(tolerate_partial_tail=True)
+
+
 def test_spend_ledger_round_trips_and_updates(tmp_path: Path) -> None:
     store = DistillRunStore(tmp_path / "run")
     assert store.read_spend() is None  # fresh dir: no ledger yet

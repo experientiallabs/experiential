@@ -1174,9 +1174,11 @@ def _read_metrics(console: Console, store: DistillRunStore) -> list[JsonObject]:
 
     `report` advertises itself as safe on a live or aborted run dir, so a torn final row (all a
     run killed mid-append can leave behind) must not end the command: drop it, say so, and
-    report what is complete. Damage above the last line means the file lost content, so it stays
-    an error; it is just a usage error now, the way `_load_gate` and `_load_eval_report` already
-    treat the same class of damage, rather than a traceback.
+    report what is complete. Every other shape of damage -- a broken row above the last one, or
+    a last line that parses into something other than a JSON object, which no truncated append
+    can produce -- means the file lost or gained content, so it stays an error; it is just a
+    usage error now, the way `_load_gate` and `_load_eval_report` already treat the same class
+    of damage, rather than a traceback.
 
     Args:
         console: Where to print the note about a dropped final line.
@@ -1186,7 +1188,7 @@ def _read_metrics(console: Console, store: DistillRunStore) -> list[JsonObject]:
         Every complete row, in append order.
 
     Raises:
-        typer.BadParameter: If a row above the last one is not a JSON object.
+        typer.BadParameter: If the damage is anything but a half-written last line.
     """
     try:
         return store.read_metrics()
