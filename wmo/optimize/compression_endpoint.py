@@ -83,7 +83,10 @@ class EndpointReply(BaseModel):
     segments: list[str]
     tokens_in: int = 0
     tokens_out: int = 0
+    # GPU compute only, measured inside the box's serializing lock. `queue_ms` is the wait for
+    # that lock, reported separately and NOT included in cost_usd.
     latency_ms: float = 0.0
+    queue_ms: float = 0.0
     cost_usd: float = 0.0
     compressor_version: str = ""
     model_fingerprint: str = ""
@@ -110,6 +113,9 @@ class LLMLingua2EndpointCompressor:
     id = "llmlingua2-endpoint"
     version = "1"
     append_stable = True
+    # The seam reads this to chunk before calling. Starts at the client default and is replaced
+    # by the box's own published cap during `handshake()`, so it tracks the running server.
+    max_segments_per_call = MAX_SEGMENTS_PER_REQUEST
 
     def __init__(
         self,
@@ -156,15 +162,19 @@ class LLMLingua2EndpointCompressor:
             cert_path = str(DEFAULT_CERT_PATH)
         return cls(base_url, api_key, cert_path=cert_path, timeout_s=timeout_s)
 
-    def verify_selection_rule(self) -> None:
-        """Check the live endpoint really runs the rule this client attests append stability for.
+    def handshake(self) -> None:
+        """Read the running box once: verify its selection rule and adopt its request caps.
 
-        Serving admission turns on `append_stable`, and that attribute is only honest while the
-        server selects on an absolute per-word threshold. Reading the rule off the running server
-        makes the attestation verifiable instead of assumed, and means a box redeployed with
-        different selection is refused at registration rather than quietly serving churn.
+        Two things a client should not assume about a box it did not start. The selection rule
+        decides whether `append_stable` is honest, so it is checked rather than trusted. The
+        request caps decide where batches have to split, so they are read from the server rather
+        than hardcoded here, where they could drift out of sync with the box's configuration.
+
+        One round trip, called at registration, so a misconfigured or wrongly-deployed endpoint
+        fails at mount instead of mid-grid.
         """
-        rule = self.health().get("selection_rule", "<absent>")
+        health = self.health()
+        rule = health.get("selection_rule", "<absent>")
         if rule != REQUIRED_SELECTION_RULE:
             raise CompressorEndpointError(
                 f"compressor endpoint at {self.base_url} reports selection rule '{rule}', not "
@@ -173,6 +183,10 @@ class LLMLingua2EndpointCompressor:
                 "already-compressed prefix on every appended turn and must not be served. "
                 "Redeploy the box from deploy/compressor-endpoint/ before using this compressor."
             )
+        self._max_segments = int(health.get("max_segments", self._max_segments))
+        self._max_chars = int(health.get("max_chars", self._max_chars))
+        # The seam chunks against this before calling, so it must reflect the box, not a guess.
+        self.max_segments_per_call = self._max_segments
 
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
         """Compress the mutable segments remotely; raise rather than degrade to no compression."""
@@ -187,6 +201,8 @@ class LLMLingua2EndpointCompressor:
         start = time.monotonic()
         out: list[str] = []
         cost = 0.0
+        gpu_ms = 0.0
+        queue_ms = 0.0
         for begin, end in self._batches(segments):
             reply = self._post(
                 {"segments": segments[begin:end], "threshold": config.aggressiveness}
@@ -199,14 +215,18 @@ class LLMLingua2EndpointCompressor:
                 )
             out.extend(reply.segments)
             cost += reply.cost_usd
+            gpu_ms += reply.latency_ms
+            queue_ms += reply.queue_ms
         # Wall clock, not the endpoint's compute time: the round trip is what the serving path
         # actually waits for, and effective-cost accounting has to see the real latency.
         latency_s = time.monotonic() - start
         log.debug(
-            "compressed %d segments via %s (round trip %.1fms, $%.6f)",
+            "compressed %d segments via %s (round trip %.1fms, gpu %.1fms, queue %.1fms, $%.6f)",
             len(segments),
             self.base_url,
             latency_s * 1000,
+            gpu_ms,
+            queue_ms,
             cost,
         )
         return CompressionResult(
@@ -323,6 +343,6 @@ def register_endpoint_compressor(
         register_endpoint_compressor()   # then policies may name 'llmlingua2-endpoint'
     """
     compressor = LLMLingua2EndpointCompressor.from_env(timeout_s=timeout_s)
-    compressor.verify_selection_rule()
+    compressor.handshake()
     register_compressor(compressor)
     return compressor

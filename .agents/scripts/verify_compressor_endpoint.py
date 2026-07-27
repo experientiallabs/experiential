@@ -125,10 +125,56 @@ def check_bank_fit_batch(client: LLMLingua2EndpointCompressor) -> bool:
     return ok
 
 
+def check_queue_not_billed(base_url: str, api_key: str, cert: str) -> bool:
+    """Concurrent callers must not bill each other's queueing as their own GPU-seconds.
+
+    The GPU is serialized by a lock. When the clock started before that lock, a request queued
+    behind N others billed the whole wait, inflating cost_usd by roughly the concurrency factor
+    and making a busy minute look like an expensive one. This fires a serial baseline and then
+    a concurrent burst of the SAME payload: cost must stay flat while queue_ms absorbs the wait.
+    """
+    body = {
+        "segments": [
+            "The quarterly revenue report shows that total revenue increased by 12 percent "
+            "year over year, driven primarily by strong performance in the enterprise segment."
+        ]
+        * 8,
+        "threshold": THRESHOLD,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    concurrency = 8
+    with httpx.Client(verify=cert, timeout=60) as raw:
+        baseline = raw.post(f"{base_url}/v1/compress", json=body, headers=headers).json()
+
+        def fire(_: int) -> dict[str, float]:
+            return raw.post(f"{base_url}/v1/compress", json=body, headers=headers).json()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            burst = list(pool.map(fire, range(concurrency)))
+
+    serial_cost = float(baseline["cost_usd"])
+    worst_cost = max(float(row["cost_usd"]) for row in burst)
+    worst_queue = max(float(row["queue_ms"]) for row in burst)
+    # Generous bound: GPU time per request is unchanged by concurrency, so the worst biller
+    # should sit near the serial cost, nowhere near concurrency x it.
+    ok = worst_cost < serial_cost * 2.5 and worst_queue > 0
+    log.info(
+        "QUEUE BILLING %s: serial $%.6f, worst concurrent $%.6f (%.2fx, would be ~%dx if "
+        "queueing were billed), worst queue_ms %.1f",
+        "PASS" if ok else "FAIL",
+        serial_cost,
+        worst_cost,
+        worst_cost / serial_cost if serial_cost else 0.0,
+        concurrency,
+        worst_queue,
+    )
+    return ok
+
+
 def check_selection_rule(client: LLMLingua2EndpointCompressor) -> bool:
-    """The append-stability attestation is only valid for absolute-threshold selection."""
+    """Verify the rule behind the append-stability attestation, and adopt the box's caps."""
     try:
-        client.verify_selection_rule()
+        client.handshake()
     except CompressorEndpointError as error:
         log.info("SELECTION RULE FAIL: %s", error)
         return False
@@ -258,6 +304,7 @@ def main() -> None:
     deterministic = check_determinism(client, transcripts)
     authorized = check_auth(base_url, cert)
     bank_fit = check_bank_fit_batch(client)
+    queue_billing = check_queue_not_billed(base_url, api_key, cert)
     wait_for_capacity(base_url, api_key, cert)
     measure(client, transcripts)
     rate_limited = check_rate_limit(base_url, api_key, cert)
@@ -276,6 +323,7 @@ def main() -> None:
         "selection_rule": rule_ok,
         "determinism": deterministic,
         "bank_fit_one_round_trip": bank_fit,
+        "queue_not_billed": queue_billing,
         "auth": authorized,
         "rate_limit": rate_limited,
         "honest_failure": honest_failure,

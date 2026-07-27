@@ -84,19 +84,40 @@ class CompressRequest(BaseModel):
     threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
+class CompressionOutcome(BaseModel):
+    """What one compress() call produced, including the GPU time it actually occupied.
+
+    `compute_s` is measured INSIDE the serializing GPU lock and after a CUDA sync, so it is the
+    time this request held the device, not the time it spent waiting for another request to let
+    go of it.
+    """
+
+    segments: list[str]
+    tokens_in: int
+    tokens_out: int
+    compute_s: float
+
+
 class CompressResponse(BaseModel):
     """Compressed segments plus this call's own metering.
 
     `tokens_in`/`tokens_out` are counted with the compressor's OWN tokenizer, which is what it
     actually processed; they are not the serving model's token counts and are not billable
-    truth. `latency_ms` is server-side compute only (no network), and `cost_usd` is that same
-    duration priced as GPU-seconds.
+    truth.
+
+    `latency_ms` is GPU compute only, measured inside the serializing lock, and `cost_usd`
+    prices exactly that as GPU-seconds. `queue_ms` is the wait for the lock, reported separately
+    and deliberately NOT billed: the box charges for wall time either way, but attributing one
+    request's queueing to another request's GPU cost would inflate cost_usd by roughly the
+    concurrency factor and make a busy minute look like an expensive one. Add the two to get
+    the server-side time a caller waited.
     """
 
     segments: list[str]
     tokens_in: int
     tokens_out: int
     latency_ms: float
+    queue_ms: float
     cost_usd: float
     compressor_version: str
     model_fingerprint: str
@@ -197,8 +218,8 @@ class LLMLingua2FixedThreshold:
         )["input_ids"]
         return [max(1, len(ids)) for ids in encoded]
 
-    def compress(self, segments: Sequence[str], threshold: float) -> tuple[list[str], int, int]:
-        """Compress every segment in one batched pass; return (segments, tokens_in, tokens_out).
+    def compress(self, segments: Sequence[str], threshold: float) -> CompressionOutcome:
+        """Compress every segment in one batched pass, timing only the GPU-held portion.
 
         All of the request's chunks share forward passes, which is what makes the endpoint
         worth its network hop (one forward per chunk costs ~2.4x more GPU per token). That
@@ -208,6 +229,9 @@ class LLMLingua2FixedThreshold:
         response is a function of its own request and nothing else in flight.
         """
         with self._lock:
+            # The clock starts here, not before the lock: a request queued behind another must
+            # not bill its wait as GPU-seconds.
+            started = time.perf_counter()
             words_per_segment = [WORD_RE.findall(segment) for segment in segments]
             leading = [segment[: len(segment) - len(segment.lstrip())] for segment in segments]
             flat_lengths = self._subword_lengths(
@@ -269,7 +293,15 @@ class LLMLingua2FixedThreshold:
                     for length, p in zip(lengths[index], scores, strict=True)
                     if p >= threshold
                 )
-        return out, tokens_in, tokens_out
+            # Sync before stopping the clock, still holding the lock: CUDA work is queued
+            # asynchronously, so without this the timer would stop before the GPU is done and
+            # under-bill the request.
+            if self.device.startswith("cuda"):
+                torch.cuda.synchronize()
+            compute_s = time.perf_counter() - started
+        return CompressionOutcome(
+            segments=out, tokens_in=tokens_in, tokens_out=tokens_out, compute_s=compute_s
+        )
 
 
 def _fingerprint(model: torch.nn.Module) -> str:
@@ -296,18 +328,18 @@ def run_self_test(compressor: LLMLingua2FixedThreshold) -> str:
     segment compresses the same alone as alongside others, the property fp16 breaks), and
     losslessness at threshold 0.0 (nothing is dropped when nothing may be).
     """
-    first, _, _ = compressor.compress(SELF_TEST_SEGMENTS, 0.5)
+    first = compressor.compress(SELF_TEST_SEGMENTS, 0.5).segments
     for _ in range(2):
-        again, _, _ = compressor.compress(SELF_TEST_SEGMENTS, 0.5)
+        again = compressor.compress(SELF_TEST_SEGMENTS, 0.5).segments
         if again != first:
             raise RuntimeError("self-test FAILED: same input produced different output")
-    isolated, _, _ = compressor.compress(SELF_TEST_SEGMENTS[:1], 0.5)
+    isolated = compressor.compress(SELF_TEST_SEGMENTS[:1], 0.5).segments
     if isolated[0] != first[0]:
         raise RuntimeError(
             "self-test FAILED: a segment compressed differently alone than in a batch; "
             "output depends on batch composition and cannot be served"
         )
-    passthrough, _, _ = compressor.compress(SELF_TEST_SEGMENTS, 0.0)
+    passthrough = compressor.compress(SELF_TEST_SEGMENTS, 0.0).segments
     if passthrough != list(SELF_TEST_SEGMENTS):
         raise RuntimeError("self-test FAILED: threshold 0.0 is not lossless")
     return "determinism+batch-invariance+threshold-0-lossless PASS"
@@ -381,26 +413,29 @@ def build_app(compressor: LLMLingua2FixedThreshold, token: str, self_test: str) 
             raise HTTPException(
                 status_code=413, detail=f"payload too large ({total_chars} > {max_chars} chars)"
             )
-        start = time.perf_counter()
-        segments, tokens_in, tokens_out = compressor.compress(body.segments, body.threshold)
-        if compressor.device.startswith("cuda"):
-            torch.cuda.synchronize()
-        elapsed = time.perf_counter() - start
+        arrived = time.perf_counter()
+        outcome = compressor.compress(body.segments, body.threshold)
+        # Everything between arrival and the end of compute that was NOT compute was spent
+        # waiting for the GPU lock. Reported, never billed.
+        queue_s = max(0.0, (time.perf_counter() - arrived) - outcome.compute_s)
         log.info(
-            "compress client=%s segments=%d tokens_in=%d tokens_out=%d threshold=%.3f %.1fms",
+            "compress client=%s segments=%d tokens_in=%d tokens_out=%d threshold=%.3f "
+            "compute=%.1fms queue=%.1fms",
             request.client.host if request.client else "?",
             len(body.segments),
-            tokens_in,
-            tokens_out,
+            outcome.tokens_in,
+            outcome.tokens_out,
             body.threshold,
-            elapsed * 1000,
+            outcome.compute_s * 1000,
+            queue_s * 1000,
         )
         return CompressResponse(
-            segments=segments,
-            tokens_in=tokens_in,
-            tokens_out=tokens_out,
-            latency_ms=round(elapsed * 1000, 3),
-            cost_usd=elapsed * USD_PER_GPU_SECOND,
+            segments=outcome.segments,
+            tokens_in=outcome.tokens_in,
+            tokens_out=outcome.tokens_out,
+            latency_ms=round(outcome.compute_s * 1000, 3),
+            queue_ms=round(queue_s * 1000, 3),
+            cost_usd=outcome.compute_s * USD_PER_GPU_SECOND,
             compressor_version=compressor.version,
             model_fingerprint=compressor.model_fingerprint,
         )

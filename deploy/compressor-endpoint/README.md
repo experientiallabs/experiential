@@ -38,7 +38,10 @@ Registration is explicit rather than on import, because building the client need
 and the seam's rule is that a misconfiguration fails at mount. It also contacts `/healthz` once
 to confirm the box really is running absolute-threshold selection before attesting
 `append_stable`, so the serving admission ticket is verified against the running server rather
-than asserted by the client. To use it directly without the registry:
+than asserted by the client. The same handshake adopts the box's published request caps as
+`max_segments_per_call`, the attribute the seam chunks against, so that limit tracks the
+running server instead of a constant compiled into the client. To use it directly without the
+registry:
 
 ```python
 from wmo.optimize.compression import CompressionConfig
@@ -117,6 +120,13 @@ Cost is honest per call: the server times its own compute and prices it as GPU-s
 the box's retail rate ($19.544/hr, 2 GPUs, so $9.772/GPU-hr). It does not amortize idle time,
 so the box's real cost per useful token is higher whenever the endpoint is quiet.
 
+That clock runs INSIDE the GPU lock. The response separates `latency_ms` (GPU compute, what
+`cost_usd` prices) from `queue_ms` (waiting for the lock, reported and never billed). It used
+to start before the lock, so a request queued behind others billed its whole wait and cost
+inflated by roughly the concurrency factor. Measured after the fix at concurrency 8: the worst
+concurrent biller pays 1.35x the serial cost, against ~8x if queueing were billed, while
+`queue_ms` absorbs the wait (worst 48.7 ms).
+
 Break-even against the tokens it removes (3.6k per 10k) still holds through the network:
 3.4x at the cheapest pool tier (gpt-5.4-mini, $0.75/M in), 13x at sonnet-5, 22x at gpt-5.5.
 
@@ -150,9 +160,25 @@ ssh h100-dev-box-6 sudo journalctl -u wmo-compressor -f
 
 Redeploying does NOT rotate the certificate: `deploy.sh` copies four files and leaves `tls/`,
 `venv/`, and `hf/` on the box alone, so the pinned cert every client verifies against survives.
-(It did rotate them briefly: an `rsync --delete-excluded` was deleting everything it was not
-explicitly told to copy, which regenerated TLS and rebuilt the venv on every deploy. Fixed, and
-verified by deploying twice and diffing the fingerprint.)
+`deploy_intact_test.py` runs the script's real rsync against a populated fake service root and
+fails if those trees change, plus refuses any `--delete` flag outright.
+
+**If you pulled this branch before 2026-07-27, re-pull.** An `rsync --delete-excluded` was
+deleting everything it was not explicitly told to copy, so every deploy wiped `tls/` and
+bootstrap minted a fresh self-signed certificate. The pinned cert rotated once during
+development, and an older `compressor-cert.pem` will fail TLS verification against the box. The
+certificate now serving, committed here, is:
+
+```
+sha256 B1:62:D7:A8:CB:08:47:C7:30:E0:54:96:88:43:B7:8F:47:BA:ED:CB:C6:6C:DE:ED:24:94:05:E1:0D:05:AC:57
+```
+
+Check yours matches what the box is actually serving:
+
+```bash
+openssl x509 -in deploy/compressor-endpoint/compressor-cert.pem -noout -fingerprint -sha256
+echo | openssl s_client -connect 40.80.93.150:8443 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+```
 
 `deploy.sh` pushes this directory to the box and runs `bootstrap.sh` there, which builds the
 venv (from the pip cache C1's bench already populated, so torch is a local unpack), copies the

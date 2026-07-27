@@ -129,7 +129,9 @@ environment-capture = { workspace = true }
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
-testpaths = ["wmo", "packages"]
+# `deploy/` carries the operated services; their tests cover the deploy scripts themselves
+# (a deploy that deletes the box's generated trees rotates the pinned TLS certificate).
+testpaths = ["wmo", "packages", "deploy"]
 # tau2-bench is a local clone of the external real-environment runner (own test suite, own
 # deps) that lives beside the tau-bench member data; it is not part of this gate.
 norecursedirs = ["tau2-bench"]

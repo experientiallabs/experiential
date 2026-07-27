@@ -56,6 +56,7 @@ class FakeEndpointState:
             "tokens_in": 20,
             "tokens_out": 9,
             "latency_ms": 12.5,
+            "queue_ms": 0.4,
             "cost_usd": 0.000034,
             "compressor_version": "llmlingua2-fixed-absolute-threshold-fp32/1",
             "model_fingerprint": "9a9d3f98bfb65abc",
@@ -63,6 +64,7 @@ class FakeEndpointState:
         self.requests: list[SeenRequest] = []
         self.auth_headers: list[str] = []
         self.selection_rule = "fixed-absolute-threshold"
+        self.max_segments = 1024
         # When set, the fake echoes back one output segment per input instead of `body`, which
         # is what the batch-splitting tests need.
         self.echo = False
@@ -90,6 +92,8 @@ def _make_handler(state: FakeEndpointState) -> type[BaseHTTPRequestHandler]:
                     "status": "ok",
                     "model_fingerprint": "9a9d3f98bfb65abc",
                     "selection_rule": state.selection_rule,
+                    "max_segments": state.max_segments,
+                    "max_chars": 8000000,
                 },
             )
 
@@ -369,6 +373,35 @@ def test_registration_refuses_a_server_running_another_selection_rule(
     assert REQUIRED_SELECTION_RULE in str(caught.value)
     with pytest.raises(ValueError, match="unknown compressor"):
         get_compressor("llmlingua2-endpoint")
+
+
+def test_handshake_adopts_the_boxs_published_caps(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """The chunking limit comes from the running box, not a constant that can drift from it."""
+    client, state = endpoint
+    state.max_segments = 64
+
+    client.handshake()
+
+    assert client.max_segments_per_call == 64
+    state.echo = True
+    client.compress(
+        [f"s{index}" for index in range(150)],
+        CompressionConfig(compressor_id="x", aggressiveness=0.5),
+    )
+    assert [len(request.segments) for request in state.requests] == [64, 64, 22]
+
+
+def test_queue_time_is_reported_but_not_billed(
+    endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
+) -> None:
+    """cost_usd carries the endpoint's GPU time only; queueing is metering, not billing."""
+    client, _ = endpoint
+    result = client.compress(SEGMENTS, CompressionConfig(compressor_id="x", aggressiveness=0.5))
+    # The fake reports latency_ms 12.5, queue_ms 0.4, cost 0.000034: cost tracks compute alone,
+    # so it must not have grown by the queue component.
+    assert result.cost_usd == pytest.approx(0.000034)
 
 
 def test_bank_fit_batch_stays_one_round_trip(
