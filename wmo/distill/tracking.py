@@ -43,8 +43,9 @@ WANDB_RUN_FILE = "wandb-run.json"
 """Run-dir file persisting the wandb run id so a restart resumes the same run."""
 
 _MISSING_WANDB_EXTRA = (
-    "the wandb SDK is not installed; run `uv sync --extra distill` to enable "
-    "[wandb] run tracking, or set wandb.enabled = false in the distill config"
+    "the wandb SDK is not installed; run `uv sync --extra distill` (or "
+    "`pip install 'world-model-optimizer[distill]'`) to enable [wandb] run tracking, "
+    "or set wandb.enabled = false in the distill config"
 )
 
 

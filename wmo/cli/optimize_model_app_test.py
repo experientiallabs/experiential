@@ -808,6 +808,36 @@ def test_an_anchor_outside_the_pool_is_refused_before_anything_is_spent(
     assert not _paths(root)[0].exists()
 
 
+def test_a_fallback_outside_the_pool_is_refused_before_anything_is_spent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--fallback names a pool candidate too, so it is checked at --baseline's boundary.
+
+    A typo used to render in the plan table as if it were a real model, pass the spend
+    confirmation, and only fail inside the fit stage, after the sweep had been bought.
+    """
+    world_model = _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
+    root = _project(tmp_path)
+    result = _run(tmp_path, root, "--yes", "--fallback", "ghost")
+    assert result.exit_code != 0
+    assert _says(result.output, "--fallback 'ghost' is not a model in")
+    assert _says(result.output, "Available: cheap, pricey")
+    assert world_model.tasks == []  # not one cell bought
+    assert not _paths(root)[0].exists()
+
+
+def test_a_fallback_typo_is_refused_by_a_dry_run_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The plan table is the thing a --dry-run reader trusts; it must not print a typo as real."""
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    result = _run(tmp_path, root, "--dry-run", "--fallback", "ghost")
+    assert result.exit_code != 0
+    assert _says(result.output, "--fallback 'ghost' is not a model in")
+    assert not _says(result.output, "knn (guarded, fallback ghost)")
+
+
 def test_a_missing_world_model_names_the_command_a_user_types(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

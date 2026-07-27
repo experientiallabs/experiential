@@ -920,6 +920,88 @@ def test_harbor_scorer_receives_the_local_backend_episode_timeout(
     assert scorer.kwargs["episode_timeout_s"] == pytest.approx(1800.0)
 
 
+# -- what --help promises ----------------------------------------------------------------------
+
+
+def _help_text() -> str:
+    return " ".join(
+        runner.invoke(app, ["optimize", "harness", "--help"]).output.replace("│", " ").split()
+    )
+
+
+def test_backend_help_does_not_deny_that_harbor_moves_the_environment() -> None:
+    """On the harbor path --backend picks the TASK environment (docker vs E2B), and there is
+    no world model at all, so the option table must not claim otherwise: the same --help says
+    the opposite three paragraphs above."""
+    help_text = _help_text()
+    assert "The environment is always the world model." not in help_text
+    assert "the environment stays the world model" in help_text
+    assert "docker tasks" in help_text and "E2B tasks" in help_text
+
+
+def test_iterations_help_states_both_environment_defaults() -> None:
+    """Each iteration is a paid propose-and-gate step, and the fallback is not the same on both
+    paths, so --help states both numbers (Click can render no static default: the None sentinel
+    is what --resume's conflict check reads)."""
+    assert "Default: 5 for a world-model environment, 10 for harbor." in _help_text()
+
+
+def test_a_world_model_search_without_iterations_buys_the_documented_five(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [call] = recorder.calls
+    assert call["iterations"] == 5
+    assert "5 iteration(s)" in " ".join(result.output.split())
+
+
+def test_a_harbor_search_without_iterations_buys_the_documented_ten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _harbor_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "pi",
+            "harbor",
+            "--harbor-config",
+            str(tmp_path / "job.yaml"),
+            "--task-ids",
+            str(tmp_path / "tasks.json"),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, _HarborRunConfig)
+    assert config.iterations == 10
+
+
 # -- the retired distill mode ------------------------------------------------------------------
 
 

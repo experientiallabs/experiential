@@ -360,14 +360,19 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
-    if baseline is not None:
-        # Knowable from the pool the pre-flight already loaded, so it is a boundary error rather
-        # than a surprise after the sweep has been paid for and the fit written.
-        known = [entry.name for entry in preflight.pool.models]
-        if baseline not in known:
+    # Both flags name a pool candidate, and the pool is loaded by the pre-flight above, so a typo
+    # is knowable here for free: a boundary error rather than a surprise after the sweep has been
+    # paid for and the fit written. --fallback used to survive this far and then be printed in the
+    # plan table as if it were a real model, only failing inside the fit stage.
+    known = [entry.name for entry in preflight.pool.models]
+    for flag, value, why in (
+        ("--fallback", fallback, "the fit can only guard a candidate the sweep measures"),
+        ("--baseline", baseline, "the report can only anchor on a candidate the sweep measures"),
+    ):
+        if value is not None and value not in known:
             raise typer.BadParameter(
-                f"--baseline '{baseline}' is not a model in {pool_file}; the report can only "
-                f"anchor on a candidate the sweep measures. Available: {', '.join(known)}"
+                f"{flag} '{value}' is not a model in {pool_file}; {why}. "
+                f"Available: {', '.join(known)}"
             )
 
     # Printed before the plan table, the way `route fit` prints it before the fit: the embedder

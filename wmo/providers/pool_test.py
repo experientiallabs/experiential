@@ -84,8 +84,9 @@ def test_load_pool_parses_entries(tmp_path: Path) -> None:
 
 def test_load_pool_missing_file_says_what_to_create(tmp_path: Path) -> None:
     missing = tmp_path / "nope.toml"
-    with pytest.raises(FileNotFoundError, match=r"\[\[model\]\]"):
+    with pytest.raises(FileNotFoundError, match=r"\[\[model\]\]") as excinfo:
         load_pool(missing)
+    assert "wmo providers set" in str(excinfo.value), "the command that writes the file"
     assert DEFAULT_POOL_PATH == Path(".wmo/pool.toml")
 
 
@@ -116,6 +117,25 @@ def test_single_bracket_model_table_says_to_double_the_brackets(tmp_path: Path) 
     # answered it with `Input should be a valid list`.
     with pytest.raises(ValueError, match=r"\[\[model\]\]"):
         load_pool(_write_pool(tmp_path, '[model]\nname = "fable"\n'))
+
+
+def test_a_pool_that_is_not_valid_toml_names_the_file(tmp_path: Path) -> None:
+    path = _write_pool(tmp_path, "model = \n")
+    with pytest.raises(ValueError) as excinfo:
+        load_pool(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "not valid TOML" in message
+
+
+def test_an_invalid_entry_names_the_file_the_table_and_the_field(tmp_path: Path) -> None:
+    path = _write_pool(tmp_path, _POOL_TOML + '\n[[model]]\nname = "half"\nkind = "openai"\n')
+    with pytest.raises(ValueError) as excinfo:
+        load_pool(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "[[model]] 4 model" in message, "the table's position in the file, and the field"
+    assert "errors.pydantic.dev" not in message
 
 
 def test_unknown_model_requires_explicit_price() -> None:
@@ -853,7 +873,10 @@ def test_openrouter_entry_needs_only_a_model_id(
 def test_openrouter_entry_offline_falls_back_to_the_explicit_price_error(tmp_path: Path) -> None:
     # No cache and no network (the conftest fetch stub refuses): the entry must fail with the
     # ordinary "declare the prices" instruction, and say WHY the automatic route did not apply.
-    with pytest.raises(ValidationError) as excinfo:
+    # `load_pool` re-raises pydantic's ValidationError as a plain ValueError (still what every
+    # caller catches) so the message can carry the file path and a next command instead of a
+    # schema dump; the entry's own instruction has to survive that rewrap intact.
+    with pytest.raises(ValueError) as excinfo:
         load_pool(_write_pool(tmp_path, _OPENROUTER_POOL))
     message = str(excinfo.value)
     assert "OpenRouter price catalog" in message

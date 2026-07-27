@@ -646,10 +646,15 @@ def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
         )
     tau2_bin = Path(cfg.tau2.tau2_bin)
     if not tau2_bin.is_file():
+        # Self-contained on purpose: tau2-bench is an external clone no wheel can ship, so a
+        # pip-installed user has no repo file to be pointed at. The one-time setup is three
+        # commands, so the message carries them instead of a path that may not exist.
         raise typer.BadParameter(
-            f"tau2.tau2_bin {tau2_bin} does not exist; point it at the tau2 CLI inside "
-            "its own venv (see packages/environment-capture/tau-bench/README.md for the "
-            "one-time setup)"
+            f"tau2.tau2_bin {tau2_bin} does not exist; tau2-bench runs from its own Python 3.13 "
+            "venv, so set it up once (`git clone --depth 1 "
+            "https://github.com/sierra-research/tau2-bench && uv venv --python 3.13 .venv && "
+            "uv pip install --python .venv ./tau2-bench audioop-lts boto3`) and point "
+            "tau2.tau2_bin at that venv's CLI, <where-you-ran-it>/.venv/bin/tau2"
         )
     data_dir = Path(cfg.tau2.data_dir)
     if not data_dir.is_dir():
@@ -686,6 +691,13 @@ def _load_config(path: Path) -> DistillConfig:
         ) from exc
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except ImportError as exc:
+        # Some sections can only be VALIDATED with the distill extra installed:
+        # `[rollout.renderers]` resolves its names through tinker-cookbook. pydantic re-raises a
+        # non-ValueError out of a field validator untouched, so without this a missing extra
+        # (the state every shipped reference config lands in on a plain `pip install`) escapes
+        # as a traceback instead of the install command the user needs.
+        raise typer.BadParameter(f"cannot load {path}: {exc}") from exc
 
 
 def _load_record(path: Path) -> DistillCliRunRecord:
@@ -1157,6 +1169,41 @@ def _print_paired_delta(console: Console, store: DistillRunStore, gate: DistillG
     )
 
 
+def _read_metrics(console: Console, store: DistillRunStore) -> list[JsonObject]:
+    """Every metrics row, surviving the half-written last line an aborted run leaves.
+
+    `report` advertises itself as safe on a live or aborted run dir, so a torn final row (all a
+    run killed mid-append can leave behind) must not end the command: drop it, say so, and
+    report what is complete. Damage above the last line means the file lost content, so it stays
+    an error; it is just a usage error now, the way `_load_gate` and `_load_eval_report` already
+    treat the same class of damage, rather than a traceback.
+
+    Args:
+        console: Where to print the note about a dropped final line.
+        store: The run store to read `metrics.jsonl` from.
+
+    Returns:
+        Every complete row, in append order.
+
+    Raises:
+        typer.BadParameter: If a row above the last one is not a JSON object.
+    """
+    try:
+        return store.read_metrics()
+    except ValueError:
+        pass  # the tolerant read below decides whether the damage is only the torn tail
+    try:
+        rows = store.read_metrics(tolerate_partial_tail=True)
+    except ValueError as fatal:
+        raise typer.BadParameter(str(fatal)) from fatal
+    console.print(
+        f"[yellow]note[/yellow] ignoring a half-written last line in "
+        f"{escape(str(store.metrics_path))} (a run killed mid-append leaves one); "
+        f"reporting the {len(rows)} complete row(s)"
+    )
+    return rows
+
+
 def _print_training_summary(console: Console, store: DistillRunStore) -> None:
     """Print the last training row's health metrics, or say the run trained nothing.
 
@@ -1164,7 +1211,7 @@ def _print_training_summary(console: Console, store: DistillRunStore) -> None:
     it. `mean_generation_tokens` is the per-episode series the loop does
     measure (sampled tokens, pooled over the batch's span-bearing episodes).
     """
-    rows = [row for row in store.read_metrics() if row.get("phase") is None]
+    rows = [row for row in _read_metrics(console, store) if row.get("phase") is None]
     if not rows:
         console.print("no training step recorded in metrics.jsonl")
         return

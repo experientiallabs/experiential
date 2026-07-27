@@ -61,6 +61,9 @@ from wmo.providers.registry import get_provider
 # The default agent seed's literal CLI name: `wmo optimize harness pi harbor ...` starts from the
 # built-in pi agent and publishes new versions under the store name "pi".
 DEFAULT_SEED_AGENT = "pi"
+# The search budget each environment falls back to when --iterations is not given. They differ
+# (harbor buys more, cheaper, steps), which is exactly why --iterations' help states both.
+_DEFAULT_WORLD_MODEL_ITERATIONS = 5
 _DEFAULT_HARBOR_ITERATIONS = 10
 _HARBOR_ENVIRONMENT = "harbor"
 _HARBOR_EXTRA_HINT = (
@@ -180,7 +183,9 @@ def optimize(
         "local",
         "--backend",
         help="Where the harness PROCESS runs: local (in/from this process) or e2b (the real "
-        "pi agent inside pooled E2B sandboxes). The environment is always the world model.",
+        "pi agent inside pooled E2B sandboxes). With a world-model ENVIRONMENT that is all it "
+        "moves: the environment stays the world model. With `harbor` it also selects the task "
+        "environment (local = docker tasks, e2b = E2B tasks).",
     ),
     eval_concurrency: int | None = typer.Option(
         None,
@@ -204,7 +209,9 @@ def optimize(
     iterations: int = typer.Option(
         None,
         min=0,
-        help="Propose-and-gate steps (the search budget). 0 scores the seed only (harbor env), "
+        help=f"Propose-and-gate steps (the search budget). Default: "
+        f"{_DEFAULT_WORLD_MODEL_ITERATIONS} for a world-model environment, "
+        f"{_DEFAULT_HARBOR_ITERATIONS} for harbor. 0 scores the seed only (harbor env), "
         "the way a baseline or a frozen champion is scored on a task set.",
     ),
     proposal_batch_size: int = typer.Option(
@@ -371,9 +378,12 @@ def optimize(
         tasks_file = Prompt.ask("Task file (JSONL of task_id/instruction/gold)")
     if iterations is None:
         iterations = (
-            IntPrompt.ask("Search iterations (each = 1 delta + 1 gated eval)", default=5)
+            IntPrompt.ask(
+                "Search iterations (each = 1 delta + 1 gated eval)",
+                default=_DEFAULT_WORLD_MODEL_ITERATIONS,
+            )
             if interactive
-            else 5
+            else _DEFAULT_WORLD_MODEL_ITERATIONS
         )
 
     if backend not in ("local", "e2b"):

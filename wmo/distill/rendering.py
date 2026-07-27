@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 MISSING_DISTILL_EXTRA = (
     "the tinker-cookbook SDK is not installed; run `uv sync --extra distill` "
-    "to use the Tinker distillation provider"
+    "(or `pip install 'world-model-optimizer[distill]'`) to use the Tinker "
+    "distillation provider"
 )
 
 
