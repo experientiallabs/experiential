@@ -115,6 +115,16 @@ class OptimizeMetrics(BaseModel):
     # `best_fresh - base_fresh`: positive means the accepted/rejected winner beat base on the
     # fresh sample; `None` exactly when `base_fresh`/`best_fresh` are `None`.
     fresh_delta: float | None = None
+    # Whether the fresh comparison above actually ran on data disjoint from GEPA's selection
+    # valset (a caller-supplied `recheck` set that yielded real steps), or fell back to re-scoring
+    # the selection valset itself (no `recheck` given, or it flattened to zero steps - e.g. the
+    # validation split was too small to leave anything past the selection cap). A selection-set
+    # comparison tests selection, not generalization: without this flag, a build whose corpus
+    # forced the fallback would persist `base_fresh`/`best_fresh`/`fresh_delta` in the exact same
+    # shape as a genuinely held-out measurement, so a reader auditing the artifact could not tell
+    # the two apart. `None` exactly when `base_fresh`/`best_fresh` are `None` (no fresh comparison
+    # happened at all); `True`/`False` whenever the acceptance re-check ran.
+    fresh_recheck_disjoint: bool | None = None
     # Reserved: judge self-consistency / human-agreement proxy. Populating it needs repeated or
     # independent judging (not yet implemented); `None` until then so it never reads as a real 0.0.
     judge_agreement: float | None = None

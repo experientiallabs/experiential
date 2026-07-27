@@ -692,6 +692,7 @@ class GEPAOptimizer:
         # comparison happened" from a real measured tie (see `OptimizeMetrics` docstring).
         base_fresh: float | None = None
         best_fresh: float | None = None
+        disjoint: bool | None = None
         if best != base_prompt:
             # Stagnant-or-improve acceptance re-check. GEPA promotes by argmax over SINGLE-sample
             # valset evaluations, and rollout+judge scores are noisy run-to-run even at T=0 (the
@@ -705,10 +706,13 @@ class GEPAOptimizer:
             # instead, which also catches winners whose valset win is real but biased (e.g. a
             # step-capped valset over-representing short traces). Always falls back to the FULL
             # valset - never the hard-filtered selection subset - and to the full valset again if
-            # the recheck traces carry no steps (0.0-vs-0.0 would silently keep any winner).
-            recheck_steps = _eval_steps(recheck, demos) if recheck else full_valset
-            if not recheck_steps:
-                recheck_steps = full_valset
+            # the recheck traces carry no steps (0.0-vs-0.0 would silently keep any winner). This
+            # fallback tests selection, not generalization, so `disjoint` records which one
+            # actually happened - a reader auditing `metrics.json` must not mistake a
+            # selection-sample fallback for a held-out measurement.
+            disjoint_steps = _eval_steps(recheck, demos) if recheck else []
+            disjoint = bool(disjoint_steps)
+            recheck_steps = disjoint_steps if disjoint else full_valset
             base_fresh = _mean_valset_score(adapter, recheck_steps, base_prompt)
             best_fresh = _mean_valset_score(adapter, recheck_steps, best)
             recheck_rollouts = 2 * len(recheck_steps)
@@ -737,6 +741,7 @@ class GEPAOptimizer:
                 base_fresh=base_fresh,
                 best_fresh=best_fresh,
                 fresh_delta=fresh_delta,
+                fresh_recheck_disjoint=disjoint,
             ),
         )
 

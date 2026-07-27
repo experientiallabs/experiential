@@ -265,13 +265,16 @@ def build(
         # (never test: the build's data boundary keeps test untouched for `wmo eval`), so its
         # leftover traces past the cap are a genuinely disjoint, still leak-free sample. Capping
         # that remainder at the same `gepa_val_size` keeps the re-check's cost the same order of
-        # magnitude as before: the two fresh eval passes already happened every GEPA build
-        # (`recheck_rollouts = 2 * len(recheck_steps)`), just against the selection data; this
-        # only repoints them. Empty (never None, falsy either way) exactly when `val` was too
-        # small to leave anything past the cap; `GEPAOptimizer.optimize` then falls back to the
-        # selection valset itself, so `metrics.base_fresh`/`best_fresh` stay populated (not a
-        # leak-free comparison in that corner case, but never silently mislabeled as one).
-        recheck = _cap_gepa_valset(val[len(gepa_val) :], gepa_val_size)
+        # magnitude as before in the common case: the two fresh eval passes already happened
+        # every GEPA build (`recheck_rollouts = 2 * len(recheck_steps)`), just against the
+        # selection data; this only repoints them. `allow_oversized_first=False`: unlike
+        # `gepa_val` (which must never come back empty - GEPA needs SOME valset), an empty
+        # `recheck` has a graceful, already-tested fallback inside `optimize()` (re-scores the
+        # selection valset itself), so a single oversized trace landing first in the leftover
+        # must not be let through alone - that would blow the re-check's cost past the selection
+        # pass it is supposed to match, for no benefit over falling back. `metrics.json` records
+        # which of the two happened via `fresh_recheck_disjoint` - never silently indistinguishable.
+        recheck = _cap_gepa_valset(val[len(gepa_val) :], gepa_val_size, allow_oversized_first=False)
         result = optimizer.optimize(
             train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget, recheck=recheck
         )
@@ -364,16 +367,28 @@ def build(
 _GEPA_VAL_STEP_CAP = 16
 
 
-def _cap_gepa_valset(traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP) -> list[Trace]:
-    """A prefix of `traces` totalling at most `max_steps` steps (always at least one trace).
+def _cap_gepa_valset(
+    traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP, *, allow_oversized_first: bool = True
+) -> list[Trace]:
+    """A prefix of `traces` totalling at most `max_steps` steps.
 
     `split_traces` already shuffles deterministically, so the prefix is an unbiased, stable
     sample of the held-out split.
+
+    `allow_oversized_first` (default True, GEPA's own selection valset): a single trace bigger
+    than `max_steps` still passes through alone when it is the very first candidate, so GEPA is
+    never starved of a valset entirely. Pass False for a caller where an EMPTY result has an
+    acceptable fallback and the cost ceiling matters more than always returning something (e.g.
+    the acceptance re-check's disjoint sample in `wmo.engine.build.build`: if the leftover
+    validation traces happen to start with one unusually long trace, letting it through alone
+    would blow the re-check's cost past what the selection valset itself pays - `optimize()`
+    already falls back gracefully to the selection valset on an empty `recheck`, so returning
+    `[]` here is strictly safer than an oversized pass).
     """
     capped: list[Trace] = []
     steps = 0
     for trace in traces:
-        if capped and steps + len(trace.steps) > max_steps:
+        if (capped or not allow_oversized_first) and steps + len(trace.steps) > max_steps:
             break
         capped.append(trace)
         steps += len(trace.steps)

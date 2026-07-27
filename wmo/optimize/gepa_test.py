@@ -247,6 +247,7 @@ def test_optimize_with_zero_budget_returns_base_prompt() -> None:
     assert result.metrics.base_fresh is None
     assert result.metrics.best_fresh is None
     assert result.metrics.fresh_delta is None
+    assert result.metrics.fresh_recheck_disjoint is None
 
 
 def test_optimize_with_no_traces_returns_base_prompt() -> None:
@@ -333,6 +334,9 @@ def test_optimize_reverts_to_base_when_fresh_recheck_contradicts(monkeypatch) ->
     assert abs(result.metrics.base_fresh - 0.9) < 1e-9
     assert abs(result.metrics.best_fresh - 0.1) < 1e-9
     assert abs(result.metrics.fresh_delta - (-0.8)) < 1e-9
+    # No `recheck` traces were supplied: the comparison fell back to re-scoring the selection
+    # valset itself, which the artifact must not mislabel as a held-out measurement.
+    assert result.metrics.fresh_recheck_disjoint is False
     # The returned prompt leads the frontier - the rejected winner must not be presented as the
     # top validated candidate (frontier.json consumers pick from the front).
     assert result.frontier[0] == "BASE"
@@ -385,6 +389,8 @@ def test_optimize_keeps_winner_when_fresh_recheck_confirms(monkeypatch) -> None:
     assert abs(result.metrics.base_fresh - 0.2) < 1e-9
     assert abs(result.metrics.best_fresh - 0.8) < 1e-9
     assert abs(result.metrics.fresh_delta - 0.6) < 1e-9
+    # No `recheck` traces were supplied here either: same fallback, same "not disjoint" label.
+    assert result.metrics.fresh_recheck_disjoint is False
 
 
 def test_optimize_recheck_raises_on_total_judge_outage(monkeypatch) -> None:  # noqa: ANN001
@@ -420,6 +426,9 @@ def test_optimize_recheck_with_empty_step_traces_falls_back_to_valset(monkeypatc
     assert result.prompt == "BASE"
     assert result.metrics.reverted_to_base is True
     assert result.metrics.held_out_accuracy > 0.0
+    # A `recheck` that flattened to zero steps is a fallback, not a disjoint measurement - the
+    # artifact must say so, or a selection-sample comparison reads as held-out evidence.
+    assert result.metrics.fresh_recheck_disjoint is False
 
 
 def test_optimize_recheck_can_use_disjoint_traces(monkeypatch) -> None:  # noqa: ANN001
@@ -448,6 +457,9 @@ def test_optimize_recheck_can_use_disjoint_traces(monkeypatch) -> None:  # noqa:
     assert result.metrics.reverted_to_base is True
     # The re-check scored the DISJOINT recheck steps, not the valset's.
     assert set(seen_contexts) == {"recheck-obs"}
+    # A genuinely disjoint `recheck` sample was used and yielded real steps: the artifact must
+    # say so, distinguishing this from a selection-sample fallback.
+    assert result.metrics.fresh_recheck_disjoint is True
 
 
 def test_optimize_minibatch_size_is_configurable(monkeypatch) -> None:  # noqa: ANN001
@@ -491,6 +503,7 @@ def test_optimize_skips_recheck_when_base_wins_the_search(monkeypatch) -> None: 
     assert result.metrics.base_fresh is None
     assert result.metrics.best_fresh is None
     assert result.metrics.fresh_delta is None
+    assert result.metrics.fresh_recheck_disjoint is None
 
 
 def _eval_batch(trace: Trace) -> list[_EvalStep]:

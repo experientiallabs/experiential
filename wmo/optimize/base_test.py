@@ -38,11 +38,13 @@ def test_optimize_metrics_fresh_recheck_fields_default_to_none_not_zero() -> Non
     assert metrics.base_fresh is None
     assert metrics.best_fresh is None
     assert metrics.fresh_delta is None
+    assert metrics.fresh_recheck_disjoint is None
     # Round-trips through JSON as `null`, not omitted or coerced to 0.0.
     dumped = json.loads(metrics.model_dump_json())
     assert dumped["base_fresh"] is None
     assert dumped["best_fresh"] is None
     assert dumped["fresh_delta"] is None
+    assert dumped["fresh_recheck_disjoint"] is None
 
 
 def test_artifact_refs_cover_every_optimizer_family() -> None:
