@@ -52,14 +52,12 @@ from wmo.optimize.scorecard import (
 CORNERS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CORNERS / "common"))
 
+import ablation_chart  # noqa: E402
 from data import (  # noqa: E402
-    CYCLE1_JUDGE,
     GRID_ARMS,
     IDENTITY_ARM,
-    cycle1_rewards_by_task,
     grid_dir,
     load_arm_matrix,
-    load_cycle1_rows,
     rewards_by_scenario,
 )
 from palette import (  # noqa: E402
@@ -71,7 +69,6 @@ from palette import (  # noqa: E402
     RED,
     apply_style,
     footnote,
-    label_point,
     save_fig,
 )
 from stats import NOISE_FLOOR_REWARD, PairedDelta, paired_delta  # noqa: E402
@@ -390,68 +387,15 @@ def chart_dial_curve(out: Path) -> None:
 
 
 def chart_training_stage(out: Path) -> None:
-    """The shared training-stage chart through the cost lens (v1: cycle-1 real data only).
+    """The shared training-stage chart, rendered through the cost lens.
 
-    Quality on y per the charter; the cost lens annotates each stage point with its
-    effective cost delta vs anchor. Cycle 1's rows carry no per-episode cost and its
-    adapter was not promoted, so the honest annotation today is "cost n/a". Grid ablation
-    lines (distill-only / +routing / +compaction) attach when the matrices land. Computed
-    from episode-rows.jsonl, not transcribed from the result note.
+    Delegates to common/ablation_chart.py, the canonical implementation (charter
+    deliverable 1: the numbers are built once so three corner renderings can never
+    disagree). The cost lens annotates each stage point with its effective cost delta;
+    cycle-1 rows carry no per-episode cost, and the canonical chart says so on the figure.
     """
-    rows = load_cycle1_rows()
-    by_arm = {arm: cycle1_rewards_by_task(rows, arm=arm) for arm in
-              ("teacher", "student-before", "student-after")}
-    solve = {
-        arm: 100 * sum(sum(r) / len(r) for r in tasks.values()) / len(tasks)
-        for arm, tasks in by_arm.items()
-    }
-    evidence = paired_delta(by_arm["student-after"], by_arm["student-before"])
-
-    fig, ax = plt.subplots(figsize=(8.5, 4.8))
-    stages = ["student-before", "student-after"]
-    labels = ["student base\n(Qwen3.5-9B)", "cycle 1\n(warmup LoRA, NOT promoted)"]
-    values = [solve[s] for s in stages]
-    # Points with a dotted connector: the gate read this drop as noise (sign test over the
-    # movers), so a solid trend line would draw a regression that was not measured.
-    ax.plot(range(len(stages)), values, color=PURPLE, linestyle=":", linewidth=1.2)
-    ax.scatter(range(len(stages)), values, color=PURPLE, s=48, zorder=3)
-    for x, v in enumerate(values):
-        ax.annotate(
-            f"{v:.1f}%\ncost Δ n/a",
-            xy=(x, v),
-            xytext=(0, -30),
-            textcoords="offset points",
-            ha="center",
-            fontsize=8,
-        )
-    p_label = "p n/a" if evidence.sign_test_p is None else f"p={evidence.sign_test_p:.2f}"
-    label_point(
-        ax, len(stages) - 1, values[-1], f"gate REJECTED\n(noise, sign test {p_label})"
-    )
-    ax.axhline(solve["teacher"], color=MUTED, linewidth=1.0, linestyle="--")
-    ax.text(
-        0.02,
-        solve["teacher"] + 0.5,
-        f"teacher reference (Qwen3.6-27B, {solve['teacher']:.1f}%)",
-        fontsize=8,
-        color=MUTED,
-        transform=ax.get_yaxis_transform(),
-    )
-    ax.set_xticks(range(len(stages)), labels, fontsize=8)
-    ax.set_xlim(-0.4, len(stages) - 0.3)
-    ax.set_ylim(55, 85)
-    ax.set_title("Training stage vs quality, cost lens (cycle 1: no measurable effect)")
-    ax.set_ylabel("tau2 solve rate, %")
-    footnote(
-        fig,
-        f"real_episode · judge: {CYCLE1_JUDGE} · k=3 x 20 pinned holdout tasks · gate "
-        f"rejected: no teacher headroom; before-vs-after within noise "
-        f"({evidence.n_up} up / {evidence.n_down} down / {evidence.n_tied} tied, sign test "
-        f"{p_label}) · rows carry no per-episode $ so cost deltas are n/a until the grid's "
-        f"student cells land · fable-5 anchor reference attaches when the grid lands "
-        f"(different provenance: wm_simulated, separate panel rule)",
-    )
-    save_fig(fig, out)
+    chart = ablation_chart.build_shared_chart_data()
+    ablation_chart.render_training_stage_chart(chart, out, lens="cost")
 
 
 def main() -> None:
