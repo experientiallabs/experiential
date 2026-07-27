@@ -47,6 +47,12 @@ class ScenarioOutcome(BaseModel):
     # fitting). Reasoning models that emit thought before the JSON action keep it here.
     replies: list[str] = []
     error: str | None = None
+    # Whether this row is a RE-measurement of a cell an earlier attempt already ran (a transport
+    # fault, a throttled judge). Additive with a default so pre-retry matrices load unchanged.
+    # Retries are not free evidence: a cell measured only on its second try survived a filter its
+    # neighbours never faced, and a reader comparing two matrices deserves to see how much of one
+    # of them is re-runs.
+    remeasured: bool = False
     # D-COMPRESS fields, additive with defaults so pre-compression matrices load unchanged;
     # 0/"" = the episode ran uncompressed. Token counts are the compressor's deterministic
     # proxy totals summed over the episode's calls (wmo.optimize.compression); billable truth

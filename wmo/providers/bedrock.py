@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from wmo.core.types import JsonValue
@@ -131,6 +132,17 @@ def resolve_region(configured: str | None) -> str | None:
     return configured or os.environ.get(AWS_REGION_ENV) or None
 
 
+_CLIENT_CONSTRUCTION_LOCK = threading.Lock()
+"""Serializes boto3 client CONSTRUCTION across every Bedrock provider in the process.
+
+boto3 documents a built client as safe to call from several threads, and says nothing of the
+kind about building one: `boto3.client()` goes through the shared default session, whose service
+loader and credential cache are filled in on first use. A concurrent sweep builds one provider
+per cell and starts several cells at once, which is exactly the race. Held only while the client
+is constructed; requests never touch it.
+"""
+
+
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
 
@@ -153,6 +165,21 @@ class BedrockProvider:
         # Lazy: import boto3 and open the client only on first use. The region comes from
         # `resolve_region` (config, then AWS_REGION), and None hands the rest of the chain
         # (AWS_DEFAULT_REGION, profile, instance role) back to boto3.
+        #
+        # Lock-guarded, and the lock is MODULE-level rather than per-provider: `boto3.client()`
+        # builds from boto3's shared default session, whose loader and credential caches are
+        # populated on first use and are not thread-safe, so two providers constructing their
+        # first client at the same moment race each other, not just themselves. A concurrent
+        # sweep does exactly that (one provider per cell, several cells starting together).
+        # Only CONSTRUCTION is serialized; the built client is thread-safe to call, and requests
+        # never touch this lock.
+        if self._client is None:
+            with _CLIENT_CONSTRUCTION_LOCK:
+                return self._build_client()
+        return self._client
+
+    def _build_client(self) -> BaseClient:
+        """Build this provider's boto3 client, unless another thread built it while we waited."""
         if self._client is None:
             import boto3
             from botocore.config import Config

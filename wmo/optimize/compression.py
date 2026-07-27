@@ -395,6 +395,31 @@ def servable_compressor(config: CompressionConfig | None) -> Compressor | None:
     return compressor
 
 
+def resolve_compression(compressor_id: str, aggressiveness: float) -> CompressionConfig:
+    """The config a `--compressor` flag names, stamped with the version that will actually RUN.
+
+    Every command that turns a compressor id into a config comes through here (`route sweep`,
+    `route fit`, `optimize model`), because two things have to happen that the config's own shape
+    does not do. The version is read off the resolved implementation rather than defaulted, since
+    that is what the field means: the version this config was fitted against. Defaulting it to "1"
+    made every fit against a version-bumped compressor stamp a lie, which the mount gate would
+    then correctly refuse with a remedy no CLI has a flag to carry out. And the result is checked
+    against the v1 serving rule right here, so an arm that could never be mounted fails at the
+    boundary instead of after a sweep has been paid for.
+
+    Raises:
+        ValueError: The id is unknown, or the implementation cannot be served, naming which.
+    """
+    resolved = get_compressor(compressor_id)
+    config = CompressionConfig(
+        compressor_id=compressor_id,
+        compressor_version=resolved.version,
+        aggressiveness=aggressiveness,
+    )
+    servable_compressor(config)
+    return config
+
+
 def register_compressor_factory(compressor_id: str, factory: CompressorFactory) -> None:
     """Register a compressor to be CONSTRUCTED on first use, not at import.
 

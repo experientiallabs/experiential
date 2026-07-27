@@ -42,11 +42,9 @@ from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.compression import (
     CompressingEmbedder,
-    CompressionConfig,
     compression_signature,
-    get_compressor,
+    resolve_compression,
     same_compression,
-    servable_compressor,
 )
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
@@ -80,6 +78,7 @@ from wmo.optimize.sweep import (
     plan_sweep,
     preflight_pool,
     resolve_config,
+    resumable_cells,
     unevenness,
 )
 from wmo.providers.pool import (
@@ -102,26 +101,6 @@ _console = Console()
 
 DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
-
-
-def _compression_for(compressor: str, aggressiveness: float) -> CompressionConfig:
-    """The compression config `--compressor` names, stamped with the version that will RUN.
-
-    The version is read off the resolved implementation rather than defaulted, because that is
-    what the field means: the version this config was fitted against. Defaulting it to "1" made
-    every fit against a version-bumped compressor stamp a lie, which the mount gate would then
-    correctly refuse with a remedy the CLI has no flag to carry out.
-
-    Raises (naming the compressor) when the id is unknown or the implementation is not servable.
-    """
-    resolved = get_compressor(compressor)
-    config = CompressionConfig(
-        compressor_id=compressor,
-        compressor_version=resolved.version,
-        aggressiveness=aggressiveness,
-    )
-    servable_compressor(config)
-    return config
 
 
 @route_app.command("sweep")
@@ -154,6 +133,17 @@ def sweep(
     ),
     max_steps: int = typer.Option(
         20, "--max-steps", min=1, help="Step budget per episode (also the cost estimate's cap)."
+    ),
+    concurrency: int = typer.Option(
+        1,
+        "--concurrency",
+        min=1,
+        help="Cells measured at once (1 = one at a time). Changes only how long the sweep takes, "
+        "never what it measures, and a sweep interrupted at one value resumes at another. Your "
+        "PROVIDER LIMITS are the real ceiling, not this number: every candidate call and every "
+        "world-model serve and judge call is a request, and the world model's own calls all come "
+        "out of ONE account's bucket, so raising this past what that bucket allows turns cells "
+        "into throttling errors instead of results.",
     ),
     history_chars: int = typer.Option(
         DEFAULT_HISTORY_CHARS,
@@ -227,6 +217,16 @@ def sweep(
     predictions become another cell's retrieved demos and the result does not depend on sweep
     order.
 
+    Nothing measured is lost, and nothing measured is bought twice. Every cell lands in
+    `<out>.partial.jsonl` the moment it completes, so a sweep killed at hour five keeps the cells
+    it paid for; re-running the same command measures only what is missing and then writes the
+    matrix and removes the sidecar. Changing what the sweep measures (the pool, the scenario cut,
+    episodes, the step budget, the observation window, the compressor) makes those rows a
+    different arm, and the command says so and stops rather than merging two arms into one matrix.
+    `--concurrency N` runs N cells at once, which is the difference between a six-hour grid and a
+    one-hour grid; it is not part of what the sweep measures, so a run interrupted at one value
+    resumes at another.
+
     Spend is confirmed before the first episode runs (`--yes` skips, as in
     `wmo optimize harness --mode distill`). What that estimate multiplies is ASSUMED tokens per
     policy call by the real cell and call counts, so it is a projection, never a measurement;
@@ -272,7 +272,7 @@ def sweep(
         try:
             # Checked before a single episode is paid for, and against the SERVING rule: there
             # is no point measuring an arm whose compressor could never be mounted.
-            sweep_compression = _compression_for(compressor, aggressiveness)
+            sweep_compression = resolve_compression(compressor, aggressiveness)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     store = WorldModelStore(root)
@@ -311,13 +311,20 @@ def sweep(
             assume_output_tokens=assume_output_tokens,
             history_chars=history_chars,
             compression=sweep_compression,
+            max_concurrency=concurrency,
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
+    try:
+        # Before the money question, not after it: a sidecar left by a run of a DIFFERENT plan is
+        # refused here, while refusing still costs nothing.
+        already_measured = resumable_cells(plan)
+    except SweepError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     world_model, _serve_provider = load_world_model(model_dir)
 
-    print_cost_estimate(_console, plan)
+    print_cost_estimate(_console, plan, already_measured=already_measured)
     _confirm_cost(yes=yes)
 
     _console.print(
@@ -328,7 +335,7 @@ def sweep(
         plan,
         world_model=world_model,
         env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
-        on_outcome=cell_progress(_console, plan.cells),
+        on_outcome=cell_progress(_console, plan.cells - already_measured),
     )
     matrix = run.matrix
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)
@@ -541,13 +548,17 @@ def print_coverage(console: Console, rows: list[CandidateCoverage]) -> None:
             )
 
 
-def print_cost_estimate(console: Console, plan: SweepPlan) -> None:
+def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: int = 0) -> None:
     """Render the projected spend, stating exactly which parts are assumed.
 
     Honest by construction: the CELL and CALL counts are real (the step budget is the per-episode
     cap, so calls are an upper bound), the tokens per call are an assumption the flags name, and
     the per-candidate $/Mtok is the pool entry's own price row. The world model's serve and judge
     calls are a separate meter (the D12 cost split) and are deliberately absent.
+
+    `already_measured` is the count a resume will reuse instead of buying. The table above it is
+    still the whole grid, because that is what the per-candidate arithmetic describes; the line
+    under it says how much of that grid this run is actually paying for.
     """
     table = Table(title="Route sweep cost estimate (ASSUMED tokens, not a measurement)")
     table.add_column("Candidate", no_wrap=True)
@@ -574,6 +585,17 @@ def print_cost_estimate(console: Console, plan: SweepPlan) -> None:
         f"{len(plan.scenarios)} held-out scenario(s) x {plan.episodes} episode(s); estimated "
         f"total ${plan.total_usd:.2f}"
     )
+    if already_measured:
+        console.print(
+            f"  RESUMING: {already_measured} of those cell(s) are already measured beside the "
+            f"matrix and are NOT bought again, so this run measures {plan.cells - already_measured}"
+            " and spends proportionally less than the total above."
+        )
+    if plan.max_concurrency > 1:
+        console.print(
+            f"  {plan.max_concurrency} cell(s) run at once, so the sweep finishes sooner for the "
+            "same money; it does not change what is measured."
+        )
     console.print(
         f"  ASSUMPTION: {plan.assume_input_tokens:,} input + {plan.assume_output_tokens:,} output "
         f"token(s) per policy call, and every episode running its full {plan.max_steps}-call "
@@ -908,7 +930,7 @@ def fit(
         try:
             # Fail before the fit spends anything: model_copy below skips validators, and an
             # unservable compressor would otherwise only surface when serving mounts the result.
-            compression = _compression_for(compressor, aggressiveness)
+            compression = resolve_compression(compressor, aggressiveness)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     # The rewards in this matrix were produced under SOME compression config, and a joint fit is

@@ -8,6 +8,7 @@ import pytest
 
 from wmo.optimize.pipeline import (
     BUILT_STAGES,
+    CONFIGURED_STAGES,
     MANIFEST_VERSION,
     RESERVED_STAGES,
     STAGE_ORDER,
@@ -22,6 +23,7 @@ from wmo.optimize.pipeline import (
     file_sha256,
     forced_stages,
     load_manifest,
+    planned_stages,
     project_sweep_spend,
 )
 
@@ -222,15 +224,28 @@ def test_file_sha256_of_a_missing_file_is_empty(tmp_path: Path) -> None:
     assert file_sha256(tmp_path / "nope") == ""
 
 
-def test_the_reserved_slots_are_named_but_not_built() -> None:
-    """The distill and compaction stages exist in the ordering so their arrival is additive."""
-    assert set(RESERVED_STAGES) == {Stage.DISTILL, Stage.COMPACT}
+def test_the_reserved_slot_is_named_but_not_built() -> None:
+    """Distill exists in the ordering so its arrival is additive; compaction has arrived."""
+    assert set(RESERVED_STAGES) == {Stage.DISTILL}
     assert set(BUILT_STAGES).isdisjoint(RESERVED_STAGES)
-    assert set(BUILT_STAGES) | set(RESERVED_STAGES) == set(STAGE_ORDER)
+    assert set(BUILT_STAGES) | set(RESERVED_STAGES) | set(CONFIGURED_STAGES) == set(STAGE_ORDER)
     # Compaction sits between sweep and fit, distill after sweep: the slots the design reserved.
     order = list(STAGE_ORDER)
     assert order.index(Stage.SWEEP) < order.index(Stage.COMPACT) < order.index(Stage.FIT)
     assert order.index(Stage.SWEEP) < order.index(Stage.DISTILL)
+
+
+def test_compaction_is_in_a_run_only_when_a_compressor_is_named() -> None:
+    # The row would otherwise advertise a stage with nothing to do, on every uncompressed run.
+    assert planned_stages(compacting=False) == BUILT_STAGES
+    assert planned_stages(compacting=True) == (
+        Stage.PREFLIGHT,
+        Stage.SWEEP,
+        Stage.COMPACT,
+        Stage.FIT,
+        Stage.TUNE,
+        Stage.REPORT,
+    )
 
 
 def _sweep_record(*, candidate: float, world_model: float, compressor: float = 0.0) -> StageRecord:

@@ -27,6 +27,7 @@ from statistics import median, quantiles
 
 from pydantic import BaseModel, Field
 
+from wmo.optimize.compression import CompressingEmbedder
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import RoutingPolicy, select_model
 from wmo.providers.pool import Tier
@@ -174,6 +175,15 @@ def build_report(
     # One embedder for the whole report: an azure spec builds an HTTP client per `build()`, and
     # a report routes every held-out scenario.
     embedder = policy.embedder.build() if policy.kind != "static" else None
+    if embedder is not None and policy.compression is not None:
+        # Representation consistency, on the reporting side. A compressed endpoint's bank lives in
+        # the geometry of compressed text, and serving compresses each request before the router
+        # embeds it. Replaying the selection on RAW task text would therefore measure a policy
+        # nobody serves: every query lands farther from every bank row, the novelty floor trips,
+        # and the report would show routing collapsing to the fallback (C2 measured the floor
+        # tripping 10-13x more often under exactly this mismatch). So the replay embeds through the
+        # same compressor the fit did.
+        embedder = CompressingEmbedder(embedder, policy.compression)
 
     routed_rows: dict[str, list[ScenarioOutcome]] = {}
     baseline_rows: dict[str, list[ScenarioOutcome]] = {}

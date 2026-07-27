@@ -13,11 +13,16 @@ command would have put it, so deleting `optimize/` resets resume without breakin
 serving path, and dropping to a manual command mid-flow just changes a fingerprint the next run
 notices.
 
-Two stages are NAMED here and not implemented in this build: `DISTILL` (train a student, gate it,
-add it to the pool, re-sweep it) and `COMPACT` (the compaction slot reserved between sweep and
-fit, which activates when the representation-consistency seam lands). They sit in `STAGE_ORDER`
-now so their arrival is additive: ordering, force-from arithmetic, and downstream invalidation
-already account for them.
+`COMPACT` is the compaction slot between sweep and fit, and it is not a paid step of its own: with
+the representation-consistency seam landed, naming a compressor CONFIGURES the sweep (which
+measures that arm) and the fit (which embeds its bank through the compressor), so the stage's whole
+job is to hold the arm's fingerprint and say so in the plan table. It is therefore in a run's
+stages only when a compressor is named (`planned_stages`), and its cost is the compressor's share
+of the sweep's own bill, never a second line item.
+
+`DISTILL` is still NAMED here and not implemented (train a student, gate it, add it to the pool,
+re-sweep it). It sits in `STAGE_ORDER` now so its arrival is additive: ordering, force-from
+arithmetic, and downstream invalidation already account for it.
 """
 
 from __future__ import annotations
@@ -61,11 +66,31 @@ BUILT_STAGES: tuple[Stage, ...] = (
     Stage.TUNE,
     Stage.REPORT,
 )
-"""The stages this build actually runs; the rest are reserved slots (see the module docstring)."""
+"""The stages EVERY run walks. `COMPACT` joins them only when a compressor is named."""
+
+CONFIGURED_STAGES: tuple[Stage, ...] = (Stage.COMPACT,)
+"""Built, but absent from a run that did not ask for them (see `planned_stages`).
+
+A configured stage is one whose work is a choice the operator makes rather than a step the
+workflow always takes: `COMPACT` does nothing at all unless `--compressor` names an arm, and
+printing a row for it on every run would advertise a stage that has nothing to do.
+"""
 
 RESERVED_STAGES: tuple[Stage, ...] = tuple(
-    stage for stage in STAGE_ORDER if stage not in BUILT_STAGES
+    stage for stage in STAGE_ORDER if stage not in BUILT_STAGES and stage not in CONFIGURED_STAGES
 )
+"""Named in the ordering, not implemented: naming one is an error pointing at the real command."""
+
+
+def planned_stages(*, compacting: bool) -> tuple[Stage, ...]:
+    """Every stage this run walks, in `STAGE_ORDER`.
+
+    Args:
+        compacting: A compressor was named, so the compaction slot is part of this run.
+    """
+    active = set(BUILT_STAGES) | ({Stage.COMPACT} if compacting else set())
+    return tuple(stage for stage in STAGE_ORDER if stage in active)
+
 
 MANIFEST_DIRNAME = "optimize"
 """Where a run's own artifacts live, under the world model's dir."""
