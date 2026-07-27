@@ -23,9 +23,10 @@ from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.engine.world_model import WorldModel
+from wmo.env.closed_loop import scenario_id
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.compression import CompressionConfig
-from wmo.optimize.outcomes import OutcomeMatrix
+from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.pipeline import (
     MANIFEST_FILENAME,
     MATRIX_FILENAME,
@@ -42,6 +43,8 @@ from wmo.optimize.policy import (
 )
 from wmo.optimize.report import ImprovementReport
 from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.sweep import SweepPlan, plan_sweep, resolve_config
+from wmo.optimize.sweep_partial import PartialHeader
 from wmo.providers.base import (
     Completion,
     Message,
@@ -51,6 +54,7 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
+from wmo.providers.pool import load_pool
 from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
@@ -601,6 +605,56 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     assert _says(result.output, "cost_quality 0.25 (Balanced (default))")
     assert "aprojection" in flat and "assumedoutputtoken" in flat
     assert _says(result.output, "are NOT in that figure")
+
+
+def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two things an operator authorizing a run needs to see: how hard it will lean on the
+    provider, and how much of the grid a previous attempt already paid for."""
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    monkeypatch.setattr(optimize_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    paced = _run(tmp_path, root, "--concurrency", "6")
+    assert "2candidate(s)x3scenario(s)x1episode(s),6atatime" in _flat(paced.output)
+
+    # A sidecar from an interrupted attempt at THIS plan: the row says what is left to buy.
+    matrix_path = _paths(root)[0]
+    matrix_path.parent.mkdir(parents=True, exist_ok=True)
+    plan = _sweep_plan(tmp_path, root)
+    sidecar = matrix_path.with_name(matrix_path.name + ".partial.jsonl")
+    sidecar.write_text(
+        PartialHeader(identity=plan.identity).model_dump_json()
+        + "\n"
+        + ScenarioOutcome(
+            scenario_id=scenario_id(plan.scenarios[0]),
+            task=plan.scenarios[0].task,
+            model="cheap",
+            reward=0.5,
+        ).model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+    resumed = _run(tmp_path, root)
+    assert "1alreadymeasured,5tobuy" in _flat(resumed.output)
+
+
+def _sweep_plan(tmp_path: Path, root: Path) -> SweepPlan:
+    """The plan `_run` builds, so a test can stamp a sidecar with the same identity."""
+    model_dir = root / "models" / "support"
+    return plan_sweep(
+        model_dir=model_dir,
+        config=resolve_config(model_dir),
+        pool=load_pool(_pool_file(tmp_path)),
+        out_path=_paths(root)[0],
+        traces_file=None,
+        scenarios=3,
+        episodes=1,
+        max_steps=4,
+        assume_input_tokens=2000,
+        assume_output_tokens=250,
+    )
 
 
 def test_an_unscored_sweep_withholds_the_fit_and_keeps_the_matrix(

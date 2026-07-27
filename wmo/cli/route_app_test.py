@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import importlib
+import itertools
 import json
 import os
 from collections import Counter
@@ -21,6 +22,7 @@ from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.distill.store import DistillModelCard
 from wmo.engine.world_model import WorldModel
+from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.compression import (
     CompressionConfig,
@@ -33,6 +35,7 @@ from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.routing import evaluate_policy
+from wmo.optimize.sweep_partial import PartialHeader, PlanIdentity
 from wmo.providers import pool as pool_module
 from wmo.providers.base import (
     Completion,
@@ -1398,6 +1401,104 @@ def test_route_sweep_scores_every_episode_through_a_scoring_env(
     # Every episode ran with index enrichment suspended, so no candidate's predictions can
     # become the next candidate's retrieved demos (which would make scores sweep-order dependent).
     assert seams.world_model.opened_frozen == [True] * 4
+
+
+def test_route_sweep_at_higher_concurrency_writes_the_same_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `--concurrency` is a speed knob the operator can see in the plan, not a change of evidence:
+    # the same cells, the same rows, in the same order.
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path, traces=_corpus())
+    out, result = _sweep(
+        tmp_path, root, "support", "--scenarios", "3", "--concurrency", "4", "--yes"
+    )
+    assert result.exit_code == 0, result.output
+    assert _says(result.output, "4 cell(s) run at once")
+    matrix = OutcomeMatrix.load(out)
+    assert [(o.model, o.scenario_id) for o in matrix.outcomes] == [
+        (model, sid) for model in ("cheap", "pricey") for sid in _HELD_OUT_IDS[:3]
+    ]
+    assert all(o.scored for o in matrix.outcomes)
+
+
+def test_route_sweep_resumes_the_cells_an_interrupted_run_already_bought(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A grid killed mid-flight is finished, not repeated: the filed gap, end to end.
+
+    The first attempt dies inside its fourth cell. The rows it completed are on disk beside the
+    matrix, so the second attempt measures only what is missing and the matrix it writes is the
+    whole grid.
+    """
+    seams = _patch_seams(monkeypatch)
+    root = _project(tmp_path, traces=_corpus())
+    real_env = route_module.WorldModelEnv
+    cells = itertools.count(1)
+
+    class _DiesOnTheFourthCell:
+        def __init__(self, world_model: object, *, score_on_close: bool = False) -> None:
+            self._inner = real_env(cast("WorldModel", world_model), score_on_close=score_on_close)
+            self._n = next(cells)
+
+        def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
+            if self._n == 4:
+                raise RuntimeError("simulated transport fault")
+            return self._inner.reset(task=task, seed_state=seed_state)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._inner, name)
+
+    monkeypatch.setattr(route_module, "WorldModelEnv", _DiesOnTheFourthCell)
+    out, first = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
+    assert first.exit_code != 0
+    assert not out.exists()  # no matrix: the sweep never finished
+    sidecar = out.with_name(out.name + ".partial.jsonl")
+    assert len(sidecar.read_text(encoding="utf-8").splitlines()) == 4  # header + 3 paid cells
+
+    monkeypatch.setattr(route_module, "WorldModelEnv", real_env)
+    scored_before = len(seams.world_model.scored)
+    _, second = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
+    assert second.exit_code == 0, second.output
+    assert _says(second.output, "RESUMING: 3 of those cell(s) are already measured")
+    assert len(seams.world_model.scored) - scored_before == 3  # only the missing cells ran
+    assert len(OutcomeMatrix.load(out).outcomes) == 6
+    assert not sidecar.exists()
+
+
+def test_route_sweep_refuses_a_sidecar_that_belongs_to_a_different_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Refused BEFORE the spend question, naming the pin that moved: two arms in one matrix is a
+    # comparison nobody measured.
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path, traces=_corpus())
+    out, _first = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
+    sidecar = out.with_name(out.name + ".partial.jsonl")
+    # Re-create the sidecar a killed run would have left, then change what the sweep measures.
+    sidecar.write_text(
+        "\n".join(
+            [
+                PartialHeader(
+                    identity=PlanIdentity(
+                        pool="stale",
+                        scenarios=tuple(_HELD_OUT_IDS[:3]),
+                        episodes=1,
+                        max_steps=20,
+                        history_chars=DEFAULT_HISTORY_CHARS,
+                        compression="raw text (no compression)",
+                    )
+                ).model_dump_json(),
+                *(row.model_dump_json() for row in OutcomeMatrix.load(out).outcomes[:2]),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _, blocked = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
+    assert blocked.exit_code != 0
+    assert _says(blocked.output, "measured under a DIFFERENT plan")
+    assert _says(blocked.output, "candidate pool changed")
 
 
 def test_route_sweep_without_a_scoring_env_produces_no_evidence(

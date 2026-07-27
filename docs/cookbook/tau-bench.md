@@ -284,6 +284,20 @@ sweep (never completed here)
 Those per-cell dollar figures are candidate-side only. A cell can come back `reward=unscored`
 when its episode or its scoring failed, and both fitters skip unscored rows.
 
+Cells run one at a time by default. `--concurrency N` runs N of them at once, which is what turns
+a several-hour grid into a run you watch finish; it changes nothing about what a cell measures, so
+the matrix is the same evidence either way. The real ceiling is your provider's rate limits, and
+the world model's own serve and judge calls all come out of one account's bucket, so a number
+past what that bucket allows buys throttling errors rather than speed.
+
+Nothing measured is lost and nothing measured is bought twice. Each cell is appended to
+`matrix.json.partial.jsonl` the moment it completes, so a sweep killed at hour five keeps every
+cell it paid for; the next run measures only what is missing, then writes the matrix and removes
+the sidecar. Change what the sweep measures (the pool, the scenario cut, episodes, the step
+budget, the observation window, the compressor) and those rows are a different arm: the command
+says which pin moved and stops, before the spend question, rather than merging two arms into one
+matrix. Resuming at a different `--concurrency` is fine, because pace is not evidence.
+
 Fit-readiness is a coverage contract, not a nonzero count: every candidate must have the same
 number of scored episodes on the same scenarios, or the policy ends up decided by whichever cells
 each candidate happened to lose. Per-candidate scored counts always print. When the evidence
@@ -343,6 +357,9 @@ instance a cost delta against an anchor whose episodes measured $0.
     └── optimize-run.json       the resume manifest
 ```
 
+A sweep in flight (or one that died mid-flight) also leaves `matrix.json.partial.jsonl` beside the
+matrix: the cells measured so far, one JSON line each. It is removed when the matrix is written.
+
 Serving artifacts stay where serving already looks for them. `optimize/` holds only the staged
 run's own bookkeeping and is disposable: deleting it resets resume and breaks no serving path.
 
@@ -356,6 +373,9 @@ halfway resumes at the stage that stopped it.
 uv run wmo optimize model tau-bench                    # resumes; skipped stages say why
 uv run wmo optimize model tau-bench --force-from sweep  # buy fresh cells anyway
 ```
+
+Inside the sweep, resume is per CELL: a stage that never completed still keeps the cells it paid
+for, and the plan table's sweep row says how many are already measured and how many are left.
 
 `--force-from` takes `sweep | fit | tune | report` and redoes that stage and everything after it.
 

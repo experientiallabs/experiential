@@ -104,6 +104,7 @@ from wmo.optimize.sweep import (
     execute_sweep,
     plan_sweep,
     resolve_config,
+    resumable_cells,
 )
 from wmo.optimize.sweep import preflight_pool as run_preflight
 from wmo.providers.pool import DEFAULT_POOL_PATH
@@ -159,6 +160,16 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     ),
     max_steps: int = typer.Option(
         DEFAULT_MAX_STEPS, "--max-steps", min=1, help="Step budget per episode."
+    ),
+    concurrency: int = typer.Option(
+        1,
+        "--concurrency",
+        min=1,
+        help="Cells the sweep measures at once (1 = one at a time). Changes only how long the "
+        "sweep takes, never what it measures, so it is not part of what decides whether the "
+        "sweep stage can be skipped. Your PROVIDER LIMITS are the real ceiling: every candidate "
+        "call and every world-model serve and judge call is a request, and the world model's own "
+        "calls all come out of ONE account's bucket.",
     ),
     cost_quality: float = typer.Option(
         COST_QUALITY_BALANCED,
@@ -257,6 +268,11 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         wmo optimize model support                 # resumes; unchanged stages say why they skipped
         wmo optimize model support --force-from sweep   # buy fresh cells anyway
         wmo optimize model support --yes --max-usd 25   # scripted, with a hard spend cap
+        wmo optimize model support --concurrency 6      # six cells at once, same evidence
+
+    Resume is per CELL inside the sweep, not just per stage: a sweep that died at hour five keeps
+    every cell it paid for (in `<matrix>.partial.jsonl`) and the next run measures only what is
+    missing, so an interrupted grid never gets bought twice.
 
     `--compressor` measures and fits a compressed arm end to end, which is the same thing a
     `route sweep --compressor` plus `route fit --compressor` pair does by hand:
@@ -336,7 +352,11 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             assume_input_tokens=ASSUMED_INPUT_TOKENS,
             assume_output_tokens=ASSUMED_OUTPUT_TOKENS,
             compression=compression,
+            max_concurrency=concurrency,
         )
+        # Read before the plan table so the sweep row can say how much of the grid a previous
+        # attempt already bought, and so a sidecar from a different plan is refused for free.
+        already_measured = resumable_cells(plan)
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
@@ -386,6 +406,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         compression=compression,
         projection=projection,
         paths=paths,
+        already_measured=already_measured,
     )
     # After the plan, before any consent or spend question: the whole point of a dry run is
     # reading the table above without committing to anything, so it exits here even when the
@@ -436,6 +457,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             baseline=baseline,
             cost_quality=cost_quality,
             allow_uneven_coverage=allow_uneven_coverage,
+            already_measured=already_measured,
         )
     except BudgetExceeded as exc:
         _print_budget_stop(model_dir.name, exc)
@@ -784,16 +806,26 @@ def _stage_plan_text(
     cost_quality: float,
     fallback: str | None,
     anchor: str,
+    already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
     match stage:
         case Stage.PREFLIGHT:
             return f"resolve {len(plan.pool.models)} backend(s), check prices"
         case Stage.SWEEP:
-            return (
+            grid = (
                 f"{len(plan.pool.models)} candidate(s) x {len(plan.scenarios)} scenario(s) "
                 f"x {plan.episodes} episode(s)"
             )
+            pace = f", {plan.max_concurrency} at a time" if plan.max_concurrency > 1 else ""
+            # A resumed sweep is not the grid it prints: saying so here is what stops the row
+            # from reading as a bill for cells the last attempt already paid for.
+            resumed = (
+                f"; {already_measured} already measured, {plan.cells - already_measured} to buy"
+                if already_measured
+                else ""
+            )
+            return f"{grid}{pace}{resumed}"
         case Stage.COMPACT:
             # Says what it IS rather than implying a step: the arm plus the two stages it sets up.
             return f"{escape(compression_signature(compression))}, configures sweep and fit"
@@ -839,6 +871,7 @@ def _print_plan(
     compression: CompressionConfig | None,
     projection: SweepSpendProjection,
     paths: _RunPaths,
+    already_measured: int = 0,
 ) -> None:
     """The whole run in one table, printed before anything spends.
 
@@ -877,6 +910,7 @@ def _print_plan(
                 cost_quality=cost_quality,
                 fallback=fallback,
                 anchor=anchor,
+                already_measured=already_measured,
             ),
             _estimate_text(decision.stage, plan=plan, embedder=embedder, paths=paths),
             _status_text(decision),
@@ -1038,6 +1072,7 @@ def _run_stages(
     baseline: str | None,
     cost_quality: float,
     allow_uneven_coverage: bool,
+    already_measured: int = 0,
 ) -> RunManifest:
     """Walk the plan, running what it said would run and recording each stage as it completes.
 
@@ -1059,7 +1094,12 @@ def _run_stages(
         match decision.stage:
             case Stage.SWEEP:
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
-                record = _stage_sweep(plan, model_dir=model_dir, pool_file=pool_file)
+                record = _stage_sweep(
+                    plan,
+                    model_dir=model_dir,
+                    pool_file=pool_file,
+                    already_measured=already_measured,
+                )
                 ledger.record(record.total_spend_usd)
             case Stage.COMPACT:
                 record = _stage_compact(compression)
@@ -1086,7 +1126,9 @@ def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
 
 
-def _stage_sweep(plan: SweepPlan, *, model_dir: Path, pool_file: Path) -> StageRecord:
+def _stage_sweep(
+    plan: SweepPlan, *, model_dir: Path, pool_file: Path, already_measured: int = 0
+) -> StageRecord:
     """Measure every candidate closed-loop and record what it cost.
 
     Deliberately does NOT judge the evidence it produced. The coverage contract that withholds a
@@ -1104,7 +1146,7 @@ def _stage_sweep(plan: SweepPlan, *, model_dir: Path, pool_file: Path) -> StageR
         plan,
         world_model=world_model,
         env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
-        on_outcome=cell_progress(_console, plan.cells),
+        on_outcome=cell_progress(_console, plan.cells - already_measured),
     )
     matrix = run.matrix
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)
