@@ -668,7 +668,7 @@ def test_examples_list_finds_a_downloaded_bundle(tmp_path, monkeypatch) -> None:
 
     listed = runner.invoke(app, ["examples", "list"])
     assert listed.exit_code == 0, listed.output
-    flat = " ".join(listed.output.split())
+    flat = _flat(listed.output)
     assert "bird-sql" in flat
     # A downloaded bundle carries no launcher, and the listing must say so up front rather than
     # letting `wmo examples run` be the only place that discloses it.
@@ -676,15 +676,14 @@ def test_examples_list_finds_a_downloaded_bundle(tmp_path, monkeypatch) -> None:
 
     ran = runner.invoke(app, ["examples", "run", "bird-sql"])
     assert ran.exit_code == 2, ran.output
-    flat_run = " ".join(ran.output.split())
+    flat_run = _flat(ran.output)
     assert "wmo build --file" in flat_run
     # No suite TOML came down with the bundle, so `wmo eval run` would be a second dead end.
     assert "wmo eval run" not in flat_run
 
 
-def test_examples_list_with_nothing_installed_names_the_download_command(  # noqa: ANN001
-    tmp_path,  # noqa: ANN001
-    monkeypatch,  # noqa: ANN001
+def test_examples_list_with_nothing_installed_names_the_download_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bundles = tmp_path / "environment-capture-data"
     monkeypatch.setattr(cli_app_module, "_bundle_root", lambda: bundles)
@@ -692,7 +691,7 @@ def test_examples_list_with_nothing_installed_names_the_download_command(  # noq
 
     listed = runner.invoke(app, ["examples", "list"])
     assert listed.exit_code == 0, listed.output
-    flat = " ".join(listed.output.split())
+    flat = _flat(listed.output)
     assert "no examples found" in flat
     # A bare "no examples found" is the defect: say why, and name the command that fixes it.
     assert "wmo download tau-bench" in flat
@@ -700,7 +699,7 @@ def test_examples_list_with_nothing_installed_names_the_download_command(  # noq
 
     unknown = runner.invoke(app, ["examples", "run", "tau-bench"])
     assert unknown.exit_code == 2
-    assert "wmo download tau-bench" in " ".join(unknown.output.split())
+    assert "wmo download tau-bench" in _flat(unknown.output)
 
 
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1944,7 +1943,7 @@ def test_eval_list_with_no_suites_says_where_suites_live(tmp_path) -> None:  # n
     empty.mkdir()
     listed = runner.invoke(app, ["eval", "list", "--examples-root", str(empty)])
     assert listed.exit_code == 0, listed.output
-    flat = " ".join(listed.output.split())
+    flat = _flat(listed.output)
     assert "no eval suites found" in flat
     assert "evals/*.toml" in flat
     assert "--examples-root" in flat
@@ -1966,27 +1965,59 @@ def test_unknown_suite_is_a_usage_error_not_a_traceback(tmp_path, argv: list[str
     empty.mkdir()
     result = runner.invoke(app, [*argv, "--examples-root", str(empty)])
     assert result.exit_code == 2, result.output  # usage error, not a ValueError traceback
-    flat = " ".join(result.output.split())
+    flat = _flat(result.output)
     assert "unknown eval suite 'tau-bench'" in flat
     assert "evals/*.toml" in flat
 
 
-def test_missing_suite_corpus_names_the_download_command(tmp_path) -> None:  # noqa: ANN001
-    # No benchmark ships its corpus, so this is the first-run failure for every shipped suite.
-    examples_root = tmp_path / "examples"
-    evals_dir = examples_root / "tau-bench" / "evals"
+def _tau_bench_suite(root: Path) -> Path:
+    """A `tau-bench/default` suite under `root` whose corpus does not exist."""
+    evals_dir = root / "tau-bench" / "evals"
     evals_dir.mkdir(parents=True)
     (evals_dir / "default.toml").write_text('files = ["../traces.otel.jsonl"]\n', encoding="utf-8")
+    return root / "tau-bench"
 
-    for argv in (
+
+@pytest.mark.parametrize(
+    "argv",
+    [
         ["eval", "run", "tau-bench"],
         ["research", "concurrency", "tau-bench", "--scenarios", "1", "--levels", "1"],
-    ):
-        result = runner.invoke(app, [*argv, "--examples-root", str(examples_root)])
-        assert result.exit_code == 2, result.output
-        flat = " ".join(result.output.split())
-        assert "has no trace corpus" in flat
-        assert "wmo download tau-bench" in flat
+    ],
+)
+def test_missing_suite_corpus_names_the_download_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
+) -> None:
+    # No benchmark ships its corpus, so this is the first-run failure for every shipped suite.
+    # ENVCAP_DATA_ROOT makes the bundle root the same dir the suite reads from, i.e. the real
+    # layout, where `wmo download` does land on the missing path.
+    examples_root = tmp_path / "environment-capture-data"
+    _tau_bench_suite(examples_root)
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
+
+    result = runner.invoke(app, [*argv, "--examples-root", str(examples_root)])
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "has no trace corpus" in flat
+    assert "wmo download tau-bench" in flat
+
+
+def test_missing_corpus_outside_the_bundle_root_does_not_promise_a_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A suite resolves `files` relative to its own TOML, so for a --examples-root that is not the
+    # bundle root `wmo download` writes somewhere the suite never reads: naming it would send the
+    # user through a fetch that leaves the exact same error behind.
+    examples_root = tmp_path / "my-suites"
+    task = _tau_bench_suite(examples_root)
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(tmp_path / "elsewhere"))
+
+    result = runner.invoke(app, ["eval", "run", "tau-bench", "--examples-root", str(examples_root)])
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "has no trace corpus" in flat
+    assert "wmo download" not in flat
+    assert str(task / "evals") in _squashed(result.output)
 
 
 def test_resolve_example_searches_the_roots_it_is_given(tmp_path) -> None:  # noqa: ANN001
@@ -2029,7 +2060,7 @@ def test_research_concurrency_real_side_uses_the_examples_root(tmp_path) -> None
         ],
     )
     assert result.exit_code == 2, result.output
-    assert "--side world" in " ".join(result.output.split())
+    assert "--side world" in _flat(result.output)
     assert str(task / "run.sh") in _squashed(result.output)
 
 

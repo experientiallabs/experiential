@@ -1706,9 +1706,12 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     """The suite's trace files, or a usage error naming the command that fetches them.
 
     No benchmark ships its corpus (they are Hub-hosted, gitignored here), so this is the normal
-    first-run failure for every shipped suite: it must name `wmo download <benchmark>`. A suite
-    that lists no files at all is a different defect — the TOML itself — so it keeps its own
-    message pointing at the file to edit.
+    first-run failure for every shipped suite: it must name `wmo download <benchmark>`. Only when
+    the download would actually land ON the missing path, though. A suite's `files` resolve
+    relative to its own TOML, so one loaded from a `--examples-root` outside the bundle root
+    reads a path no download will ever write, and sending the user there would fail twice. A
+    suite that lists no files at all is a different defect — the TOML itself — so it keeps its
+    own message pointing at the file to edit.
     """
     files = suite.resolve_files()
     if not files:
@@ -1717,10 +1720,13 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
         )
     missing = [path for path in files if not path.exists()]
     if missing:
+        fetched = corpus_path(suite.example) if suite.example in CORPORA else None
+        downloadable = fetched is not None and fetched.resolve() in {p.resolve() for p in missing}
         remedy = (
             f"fetch the bundle with `wmo download {suite.example}`"
-            if suite.example in CORPORA
-            else f"capture or copy the corpus into {_bundle_root() / suite.example}"
+            if downloadable
+            else f"the suite resolves `files` relative to {suite.path.parent}; put a corpus there "
+            "(or edit `files` to point at one)"
         )
         raise typer.BadParameter(
             f"suite {suite.id!r} has no trace corpus at {missing or files}; {remedy}"
