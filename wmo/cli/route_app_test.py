@@ -23,6 +23,7 @@ from wmo.cli.route_app import (
     AZURE_EMBEDDER_DIM,
     HASHING_DOWNGRADE_NOTICE,
     HASHING_EMBEDDER_DIM,
+    probe_embedder,
     resolve_embedder,
 )
 from wmo.config import HarnessConfig, save_config
@@ -2379,3 +2380,57 @@ def test_an_unknown_embedder_is_a_usage_error() -> None:
     with pytest.raises(typer.BadParameter) as caught:
         resolve_embedder("word2vec", dim=None, deployment=None, endpoint=None, api_key_env=None)
     assert "auto, hashing or azure" in str(caught.value)
+
+
+def test_the_azure_resolution_line_says_it_bills_an_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Resolving to azure is spend nobody typed a flag for, so it must be stated.
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    _, line = resolve_embedder("auto", dim=None, deployment=None, endpoint=None, api_key_env=None)
+    assert "calls the embedding API and is billed" in line
+
+
+def test_probe_passes_for_the_offline_hashing_embedder() -> None:
+    probe_embedder(EmbedderSpec(dim=32))
+
+
+def test_probe_turns_a_dead_embedding_deployment_into_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded Azure layout points at resources WITHOUT an embedding deployment.
+
+    Without the probe that surfaced as a traceback wall from inside the fit, after the matrix
+    had been read. It must name the deployment, the endpoint, and the way out.
+    """
+
+    def _explode(_self: EmbedderSpec) -> object:
+        raise RuntimeError("Resource not found (404)")
+
+    monkeypatch.setattr(EmbedderSpec, "build", _explode)
+    spec = EmbedderSpec(
+        kind="azure", dim=3072, deployment="text-embedding-3-large", endpoint="https://x"
+    )
+    with pytest.raises(typer.BadParameter) as caught:
+        probe_embedder(spec)
+    message = str(caught.value)
+    assert "text-embedding-3-large" in message
+    assert "https://x" in message
+    assert "404" in message
+    assert "--embedder hashing" in message
+    assert "Traceback" not in message
+
+
+def test_probe_rejects_an_embedder_that_returns_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Empty:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return [[] for _ in texts]
+
+    monkeypatch.setattr(EmbedderSpec, "build", lambda _self: _Empty())
+    with pytest.raises(typer.BadParameter, match="empty vector"):
+        probe_embedder(
+            EmbedderSpec(kind="azure", dim=3072, deployment="embed", endpoint="https://x")
+        )

@@ -130,7 +130,9 @@ class EmbedderSpec(BaseModel):
     """
 
     kind: Literal["hashing", "azure"] = "hashing"
-    dim: int = 512
+    # gt=0 because a zero-width embedding is not a smaller embedding, it is no embedding: it
+    # would reach the provider as `dimensions=0` and build a bank of empty rows.
+    dim: int = Field(default=512, gt=0)
     deployment: str | None = None  # azure embedding deployment name
     endpoint: str | None = None
     api_key_env: str | None = None

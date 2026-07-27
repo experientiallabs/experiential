@@ -39,6 +39,7 @@ from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
+from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     DialResult,
@@ -149,6 +150,11 @@ def resolve_embedder(
     should be told what they are getting instead. So the resolution is ALWAYS printed, and the
     downgrade quotes the measured gap rather than a vague warning.
 
+    Resolving to azure makes the fit BILL an embedding API, which is spend nobody typed a flag
+    for, so the resolution line says so. It also makes the fit depend on that resource actually
+    hosting an embedding deployment, which the env variables do not promise; `probe_embedder`
+    is what turns that from a mid-fit traceback into a usage error.
+
     `--dim` defaults to the RESOLVED backend's native width on every path: 512 for hashing, and
     the embedding model's own width for azure (see `_native_dim`). It used to default to 512
     everywhere, which meant `--embedder azure --deployment text-embedding-3-large` silently
@@ -168,7 +174,7 @@ def resolve_embedder(
         present = all(os.environ.get(name) for name in AZURE_EMBEDDER_ENV)
         if not present:
             missing = [name for name in AZURE_EMBEDDER_ENV if not os.environ.get(name)]
-            spec = EmbedderSpec(dim=dim or HASHING_EMBEDDER_DIM)
+            spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
             return spec, (
                 f"embedder: hashing-{spec.dim} (auto; {', '.join(missing)} unset). "
                 f"[yellow]{HASHING_DOWNGRADE_NOTICE}[/yellow]. Set "
@@ -185,7 +191,7 @@ def resolve_embedder(
         )
 
     if choice == "hashing":
-        spec = EmbedderSpec(dim=dim or HASHING_EMBEDDER_DIM)
+        spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
         return spec, f"embedder: hashing-{spec.dim} (explicit). {HASHING_DOWNGRADE_NOTICE}"
 
     if not (deployment and endpoint):
@@ -215,7 +221,7 @@ def _azure_spec(
     native, recognized = _native_dim(deployment)
     spec = EmbedderSpec(
         kind="azure",
-        dim=dim or native,
+        dim=native if dim is None else dim,
         deployment=deployment,
         endpoint=endpoint,
         api_key_env=api_key_env,
@@ -231,7 +237,51 @@ def _azure_spec(
             f". Unrecognized deployment name, so the width is a guess: pass --dim if "
             f"{deployment} is not {spec.dim}-dimensional"
         )
-    return spec, f"embedder: azure {deployment} ({width}) at {endpoint} ({how}){hint}"
+    # Stated because it is spend the operator did not type a flag for: `auto` reaching the azure
+    # branch means this fit BILLS an embedding API, and the probe below bills the first call.
+    return spec, (
+        f"embedder: azure {deployment} ({width}) at {endpoint} ({how}){hint}. "
+        "This calls the embedding API and is billed to that resource."
+    )
+
+
+def probe_embedder(spec: EmbedderSpec) -> None:
+    """Embed one short text before the fit does, so a broken backend fails cleanly and early.
+
+    `--embedder auto` turns the mere PRESENCE of `AZURE_OPENAI_*` into a network dependency, and
+    those variables routinely point at a resource that serves chat but hosts no embedding
+    deployment. Without this, the first thing an operator sees is a traceback wall from inside
+    the fit, after the matrix has been read and (for a large corpus) after real spend. One
+    throwaway embedding turns that into a usage error at the boundary, which is rule 9's bar:
+    say what went wrong and what to do about it.
+
+    Hashing specs are checked too. It costs nothing, and it keeps the failure shape identical on
+    both branches rather than leaving one path with a different error surface.
+
+    Raises:
+        typer.BadParameter: The embedder could not produce a vector, naming what was tried and
+            the escape hatch.
+    """
+    try:
+        vectors = spec.build().embed(["routing embedder probe"])
+    except Exception as exc:  # noqa: BLE001 - any backend failure here is a usage error
+        raise typer.BadParameter(_probe_failure(spec, str(exc) or type(exc).__name__)) from exc
+    if not vectors or not vectors[0]:
+        raise typer.BadParameter(_probe_failure(spec, "it returned an empty vector"))
+
+
+def _probe_failure(spec: EmbedderSpec, detail: str) -> str:
+    """What to tell an operator whose embedder does not work, in the vocabulary they typed."""
+    if spec.kind == "hashing":
+        return f"the hashing embedder failed to embed a probe text: {detail}"
+    return (
+        f"embedding deployment '{spec.deployment}' at {spec.endpoint} could not embed a probe "
+        f"text: {detail}. That resource may serve chat models without hosting an embedding "
+        f"deployment, or '{spec.deployment}' may be named differently there. Deploy "
+        f"{AZURE_EMBEDDER_DEPLOYMENT} on it, point --deployment/--endpoint at one that has it, "
+        "or fit on offline features with --embedder hashing (which needs no credentials and no "
+        "network, at the accuracy cost this command printed above)."
+    )
 
 
 @route_app.command("sweep")
@@ -264,6 +314,15 @@ def sweep(
     ),
     max_steps: int = typer.Option(
         20, "--max-steps", min=1, help="Step budget per episode (also the cost estimate's cap)."
+    ),
+    history_chars: int = typer.Option(
+        DEFAULT_HISTORY_CHARS,
+        "--history-chars",
+        min=1,
+        help="Characters of each observation the agent sees on later turns. Raise it for an "
+        "environment whose tool payloads are large: too small and the agent cannot see what it "
+        "just fetched, so it re-fetches. Changes what candidates are measured on, so matrices "
+        "swept at different values are not comparable.",
     ),
     assume_input_tokens: int = typer.Option(
         2000,
@@ -903,11 +962,13 @@ def fit(
         "--embedder",
         help="auto | hashing | azure. auto uses the Azure text-embedding-3-large deployment when "
         f"{' and '.join(AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; either way it says "
-        "which one it picked.",
+        "which one it picked. Resolving to azure means this fit CALLS A PAID EMBEDDING API "
+        "(billed to that resource); --embedder hashing keeps it offline and free.",
     ),
     dim: int = typer.Option(
         None,
         "--dim",
+        min=1,
         help="Embedding dimension, sent as the request's `dimensions`. Default: the resolved "
         f"model's native width ({HASHING_EMBEDDER_DIM} hashing, {AZURE_EMBEDDER_DIM} "
         "text-embedding-3-large). Set it only to reduce a model's output deliberately.",
@@ -934,6 +995,9 @@ def fit(
         # typer's min is inclusive but the artifact field requires > 0; fail before the fit
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
+    # One throwaway embedding BEFORE the bulk work: an unreachable or embedding-less resource is
+    # a usage error at the boundary here, instead of a traceback from inside the fit.
+    probe_embedder(spec)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
