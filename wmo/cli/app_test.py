@@ -774,6 +774,60 @@ def test_demo_provider_failure_is_a_clean_error_not_a_traceback(
     assert _squashed("wmo providers verify") in flat
 
 
+def test_demo_off_a_terminal_calls_an_outage_an_outage(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 429 that outlived the retries is not a credentials problem, and must not claim to be.
+
+    CliRunner is never a terminal, so this is exactly the CI/redirected path: the interactive
+    branch (offer a different provider) is unreachable and the capacity error falls through to
+    the setup-error renderer, which used to print `check ... your credentials`.
+    """
+    import httpx
+    import openai
+
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    class _RateLimited(FakeProvider):
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            raise openai.RateLimitError(
+                "Rate limit reached for gpt-4o",
+                response=httpx.Response(429, request=request),
+                body=None,
+            )
+
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _RateLimited())
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, openai.RateLimitError)  # still no traceback
+    flat = _squashed(result.output)
+    assert _squashed("is out of capacity") in flat
+    assert _squashed("not a credentials problem") in flat
+    assert _squashed("re-run `wmo demo --name demo-model`") in flat  # the exact next command
+    assert "credentialsareset" not in flat  # the setup hint, squashed; wrong diagnosis here
+    assert "wmoprovidersverify" not in flat  # it would only re-report the same outage
+
+
 def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """Only backend SDK failures are re-rendered; our own bugs must not be dressed up as setup."""
     root = tmp_path / ".wmo"

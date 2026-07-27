@@ -20,7 +20,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 from uuid import uuid4
 
 import typer
@@ -2493,23 +2493,20 @@ def demo(
                     _NARRATOR.detach()
             break
         except Exception as exc:  # noqa: BLE001 - classified below
-            if not is_capacity_error(exc) or not _console.is_terminal:
+            out_of_capacity = is_capacity_error(exc)
+            if not out_of_capacity or not _console.is_terminal:
                 # A backend that refused the request (missing/expired credentials, a model id it
                 # does not serve) is a user-fixable setup error, not a wmo bug: render it with the
                 # same hint `wmo providers verify` prints. Anything else keeps its traceback.
                 if not _is_provider_sdk_error(exc):
                     raise
-                serve_config = config.serve_provider_config()
-                _console.print(
-                    f"\n[red]✗ the serve provider for {resolved_name!r} "
-                    f"({serve_config.kind.value}, {serve_config.model}) failed[/red]: "
-                    f"{escape(_short_error(exc))}"
+                _exit_serve_provider_failure(
+                    resolved_name,
+                    config.serve_provider_config(),
+                    exc,
+                    out_of_capacity=out_of_capacity,
+                    retry=f"`wmo demo --name {resolved_name}`",
                 )
-                _console.print(
-                    f"  [yellow]{escape(_credential_hint(serve_config.kind, str(exc)))}[/yellow]"
-                )
-                _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
-                raise typer.Exit(1) from exc
             # Retries are exhausted and the backend is still down: offer to re-point the model
             # at a different provider (same picker as the build wizard) and RESUME from the
             # failed step — completed steps stay done.
@@ -3159,6 +3156,42 @@ def _prepare_serve_provider_or_exit(provider: Provider, config: ProviderConfig) 
         _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
         _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
         raise typer.Exit(1) from exc
+
+
+def _exit_serve_provider_failure(
+    resolved_name: str,
+    config: ProviderConfig,
+    exc: Exception,
+    *,
+    out_of_capacity: bool,
+    retry: str,
+) -> NoReturn:
+    """Render a serve-provider failure as the setup error or the outage it actually is, then exit.
+
+    The two need opposite next steps, and printing the wrong one costs the user the debugging
+    session: a 429/503/timeout has already survived `RetryingProvider`'s backoff, so the
+    credentials it took to get that far are demonstrably fine and `wmo providers verify` will
+    just report the same outage. Only a refusal (bad key, unserved model id) earns the
+    credential hint.
+    """
+    verb = "is out of capacity" if out_of_capacity else "failed"
+    _console.print(
+        f"\n[red]✗ the serve provider for {resolved_name!r} "
+        f"({config.kind.value}, {config.model}) {verb}[/red]: {escape(_short_error(exc))}"
+    )
+    if out_of_capacity:
+        _console.print(
+            "  [yellow]retries are exhausted and the backend is still refusing; this is an "
+            "outage or a rate limit, not a credentials problem[/yellow]"
+        )
+        _console.print(
+            f"  [yellow]re-run {retry} once it recovers, or run it on a terminal to switch "
+            "provider and resume from the failed step[/yellow]"
+        )
+    else:
+        _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
+        _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
+    raise typer.Exit(1) from exc
 
 
 # Top-level modules whose exceptions mean "the backend refused", not "wmo has a bug": the provider
