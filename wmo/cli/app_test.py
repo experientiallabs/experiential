@@ -2449,7 +2449,7 @@ def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noq
 
 # Hand-editing `.wmo/settings.toml` is documented (docs/reference/closed_loop.md), and a file
 # written by an older CLI outlives an upgrade, so every command that reads it has to fail as a
-# usage error naming the file — never as a tomllib/pydantic traceback.
+# usage error naming the file, never as a tomllib/pydantic traceback.
 _BROKEN_SETTINGS = pytest.mark.parametrize(
     ("payload", "expected"),
     [
@@ -2608,7 +2608,7 @@ def test_providers_verify_missing_optional_sdk_points_at_the_install(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # tinker's SDK is an optional extra, and its ImportError text replaces the "No module named"
-    # wording the hint used to key on — so the hint said "check your credentials" on a failure
+    # wording the hint used to key on, so the hint said "check your credentials" on a failure
     # that has nothing to do with credentials.
     root = tmp_path / ".wmo"
     settings = load_settings(root)
@@ -2626,7 +2626,7 @@ def test_providers_verify_missing_optional_sdk_points_at_the_install(
     result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
 
     flat = _flat(result.output)
-    # pip is the documented install path, so the extra must be reachable without a checkout —
+    # pip is the documented install path, so the extra must be reachable without a checkout,
     # and the `[distill]` must survive rich markup rather than being read as a style tag.
     assert "pip install 'world-model-optimizer[distill]'" in flat
     assert "credentials are set" not in flat

@@ -79,7 +79,7 @@ def test_refused_settings_name_the_path_and_the_repair(
 
 def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
     # TOML is UTF-8 by definition, and `tomllib.load` decodes before it parses, so a file saved
-    # in another encoding raises UnicodeDecodeError — a ValueError that is not a TOMLDecodeError
+    # in another encoding raises UnicodeDecodeError, a ValueError that is not a TOMLDecodeError
     # and so used to escape the guard as a bare codec error naming no file.
     root = tmp_path / ".wmo"
     root.mkdir()

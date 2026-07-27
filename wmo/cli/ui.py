@@ -992,7 +992,7 @@ def build_summary_panel(info: ModelInfo, root: str) -> Panel:
 def models_table(infos: list[ModelInfo]) -> Table:
     """A table of every built world model (for `wmo list`).
 
-    An artifact the store could not read still gets a row, marked `unreadable` — it exists on
+    An artifact the store could not read still gets a row, marked `unreadable`: it exists on
     disk, so hiding it would be a lie, and dropping the whole table would hide the healthy models
     beside it. `wmo list` prints the reason under the table.
     """

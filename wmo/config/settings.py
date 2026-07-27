@@ -98,7 +98,7 @@ _SETTINGS_REPAIR = "fix the file, or delete it and re-run `wmo providers set` to
 """How to recover a settings file this loader refuses. Every raise below names it.
 
 `wmo providers set` reads the file before it rewrites it, so "just re-run it" is only true once
-the broken file is out of the way — hence "delete it and re-run", not "re-run".
+the broken file is out of the way, hence "delete it and re-run", not "re-run".
 """
 
 
