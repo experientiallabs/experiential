@@ -41,6 +41,7 @@ from wmo.serving.chat import (
     install_openai_error_shapes,
 )
 from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmo.serving.query_embeddings import QUERY_EMBEDDING_FILENAME, QueryEmbeddingStore
 from wmo.serving.traces_source import (
     TRACES_FILENAME,
     TracesDownloader,
@@ -189,6 +190,7 @@ def _endpoint_runtimes(
     policies: Mapping[str, RoutingPolicy],
     model_dirs: Mapping[str, Path],
     log: RequestLog,
+    embeddings: QueryEmbeddingStore | None = None,
 ) -> dict[str, EndpointRuntime]:
     """Turn policies into served endpoints, each on the dial its `endpoint.toml` asks for.
 
@@ -220,6 +222,7 @@ def _endpoint_runtimes(
                 log=log,
                 cost_quality=settings.cost_quality,
                 config_path=config_path,
+                embeddings=embeddings,
             )
         except ValueError as exc:
             # Fail fast and name the file: a dial the policy cannot honor (a savings position on
@@ -291,8 +294,15 @@ def create_app(
     # With no artifact root (injected-models tests) the log keeps its in-memory tail only.
     log_path = Path(artifact_dirs[0]) / "serving" / "requests.jsonl" if artifact_dirs else None
     request_log = RequestLog(log_path)
+    # The query-vector sidecar lives beside the request log, so a log row and the vector it was
+    # routed on are one directory apart. No artifact root means no store, matching the log.
+    embeddings = QueryEmbeddingStore(
+        log_path.parent / QUERY_EMBEDDING_FILENAME if log_path is not None else None
+    )
     app.include_router(
-        create_chat_router(_endpoint_runtimes(endpoint_policies, model_dirs, request_log))
+        create_chat_router(
+            _endpoint_runtimes(endpoint_policies, model_dirs, request_log, embeddings)
+        )
     )
     install_openai_error_shapes(app)
 

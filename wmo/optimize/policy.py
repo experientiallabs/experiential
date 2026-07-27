@@ -285,6 +285,42 @@ class ClusterRanking(BaseModel):
     total: int = 0  # fit scenarios that landed in this cluster
 
 
+# How a non-baseline candidate fared, as `RoutingEvidence.gate` records it. "passed" and
+# "reverted" are the two outcomes of the paired statistical guard; "novelty-abstain" is the
+# coverage floor firing before the guard ever runs. "contained" belongs to the containment gate
+# (a global win-vs-baseline check on top of the neighborhood's verdict), which is NOT shipped:
+# the value is pinned here so that landing it later does not change a persisted log's vocabulary,
+# and nothing emits it today.
+GateOutcome = Literal["passed", "reverted", "contained", "novelty-abstain"]
+
+# Why this request went where it did, in the one distinction an offline analysis needs: "greedy"
+# means the router served the candidate its own scoring preferred (which includes the baseline
+# winning on merit), "fallback-forced" means something overrode that preference back to the
+# baseline. Counting fallback-forced requests is how a coverage problem shows up as a number
+# rather than as a string that has to be grepped out of `reason`.
+Propensity = Literal["greedy", "fallback-forced"]
+
+
+class RoutingEvidence(BaseModel):
+    """The numbers behind one routing decision, as structured fields rather than prose.
+
+    `reason` is written for a human reading a request log; this is the same decision in a shape
+    something can aggregate. The fields are exactly what `knn_decision` already computes on the
+    way to its answer, so recording them costs nothing and invents nothing.
+
+    The paired statistics are present only when the guard actually ran, which means only when a
+    non-baseline candidate led the neighborhood: a request the baseline won outright, or that
+    abstained before any candidate was scored, has no paired comparison to report and leaves them
+    None rather than reporting a zero that would average in as evidence.
+    """
+
+    mean_diff: float | None = None  # mean paired reward difference, candidate minus baseline
+    se: float | None = None  # its standard error, after any small-sample floor
+    n_pairs: int | None = None  # neighbors scored on BOTH sides, the guard's sample size
+    gate: GateOutcome | None = None  # None when no gate was reached
+    propensity: Propensity
+
+
 class RoutingDecision(BaseModel):
     """Where one request goes and why (the request log's model/cluster/routing_reason)."""
 
@@ -292,6 +328,23 @@ class RoutingDecision(BaseModel):
     cluster_id: int | None = None
     cluster_label: str = ""
     reason: str
+    # Populated by `knn_decision`; None for the kinds that compute no paired evidence (static and
+    # rank) and for a sticky decision, which never consults the policy at all.
+    evidence: RoutingEvidence | None = None
+
+    # The L2-normalized vector this request was routed on, attached by `select_model` so serving
+    # can persist it (`wmo.serving.query_embeddings`) without re-embedding the text. Private
+    # because it is per-request state, not part of the decision's shape: it must not appear in a
+    # log row, a report, or a comparison between two decisions.
+    _query_embedding: np.ndarray | None = PrivateAttr(default=None)
+
+    def attach_query_embedding(self, vector: np.ndarray) -> None:
+        """Record the vector this decision was made from (see `_query_embedding`)."""
+        self._query_embedding = vector
+
+    def query_embedding(self) -> np.ndarray | None:
+        """The vector this decision was made from, when one was embedded for it."""
+        return self._query_embedding
 
 
 class RoutingPolicy(BaseModel):
@@ -544,9 +597,13 @@ def select_model(
         return RoutingDecision(model=policy.default_model, reason="static policy")
 
     query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
-    if policy.kind == "knn":
-        return knn_decision(policy, query)
-    return rank_decision(policy, query)
+    decision = knn_decision(policy, query) if policy.kind == "knn" else rank_decision(policy, query)
+    # Normalized separately rather than by normalizing `query` first: both decision functions do
+    # their own normalization in their own precision, and pre-normalizing here would perturb the
+    # champion's numerical path for the sake of a logging side effect.
+    norm = float(np.linalg.norm(query))
+    decision.attach_query_embedding(query / norm if norm > 0.0 else query)
+    return decision
 
 
 def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
@@ -643,6 +700,7 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
                 f"knn novelty abstain: best similarity {float(np.max(sims)):.3f} below the "
                 f"fit-bank floor {policy.floor_sim:.3f}, serving {baseline}"
             ),
+            evidence=RoutingEvidence(gate="novelty-abstain", propensity="fallback-forced"),
         )
 
     budget = min(policy.rag_num, sims.shape[0])
@@ -669,6 +727,7 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         return RoutingDecision(
             model=baseline,
             reason=f"knn: {rows.size} neighbors carry no scored reward, serving {baseline}",
+            evidence=RoutingEvidence(propensity="fallback-forced"),
         )
     mean_cost = bank.mean_costs()
     # The cost knob prices each candidate in average-call units before the argmax; at
@@ -697,11 +756,15 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
                     f"{rows.size} neighbors on evidence (profile {profile[leader_index]:.3f} vs "
                     f"{profile[pick_index]:.3f}) but not on price"
                 ),
+                # Greedy: the baseline IS the argmax once the cost knob has priced the
+                # candidates, so nothing overrode the router's own preference.
+                evidence=RoutingEvidence(propensity="greedy"),
             )
         return RoutingDecision(
             model=baseline,
             reason=f"knn: baseline {baseline} leads {rows.size} neighbors "
             f"(profile {profile[pick_index]:.3f})",
+            evidence=RoutingEvidence(propensity="greedy"),
         )
 
     base_index = bank.models.index(baseline)
@@ -729,6 +792,13 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         return RoutingDecision(
             model=baseline,
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
+            evidence=RoutingEvidence(
+                mean_diff=mean_diff,
+                se=error,
+                n_pairs=pairs,
+                gate="reverted",
+                propensity="fallback-forced",
+            ),
         )
     knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
     # Only the symmetric bar doubles z for a pricier pick; the asymmetric one holds it at z.
@@ -739,4 +809,11 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         model=pick,
         reason=f"knn: {rows.size} neighbors, delta={mean_diff:+.3f} > {z_effective:g}xSE"
         f"={needed:.3f}{price_note}{knob}",
+        evidence=RoutingEvidence(
+            mean_diff=mean_diff,
+            se=error,
+            n_pairs=pairs,
+            gate="passed",
+            propensity="greedy",
+        ),
     )

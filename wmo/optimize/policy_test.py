@@ -780,3 +780,66 @@ def test_embedder_provenance_separates_two_azure_resources() -> None:
     # must not read as a refit.
     assert embedder_provenance(azure("https://east.openai.azure.com", "OTHER_KEY")) == east
     assert embedder_provenance(EmbedderSpec(dim=512)) == "hashing-512"
+
+
+def test_evidence_records_the_guards_numbers_when_a_pick_is_routed() -> None:
+    # The same decision the reason string describes in prose, in a shape something can aggregate.
+    decision = knn_decision(_knn_policy(_knn_bank([[0.0, 1.0]] * 12)), _QUERY)
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "passed"
+    assert decision.evidence.propensity == "greedy"
+    assert decision.evidence.n_pairs == 12
+    assert decision.evidence.mean_diff == pytest.approx(1.0)
+    assert decision.evidence.se is not None
+
+
+def test_evidence_records_a_guard_revert_as_fallback_forced() -> None:
+    decision = knn_decision(_knn_policy(_knn_bank([[0.0, 1.0]] * 5)), _QUERY)
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "reverted"
+    assert decision.evidence.propensity == "fallback-forced"
+    # The numbers behind the refusal are kept, which is what makes a revert diagnosable in bulk.
+    assert decision.evidence.n_pairs == 5
+
+
+def test_evidence_calls_a_baseline_that_won_on_merit_greedy_with_no_gate() -> None:
+    # Nothing overrode the router here: the baseline WAS its preference, so counting this as a
+    # forced fallback would make a healthy endpoint look like a coverage problem.
+    decision = knn_decision(_knn_policy(_knn_bank([[1.0, 0.0]] * 12)), _QUERY)
+    assert decision.evidence is not None
+    assert decision.evidence.gate is None
+    assert decision.evidence.propensity == "greedy"
+    assert decision.evidence.n_pairs is None
+
+
+def test_evidence_records_a_novelty_abstain() -> None:
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    abstaining = policy.model_copy(update={"floor_sim": 2.0})  # no similarity can clear it
+    abstaining.attach_bank(policy.knn_bank())
+    decision = knn_decision(abstaining, _QUERY)
+    assert decision.model == "fable-5"
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "novelty-abstain"
+    assert decision.evidence.propensity == "fallback-forced"
+
+
+def test_select_model_attaches_the_normalized_query_vector() -> None:
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    decision = select_model(policy, "anything", embedder=_UnitEmbedder())
+    vector = decision.query_embedding()
+    assert vector is not None
+    assert float(np.linalg.norm(vector)) == pytest.approx(1.0)
+    # Private state, not part of the decision's shape: it must never reach a log row or a report.
+    assert "query_embedding" not in decision.model_dump()
+
+
+def test_a_sticky_decision_carries_no_evidence_and_no_vector() -> None:
+    # It never consulted the policy at all, so reporting evidence would be inventing it.
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    decision = select_model(policy, "anything", incumbent="haiku-4-5", embedder=_UnitEmbedder())
+    assert decision.evidence is None
+    assert decision.query_embedding() is None
+
+
+def test_a_static_policy_carries_no_evidence() -> None:
+    assert select_model(_static(), "anything").evidence is None
