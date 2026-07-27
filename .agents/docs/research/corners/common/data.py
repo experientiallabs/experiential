@@ -1,8 +1,9 @@
 """Read-only loaders for the corner analyses' data sources. Never regenerates anything.
 
 The charter pins the sources: grid arm matrices under the MAIN checkout's
-`.wmo/jt/grid/<arm>/matrix.json` (landing per arm as the grid runner merges chunks, wall
-estimate ~15h from the 2026-07-27 launch), the cycle-1 per-task per-arm rows
+`.wmo/jt/grid-c2/<arm>/matrix.json` (the LIVE cohort, relaunched 2026-07-27 at tip f1ebaca6
+with #330's concurrent per-cell persistence; the earlier `.wmo/jt/grid` dir is a RETIRED
+cohort and is never read as evidence), the cycle-1 per-task per-arm rows
 (`episode-rows.jsonl`, 180 rows), and the D-DIAL anchors (imported straight from
 `wmo.optimize.knn`, never copied). `.wmo/` artifacts are machine-local and gitignored, so the
 paths default to Silen's main checkout and are overridable via WMO_MAIN_CHECKOUT for anyone
@@ -27,6 +28,8 @@ from pydantic import BaseModel
 # field annotation, which pydantic must resolve when the model class is built.
 from wmo.core.types import JsonObject
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.sweep_partial import PARTIAL_SUFFIX, PartialHeader, read_partial
+from wmo.providers.pool import load_pool
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -74,8 +77,14 @@ def main_checkout() -> Path:
 
 
 def grid_dir() -> Path:
-    """The canonical tau grid directory (cohort pins, ledger, per-arm matrices)."""
-    return main_checkout() / ".wmo" / "jt" / "grid"
+    """The LIVE canonical tau grid cohort (pins, ledger, per-arm matrices).
+
+    grid-c2 replaced the original `jt/grid` cohort on 2026-07-27 (DECISIONS: relaunched at
+    tip f1ebaca6 with concurrent sweep persistence after the original persisted zero cells
+    in ~1.5h). The old dir still exists on disk; it is retired evidence and nothing here may
+    read it.
+    """
+    return main_checkout() / ".wmo" / "jt" / "grid-c2"
 
 
 def cycle1_run_dir() -> Path:
@@ -156,20 +165,46 @@ def load_arm_snapshot(arm: str, *, root: Path | None = None) -> ArmSnapshot | No
     chunks = sorted(
         arm_dir.glob("chunk-*.json"), key=lambda p: int(p.stem.removeprefix("chunk-"))
     )
-    if not chunks:
-        logger.info("grid arm %r has no chunk files yet under %s", arm, arm_dir)
-        return None
     matrices = [
         OutcomeMatrix.model_validate_json(path.read_text(encoding="utf-8")) for path in chunks
     ]
+    # grid-c2 (#330) persists every cell to a `chunk-N.json.partial.jsonl` sidecar as it
+    # completes; a chunk whose matrix has not been written yet still has live evidence there.
+    # The product's own parser does the reading (header check, torn-final-line tolerance,
+    # plan-identity guard against a stale sidecar from another cohort); rows are priced with
+    # the cohort's pool.toml, since a sidecar carries only the pool digest.
+    sidecars = [
+        path
+        for path in sorted(arm_dir.glob("chunk-*.json.partial.jsonl"))
+        if not path.with_name(path.name.removesuffix(PARTIAL_SUFFIX)).exists()
+    ]
+    sidecar_rows: list[ScenarioOutcome] = []
+    for path in sidecars:
+        first_line = path.read_text(encoding="utf-8").split("\n", 1)[0]
+        header = PartialHeader.model_validate_json(first_line)
+        sidecar_rows.extend(read_partial(path, header.identity))
+    if not chunks and not sidecar_rows:
+        logger.info("grid arm %r has no chunk files or sidecars yet under %s", arm, arm_dir)
+        return None
     if len({tuple(m.model_names()) for m in matrices}) > 1:
         raise ValueError(f"{arm}: chunk files disagree on the pool; refusing to concatenate")
+    pool = (
+        matrices[0].pool
+        if matrices
+        else load_pool((root or grid_dir()) / "pool.toml").models
+    )
+    parts = []
+    if chunks:
+        parts.append(f"{len(chunks)} chunk file(s)")
+    if sidecars:
+        parts.append(f"{len(sidecars)} live sidecar(s), {len(sidecar_rows)} cell(s)")
     return ArmSnapshot(
         name=arm,
         matrix=OutcomeMatrix(
-            pool=matrices[0].pool, outcomes=[o for m in matrices for o in m.outcomes]
+            pool=pool,
+            outcomes=[o for m in matrices for o in m.outcomes] + sidecar_rows,
         ),
-        status=f"partial ({len(chunks)} chunk file(s), pre-retry)",
+        status=f"partial ({', '.join(parts)}, pre-retry)",
     )
 
 
