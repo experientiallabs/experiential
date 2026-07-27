@@ -330,9 +330,7 @@ def test_installed_wheel_without_the_bundled_cert_says_what_to_set(
     monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443")
     monkeypatch.setenv(KEY_ENV, "x" * 64)
     monkeypatch.delenv(CA_ENV, raising=False)
-    monkeypatch.setattr(
-        compression_endpoint, "BUNDLED_CERT_PATH", tmp_path / "absent" / "cert.pem"
-    )
+    monkeypatch.setattr(compression_endpoint, "BUNDLED_CERT_PATH", tmp_path / "absent" / "cert.pem")
 
     with pytest.raises(CompressorEndpointError) as caught:
         LLMLingua2EndpointCompressor.from_env()
