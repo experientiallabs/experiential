@@ -81,6 +81,7 @@ from wmo.optimize.compression import (
     CompressionStats,
     Compressor,
     estimate_tokens,
+    same_compression,
 )
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
@@ -118,6 +119,15 @@ logger = logging.getLogger(__name__)
 # Finished-exchange fingerprints remembered per endpoint for conversation affinity. Bounded so
 # a long-running server cannot grow without limit; least-recently-used conversations re-route.
 _AFFINITY_CAPACITY = 4096
+
+# The compressed-transcript cache is bounded by BYTES, not by entry count. An affinity entry is
+# a fingerprint and a model name (tens of bytes, so 4096 of them is nothing), but a compressed
+# transcript is the conversation itself: a measured 40-turn conversation runs about 99KB, and
+# tool results push that much higher, so reusing the count cap would allow 0.41GB of ordinary
+# traffic and multiple GB of tool-heavy traffic. 64MB holds roughly 650 conversations of that
+# measured size, which is far more than the affinity map keeps anyway, and costs a fixed,
+# statable amount of memory per endpoint instead of an unbounded one.
+_COMPRESSED_CAPACITY_BYTES = 64 * 1024 * 1024
 
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
@@ -641,8 +651,11 @@ class EndpointRuntime:
         self._savings: dict[SavingsWindow, tuple[int, EndpointSavings]] = {}
         # Compressed provider-visible transcripts, keyed by the SAME remembered-prefix
         # fingerprint as _affinity: the affinity state decides compression segment boundaries.
-        # Only populated when the policy carries a compression config.
-        self._compressed: OrderedDict[str, list[ChatMessage]] = OrderedDict()
+        # Only populated when the policy carries a compression config. Bounded by BYTES
+        # (_COMPRESSED_CAPACITY_BYTES), so the value is (transcript, its measured size) and
+        # `_compressed_bytes` is their running sum.
+        self._compressed: OrderedDict[str, tuple[list[ChatMessage], int]] = OrderedDict()
+        self._compressed_bytes = 0
         # Resolved at mount and re-resolved on every dial-driven policy install, mirroring the
         # embedder-once pattern: no per-request registry lookups. Resolving through the policy
         # re-runs the D-COMPRESS mount gates, so an artifact that was assembled in memory
@@ -688,13 +701,34 @@ class EndpointRuntime:
             self._install_policy(adjusted)
 
     def _install_policy(self, adjusted: RoutingPolicy) -> None:
+        # Resolved OUTSIDE the lock and before the swap: it re-runs the D-COMPRESS mount gates,
+        # and a policy that fails them must leave the live endpoint exactly as it was rather
+        # than half-installed.
+        compressor = adjusted.serving_compressor()
         with self._lock:
+            stale = not same_compression(self.policy.compression, adjusted.compression)
             self.policy = adjusted
             # Keep the resolved compressor matched to the policy object requests will read;
             # apply_cost_quality carries `compression` through, but the invariant should not
             # depend on that staying true.
-            self._compressor = adjusted.serving_compressor()
+            self._compressor = compressor
+            if stale:
+                # Every stored prefix was produced by the OUTGOING config, so reusing one would
+                # hand the provider a transcript that is half one compression config and half
+                # another. Today's dial carries `compression` through unchanged and this never
+                # fires; it exists so that a dial which ever does vary compression cannot serve
+                # a spliced transcript.
+                self._clear_compressed()
             self._savings.clear()  # the dial changed, so the quality expectation did too
+
+    def _clear_compressed(self) -> None:
+        """Drop every stored compressed transcript. Caller holds `_lock`.
+
+        The map and its running byte total are one piece of state; clearing them apart is how a
+        byte-bounded cache starts evicting for memory it is no longer holding.
+        """
+        self._compressed.clear()
+        self._compressed_bytes = 0
 
     def savings(self, window: SavingsWindow = "all_time") -> EndpointSavings:
         """What this endpoint has saved so far (see `wmo.serving.savings`).
@@ -772,25 +806,36 @@ class EndpointRuntime:
         At most ONE compressor call per request, carrying every segment that needs compressing:
         an endpoint-backed compressor pays one round trip per request, not one per message.
         """
-        config = self.policy.compression
-        if config is None or self._compressor is None:
+        # One snapshot, one lock: `_install_policy` swaps the policy and its compressor together
+        # under this lock, so reading them in two unsynchronized statements could pair a new
+        # config with the previous implementation. Harmless while both dial positions share a
+        # compressor, silently wrong the moment they do not.
+        with self._lock:
+            policy = self.policy
+            compressor = self._compressor
+        config = policy.compression
+        if config is None or compressor is None:
             return messages, None
         started = time.monotonic()
         prefix: list[ChatMessage] | None = None
         remembered = _remembered_prefix(messages)
         if remembered is not None:
+            key = _fingerprint(remembered)
             with self._lock:
-                prefix = self._compressed.get(_fingerprint(remembered))
+                cached = self._compressed.get(key)
+                if cached is not None:
+                    self._compressed.move_to_end(key)  # LRU is by USE, not just by write
+                    prefix = cached[0]
         if prefix is not None:
             # The stored prefix has one entry per remembered message, so the tail is everything
             # the client appended after the turn we already compressed.
-            tail, cost_usd = _compress_user_turns(messages[len(prefix) :], self._compressor, config)
+            tail, cost_usd = _compress_user_turns(messages[len(prefix) :], compressor, config)
             compressed = [*prefix, *tail]
         else:
-            compressed, cost_usd = _compress_user_turns(messages, self._compressor, config)
+            compressed, cost_usd = _compress_user_turns(messages, compressor, config)
         return compressed, CompressionStats(
-            compressor_id=self._compressor.id,
-            compressor_version=self._compressor.version,
+            compressor_id=compressor.id,
+            compressor_version=compressor.version,
             aggressiveness=config.aggressiveness,
             tokens_in_raw=sum(estimate_tokens(m.content) for m in messages),
             tokens_in_compressed=sum(estimate_tokens(m.content) for m in compressed),
@@ -839,6 +884,13 @@ class EndpointRuntime:
         fingerprint must match it). `compressed` is the provider-visible transcript when
         compression ran; stored under the same key so the next turn reuses the exact bytes the
         provider's prompt cache was written with.
+
+        The two caches are bounded independently (entries for affinity, bytes for transcripts),
+        so they can disagree about which conversations they remember. Both directions of
+        disagreement are safe: a compressed prefix evicted while its affinity entry survives
+        falls back to full recompression, which per-segment determinism makes byte-identical,
+        and an affinity entry evicted while its prefix survives simply re-routes while still
+        reusing the exact bytes that fingerprint was stored with.
         """
         transcript = [*messages, reply]
         key = _fingerprint(transcript)
@@ -848,10 +900,16 @@ class EndpointRuntime:
             while len(self._affinity) > _AFFINITY_CAPACITY:
                 self._affinity.popitem(last=False)
             if compressed is not None:
-                self._compressed[key] = [*compressed, reply]
-                self._compressed.move_to_end(key)
-                while len(self._compressed) > _AFFINITY_CAPACITY:
-                    self._compressed.popitem(last=False)
+                transcript = [*compressed, reply]
+                previous = self._compressed.pop(key, None)
+                if previous is not None:
+                    self._compressed_bytes -= previous[1]
+                size = _transcript_bytes(transcript)
+                self._compressed[key] = (transcript, size)
+                self._compressed_bytes += size
+                while self._compressed and self._compressed_bytes > _COMPRESSED_CAPACITY_BYTES:
+                    _, (_, evicted) = self._compressed.popitem(last=False)
+                    self._compressed_bytes -= evicted
 
     def provider_for(self, pool_name: str) -> tuple[PoolEntry, Provider]:
         entry = next(e for e in self.policy.pool if e.name == pool_name)
@@ -865,6 +923,26 @@ class EndpointRuntime:
             with self._lock:
                 provider = self._providers.setdefault(pool_name, provider)
         return entry, provider
+
+
+def _transcript_bytes(messages: list[ChatMessage]) -> int:
+    """Roughly what one stored transcript costs in memory, for the byte-bounded cache.
+
+    Sums the UTF-8 length of everything that varies with conversation size: message content,
+    tool-call ids/names/arguments, and tool_call_id. Tool arguments and results are counted
+    because they are where transcripts actually get large. It is an estimate, not an allocator
+    figure (it ignores per-object overhead, which is roughly constant per message), and it is
+    used only to decide when to evict.
+    """
+    total = 0
+    for message in messages:
+        total += len(message.content.encode("utf-8")) + len(message.role)
+        if message.tool_call_id is not None:
+            total += len(message.tool_call_id)
+        for call in message.tool_calls or ():
+            total += len(call.id) + len(call.function.name)
+            total += len(call.function.arguments.encode("utf-8"))
+    return total
 
 
 def _compress_user_turns(

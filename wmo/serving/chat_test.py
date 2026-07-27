@@ -50,6 +50,7 @@ from wmo.providers.base import (
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.retrieval.embedders import HashingEmbedder
+from wmo.serving import chat as chat_module
 from wmo.serving.chat import ChatMessage as EndpointMessage
 from wmo.serving.chat import (
     EndpointRuntime,
@@ -2463,7 +2464,7 @@ def test_lost_affinity_recompression_is_byte_identical(tmp_path: Path) -> None:
 
     with runtime._lock:
         runtime._affinity.clear()
-        runtime._compressed.clear()
+        runtime._clear_compressed()
 
     second = client.post(
         "/v1/chat/completions",
@@ -2742,3 +2743,84 @@ def test_the_compressor_bill_reaches_the_log_on_the_error_path_too(tmp_path: Pat
     row = _rows(log_path)[-1]
     assert row["status"] == "error"
     assert row["compressor_cost_usd"] == pytest.approx(0.00054)
+
+
+def _one_exchange(client: TestClient, content: str) -> None:
+    """Drive one full request so the runtime remembers a compressed transcript for it."""
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": content}]},
+    )
+    assert response.status_code == 200
+
+
+def test_the_compressed_cache_is_bounded_by_bytes_not_by_entry_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A compressed transcript is the whole conversation, not a fingerprint: at the affinity
+    # map's 4096-entry cap, measured 99KB conversations would be 0.41GB and tool-heavy ones
+    # multiple GB. The cap is therefore in bytes, and the running total tracks the map.
+    monkeypatch.setattr(chat_module, "_COMPRESSED_CAPACITY_BYTES", 2_000)
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.0)
+    client, _, runtime, _ = _compressed_runtime(tmp_path, config)
+
+    for index in range(12):
+        _one_exchange(client, f"conversation {index} " + "padding word " * 40)
+
+    with runtime._lock:
+        stored = len(runtime._compressed)
+        total = runtime._compressed_bytes
+        measured = sum(size for _, size in runtime._compressed.values())
+    assert 0 < stored < 12  # older conversations were evicted, newer ones kept
+    assert total <= 2_000  # the bound actually binds
+    assert total == measured  # the running total never drifts from what is held
+
+
+def test_the_byte_total_is_repaired_when_a_conversation_is_re_remembered(tmp_path: Path) -> None:
+    # remember() overwrites a key on each turn of the same conversation. Without subtracting the
+    # previous size first, the total would climb forever and start evicting live entries.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.0)
+    client, _, runtime, _ = _compressed_runtime(tmp_path, config)
+    _one_exchange(client, "alpha beta gamma delta")
+    with runtime._lock:
+        after_first = runtime._compressed_bytes
+        measured_first = sum(size for _, size in runtime._compressed.values())
+    _one_exchange(client, "alpha beta gamma delta")  # the identical request again
+    with runtime._lock:
+        assert runtime._compressed_bytes == after_first == measured_first
+        assert runtime._compressed_bytes == sum(size for _, size in runtime._compressed.values())
+
+
+def test_installing_a_different_compression_config_drops_stale_prefixes(tmp_path: Path) -> None:
+    # A stored prefix carries the OUTGOING config's bytes. Reusing one after the config changed
+    # would hand the provider a transcript that is half one compression config and half another.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, _, runtime, _ = _compressed_runtime(tmp_path, config)
+    _one_exchange(client, "alpha beta gamma delta epsilon zeta")
+    with runtime._lock:
+        assert runtime._compressed  # there is something to go stale
+
+    runtime._install_policy(
+        runtime.policy.model_copy(
+            update={"compression": CompressionConfig(compressor_id="identity")}
+        )
+    )
+
+    with runtime._lock:
+        assert not runtime._compressed
+        assert runtime._compressed_bytes == 0
+
+
+def test_installing_the_same_compression_config_keeps_the_prefixes(tmp_path: Path) -> None:
+    # The dial's actual behavior today: it carries `compression` through unchanged, and a dial
+    # move must not throw away every warm prefix (and with it the provider's prompt cache).
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, _, runtime, _ = _compressed_runtime(tmp_path, config)
+    _one_exchange(client, "alpha beta gamma delta epsilon zeta")
+    with runtime._lock:
+        before = dict(runtime._compressed)
+
+    runtime._install_policy(runtime.policy.model_copy(update={"guard_margin": 0.01}))
+
+    with runtime._lock:
+        assert dict(runtime._compressed) == before
