@@ -14,6 +14,7 @@ from typing import cast
 
 import pytest
 import typer
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from wmo.cli import app, pool_registry
@@ -25,6 +26,7 @@ from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3wa
 from wmo.engine.eval_suites import EvalSuiteConfig
 from wmo.providers.base import (
     Completion,
+    EmbedderKind,
     Message,
     ProviderConfig,
     ProviderKind,
@@ -1498,6 +1500,95 @@ def test_research_concurrency_rejects_bad_select() -> None:
     )
     assert result.exit_code != 0
     assert "--select must be one of" in result.output
+
+
+def _framed(output: str) -> str:
+    """One flat line of a rich-framed message: the box wraps and pads what it renders."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def test_research_concurrency_unknown_suite_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # The suite argument must fail like every other argument on this command: a framed usage
+    # error naming the next command, not the raw ValueError traceback out of resolve_eval_suite.
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "nosuchsuite", "--examples-root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValueError)
+    flat = _framed(result.output)
+    assert "unknown eval suite 'nosuchsuite'" in flat
+    assert "`wmo eval list` prints the suites" in flat
+
+
+def test_scenarios_build_missing_file_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # A typo in --file is the likeliest first-run mistake; it must not be a FileNotFoundError.
+    result = runner.invoke(app, ["scenarios", "build", "--file", str(tmp_path / "nope.jsonl")])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, FileNotFoundError)
+    flat = _framed(result.output)
+    assert "does not exist" in flat
+    assert "`wmo download <benchmark>`" in flat
+
+
+def test_scenarios_build_directory_file_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["scenarios", "build", "--file", str(tmp_path)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, IsADirectoryError)
+    assert "is a directory" in _framed(result.output)
+
+
+def test_scenarios_build_help_documents_the_accepted_embed_provider() -> None:
+    # The help must name values the command accepts: EmbedderKind spells Azure "azure".
+    result = runner.invoke(app, ["scenarios", "build", "--help"])
+    assert result.exit_code == 0
+    flat = _framed(result.output)
+    documented = flat[flat.index("Facet embedder") : flat.index("--embed-model")]
+    for kind in EmbedderKind:
+        assert kind.value in documented, kind
+    assert "azure_openai" not in documented
+
+
+def test_scenarios_verify_missing_scenario_set_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["scenarios", "verify", str(tmp_path / "nope.json"), "--file", str(corpus)],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, FileNotFoundError)
+    flat = _framed(result.output)
+    assert "does not exist" in flat
+    assert "`wmo scenarios build --file <traces.jsonl> --out" in flat
+
+
+def test_scenarios_verify_missing_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    scenarios_file = tmp_path / "scenarios.json"
+    scenarios_file.write_text('{"scenarios": []}', encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["scenarios", "verify", str(scenarios_file), "--file", str(tmp_path / "nope.jsonl")],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, FileNotFoundError)
+    flat = _framed(result.output)
+    assert "--file" in flat and "does not exist" in flat
+
+
+def test_scenarios_verify_malformed_scenario_set_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Pydantic's ValidationError points at pydantic's docs; the user needs the command that
+    # writes this artifact instead.
+    scenarios_file = tmp_path / "scenarios.json"
+    scenarios_file.write_text("not json\n", encoding="utf-8")
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    result = runner.invoke(app, ["scenarios", "verify", str(scenarios_file), "--file", str(corpus)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValidationError)
+    flat = _framed(result.output)
+    assert "is not a scenario set written by `wmo scenarios build`" in flat
+    assert "errors.pydantic.dev" not in flat
 
 
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001

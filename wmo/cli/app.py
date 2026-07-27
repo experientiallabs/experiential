@@ -30,6 +30,7 @@ from environment_capture.hub import (
     published_corpora,
 )
 from llm_waterfall import is_capacity_error
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -77,7 +78,7 @@ from wmo.config import (
     validate_name,
 )
 from wmo.config.card import make_build_card, save_card
-from wmo.core.types import JsonObject
+from wmo.core.types import JsonObject, Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, ingest, split_traces
 from wmo.engine.build import build as run_build
 from wmo.engine.demo import run_demo
@@ -1800,7 +1801,7 @@ def scenarios_build(
         help=(
             "Facet embedder: hashing (offline but lexical-only — clusters by wording, not "
             "meaning; prefer a semantic embedder for real corpora) | bedrock | openai | "
-            "azure_openai."
+            "azure."
         ),
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
@@ -1812,7 +1813,7 @@ def scenarios_build(
     Writes a `ScenarioSet` JSON: scenarios (task, seed state, checklist, weight, provenance),
     the named clusters they came from, and the corpus-coverage number that justifies them.
     """
-    traces = get_adapter("otel-genai").from_file(file)
+    traces = _ingest_scenario_corpus(file)
     if limit is not None:
         traces = traces[:limit]
     if not traces:
@@ -1861,8 +1862,8 @@ def scenarios_verify(
     baseline LLM agent on every scenario, and grades episodes against each scenario's checklist.
     With `--drop`, unverified scenarios are removed from the set in place.
     """
-    scenario_set = ScenarioSet.load(scenarios_file)
-    traces = get_adapter("otel-genai").from_file(file)
+    scenario_set = _load_scenario_set(scenarios_file)
+    traces = _ingest_scenario_corpus(file)
     if provider is not None or model is not None:
         store = WorldModelStore(root)
         model_dir = store.resolve(_resolve_name(store, name))
@@ -1916,6 +1917,55 @@ def scenarios_verify(
             f"kept {len(scenario_set.scenarios)} verified scenarios "
             f"(weights renormalized, coverage reset) -> {scenarios_file}"
         )
+
+
+def _ingest_scenario_corpus(file: str) -> list[Trace]:
+    """Ingest a `--file` trace corpus for the scenarios commands as a validated CLI input.
+
+    `--file` is the only required option on `wmo scenarios build`, so a mistyped path is the
+    likeliest first-run mistake. Guard it here rather than letting `Path.read_text` raise, which
+    reaches the user as a stdlib FileNotFoundError/IsADirectoryError traceback.
+    """
+    path = Path(file)
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"--file {file} is a directory; point it at the trace file itself, "
+            f"e.g. `--file {Path(file) / 'traces.otel.jsonl'}`"
+        )
+    if not path.exists():
+        raise typer.BadParameter(
+            f"--file {file} does not exist; pass an exported OTel-GenAI corpus, or fetch a "
+            "benchmark one with `wmo download <benchmark>`"
+        )
+    return get_adapter("otel-genai").from_file(file)
+
+
+def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
+    """Load a `ScenarioSet` argument, reporting a missing or malformed file as a usage error.
+
+    The raw failures are a stdlib FileNotFoundError/IsADirectoryError and a pydantic
+    ValidationError that sends the user to pydantic's docs; neither says the file is supposed to
+    be the output of `wmo scenarios build`.
+    """
+    path = Path(scenarios_file)
+    build_hint = (
+        f"build one with `wmo scenarios build --file <traces.jsonl> --out {scenarios_file}`"
+    )
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"scenario set {scenarios_file} is a directory; pass the JSON file written by "
+            "`wmo scenarios build --out <scenarios.json>`"
+        )
+    if not path.exists():
+        raise typer.BadParameter(f"scenario set {scenarios_file} does not exist; {build_hint}")
+    try:
+        return ScenarioSet.load(path)
+    except ValidationError as exc:
+        raise typer.BadParameter(
+            f"{scenarios_file} is not a scenario set written by `wmo scenarios build` "
+            f"({exc.error_count()} validation error(s), first: {exc.errors()[0]['msg']}); "
+            f"{build_hint}"
+        ) from exc
 
 
 def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
@@ -2392,7 +2442,12 @@ def research_concurrency(
     suite_roots = (
         [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
     )
-    resolved = resolve_eval_suite(suite, suite_roots)
+    # An unresolvable suite is a bad argument, like every other input validated above; the
+    # ValueError carries the available names, so only the next command has to be added.
+    try:
+        resolved = resolve_eval_suite(suite, suite_roots)
+    except ValueError as exc:
+        raise typer.BadParameter(f"{exc}; `wmo eval list` prints the suites") from exc
     files = resolved.resolve_files()
     missing = [f for f in files if not f.exists()]
     if not files or missing:
