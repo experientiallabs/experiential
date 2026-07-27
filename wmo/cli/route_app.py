@@ -310,6 +310,7 @@ def sweep(
             assume_input_tokens=assume_input_tokens,
             assume_output_tokens=assume_output_tokens,
             history_chars=history_chars,
+            compression=sweep_compression,
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -335,8 +336,8 @@ def sweep(
     # the line would print a path that does not exist (and this one is meant to be copied).
     _console.print(
         f"[green]✓[/green] {len(matrix.outcomes)} cell(s), {scored} scored -> {escape(out)}\n"
-        f"  measured candidate spend ${run.candidate_usd:.4f} (the world model's own serve/judge "
-        "cost is metered separately)",
+        f"  measured candidate spend ${run.candidate_usd:.4f}{_compressor_note(run)} (the world "
+        "model's own serve/judge cost is metered separately)",
         soft_wrap=True,  # a path a user copies must not be wrapped
     )
     print_world_model_spend(_console, run)
@@ -403,6 +404,19 @@ def print_tiny_corpus_note(console: Console, plan: SweepPlan) -> None:
         "these scenarios come from the FULL corpus: they are not leak-free, and a policy "
         "fitted on them is a smoke test, not evidence"
     )
+
+
+def _compressor_note(run: SweepRun) -> str:
+    """Name the compressor's share of candidate spend, but only when one actually billed.
+
+    The D-COMPRESS rule folds the compressor's inference cost into the candidate figure, so on a
+    compressed arm that number is not just the models. Saying so on an UNCOMPRESSED sweep would
+    be noise about a stage that did not run, which is why this is conditional on a nonzero bill
+    rather than on the flag.
+    """
+    if run.compressor_usd <= 0.0:
+        return ""
+    return f" (incl. ${run.compressor_usd:.4f} compressor)"
 
 
 def print_world_model_spend(console: Console, run: SweepRun) -> None:
@@ -896,7 +910,6 @@ def fit(
             compression = _compression_for(compressor, aggressiveness)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
-        compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
     # The rewards in this matrix were produced under SOME compression config, and a joint fit is
     # only joint if that config is the one being fitted. `--compressor` moves the fit-side
     # representation (embeddings), but it cannot retroactively change what the episodes ran

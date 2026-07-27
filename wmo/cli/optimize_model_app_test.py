@@ -885,7 +885,9 @@ def test_a_second_sweep_forecasts_the_world_model_side_from_the_first(
     forced = _run(tmp_path, root, "--yes", "--force-from", "sweep")
     assert forced.exit_code == 0, forced.output
     assert _says(forced.output, "plus a projected ~$30.00 world-model side")
-    assert _says(forced.output, "measured $0.1200 world-model against $0.0013 candidate")
+    assert _says(
+        forced.output, "measured $0.1200 world-model against $0.0013 projectable candidate"
+    )
     assert _says(forced.output, "90.9x")
     assert _says(forced.output, "a forecast from one prior sweep, not arithmetic")
 

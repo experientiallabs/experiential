@@ -27,6 +27,7 @@ from wmo.optimize.compression import (
     Compressor,
     TruncateCompressor,
     register_compressor,
+    same_compression,
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
@@ -2491,3 +2492,55 @@ def test_route_fit_stamps_the_running_compressor_version(tmp_path: Path) -> None
     assert policy.compression.compressor_version == "3"
     assert policy.fit_compression == policy.compression
     assert policy.serving_compressor() is not None  # and it mounts
+
+
+def test_route_fit_knn_stamps_the_compression_it_was_fitted_under(tmp_path: Path) -> None:
+    """The knn path must carry the stamp, not just the rank path.
+
+    `--kind knn` returns from `fit_knn_artifact` before the rank path's stamping line, so a fit
+    that attached compression only after the branch would write a knn policy with no
+    `fit_compression` at all. That is the representation-consistency failure in a new costume:
+    the endpoint would serve compressed while its bank claimed to be raw, and the mount gate
+    would have nothing to compare.
+    """
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    matrix_file = _knn_matrix_file(tmp_path, compression=config)
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--kind",
+            "knn",
+            "--out",
+            str(policy_file),
+            "--fallback",
+            "a",
+            "--min-pairs",
+            "0",
+            "--compressor",
+            "truncate",
+            "--aggressiveness",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    policy = RoutingPolicy.load(policy_file)
+    assert policy.kind == "knn"
+    assert policy.compression is not None
+    assert policy.compression.compressor_id == "truncate"
+    # Both halves, so the mount gate has an identity to check rather than a null.
+    assert policy.fit_compression is not None
+    assert same_compression(policy.compression, policy.fit_compression)
+
+
+def test_route_fit_knn_leaves_the_stamp_null_without_the_flag(tmp_path: Path) -> None:
+    """The negative control: an uncompressed knn fit is byte-identical to before this seam."""
+    policy_file = tmp_path / "policy.json"
+    result = _fit_knn(_knn_matrix_file(tmp_path), policy_file)
+    assert result.exit_code == 0, result.output
+    policy = RoutingPolicy.load(policy_file)
+    assert policy.compression is None and policy.fit_compression is None

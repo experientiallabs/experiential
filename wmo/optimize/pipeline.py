@@ -107,6 +107,12 @@ class StageRecord(BaseModel):
     # the candidate models charged (the serving cost a customer would pay) and what the world
     # model charged to run the evaluation (eval infrastructure). Both are 0.0 for the free stages.
     spend_usd: float = 0.0
+    # The compressor's share of `spend_usd`, which is folded INTO it (D-COMPRESS accounting:
+    # every savings number carries the compressor's inference cost). Recorded separately for one
+    # reason: the plan table cannot project a compressor's per-call cost, so a forecast built
+    # from this stage has to divide the folded total back down to the projectable part or it
+    # compares two different quantities (see `project_sweep_spend`).
+    compressor_spend_usd: float = 0.0
     world_model_spend_usd: float = 0.0
 
     @property
@@ -370,7 +376,15 @@ def project_sweep_spend(candidate_usd: float, prior: StageRecord | None) -> Swee
     """
     if prior is None or prior.stage is not Stage.SWEEP or prior.spend_usd <= 0.0:
         return SweepSpendProjection(candidate_usd=candidate_usd, world_model_usd=0.0, basis=None)
-    ratio = prior.world_model_spend_usd / prior.spend_usd
+    # Divide by the PROJECTABLE part of the prior candidate spend, not the folded total. The
+    # number this ratio multiplies is a projection that excludes the compressor by construction
+    # (nothing predicts a compressor's per-call cost in advance), so a folded denominator would
+    # shrink the forecast by the compressor's share of the last run: systematically short, on the
+    # term that dominates the bill.
+    projectable = prior.spend_usd - prior.compressor_spend_usd
+    if projectable <= 0.0:
+        return SweepSpendProjection(candidate_usd=candidate_usd, world_model_usd=0.0, basis=None)
+    ratio = prior.world_model_spend_usd / projectable
     return SweepSpendProjection(
         candidate_usd=candidate_usd,
         world_model_usd=candidate_usd * ratio,
@@ -379,7 +393,7 @@ def project_sweep_spend(candidate_usd: float, prior: StageRecord | None) -> Swee
         # itself and looks exactly like the divide-by-zero this function refuses to do.
         basis=(
             f"the last sweep of this model measured ${prior.world_model_spend_usd:.4f} "
-            f"world-model against ${prior.spend_usd:.4f} candidate ({ratio:.1f}x)"
+            f"world-model against ${projectable:.4f} projectable candidate ({ratio:.1f}x)"
         ),
     )
 

@@ -233,12 +233,13 @@ def test_the_reserved_slots_are_named_but_not_built() -> None:
     assert order.index(Stage.SWEEP) < order.index(Stage.DISTILL)
 
 
-def _sweep_record(*, candidate: float, world_model: float) -> StageRecord:
+def _sweep_record(*, candidate: float, world_model: float, compressor: float = 0.0) -> StageRecord:
     return StageRecord(
         stage=Stage.SWEEP,
         fingerprint={"pool": "abc"},
         completed_at="2026-07-27T00:00:00+00:00",
         spend_usd=candidate,
+        compressor_spend_usd=compressor,
         world_model_spend_usd=world_model,
     )
 
@@ -263,7 +264,7 @@ def test_a_prior_sweep_projects_the_world_model_side_from_its_measured_ratio() -
     assert projection.basis is not None
     assert "7.0x" in projection.basis
     # Four decimals: a sub-cent side must not render as "$0.00" beside a nonzero ratio.
-    assert "$1.8076" in projection.basis and "$0.2581" in projection.basis
+    assert "$1.8076" in projection.basis and "$0.2581 projectable candidate" in projection.basis
 
 
 def test_the_projection_scales_with_the_size_of_the_sweep_being_planned() -> None:
@@ -303,4 +304,33 @@ def test_a_sub_cent_candidate_side_is_not_rendered_as_zero_in_the_basis() -> Non
     basis = project_sweep_spend(1.0, _sweep_record(candidate=0.00132, world_model=0.12)).basis
     assert basis is not None
     assert "$0.00 candidate" not in basis
-    assert "$0.0013 candidate" in basis
+    assert "$0.0013 projectable candidate" in basis
+
+
+def test_a_compressed_prior_forecasts_on_like_units_not_the_folded_total() -> None:
+    """The ratio's denominator has to match the units of the number it multiplies.
+
+    D-COMPRESS folds the compressor's bill into candidate spend, but nothing can project a
+    compressor's per-call cost in advance, so the projection this ratio multiplies is the model
+    half alone. Dividing by the FOLDED total would shrink every forecast by the compressor's
+    share of the last run: systematically short, on the term that dominates the bill.
+
+    Concrete rather than re-derived: asserting the formula the implementation uses would pass
+    even if both were wrong together.
+    """
+    prior = _sweep_record(candidate=1.00, world_model=7.00, compressor=0.30)
+    projection = project_sweep_spend(0.70, prior)
+    # 7.00 / (1.00 - 0.30) = 10.0x on the projectable part; 10.0 x 0.70 = $7.00 like-for-like.
+    # A folded denominator would give 7.00 / 1.00 = 7.0x -> $4.90, a 30% shortfall.
+    assert projection.world_model_usd == pytest.approx(7.00)
+    assert projection.total_usd == pytest.approx(7.70)
+    assert projection.basis is not None
+    assert "$0.7000 projectable candidate" in projection.basis and "10.0x" in projection.basis
+
+
+def test_a_prior_that_was_all_compressor_supplies_no_ratio() -> None:
+    # Projectable part is zero, so there is nothing to divide by and nothing honest to forecast.
+    projection = project_sweep_spend(
+        1.0, _sweep_record(candidate=0.5, world_model=9.0, compressor=0.5)
+    )
+    assert projection.basis is None and projection.world_model_usd == 0.0

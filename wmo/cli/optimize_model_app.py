@@ -28,6 +28,7 @@ from rich.table import Table
 from wmo.cli.route_app import (
     BIAS_ACCEPTED_NOTE,
     NO_EVIDENCE_WARNING,
+    _compressor_note,
     cell_progress,
     print_coverage,
     print_deferred_risks,
@@ -39,6 +40,7 @@ from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.closed_loop import scenario_id
+from wmo.optimize.compression import compression_signature
 from wmo.optimize.knn import (
     COST_QUALITY_BALANCED,
     DEFAULT_KNN_MIN_PAIRS,
@@ -478,6 +480,12 @@ def _live_inputs(
                     "scenarios": _scenario_identity(plan),
                     "episodes": str(plan.episodes),
                     "max_steps": str(plan.max_steps),
+                    # A matrix's rewards belong to ONE D-COMPRESS arm, so a changed compressor
+                    # means different evidence and the cells have to be bought again. The
+                    # orchestrator exposes no compression flag yet, so this reads "raw text"
+                    # today; recording it now means the reserved COMPACT stage cannot arrive
+                    # and silently reuse a matrix measured under a different arm.
+                    "compression": compression_signature(plan.compression),
                 },
                 artifact=paths.matrix,
                 artifact_identity=file_sha256(paths.matrix),
@@ -682,7 +690,7 @@ def _print_plan(
         f"input + {ASSUMED_OUTPUT_TOKENS:,} assumed output token(s) per call, times the real cell "
         f"and call counts, at each candidate's own pool price)"
     )
-    console.print(_world_model_forecast(projection))
+    console.print(_world_model_forecast(projection, compressed=plan.compression is not None))
 
 
 def _print_budget_stop(name: str, exc: BudgetExceeded) -> None:
@@ -699,7 +707,7 @@ def _will_sweep(decisions: list[StageDecision]) -> bool:
     return any(decision.stage is Stage.SWEEP and decision.will_run for decision in decisions)
 
 
-def _world_model_forecast(projection: SweepSpendProjection) -> str:
+def _world_model_forecast(projection: SweepSpendProjection, *, compressed: bool) -> str:
     """What to say about the OTHER side of the bill before the operator authorizes the run.
 
     Two honest answers, never a zero. With a prior sweep of this model there is a measured ratio
@@ -708,11 +716,20 @@ def _world_model_forecast(projection: SweepSpendProjection) -> str:
     be, or "not in this figure" reads as "not much" and the operator plans against the wrong
     number.
     """
+    # A compressed arm makes the candidate projection wrong in BOTH directions at once, so say
+    # so rather than let the reader assume the usual over-estimate is the whole story.
+    arm = (
+        "\n  on a compressed arm that candidate figure is an OVER-estimate (it assumes "
+        "uncompressed tokens) while the compressor's OWN per-call cost is not in it at all, "
+        "because nothing predicts that in advance. Both are measured when the sweep finishes."
+        if compressed
+        else ""
+    )
     if projection.projected:
         return (
             f"  plus a projected ~${projection.world_model_usd:.2f} world-model side "
             f"({projection.basis}), so ~${projection.total_usd:.2f} total is what --max-usd is "
-            "checked against. That half is a forecast from one prior sweep, not arithmetic."
+            "checked against. That half is a forecast from one prior sweep, not arithmetic." + arm
         )
     return (
         "  the world model's own serve and judge calls are NOT in that figure and are not "
@@ -720,7 +737,7 @@ def _world_model_forecast(projection: SweepSpendProjection) -> str:
         "judge's token use per episode in advance. It is not a rounding error either, measuring "
         "7.0x the candidate side on one real tau corpus, so treat the number above as a lower "
         "bound. Both sides are measured and reported when the sweep finishes, and the next run "
-        "forecasts this line from them."
+        "forecasts this line from them." + arm
     )
 
 
@@ -866,8 +883,8 @@ def _stage_sweep(plan: SweepPlan, *, model_dir: Path, pool_file: Path) -> StageR
     _console.print(
         f"  [green]✓[/green] {len(matrix.outcomes)} cell(s), {scored} scored -> "
         f"{escape(str(plan.out_path))}\n"
-        f"  measured candidate spend ${run.candidate_usd:.4f} (the world model's own serve/judge "
-        "cost is metered separately)",
+        f"  measured candidate spend ${run.candidate_usd:.4f}{_compressor_note(run)} (the world "
+        "model's own serve/judge cost is metered separately)",
         soft_wrap=True,
     )
     print_world_model_spend(_console, run)
@@ -878,11 +895,13 @@ def _stage_sweep(plan: SweepPlan, *, model_dir: Path, pool_file: Path) -> StageR
             "scenarios": _scenario_identity(plan),
             "episodes": str(plan.episodes),
             "max_steps": str(plan.max_steps),
+            "compression": compression_signature(plan.compression),
         },
         artifact_path=str(plan.out_path),
         artifact_identity=file_sha256(plan.out_path),
         completed_at=_now(),
         spend_usd=run.candidate_usd,
+        compressor_spend_usd=run.compressor_usd,
         world_model_spend_usd=run.world_model_usd,
     )
     return record
