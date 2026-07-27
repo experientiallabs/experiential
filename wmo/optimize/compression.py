@@ -42,10 +42,21 @@ def estimate_tokens(text: str) -> int:
 class CompressionConfig(BaseModel):
     """Per-cluster compression choice carried on the policy artifact (D-COMPRESS shape).
 
-    `aggressiveness` is the fraction of content the compressor may remove, in [0, 1];
-    risk-tiered per cluster and learned within bounds by the research track. 0.0 must be a
-    no-op for every compressor. `compressor_version` records the version the config was
-    fitted against (provenance); serving logs the version that actually ran.
+    `aggressiveness` is a compressor-DEFINED dial in [0, 1], deliberately not a removal
+    fraction. Two invariants bind every implementation: 0.0 is a strict bit-for-bit no-op, and
+    the dial is monotone (a higher value never removes less than a lower one). Requiring an
+    exact removal fraction instead would force per-input percentile selection, which is the
+    cache-hostile selection rule this track rejected (it rewrites the already-emitted prefix
+    every turn, see `Compressor.append_stable`); the cache-safe learned compressors are
+    fixed-threshold ones, whose removal varies with the input by construction.
+
+    The ACHIEVED removal ratio is therefore an outcome, not a setting: read it per call off
+    `CompressionResult` (tokens_in_compressed / tokens_in_raw), and match ratio-matched controls
+    on that achieved ratio rather than on the nominal dial.
+
+    Aggressiveness is risk-tiered per cluster and learned within bounds by the research track.
+    `compressor_version` records the version the config was fitted against (provenance);
+    serving logs the version that actually ran.
     """
 
     compressor_id: str = Field(min_length=1)
@@ -88,7 +99,17 @@ class CompressionStats(BaseModel):
 
 @runtime_checkable
 class Compressor(Protocol):
-    """The pluggable compressor seam. Implementations must be deterministic and 0.0-safe.
+    """The pluggable compressor seam.
+
+    Three contracts bind an implementation: it is deterministic (same segments and config, same
+    bytes out), it honors the `aggressiveness` dial's invariants (0.0 is a strict bit-for-bit
+    no-op, and the dial is monotone; see `CompressionConfig`), and it attests `append_stable`
+    truthfully.
+
+    One `compress` call takes ALL of a request's mutable segments at once, so an implementation
+    backed by a network endpoint pays one round trip per request rather than one per message,
+    and can batch internally. Per-segment determinism still holds: a segment's output may not
+    depend on which other segments accompanied it.
 
     `append_stable` is the implementation's ATTESTATION that appending a segment never rewrites
     the bytes of the segments already emitted (C1's audit calls this append-only; the selection
@@ -129,12 +150,15 @@ class IdentityCompressor:
 
 
 class TruncateCompressor:
-    """The trivial ratio-matched control: drop the trailing `aggressiveness` fraction.
+    """The trivial ratio-matched control: drop the trailing words of every segment.
 
     Keeps the leading ceil((1 - aggressiveness) * n) whitespace-delimited tokens of each
-    segment. Deterministic per segment, so an unchanged segment always compresses to the same
-    bytes (append-stability). This is a CONTROL, not a method: a learned compressor that does
-    not beat it at equal ratio has learned nothing (the track's mandatory baseline).
+    segment, which is this compressor's own reading of the dial. Being structural, it can hit a
+    removal fraction exactly; a learned compressor generally cannot (see `CompressionConfig`),
+    which is why controls are matched on ACHIEVED ratio. Deterministic per segment, so an
+    unchanged segment always compresses to the same bytes (append-stability). This is a CONTROL,
+    not a method: a learned compressor that does not beat it at equal achieved ratio has learned
+    nothing (the track's mandatory baseline).
 
     Append-stable by C1's round-0 semantics: head-keep truncation is head-absolute per segment,
     the kept prefix of a segment depends on nothing outside that segment, and a segment already
@@ -208,6 +232,10 @@ class CompressingEmbedder:
 
     Serving does NOT wrap its embedder: the compression stage has already rewritten the request
     by the time the router embeds it, so wrapping there would compress twice.
+
+    One `compress` call per `embed` batch, not one per text: fitting a bank means compressing
+    every fit scenario, which would otherwise be a round trip each against an endpoint-backed
+    compressor.
     """
 
     def __init__(self, inner: Embedder, config: CompressionConfig) -> None:

@@ -171,3 +171,29 @@ def test_compressing_embedder_embeds_the_compressed_text() -> None:
     config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
     CompressingEmbedder(inner, config).embed(["one two three four", "alpha beta"])
     assert inner.seen == [["one two", "alpha"]]
+
+
+def test_the_dial_invariants_hold_for_every_reference_compressor() -> None:
+    # `aggressiveness` is a compressor-defined dial, not a removal fraction, so these two
+    # invariants are the whole contract an implementation has to honor: 0.0 is a strict
+    # bit-for-bit no-op, and higher never removes less.
+    segments = ["one two three four five six seven eight", "alpha beta gamma", ""]
+    for compressor_id in ("identity", "truncate"):
+        compressor = get_compressor(compressor_id)
+        removed = []
+        for level in (0.0, 0.25, 0.5, 0.75, 1.0):
+            config = CompressionConfig(compressor_id=compressor_id, aggressiveness=level)
+            result = compressor.compress(segments, config)
+            if level == 0.0:
+                assert result.segments == segments, compressor_id
+            removed.append(result.tokens_in_raw - result.tokens_in_compressed)
+        assert removed == sorted(removed), f"{compressor_id} dial is not monotone: {removed}"
+
+
+def test_one_call_carries_every_segment() -> None:
+    # The batching contract a network-backed compressor depends on: the caller hands over all
+    # of a request's mutable segments at once, so the implementation pays one round trip and
+    # can batch internally.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    result = get_compressor("truncate").compress(["one two", "three four", "five six"], config)
+    assert len(result.segments) == 3

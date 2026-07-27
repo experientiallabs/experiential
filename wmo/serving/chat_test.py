@@ -2622,3 +2622,29 @@ def test_mounting_a_mismatched_compression_artifact_fails_loudly(tmp_path: Path)
             provider_factory=_EchoProvider,
             log=RequestLog(tmp_path / "requests.jsonl"),
         )
+
+
+def test_the_stage_makes_one_compressor_call_per_request(tmp_path: Path) -> None:
+    # Round trip dominates for an endpoint-backed compressor, so the stage must hand over a
+    # request's whole segment set in ONE call rather than one call per message.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    client, _, runtime, _ = _compressed_runtime(tmp_path, config)
+    spy = _SpyCompressor(cast("Compressor", runtime._compressor))
+    runtime._compressor = spy
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "system", "content": "never compressed"},
+                {"role": "user", "content": "first user turn here"},
+                {"role": "assistant", "content": "an earlier reply"},
+                {"role": "user", "content": "second user turn here"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    # One call (a cold transcript: no affinity to reuse), carrying BOTH user turns.
+    assert spy.calls == [["first user turn here", "second user turn here"]]

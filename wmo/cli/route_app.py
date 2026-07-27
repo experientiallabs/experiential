@@ -807,8 +807,9 @@ def fit(
         "--aggressiveness",
         min=0.0,
         max=1.0,
-        help="Fraction of compressible content the compressor may remove, in [0, 1]. "
-        "Only meaningful with --compressor.",
+        help="Compressor-defined dial in [0, 1]: 0.0 is a no-op and higher never removes "
+        "less, but it is not an exact removal fraction (the achieved ratio is reported per "
+        "call). Only meaningful with --compressor.",
     ),
 ) -> None:
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""

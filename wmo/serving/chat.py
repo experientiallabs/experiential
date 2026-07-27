@@ -758,6 +758,9 @@ class EndpointRuntime:
         per-segment determinism makes that reproduce the same bytes, so the provider-visible
         prefix stays append-only either way. Returns the input list untouched when compression
         is off.
+
+        At most ONE compressor call per request, carrying every segment that needs compressing:
+        an endpoint-backed compressor pays one round trip per request, not one per message.
         """
         config = self.policy.compression
         if config is None or self._compressor is None:
