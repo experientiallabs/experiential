@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import cast
 
 import pytest
@@ -419,6 +421,165 @@ def test_uncompressed_rows_keep_default_compression_fields() -> None:
     assert outcome.tokens_in_raw == 0
     assert outcome.tokens_in_compressed == 0
     assert outcome.aggressiveness == 0.0
+
+
+class _SleepingProvider(_ScriptedProvider):
+    """Scripted provider whose every completion takes real wall time, like a real one does."""
+
+    delay_s = 0.05
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        time.sleep(self.delay_s)
+        return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
+
+
+def _timed_evaluation(max_concurrency: int) -> tuple[float, list[ScenarioOutcome]]:
+    """Wall seconds to measure the 4-cell grid at `max_concurrency`, and the rows it produced."""
+    started = time.monotonic()
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS,
+        provider_factory=_SleepingProvider,
+        max_steps=2,
+        max_concurrency=max_concurrency,
+    )
+    return time.monotonic() - started, matrix.outcomes
+
+
+def test_concurrent_cells_finish_in_a_fraction_of_the_sequential_wall_clock() -> None:
+    """The point of the whole change: cells are IO-bound, so they overlap.
+
+    4 cells x 2 completions x 50ms = 400ms of sleeping. Sequentially that is the wall clock;
+    four at a time it is one cell's worth. The assertion is deliberately coarse (the ratio, plus
+    a ceiling well above the ideal 100ms) so a loaded CI box cannot make it flap, while a
+    regression that quietly serializes the pool again cannot pass it.
+    """
+    concurrent_s, concurrent_rows = _timed_evaluation(4)
+    sequential_s, sequential_rows = _timed_evaluation(1)
+    assert concurrent_s < 0.25, f"4 cells at once took {concurrent_s:.3f}s"
+    assert sequential_s > concurrent_s * 1.8
+    # Same evidence either way: concurrency is a speed knob, not a measurement change.
+    assert [(row.model, row.scenario_id) for row in concurrent_rows] == [
+        (row.model, row.scenario_id) for row in sequential_rows
+    ]
+    assert all(row.reward == pytest.approx(0.8) for row in concurrent_rows)
+
+
+def test_the_matrix_is_in_cell_order_even_when_the_cells_finish_backwards() -> None:
+    """Row order is the grid's order, not the finish order, or every digest of it drifts.
+
+    The second candidate is made much faster than the first, so completion order is the reverse
+    of cell order. The rows must still come back candidate-major.
+    """
+    finished: list[str] = []
+
+    class _PacedProvider(_ScriptedProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Completion:
+            time.sleep(0.08 if self.config.model == "custom-a" else 0.0)
+            return super().complete(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            )
+
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS,
+        provider_factory=_PacedProvider,
+        max_steps=2,
+        max_concurrency=4,
+        on_outcome=lambda outcome: finished.append(outcome.model),
+    )
+    assert finished[0] == "candidate-b"  # the fast candidate really did finish first
+    assert [row.model for row in matrix.outcomes] == [
+        "candidate-a",
+        "candidate-a",
+        "candidate-b",
+        "candidate-b",
+    ]
+
+
+def test_the_progress_callback_never_runs_two_cells_at_once() -> None:
+    # A console-printing callback that interleaved would corrupt the operator's progress lines,
+    # so the callback is serialized even though the cells are not.
+    inside = 0
+    overlaps = 0
+
+    def watch(outcome: ScenarioOutcome) -> None:
+        nonlocal inside, overlaps
+        inside += 1
+        if inside > 1:
+            overlaps += 1
+        time.sleep(0.01)
+        inside -= 1
+
+    evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS,
+        provider_factory=_ScriptedProvider,
+        max_concurrency=4,
+        on_outcome=watch,
+    )
+    assert overlaps == 0
+
+
+def test_a_cell_that_raises_under_concurrency_still_reports_the_cells_that_finished() -> None:
+    # The failure aborts the measurement (there is no matrix to return), but the cells that were
+    # already paid for reached the callback, which is what the sweep persists them from.
+    seen: list[str] = []
+
+    class _ExplodingEnv(_FakeEnv):
+        def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
+            raise RuntimeError("world model session refused")
+
+    envs = iter(
+        [
+            _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="ok")),
+            _ExplodingEnv(None),
+        ]
+    )
+    lock = threading.Lock()
+
+    def next_env() -> _FakeEnv:
+        with lock:
+            return next(envs)
+
+    with pytest.raises(RuntimeError, match="session refused"):
+        evaluate_pool(
+            next_env,
+            ModelPool(models=[_pool().models[0]]),
+            _SCENARIOS,
+            provider_factory=_ScriptedProvider,
+            max_concurrency=2,
+            on_outcome=lambda outcome: seen.append(outcome.scenario_id),
+        )
+    assert len(seen) == 1
+
+
+def test_a_concurrency_below_one_is_a_usage_error() -> None:
+    with pytest.raises(ValueError, match="max_concurrency must be >= 1"):
+        evaluate_pool(
+            lambda: _FakeEnv(EpisodeScore(reward=0.1, success=False, critique="")),
+            _pool(),
+            _SCENARIOS[:1],
+            provider_factory=_ScriptedProvider,
+            max_concurrency=0,
+        )
 
 
 def test_pre_compression_outcome_json_loads_with_defaults() -> None:
