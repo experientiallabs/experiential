@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -712,3 +713,57 @@ def test_ground_failures_degrade_and_are_never_negative_cached(tmp_path: Path) -
     session2 = wm2.new_session(task="t")
     wm2.step(session2.id, Action(kind=ActionKind.TOOL_CALL, name="f", arguments={}))
     assert kb.lookup_grounded("entity y") is None  # empty results never negative-cached
+
+
+def test_a_frozen_world_model_serves_concurrent_sessions_without_crossing_them() -> None:
+    """The property a concurrent sweep bets on, measured rather than assumed.
+
+    A sweep runs many episodes against ONE WorldModel at once, each with its own session, with
+    the model frozen for the whole run. What could go wrong is shared mutable state: the session
+    and tracker dicts, the retrieval index, and the enrichment flag. So: 16 sessions on 8 threads,
+    each stepping several times, then check that every session kept its OWN history and its OWN
+    metering, that the shared retrieval buffer did not grow, and that ending them all leaves the
+    model empty.
+
+    Frozen is load-bearing here, not incidental. Enrichment appends to the retriever's step list
+    and vstacks its matrix, which concurrent sessions would race; freezing turns the shared index
+    read-only for the duration, which is why `execute_sweep` freezes around the whole grid rather
+    than per cell.
+    """
+    sessions_per_thread, threads = 2, 8
+    provider = FakeProvider('{"output": "ok", "is_error": false}')
+    retriever = _retriever_with(
+        [
+            Step(
+                action=Action(kind=ActionKind.TOOL_CALL, name="ls", arguments={}),
+                observation=Observation(content="a.txt"),
+            )
+        ]
+    )
+    wm = WorldModel(provider, retriever, top_k=1)
+    indexed_before = len(retriever.sample(1000))
+    steps_per_session = 3
+    errors: list[BaseException] = []
+
+    def episode(index: int) -> tuple[int, int]:
+        try:
+            session = wm.new_session(task=f"task {index}")
+            for _ in range(steps_per_session):
+                wm.step(session.id, Action(kind=ActionKind.TOOL_CALL, name="ls", arguments={}))
+            history = len(wm.get_session(session.id).history)
+            record = wm.end_session(session.id)
+            return history, record.total.calls
+        except BaseException as exc:  # noqa: BLE001 - re-raised through the collected list
+            errors.append(exc)
+            raise
+
+    with wm.frozen(), ThreadPoolExecutor(max_workers=threads) as pool:
+        results = list(pool.map(episode, range(sessions_per_thread * threads)))
+
+    assert not errors
+    # Every session saw its own steps and only its own: a shared history would show 3 x N here,
+    # and a tracker read off the wrong session would show someone else's call count.
+    assert len(results) == sessions_per_thread * threads
+    assert results == [(steps_per_session, steps_per_session)] * len(results)
+    assert wm._sessions == {} and wm._trackers == {}
+    assert len(retriever.sample(1000)) == indexed_before  # no cell fed another cell's retrieval
