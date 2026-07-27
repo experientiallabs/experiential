@@ -17,10 +17,19 @@ Importing this module needs matplotlib (the repo's viz extra):
 
 from __future__ import annotations
 
+import textwrap
+from typing import TYPE_CHECKING
+
 import matplotlib
 
 matplotlib.use("Agg")  # figure scripts render to files; never require a display
 from matplotlib import pyplot as plt  # noqa: E402
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
 
 INK = "#0a0a0a"
 MUTED = "#8a8a8a"
@@ -75,3 +84,36 @@ def apply_style() -> None:
             "savefig.facecolor": "white",
         }
     )
+
+
+def footnote(fig: Figure, text: str) -> None:
+    """The provenance line under a corner figure (labeling rules in common/README.md).
+
+    Wrapped to the figure width: a long single-line provenance string inflates the tight
+    bounding box and shrinks the axes to a fraction of the canvas (measured on the cost
+    chat's first render).
+    """
+    width = int(fig.get_figwidth() * 16)
+    wrapped = "\n".join(textwrap.wrap(text, width=width))
+    fig.text(0.005, -0.02, wrapped, fontsize=7.5, color=MUTED, ha="left", va="top")
+
+
+def label_point(ax: Axes, x: float, y: float, text: str) -> None:
+    """Direct label beside a mark, in ink: identity never rides on color alone, and text
+    wears text tokens rather than the series color."""
+    ax.annotate(
+        text,
+        xy=(x, y),
+        xytext=(6, 0),
+        textcoords="offset points",
+        va="center",
+        fontsize=9,
+        color=INK,
+    )
+
+
+def save_fig(fig: Figure, path: Path) -> None:
+    """Write a figure and close it (figure scripts render many; leaks add up)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path)
+    plt.close(fig)

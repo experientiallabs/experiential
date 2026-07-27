@@ -1,0 +1,16 @@
+{
+  "grid_dir": "/Users/silen/Desktop/Projects/world-model-harness/.wmo/jt/grid",
+  "arms_present": [],
+  "arms_pending": [
+    "identity",
+    "truncate",
+    "llmlingua2-endpoint"
+  ],
+  "anchor": "fable-5",
+  "best_single": null,
+  "vs_fable5": {},
+  "vs_best_single": {},
+  "notes": [
+    "identity matrix (or its anchor rows) not landed yet: grid charts pending"
+  ]
+}
