@@ -551,6 +551,49 @@ def collect_rollouts(
     *,
     should_cancel: Callable[[], bool] | None = None,
 ) -> tuple[list[TrialRecord], RolloutStats]:
+    """Run one train batch through the config-selected rollout source.
+
+    The training loop's single rollout entry point: dispatches to the harbor
+    collector below or the tau2 collector (`wmo.distill.tau2`) on
+    `cfg.rollout_source`, with one shared signature and return contract so
+    the loop, warmup, and eval paths stay source-agnostic.
+
+    The tau2 import is deferred: `wmo.distill.tau2` imports this module's
+    stats types, so a module-scope import here would be circular.
+    """
+    if cfg.rollout_source == "tau2":
+        from wmo.distill.tau2 import collect_tau2_rollouts
+
+        return collect_tau2_rollouts(
+            step_index,
+            task_ids,
+            cfg,
+            harness,
+            provider_config,
+            run_dir,
+            should_cancel=should_cancel,
+        )
+    return collect_harbor_rollouts(
+        step_index,
+        task_ids,
+        cfg,
+        harness,
+        provider_config,
+        run_dir,
+        should_cancel=should_cancel,
+    )
+
+
+def collect_harbor_rollouts(
+    step_index: int,
+    task_ids: Sequence[str],
+    cfg: DistillConfig,
+    harness: HarnessDoc,
+    provider_config: ProviderConfig,
+    run_dir: Path,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[list[TrialRecord], RolloutStats]:
     """Run one train batch of harbor trials and join rewards with token spans.
 
     Each task in `task_ids` runs `cfg.train.group_size` attempts (the
@@ -593,6 +636,8 @@ def collect_rollouts(
     """
     if step_index < 0:
         raise ValueError(f"step_index must be >= 0, got {step_index}")
+    if cfg.harbor is None:
+        raise ValueError("collect_harbor_rollouts needs a config whose [harbor] section is set")
     try:
         import yaml
         from harbor.models.job.config import JobConfig

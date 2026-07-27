@@ -55,6 +55,8 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.student.lora_rank == 32
     assert cfg.teacher.backend == "tinker"
     assert cfg.teacher.checkpoint is None
+    assert cfg.rollout_source == "harbor"
+    assert cfg.harbor is not None
     assert cfg.harbor.backend == "local"
     assert cfg.harbor.reward_key == "reward"
     # 100, not 20: at 20 the cap fired mid-tool-call on 45% of Ultra TerminalBench-2 trials and
@@ -189,6 +191,7 @@ tags = ["smoke", "tb2"]
     cfg = load_distill_config(_write(tmp_path, text))
     assert cfg.student.lora_rank == 8
     assert cfg.teacher.checkpoint == "tinker://run/weights/ck-7"
+    assert cfg.harbor is not None
     assert cfg.harbor.backend == "e2b"
     assert cfg.harbor.reward_key == "score"
     assert cfg.rollout.max_turns == 5

@@ -506,6 +506,7 @@ def test_template_load_failures_are_actionable(tmp_path: Path) -> None:
     harness = HarnessDoc.baseline()
 
     missing = cfg.model_copy(deep=True)
+    assert missing.harbor is not None
     missing.harbor.job_template = str(tmp_path / "nowhere.yaml")
     with pytest.raises(ValueError, match="cannot load the harbor job template"):
         collect_rollouts(0, _TASK_IDS, missing, harness, _provider_config(), tmp_path / "run")
@@ -513,6 +514,7 @@ def test_template_load_failures_are_actionable(tmp_path: Path) -> None:
     not_mapping = tmp_path / "list.yaml"
     not_mapping.write_text("- 1\n- 2\n", encoding="utf-8")
     listy = cfg.model_copy(deep=True)
+    assert listy.harbor is not None
     listy.harbor.job_template = str(not_mapping)
     with pytest.raises(ValueError, match="must be a mapping"):
         collect_rollouts(0, _TASK_IDS, listy, harness, _provider_config(), tmp_path / "run")
@@ -520,6 +522,7 @@ def test_template_load_failures_are_actionable(tmp_path: Path) -> None:
     invalid = tmp_path / "invalid.yaml"
     invalid.write_text("agents: nope\n", encoding="utf-8")
     broken = cfg.model_copy(deep=True)
+    assert broken.harbor is not None
     broken.harbor.job_template = str(invalid)
     with pytest.raises(ValueError, match="invalid harbor job template"):
         collect_rollouts(0, _TASK_IDS, broken, harness, _provider_config(), tmp_path / "run")

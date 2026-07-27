@@ -996,6 +996,7 @@ def test_an_explicit_backend_overrides_the_config(
     [call] = recorder.calls
     cfg = call["cfg"]
     assert isinstance(cfg, DistillConfig)
+    assert cfg.harbor is not None
     assert cfg.harbor.backend == "e2b"  # the config says "local"
     record = json.loads((tmp_path / "run" / "distill-run.json").read_text(encoding="utf-8"))
     assert record["backend"] == "e2b"

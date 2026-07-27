@@ -1,0 +1,22 @@
+[
+ "airline/0",
+ "airline/12",
+ "airline/22",
+ "airline/4",
+ "airline/40",
+ "airline/44",
+ "airline/6",
+ "retail/100",
+ "retail/102",
+ "retail/33",
+ "retail/52",
+ "retail/8",
+ "retail/86",
+ "retail/88",
+ "retail/92",
+ "telecom/[mms_issue]break_apn_mms_setting|user_abroad_roaming_disabled_off[PERSONA:Hard]",
+ "telecom/[mms_issue]break_app_both_permissions|unseat_sim_card[PERSONA:Hard]",
+ "telecom/[mobile_data_issue]airplane_mode_on|data_usage_exceeded[PERSONA:Easy]",
+ "telecom/[mobile_data_issue]bad_vpn|user_abroad_roaming_disabled_on[PERSONA:None]",
+ "telecom/[service_issue]break_apn_settings|lock_sim_card_pin|overdue_bill_suspension[PERSONA:Easy]"
+]

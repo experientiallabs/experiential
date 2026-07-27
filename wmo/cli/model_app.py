@@ -24,6 +24,7 @@ a bare `--resume` (no `--config`) loads.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
@@ -358,7 +359,9 @@ def run_distill(
         train_ids = _load_harbor_task_ids(Path(task_ids_path))
         holdout_ids = _load_harbor_task_ids(Path(holdout_task_ids_path))
         base, seed_doc, seed_version = _resolve_seed_doc(root, harness_name)
-        effective_backend = backend_override if backend_override is not None else cfg.harbor.backend
+        effective_backend = (
+            backend_override if backend_override is not None else _source_backend(cfg)
+        )
 
     overlap = sorted(set(train_ids) & set(holdout_ids))
     if overlap:
@@ -367,9 +370,12 @@ def run_distill(
             "--holdout-task-ids; the gate is only meaningful on tasks the student "
             "never trained on, so make the splits disjoint"
         )
-    if effective_backend != cfg.harbor.backend:
+    if effective_backend != _source_backend(cfg):
+        source = cfg.rollout_source
+        section = cfg.harbor if source == "harbor" else cfg.tau2
+        assert section is not None  # exactly-one source, validated by the config
         cfg = cfg.model_copy(
-            update={"harbor": cfg.harbor.model_copy(update={"backend": effective_backend})}
+            update={source: section.model_copy(update={"backend": effective_backend})}
         )
     runtime_kind = seed_doc.runtime_kind()
     if runtime_kind != _PI_NODE_RUNTIME:
@@ -379,15 +385,18 @@ def run_distill(
             f"pi-node harness (the built-in {DEFAULT_DISTILL_HARNESS!r} agent, or a "
             "version optimized from it)"
         )
-    template_path = Path(cfg.harbor.job_template)
-    if not template_path.is_file():
-        raise typer.BadParameter(
-            f"harbor.job_template {template_path} does not exist; point the distill "
-            "config's [harbor] job_template at the harbor JobConfig YAML/JSON the "
-            "rollouts should run"
-        )
-    if effective_backend == "e2b":
-        _preflight_e2b_capacity(console, trial_concurrency=cfg.train.trial_concurrency)
+    if cfg.harbor is not None:
+        template_path = Path(cfg.harbor.job_template)
+        if not template_path.is_file():
+            raise typer.BadParameter(
+                f"harbor.job_template {template_path} does not exist; point the distill "
+                "config's [harbor] job_template at the harbor JobConfig YAML/JSON the "
+                "rollouts should run"
+            )
+        if effective_backend == "e2b":
+            _preflight_e2b_capacity(console, trial_concurrency=cfg.train.trial_concurrency)
+    else:
+        _preflight_tau2(cfg)
 
     console.print(
         f"distilling [bold]{base}[/bold]: student {cfg.student.base_model} <- teacher "
@@ -453,6 +462,55 @@ def run_distill(
 
 
 # -- input resolution ------------------------------------------------------------------------
+
+
+def _source_backend(cfg: DistillConfig) -> Literal["local", "e2b"]:
+    """The configured rollout source's backend (the `--backend` default)."""
+    if cfg.harbor is not None:
+        return cfg.harbor.backend
+    assert cfg.tau2 is not None  # exactly-one source, validated by the config
+    return cfg.tau2.backend
+
+
+def _preflight_tau2(cfg: DistillConfig) -> None:
+    """Fail a tau2-source run before anything is spent, naming the fix.
+
+    Checks the pieces a tau2 rollout cannot run without: the tau2 CLI in its
+    own venv, the data directory, and (for an azure/ user simulator) the
+    litellm Azure credentials, by NAME only.
+
+    Args:
+        cfg: The validated run config; `cfg.tau2` must be set.
+
+    Raises:
+        typer.BadParameter: If any prerequisite is missing.
+    """
+    assert cfg.tau2 is not None
+    tau2_bin = Path(cfg.tau2.tau2_bin)
+    if not tau2_bin.is_file():
+        raise typer.BadParameter(
+            f"tau2.tau2_bin {tau2_bin} does not exist; point it at the tau2 CLI inside "
+            "its own venv (see packages/environment-capture/tau-bench/README.md for the "
+            "one-time setup)"
+        )
+    data_dir = Path(cfg.tau2.data_dir)
+    if not data_dir.is_dir():
+        raise typer.BadParameter(
+            f"tau2.data_dir {data_dir} does not exist; point it at the tau2-bench clone's "
+            "data directory (exported to every runner as TAU2_DATA_DIR)"
+        )
+    if cfg.tau2.user_llm.startswith("azure/"):
+        missing = [
+            name
+            for name in ("AZURE_API_KEY", "AZURE_API_BASE", "AZURE_API_VERSION")
+            if not os.environ.get(name)
+        ]
+        if missing:
+            raise typer.BadParameter(
+                f"tau2.user_llm {cfg.tau2.user_llm!r} runs the user simulator through "
+                f"litellm's azure/ route, which needs {', '.join(missing)} in the "
+                "environment (set them in the gitignored .env; never commit values)"
+            )
 
 
 def _load_config(path: Path) -> DistillConfig:
