@@ -497,9 +497,41 @@ def _invoke_harbor(tmp_path: Path, *extra: str) -> Result:
             str(tmp_path / "run"),
             "--root",
             str(tmp_path / ".wmo"),
+            # Consent is explicit everywhere now: a non-TTY spending run without --yes
+            # refuses (exit 2), and CliRunner is never a TTY. Consent semantics have their
+            # own test below; every other harbor test consents up front.
+            "--yes",
             *extra,
         ],
     )
+
+
+def test_harbor_non_interactive_without_yes_refuses_to_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: the run refuses with exit 2 before any paid work starts."""
+    _harbor_project(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "pi",
+            "harbor",
+            "--harbor-config",
+            str(tmp_path / "job.yaml"),
+            "--task-ids",
+            str(tmp_path / "tasks.json"),
+            "--iterations",
+            "1",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in result.output
 
 
 def test_harbor_dispatch_runs_the_population_and_publishes_the_winner(
@@ -560,6 +592,7 @@ def test_harbor_checkpoint_then_resume_completes_and_rejects_conflicts(
             "pi",
             "harbor",
             "--resume",
+            "--yes",
             "--run-dir",
             str(tmp_path / "run"),
             "--root",
@@ -670,6 +703,7 @@ def test_harbor_publication_is_idempotent_across_resumes(
             "pi",
             "harbor",
             "--resume",
+            "--yes",
             "--run-dir",
             str(tmp_path / "run"),
             "--root",
@@ -723,6 +757,7 @@ def test_harbor_seed_ref_resolves_through_the_store_and_resume_pins_it(
             str(tmp_path / "run"),
             "--root",
             str(tmp_path / ".wmo"),
+            "--yes",
         ],
     )
     assert first.exit_code == 0, first.output
@@ -742,6 +777,7 @@ def test_harbor_seed_ref_resolves_through_the_store_and_resume_pins_it(
             "pi@champion",
             "harbor",
             "--resume",
+            "--yes",
             "--run-dir",
             str(tmp_path / "run"),
             "--root",
@@ -797,6 +833,7 @@ def test_harbor_resume_accepts_a_restated_episode_timeout_for_an_e2b_run(
             "pi",
             "harbor",
             "--resume",
+            "--yes",
             "--episode-timeout",
             "120",
             "--run-dir",

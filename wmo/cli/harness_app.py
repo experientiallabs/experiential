@@ -689,8 +689,16 @@ def _optimize_harbor(
         f"{config.attempts} attempt(s), reward mode {config.reward_mode}, "
         f"worker backend {config.backend} (proposer project: E2B) -> {run_dir}"
     )
-    if _console.is_terminal and not yes and not Confirm.ask("Proceed?", default=True):
-        raise typer.Exit(0)
+    if not yes:
+        if not _console.is_terminal:
+            # Consent is said, never inferred (the shared spend-surface rule).
+            _console.print(
+                "non-interactive session: cannot ask for spend consent; re-run with --yes to "
+                "consent explicitly"
+            )
+            raise typer.Exit(2)
+        if not Confirm.ask("Proceed?", default=True):
+            raise typer.Exit(0)
 
     scorer, task_pins = _build_harbor_scorer(config, run_dir=run_dir, provider_config=agent_config)
     if resume:

@@ -793,8 +793,9 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
     run of only those does not need permission to happen.
 
     A non-interactive session cannot answer, so a spending run REFUSES rather than proceeding:
-    consent must be said (`--yes`), never inferred from the absence of a terminal. This is
-    `route sweep`'s own rule, and this command briefly shipped the opposite, which cost a
+    consent must be said (`--yes`), never inferred from the absence of a terminal. Every spend
+    surface (`route sweep`, `optimize distill`, the harbor search) shares this rule; all of
+    them originally shipped proceed-silently-or-note, and the proceed branch here cost a
     scripted caller real money it never agreed to.
 
     Raises:

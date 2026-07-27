@@ -590,22 +590,23 @@ def print_cost_estimate(console: Console, plan: SweepPlan) -> None:
 def _confirm_cost(*, yes: bool) -> None:
     """Confirm the projected spend before any episode runs.
 
-    Every pool entry is priced (`load_pool` refuses an unpriced candidate), so the spend is
-    accountable and `--yes` always applies, the rule `wmo optimize harness --mode distill`
-    uses. A non-interactive session cannot answer a prompt, so it proceeds and says so instead
-    of hanging.
+    Consent is said, never inferred: a non-interactive session cannot answer a prompt, so a
+    spending run REFUSES unless `--yes` was passed. This command shipped proceed-and-note for
+    its first day, and the equivalent branch in `wmo optimize model` spent a scripted caller's
+    real money it never agreed to; every spend surface now shares the refusal.
 
     Raises:
-        typer.Exit: The user declined (exit code 0).
+        typer.Exit: The user declined (exit code 0), or a non-interactive session was not told
+            `--yes` (exit code 2).
     """
     if yes:
         return
     if not _console.is_terminal:
         _console.print(
-            "non-interactive session: proceeding without confirmation (pass --yes to say so "
-            "explicitly)"
+            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
+            "consent explicitly"
         )
-        return
+        raise typer.Exit(2)
     if not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
 

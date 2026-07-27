@@ -1610,17 +1610,18 @@ def test_route_sweep_confirming_at_a_tty_runs_the_sweep(
     assert seams.built_providers == ["cheap-1", "pricey-1", "cheap-1", "pricey-1"]
 
 
-def test_route_sweep_non_interactive_without_yes_says_it_could_not_ask(
+def test_route_sweep_non_interactive_without_yes_refuses_to_spend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No TTY to prompt at and no --yes: every pool entry is priced, so the spend is accountable
-    # and the run proceeds (the distill CLI's rule), but the log has to say that out loud.
+    # No TTY to prompt at and no --yes: consent is said, never inferred. This branch used to
+    # proceed-and-note; the equivalent branch in `optimize model` spent a scripted caller's
+    # real money, so every spend surface now refuses (exit 2) and names the fix.
     _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "1")
-    assert result.exit_code == 0, result.output
-    assert _says(result.output, "non-interactive session: proceeding without confirmation")
-    assert len(OutcomeMatrix.load(out).outcomes) == 2
+    assert result.exit_code == 2, result.output
+    assert _says(result.output, "cannot ask for spend consent")
+    assert not Path(out).exists()  # nothing bought
 
 
 def test_route_sweep_cost_estimate_states_its_assumption(

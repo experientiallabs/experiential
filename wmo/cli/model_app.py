@@ -782,7 +782,17 @@ def _confirm_cost(
         if not Confirm.ask("Proceed with unbounded spend?", default=False):
             raise typer.Exit(0)
         return
-    if console.is_terminal and not yes and not Confirm.ask("Proceed?", default=True):
+    if yes:
+        return
+    if not console.is_terminal:
+        # Consent is said, never inferred: a bounded budget caps the damage but does not
+        # grant permission, and this used to start six-figure-token training runs silently.
+        console.print(
+            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
+            "consent explicitly"
+        )
+        raise typer.Exit(2)
+    if not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
 
 
