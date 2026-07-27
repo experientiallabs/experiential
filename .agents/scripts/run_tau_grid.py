@@ -716,15 +716,22 @@ def slice_plan(base: SweepPlan, scenarios: Sequence[Scenario], out_path: Path) -
 def single_cell_plan(
     base: SweepPlan, pool: ModelPool, scenario: Scenario, out_path: Path
 ) -> SweepPlan:
-    """`base` narrowed to one candidate on one scenario: the retry pass's unit of work."""
+    """`base` narrowed to ONE episode of one candidate on one scenario: the retry's unit of work.
+
+    `episodes` is forced to 1 no matter what the arm runs at. A retry replaces a single failed row,
+    so inheriting `--episodes 2` would buy two episodes and use one, and the discarded one would
+    still be on the bill. The caller stamps the replacement with the failed row's own episode
+    index, which is what keeps the (scenario, model, episode) key it is standing in for.
+    """
     return base.model_copy(
         update={
             "pool": pool,
             "scenarios": (scenario,),
+            "episodes": 1,
             "out_path": out_path,
             "cost_lines": scaled_cost_lines(
                 [line for line in base.cost_lines if line.candidate == pool.models[0].name],
-                1.0 / len(base.scenarios) if base.scenarios else 0.0,
+                1.0 / (len(base.scenarios) * base.episodes) if base.scenarios else 0.0,
             ),
         }
     )
