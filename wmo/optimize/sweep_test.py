@@ -7,6 +7,9 @@ cases are cheaper to state than to stage through a command.
 
 from __future__ import annotations
 
+import json
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +19,7 @@ import pytest
 
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.env.closed_loop import CellKey
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -30,14 +34,25 @@ from wmo.optimize.sweep import (
     plan_sweep,
     preflight_pool,
     resolve_config,
+    resumable_cells,
     unevenness,
 )
-from wmo.providers.base import ProviderConfig, ProviderKind
+from wmo.optimize.sweep_partial import partial_path
+from wmo.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    TokenUsage,
+    VerifyResult,
+)
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from wmo.engine.world_model import WorldModel
     from wmo.env.base import Env
 
@@ -94,13 +109,15 @@ def _plan(
     episodes: int = 1,
     max_steps: int = 4,
     compression: CompressionConfig | None = None,
+    max_concurrency: int = 1,
+    out_name: str = "matrix.json",
 ) -> SweepPlan:
     model_dir = _model_dir(tmp_path)
     return plan_sweep(
         model_dir=model_dir,
         config=resolve_config(model_dir),
         pool=load_pool(_pool_file(tmp_path)),
-        out_path=tmp_path / "matrix.json",
+        out_path=tmp_path / out_name,
         traces_file=None,
         assume_input_tokens=2000,
         assume_output_tokens=250,
@@ -108,6 +125,7 @@ def _plan(
         episodes=episodes,
         max_steps=max_steps,
         compression=compression,
+        max_concurrency=max_concurrency,
     )
 
 
@@ -392,3 +410,274 @@ def test_a_sweep_that_dies_mid_flight_still_accounts_for_what_it_already_spent(
     # session was still opened against the world model and still metered, so leaving it out
     # would under-report what the aborted sweep actually cost.
     assert salvaged.total.cost_usd == pytest.approx(0.13)
+
+
+# --------------------------------------------------------- concurrency, persistence, and resume
+# The three properties a six-hour grid needs from this library: cells overlap, a cell that
+# completed is on disk, and a run that died buys only what is missing.
+
+
+class _DoneProvider:
+    """Candidate provider that finishes the episode on its first call, deterministically."""
+
+    def __init__(self, config: ProviderConfig) -> None:
+        self.config = config
+
+    def complete(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Completion:
+        return Completion(
+            text='{"done": true, "summary": "finished"}',
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+
+    def verify(self) -> VerifyResult:
+        raise NotImplementedError
+
+
+@pytest.fixture
+def candidates(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub candidate construction; returns the list every constructed model id lands in.
+
+    `pool_provider` resolves `get_provider` from its module at call time, which is the seam the
+    CLI tests already use. Counting constructions is how a resume test proves that a skipped cell
+    was not merely overwritten but never ran.
+    """
+    built: list[str] = []
+
+    def _get_provider(config: ProviderConfig, api_key: str | None = None) -> _DoneProvider:
+        built.append(config.model)
+        return _DoneProvider(config)
+
+    monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
+    return built
+
+
+class _SlowEnv(_StubEnv):
+    """A stub env whose episode takes real wall time, so overlap is measurable."""
+
+    def reset(self, task: str | None = None, seed_state: object | None = None) -> EnvState:
+        time.sleep(0.05)
+        return super().reset(task, seed_state)
+
+
+class _ExplodingEnv(_StubEnv):
+    """A stub env that refuses to start: the transport fault a long grid eventually hits."""
+
+    def reset(self, task: str | None = None, seed_state: object | None = None) -> EnvState:
+        raise RuntimeError("world model session refused")
+
+
+def _factory(envs: list[_StubEnv]) -> Callable[[], Env]:
+    """Hand out `envs` in order, safely from several threads."""
+    handed = iter(envs)
+    lock = threading.Lock()
+
+    def build() -> Env:
+        with lock:
+            return cast("Env", next(handed))
+
+    return build
+
+
+def _run_plan(
+    plan: SweepPlan,
+    envs: list[_StubEnv],
+    *,
+    runs_dir: Path,
+    remeasure: frozenset[CellKey] = frozenset(),
+    on_outcome: Callable[[ScenarioOutcome], None] | None = None,
+) -> SweepRun:
+    return execute_sweep(
+        plan,
+        world_model=cast("WorldModel", _FrozenWorldModel()),
+        env_factory=_factory(envs),
+        runs_dir=runs_dir,
+        remeasure=remeasure,
+        on_outcome=on_outcome,
+    )
+
+
+def _sidecar_rows(plan: SweepPlan) -> list[ScenarioOutcome]:
+    """Every row in the sidecar, header skipped, in the order it was written."""
+    lines = partial_path(plan.out_path).read_text(encoding="utf-8").splitlines()
+    return [ScenarioOutcome.model_validate_json(line) for line in lines[1:]]
+
+
+def _comparable(matrix: OutcomeMatrix) -> str:
+    """The matrix as JSON with per-call WALL TIMES dropped, which no two runs can share."""
+    payload = matrix.model_dump(mode="json")
+    for row in payload["outcomes"]:
+        row["call_seconds"] = len(row["call_seconds"])
+    return json.dumps(payload, sort_keys=True)
+
+
+def test_a_cell_is_on_disk_before_the_next_one_starts(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    # The whole crash-safety claim in one assertion: by the time a cell is reported, its row is
+    # already durable, so a kill one microsecond later cannot lose it.
+    plan = _plan(tmp_path, scenarios=3)
+    seen_lines: list[int] = []
+
+    def check(outcome: ScenarioOutcome) -> None:
+        rows = _sidecar_rows(plan)
+        assert rows[-1].scenario_id == outcome.scenario_id
+        seen_lines.append(len(rows))
+
+    run = _run_plan(
+        plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs", on_outcome=check
+    )
+    assert seen_lines == [1, 2, 3]
+    assert len(run.matrix.outcomes) == 3
+    # ...and the sidecar is gone once the matrix it protected exists.
+    assert not partial_path(plan.out_path).exists()
+    assert plan.out_path.is_file()
+
+
+def test_a_crash_keeps_its_paid_cells_and_the_resume_buys_only_the_rest(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    envs = [_StubEnv(0.10), _StubEnv(0.10), _ExplodingEnv(0.10)]
+    with pytest.raises(RuntimeError, match="session refused"):
+        _run_plan(plan, envs, runs_dir=tmp_path / "runs")
+    assert len(_sidecar_rows(plan)) == 2  # the two that completed, not the one that died
+    assert not plan.out_path.exists()  # no matrix: the sweep never finished
+
+    built_before = len(candidates)
+    resumed = _run_plan(_plan(tmp_path, scenarios=3), [_StubEnv(0.10)], runs_dir=tmp_path / "runs")
+    assert len(candidates) - built_before == 1  # ONE cell ran, not three
+    assert resumed.resumed_cells == 2
+    assert len(resumed.matrix.outcomes) == 3
+    assert resumed.episodes_metered == 1  # this attempt's world-model spend, not the last one's
+    assert not partial_path(plan.out_path).exists()
+
+
+def test_a_resumed_run_says_its_world_model_figure_is_this_attempt_only(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    # The earlier attempt persisted its own kind="sweep" record, so adding the two here would
+    # double count; saying which cells this number covers is the honest alternative.
+    plan = _plan(tmp_path, scenarios=2)
+    with pytest.raises(RuntimeError):
+        _run_plan(plan, [_StubEnv(0.10), _ExplodingEnv(0.0)], runs_dir=tmp_path / "runs")
+    resumed = _run_plan(_plan(tmp_path, scenarios=2), [_StubEnv(0.10)], runs_dir=tmp_path / "runs")
+    gap = resumed.metering_gap
+    assert gap is not None and "this attempt only" in gap
+    assert resumed.world_model_usd == pytest.approx(0.10)
+
+
+def test_a_sidecar_from_a_different_plan_is_refused_rather_than_merged(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    # Two arms in one matrix is a fabricated comparison, so the mismatch is fatal and names the
+    # field that changed. Refused BEFORE the spend question too, via `resumable_cells`.
+    plan = _plan(tmp_path, scenarios=3)
+    with pytest.raises(RuntimeError):
+        _run_plan(plan, [_StubEnv(0.10), _ExplodingEnv(0.0)], runs_dir=tmp_path / "runs")
+    changed = _plan(tmp_path, scenarios=3, episodes=2)
+    with pytest.raises(SweepError, match="episodes per cell changed"):
+        resumable_cells(changed)
+    with pytest.raises(SweepError, match="DIFFERENT plan"):
+        _run_plan(changed, [_StubEnv(0.10) for _ in range(6)], runs_dir=tmp_path / "runs")
+
+
+def test_a_remeasured_cell_replaces_its_row_and_the_row_says_so(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    with pytest.raises(RuntimeError, match="session refused"):
+        _run_plan(
+            plan, [_StubEnv(0.10), _StubEnv(0.10), _ExplodingEnv(0.10)], runs_dir=tmp_path / "runs"
+        )
+    retry = CellKey.of(_sidecar_rows(plan)[0])
+    resumed = _run_plan(
+        _plan(tmp_path, scenarios=3),
+        [_StubEnv(0.10), _StubEnv(0.10)],
+        runs_dir=tmp_path / "runs",
+        remeasure=frozenset({retry}),
+    )
+    assert resumed.remeasured_cells == 1
+    assert resumed.resumed_cells == 1  # the other completed cell was still reused
+    rows = {CellKey.of(row).model_dump_json(): row for row in resumed.matrix.outcomes}
+    assert rows[retry.model_dump_json()].remeasured is True
+    assert sum(row.remeasured for row in resumed.matrix.outcomes) == 1
+    assert len(resumed.matrix.outcomes) == 3  # replaced, not appended
+
+
+def test_the_matrix_is_the_same_evidence_at_one_cell_at_a_time_or_four(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    """The control for the whole change: concurrency is a speed knob, not a measurement change.
+
+    Compared with per-call wall times dropped, because those are the one field two runs of
+    anything cannot share. Everything else, including row ORDER, must match exactly, or the
+    matrix digests that `fit` and `tune` identify evidence by would drift with the thread count.
+    """
+    sequential = _run_plan(
+        _plan(tmp_path, scenarios=3, out_name="one.json"),
+        [_StubEnv(0.10) for _ in range(3)],
+        runs_dir=tmp_path / "runs",
+    )
+    concurrent = _run_plan(
+        _plan(tmp_path, scenarios=3, max_concurrency=4, out_name="four.json"),
+        [_StubEnv(0.10) for _ in range(3)],
+        runs_dir=tmp_path / "runs",
+    )
+    assert _comparable(concurrent.matrix) == _comparable(sequential.matrix)
+
+
+def test_concurrent_cells_overlap_and_still_meter_every_session(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    # Four 50ms episodes: sequentially 200ms of wall clock, four at a time one episode's worth.
+    # The metering assertion rides along because the harvest is what the redesign put at risk:
+    # four envs are alive at once, and each one's record must land exactly once.
+    plan = _plan(tmp_path, scenarios=4, max_concurrency=4)
+    started = time.monotonic()
+    run = _run_plan(plan, [_SlowEnv(0.10) for _ in range(4)], runs_dir=tmp_path / "runs")
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.15, f"4 overlapping cells took {elapsed:.3f}s"
+    assert run.episodes_metered == 4 and run.episodes_unmetered == 0
+    assert run.world_model_usd == pytest.approx(0.40)
+    assert run.metering_gap is None
+    assert len(_load_records(tmp_path / "runs")) == 1
+
+
+def _load_records(runs_dir: Path) -> list[RunRecord]:
+    return [
+        RunRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        for path in sorted(runs_dir.glob("*.json"))
+    ]
+
+
+def test_a_plan_identity_changes_with_what_it_measures_and_not_with_how_fast(
+    tmp_path: Path,
+) -> None:
+    base = _plan(tmp_path, scenarios=3)
+    assert _plan(tmp_path, scenarios=3, max_concurrency=8).identity == base.identity
+    assert _plan(tmp_path, scenarios=3, episodes=2).identity != base.identity
+    assert _plan(tmp_path, scenarios=2).identity != base.identity
+    assert (
+        _plan(
+            tmp_path,
+            scenarios=3,
+            compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+        ).identity
+        != base.identity
+    )
+    assert len(base.identity.digest) == 16
+
+
+def test_a_concurrency_below_one_is_refused_at_plan_time(tmp_path: Path) -> None:
+    with pytest.raises(SweepError, match="at least 1"):
+        _plan(tmp_path, max_concurrency=0)

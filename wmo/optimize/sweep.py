@@ -17,25 +17,45 @@ constructed, and so tests can stub both at the CLI module they already patch.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
+import threading
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.config import ArtifactPaths, HarnessConfig, load_config
+from wmo.core.types import Action, EnvState, Observation
 from wmo.engine import split_holdout
-from wmo.env.closed_loop import evaluate_pool
+from wmo.env.closed_loop import (
+    CellKey,
+    PoolCell,
+    ScoringEnv,
+    pool_cells,
+    run_cells,
+    scenario_id,
+)
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
 from wmo.ingest import get_adapter
-from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression import CompressionConfig, compression_signature
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.sweep_partial import (
+    PartialSweepError,
+    PartialWriter,
+    PlanIdentity,
+    partial_path,
+    read_partial,
+)
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, load_pool, prepare_pool_provider
 from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
@@ -45,6 +65,8 @@ if TYPE_CHECKING:
     from wmo.core.types import Trace
     from wmo.engine.world_model import WorldModel
     from wmo.env.base import Env
+
+logger = logging.getLogger(__name__)
 
 
 class SweepError(ValueError):
@@ -128,6 +150,10 @@ class SweepPlan(BaseModel):
     # runs: it decides what the rewards MEAN, so two matrices swept under different compressors
     # are different evidence, and a resumed run whose compressor changed must re-measure.
     compression: CompressionConfig | None = None
+    # How many cells run at once. NOT part of the plan's identity: it changes how long the
+    # measurement takes, never what a cell measures, so a run resumed at a different value
+    # continues the same cohort rather than re-buying it. 1 is the sequential default.
+    max_concurrency: int = Field(default=1, ge=1)
     trace_count: int  # traces the corpus ingested, which is what decides `tiny_corpus`
     tiny_corpus: bool  # too small for a held-out band, so the scenarios are not leak-free
     assume_input_tokens: int
@@ -143,6 +169,25 @@ class SweepPlan(BaseModel):
     def total_usd(self) -> float:
         """The projected candidate-side spend (a projection, never a measurement)."""
         return sum(line.usd for line in self.cost_lines)
+
+    @property
+    def identity(self) -> PlanIdentity:
+        """What this plan MEASURES, as the value a resumed run is checked against.
+
+        Everything a matrix's rows depend on for comparability: which candidates at which prices,
+        which scenario cut, how many episodes of how many steps, how much of each observation the
+        agent saw, and which compression arm. Two plans that agree here produce rows that belong
+        in one matrix; two that disagree produce two arms, and merging them would be a fabricated
+        comparison. `identity.digest` is the short form for stamping into logs and artifacts.
+        """
+        return PlanIdentity(
+            pool=_pool_digest(self.pool),
+            scenarios=tuple(scenario_id(scenario) for scenario in self.scenarios),
+            episodes=self.episodes,
+            max_steps=self.max_steps,
+            history_chars=self.history_chars,
+            compression=compression_signature(self.compression),
+        )
 
 
 def resolve_config(model_dir: Path) -> HarnessConfig:
@@ -229,6 +274,7 @@ def plan_sweep(
     assume_output_tokens: int,
     history_chars: int = DEFAULT_HISTORY_CHARS,
     compression: CompressionConfig | None = None,
+    max_concurrency: int = 1,
 ) -> SweepPlan:
     """Cut the held-out scenario set and project the spend, without touching the filesystem.
 
@@ -236,10 +282,20 @@ def plan_sweep(
     and a corpus that carries no task prompt are both boundary errors, raised before a caller
     asks its operator to authorize anything.
 
+    `max_concurrency` is how many cells the sweep runs at once (1 = sequential). It is on the
+    PLAN because an operator confirms the plan, and how hard a run leans on a provider's rate
+    limit is something they should see before they say yes; it is not part of the plan's identity,
+    because it changes nothing about what a cell measures.
+
     Raises:
-        SweepError: The destination is unwritable, the corpus is missing or unreadable, or the
-            held-out band carries no task prompt to measure.
+        SweepError: The destination is unwritable, the corpus is missing or unreadable, the
+            held-out band carries no task prompt to measure, or `max_concurrency` is below 1.
     """
+    if max_concurrency < 1:
+        raise SweepError(
+            f"--concurrency must be at least 1, got {max_concurrency}: 1 runs the cells one at "
+            "a time, higher runs that many at once"
+        )
     _check_out_writable(out_path)
     traces = _corpus_traces(model_dir, config.trace_adapter, traces_file)
     train, holdout, tiny_corpus = split_holdout(
@@ -264,6 +320,7 @@ def plan_sweep(
         tools_hint=tools_hint_from_traces(train) or None,
         history_chars=history_chars,
         compression=compression,
+        max_concurrency=max_concurrency,
         trace_count=len(traces),
         tiny_corpus=tiny_corpus,
         assume_input_tokens=assume_input_tokens,
@@ -306,6 +363,12 @@ class SweepRun(BaseModel):
     episodes_metered: int  # episodes whose world-model session reported usage
     episodes_unmetered: int  # episodes whose env exposed none (see `metering_gap`)
     usage_path: Path | None  # where the kind="sweep" record was persisted, if it was
+    # Cells this attempt did NOT run because an earlier attempt already had (see the resume
+    # contract in `execute_sweep`). Zero for a sweep that measured its whole grid.
+    resumed_cells: int = 0
+    # Cells this attempt measured AGAIN on the caller's instruction, after an earlier attempt
+    # produced a row it did not want to keep.
+    remeasured_cells: int = 0
 
     @property
     def world_model_usd(self) -> float:
@@ -317,18 +380,32 @@ class SweepRun(BaseModel):
         """Why the world-model figure is not the whole sweep, or None when it covers every cell.
 
         A caller prints this INSTEAD of the number when nothing was metered: a $0.00 that means
-        "not measured" is the kind of zero the numbers-honesty rule exists to forbid.
+        "not measured" is the kind of zero the numbers-honesty rule exists to forbid. A resumed
+        run reports the same way for a different reason: its number is real, but it covers only
+        the cells THIS attempt ran, and the earlier attempt persisted its own record.
         """
         if self.episodes_unmetered == 0:
-            return None
+            return self._resume_note
         if self.episodes_metered == 0:
             return (
                 "not measured: the env this sweep ran on exposes no usage record, so the world "
                 "model's own serve and judge cost is unknown rather than zero"
             )
-        return (
+        partial = (
             f"partial: {self.episodes_metered} of "
             f"{self.episodes_metered + self.episodes_unmetered} episode(s) reported usage"
+        )
+        note = self._resume_note
+        return f"{partial}; {note}" if note else partial
+
+    @property
+    def _resume_note(self) -> str | None:
+        """How a resume narrows what the world-model figure covers, or None when it did not."""
+        if self.resumed_cells == 0:
+            return None
+        return (
+            f"this attempt only: {self.resumed_cells} cell(s) came from the earlier attempt, "
+            "whose own world-model spend is in its own run record"
         )
 
 
@@ -339,53 +416,89 @@ def execute_sweep(
     env_factory: Callable[[], Env],
     on_outcome: Callable[[ScenarioOutcome], None] | None = None,
     runs_dir: Path | None = None,
+    remeasure: frozenset[CellKey] = frozenset(),
 ) -> SweepRun:
     """Run every cell of `plan` against a FROZEN world model, write the matrix, meter both sides.
 
     Frozen for the whole sweep (the `wmo.evals.closed_loop` precedent): without it a candidate's
     PREDICTED steps enter the shared retrieval buffer and become demos for the next candidate, so
-    the comparison this matrix exists to make would depend on sweep order.
+    the comparison this matrix exists to make would depend on sweep order. Freezing is also what
+    makes concurrent cells safe: the shared retrieval index is read-only for the whole run, so
+    parallel episodes cannot race to write it (see `plan.max_concurrency`).
 
     `env_factory` must build an env that scores on close (`score_on_close=True`): a matrix
-    without verified rewards is not evidence, and `evaluate_pool` refuses one that does not score.
+    without verified rewards is not evidence, and a cell refuses an env that does not score. It
+    is called once per CELL, on the worker thread running that cell, so it must be safe to call
+    from several threads (`WorldModelEnv` is: each env owns its own world-model session).
+
+    NOTHING IS LOST TO A CRASH. Every cell is appended to `<out>.partial.jsonl` the moment it
+    completes, and a later call with the same plan measures only the cells that file does not
+    already hold. A sidecar whose rows were measured under a different plan is refused rather
+    than merged (`SweepPlan.identity`). The sidecar is removed once the matrix is written, so a
+    finished sweep leaves exactly the artifact it always left.
 
     The world model opens one metered session per episode and `WorldModelEnv.close` leaves that
     session's final `RunRecord` on the env. Those records used to die with the env: the sweep
     said the simulator's cost was "metered separately" and then nothing anywhere persisted it, so
-    the eval-infrastructure half of a sweep's bill was unaccountable. They are harvested here and
-    rolled into ONE `kind="sweep"` record under `runs_dir`, beside the build and serve records the
-    same directory already holds.
+    the eval-infrastructure half of a sweep's bill was unaccountable. They are harvested here as
+    each env closes and rolled into ONE `kind="sweep"` record under `runs_dir`, beside the build
+    and serve records the same directory already holds. A RESUMED run records only what IT spent;
+    the attempt that bought the earlier cells wrote its own record, so nothing is double counted
+    and `metering_gap` says the figure covers this attempt alone.
 
     Args:
         plan: What to measure, from `plan_sweep`.
         world_model: The model to freeze and measure against.
-        env_factory: Builds one scoring env per episode.
-        on_outcome: Per-cell progress callback.
+        env_factory: Builds one scoring env per episode; called per cell, from worker threads.
+        on_outcome: Per-cell progress callback, fired from the worker thread that finished the
+            cell and serialized so two cells never interleave inside it.
         runs_dir: Where to persist the run record. Defaults to the model's own `runs/`; pass a
             path to redirect it, and nothing is written when the sweep metered no session at all.
+        remeasure: Cells to buy again even though the sidecar already holds them, for a retry
+            pass over cells an earlier attempt lost to a transient fault. Their new rows carry
+            `remeasured=True` and replace the earlier ones.
+
+    Raises:
+        SweepError: The sidecar beside `out_path` belongs to a different plan, or is damaged.
     """
+    resumed = _resume(plan, remeasure)
     harvest = _SessionHarvest(env_factory)
     destination = runs_dir or ArtifactPaths(plan.model_dir).runs
+    measured: list[ScenarioOutcome] = []
+
+    def persist(outcome: ScenarioOutcome) -> None:
+        """Bank one measured cell durably, then let the caller's progress display have it.
+
+        Called under the one lock `run_cells` serializes its callback with, which is why the
+        writer needs no lock of its own and why the log's order is the completion order.
+        """
+        resumed.writer.append(outcome)
+        if on_outcome is not None:
+            on_outcome(outcome)
+
     try:
         with world_model.frozen():
-            matrix = evaluate_pool(
+            measured = run_cells(
+                resumed.pending,
                 harvest,
-                plan.pool,
-                list(plan.scenarios),
-                episodes_per_scenario=plan.episodes,
                 max_steps=plan.max_steps,
                 tools_hint=plan.tools_hint,
                 history_chars=plan.history_chars,
-                on_outcome=on_outcome,
+                on_outcome=persist,
                 compression=plan.compression,
+                max_concurrency=plan.max_concurrency,
             )
     finally:
-        # `evaluate_pool` can raise (a provider that fails to build, an env that does not score),
-        # and the episodes it already ran were still paid for on the world model's side. Persisting
-        # the harvest here keeps that spend accountable instead of dying with the exception; the
-        # candidate-side matrix is lost either way, because there is no matrix to save.
+        # A cell can raise (a provider that fails to build, an env that does not score), and the
+        # episodes that already ran were still paid for on the world model's side. Persisting the
+        # harvest here keeps that spend accountable instead of dying with the exception; the
+        # candidate-side rows survive in the sidecar, which is what the next run resumes from.
         usage, usage_path = _persist_harvest(harvest, destination)
+        resumed.writer.close()
+    matrix = OutcomeMatrix(pool=plan.pool.models, outcomes=_assemble(plan, resumed.rows, measured))
     matrix.save(plan.out_path)
+    # Only now: while the matrix was unwritten the sidecar was the only copy of these cells.
+    resumed.writer.discard()
     return SweepRun(
         matrix=matrix,
         candidate_usd=sum(
@@ -396,12 +509,119 @@ def execute_sweep(
         episodes_metered=len(harvest.records),
         episodes_unmetered=harvest.unmetered,
         usage_path=usage_path,
+        resumed_cells=len(resumed.rows),
+        remeasured_cells=sum(1 for cell in resumed.pending if cell.remeasured),
     )
+
+
+@dataclass(frozen=True)
+class _Resume:
+    """What an earlier attempt at this plan left behind, and what is therefore left to run.
+
+    A dataclass rather than a model because it carries an OPEN FILE: the sidecar writer is a live
+    resource with a lifetime, not validated data to persist.
+    """
+
+    rows: dict[str, ScenarioOutcome]  # surviving row per reused cell, keyed by CellKey JSON
+    pending: list[PoolCell]  # cells this attempt must measure, in canonical order
+    writer: PartialWriter
+
+
+def _resume(plan: SweepPlan, remeasure: frozenset[CellKey]) -> _Resume:
+    """Read the sidecar, decide which cells still need buying, and open the log for appending.
+
+    A row is reused when the sidecar holds it AND the caller did not ask for that cell again.
+    Unscored rows are reused too: the cell ran, the episode was paid for, and its `error` is the
+    diagnosis. Re-running it is a decision the caller makes with `remeasure`, not one a resume
+    makes silently on their behalf and their budget.
+
+    Raises:
+        SweepError: The sidecar belongs to a different plan, or cannot be read.
+    """
+    path = partial_path(plan.out_path)
+    identity = plan.identity
+    try:
+        rows = read_partial(path, identity)
+        writer = PartialWriter(path, identity)
+    except PartialSweepError as exc:
+        raise SweepError(str(exc)) from exc
+    except OSError as exc:
+        raise SweepError(f"cannot write the partial sweep log at {path}: {exc}") from exc
+    reusable: dict[str, ScenarioOutcome] = {}
+    for row in rows:  # append-only log: a later row for a cell supersedes an earlier one
+        key = CellKey.of(row)
+        if key not in remeasure:
+            reusable[key.model_dump_json()] = row
+    pending: list[PoolCell] = []
+    for cell in pool_cells(plan.pool, list(plan.scenarios), episodes_per_scenario=plan.episodes):
+        if cell.key.model_dump_json() in reusable:
+            continue
+        pending.append(cell.model_copy(update={"remeasured": cell.key in remeasure}))
+    if reusable:
+        logger.info(
+            "resuming sweep %s: %d cell(s) already measured, %d to go",
+            identity.digest,
+            len(reusable),
+            len(pending),
+        )
+    return _Resume(rows=reusable, pending=pending, writer=writer)
+
+
+def _assemble(
+    plan: SweepPlan, reused: dict[str, ScenarioOutcome], measured: list[ScenarioOutcome]
+) -> list[ScenarioOutcome]:
+    """The matrix's rows in canonical cell order, whatever order they were measured in.
+
+    Deterministic ORDER, not just deterministic content: `fit` and `tune` identify a matrix by the
+    sha256 of its bytes, so a matrix whose rows follow finish time would get a different digest
+    every run and every artifact stamped with it would look like new evidence. Sorting by cell
+    position (rather than, say, by scenario id) also means a concurrent sweep and a sequential one
+    of the same plan produce the same file, byte for byte.
+    """
+    fresh = {CellKey.of(outcome).model_dump_json(): outcome for outcome in measured}
+    ordered: list[ScenarioOutcome] = []
+    for cell in pool_cells(plan.pool, list(plan.scenarios), episodes_per_scenario=plan.episodes):
+        key = cell.key.model_dump_json()
+        # This attempt's row wins over a reused one: a remeasured cell is measured precisely to
+        # replace what the sidecar holds. A cell in neither is one no attempt has run, which the
+        # matrix simply omits (the coverage contract is what judges the hole).
+        row = fresh.get(key, reused.get(key))
+        if row is not None:
+            ordered.append(row)
+    return ordered
+
+
+def resumable_cells(plan: SweepPlan) -> int:
+    """How many of `plan`'s cells a previous attempt already measured and left in the sidecar.
+
+    Called BEFORE the spend confirmation, so a resumed run can say how much of the projected cost
+    it is not going to pay again, and so a sidecar that belongs to a different plan is refused
+    while refusing is still free. Zero when there is nothing to resume.
+
+    Raises:
+        SweepError: The sidecar beside the plan's `out_path` belongs to a different plan, or is
+            damaged. Same message the run itself would raise, delivered before the money question.
+    """
+    try:
+        rows = read_partial(partial_path(plan.out_path), plan.identity)
+    except PartialSweepError as exc:
+        raise SweepError(str(exc)) from exc
+    return len({CellKey.of(row).model_dump_json() for row in rows})
+
+
+def _pool_digest(pool: ModelPool) -> str:
+    """A digest of the candidate roster: which models, at which prices, in which order.
+
+    The whole entry, not just the name: a matrix's rows are priced by their pool entry, so an
+    edited price makes an old row's `cost_usd` a different number than the same cell would get
+    today, and resuming across that edit would mix two price regimes into one comparison.
+    """
+    payload = "\n".join(entry.model_dump_json() for entry in pool.models)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _persist_harvest(harvest: _SessionHarvest, runs_dir: Path) -> tuple[RunRecord, Path | None]:
     """Roll the harvested sessions into one record and write it, unless nothing was metered."""
-    harvest.finish()
     usage = merge_run_records(
         harvest.records,
         run_id=f"sweep-{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}",
@@ -417,37 +637,75 @@ SWEEP_RUN_KIND = "sweep"
 class _SessionHarvest:
     """An `env_factory` wrapper that collects each episode's world-model usage as it completes.
 
-    Harvesting on the NEXT call (and once more at `finish`) rather than holding every env is
-    deliberate: `run_episode` closes its env before `evaluate_pool` asks for the next one, so the
-    previous env's record is already final by then, and a sweep of thousands of cells keeps one
-    env alive at a time instead of all of them.
+    Harvest happens at each env's OWN close, which is the only rule that survives concurrency.
+    The previous design banked the last env's record when the next env was requested, on the
+    assumption that exactly one env is alive at a time; with cells running in parallel that
+    assumption is false in both directions (several envs are open at once, and the next request
+    comes from a different thread than the one that finished), and the records would be attributed
+    to the wrong episodes or dropped entirely. Wrapping the env instead needs no bookkeeping at
+    all: the record is final exactly when `close` returns, and that is where it is taken.
 
-    An env that exposes no usage is counted, not guessed at. `evaluate_pool` accepts any `Env`,
-    and a caller who supplies a non-metering one gets a stated gap rather than a fabricated $0.
+    An env that exposes no usage is counted, not guessed at. A cell accepts any `Env`, and a
+    caller who supplies a non-metering one gets a stated gap rather than a fabricated $0.
     """
 
     def __init__(self, inner: Callable[[], Env]) -> None:
         self._inner = inner
-        self._open: Env | None = None
+        self._lock = threading.Lock()
         self.records: list[RunRecord] = []
         self.unmetered = 0
 
     def __call__(self) -> Env:
-        """Build the next episode's env, banking the previous one's record first."""
-        self.finish()
-        self._open = self._inner()
-        return self._open
+        """Build one cell's env, wrapped so its record is banked when the cell closes it."""
+        return cast("Env", _HarvestedEnv(self._inner(), self))
 
-    def finish(self) -> None:
-        """Take the record off the env that just finished, if it kept one."""
-        if self._open is None:
-            return
-        env, self._open = self._open, None
+    def bank(self, env: Env) -> None:
+        """Take the final record off a closed env, or count it as unmetered."""
         record = getattr(env, "usage", None)
-        if isinstance(record, RunRecord):
-            self.records.append(record)
-        else:
-            self.unmetered += 1
+        with self._lock:
+            if isinstance(record, RunRecord):
+                self.records.append(record)
+            else:
+                self.unmetered += 1
+
+
+class _HarvestedEnv:
+    """One cell's env, which banks its world-model usage into the harvest when it closes.
+
+    Everything delegates. `last_score` in particular must propagate its own failures verbatim,
+    since a cell reads it defensively and tells a missing attribute (a non-scoring env, fatal)
+    apart from a raised one (a throttled judge, this cell only).
+    """
+
+    def __init__(self, inner: Env, harvest: _SessionHarvest) -> None:
+        self._inner = inner
+        self._harvest = harvest
+        self._banked = False
+
+    def reset(self, task: str | None = None, seed_state: EnvState | None = None) -> EnvState:
+        return self._inner.reset(task=task, seed_state=seed_state)
+
+    def step(self, action: Action) -> Observation:
+        return self._inner.step(action)
+
+    def close(self) -> None:
+        """Close the episode, then bank its record. Idempotent, as the `Env` contract requires."""
+        try:
+            self._inner.close()
+        finally:
+            if not self._banked:
+                self._banked = True
+                self._harvest.bank(self._inner)
+
+    @property
+    def last_score(self) -> EpisodeScore:
+        scoring = cast("ScoringEnv", self._inner)
+        return scoring.last_score
+
+    @property
+    def usage(self) -> RunRecord | None:
+        record = getattr(self._inner, "usage", None)
+        return record if isinstance(record, RunRecord) else None
 
 
 class CandidateCoverage(BaseModel):
