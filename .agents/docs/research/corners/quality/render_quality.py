@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
 import data  # noqa: E402
 import palette  # noqa: E402
 import stats  # noqa: E402
+import teacher_view  # noqa: E402
 from matplotlib import pyplot as plt  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,86 @@ def render_quality_vs_anchor() -> Path | None:
     return out
 
 
+def render_teacher_verdict() -> Path | None:
+    """The teacher-search verdict table as a figure: the distill go/no-go made visible.
+
+    Per-model paired gain over the cheapest candidate on the identity arm, CI-guarded with
+    the shared verdict rule. Renders from pre-retry chunks when only those exist, with
+    completeness labeled. Computation handoff contract: common/teacher_view.py docstring
+    (wmo.optimize.teacher on jt/teacher-gate replaces it when it lands).
+    """
+    snapshot = data.load_arm_snapshot(data.IDENTITY_ARM)
+    if snapshot is None:
+        logger.info("teacher-verdict pending: identity arm has no matrix or chunks yet")
+        return None
+    rows = teacher_view.teacher_verdict_rows(snapshot.matrix)
+
+    palette.apply_style()
+    fig, ax = plt.subplots(figsize=(9, 1.6 + 0.42 * len(rows)))
+    ax.axvspan(
+        -stats.NOISE_FLOOR_REWARD,
+        stats.NOISE_FLOOR_REWARD,
+        color=palette.NOISE_BAND_COLOR,
+        alpha=palette.NOISE_BAND_ALPHA,
+        zorder=0,
+    )
+    ax.axvline(0, color=palette.MUTED, linewidth=0.8)
+    for y, row in enumerate(reversed(rows)):
+        color = palette.BLUE if row.verdict == "headroom" else palette.MUTED
+        ax.errorbar(
+            [row.delta.mean_delta],
+            [y],
+            xerr=[
+                [row.delta.mean_delta - row.delta.ci_low],
+                [row.delta.ci_high - row.delta.mean_delta],
+            ],
+            color=color,
+            marker="D",
+            markersize=6,
+            capsize=3,
+            linewidth=1.8,
+        )
+        cost = (
+            f"${row.cost_per_completed_task_usd:.2f}/task"
+            if row.cost_per_completed_task_usd is not None
+            else "cost undefined (nothing completed)"
+        )
+        ax.annotate(
+            f"{row.verdict} | {cost}",
+            (1.01, y),
+            xycoords=("axes fraction", "data"),
+            fontsize=8,
+            color=palette.INK if row.verdict == "headroom" else palette.MUTED,
+            va="center",
+        )
+    ax.set_yticks(
+        range(len(rows) - 1, -1, -1),
+        [f"{row.model}  ({row.mean_reward:.3f})" for row in rows],
+        fontsize=9,
+    )
+    ax.set_xlabel(
+        f"paired per-scenario reward gain over the cheapest candidate ({rows[0].baseline})"
+    )
+    ax.set_title("Teacher search: who has headroom worth distilling (CI-guarded)")
+    ax.grid(axis="y", visible=False)
+    palette.footnote(
+        fig,
+        f"wm_simulated, identity arm ({snapshot.status}); WM verifier per grid cohort pins; "
+        f"noise floor +-0.02 shaded; 'headroom' needs a CI excluding zero AND a mean past the "
+        f"floor. Baseline = cheapest by effective cost per completed task (proxies the student "
+        f"tier until student cells merge; cycle-1's lesson: a 1.6pt teacher gap distills "
+        f"nothing). Verdict via corners/common until wmo.optimize.teacher (jt/teacher-gate) "
+        f"lands, then this figure renders the repo function's table.",
+        y=-0.1,
+    )
+    out = FIGURES / "teacher-verdict.png"
+    palette.save_fig(fig, out)
+    out.with_suffix(".json").write_text(
+        "[" + ",".join(row.model_dump_json() for row in rows) + "]", encoding="utf-8"
+    )
+    return out
+
+
 def main() -> None:
     """Render every quality topline figure whose data has landed; log what is pending."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -307,6 +388,9 @@ def main() -> None:
     anchor_fig = render_quality_vs_anchor()
     if anchor_fig is not None:
         logger.info("rendered %s", anchor_fig)
+    teacher_fig = render_teacher_verdict()
+    if teacher_fig is not None:
+        logger.info("rendered %s", teacher_fig)
 
 
 if __name__ == "__main__":

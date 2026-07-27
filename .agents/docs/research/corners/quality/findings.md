@@ -67,7 +67,20 @@ lengthening episodes, so the quality cost of compression on tau must be read joi
 effective cost, never per-token savings. The truncate arm here is a ratio-matched control
 (achieved keep 0.5656, aggressiveness 0.33), not a product lever.
 
-## 6. Negative results kept
+## 6. Teacher search: the distill go/no-go, rendered from the same matrices (pending grid)
+
+The teacher-search verdict is becoming a repo function (`wmo.optimize.teacher`, branch
+jt/teacher-gate) over the same matrices this corner charts. `figures/teacher-verdict.png`
+(renders when the identity arm lands, from pre-retry chunks with completeness labeled) shows
+every candidate's PAIRED gain over the cheapest candidate, CI-guarded by the shared verdict
+rule: "headroom" needs a CI excluding zero and a mean past the noise floor. The baseline
+proxies the student tier until student cells merge (then it becomes the student itself).
+Cycle-1 is the motivating negative result: a 1.6-point teacher gap distills nothing, and this
+figure is that lesson applied BEFORE spend. Handoff contract in `../common/teacher_view.py`:
+when the repo function lands, the corners computation is replaced by rendering its verdict
+artifact, and any disagreement between the two is a bug, not a second opinion.
+
+## 7. Negative results kept
 
 - Cycle-1 warmup distillation: gate rejected, adapter unpromoted, see finding 1.
 - The +-0.015 to 0.02 noise floor applies to every paired delta on 20-scenario samples;
