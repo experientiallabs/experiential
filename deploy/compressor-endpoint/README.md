@@ -222,9 +222,14 @@ and commit the refreshed `compressor-cert.pem`.
 `server.py` refuses to start without both `--ssl-certfile` and `--ssl-keyfile`. Uvicorn treats
 missing SSL arguments as "serve plaintext", so a typo in the unit file would otherwise
 downgrade a process bound to `0.0.0.0` while it still looked healthy, sending the reusable
-bearer token in cleartext on every request. There is an escape hatch for local experiments,
-`--insecure-dev-no-tls`, named so nobody types it by accident; it logs a loud warning for the
-life of the process.
+bearer token in cleartext on every request.
+
+There is an escape hatch for local experiments, `--insecure-dev-no-tls`, named so nobody types
+it by accident. It escapes TLS, not the network boundary: it is refused unless `--host` is a
+loopback address, because combining it with the `0.0.0.0` default would publish cleartext
+bearer tokens on every interface, which is worse than the failure the TLS requirement exists to
+prevent. So `--insecure-dev-no-tls --host 127.0.0.1` works and logs a loud warning for the life
+of the process; `--insecure-dev-no-tls` alone exits with the remedy.
 
 ### Security posture
 

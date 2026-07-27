@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import re
@@ -449,6 +450,20 @@ def build_app(compressor: LLMLingua2FixedThreshold, token: str, self_test: str) 
     return app
 
 
+def _is_loopback(host: str) -> bool:
+    """Whether `host` can only be reached from this machine.
+
+    Unresolvable or wildcard hosts are NOT loopback: the answer gates a plaintext bind, so
+    anything this function cannot prove is local is treated as remote.
+    """
+    if host in ("localhost", "localhost.", ""):
+        return host != ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def main() -> None:
     """Load the model, prove the invariants, then serve over TLS."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -463,8 +478,9 @@ def main() -> None:
         "--insecure-dev-no-tls",
         action="store_true",
         help=(
-            "Serve plaintext HTTP. Every request then carries a reusable bearer token in "
-            "cleartext. Local experiments only, never on a box reachable from the network."
+            "Serve plaintext HTTP, and only on a loopback address. Every request then carries "
+            "a reusable bearer token in cleartext, so this is for local experiments; it is "
+            "refused unless --host is a loopback address."
         ),
     )
     args = parser.parse_args()
@@ -486,6 +502,19 @@ def main() -> None:
             "(bootstrap.sh generates them at /nvme/work/wmo-compressor/tls/). Every request "
             "carries a reusable bearer token, so plaintext would expose it to anyone on the "
             "path. Pass --insecure-dev-no-tls only for a local experiment on a loopback bind."
+        )
+    # The escape hatch escapes TLS, not the network boundary. Without this, the flag combined
+    # with the default --host 0.0.0.0 would publish cleartext bearer tokens on every interface,
+    # which is a worse posture than the one the TLS requirement above exists to prevent. The
+    # loopback restriction is enforced rather than documented, because "for local experiments"
+    # in a help string is not a control.
+    if args.insecure_dev_no_tls and not _is_loopback(args.host):
+        raise SystemExit(
+            f"--insecure-dev-no-tls refuses to bind {args.host}: plaintext is allowed only on a "
+            "loopback address, otherwise a reusable bearer token goes out in cleartext on every "
+            "reachable interface for anyone on the path to read and replay. Pass "
+            "`--host 127.0.0.1` for a local experiment, or serve TLS with --ssl-certfile and "
+            "--ssl-keyfile."
         )
     if args.insecure_dev_no_tls:
         log.warning(
