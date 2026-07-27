@@ -39,11 +39,22 @@ Discipline inherited from the surrounding code, and where this module deliberate
   seconds per task are the pair an operator reasons about; a per-call p95 cannot be compared
   against a per-task cost.
 
+A rung is a CONFIG evaluated offline against one existing matrix, never a rerun: a single-model
+arm selects its rows with `rows_for_model`, and a routed arm replays its policy's own choices
+with `rows_for_policy`. Buy the matrix once, then every rung is a lookup.
+
 Call site (the joint tau-bench ablation ladder):
 
     tau = ConditionLabel(
         dataset="tau-bench-retail", split="test", judge="tau2-verifier",
         provenance="real_episode", base_model="qwen3-8b", optimizer="none",
+    )
+    plus_routing = Arm(
+        name="+routing",
+        condition=tau.replace(optimizer="distill+routing"),
+        rows=rows_for_policy(matrix, champion_policy),
+        overheads=router_overheads,
+        dial_position=0.25,
     )
     ladder = build_ladder(
         "joint-tau",
@@ -66,9 +77,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wmo.optimize.knn import CostQualityAnchor
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.routing import route_scenarios
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from wmo.optimize.policy import RoutingPolicy
+    from wmo.providers.base import Embedder
 
 # Whether an arm's numbers came from episodes against a world-model simulation or against the
 # real environment. Mixing the two in one comparison is the single easiest way to publish a
@@ -366,6 +381,42 @@ def rows_for_model(matrix: OutcomeMatrix, model: str) -> list[ScenarioOutcome]:
     if model not in names:
         raise KeyError(f"no pool model named '{model}' in this matrix; available: {names}")
     return [o for o in matrix.outcomes if o.model == model]
+
+
+def rows_for_policy(
+    matrix: OutcomeMatrix,
+    policy: RoutingPolicy,
+    *,
+    ids: Sequence[str] | None = None,
+    embedder: Embedder | None = None,
+) -> list[ScenarioOutcome]:
+    """The rows a routing policy's own choices select: how a routed ladder rung is built.
+
+    Replays the policy through `wmo.optimize.routing.route_scenarios`, the shared offline replay
+    that `evaluate_policy` also scores through, and takes each scenario's rows for the model the
+    policy chose. A rung is therefore a POLICY CONFIG evaluated offline against an existing
+    matrix: no episode is rerun, and the routed arm is measured on exactly the rows the pool
+    already produced.
+
+    Args:
+        matrix: the precomputed pool x scenario grid.
+        policy: the routing policy this rung represents.
+        ids: which scenarios to route, defaulting to every scenario in the matrix.
+        embedder: one embedder for the whole replay (an azure spec otherwise builds an HTTP
+            client per call). Must be the function `policy.embedder` describes.
+
+    Note:
+        This is the one function in this module that can touch the network, since a non-static
+        policy embeds its queries. Single-model arms via `rows_for_model` stay pure.
+    """
+    wanted = list(ids) if ids is not None else matrix.scenario_ids()
+    decisions = route_scenarios(policy, matrix, wanted, embedder=embedder)
+    return [
+        row
+        for scenario_id, decision in decisions.items()
+        for row in matrix.for_scenario(scenario_id)
+        if row.model == decision.model
+    ]
 
 
 def effective_cost_per_completed_task(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmo.optimize.scorecard import (
     Arm,
     CompletionRule,
@@ -18,9 +19,11 @@ from wmo.optimize.scorecard import (
     build_scorecard,
     effective_cost_per_completed_task,
     rows_for_model,
+    rows_for_policy,
 )
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
+from wmo.retrieval.embedders import HashingEmbedder
 
 _BASE = ConditionLabel(
     base_model="qwen3-8b",
@@ -513,6 +516,92 @@ def test_rows_for_model_selects_one_pool_model_and_names_a_bad_handle() -> None:
     assert [o.scenario_id for o in rows_for_model(matrix, "student")] == ["s1", "s2"]
     with pytest.raises(KeyError, match="no pool model named 'ghost'"):
         rows_for_model(matrix, "ghost")
+
+
+def _routing_matrix() -> OutcomeMatrix:
+    return OutcomeMatrix(
+        pool=[
+            PoolEntry(
+                name="cheap",
+                kind=ProviderKind.OPENAI,
+                model="custom-cheap",
+                tier="open",
+                input_per_mtok=0.1,
+                output_per_mtok=0.2,
+            ),
+            PoolEntry(name="strong", kind=ProviderKind.ANTHROPIC, model="claude-fable-5"),
+        ],
+        outcomes=[
+            _row("s1", "cheap", reward=0.2, cost=0.001),
+            _row("s1", "strong", reward=1.0, cost=0.050),
+            _row("s2", "cheap", reward=1.0, cost=0.001),
+            _row("s2", "strong", reward=1.0, cost=0.050),
+        ],
+    )
+
+
+def test_rows_for_policy_selects_the_rows_the_policy_would_have_routed_to() -> None:
+    matrix = _routing_matrix()
+    embedder = HashingEmbedder(dim=64)
+    sql, prose = embedder.embed(["task for s1", "task for s2"])
+    policy = RoutingPolicy(
+        kind="rank",
+        default_model="cheap",
+        pool=matrix.pool,
+        embedder=EmbedderSpec(dim=64),
+        top_k_clusters=1,
+        clusters=[
+            ClusterRanking(cluster_id=0, label="hard", centroid=sql, ranking=["strong", "cheap"]),
+            ClusterRanking(cluster_id=1, label="easy", centroid=prose, ranking=["cheap", "strong"]),
+        ],
+    )
+    rows = rows_for_policy(matrix, policy, embedder=embedder)
+
+    # s1 routes to strong, s2 to cheap: one row per scenario, from the model actually chosen.
+    assert [(r.scenario_id, r.model) for r in rows] == [("s1", "strong"), ("s2", "cheap")]
+    # The routed mix beats either single model on effective cost: it buys the expensive model
+    # only where the cheap one fails.
+    routed = effective_cost_per_completed_task(rows)
+    assert routed.n_completed == 2
+    assert routed.cost_per_completed_task_usd == pytest.approx(0.0255)
+    assert effective_cost_per_completed_task(
+        rows_for_model(matrix, "strong")
+    ).cost_per_completed_task_usd == pytest.approx(0.050)
+
+
+def test_rows_for_policy_honors_a_static_policy_and_an_id_subset() -> None:
+    matrix = _routing_matrix()
+    policy = RoutingPolicy(kind="static", default_model="cheap", pool=matrix.pool)
+
+    assert [(r.scenario_id, r.model) for r in rows_for_policy(matrix, policy)] == [
+        ("s1", "cheap"),
+        ("s2", "cheap"),
+    ]
+    assert [r.scenario_id for r in rows_for_policy(matrix, policy, ids=["s2"])] == ["s2"]
+
+
+def test_a_routed_rung_composes_into_a_ladder() -> None:
+    matrix = _routing_matrix()
+    policy = RoutingPolicy(kind="static", default_model="cheap", pool=matrix.pool)
+    routed = Arm(
+        name="+routing",
+        condition=_BASE.replace(optimizer="distill+routing"),
+        rows=rows_for_policy(matrix, policy),
+    )
+    anchor = Arm(
+        name="strong-only",
+        condition=_BASE.replace(base_model="claude-fable-5"),
+        rows=rows_for_model(matrix, "strong"),
+    )
+    ladder = build_ladder("joint-tau", anchor=anchor, arms=[routed])
+
+    assert ladder.scenarios_compared == 2
+    card = ladder.rungs[0].scorecard
+    # Static-to-cheap completes only s2, so its effective cost per completed task is $0.002
+    # against the anchor's $0.050 while quality drops 40 points. Both objectives visible.
+    assert card.cost.n_completed == 1
+    assert card.cost.cost_per_completed_task_usd == pytest.approx(0.002)
+    assert card.quality_delta_points == pytest.approx(-40.0)
 
 
 def test_multiple_episodes_of_one_scenario_are_separate_tasks() -> None:

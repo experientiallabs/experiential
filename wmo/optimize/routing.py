@@ -306,6 +306,47 @@ class PolicyEval(BaseModel):
     unscored_scenarios: int  # scenario/model pairs the routed choice had no scored row for
 
 
+def route_scenarios(
+    policy: RoutingPolicy,
+    matrix: OutcomeMatrix,
+    ids: list[str],
+    *,
+    embedder: Embedder | None = None,
+) -> dict[str, RoutingDecision]:
+    """Replay `policy`'s serve-time choice over the scenarios in `ids`, in `ids` order.
+
+    The single owner of offline policy replay: `evaluate_policy` scores through it, and the
+    ablation scorecard builds a routed arm's rows from it, so a routed number never depends on
+    which caller reimplemented selection.
+
+    Selection runs through the SAME decision code serving uses (`rank_decision` or
+    `knn_decision`; queries are batch embedded once for speed, and both normalize internally, so
+    the scoring math is shared rather than reimplemented).
+
+    `embedder` overrides the function built from `policy.embedder`, exactly as in `select_model`:
+    one client for the whole replay, or cached vectors in research code.
+
+    Raises:
+        ValueError: when none of `ids` names a scenario the matrix measured.
+    """
+    scenario_tasks: dict[str, str] = {}
+    for outcome in matrix.outcomes:
+        scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
+    wanted = [sid for sid in ids if sid in scenario_tasks]
+    if not wanted:
+        raise ValueError("none of the requested ids are in the matrix")
+
+    if policy.kind == "static":
+        return {
+            sid: RoutingDecision(model=policy.default_model, reason="static policy")
+            for sid in wanted
+        }
+    decide = knn_decision if policy.kind == "knn" else rank_decision
+    built = embedder or policy.embedder.build()
+    embeddings = np.asarray(built.embed([scenario_tasks[sid] for sid in wanted]))
+    return {sid: decide(policy, embeddings[index]) for index, sid in enumerate(wanted)}
+
+
 def evaluate_policy(
     policy: RoutingPolicy,
     matrix: OutcomeMatrix,
@@ -315,31 +356,10 @@ def evaluate_policy(
 ) -> PolicyEval:
     """Replay `policy` over the scenarios in `ids`, scoring via each routed model's rows.
 
-    Selection runs through the SAME decision code serving uses (`rank_decision` or
-    `knn_decision`; queries are batch embedded once for speed, and both normalize internally, so
-    the scoring math is shared rather than reimplemented).
-
-    `embedder` overrides the function built from `policy.embedder`, exactly as in `select_model`:
-    one client for the whole replay, or cached vectors in research code.
+    Selection is `route_scenarios`; this adds the scoring pass over the routed rows.
     """
-    scenario_tasks: dict[str, str] = {}
-    for outcome in matrix.outcomes:
-        scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
-    wanted = [sid for sid in ids if sid in scenario_tasks]
-    if not wanted:
-        raise ValueError("none of the requested ids are in the matrix")
-
-    decisions: dict[str, RoutingDecision]
-    if policy.kind == "static":
-        decisions = {
-            sid: RoutingDecision(model=policy.default_model, reason="static policy")
-            for sid in wanted
-        }
-    else:
-        decide = knn_decision if policy.kind == "knn" else rank_decision
-        built = embedder or policy.embedder.build()
-        embeddings = np.asarray(built.embed([scenario_tasks[sid] for sid in wanted]))
-        decisions = {sid: decide(policy, embeddings[index]) for index, sid in enumerate(wanted)}
+    decisions = route_scenarios(policy, matrix, ids, embedder=embedder)
+    wanted = list(decisions)
 
     by_scenario_model: dict[tuple[str, str], list[float]] = {}
     costs: dict[tuple[str, str], list[float]] = {}
