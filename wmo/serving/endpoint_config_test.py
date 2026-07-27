@@ -31,9 +31,13 @@ def test_saving_leaves_no_partial_file_behind(tmp_path: Path) -> None:
 
 
 def test_an_unset_dial_is_omitted_rather_than_written_as_null(tmp_path: Path) -> None:
+    # This used to assert the whole file was empty, which stopped being the invariant once the
+    # config grew a non-optional key (`log_query_embeddings`) whose default is legitimately
+    # written out. The invariant it exists for is unchanged and asserted directly: an unset dial
+    # leaves no `cost_quality` behind, so a later load reads "serve as fitted" rather than a null.
     path = tmp_path / ENDPOINT_CONFIG_FILENAME
     EndpointConfig().save(path)
-    assert path.read_text(encoding="utf-8").strip() == ""
+    assert "cost_quality" not in path.read_text(encoding="utf-8")
     assert EndpointConfig.load(path).cost_quality is None
 
 
@@ -127,3 +131,10 @@ def test_a_typo_in_the_representation_table_fails_with_the_key_named(tmp_path: P
     with pytest.raises(ValidationError) as caught:
         EndpointConfig.load(path)
     assert "aggressivness" in str(caught.value)
+
+
+def test_log_query_embeddings_defaults_on_and_round_trips_off(tmp_path: Path) -> None:
+    assert EndpointConfig().log_query_embeddings is True
+    path = tmp_path / ENDPOINT_CONFIG_FILENAME
+    EndpointConfig(log_query_embeddings=False).save(path)
+    assert EndpointConfig.load(path).log_query_embeddings is False

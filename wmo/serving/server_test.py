@@ -16,8 +16,10 @@ from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmo.serving.builds import BuildManager
+from wmo.serving.chat import ChatMessage as EndpointMessage
 from wmo.serving.chat import RequestLog
 from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmo.serving.query_embeddings import QUERY_EMBEDDING_FILENAME, QueryEmbeddingStore
 from wmo.serving.server import (
     _endpoint_runtimes,
     _load_card_or_none,
@@ -501,3 +503,51 @@ def test_an_injected_policy_mismatch_names_the_endpoint_not_a_missing_file(tmp_p
     with pytest.raises(ValueError) as caught:
         _endpoint_runtimes({"support": compressed}, {}, RequestLog(None))
     assert str(caught.value).startswith("endpoint 'support' cannot be served")
+
+
+def test_moving_the_dial_preserves_other_endpoint_toml_keys(tmp_path: Path) -> None:
+    """A dial PUT must not delete settings it does not own.
+
+    Regression for a server-wide outage: `set_cost_quality` used to write a config built from
+    the dial alone, dropping `[representation]`. The live endpoint kept serving, so nothing
+    looked wrong until the next mount, where the now-uncompressed policy no longer matched the
+    endpoint and `create_app` failed for EVERY endpoint, off the platform's most-used write path.
+    """
+    model_dir, fitted = _knn_policy_dir(tmp_path)
+    policy = fitted.model_copy(
+        update={"rep_compressor_id": "llmlingua2", "rep_aggressiveness": 0.4}
+    )
+    config_path = model_dir / ENDPOINT_CONFIG_FILENAME
+    EndpointConfig(
+        cost_quality=0.25,
+        representation=Representation(compressor_id="llmlingua2", aggressiveness=0.4),
+    ).save(config_path)
+
+    runtimes = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    runtimes["support"].set_cost_quality(0.75)
+
+    reloaded = EndpointConfig.load(config_path)
+    assert reloaded.cost_quality == 0.75
+    assert reloaded.representation == Representation(compressor_id="llmlingua2", aggressiveness=0.4)
+    # And the endpoint still mounts, which is the failure the dropped table used to cause.
+    remounted = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    assert remounted["support"].cost_quality == 0.75
+
+
+def test_endpoint_toml_can_switch_the_query_embedding_store_off(tmp_path: Path) -> None:
+    # "Default on and undisableable" is not a choice an operator should be denied: an embedding
+    # is request content at rest, and whether to keep it is a tenancy decision.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    EndpointConfig(log_query_embeddings=False).save(model_dir / ENDPOINT_CONFIG_FILENAME)
+    runtimes = _endpoint_runtimes(
+        {"support": policy},
+        {"support": model_dir},
+        RequestLog(None),
+        QueryEmbeddingStore(tmp_path / QUERY_EMBEDDING_FILENAME),
+    )
+    decision = runtimes["support"].decide(
+        [EndpointMessage(role="user", content="SELECT count(*) FROM superheroes")]
+    )
+    assert decision.query_embedding() is not None  # the policy still embeds
+    assert runtimes["support"].record_query_embedding("chatcmpl-x", decision) is None
+    assert not (tmp_path / QUERY_EMBEDDING_FILENAME).exists()

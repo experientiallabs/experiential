@@ -104,3 +104,53 @@ def test_the_documented_size_per_1k_requests_holds(
         store.append(f"chatcmpl-{index:032x}", _unit(dim, seed=index))
     per_1k_kb = path.stat().st_size / 20 * 1000 / 1024
     assert per_1k_kb <= max_kb_per_1k, f"dim {dim}: {per_1k_kb:.0f} KB per 1k requests"
+
+
+def test_the_store_rotates_once_past_its_cap_and_keeps_one_generation(tmp_path: Path) -> None:
+    # A default-on store on a busy endpoint is otherwise a slow disk leak; the cap bounds it at
+    # twice the limit forever.
+    path = tmp_path / QUERY_EMBEDDING_FILENAME
+    store = QueryEmbeddingStore(path, max_bytes=2000)
+    for index in range(12):
+        store.append(f"row{index}", _unit(256, seed=index))
+    previous = tmp_path / "query_embeddings.1.jsonl"
+    assert previous.is_file(), sorted(p.name for p in tmp_path.iterdir())
+    assert path.stat().st_size < 2000 + 2000  # the current file restarted after the roll
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "query_embeddings.1.jsonl",
+        QUERY_EMBEDDING_FILENAME,
+    ]
+
+
+def test_a_ref_still_resolves_after_one_rotation(tmp_path: Path) -> None:
+    # Written to survive row-size drift: append until the roll first happens, then stop, so this
+    # tests exactly one rotation rather than however many the byte math happens to produce.
+    path = tmp_path / QUERY_EMBEDDING_FILENAME
+    previous = tmp_path / "query_embeddings.1.jsonl"
+    store = QueryEmbeddingStore(path, max_bytes=1500)
+    early = _unit(256, seed=99)
+    store.append("early", early)
+    for index in range(50):
+        store.append(f"filler{index}", _unit(256, seed=index))
+        if previous.is_file():
+            break
+    assert previous.is_file()
+    assert np.allclose(_resolved(store, f"{QUERY_EMBEDDING_FILENAME}#early"), early, atol=1e-3)
+
+
+def test_a_ref_older_than_the_retention_window_resolves_to_none(tmp_path: Path) -> None:
+    # The bounded-retention trade, made explicit: past one rotation the vector is gone and the
+    # caller gets None rather than a stale or wrong answer.
+    path = tmp_path / QUERY_EMBEDDING_FILENAME
+    store = QueryEmbeddingStore(path, max_bytes=900)
+    store.append("ancient", _unit(256))
+    for index in range(24):
+        store.append(f"filler{index}", _unit(256, seed=index))
+    assert store.get(f"{QUERY_EMBEDDING_FILENAME}#ancient") is None
+
+
+def test_rotation_never_grows_past_two_generations(tmp_path: Path) -> None:
+    store = QueryEmbeddingStore(tmp_path / QUERY_EMBEDDING_FILENAME, max_bytes=800)
+    for index in range(60):
+        store.append(f"row{index}", _unit(256, seed=index))
+    assert len(list(tmp_path.iterdir())) == 2
