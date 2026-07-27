@@ -56,7 +56,11 @@ def main() -> int:
                 "tau2_bin": str(tau2_root / ".venv" / "bin" / "tau2"),
                 "data_dir": str(tau2_root / "tau2-bench" / "data"),
             },
-            "rollout": {"max_turns": 40, "episode_timeout_s": 900.0},
+            # 1800s: at 900s EVERY retail episode died at the deadline (airline
+            # finished in minutes; retail runs long conversations over growing
+            # prompts, and tau2's graceful --timeout does not interrupt a
+            # running turn, so the hard kill was what fired).
+            "rollout": {"max_turns": 40, "episode_timeout_s": 1800.0},
             # 8192: at 4096 the loop smoke truncated a turn in 1 of 4 episodes,
             # and a truncated turn reads as a broken action to the environment.
             "sampling": {"temperature": 1.0, "max_tokens": 8192},
