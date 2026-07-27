@@ -143,7 +143,7 @@ the new versioned champion harness.
 
 ## Development
 
-Managed with [uv](https://docs.astral.sh/uv/); linting/formatting with [ruff](https://docs.astral.sh/ruff/); type checking with [ty](https://github.com/astral-sh/ty). Conventions live in [AGENTS.md](./AGENTS.md).
+Managed with [uv](https://docs.astral.sh/uv/); linting/formatting with [ruff](https://docs.astral.sh/ruff/); type checking with [ty](https://github.com/astral-sh/ty); tasks run through [just](https://github.com/casey/just) (`brew install just` / `cargo install just`). Conventions live in [AGENTS.md](./AGENTS.md).
 
 ```bash
 just setup               # first time: .env from the template + uv sync
