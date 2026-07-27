@@ -165,11 +165,19 @@ _TRANSIENT_PATTERNS = (
     r"timed? ?out",
     r"timeout",
     r"connection (?:reset|error|aborted|refused)",
+    # Observed in the smoke: the compressor endpoint dropped one request mid-flight. Its client
+    # already retries a transport fault once, so a cell only reaches here when BOTH attempts were
+    # dropped, which is still capacity rather than a bad request.
+    r"server disconnected",
     r"remote end closed",
     r"eof occurred",
     r"read operation timed out",
 )
 _TRANSIENT = re.compile("|".join(_TRANSIENT_PATTERNS), re.IGNORECASE)
+
+# Above this share of a chunk's cells failing transiently, the retry pass reads the failures as one
+# outage rather than many blips and declines to buy the same failure once per cell.
+SYSTEMIC_FAILURE_SHARE = 0.5
 
 # The calibration probe's measured all-in cost per cell at max-steps 12 ($7.05 over 18 cells,
 # DECISIONS.md 2026-07-27). Used ONLY as the cap guard's seed: once this grid has measured cells of
@@ -986,6 +994,24 @@ class ArmRunner:
                 and cell_key(outcome) not in already
             ]
             if not targets:
+                continue
+            if len(targets) > len(matrix.outcomes) * SYSTEMIC_FAILURE_SHARE:
+                # Most of a chunk failing transiently is not many independent blips, it is one
+                # thing being down (a backend, the compressor box, the network). Retrying each
+                # cell then buys the same failure N times at full episode price, so the chunk is
+                # left as measured and the operator gets told what to fix before re-running it.
+                log.warning(
+                    "%s chunk %d: %d of %d cell(s) failed transiently, which reads as a systemic "
+                    "outage rather than independent blips. NOT retrying them (that would buy the "
+                    "same failure once per cell). First error: %s. Fix the backend, delete "
+                    "%s, and re-run this arm.",
+                    self.arm,
+                    index,
+                    len(targets),
+                    len(matrix.outcomes),
+                    targets[0][1].error,
+                    self.chunk_path(index),
+                )
                 continue
             log.info(
                 "%s chunk %d: retrying %d transiently-failed cell(s)", self.arm, index, len(targets)
