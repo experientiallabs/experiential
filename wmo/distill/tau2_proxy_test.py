@@ -133,7 +133,10 @@ class TestServing:
             {"model": "ep-b", "messages": [{"role": "user", "content": "hi"}]},
         )
         assert status == 502
-        assert "sampler wedged" in body["error"]["message"]
+        # The class name crosses the wire; the detail stays in the collector log
+        # (CodeQL: stack-trace exposure), mirroring wmo.serving.chat's split.
+        assert "RuntimeError" in body["error"]["message"]
+        assert "sampler wedged" not in body["error"]["message"]
 
     def test_released_alias_stops_serving(self, proxy: EpisodeProxy) -> None:
         proxy.register("ep-c", _FakeProvider())

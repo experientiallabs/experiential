@@ -210,11 +210,16 @@ class EpisodeProxy:
                 realign_tool_argument_types(response, chat_request.tools)
             except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
                 logger.error("proxy completion for %s failed: %s", alias, exc)
+                # Same split as wmo.serving.chat: full detail to the log above,
+                # exception class name to the wire (CodeQL: stack-trace exposure).
                 return JSONResponse(
                     status_code=502,
                     content={
                         "error": {
-                            "message": f"upstream sampling failed ({type(exc).__name__}): {exc}",
+                            "message": (
+                                f"upstream sampling failed ({type(exc).__name__}); see the "
+                                "rollout collector's log for details"
+                            ),
                             "type": "api_error",
                         }
                     },
