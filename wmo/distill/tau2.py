@@ -56,6 +56,7 @@ from pathlib import Path
 
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig
+from wmo.distill.data import CONTEXT_OVERFLOW_STOP_REASON
 from wmo.distill.rollouts import RolloutStats, rollout_stats
 from wmo.distill.tau2_proxy import EpisodeProxy
 from wmo.distill.tokens import TrialRecord, load_trial_spans
@@ -101,7 +102,10 @@ _TERMINATION_STOP_REASONS: dict[str, str] = {
     # The agent burned tau2's per-episode error budget on malformed or invalid
     # tool calls; the closest scaffold-loss bucket names the cause.
     "too_many_errors": StopReason.UNPARSED_TOOL_CALL.value,
-    "context_window_exceeded": StopReason.PROVIDER_ERROR.value,
+    # The datum builder's explicit drop keys on this exact string
+    # (`wmo.distill.data.CONTEXT_OVERFLOW_STOP_REASON`): an episode that
+    # outgrew the window must leave training whole, tokens aligned.
+    "context_window_exceeded": CONTEXT_OVERFLOW_STOP_REASON,
     "agent_error": StopReason.ERROR.value,
     "user_error": StopReason.ERROR.value,
     "unexpected_error": StopReason.ERROR.value,

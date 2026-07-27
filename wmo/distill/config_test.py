@@ -990,3 +990,13 @@ def test_warmup_only_run_is_valid_but_needs_a_warmup(tmp_path: Path) -> None:
     trains_nothing = TAU2_TOML + "\n[train]\nsteps = 0\n"
     with pytest.raises(ValueError, match="nothing would train"):
         load_distill_config(_write(tmp_path, trains_nothing))
+
+
+def test_snapshot_round_trips_the_tau2_source(tmp_path: Path) -> None:
+    # The run store snapshots the config and a resume re-parses it, so the
+    # tau2 section (and the omitted harbor=None) must survive the round trip.
+    text = TAU2_TOML + "\n[train]\nsteps = 0\n\n[warmup]\nsteps = 2\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    snap_path = tmp_path / "snapshot.toml"
+    snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
+    assert load_distill_config(snap_path) == cfg

@@ -127,7 +127,8 @@ class TestAssembleRecord:
             ("max_steps", "max_turns"),
             ("timeout", "budget"),
             ("too_many_errors", "unparsed_tool_call"),
-            ("context_window_exceeded", "provider_error"),
+            # the datum builder's whole-episode drop keys on this exact string
+            ("context_window_exceeded", "context_overflow"),
             ("unexpected_error", "error"),
         ],
     )
