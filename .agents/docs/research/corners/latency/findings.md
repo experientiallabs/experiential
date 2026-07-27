@@ -25,6 +25,11 @@ exist and is re-run as arms land. Zero LLM spend; offline computation only.
   not as a dominance coordinate.
 - **Unscored rows are infrastructure, not verdicts.** They are excluded from quality, cost,
   and latency pools alike, and counted. Partial chunk reads are pre-retry-pass and labeled.
+- **Distill-stage verdicts are sourced, never hand-ruled.** A stage annotation quotes the
+  recorded gate artifact (cycle-1: `gate.json`, "rejected: after 0.650 regressed below
+  before 0.717"); diagnosis prose (the no-teacher-headroom reading) stays in findings, not
+  in verdict labels. Once `jt/teacher-gate` lands, the verdict source is
+  `wmo optimize distill probe` over the same grid matrices.
 
 ## Where tau latency comes from (mechanism now, magnitudes when the grid lands)
 
@@ -100,9 +105,11 @@ serving-mechanics entry).
   it.
 - Cycle side: the distill-only line DROPS 71.7% -> 65.0% at cycle 1. That regression is 4
   episodes of 60; the paired sign test over the 7 tasks that moved gives p = 0.45 —
-  indistinguishable from noise, and the gate refused promotion for lack of teacher headroom
-  (1.6 points), not for degeneration (behavioral metrics flat: 60/60 clean stops, ~30
-  messages, p50 wall 91 s vs 82 s). The latency lens adds: warmup distillation did not
+  indistinguishable from noise. The gate's recorded verdict (gate.json) is "rejected: after
+  0.650 regressed below before 0.717"; the no-teacher-headroom reading (a 1.6-point
+  teacher-student gap left nothing to copy) is the result note's diagnosis, and degeneration
+  is ruled out (behavioral metrics flat: 60/60 clean stops, ~30 messages, p50 wall 91 s vs
+  82 s). The latency lens adds: warmup distillation did not
   change episode wall time either (93 s vs 94 s mean) — no latency win came from cycle 1.
 - Per-episode COST was not recorded in cycle-1 artifacts (run total $34.94), so the stage
   chart's cost annotation is honest about its absence rather than derived after the fact.
