@@ -2174,7 +2174,7 @@ def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:
     assert config.model == "us.anthropic.claude-opus-4-8"
 
 
-def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str) -> None:
+def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str | None) -> None:
     from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
     monkeypatch.setattr(
@@ -2197,21 +2197,53 @@ def test_worker_role_provider_config_model_flag_keeps_the_role_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The endpoint describes the BACKEND, not the model, so swapping the model keeps it.
-    _azure_worker_settings(monkeypatch, "gpt-5.4")
+    _azure_worker_settings(monkeypatch, "prod-54-canary")
 
-    config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+    config = cli_app_module._worker_role_provider_config(
+        None, "gpt-5.5", None, deployment="prod-55-canary"
+    )
 
     assert config.kind is ProviderKind.AZURE_OPENAI
     assert config.model == "gpt-5.5"
     assert config.endpoint == "https://azure.example/v1"
+    assert config.deployment == "prod-55-canary"
 
 
-def test_worker_role_provider_config_model_flag_moves_the_azure_deployment(
+def test_worker_role_provider_config_refuses_an_azure_model_swap_without_a_deployment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # On Azure the wire `model` IS the deployment name, so the role's deployment names the model
-    # being replaced. Carrying it over would call gpt-5.4 while reporting gpt-5.5.
-    _azure_worker_settings(monkeypatch, "gpt-5.4")
+    # being replaced. Keeping it would call gpt-5.4 while reporting gpt-5.5; guessing `gpt-5.5`
+    # 404s on a resource that names deployments anything else, and `wmo eval` turns that into a
+    # silent fidelity=0.000 at exit 0. So refuse, naming the command that fixes it.
+    _azure_worker_settings(monkeypatch, "prod-54-canary")
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
+    message = str(excinfo.value)
+    assert "prod-54-canary" in message
+    assert "wmo providers set --provider azure --model gpt-5.5 --deployment <deployment>" in message
+
+
+def test_worker_role_provider_config_allows_an_azure_model_swap_the_deployment_already_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A resource whose deployments are named after their models has already answered the question.
+    _azure_worker_settings(monkeypatch, "gpt-5.5")
+
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
+    assert config.model == "gpt-5.5"
+    assert config.deployment == "gpt-5.5"
+
+
+def test_worker_role_provider_config_derives_a_deployment_the_role_never_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing configured to contradict, so fall back to the model type as
+    # `_worker_provider_config` does rather than refusing over a value that was never there.
+    _azure_worker_settings(monkeypatch, None)
 
     config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
 

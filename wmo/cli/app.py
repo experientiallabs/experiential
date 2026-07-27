@@ -106,7 +106,11 @@ from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmo.providers import ProviderConfig, ProviderKind, VerifyResult, verify_all, verify_embedder
 from wmo.providers.base import Embedder, EmbedderKind, Provider
-from wmo.providers.models import model_types_for_provider, resolve_provider_model
+from wmo.providers.models import (
+    ProviderModel,
+    model_types_for_provider,
+    resolve_provider_model,
+)
 from wmo.providers.pool import Tier
 from wmo.providers.retry import wrap_provider_with_retries
 from wmo.research import Side, run_concurrency_scaling
@@ -2251,8 +2255,41 @@ def _role_provider_config(role: str, region: str | None) -> ProviderConfig | Non
     )
 
 
+def _azure_deployment_for_model(
+    configured: ProviderConfig, spec: ProviderModel, deployment: str | None
+) -> str:
+    """The Azure deployment to invoke after `--model` moved the role off its configured one.
+
+    On Azure the wire `model` IS the deployment name (`AzureOpenAIProvider._deployment`), so a
+    role's deployment names the model being replaced. Keeping it would call the old model and
+    report the new one. Guessing the new one is no better: an operator's deployment name is not
+    derivable from a model id, and a wrong guess 404s on every prediction, which `wmo eval`
+    reports as a silent `fidelity=0.000` at exit 0 — the defect this whole path exists to stop.
+    So a model swap on Azure has to be told which deployment serves it.
+    """
+    if deployment is not None:
+        return deployment
+    if configured.deployment is None:
+        # Nothing configured to contradict, so derive it from the model as
+        # `_worker_provider_config` does; the role could not have been called without one anyway.
+        return spec.model_type
+    if configured.deployment in (spec.model_type, spec.model_id):
+        return configured.deployment
+    raise typer.BadParameter(
+        f"the configured azure worker serves {configured.model} from deployment "
+        f"{configured.deployment!r}, and on Azure the deployment name is what is actually "
+        f"invoked, so --model {spec.model_type} needs the deployment that serves it. Run "
+        f"`wmo providers set --provider azure --model {spec.model_type} "
+        f"--deployment <deployment>` to point the worker role at it."
+    )
+
+
 def _worker_role_provider_config(
-    provider: str | None, model: str | None, region: str | None
+    provider: str | None,
+    model: str | None,
+    region: str | None,
+    *,
+    deployment: str | None = None,
 ) -> ProviderConfig:
     """The backend for a worker-role call: explicit flags, then the worker role, then the default.
 
@@ -2265,20 +2302,22 @@ def _worker_role_provider_config(
     configured = _role_provider_config("worker", region)
     if configured is None or (provider is not None and provider != configured.kind.value):
         kind = _provider_kind(provider or _DEFAULT_WORKER_PROVIDER)
-        return _provider_config(kind.value, model or _default_model_for_provider(kind), region)
-    if model is None:
-        return configured
-    spec = resolve_provider_model(configured.kind, model)
-    if spec.model_id == configured.model:
-        return configured
-    update: dict[str, object] = {"model_type": spec.model_type, "model": spec.model_id}
-    if configured.kind is ProviderKind.AZURE_OPENAI:
-        # On Azure the wire `model` IS the deployment name (AzureOpenAIProvider._deployment), so
-        # the role's deployment names the model we are replacing. Carrying it over would call the
-        # old model and report the new one — the misattribution this whole path exists to stop.
-        # Re-derive it from the requested model, as `_worker_provider_config` already does.
-        update["deployment"] = spec.model_type
-    return configured.model_copy(update=update)
+        config = _provider_config(kind.value, model or _default_model_for_provider(kind), region)
+    elif model is None:
+        config = configured
+    else:
+        spec = resolve_provider_model(configured.kind, model)
+        if spec.model_id == configured.model:
+            # Re-stating the role's own model is not a model change: leave its connection alone.
+            config = configured
+        else:
+            update: dict[str, object] = {"model_type": spec.model_type, "model": spec.model_id}
+            if configured.kind is ProviderKind.AZURE_OPENAI:
+                update["deployment"] = _azure_deployment_for_model(configured, spec, deployment)
+            config = configured.model_copy(update=update)
+    if deployment is not None:
+        config = config.model_copy(update={"deployment": deployment})
+    return config
 
 
 def _scenario_role_llms(
@@ -2699,14 +2738,12 @@ def research_concurrency(
         raise typer.BadParameter(f"--side must be one of: {allowed}") from None
     # Resolve (and so validate) the environment LLM up front, not lazily inside a worker thread
     # mid-sweep. Omitted flags come from the configured worker role.
-    env_config = _worker_role_provider_config(provider, model, region)
+    # `--deployment` goes IN rather than on top: on Azure it is what a `--model` swap needs to
+    # know, and layering it afterwards would reject a run the user had already answered for.
+    env_config = _worker_role_provider_config(provider, model, region, deployment=deployment)
     connection = {
         field: value
-        for field, value in (
-            ("deployment", deployment),
-            ("api_version", api_version),
-            ("endpoint", endpoint),
-        )
+        for field, value in (("api_version", api_version), ("endpoint", endpoint))
         if value is not None
     }
     if connection:
