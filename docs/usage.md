@@ -39,9 +39,9 @@ functions they do, so you can drop to any stage and the next run resumes around 
 | Command | Purpose | Artifact |
 |---|---|---|
 | `wmo play` | Step into the environment yourself: type actions, get observations back. | nothing (a session) |
-| `wmo demo` | Replay a randomly sampled recorded scenario against the world model, open loop. | nothing (prints) |
+| `wmo demo` | Replay a randomly sampled recorded scenario against the world model, open loop. Needs the corpus (`--traces`) unless the model ships one, since a build keeps no copy of what it read. | nothing (prints) |
 | `wmo eval` | Score reconstruction fidelity (open-loop, teacher-forced) or run a live agent against the model (`--mode closed-loop`), or run a named example-local suite. | results under `.wmo/evals/` |
-| `wmo knowledge` | Print the model's knowledge base directory: editable markdown that is the env's canonical facts. | nothing (the directory it names is the editing interface) |
+| `wmo knowledge` | Print the model's knowledge base directory: editable markdown that is the env's canonical facts. Says so when the model was built without `--knowledge`, which makes those files inert. | nothing (the directory it names is the editing interface) |
 | `wmo list` | List every world model built under the project dir. | nothing (prints) |
 
 ## Traces and data

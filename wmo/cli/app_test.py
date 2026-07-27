@@ -94,6 +94,16 @@ class FakeProvider:
         return verify_via_ping(self)
 
 
+def _squashed(text: str) -> str:
+    """Whitespace-free view of rich output, so a boxed+wrapped message still matches a substring.
+
+    Typer renders usage errors inside a panel that hard-wraps at the terminal width, which splits
+    long paths and command hints across lines; dropping whitespace and the box rules puts them
+    back together. Callers squash the expected string the same way.
+    """
+    return "".join(ch for ch in text if not ch.isspace() and ch not in "│┃")
+
+
 def _traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
     span_llm = {
         "traceId": "a" * 32,
@@ -371,6 +381,8 @@ def test_knowledge_command_prints_bracketed_markdown_verbatim(tmp_path) -> None:
 
 
 def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
+    # The empty state used to print a directory that does not exist and say "drop *.md files in
+    # this folder" without naming the flag that seeds one, so this now pins both halves.
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
 
@@ -378,7 +390,67 @@ def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # n
     save_config(HarnessConfig(), root=root / "models" / "airline")
     result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
     assert result.exit_code == 0, result.output
-    assert "empty" in result.output.lower()
+    flat = _squashed(result.output)
+    assert _squashed("does not exist yet") in flat  # the printed dir is absent, and it says so
+    assert "--knowledge" in flat  # the exact build flag that creates one
+
+
+def test_knowledge_command_flags_a_kb_the_model_ignores(tmp_path) -> None:  # noqa: ANN001
+    """Files under `knowledge/` are inert unless the model was built with `--knowledge`."""
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmo"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)  # knowledge=False, the build default
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    flat = _squashed(result.output)
+    assert "inert" in flat
+    assert "--knowledge" in flat  # names the flag that activates them
+    assert _squashed("gate: auth required") in flat  # the files are still shown
+
+
+def test_knowledge_command_stays_quiet_when_the_kb_is_live(tmp_path) -> None:  # noqa: ANN001
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmo"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(knowledge=True), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "inert" not in result.output
+
+
+def test_knowledge_resolves_a_shipped_example_like_demo_and_play(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """`wmo knowledge` must see the same models `wmo demo`/`wmo play` resolve, examples included."""
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    example = tmp_path / "airline-bench"
+    model_dir = example / "models" / "airline"
+    save_config(HarnessConfig(knowledge=True), root=model_dir)
+    (example / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline"])
+
+    assert result.exit_code == 0, result.output
+    assert "gate: auth required" in result.output
 
 
 @pytest.mark.parametrize(
@@ -595,6 +667,233 @@ def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -
     assert "predicted" in result.output
     assert "actual" in result.output
     assert "exact matches" in result.output
+
+
+@pytest.mark.parametrize("steps", ["0", "-1"])
+def test_demo_rejects_a_non_positive_step_budget(patched_provider, tmp_path, steps) -> None:  # noqa: ANN001
+    # `--steps 0` used to slice the trace to [] and index [-1] on it: an IndexError traceback.
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            steps,
+            "--no-prompt",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert not isinstance(result.exception, IndexError)
+    assert "--steps" in result.output
+
+
+def test_demo_missing_explicit_traces_names_the_path_given(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # The old message blamed the model's default location and told you to pass the flag you just
+    # passed; an explicit path that does not exist must name that path.
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    typo = tmp_path / "does-not-exist.jsonl"
+    result = runner.invoke(
+        app, ["demo", "--name", "demo-model", "--root", str(root), "--traces", str(typo)]
+    )
+    assert result.exit_code == 2, result.output
+    assert _squashed(str(typo)) in _squashed(result.output)
+
+
+def test_demo_without_a_corpus_names_the_file_to_pass(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    """A build keeps no copy of its corpus, so the default can never resolve after `wmo build`."""
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(app, ["demo", "--name", "demo-model", "--root", str(root)])
+    assert result.exit_code == 2, result.output
+    flat = _squashed(result.output)
+    assert _squashed("keeps no copy of the corpus it read") in flat
+    assert _squashed("--traces <that file>") in flat
+    assert _squashed(str(root / "models" / "demo-model" / "traces.otel.jsonl")) in flat
+
+
+def test_demo_finds_a_corpus_stored_beside_the_artifact(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    """serve and `optimize route sweep` read <model_dir>/traces.otel.jsonl; demo must too."""
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    corpus = Path(_traces_file(tmp_path)).read_text(encoding="utf-8")
+    (root / "models" / "demo-model" / "traces.otel.jsonl").write_text(corpus, encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["demo", "--name", "demo-model", "--root", str(root), "--seed", "0", "--steps", "1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "replaying scenario" in result.output
+
+
+def test_demo_provider_failure_is_a_clean_error_not_a_traceback(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The likeliest first-run failure: the serve provider has no credentials."""
+    import openai
+
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+
+    class _NoCredentials(FakeProvider):
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            raise openai.OpenAIError("Missing credentials. Please pass an `api_key`")
+
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _NoCredentials())
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, openai.OpenAIError)
+    flat = _squashed(result.output)
+    assert _squashed("Missing credentials") in flat
+    assert _squashed("wmo providers verify") in flat
+
+
+def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Only backend SDK failures are re-rendered; our own bugs must not be dressed up as setup."""
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    monkeypatch.setattr(
+        cli_app_module,
+        "run_demo",
+        lambda *a, **kw: (_ for _ in ()).throw(KeyError("internal")),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert isinstance(result.exception, KeyError)
+
+
+def test_play_refuses_a_serve_provider_it_cannot_prepare(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`prepare()` is free and offline, so a missing credential fails before the first step."""
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+
+    class _Unpreparable(FakeProvider):
+        def prepare(self) -> None:
+            raise RuntimeError("Missing credentials. Set OPENAI_API_KEY")
+
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _Unpreparable())
+
+    result = runner.invoke(app, ["play", "--name", "demo-model", "--root", str(root)])
+
+    assert result.exit_code == 1, result.output
+    flat = _squashed(result.output)
+    assert _squashed("Missing credentials") in flat
+    assert _squashed("wmo providers verify") in flat
+
+
+def _example_model(root: Path, example: str, name: str) -> Path:
+    """A shipped-example artifact: <root>/<example>/models/<name>/ plus the example's corpus."""
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+
+    example_dir = root / example
+    (example_dir / "traces.otel.jsonl").parent.mkdir(parents=True, exist_ok=True)
+    (example_dir / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    model_dir = example_dir / "models" / name
+    save_config(HarnessConfig(), root=model_dir)
+    return model_dir
+
+
+def test_demo_root_spelling_does_not_change_what_is_discovered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Discovery used to be gated on `root != ".wmo"` string equality, so `./.wmo` (or the `.wmo/`
+    # shell tab-completion types) silently searched a different set than the identical `.wmo`.
+    _example_model(tmp_path, "airline-bench", "airline")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+    monkeypatch.chdir(project)
+
+    outputs = [
+        _squashed(runner.invoke(app, ["demo", "--name", "ghost", "--root", spelling]).output)
+        for spelling in (".wmo", "./.wmo", ".wmo/")
+    ]
+
+    assert all(_squashed("airline (airline-bench example)") in out for out in outputs), outputs
+
+
+def test_demo_lists_a_shadowed_example_distinguishably(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A local build of the same name used to appear twice in the list, and --name could not say
+    # which one was meant.
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+
+    _example_model(tmp_path, "airline-bench", "airline")
+    project = tmp_path / "project"
+    save_config(HarnessConfig(), root=project / ".wmo" / "models" / "airline")
+    _example_model(tmp_path, "retail-bench", "retail")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["demo"])
+
+    assert result.exit_code == 2, result.output
+    flat = _squashed(result.output)
+    assert _squashed("airline (local)") in flat
+    assert _squashed("airline (airline-bench example)") in flat
+    assert _squashed(f"--root {tmp_path / 'airline-bench'}") in flat
+
+
+def test_demo_with_nothing_built_points_at_a_command_that_exists(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The old hint named `examples/tau-bench`, a path that ships in neither the wheel nor the repo.
+    empty_root = tmp_path / "no-examples"
+    empty_root.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (empty_root,))
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["demo"])
+
+    assert result.exit_code == 2, result.output
+    flat = _squashed(result.output)
+    assert "examples/tau-bench" not in flat
+    assert "wmodownload" in flat
+    assert _squashed("wmo build --file <traces> --name <name>") in flat
 
 
 def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) -> None:  # noqa: ANN001

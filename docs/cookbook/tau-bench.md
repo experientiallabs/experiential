@@ -144,8 +144,12 @@ Look at the thing before optimizing it:
 
 ```bash
 uv run wmo play --name tau-bench      # step in yourself
-uv run wmo demo --name tau-bench      # replay a recorded scenario, open loop
+uv run wmo demo --name tau-bench \
+  --traces packages/environment-capture/tau-bench/traces.otel.jsonl   # replay one, open loop
 ```
+
+`wmo demo` needs the corpus because a build keeps no copy of the traces it read, only the prompts,
+the metrics and the retrieval index. Pass the same file step 1's `wmo build --file` was given.
 
 ## Step 2: register the routing candidates
 

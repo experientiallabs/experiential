@@ -105,7 +105,7 @@ from wmo.evals.open_loop import EvalReport, OpenLoopEval
 from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmo.providers import ProviderConfig, ProviderKind, VerifyResult, verify_all, verify_embedder
-from wmo.providers.base import Embedder, EmbedderKind, Provider
+from wmo.providers.base import Embedder, EmbedderKind, PreparableProvider, Provider
 from wmo.providers.models import (
     ProviderModel,
     model_types_for_provider,
@@ -127,6 +127,7 @@ from wmo.scenarios import (
     verify_scenarios,
 )
 from wmo.serving.server import create_app
+from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
 from wmo.telemetry import (
     BuildTelemetryStats,
     TelemetryBuildReporter,
@@ -1958,24 +1959,41 @@ def _eval_report_payload(report: EvalReport) -> JsonObject:
 @app.command("knowledge")
 def knowledge_(
     name: str = typer.Option(None, "--name", help="World model (default: the only one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    root: str = typer.Option(
+        ARTIFACT_DIR,
+        help="Project dir. Shipped example models are found too while this is the default "
+        "project dir; point it elsewhere to search that root alone.",
+    ),
 ) -> None:
     """Show a model's knowledge base: the env's canonical facts, a folder of editable markdown.
 
-    The printed directory IS the editing interface — open it in any editor. `rules.md`/
+    The printed directory IS the editing interface, open it in any editor. `rules.md`/
     `entities.md`/`schemas.md` are seeded at build (with knowledge enabled); `learned.md` collects
-    the env's own cross-session notes; `grounded.md` caches web-search groundings.
+    the env's own cross-session notes; `grounded.md` caches web-search groundings. Models are
+    resolved exactly as `wmo demo`/`wmo play` resolve them, so a shipped example needs no `--root`.
     """
-    store = WorldModelStore(root)
-    resolved = _resolve_name(store, name)
-    kb = KnowledgeBase(ArtifactPaths(store.resolve(resolved)).knowledge)
+    store_root, resolved = _resolve_model_any(name, root)
+    model_dir = WorldModelStore(str(store_root)).resolve(resolved)
+    kb = KnowledgeBase(ArtifactPaths(model_dir).knowledge)
     _console.print(f"[bold]{escape(str(kb.directory))}[/bold]")
+    build_with_knowledge = f"`wmo build --name {resolved} --file <traces> --knowledge`"
     if kb.is_empty:
+        state = "is empty" if kb.directory.is_dir() else "does not exist yet"
         _console.print(
-            "(empty — enable knowledge at build, drop *.md files in this folder, "
-            "or PUT files via the serving API)"
+            f"(that directory {state}) seed one with {build_with_knowledge}, which extracts "
+            "rules.md / entities.md / schemas.md from the train traces"
         )
         return
+    if not load_config(model_dir).knowledge:
+        # The files are on disk but `WorldModel.load` gates the KB on config.knowledge, so at the
+        # default fidelity nothing here reaches the env prompt. Say so instead of printing them
+        # back as if they were live.
+        _console.print(
+            f"[yellow]inert[/yellow]: {resolved!r} was built without a knowledge base, so "
+            "`wmo demo` / `wmo play` / `wmo serve` never render these files into the env "
+            f"prompt. Activate them by rebuilding with {build_with_knowledge}, or by setting "
+            f"`knowledge = true` in {escape(str(ArtifactPaths(model_dir).config))}."
+        )
     # Knowledge is hand-edited markdown: `[/items]`, `list[str]` and `[text](url)` are ordinary
     # content, so it is escaped rather than parsed as rich markup (which would crash on the
     # first, and silently delete the other two).
@@ -2380,10 +2398,18 @@ def _resolve_scenario_embedder(
 @app.command("demo")
 def demo(
     name: str = typer.Option(None, "--name", help="World model to demo (default: pick one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
-    steps: int = typer.Option(5, help="Max scenario steps to replay."),
+    root: str = typer.Option(
+        ARTIFACT_DIR,
+        help="Project dir. Shipped example models are found too while this is the default "
+        "project dir; point it elsewhere to search that root alone.",
+    ),
+    steps: int = typer.Option(5, min=1, help="Max scenario steps to replay."),
     traces: str = typer.Option(
-        None, "--traces", help="Trace file to sample the scenario from (default: the model's)."
+        None,
+        "--traces",
+        help="Trace file to sample the scenario from. Default: the model's own "
+        "traces.otel.jsonl, which only a Hub-downloaded model or a shipped example has, since a "
+        "build keeps no copy of the corpus it read.",
     ),
     seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
     show_prompt: bool = typer.Option(
@@ -2399,12 +2425,8 @@ def demo(
     wm, resolved_name, _provider, model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
     )
-    traces_file = Path(traces) if traces else _traces_for_root(model_root)
-    if traces_file is None or not traces_file.exists():
-        raise typer.BadParameter(
-            f"no trace file found for {resolved_name!r} under {model_root}; pass --traces"
-        )
     model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
+    traces_file = _demo_traces(model_dir, resolved_name, traces)
     config = load_config(model_dir)  # the model dir holds its own HarnessConfig
     candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
     if not candidates:
@@ -2472,7 +2494,22 @@ def demo(
             break
         except Exception as exc:  # noqa: BLE001 - classified below
             if not is_capacity_error(exc) or not _console.is_terminal:
-                raise
+                # A backend that refused the request (missing/expired credentials, a model id it
+                # does not serve) is a user-fixable setup error, not a wmo bug: render it with the
+                # same hint `wmo providers verify` prints. Anything else keeps its traceback.
+                if not _is_provider_sdk_error(exc):
+                    raise
+                serve_config = config.serve_provider_config()
+                _console.print(
+                    f"\n[red]✗ the serve provider for {resolved_name!r} "
+                    f"({serve_config.kind.value}, {serve_config.model}) failed[/red]: "
+                    f"{escape(_short_error(exc))}"
+                )
+                _console.print(
+                    f"  [yellow]{escape(_credential_hint(serve_config.kind, str(exc)))}[/yellow]"
+                )
+                _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
+                raise typer.Exit(1) from exc
             # Retries are exhausted and the backend is still down: offer to re-point the model
             # at a different provider (same picker as the build wizard) and RESUME from the
             # failed step — completed steps stay done.
@@ -2514,7 +2551,11 @@ def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
 def play(
     name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    root: str = typer.Option(
+        ARTIFACT_DIR,
+        help="Project dir. Shipped example models are found too while this is the default "
+        "project dir; point it elsewhere to search that root alone.",
+    ),
     max_fidelity: bool = typer.Option(
         False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
     ),
@@ -2527,10 +2568,28 @@ def play(
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
 
 
-def _traces_for_root(model_root: Path) -> Path | None:
-    """The trace corpus that built the models under `model_root`, when it ships alongside."""
-    candidate = model_root / "traces.otel.jsonl"
-    return candidate if candidate.exists() else None
+def _demo_traces(model_dir: Path, resolved_name: str, explicit: str | None) -> Path:
+    """The corpus `wmo demo` samples its scenario from: explicit `--traces`, else the model's own.
+
+    Default resolution is `local_traces_path`, the same one `wmo serve` and `wmo optimize route
+    sweep` use: a Hub-downloaded copy inside the artifact, else the sibling corpus of the shipped
+    example layout. A build keeps NO copy of the corpus it read, so a plain `wmo build` leaves
+    neither, and the failure has to name the file to pass rather than the directory it searched.
+    """
+    if explicit is not None:
+        path = Path(explicit)
+        if not path.is_file():
+            raise typer.BadParameter(f"no trace file at {path} (--traces)")
+        return path
+    found = local_traces_path(model_dir)
+    if found is not None:
+        return found
+    raise typer.BadParameter(
+        f"no trace corpus for world model {resolved_name!r}: looked for "
+        f"{model_dir / TRACES_FILENAME} and {model_dir.parent.parent / TRACES_FILENAME}. "
+        "A build keeps no copy of the corpus it read, so pass the file `wmo build --file` was "
+        f"given: `wmo demo --name {resolved_name} --traces <that file>`"
+    )
 
 
 def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
@@ -2553,49 +2612,90 @@ def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
 
 
 def _load_model_any(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
-    """Resolve a model across the project dir AND shipped examples, then load it.
+    """Resolve a model across the project dir AND shipped examples, then load it."""
+    store_root, resolved = _resolve_model_any(name, root)
+    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
+    return wm, resolved, provider, store_root
 
-    An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
-    spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
+
+def _model_candidates(root: str) -> list[tuple[str, Path, str]]:
+    """Every reachable artifact as `(label, store_root, name)`, local builds first.
+
+    The label disambiguates same-named artifacts (`tau-bench (local)` vs `tau-bench (tau-bench
+    example)`), so every message that enumerates choices must print labels, not bare names.
     """
-    if root != ARTIFACT_DIR:
-        wm, resolved, provider = _load_model(name, root, max_fidelity=max_fidelity)
-        return wm, resolved, provider, Path(root)
-
-    candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
-    local = WorldModelStore(root)
-    candidates.extend((f"{n} (local)", Path(root), n) for n in local.list_names())
+    candidates: list[tuple[str, Path, str]] = []
+    candidates.extend((f"{n} (local)", Path(root), n) for n in WorldModelStore(root).list_names())
     for example_dir in _discover_examples():
         example_store = WorldModelStore(example_dir)
         candidates.extend(
             (f"{n} ({example_dir.name} example)", example_dir, n)
             for n in example_store.list_names()
         )
+    return candidates
 
+
+def _is_default_project_dir(root: str) -> bool:
+    """Whether `--root` still points at the default project dir, however it was spelled.
+
+    Comparing the raw string against `.wmo` made `--root ./.wmo` and `--root .wmo/` (what shell
+    tab-completion types) silently mean something different from `--root .wmo`, so resolve both.
+    """
+    return Path(root).resolve() == Path(ARTIFACT_DIR).resolve()
+
+
+def _resolve_model_any(name: str | None, root: str) -> tuple[Path, str]:
+    """Which artifact a read command should open, as `(store_root, resolved_name)`.
+
+    A `--root` pointing somewhere other than the default project dir keeps single-root behavior.
+    Otherwise the search spans `<root>/models/*` plus the shipped `examples/*/models/*` and
+    `packages/environment-capture/*/models/*`, so `demo`, `play` and `knowledge` all agree on
+    which models exist.
+    """
+    if not _is_default_project_dir(root):
+        return Path(root), _resolve_name(WorldModelStore(root), name)
+
+    candidates = _model_candidates(root)
     if name is not None:
         matched = [c for c in candidates if c[2] == name]
         if not matched:
-            have = ", ".join(c[2] for c in candidates) or "none built"
+            have = ", ".join(c[0] for c in candidates) or "none built"
             raise typer.BadParameter(f"no world model named {name!r} (have: {have})")
         # Prefer the local build over a same-named example artifact.
-        label, store_root, resolved = matched[0]
+        _label, store_root, resolved = matched[0]
     elif not candidates:
         raise typer.BadParameter(
-            "no world models found; run `wmo build` or try an example "
-            "(packages/environment-capture/tau-bench)"
+            "no world models found; build one with `wmo build --file <traces> --name <name>`, "
+            "or fetch a published benchmark corpus first with `wmo download tau-bench`"
         )
     elif len(candidates) == 1:
-        label, store_root, resolved = candidates[0]
+        _label, store_root, resolved = candidates[0]
     elif _console.is_terminal:
         labels = [c[0] for c in candidates]
         chosen = _select_from(labels)
-        label, store_root, resolved = candidates[labels.index(chosen)]
+        _label, store_root, resolved = candidates[labels.index(chosen)]
     else:
-        have = ", ".join(c[2] for c in candidates)
-        raise typer.BadParameter(f"multiple world models ({have}); pass --name")
+        have = ", ".join(c[0] for c in candidates)
+        raise typer.BadParameter(
+            f"multiple world models ({have}); pass --name{_shadow_hint(candidates)}"
+        )
+    return store_root, resolved
 
-    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
-    return wm, resolved, provider, store_root
+
+def _shadow_hint(candidates: list[tuple[str, Path, str]]) -> str:
+    """Name the flag that reaches a shipped example a same-named local build shadows.
+
+    `--name` cannot separate the two (the local build always wins), so a listing that shows the
+    name twice has to say which flag can: `--root <the example dir>`.
+    """
+    names = [c[2] for c in candidates]
+    shadowed = [c for c in candidates if names.count(c[2]) > 1 and not c[0].endswith("(local)")]
+    if not shadowed:
+        return ""
+    label, store_root, shadowed_name = shadowed[0]
+    return (
+        f" (--name {shadowed_name} takes the local build; for '{label}' pass --root {store_root})"
+    )
 
 
 def _select_from(labels: list[str]) -> str:
@@ -3024,8 +3124,11 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
     resolved_name = _resolve_name(store, name)
     model_dir = store.resolve(resolved_name)
     config = load_config(model_dir)
+    serve_config = config.serve_provider_config()
+    backend = providers.get_provider(serve_config)
+    _prepare_serve_provider_or_exit(backend, serve_config)
     provider = wrap_provider_with_retries(
-        providers.get_provider(config.serve_provider_config()),
+        backend,
         on_retry=_NARRATOR.on_retry,
         sleep=_NARRATOR.sleep,
     )
@@ -3033,6 +3136,50 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
         str(model_dir), provider, telemetry_root=store.root, max_fidelity=max_fidelity
     )
     return world_model, resolved_name, provider
+
+
+def _prepare_serve_provider_or_exit(provider: Provider, config: ProviderConfig) -> None:
+    """Resolve the serve backend's local prerequisites before the first step, or exit cleanly.
+
+    Every backend builds its SDK client lazily, so a missing SDK or an unset credential otherwise
+    surfaces as the SDK's own exception mid-rollout, which Typer renders as a traceback.
+    `PreparableProvider.prepare` is the free, offline seam `wmo optimize route sweep` already
+    pre-flights with (no backend's `prepare` touches the network), so the interactive commands
+    fail here with the same hint `wmo providers verify` prints. Bedrock and tinker document a
+    residual gap they cannot close locally; those still fail on the first call.
+    """
+    if not isinstance(provider, PreparableProvider):
+        return
+    try:
+        provider.prepare()
+    except Exception as exc:  # noqa: BLE001 - every backend raises its own SDK's type here
+        _console.print(
+            f"[red]✗ {config.kind.value} ({config.model}) unusable[/red]: {escape(str(exc))}"
+        )
+        _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
+        _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
+        raise typer.Exit(1) from exc
+
+
+# Top-level modules whose exceptions mean "the backend refused", not "wmo has a bug": the provider
+# SDKs plus the HTTP transports they raise through. llm-waterfall gates its capacity/client
+# classification on the same set; this one answers a different question (is a credential hint the
+# right thing to print?), so it stays a local literal rather than importing a private name.
+_PROVIDER_SDK_MODULES = frozenset(
+    {"anthropic", "boto3", "botocore", "httpcore", "httpx", "openai", "tinker"}
+)
+
+
+def _is_provider_sdk_error(exc: Exception) -> bool:
+    """Whether `exc` was DEFINED by a provider SDK (bad creds, bad model id, refused request).
+
+    Deliberately narrow: wmo's own bugs must keep their traceback, so only exceptions whose class
+    (or a base of it) comes from a backend SDK are re-rendered as a setup error.
+    """
+    return any(
+        (getattr(klass, "__module__", "") or "").split(".")[0] in _PROVIDER_SDK_MODULES
+        for klass in type(exc).__mro__
+    )
 
 
 if __name__ == "__main__":
