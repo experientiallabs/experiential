@@ -221,6 +221,7 @@ class HarnessConfig(BaseModel):
         train_split: float = _DEFAULT_TRAIN_SPLIT,
         judge_model: str | None = None,
         trace_adapter: str = "otel-genai",
+        endpoint: str | None = None,
     ) -> HarnessConfig:
         """Assemble a build config from the choices `wmo build` collects.
 
@@ -236,6 +237,7 @@ class HarnessConfig(BaseModel):
             model_type=serve_spec.model_type,
             model=serve_spec.model_id,
             region=region,
+            endpoint=endpoint,
         )
         providers = [serve]
         if embed_provider is not EmbedderKind.HASHING:
