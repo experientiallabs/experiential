@@ -283,6 +283,19 @@ def servable_compressor(config: CompressionConfig | None) -> Compressor | None:
     if config is None:
         return None
     compressor = get_compressor(config.compressor_id)
+    if compressor.version != config.compressor_version:
+        # The id alone does not identify the bytes. A stamped version that this build cannot
+        # produce means the artifact was fitted against a DIFFERENT implementation of the same
+        # id, so its bank sits in that implementation's geometry: the same failure as serving a
+        # different compressor entirely, and invisible without this check.
+        raise ValueError(
+            f"compressor '{config.compressor_id}' is version {compressor.version} in this "
+            f"build, but the policy was fitted against version {config.compressor_version}. "
+            "The bytes a compressor emits are versioned, so its routing evidence does not "
+            "transfer across versions: refit under the running version "
+            "(`wmo optimize route fit --compressor <id> --aggressiveness <a>`), or deploy the "
+            "build whose compressor matches the artifact."
+        )
     if not compressor.append_stable:
         raise ValueError(
             f"compressor '{config.compressor_id}' is not attested append-stable, so it cannot be "

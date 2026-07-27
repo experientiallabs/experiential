@@ -197,3 +197,43 @@ def test_one_call_carries_every_segment() -> None:
     config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
     result = get_compressor("truncate").compress(["one two", "three four", "five six"], config)
     assert len(result.segments) == 3
+
+
+class _V2Compressor:
+    """Stands in for a compressor whose implementation was version-bumped under a stable id."""
+
+    id = "versioned-compression-test"
+    version = "2"
+    append_stable = True
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        del config
+        out = [segment.upper() for segment in segments]
+        return CompressionResult(
+            segments=out,
+            tokens_in_raw=sum(estimate_tokens(segment) for segment in segments),
+            tokens_in_compressed=sum(estimate_tokens(segment) for segment in out),
+            latency_s=0.0,
+        )
+
+
+_V2 = _V2Compressor()
+
+
+def test_a_config_version_the_build_cannot_produce_is_refused() -> None:
+    # The id alone does not identify the bytes. An artifact stamped against a version this
+    # build does not run was fitted in a DIFFERENT implementation's geometry, which is the same
+    # failure as serving a different compressor and is invisible without this check.
+    with pytest.raises(ValueError, match="version 1 in this build.*fitted against version 99"):
+        servable_compressor(CompressionConfig(compressor_id="truncate", compressor_version="99"))
+
+
+def test_a_version_bumped_implementation_refuses_the_old_stamp() -> None:
+    # The other direction: the build moved forward and the artifact did not.
+    register_compressor(_V2)
+    assert (
+        servable_compressor(CompressionConfig(compressor_id=_V2.id, compressor_version="2"))
+        is not None
+    )
+    with pytest.raises(ValueError, match="version 2 in this build.*fitted against version 1"):
+        servable_compressor(CompressionConfig(compressor_id=_V2.id, compressor_version="1"))

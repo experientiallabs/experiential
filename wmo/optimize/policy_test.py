@@ -1237,3 +1237,28 @@ def test_probe_rejects_an_embedder_that_returns_nothing(
         probe_embedder(
             EmbedderSpec(kind="azure", dim=3072, deployment="embed", endpoint="https://x")
         )
+def test_a_policy_stamped_with_an_unrunnable_compressor_version_does_not_mount() -> None:
+    # Requirement A at the version grain: same id, different implementation, different bytes.
+    with pytest.raises(ValidationError, match="fitted against version 99"):
+        RoutingPolicy(
+            kind="static",
+            default_model="haiku-4-5",
+            pool=_pool(),
+            compression=CompressionConfig(compressor_id="truncate", compressor_version="99"),
+        )
+
+
+def test_a_per_cluster_override_is_version_checked_too(tmp_path: Path) -> None:
+    policy = _rank_policy()
+    clusters = [
+        policy.clusters[0].model_copy(
+            update={
+                "compression": CompressionConfig(compressor_id="truncate", compressor_version="99")
+            }
+        ),
+        *policy.clusters[1:],
+    ]
+    path = tmp_path / "policy.json"
+    policy.model_copy(update={"clusters": clusters}).save(path)
+    with pytest.raises(ValidationError, match="fitted against version 99"):
+        RoutingPolicy.load(path)
