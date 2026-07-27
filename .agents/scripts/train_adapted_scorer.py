@@ -37,7 +37,9 @@ MAX_WORDS = 400  # window matching the server's chunk budget
 
 
 def load_examples(corpus: str) -> list[dict]:
-    path = HERE / f"labels-{corpus}.jsonl"
+    path = HERE / f"labels-{corpus}-aggressive.jsonl"
+    if not path.exists():
+        path = HERE / f"labels-{corpus}.jsonl"
     return [json.loads(ln) for ln in path.open()]
 
 
@@ -62,7 +64,6 @@ def main() -> None:
     args = ap.parse_args()
 
     import torch
-    from torch.utils.data import DataLoader
     from transformers import AutoModelForTokenClassification, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -103,6 +104,9 @@ def main() -> None:
                     target[row, pos] = labels[row][wid]
         return enc, target
 
+    p0, r0, f0, _ = eval_holdout(model)
+    log.info("STOCK holdout label agreement (pre-training): P=%.3f R=%.3f F1=%.3f", p0, r0, f0)
+
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=LR_LORA if args.arm == "lora" else LR_FULL,
@@ -124,36 +128,45 @@ def main() -> None:
             total += float(loss)
         log.info("epoch %d: mean loss %.4f", epoch, total / max(1, len(fit) // BATCH))
 
-    # Held-out label agreement + prob distribution for the matched-ratio comparison.
+    def eval_holdout(m) -> tuple[float, float, float, list[float]]:  # noqa: ANN001
+        m.eval()
+        tp = fp = fn = 0
+        probs: list[float] = []
+        keep_idx = 1  # id2label {0: LABEL_0, 1: LABEL_1}; 1 = preserve for this model
+        with torch.no_grad():
+            for i in range(0, len(holdout), BATCH):
+                enc, target = encode(holdout[i : i + BATCH])
+                enc = enc.to(args.device)
+                logits = m(**enc).logits
+                keep_p = torch.softmax(logits.float(), dim=-1)[:, :, keep_idx].cpu()
+                pred = keep_p >= 0.5
+                mask = target != -100
+                gold = target == 1
+                tp += int((pred & gold & mask).sum())
+                fp += int((pred & ~gold & mask).sum())
+                fn += int((~pred & gold & mask).sum())
+                probs.extend(keep_p[mask].tolist())
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        f1 = 2 * precision * recall / max(1e-9, precision + recall)
+        m.train()
+        return precision, recall, f1, probs
+
+    precision, recall, f1, probs_all = eval_holdout(model)
     model.eval()
-    tp = fp = fn = 0
-    probs_all: list[float] = []
-    with torch.no_grad():
-        for i in range(0, len(holdout), BATCH):
-            enc, target = encode(holdout[i : i + BATCH])
-            enc = enc.to(args.device)
-            logits = model(**enc).logits
-            keep_p = torch.softmax(logits.float(), dim=-1)[:, :, 1].cpu()
-            pred = keep_p >= 0.5
-            mask = target != -100
-            gold = target == 1
-            tp += int((pred & gold & mask).sum())
-            fp += int((pred & ~gold & mask).sum())
-            fn += int((~pred & gold & mask).sum())
-            probs_all.extend(keep_p[mask].tolist())
-    precision = tp / max(1, tp + fp)
-    recall = tp / max(1, tp + fn)
-    f1 = 2 * precision * recall / max(1e-9, precision + recall)
-    log.info("holdout label agreement: P=%.3f R=%.3f F1=%.3f", precision, recall, f1)
+    log.info("ADAPTED holdout label agreement: P=%.3f R=%.3f F1=%.3f", precision, recall, f1)
 
     out = args.out or str(HERE / f"adapted-{args.corpus}-{args.arm}")
-    (model.save_pretrained if hasattr(model, "save_pretrained") else None)(out)
+    model.save_pretrained(out)
     tokenizer.save_pretrained(out)
     Path(out, "eval.json").write_text(
         json.dumps(
             {
                 "corpus": args.corpus,
                 "arm": args.arm,
+                "stock_f1": f0,
+                "stock_precision": p0,
+                "stock_recall": r0,
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
