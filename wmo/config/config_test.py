@@ -142,6 +142,19 @@ def test_load_unreadable_config_raises_friendly_error(tmp_path: Path) -> None:
         config.chmod(0o644)
 
 
+def test_load_non_utf8_config_raises_friendly_error(tmp_path: Path) -> None:
+    # `tomllib.load` decodes before it parses, and UnicodeDecodeError is a ValueError rather than
+    # a TOMLDecodeError, so a non-UTF-8 artifact used to surface a bare codec error naming no file.
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    (root / "config.toml").write_bytes(b'system_prompt = "\x93hi\x94"\n')
+    with pytest.raises(ValueError) as excinfo:
+        load_config(root=root)
+    message = str(excinfo.value)
+    assert "not valid TOML" in message
+    assert str(root / "config.toml") in message
+
+
 def test_save_does_not_leave_temp_file(tmp_path: Path) -> None:
     root = tmp_path / ".wmo"
     save_config(HarnessConfig(), root=root)

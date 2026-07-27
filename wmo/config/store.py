@@ -161,15 +161,12 @@ class WorldModelStore:
         accuracy: float | None = None
         rollouts: int | None = None
         if paths.metrics.exists():
-            metrics = _read_json(paths.metrics)
-            if isinstance(metrics, dict):
-                accuracy = _as_float(metrics.get("held_out_accuracy"))
-                rollouts = _as_int(metrics.get("rollouts_used"))
+            metrics = _read_json(paths.metrics, dict)
+            accuracy = _as_float(metrics.get("held_out_accuracy"))
+            rollouts = _as_int(metrics.get("rollouts_used"))
         frontier_size: int | None = None
         if paths.frontier.exists():
-            frontier = _read_json(paths.frontier)
-            if isinstance(frontier, list):
-                frontier_size = len(frontier)
+            frontier_size = len(_read_json(paths.frontier, list))
         serve = config.serve_provider_config()
         model_type = serve.model_type or resolve_provider_model(serve.kind, serve.model).model_type
         return ModelInfo(
@@ -197,12 +194,27 @@ class WorldModelStore:
         return infos
 
 
-def _read_json(path: Path) -> JsonValue:
-    """Parse `path`, naming it in the error so a bad row can say which file is bad."""
+_JSON_SHAPE_NAMES: dict[type, str] = {dict: "object", list: "array"}
+
+
+def _read_json[T: dict | list](path: Path, shape: type[T]) -> T:
+    """Parse `path` as a JSON `shape`, naming it so a bad row can say which file is bad.
+
+    The shape is checked here rather than skipped past at the call site: an artifact whose
+    `metrics.json` holds an array is corrupt, and reading it as "this model has no metrics"
+    would print a row indistinguishable from a healthy model that was never evaluated.
+    """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # UnicodeDecodeError is a ValueError, not an OSError, so it needs naming here or a
+        # non-UTF-8 artifact reports a bare codec error with no path and no next step.
         raise ValueError(f"{path} could not be read ({exc}); re-run `wmo build`") from exc
+    if not isinstance(value, shape):
+        raise ValueError(
+            f"{path} is not a JSON {_JSON_SHAPE_NAMES[shape]}; re-run `wmo build` to regenerate it"
+        )
+    return value
 
 
 def _as_float(value: JsonValue) -> float | None:

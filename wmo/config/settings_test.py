@@ -77,6 +77,21 @@ def test_refused_settings_name_the_path_and_the_repair(
     assert "delete it and re-run `wmo providers set`" in message
 
 
+def test_non_utf8_settings_name_the_path_and_the_repair(tmp_path: Path) -> None:
+    # TOML is UTF-8 by definition, and `tomllib.load` decodes before it parses, so a file saved
+    # in another encoding raises UnicodeDecodeError — a ValueError that is not a TOMLDecodeError
+    # and so used to escape the guard as a bare codec error naming no file.
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    settings_path(root).write_bytes(b'[models.worker]\nprovider = "\x93openai\x94"\n')
+    with pytest.raises(ValueError) as excinfo:
+        load_settings(root)
+    message = str(excinfo.value)
+    assert "not valid TOML" in message
+    assert str(settings_path(root)) in message
+    assert "delete it and re-run `wmo providers set`" in message
+
+
 def test_model_roles_round_trip_through_toml(tmp_path: Path) -> None:
     root = tmp_path / ".wmo"
     settings = ProjectSettings(

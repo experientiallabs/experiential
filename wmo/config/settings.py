@@ -115,7 +115,10 @@ def load_settings(root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
     try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # A TOML document is UTF-8 by definition, so bytes that do not decode are the same
+        # "not valid TOML" answer; `tomllib.load` decodes before it parses, and the raw
+        # UnicodeDecodeError names neither the file nor the way out.
         raise ValueError(f"{path} is not valid TOML ({exc}); {_SETTINGS_REPAIR}") from exc
     except OSError as exc:
         raise ValueError(f"{path} could not be read ({exc}); {_SETTINGS_REPAIR}") from exc

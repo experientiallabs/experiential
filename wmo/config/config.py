@@ -361,7 +361,10 @@ def load_config(root: str | Path = ARTIFACT_DIR) -> HarnessConfig:
     try:
         with paths.config.open("rb") as fh:
             data = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # A TOML document is UTF-8 by definition, so bytes that do not decode are the same
+        # "not valid TOML" answer; `tomllib.load` decodes before it parses, and the raw
+        # UnicodeDecodeError names neither the file nor the way out.
         raise ValueError(
             f"{paths.config} is not valid TOML ({exc}); re-run `wmo build` to regenerate it"
         ) from exc
