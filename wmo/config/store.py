@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import json
 import re
-import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, JsonValue
 
 from wmo.config.card import ModelCard, load_card
-from wmo.config.config import ARTIFACT_DIR, ArtifactPaths, HarnessConfig
+from wmo.config.config import ARTIFACT_DIR, ArtifactPaths, load_config
 from wmo.providers.models import resolve_provider_model
 
 # The implicit model name used when the user does not pass `--name`.
@@ -64,6 +63,13 @@ class ModelInfo(BaseModel):
     held_out_accuracy: float | None = None
     rollouts_used: int | None = None
     frontier_size: int | None = None
+    error: str | None = None
+    """Why this artifact could not be read, on a row where the summary fields are unknown."""
+
+    @classmethod
+    def unreadable(cls, name: str, error: str) -> ModelInfo:
+        """A `wmo list` row standing in for an artifact that could not be summarized."""
+        return cls(name=name, serve_provider="-", serve_model="-", error=error)
 
 
 class WorldModelStore:
@@ -140,22 +146,28 @@ class WorldModelStore:
         return load_card(model_dir)
 
     def info(self, name: str) -> ModelInfo:
-        """Read a model's config + metrics into a summary (for `wmo list`)."""
+        """Read a model's config + metrics into a summary (for `wmo list`).
+
+        Raises:
+            FileNotFoundError: No artifact named `name` under this root.
+            ValueError: One of the artifact's files could not be read or parsed. Goes through
+                `load_config` / `_read_json` so the message names the offending file.
+        """
         model_dir = self.dir_for(name)
         if model_dir is None:
             raise FileNotFoundError(f"no world model named {name!r}")
         paths = ArtifactPaths(model_dir)
-        with paths.config.open("rb") as fh:
-            config = HarnessConfig.model_validate(tomllib.load(fh))
+        config = load_config(model_dir)
         accuracy: float | None = None
         rollouts: int | None = None
         if paths.metrics.exists():
-            metrics = json.loads(paths.metrics.read_text(encoding="utf-8"))
-            accuracy = _as_float(metrics.get("held_out_accuracy"))
-            rollouts = _as_int(metrics.get("rollouts_used"))
+            metrics = _read_json(paths.metrics)
+            if isinstance(metrics, dict):
+                accuracy = _as_float(metrics.get("held_out_accuracy"))
+                rollouts = _as_int(metrics.get("rollouts_used"))
         frontier_size: int | None = None
         if paths.frontier.exists():
-            frontier = json.loads(paths.frontier.read_text(encoding="utf-8"))
+            frontier = _read_json(paths.frontier)
             if isinstance(frontier, list):
                 frontier_size = len(frontier)
         serve = config.serve_provider_config()
@@ -170,7 +182,27 @@ class WorldModelStore:
         )
 
     def list_info(self) -> list[ModelInfo]:
-        return [self.info(name) for name in self.list_names()]
+        """One row per built model; an artifact that cannot be read becomes a row, not a raise.
+
+        `wmo list` is how you find out what a project holds, so one hand-edited or half-copied
+        `models/<name>/config.toml` must not hide every healthy model beside it. The failure
+        rides along in `ModelInfo.error` for the caller to render next to the good rows.
+        """
+        infos: list[ModelInfo] = []
+        for name in self.list_names():
+            try:
+                infos.append(self.info(name))
+            except (OSError, ValueError) as exc:
+                infos.append(ModelInfo.unreadable(name, str(exc)))
+        return infos
+
+
+def _read_json(path: Path) -> JsonValue:
+    """Parse `path`, naming it in the error so a bad row can say which file is bad."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path} could not be read ({exc}); re-run `wmo build`") from exc
 
 
 def _as_float(value: JsonValue) -> float | None:

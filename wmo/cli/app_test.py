@@ -26,7 +26,9 @@ from wmo.config import (
     FIDELITY_TIERS,
     FidelityTier,
     HarnessConfig,
+    ModelInfo,
     ModelRole,
+    WorldModelStore,
     load_config,
     load_settings,
     save_settings,
@@ -45,6 +47,10 @@ from wmo.providers.base import (
     verify_via_ping,
 )
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+
+# The exact text the tinker provider raises: the CLI hint has to recognise THAT
+# message, not a paraphrase of it.
+from wmo.providers.tinker import _MISSING_TINKER_EXTRA
 from wmo.tracking.pricing import ModelPrice
 
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
@@ -1883,6 +1889,79 @@ def test_list_empty_project_is_friendly(tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(app, ["list", "--root", str(tmp_path / ".wmo")])
     assert result.exit_code == 0
     assert "no world models" in result.output
+    # --root defaults to a cwd-relative `.wmo`, so "nothing built" and "wrong directory" read
+    # the same unless the empty listing says where it looked. Asserted on the tail of the path
+    # only: rich wraps a long tmp_path across lines.
+    flat = _flat(result.output)
+    assert "no world models built under" in flat
+    assert str(Path(".wmo") / "models") in flat
+
+
+def test_list_rejects_a_file_as_root(tmp_path) -> None:  # noqa: ANN001
+    # `--root traces.jsonl` used to report a healthy empty project; a file can never hold models/.
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("{}\n", encoding="utf-8")
+    result = runner.invoke(app, ["list", "--root", str(corpus)])
+    assert result.exit_code == 2
+    assert "is a file, not a project dir" in _flat(result.output)
+
+
+def test_list_shows_an_unreadable_artifact_as_a_row(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # One artifact this CLI cannot parse (a bundle from a newer CLI, a hand edit) used to
+    # traceback the whole listing; the healthy models beside it must still be listed.
+    root = tmp_path / ".wmo"
+    _build(root, "alpha-healthy", tmp_path)
+    broken = root / "models" / "zz-broken"
+    broken.mkdir(parents=True)
+    (broken / "config.toml").write_text("this is not toml =", encoding="utf-8")
+
+    result = runner.invoke(app, ["list", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None  # a bad row, not an escaped TOMLDecodeError
+    assert "alpha-healthy" in result.output
+    assert "unreadable" in result.output
+    assert "zz-broken" in result.output
+    assert "is not valid TOML" in _flat(result.output)
+
+
+def _write_broken_model(root: Path, name: str) -> None:
+    (root / "models" / name).mkdir(parents=True)
+    (root / "models" / name / "config.toml").write_text("this is not toml =", encoding="utf-8")
+
+
+def test_the_model_picker_offers_only_readable_artifacts(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `list_info` now hands back a row for an artifact it could not read, so the picker has to
+    # drop those rather than offer a choice that dead-ends the moment it is picked.
+    root = tmp_path / ".wmo"
+    _build(root, "alpha-healthy", tmp_path)
+    _build(root, "beta-healthy", tmp_path)
+    _write_broken_model(root, "zz-broken")
+    offered: list[str] = []
+
+    def fake_select_model(console: object, infos: list[ModelInfo]) -> str:
+        offered.extend(info.name for info in infos)
+        return infos[0].name
+
+    monkeypatch.setattr(cli_app_module, "_console", SimpleNamespace(is_terminal=True))
+    monkeypatch.setattr(cli_app_module, "select_model", fake_select_model)
+
+    assert cli_app_module._resolve_name(WorldModelStore(root), None) == "alpha-healthy"
+    assert offered == ["alpha-healthy", "beta-healthy"]
+
+
+def test_the_model_picker_reports_when_nothing_is_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".wmo"
+    for name in ("one-broken", "two-broken"):
+        _write_broken_model(root, name)
+    monkeypatch.setattr(cli_app_module, "_console", SimpleNamespace(is_terminal=True))
+
+    with pytest.raises(typer.BadParameter, match="no readable world model"):
+        cli_app_module._resolve_name(WorldModelStore(root), None)
 
 
 def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -2368,6 +2447,85 @@ def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noq
     assert not isinstance(result.exception, FileNotFoundError)
 
 
+# Hand-editing `.wmo/settings.toml` is documented (docs/reference/closed_loop.md), and a file
+# written by an older CLI outlives an upgrade, so every command that reads it has to fail as a
+# usage error naming the file — never as a tomllib/pydantic traceback.
+_BROKEN_SETTINGS = pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('[models.worker\nprovider = "openai"\n', "is not valid TOML"),
+        ('[models]\nworker = "openai"\n', "does not match the current settings schema"),
+    ],
+    ids=["malformed-toml", "schema-invalid"],
+)
+
+
+def _write_settings(tmp_path: Path, payload: str) -> Path:
+    root = tmp_path / ".wmo"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "settings.toml").write_text(payload, encoding="utf-8")
+    return root
+
+
+@_BROKEN_SETTINGS
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["providers", "verify"],
+        ["config", "telemetry", "status"],
+        ["config", "telemetry", "enable"],
+        ["providers", "set", "--provider", "openai", "--model", "gpt-5.4"],
+    ],
+    ids=["verify", "telemetry-status", "telemetry-enable", "providers-set"],
+)
+def test_broken_settings_is_a_usage_error_not_a_traceback(
+    tmp_path: Path, payload: str, expected: str, argv: list[str]
+) -> None:
+    root = _write_settings(tmp_path, payload)
+
+    result = runner.invoke(app, [*argv, "--root", str(root)])
+
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)  # BadParameter, not a leaked loader raise
+    flat = _flat(result.output)
+    assert expected in flat
+    assert "settings.toml" in flat
+    assert "delete it and re-run `wmo providers set`" in flat
+
+
+@_BROKEN_SETTINGS
+def test_providers_set_rejects_a_bad_provider_before_reading_settings(
+    tmp_path: Path, payload: str, expected: str
+) -> None:
+    # The caller's own argument is wrong too; the error must be about the argument they typed.
+    root = _write_settings(tmp_path, payload)
+
+    result = runner.invoke(
+        app, ["providers", "set", "--provider", "bogus", "--model", "x", "--root", str(root)]
+    )
+
+    assert result.exit_code == 2
+    assert "unknown provider 'bogus'" in _flat(result.output)
+    assert expected not in _flat(result.output)
+
+
+def test_providers_verify_unreadable_model_config_is_clean_error(tmp_path: Path) -> None:
+    # An artifact copied in by hand (or extracted from a bundle a newer CLI wrote) can hold a
+    # config.toml this CLI cannot parse; the command whose job is reporting configuration
+    # problems must report that one too.
+    broken = tmp_path / ".wmo" / "models" / "foo"
+    broken.mkdir(parents=True)
+    (broken / "config.toml").write_text("this is not toml [[[\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "foo/config.toml is not valid TOML" in flat
+    assert "re-run `wmo build`" in flat
+
+
 def _record_verify_all(monkeypatch: pytest.MonkeyPatch, pinged: list[ProviderConfig]) -> None:
     """Record exactly which providers `providers verify` decided to ping, and report them ok."""
 
@@ -2444,6 +2602,34 @@ def test_providers_verify_reports_a_role_failure_with_its_credentials(
     assert "fail bedrock" in result.output
     assert "[foo]" in result.output
     assert "AWS_ACCESS_KEY_ID" in result.output
+
+
+def test_providers_verify_missing_optional_sdk_points_at_the_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # tinker's SDK is an optional extra, and its ImportError text replaces the "No module named"
+    # wording the hint used to key on — so the hint said "check your credentials" on a failure
+    # that has nothing to do with credentials.
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="tinker", model="Qwen/Qwen3-8B")
+    save_settings(settings, root)
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: [
+            VerifyResult(ok=False, kind=c.kind, model=c.model, detail=_MISSING_TINKER_EXTRA)
+            for c in configs
+        ],
+    )
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    flat = _flat(result.output)
+    # pip is the documented install path, so the extra must be reachable without a checkout —
+    # and the `[distill]` must survive rich markup rather than being read as a style tag.
+    assert "pip install 'world-model-optimizer[distill]'" in flat
+    assert "credentials are set" not in flat
 
 
 def test_providers_verify_reports_built_model_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -2885,7 +3071,7 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
     monkeypatch.setattr(cli_app_module.providers, "get_provider", fake_get_provider)
     monkeypatch.setattr(
         cli_app_module,
-        "load_settings",
+        "load_settings_or_abort",
         lambda: ProjectSettings(
             models=ModelsSettings(
                 worker=ModelRole(provider="azure", model="gpt-5.4", endpoint="https://x/v1"),
@@ -2937,7 +3123,7 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
     from wmo.config.settings import ProjectSettings
 
     monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
-    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
     assert summary is worker
     assert worker is judge

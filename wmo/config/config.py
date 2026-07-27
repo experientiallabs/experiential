@@ -342,7 +342,13 @@ def _strip_none_object(obj: dict[str, JsonValue]) -> JsonObject:
 
 
 def load_config(root: str | Path = ARTIFACT_DIR) -> HarnessConfig:
-    """Read `.wmo/config.toml`. Raises a friendly error if the project hasn't been built yet."""
+    """Read `.wmo/config.toml`. Raises a friendly error if the project hasn't been built yet.
+
+    Raises:
+        FileNotFoundError: The root or its `config.toml` does not exist yet.
+        ValueError: The config exists but cannot be read, is not valid TOML, or does not match
+            the current schema. The message names the path and the repair.
+    """
     paths = ArtifactPaths(root)
     if not paths.root.exists():
         raise FileNotFoundError(
@@ -358,6 +364,13 @@ def load_config(root: str | Path = ARTIFACT_DIR) -> HarnessConfig:
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(
             f"{paths.config} is not valid TOML ({exc}); re-run `wmo build` to regenerate it"
+        ) from exc
+    except OSError as exc:
+        # An unreadable (root-owned, chmod 000, half-copied) artifact is the same user problem as
+        # a corrupt one, so it gets the same named-path error rather than a bare PermissionError.
+        raise ValueError(
+            f"{paths.config} could not be read ({exc}); fix the file's permissions, or re-run "
+            "`wmo build` to regenerate it"
         ) from exc
     try:
         return HarnessConfig.model_validate(data)

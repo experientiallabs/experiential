@@ -49,7 +49,7 @@ from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
 # mode-inapplicable flags exactly the way `wmo optimize harness` already does.
 from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
-from wmo.cli.model_roles import configured_role_configs
+from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
 from wmo.cli.platform_cmds import register as register_platform_commands
 from wmo.cli.ui import (
     BuildParams,
@@ -76,7 +76,6 @@ from wmo.config import (
     WorldModelStore,
     load_config,
     load_env_file,
-    load_settings,
     normalize_name,
     save_settings,
     set_telemetry_enabled,
@@ -239,14 +238,14 @@ def config_telemetry(
 ) -> None:
     """View or change project-local usage telemetry settings."""
     normalized = action.lower()
-    if normalized == "status":
-        settings = load_settings(root)
-    elif normalized == "enable":
-        settings = set_telemetry_enabled(True, root)
-    elif normalized == "disable":
-        settings = set_telemetry_enabled(False, root)
-    else:
+    if normalized not in ("status", "enable", "disable"):
         raise typer.BadParameter("action must be one of: status, enable, disable")
+    # Read through the guarded loader first: `set_telemetry_enabled` reads the same file to
+    # preserve the rest of it, so a corrupt settings.toml must fail here as a usage error naming
+    # the file rather than as a tomllib traceback from inside the write.
+    settings = load_settings_or_abort(root)
+    if normalized != "status":
+        settings = set_telemetry_enabled(normalized == "enable", root)
     state = "enabled" if settings.telemetry.enabled else "disabled"
     _console.print(f"telemetry {state} ({settings_path(root)})")
 
@@ -331,7 +330,11 @@ def providers_set(
             "set both --input-per-mtok and --output-per-mtok, or neither; a pool entry prices "
             "prompt and completion tokens together"
         )
-    existing = load_settings(root).models.worker
+    if provider is not None:
+        # Reject a bad --provider before reading the project's settings, so the argument the
+        # caller typed is what the error is about even in a project whose settings.toml is broken.
+        _provider_kind(provider)
+    existing = load_settings_or_abort(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:
         provider, model, region = select_provider_and_model(
@@ -374,7 +377,7 @@ def providers_set(
             _console.print(f"[red]provider verification failed[/red]: {detail}")
             raise typer.Exit(1)
 
-    settings = load_settings(root)
+    settings = load_settings_or_abort(root)
     settings.models.worker = ModelRole(
         provider=config.kind.value,
         model=config.model_type or model,
@@ -464,10 +467,11 @@ def providers_verify(
     configs: list[HarnessConfig] = []
     for model_name in names:
         try:
-            model_dir = str(store.resolve(model_name))
+            # Reading the artifact is inside the guard too: a model dir that exists but whose
+            # config.toml is corrupt or unreadable is a bad artifact, not an internal error.
+            configs.append(load_config(str(store.resolve(model_name))))
         except (FileNotFoundError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
-        configs.append(load_config(model_dir))
 
     # Dedup identical completion calls across all selected models, then across the settings
     # roles. World models come FIRST so a config present in both is pinged with the built
@@ -541,16 +545,17 @@ def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: st
     """Print one `providers verify` line, plus the next step to take when the ping failed.
 
     `sources` names what asked for this provider (world model names, `models.<role>` settings
-    roles) so a failure points at the thing to fix. The detail is escaped: it carries raw
-    provider error text, and an unescaped `[...]` in it would be read as rich markup and crash
-    the report.
+    roles) so a failure points at the thing to fix. The detail and the hint are escaped: they
+    carry raw provider error text and pip extras (`...[distill]`), and an unescaped `[...]` in
+    either would be read as rich markup and silently dropped from the report.
     """
     mark = "[green]ok[/green]" if result.ok else "[red]fail[/red]"
     origin = f" [dim]({', '.join(sources)})[/dim]" if sources else ""
     detail = f" {escape(result.detail)}" if result.detail else ""
     _console.print(f"{mark} {prefix}{result.kind.value} ({result.model}){origin}{detail}")
     if not result.ok:
-        _console.print(f"  [yellow]{_credential_hint(result.kind, result.detail)}[/yellow]")
+        hint = escape(_credential_hint(result.kind, result.detail))
+        _console.print(f"  [yellow]{hint}[/yellow]")
 
 
 @examples_app.command("list")
@@ -790,7 +795,7 @@ def build(
     needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
-    configured_worker = load_settings(root).models.resolve("worker")
+    configured_worker = load_settings_or_abort(root).models.resolve("worker")
     use_configured_worker = configured_worker is not None and (
         provider is None or provider == configured_worker.provider
     )
@@ -1081,9 +1086,28 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
             continue
         failed = True
         _console.print(f"  [red]✗ {label} ({result.model}) failed[/red]: {result.detail}")
-        _console.print(f"    [yellow]{_credential_hint(cfg.kind, result.detail)}[/yellow]")
+        hint = escape(_credential_hint(cfg.kind, result.detail))
+        _console.print(f"    [yellow]{hint}[/yellow]")
     if failed:
         raise typer.Exit(1)
+
+
+_PROVIDER_EXTRAS: dict[ProviderKind, str] = {ProviderKind.TINKER: "distill"}
+"""Providers whose SDK ships in an optional extra, keyed by kind so the hint can name the extra.
+
+Every other provider's SDK is a core dependency, so "the module is missing" means something
+different for them (a stale env) than it does here (an install step the user has not run yet).
+"""
+
+
+def _missing_sdk(detail: str) -> bool:
+    """Does a failed ping's detail mean "the SDK is absent" rather than "the creds are wrong"?
+
+    Two shapes reach here: the raw ImportError text of a core SDK ("No module named 'boto3'"), and
+    an optional extra's own message, which replaces that text with its install hint (see
+    `wmo.providers.tinker.check_tinker_prerequisites`) and so never contains the module wording.
+    """
+    return "No module named" in detail or "SDK is not installed" in detail
 
 
 def _credential_hint(kind: ProviderKind, detail: str) -> str:
@@ -1091,8 +1115,14 @@ def _credential_hint(kind: ProviderKind, detail: str) -> str:
 
     Shared by the pre-build guard and `wmo providers verify` so both name the same env vars.
     """
-    if "No module named" in detail:
-        # SDKs are core deps; a missing module means the env is stale or hand-rolled.
+    if _missing_sdk(detail):
+        extra = _PROVIDER_EXTRAS.get(kind)
+        if extra is not None:
+            return (
+                f"run `pip install 'world-model-optimizer[{extra}]'` (or `uv sync --extra {extra}` "
+                "in a checkout), then re-run `wmo providers verify`"
+            )
+        # The rest are core deps; a missing module means the env is stale or hand-rolled.
         return "run `uv sync` to install the provider SDKs"
     envs = ", ".join(PROVIDER_ENV_VARS.get(kind, []))
     hint = f" ({envs})" if envs else ""
@@ -1101,16 +1131,31 @@ def _credential_hint(kind: ProviderKind, detail: str) -> str:
 
 @app.command("list")
 def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list.")) -> None:
-    """List every world model built under the project dir."""
-    infos = WorldModelStore(root).list_info()
+    """List every world model built under the project dir.
+
+    An empty listing names the directory it searched, because `--root` defaults to a
+    cwd-relative `.wmo` and "nothing here" and "wrong directory" look identical otherwise.
+    An artifact that cannot be read is listed as `unreadable` with its reason, so one broken
+    `config.toml` costs you that one row instead of the whole listing.
+    """
+    if Path(root).is_file():
+        raise typer.BadParameter(
+            f"--root {root} is a file, not a project dir; pass the dir holding models/ "
+            f"(the default is `{ARTIFACT_DIR}`)"
+        )
+    store = WorldModelStore(root)
+    infos = store.list_info()
     if not infos:
         # Name the trace export too: `wmo build --name <name>` alone has no corpus to build from.
         _console.print(
-            "[yellow]no world models built yet[/yellow]; run "
+            f"[yellow]no world models built under {store.models_dir}[/yellow]; run "
             "`wmo build --name <name> --file <traces export>`"
         )
         return
     _console.print(models_table(infos))
+    for info in infos:
+        if info.error is not None:
+            _console.print(f"  [red]✗ {info.name}[/red]: {escape(info.error)}")
 
 
 @app.command("download")
@@ -2339,6 +2384,7 @@ def _unreadable_input(
 
 
 def _provider_kind(provider: str) -> ProviderKind:
+    """The `ProviderKind` a `--provider` flag names, as a usage error when it names none."""
     try:
         return ProviderKind(provider)
     except ValueError:
@@ -2389,7 +2435,7 @@ def _role_provider_config(role: str, region: str | None) -> ProviderConfig | Non
     generic `--region` flag — the flag also feeds the embedder, and e.g. a judge pinned to the
     one region where its model is enabled must not follow it.
     """
-    configured = load_settings().models.resolve(role)
+    configured = load_settings_or_abort().models.resolve(role)
     if configured is None:
         return None
     config = _provider_config(configured.provider, configured.model, configured.region or region)
@@ -2846,7 +2892,15 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         # Only enumerate full model summaries when we actually need the picker (>1 model on a TTY).
         # `list_names` is cheap (a dir scan); `list_info` reads every config/metrics/frontier file.
         if _console.is_terminal and len(store.list_names()) > 1:
-            return select_model(_console, store.list_info())
+            # An artifact `list_info` reports as unreadable cannot be run, so keep it off the
+            # menu; `wmo list` is where its reason is printed.
+            readable = [info for info in store.list_info() if info.error is None]
+            if not readable:
+                raise ValueError(
+                    f"no readable world model under {store.models_dir}; "
+                    "run `wmo list` to see what is wrong with each one"
+                )
+            return select_model(_console, readable)
         return store.resolve(None).name
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc

@@ -43,8 +43,9 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.agents.default import default_agent
+from wmo.cli.model_roles import load_settings_or_abort
 from wmo.config import ARTIFACT_DIR
-from wmo.config.settings import ModelRole, load_settings, save_settings, settings_path
+from wmo.config.settings import ModelRole, save_settings, settings_path
 from wmo.config.store import validate_name
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig, load_distill_config
@@ -1026,10 +1027,7 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
             f"skipped writing \\[models.agent]; paste the handoff snippet into {path} when ready"
         )
         return
-    try:
-        settings = load_settings(root)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    settings = load_settings_or_abort(root)
     settings.models.agent = ModelRole(
         provider="openai",
         model=result.final_sampler_path,

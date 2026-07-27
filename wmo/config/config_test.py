@@ -127,6 +127,21 @@ def test_load_schema_invalid_toml_raises_friendly_error(tmp_path: Path) -> None:
         load_config(root=root)
 
 
+def test_load_unreadable_config_raises_friendly_error(tmp_path: Path) -> None:
+    # A root-owned or chmod-000 artifact used to escape as a bare PermissionError with no path
+    # and no next step; it is the same user problem as a corrupt one.
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    config = root / "config.toml"
+    config.write_text("top_k = 3", encoding="utf-8")
+    config.chmod(0o000)
+    try:
+        with pytest.raises(ValueError, match="could not be read"):
+            load_config(root=root)
+    finally:
+        config.chmod(0o644)
+
+
 def test_save_does_not_leave_temp_file(tmp_path: Path) -> None:
     root = tmp_path / ".wmo"
     save_config(HarnessConfig(), root=root)

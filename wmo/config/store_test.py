@@ -82,3 +82,34 @@ def test_resolve_unknown_name_lists_available(tmp_path) -> None:  # noqa: ANN001
     _build_fake_model(store, "alpha")
     with pytest.raises(FileNotFoundError, match="alpha"):
         store.resolve("nope")
+
+
+def test_one_unreadable_artifact_does_not_hide_the_healthy_ones(tmp_path) -> None:  # noqa: ANN001
+    # A model dir arrives from `wmo pull` or a hand copy, so a config.toml this CLI cannot parse
+    # is an ordinary state. It must cost its own row, not the whole listing.
+    store = WorldModelStore(tmp_path / ".wmo")
+    _build_fake_model(store, "alpha-healthy")
+    for name, payload in (("zz-bad-toml", "this is not toml ="), ("zz-bad-schema", 'top_k = "x"')):
+        bad = store.model_dir(name)
+        bad.mkdir(parents=True)
+        (bad / "config.toml").write_text(payload, encoding="utf-8")
+
+    infos = {info.name: info for info in store.list_info()}
+
+    assert infos["alpha-healthy"].error is None
+    assert infos["alpha-healthy"].serve_provider == "bedrock"
+    # Each bad row names its own file and the way out.
+    assert "zz-bad-toml/config.toml is not valid TOML" in str(infos["zz-bad-toml"].error)
+    assert "re-run `wmo build`" in str(infos["zz-bad-toml"].error)
+    assert "does not match the current config schema" in str(infos["zz-bad-schema"].error)
+
+
+def test_unreadable_metrics_names_the_file_it_could_not_read(tmp_path) -> None:  # noqa: ANN001
+    # metrics.json is written after config.toml, so a half-written artifact fails here; the row
+    # has to say which file rather than a bare json decode position.
+    store = WorldModelStore(tmp_path / ".wmo")
+    _build_fake_model(store, "alpha")
+    ArtifactPaths(store.model_dir("alpha")).metrics.write_text("{not json", encoding="utf-8")
+
+    (info,) = store.list_info()
+    assert "metrics.json could not be read" in str(info.error)
