@@ -131,15 +131,16 @@ def main() -> None:
             segments = segments[:CAP_PER_CORPUS]
         suffix = ("-pilot" if args.pilot else "") + (f"-{args.instruction}" if args.instruction != "strict" else "")
         out_path = OUT_DIR / f"labels-{corpus}{suffix}.jsonl"
-        done: set[tuple[str, int]] = set()
+        done: set[tuple[str, int, int]] = set()
         if out_path.exists():
-            done = {(r["trace_id"], r["segment_index"]) for r in map(json.loads, out_path.open())}
+            done = {
+                (r["trace_id"], r["segment_index"], r.get("window_index", 0))
+                for r in map(json.loads, out_path.open())
+            }
         n_discarded = 0
         with out_path.open("a") as f:
             jobs: list[tuple] = []
             for trace_id, seg_idx, segment, task in segments:
-                if (trace_id, seg_idx) in done:
-                    continue
                 # One teacher call per word-window: a segment longer than max_tokens
                 # would otherwise truncate the teacher's output and mislabel the tail
                 # as drop (caught by the terminal-tasks pilot, keep_fraction 0.0).
@@ -151,6 +152,7 @@ def main() -> None:
                 jobs.extend(
                     (trace_id, seg_idx, win_idx, window, task)
                     for win_idx, window in enumerate(windows)
+                    if (trace_id, seg_idx, win_idx) not in done
                 )
 
             lock = threading.Lock()
@@ -165,12 +167,20 @@ def main() -> None:
                     f"TASK CONTEXT (for judging relevance only; never copy it into the "
                     f"output): {task[:1200]}\n\nTEXT TO COMPRESS:\n{window}"
                 )
-                completion = provider.complete(
-                    instruction,
-                    [Message(role="user", content=user_content)],
-                    temperature=0.0,
-                    max_tokens=2048,
-                )
+                try:
+                    completion = provider.complete(
+                        instruction,
+                        [Message(role="user", content=user_content)],
+                        temperature=0.0,
+                        max_tokens=2048,
+                    )
+                except Exception as exc:  # noqa: BLE001 - agent transcripts trip Azure's
+                    # jailbreak detector (instruction-shaped text); a filtered window is a
+                    # counted discard, never a crashed corpus.
+                    with lock:
+                        state["discarded"] += 1
+                    log.warning("window discarded (provider error): %s", str(exc)[:120])
+                    return
                 usage = completion.usage
                 cost = (usage.input_tokens * PRICE_IN + usage.output_tokens * PRICE_OUT) / 1e6
                 labels = align_labels(window, completion.text)

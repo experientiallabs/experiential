@@ -104,6 +104,30 @@ def main() -> None:
                     target[row, pos] = labels[row][wid]
         return enc, target
 
+    def eval_holdout(m) -> tuple[float, float, float, list[float]]:  # noqa: ANN001
+        m.eval()
+        tp = fp = fn = 0
+        probs: list[float] = []
+        keep_idx = 1  # id2label {0: LABEL_0, 1: LABEL_1}; 1 = preserve for this model
+        with torch.no_grad():
+            for i in range(0, len(holdout), BATCH):
+                enc, target = encode(holdout[i : i + BATCH])
+                enc = enc.to(args.device)
+                logits = m(**enc).logits
+                keep_p = torch.softmax(logits.float(), dim=-1)[:, :, keep_idx].cpu()
+                pred = keep_p >= 0.5
+                mask = target != -100
+                gold = target == 1
+                tp += int((pred & gold & mask).sum())
+                fp += int((pred & ~gold & mask).sum())
+                fn += int((~pred & gold & mask).sum())
+                probs.extend(keep_p[mask].tolist())
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        f1 = 2 * precision * recall / max(1e-9, precision + recall)
+        m.train()
+        return precision, recall, f1, probs
+
     p0, r0, f0, _ = eval_holdout(model)
     log.info("STOCK holdout label agreement (pre-training): P=%.3f R=%.3f F1=%.3f", p0, r0, f0)
 
@@ -128,29 +152,6 @@ def main() -> None:
             total += float(loss)
         log.info("epoch %d: mean loss %.4f", epoch, total / max(1, len(fit) // BATCH))
 
-    def eval_holdout(m) -> tuple[float, float, float, list[float]]:  # noqa: ANN001
-        m.eval()
-        tp = fp = fn = 0
-        probs: list[float] = []
-        keep_idx = 1  # id2label {0: LABEL_0, 1: LABEL_1}; 1 = preserve for this model
-        with torch.no_grad():
-            for i in range(0, len(holdout), BATCH):
-                enc, target = encode(holdout[i : i + BATCH])
-                enc = enc.to(args.device)
-                logits = m(**enc).logits
-                keep_p = torch.softmax(logits.float(), dim=-1)[:, :, keep_idx].cpu()
-                pred = keep_p >= 0.5
-                mask = target != -100
-                gold = target == 1
-                tp += int((pred & gold & mask).sum())
-                fp += int((pred & ~gold & mask).sum())
-                fn += int((~pred & gold & mask).sum())
-                probs.extend(keep_p[mask].tolist())
-        precision = tp / max(1, tp + fp)
-        recall = tp / max(1, tp + fn)
-        f1 = 2 * precision * recall / max(1e-9, precision + recall)
-        m.train()
-        return precision, recall, f1, probs
 
     precision, recall, f1, probs_all = eval_holdout(model)
     model.eval()
