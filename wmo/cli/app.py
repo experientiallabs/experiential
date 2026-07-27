@@ -1719,6 +1719,11 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     0.1.0 — the version the wheel still resolves from PyPI — so it is read defensively: a member
     that predates the field keeps the old assume-downloadable behaviour instead of raising
     `AttributeError` inside the error path.
+
+    A suite may list several `files`, and a fetch writes the corpus and its data dirs into the
+    bundle dir and nowhere else, so any missing path outside that dir survives the download. Those
+    are named too: `wmo download` is still the right first step, but on its own it would leave the
+    suite failing on exactly the same line.
     """
     files = suite.resolve_files()
     if not files:
@@ -1729,12 +1734,23 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     if missing:
         spec = CORPORA.get(suite.example)
         fetched = corpus_path(suite.example) if spec is not None else None
-        on_path = fetched is not None and fetched.resolve() in {p.resolve() for p in missing}
+        resolved = [path.resolve() for path in missing]
+        on_path = fetched is not None and fetched.resolve() in resolved
+        elsewhere = (
+            [p for p in resolved if not p.is_relative_to(fetched.parent.resolve())]
+            if fetched is not None
+            else resolved
+        )
         if on_path and getattr(spec, "published", True):
             remedy = (
                 f"fetch the bundle with `wmo download {suite.example}` (or `wmo download` with "
                 "no arguments to pick from what is published)"
             )
+            if elsewhere:
+                remedy += (
+                    f"; that will not produce {elsewhere}, which the suite resolves relative to "
+                    f"{suite.path.parent}"
+                )
         elif on_path:
             remedy = (
                 f"{suite.example!r} is a registered benchmark whose data bundle has not been "

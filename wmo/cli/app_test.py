@@ -2005,6 +2005,29 @@ def test_missing_suite_corpus_names_the_download_command(
     assert "`wmo download` with no arguments" in flat
 
 
+def test_missing_corpus_names_the_files_the_download_will_not_produce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A suite may list several `files`. `wmo download` writes the corpus and its data dirs into
+    # the bundle dir and nowhere else, so a second file outside it survives the fetch: naming the
+    # download alone would send the user back to the identical error.
+    examples_root = tmp_path / "environment-capture-data"
+    evals_dir = examples_root / "tau-bench" / "evals"
+    evals_dir.mkdir(parents=True)
+    outside = tmp_path / "extra" / "more.otel.jsonl"
+    (evals_dir / "default.toml").write_text(
+        f'files = ["../traces.otel.jsonl", "{outside}"]\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
+
+    result = runner.invoke(app, ["eval", "run", "tau-bench", "--examples-root", str(examples_root)])
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "wmo download tau-bench" in flat
+    assert "will not produce" in flat
+    assert str(outside) in _squashed(result.output)
+
+
 def test_missing_corpus_for_an_unpublished_bundle_does_not_promise_a_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
