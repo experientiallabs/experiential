@@ -75,3 +75,108 @@ def test_outcomes_must_name_pool_models() -> None:
             pool=matrix.pool,
             outcomes=[*matrix.outcomes, _outcome("s1", "ghost-model")],
         )
+
+
+def test_measured_compression_reads_the_arm_off_the_scored_rows() -> None:
+    matrix = OutcomeMatrix(
+        pool=[
+            PoolEntry(
+                name="a",
+                kind=ProviderKind.OPENAI,
+                model="a",
+                input_per_mtok=1.0,
+                output_per_mtok=1.0,
+            )
+        ],
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id="s1",
+                task="t",
+                model="a",
+                reward=1.0,
+                compressor_id="truncate",
+                compressor_version="1",
+                aggressiveness=0.5,
+            )
+        ],
+    )
+    config = matrix.measured_compression()
+    assert config is not None
+    assert config.compressor_id == "truncate"
+    assert config.aggressiveness == 0.5
+
+
+def test_a_matrix_with_no_compression_fields_reads_as_the_uncompressed_arm() -> None:
+    # Every matrix captured before D-COMPRESS existed, which must keep fitting exactly as before.
+    matrix = OutcomeMatrix(
+        pool=[
+            PoolEntry(
+                name="a",
+                kind=ProviderKind.OPENAI,
+                model="a",
+                input_per_mtok=1.0,
+                output_per_mtok=1.0,
+            )
+        ],
+        outcomes=[ScenarioOutcome(scenario_id="s1", task="t", model="a", reward=1.0)],
+    )
+    assert matrix.measured_compression() is None
+
+
+def test_a_matrix_that_mixes_arms_refuses_to_name_one() -> None:
+    # Two arms in one file: the rows are not comparable, so no single policy can be fitted
+    # from them and picking a winner here would hide that.
+    matrix = OutcomeMatrix(
+        pool=[
+            PoolEntry(
+                name="a",
+                kind=ProviderKind.OPENAI,
+                model="a",
+                input_per_mtok=1.0,
+                output_per_mtok=1.0,
+            )
+        ],
+        outcomes=[
+            ScenarioOutcome(scenario_id="s1", task="t", model="a", reward=1.0),
+            ScenarioOutcome(
+                scenario_id="s2",
+                task="t",
+                model="a",
+                reward=1.0,
+                compressor_id="truncate",
+                compressor_version="1",
+                aggressiveness=0.5,
+            ),
+        ],
+    )
+    with pytest.raises(ValueError, match="mixes compression configs"):
+        matrix.measured_compression()
+
+
+def test_an_unscored_row_does_not_decide_the_arm() -> None:
+    # An unscored episode produced no reward, so whatever it ran under cannot bias a fit.
+    matrix = OutcomeMatrix(
+        pool=[
+            PoolEntry(
+                name="a",
+                kind=ProviderKind.OPENAI,
+                model="a",
+                input_per_mtok=1.0,
+                output_per_mtok=1.0,
+            )
+        ],
+        outcomes=[
+            ScenarioOutcome(scenario_id="s1", task="t", model="a", reward=1.0),
+            ScenarioOutcome(
+                scenario_id="s2",
+                task="t",
+                model="a",
+                reward=None,
+                error="provider throttled",
+                compressor_id="truncate",
+                compressor_version="1",
+                aggressiveness=0.5,
+            ),
+        ],
+    )
+    assert matrix.measured_compression() is None

@@ -17,6 +17,7 @@ import pytest
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmo.ingest.otel_writer import write_traces_jsonl
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.sweep import (
@@ -86,9 +87,15 @@ def _pool_file(tmp_path: Path) -> Path:
     return path
 
 
-def _plan(tmp_path: Path, **overrides: int) -> SweepPlan:
+def _plan(
+    tmp_path: Path,
+    *,
+    scenarios: int = 3,
+    episodes: int = 1,
+    max_steps: int = 4,
+    compression: CompressionConfig | None = None,
+) -> SweepPlan:
     model_dir = _model_dir(tmp_path)
-    settings = {"scenarios": 3, "episodes": 1, "max_steps": 4} | overrides
     return plan_sweep(
         model_dir=model_dir,
         config=resolve_config(model_dir),
@@ -97,7 +104,10 @@ def _plan(tmp_path: Path, **overrides: int) -> SweepPlan:
         traces_file=None,
         assume_input_tokens=2000,
         assume_output_tokens=250,
-        **settings,
+        scenarios=scenarios,
+        episodes=episodes,
+        max_steps=max_steps,
+        compression=compression,
     )
 
 

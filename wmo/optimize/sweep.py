@@ -34,6 +34,7 @@ from wmo.env.closed_loop import evaluate_pool
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.env.scenarios import Scenario, scenarios_from_traces, tools_hint_from_traces
 from wmo.ingest import get_adapter
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, load_pool, prepare_pool_provider
@@ -123,6 +124,10 @@ class SweepPlan(BaseModel):
     # changes what the candidates are measured on, so two matrices swept at different values are
     # not comparable and the value has to travel with the run that produced them.
     history_chars: int = DEFAULT_HISTORY_CHARS
+    # The D-COMPRESS arm this sweep measures. Part of what the plan IS, not a detail of how it
+    # runs: it decides what the rewards MEAN, so two matrices swept under different compressors
+    # are different evidence, and a resumed run whose compressor changed must re-measure.
+    compression: CompressionConfig | None = None
     trace_count: int  # traces the corpus ingested, which is what decides `tiny_corpus`
     tiny_corpus: bool  # too small for a held-out band, so the scenarios are not leak-free
     assume_input_tokens: int
@@ -223,6 +228,7 @@ def plan_sweep(
     assume_input_tokens: int,
     assume_output_tokens: int,
     history_chars: int = DEFAULT_HISTORY_CHARS,
+    compression: CompressionConfig | None = None,
 ) -> SweepPlan:
     """Cut the held-out scenario set and project the spend, without touching the filesystem.
 
@@ -257,6 +263,7 @@ def plan_sweep(
         max_steps=max_steps,
         tools_hint=tools_hint_from_traces(train) or None,
         history_chars=history_chars,
+        compression=compression,
         trace_count=len(traces),
         tiny_corpus=tiny_corpus,
         assume_input_tokens=assume_input_tokens,
@@ -286,7 +293,15 @@ class SweepRun(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     matrix: OutcomeMatrix
+    # Candidate-side spend with the compressor's bill IN it. The D-COMPRESS accounting rule is
+    # that every savings number is effective cost per completed task, compressor inference cost
+    # and latency included, and `wmo.serving.savings` already sums both; a sweep reporting only
+    # the model half would be a second, quieter answer to the same question.
     candidate_usd: float
+    # The compressor's share of that total. Kept separately because it is the part the plan
+    # table cannot project, so the spend forecast has to divide it back out to stay like-for-like
+    # (see `wmo.optimize.pipeline.project_sweep_spend`).
+    compressor_usd: float = 0.0
     world_model_usage: RunRecord
     episodes_metered: int  # episodes whose world-model session reported usage
     episodes_unmetered: int  # episodes whose env exposed none (see `metering_gap`)
@@ -362,6 +377,7 @@ def execute_sweep(
                 tools_hint=plan.tools_hint,
                 history_chars=plan.history_chars,
                 on_outcome=on_outcome,
+                compression=plan.compression,
             )
     finally:
         # `evaluate_pool` can raise (a provider that fails to build, an env that does not score),
@@ -372,7 +388,10 @@ def execute_sweep(
     matrix.save(plan.out_path)
     return SweepRun(
         matrix=matrix,
-        candidate_usd=sum(outcome.cost_usd for outcome in matrix.outcomes),
+        candidate_usd=sum(
+            outcome.cost_usd + outcome.compressor_cost_usd for outcome in matrix.outcomes
+        ),
+        compressor_usd=sum(outcome.compressor_cost_usd for outcome in matrix.outcomes),
         world_model_usage=usage,
         episodes_metered=len(harvest.records),
         episodes_unmetered=harvest.unmetered,

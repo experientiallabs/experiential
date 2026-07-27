@@ -43,6 +43,8 @@ from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.compression import (
     CompressingEmbedder,
     CompressionConfig,
+    compression_signature,
+    same_compression,
     servable_compressor,
 )
 from wmo.optimize.knn import (
@@ -166,6 +168,22 @@ def sweep(
         "scenarios. The fit is then biased (both fitters skip unscored rows and weigh the rest per "
         "episode); the coverage table prints either way.",
     ),
+    compressor: str = typer.Option(
+        None,
+        "--compressor",
+        help="D-COMPRESS: measure every candidate call through this compressor (identity | "
+        "truncate), so the matrix is the compressed ARM of the grid. Default: uncompressed. "
+        "`fit` requires the matrix arm to match the policy it stamps.",
+    ),
+    aggressiveness: float = typer.Option(
+        0.0,
+        "--aggressiveness",
+        min=0.0,
+        max=1.0,
+        help="Compressor-defined dial in [0, 1] for --compressor: 0.0 is a no-op and higher "
+        "never removes less, but it is not an exact removal fraction (the achieved ratio is "
+        "recorded per episode).",
+    ),
 ) -> None:
     """Measure every pool candidate closed-loop and write the outcome matrix `fit` consumes.
 
@@ -226,6 +244,19 @@ def sweep(
     it, and the matrix is written either way.
     """
     out_path = Path(out)
+    if compressor is None and aggressiveness > 0.0:
+        raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
+    sweep_compression = None
+    if compressor is not None:
+        sweep_compression = CompressionConfig(
+            compressor_id=compressor, aggressiveness=aggressiveness
+        )
+        try:
+            # Checked before a single episode is paid for, and against the SERVING rule: there
+            # is no point measuring an arm whose compressor could never be mounted.
+            servable_compressor(sweep_compression)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     store = WorldModelStore(root)
     try:
         model_dir = store.resolve(model)
@@ -849,6 +880,21 @@ def fit(
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
         compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
+    # The rewards in this matrix were produced under SOME compression config, and a joint fit is
+    # only joint if that config is the one being fitted. `--compressor` moves the fit-side
+    # representation (embeddings), but it cannot retroactively change what the episodes ran
+    # under: fitting a compressed policy over uncompressed rewards would stamp an arm that was
+    # never measured. Checked both directions, since compressed rewards under a raw fit is the
+    # same mistake mirrored.
+    measured = matrix.measured_compression()
+    if not same_compression(measured, compression):
+        raise typer.BadParameter(
+            f"this matrix's rewards were measured with {compression_signature(measured)}, but "
+            f"the fit would stamp {compression_signature(compression)}. Rewards cannot be "
+            "recompressed after the fact, so measure the arm you intend to serve: "
+            "`wmo optimize route sweep <model> --compressor <id> --aggressiveness <a>` writes a "
+            "matrix whose episodes actually ran that way (one matrix per arm)."
+        )
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(

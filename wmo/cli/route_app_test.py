@@ -22,6 +22,7 @@ from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, S
 from wmo.distill.store import DistillModelCard
 from wmo.engine.world_model import WorldModel
 from wmo.ingest.otel_writer import write_traces_jsonl
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.reward import EpisodeScore
@@ -45,7 +46,24 @@ from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 runner = CliRunner()
 
 
-def _matrix_file(tmp_path: Path) -> Path:
+def _arm(compression: CompressionConfig | None) -> tuple[str, str, float]:
+    """The D-COMPRESS fields an episode measured under `compression` would carry.
+
+    A matrix records the arm its rewards were produced under, and `fit` refuses to stamp a
+    policy whose compression config disagrees, so a fixture fitting `--compressor` has to look
+    like episodes that actually ran that way.
+    """
+    if compression is None:
+        return "", "", 0.0
+    return (
+        compression.compressor_id,
+        compression.compressor_version,
+        compression.aggressiveness,
+    )
+
+
+def _matrix_file(tmp_path: Path, *, compression: CompressionConfig | None = None) -> Path:
+    """The uncompressed arm by default; `compression` stamps the rows as that arm instead."""
     pool = [
         PoolEntry(
             name="a", kind=ProviderKind.OPENAI, model="a", input_per_mtok=1.0, output_per_mtok=1.0
@@ -54,6 +72,7 @@ def _matrix_file(tmp_path: Path) -> Path:
             name="b", kind=ProviderKind.OPENAI, model="b", input_per_mtok=1.0, output_per_mtok=1.0
         ),
     ]
+    arm_id, arm_version, arm_aggressiveness = _arm(compression)
     outcomes = []
     tasks = {
         "s1": "SELECT count(*) FROM t",
@@ -73,6 +92,9 @@ def _matrix_file(tmp_path: Path) -> Path:
                     reward=1.0 if wins else 0.0,
                     success=wins,
                     cost_usd=0.001,
+                    compressor_id=arm_id,
+                    compressor_version=arm_version,
+                    aggressiveness=arm_aggressiveness,
                 )
             )
     path = tmp_path / "matrix.json"
@@ -134,7 +156,13 @@ def test_route_fit_rejects_unknown_embedder(tmp_path: Path) -> None:
     assert "hashing or azure" in result.output
 
 
-def _knn_matrix_file(tmp_path: Path, *, flip: bool = False, name: str = "knn_matrix.json") -> Path:
+def _knn_matrix_file(
+    tmp_path: Path,
+    *,
+    flip: bool = False,
+    name: str = "knn_matrix.json",
+    compression: CompressionConfig | None = None,
+) -> Path:
     """Twelve scenarios: enough neighbors per query for a guarded fit to route at all.
 
     `flip` swaps which model wins each half, so two matrices built here disagree on every cell.
@@ -165,6 +193,7 @@ def _knn_matrix_file(tmp_path: Path, *, flip: bool = False, name: str = "knn_mat
         "write a gentle reminder about the expense deadline",
         "write a farewell note for a departing teammate",
     ]
+    arm_id, arm_version, arm_aggressiveness = _arm(compression)
     outcomes = []
     for group, tasks in (("sql", sql), ("prose", prose)):
         for index, task in enumerate(tasks):
@@ -178,6 +207,9 @@ def _knn_matrix_file(tmp_path: Path, *, flip: bool = False, name: str = "knn_mat
                         reward=1.0 if wins else 0.0,
                         success=wins,
                         cost_usd=0.001,
+                        compressor_id=arm_id,
+                        compressor_version=arm_version,
+                        aggressiveness=arm_aggressiveness,
                     )
                 )
     path = tmp_path / name
@@ -2236,7 +2268,8 @@ def test_route_sweep_persists_the_world_models_own_spend_as_a_run_record(
 
 
 def test_route_fit_writes_compression_config(tmp_path: Path) -> None:
-    matrix_file = _matrix_file(tmp_path)
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    matrix_file = _matrix_file(tmp_path, compression=config)
     policy_file = tmp_path / "policy.json"
     result = runner.invoke(
         app,
@@ -2309,13 +2342,14 @@ def test_route_fit_stamps_what_the_evidence_was_fitted_under(tmp_path: Path) -> 
     # onto the compressed representation and records that on the artifact, which is what makes
     # the resulting policy mountable at all.
     policy_file = tmp_path / "policy.json"
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
     result = runner.invoke(
         app,
         [
             "optimize",
             "route",
             "fit",
-            str(_knn_matrix_file(tmp_path)),
+            str(_knn_matrix_file(tmp_path, compression=config)),
             "--kind",
             "knn",
             "--out",
@@ -2332,3 +2366,84 @@ def test_route_fit_stamps_what_the_evidence_was_fitted_under(tmp_path: Path) -> 
     policy = RoutingPolicy.load(policy_file)  # loads, so the mount gate is satisfied
     assert policy.fit_compression is not None
     assert policy.fit_compression == policy.compression
+
+
+def test_route_fit_refuses_to_stamp_an_arm_the_matrix_never_measured(tmp_path: Path) -> None:
+    # The contract gap: --compressor moved the fit-side embeddings but could not retroactively
+    # change what the EPISODES ran under, so a compressed policy could be stamped over rewards
+    # measured uncompressed. That is a joint fit over an arm nobody ran.
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_matrix_file(tmp_path)),  # uncompressed rewards
+            "--out",
+            str(tmp_path / "policy.json"),
+            "--compressor",
+            "truncate",
+            "--aggressiveness",
+            "0.5",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "measured with raw text" in result.output
+    assert "one matrix per arm" in result.output
+
+
+def test_route_fit_refuses_compressed_rewards_under_a_raw_fit(tmp_path: Path) -> None:
+    # The mirror image, and the same error: rewards produced under compression do not describe
+    # an endpoint that serves raw text.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_matrix_file(tmp_path, compression=config)),
+            "--out",
+            str(tmp_path / "policy.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "would stamp raw text" in result.output
+
+
+def test_route_sweep_rejects_an_unservable_compressor_before_spending(tmp_path: Path) -> None:
+    # The arm has to be one that could actually be served, and the check lands before any
+    # episode is paid for.
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "support",
+            "--compressor",
+            "llmzip",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "unknown compressor" in result.output
+
+
+def test_route_sweep_rejects_orphan_aggressiveness(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "sweep",
+            "support",
+            "--aggressiveness",
+            "0.5",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "--compressor" in result.output
