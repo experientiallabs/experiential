@@ -167,6 +167,20 @@ class EmbedderSpec(BaseModel):
         return BatchedEmbedder(provider, batch=self.batch)
 
 
+def embedder_provenance(spec: EmbedderSpec) -> str:
+    """The embedding-function half of `fitted_from`, taken from the spec serving rebuilds.
+
+    Derived from `EmbedderSpec` rather than from the caller's flags, so it cannot describe an
+    embedder different from the one recorded in the artifact. The azure RESOURCE is part of the
+    identity and not just the deployment name: two accounts routinely hold a deployment of the
+    same name and dimension, their embeddings are not interchangeable, and a refit that only
+    repointed the endpoint therefore has to read as a different fit. The credential variable is
+    left out on purpose: renaming it does not move a single vector.
+    """
+    tag = f"{spec.kind}-{spec.dim}"
+    return tag if spec.kind == "hashing" else f"{tag}/{spec.deployment}@{spec.endpoint}"
+
+
 @dataclass(frozen=True)
 class KnnBank:
     """The fit-split evidence a `knn` policy routes against: the `.npz` sidecar's contents.

@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.optimize.policy import (
     DEFAULT_KNN_MIN_PAIRS,
@@ -45,7 +45,11 @@ from wmo.optimize.policy import (
     EmbedderSpec,
     KnnBank,
     RoutingPolicy,
+    embedder_provenance,
+    knn_bank_path_for,
+    write_artifact_atomically,
 )
+from wmo.optimize.routing import evaluate_policy
 
 if TYPE_CHECKING:
     from wmo.optimize.outcomes import OutcomeMatrix
@@ -259,6 +263,87 @@ def fit_knn_policy(
         bank_path,
     )
     return policy
+
+
+class KnnFitOutcome(BaseModel):
+    """A written knn policy plus what replaying it over its own fit matrix scored."""
+
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    policy: RoutingPolicy
+    out_path: Path
+    bank_path: Path
+    scenarios: int
+    # IN-SAMPLE: every request retrieves its own row. Held-out numbers come from the report.
+    fit_accuracy: float
+    cost_per_scenario: float
+    routed_share: float  # fraction of fit scenarios that left the fallback
+
+
+def fit_knn_artifact(
+    matrix: OutcomeMatrix,
+    *,
+    out_path: Path,
+    matrix_source: str,
+    embedder: EmbedderSpec,
+    fallback: str | None = None,
+    z: float = DEFAULT_KNN_Z,
+    rag_num: int = DEFAULT_RAG_NUM,
+    rag_thres: float = DEFAULT_RAG_THRES,
+    min_pairs: int = DEFAULT_KNN_MIN_PAIRS,
+    se_floor: bool = True,
+    floor_q: float = 0.05,
+) -> KnnFitOutcome:
+    """Fit a knn policy, write it and its bank sidecar, and replay it over the fit matrix.
+
+    The whole knn `fit` step in one call, so `wmo optimize route fit --kind knn` and the fit stage
+    of `wmo optimize model` produce byte-identical artifacts from identical inputs. Three details
+    are the reason this is shared rather than reimplemented per caller:
+
+    - ONE embedder is built and used for both the fit and the replay; an azure spec would
+      otherwise open a second client and embed every scenario twice.
+    - The bank sidecar is named after `out_path` and sits beside it, and the fit records that
+      name in the policy JSON, so a second knn fit into the same directory gets its own bank
+      instead of overwriting this one's.
+    - `fitted_from` records the matrix digest, every knob, and the embedder identity, which is
+      what lets `tune_policy_dial` tell a fit from a superseded one.
+
+    Raises:
+        ValueError: `rag_thres` is not positive, or the fit itself refuses the matrix.
+    """
+    if rag_thres <= 0.0:
+        raise ValueError("rag_thres must be greater than 0")
+    built = embedder.build()
+    embed_tag = embedder_provenance(embedder)
+    policy = fit_knn_policy(
+        matrix,
+        bank_path=knn_bank_path_for(out_path),
+        embedder=embedder,
+        embed_with=built,
+        guard_model=fallback,
+        rag_num=rag_num,
+        rag_thres=rag_thres,
+        z=z,
+        min_pairs=min_pairs,
+        se_floor=se_floor,
+        floor_q=floor_q,
+        fitted_from=(
+            f"{matrix_source} knn fallback={fallback or 'auto'} z={z:g} k={rag_num} "
+            f"thres={rag_thres:g} pairs={min_pairs} se_floor={se_floor} q={floor_q:g} "
+            f"{embed_tag}"
+        ),
+    )
+    policy.save(out_path)
+    result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
+    return KnnFitOutcome(
+        policy=policy,
+        out_path=out_path,
+        bank_path=policy.bank_path(),
+        scenarios=result.scenarios,
+        fit_accuracy=result.accuracy,
+        cost_per_scenario=result.cost_per_scenario,
+        routed_share=1.0 - result.model_mix.get(policy.default_model, 0.0),
+    )
 
 
 # --------------------------------------------------------------------------- the operator dial
@@ -493,3 +578,68 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
     # 10MB sidecar, and a research caller may have attached a bank that is not on disk at all.
     adjusted.attach_bank(bank)
     return adjusted
+
+
+class DialResult(BaseModel):
+    """What one applied dial position produced, for the caller to report."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    cost_quality: float
+    named_point: CostQualityPointName
+    knobs: CostQualityKnobs
+    policy_path: Path
+    base_path: Path  # the as-fitted snapshot every later slide is re-applied from
+
+
+def tune_policy_dial(policy_path: Path, cost_quality: float) -> DialResult:
+    """Set a fitted policy's cost/quality dial on disk, without refitting anything.
+
+    The first successful slide copies the un-tuned artifact to `<stem>.base<suffix>` and every
+    later one re-reads THAT, so the dial is always applied to the policy as fitted and sliding
+    twice never compounds.
+
+    That snapshot is only a valid baseline for the fit it came from, so a snapshot describing a
+    different fit is refused rather than silently dialed back over the new one. A refused slide
+    writes nothing at all, and every write it does make is atomic.
+
+    Raises:
+        ValueError: There is no policy at `policy_path`, the snapshot beside it belongs to a
+            superseded fit, or the policy has no dial (see `apply_cost_quality`).
+    """
+    if not policy_path.is_file():
+        raise ValueError(f"no policy file at {policy_path}")
+    policy = RoutingPolicy.load(policy_path)
+    base_path = policy_path.with_name(f"{policy_path.stem}.base{policy_path.suffix}")
+    as_fitted = RoutingPolicy.load(base_path) if base_path.is_file() else None
+    if as_fitted is not None and (as_fitted.kind, fit_provenance(as_fitted)) != (
+        policy.kind,
+        fit_provenance(policy),
+    ):
+        # A fit overwrites the policy without touching this snapshot, so a refit leaves one
+        # behind that describes a policy that no longer exists. Dialing it would report success
+        # while replacing the new fit with a slid copy of the superseded one.
+        raise ValueError(
+            f"{base_path} is the as-fitted snapshot of a different fit than {policy_path}: the "
+            f"snapshot holds kind='{as_fitted.kind}' from '{fit_provenance(as_fitted)}', the "
+            f"policy holds kind='{policy.kind}' from '{fit_provenance(policy)}'. Tuning it "
+            f"would overwrite the current fit with a dialed copy of the old one. Delete "
+            f"{base_path} to re-baseline the dial on the fit that is on disk now."
+        )
+    tuned = apply_cost_quality(policy if as_fitted is None else as_fitted, cost_quality)
+    if as_fitted is None:
+        # Preserve the artifact as fitted, so the dial is always re-appliable from the fit and
+        # never from an already-slid copy of itself. Written only now that the dial has applied:
+        # a snapshot left behind by a REJECTED slide would poison the path for the next fit.
+        # Both writes are atomic, so the only interruption that leaves a snapshot behind is one
+        # where the policy is still the as-fitted bytes the snapshot copied, which is consistent
+        # rather than stale.
+        write_artifact_atomically(base_path, policy_path.read_bytes())
+    tuned.save(policy_path)
+    return DialResult(
+        cost_quality=cost_quality,
+        named_point=cost_quality_named_point(cost_quality),
+        knobs=cost_quality_knobs(cost_quality),
+        policy_path=policy_path,
+        base_path=base_path,
+    )

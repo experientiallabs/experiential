@@ -17,7 +17,6 @@ from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.cli.app import app
-from wmo.cli.route_app import _embedder_provenance
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.distill.store import DistillModelCard
@@ -507,31 +506,6 @@ def test_route_tune_survives_a_matrix_path_that_looks_like_a_dial_suffix(tmp_pat
     after = RoutingPolicy.load(policy_file)
     assert after.default_model == "b"  # the refit survives, not a dialed copy of the old fit
     assert after.cost_quality is None
-
-
-def test_embedder_provenance_separates_two_azure_resources() -> None:
-    """A deployment name is not an embedder identity; the resource behind it is.
-
-    Two Azure accounts routinely hold a deployment of the same name and dimension, and their
-    embeddings are not interchangeable. If both fits render the same `fitted_from`, `tune`
-    accepts the pre-refit snapshot and dials the superseded fit over the new one.
-    """
-
-    def azure(endpoint: str, api_key_env: str | None = None) -> EmbedderSpec:
-        return EmbedderSpec(
-            kind="azure",
-            dim=3072,
-            deployment="text-embedding-3-large",  # the SAME deployment name on both resources
-            endpoint=endpoint,
-            api_key_env=api_key_env,
-        )
-
-    east = _embedder_provenance(azure("https://east.openai.azure.com"))
-    assert east != _embedder_provenance(azure("https://west.openai.azure.com"))
-    # ...and the axes that do not move a vector stay out of it: renaming the credential variable
-    # must not read as a refit.
-    assert _embedder_provenance(azure("https://east.openai.azure.com", "OTHER_KEY")) == east
-    assert _embedder_provenance(EmbedderSpec(dim=512)) == "hashing-512"
 
 
 def test_route_tune_that_fails_leaves_no_base_snapshot_behind(tmp_path: Path) -> None:

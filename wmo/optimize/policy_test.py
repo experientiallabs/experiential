@@ -17,6 +17,7 @@ from wmo.optimize.policy import (
     EmbedderSpec,
     KnnBank,
     RoutingPolicy,
+    embedder_provenance,
     knn_decision,
     rank_decision,
     select_model,
@@ -754,3 +755,28 @@ def test_a_genuine_baseline_win_still_says_the_baseline_led() -> None:
     assert decision.model == "fable-5"
     assert "leads 12 neighbors" in decision.reason
     assert "cost knob" not in decision.reason
+
+
+def test_embedder_provenance_separates_two_azure_resources() -> None:
+    """A deployment name is not an embedder identity; the resource behind it is.
+
+    Two Azure accounts routinely hold a deployment of the same name and dimension, and their
+    embeddings are not interchangeable. If both fits render the same `fitted_from`, `tune`
+    accepts the pre-refit snapshot and dials the superseded fit over the new one.
+    """
+
+    def azure(endpoint: str, api_key_env: str | None = None) -> EmbedderSpec:
+        return EmbedderSpec(
+            kind="azure",
+            dim=3072,
+            deployment="text-embedding-3-large",  # the SAME deployment name on both resources
+            endpoint=endpoint,
+            api_key_env=api_key_env,
+        )
+
+    east = embedder_provenance(azure("https://east.openai.azure.com"))
+    assert east != embedder_provenance(azure("https://west.openai.azure.com"))
+    # ...and the axes that do not move a vector stay out of it: renaming the credential variable
+    # must not read as a refit.
+    assert embedder_provenance(azure("https://east.openai.azure.com", "OTHER_KEY")) == east
+    assert embedder_provenance(EmbedderSpec(dim=512)) == "hashing-512"

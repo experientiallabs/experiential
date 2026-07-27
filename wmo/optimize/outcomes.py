@@ -8,12 +8,18 @@ number of policy variants offline on identical data. Produced by `wmo.env.closed
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
+
+# Provenance carries a digest of the matrix, not just its path: a corpus is routinely rebuilt in
+# place under the same filename, and a fit is identified by the data it saw. 16 hex characters
+# is 64 bits, far past collision risk for the handful of matrices one artifact directory sees.
+MATRIX_DIGEST_CHARS = 16
 
 
 class ScenarioOutcome(BaseModel):
@@ -101,3 +107,26 @@ class OutcomeMatrix(BaseModel):
     @classmethod
     def load(cls, path: Path) -> OutcomeMatrix:
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def load_matrix_with_digest(matrix_file: Path) -> tuple[OutcomeMatrix, str]:
+    """The matrix and its `<path> sha256=<digest>` provenance, from ONE read of the file.
+
+    The digest is what makes a policy's `fitted_from` an identity rather than a label. `tune`
+    compares it against the as-fitted snapshot beside a policy, and two fits of the same path with
+    different contents (or the same contents at two paths) have to come out different for that
+    check to protect anything.
+
+    Both come out of the same bytes on purpose. Digesting a SECOND read would let a corpus
+    rebuilt in place between the two describe the fit as having seen bytes it never saw: the
+    policy would be fitted from the old matrix and stamped with the new one's digest, so the
+    next fit of that new matrix would match its provenance and `tune` would accept the
+    superseded snapshot, the exact failure the digest exists to catch, reintroduced by
+    reading twice.
+    """
+    payload = matrix_file.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    return (
+        OutcomeMatrix.model_validate_json(payload),
+        f"{matrix_file} sha256={digest[:MATRIX_DIGEST_CHARS]}",
+    )

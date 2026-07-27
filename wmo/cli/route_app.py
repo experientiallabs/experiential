@@ -20,60 +20,61 @@ customer copy never says router.
 
 from __future__ import annotations
 
-import hashlib
 import itertools
-import os
 from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
 import typer
 from llm_waterfall import ChatMaxTokensField
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.prompt import Confirm
 from rich.table import Table
 
-from wmo.config import ARTIFACT_DIR, WorldModelStore, load_config
-from wmo.core.types import Trace
+from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
-from wmo.engine import load_world_model, split_holdout
+from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
-from wmo.env.closed_loop import evaluate_pool
-from wmo.env.scenarios import scenarios_from_traces, tools_hint_from_traces
-from wmo.ingest import get_adapter
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
-    apply_cost_quality,
-    cost_quality_knobs,
-    cost_quality_named_point,
-    fit_knn_policy,
-    fit_provenance,
+    DialResult,
+    KnnFitOutcome,
+    fit_knn_artifact,
+    tune_policy_dial,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, load_matrix_with_digest
 from wmo.optimize.policy import (
     POLICY_FILENAME,
     EmbedderSpec,
     RoutingPolicy,
-    knn_bank_path_for,
-    write_artifact_atomically,
+    embedder_provenance,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
-from wmo.providers.base import ProviderKind, TokenUsage
+from wmo.optimize.sweep import (
+    CandidateCoverage,
+    DeferredRisk,
+    SweepError,
+    SweepPlan,
+    Unevenness,
+    coverage,
+    execute_sweep,
+    plan_sweep,
+    preflight_pool,
+    resolve_config,
+    unevenness,
+)
 from wmo.providers.pool import (
     DEFAULT_POOL_PATH,
-    ModelPool,
     PoolEntry,
     PoolLockTimeout,
     load_pool,
-    prepare_pool_provider,
     upsert_pool_entry,
 )
-from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
 
 # The two output-budget parameter names any OpenAI-compatible backend accepts.
 _MAX_TOKENS_FIELDS: tuple[ChatMaxTokensField, ...] = ("max_tokens", "max_completion_tokens")
@@ -218,87 +219,46 @@ def sweep(
             f"multiple world models built ({', '.join(names)}); name one as the MODEL argument, "
             f"e.g. `wmo optimize route sweep {names[0]}`"
         ) from exc
-    try:
-        config = load_config(model_dir)
-    except (FileNotFoundError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    try:
-        pool = load_pool(Path(pool_file))
-    except (FileNotFoundError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    # Everything knowable without spending is checked BEFORE the cost question: a candidate whose
+    # Everything knowable without spending is settled BEFORE the cost question: a candidate whose
     # backend cannot even be constructed, or an --out that cannot be written, would otherwise
     # surface after the sweep had already paid for cells it then throws away.
-    _check_pool_backends(pool)
-    _check_out_writable(out_path)
-
-    traces = _corpus_traces(model_dir, config.trace_adapter, traces_file)
-    train, holdout, tiny_corpus = split_holdout(
-        traces, config.train_split, (1.0 - config.train_split) / 2
-    )
-    # Sorted by trace id first, so `--scenarios` always cuts the same prefix of the same corpus.
-    ordered = sorted(holdout, key=lambda trace: trace.trace_id)
-    sweep_scenarios = scenarios_from_traces(ordered)[:scenarios]
-    if not sweep_scenarios:
-        raise typer.BadParameter(
-            f"the {len(holdout)} held-out trace(s) of world model '{model_dir.name}' carry no "
-            "task prompt, so there is nothing to measure; rebuild from a corpus whose traces "
-            "record the instruction they were given"
+    try:
+        config = resolve_config(model_dir)
+        preflight = preflight_pool(Path(pool_file))
+    except SweepError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    print_deferred_risks(_console, preflight.deferred)
+    try:
+        plan = plan_sweep(
+            model_dir=model_dir,
+            config=config,
+            pool=preflight.pool,
+            out_path=out_path,
+            traces_file=Path(traces_file) if traces_file is not None else None,
+            scenarios=scenarios,
+            episodes=episodes,
+            max_steps=max_steps,
+            assume_input_tokens=assume_input_tokens,
+            assume_output_tokens=assume_output_tokens,
         )
-    if tiny_corpus:
-        _console.print(
-            f"[yellow]note[/yellow] {len(traces)} trace(s) is too few for a held-out band, so "
-            "these scenarios come from the FULL corpus: they are not leak-free, and a policy "
-            "fitted on them is a smoke test, not evidence"
-        )
+    except SweepError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    print_tiny_corpus_note(_console, plan)
     world_model, _serve_provider = load_world_model(model_dir)
 
-    lines = _estimate_cost(
-        pool,
-        episodes_per_candidate=len(sweep_scenarios) * episodes,
-        calls_per_episode=max_steps,
-        input_tokens=assume_input_tokens,
-        output_tokens=assume_output_tokens,
-    )
-    _print_cost_estimate(
-        lines,
-        scenario_count=len(sweep_scenarios),
-        episodes=episodes,
-        max_steps=max_steps,
-        input_tokens=assume_input_tokens,
-        output_tokens=assume_output_tokens,
-    )
+    print_cost_estimate(_console, plan)
     _confirm_cost(yes=yes)
 
-    cells = len(pool.models) * len(sweep_scenarios) * episodes
     _console.print(
-        f"sweeping {len(pool.models)} candidate(s) over {len(sweep_scenarios)} held-out "
+        f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.scenarios)} held-out "
         f"scenario(s) of [bold]{escape(model_dir.name)}[/bold], {episodes} episode(s) each…"
     )
-    done = itertools.count(1)
-
-    def _on_outcome(outcome: ScenarioOutcome) -> None:
-        reward = "unscored" if outcome.reward is None else f"{outcome.reward:.2f}"
-        _console.print(
-            f"  [{next(done)}/{cells}] {escape(outcome.model)} {escape(outcome.scenario_id)} "
-            f"ep{outcome.episode}: reward={reward} ${outcome.cost_usd:.5f} "
-            f"steps={outcome.steps}"
-        )
-
-    # Frozen for the whole sweep (the `wmo.evals.closed_loop` precedent): without it a
-    # candidate's PREDICTED steps enter the shared retrieval buffer and become demos for the next
-    # candidate, so the comparison this matrix exists to make would depend on sweep order.
-    with world_model.frozen():
-        matrix = evaluate_pool(
-            lambda: WorldModelEnv(world_model, score_on_close=True),
-            pool,
-            sweep_scenarios,
-            episodes_per_scenario=episodes,
-            max_steps=max_steps,
-            tools_hint=tools_hint_from_traces(train) or None,
-            on_outcome=_on_outcome,
-        )
-    matrix.save(out_path)
+    matrix = execute_sweep(
+        plan,
+        world_model=world_model,
+        env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
+        on_outcome=cell_progress(_console, plan.cells),
+    )
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)
     spent = sum(outcome.cost_usd for outcome in matrix.outcomes)
     # `escape(out)`: a bracketed path segment would otherwise be read as markup and dropped, so
@@ -309,18 +269,15 @@ def sweep(
         "metered separately)",
         soft_wrap=True,  # a path a user copies must not be wrapped
     )
-    coverage = _coverage(matrix)
-    _print_coverage(coverage)
+    rows = coverage(matrix)
+    print_coverage(_console, rows)
     if scored == 0:
         # Exit non-zero: a matrix with no verified reward is not evidence, so `sweep && fit` in a
         # script must stop here rather than fit on it. The rows are on disk for their `error`s.
         # No --allow-uneven-coverage escape: there is nothing to fit, so `fit` would fail anyway.
-        _console.print(
-            "[yellow]warning[/yellow] no cell was scored, so this matrix is not evidence and "
-            "fitting will fail; read the `error` field of a row to see what broke"
-        )
+        _console.print(NO_EVIDENCE_WARNING)
         raise typer.Exit(1)
-    warning = _uneven_warning(coverage)
+    warning = uneven_warning(rows)
     if warning is not None:
         _console.print(warning)
         if not allow_uneven_coverage:
@@ -329,177 +286,81 @@ def sweep(
                 "re-run with [bold]--allow-uneven-coverage[/bold] to fit on this matrix anyway"
             )
             raise typer.Exit(1)
-        _console.print(
-            "  --allow-uneven-coverage was passed: fitting on it anyway, with that bias accepted"
-        )
+        _console.print(BIAS_ACCEPTED_NOTE)
     _console.print(
         f"  next: [bold]wmo optimize route fit {escape(out)} --kind knn[/bold]", soft_wrap=True
     )
 
 
-# What each kind still cannot know before its first cell, and why. Both are measured properties
-# of the backend (see `BedrockProvider.prepare` and `TinkerChatProvider.prepare`), not caution: a
-# pre-flight that resolved them would have to make a request, which is the one thing it may not do.
-_DEFERRED_RISK: dict[ProviderKind, str] = {
-    ProviderKind.BEDROCK: (
-        "AWS credentials (boto3 resolves them by walking a chain that can reach the "
-        "instance-metadata endpoint over the network, and it builds a client with no credentials "
-        "at all)"
-    ),
-    ProviderKind.TINKER: (
-        "the Tinker service being reachable and serving this model (constructing the client "
-        "connects and pins a server-side session for the whole process)"
-    ),
-}
+# ------------------------------------------------------------------ shared sweep presentation
+# Rendering for the sweep's typed results, shared by `route sweep` and `optimize model`'s sweep
+# stage so the coverage contract reads the same whichever command a user reached it through.
+# Every one takes its console explicitly: the two commands own different ones.
 
+NO_EVIDENCE_WARNING = (
+    "[yellow]warning[/yellow] no cell was scored, so this matrix is not evidence and "
+    "fitting will fail; read the `error` field of a row to see what broke"
+)
 
-def _check_pool_backends(pool: ModelPool) -> None:
-    """Resolve every candidate's backend as far as it goes locally, BEFORE anything is spent.
-
-    `evaluate_pool` builds a candidate's provider lazily at that candidate's FIRST CELL, and every
-    backend then builds its SDK client lazily inside that first call, so any reason a candidate
-    cannot be used (an unset `api_key_env`, a kind that refuses the explicit key the entry names,
-    a missing SDK extra, an Azure config with no api_version, a Bedrock entry whose region
-    resolves nowhere) used to abort the run as a raw traceback after every earlier candidate had
-    been fully paid for, with no matrix written. `prepare_pool_provider` closes that: it checks the
-    kind's static requirements from the entry alone, then forces the lazy client to be BUILT, which
-    imports the SDK and resolves credentials from the environment and local credential files.
-
-    No request, ever. Every `prepare` is documented network-free, and verifying a candidate over
-    the wire is deliberately NOT done here: `wmo providers verify` bills a real call per model,
-    which would spend money inside a pre-flight whose whole job is to run before any spend is
-    authorized, and would make the cost estimate printed next understate what the command had
-    already spent. Some backends therefore keep a residual gap (`_DEFERRED_RISK`), and this prints
-    it per entry rather than leaving the operator to discover it mid-sweep.
-
-    Every prepared provider is discarded: `evaluate_pool` still builds its own per cell, so
-    per-cell provider state (the tinker provider's per-episode prompt history) is unchanged.
-
-    Reports EVERY unusable candidate, not just the first: a pool is edited as a file, so an
-    operator fixing one entry at a time pays a full round trip per typo.
-
-    Raises:
-        typer.BadParameter: One or more candidates cannot be used, each named with its kind.
-    """
-    problems: list[str] = []
-    for entry in pool.models:
-        try:
-            prepare_pool_provider(entry)
-        except Exception as exc:  # noqa: BLE001 - anything here is a usage error, never a spend
-            # `prepare_pool_provider` already prefixes its own failures with the entry name and
-            # kind; a surprise from deeper down gets the same identification so the file is
-            # editable from the message.
-            detail = str(exc)
-            problems.append(
-                detail
-                if detail.startswith(f"pool model '{entry.name}'")
-                else f"pool model '{entry.name}' (kind={entry.kind.value}): {detail}"
-            )
-    if problems:
-        raise typer.BadParameter(
-            "; ".join(problems)
-            + ". Fix or remove those entries in the pool file, then re-run (checked all "
-            + f"{len(pool.models)} candidate(s) before spending anything)"
-        )
-    deferred = [entry for entry in pool.models if entry.kind in _DEFERRED_RISK]
-    if deferred:
-        _console.print(
-            "[yellow]note[/yellow] the pre-flight makes no request, so one thing per candidate "
-            "below can still fail at its first cell (the matrix records it as that cell's `error`):"
-        )
-        for entry in deferred:
-            _console.print(
-                f"  {escape(entry.name)} (kind={entry.kind.value}): {_DEFERRED_RISK[entry.kind]}"
-            )
-
-
-class _CandidateCoverage(BaseModel):
-    """One candidate's scored coverage: what a fitter would actually weigh it on."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    candidate: str
-    scored: int  # cells with a verified reward
-    unscored: int  # cells whose episode or scoring failed (skipped by both fitters)
-    # Scored EPISODE COUNT per swept scenario, in sweep order. Counts, not presence: both fitters
-    # weigh episodes, not scenarios (see `_unevenness`), so `X: 3` and `X: 1` are different
-    # evidence even though both "cover" X.
-    scored_episodes: tuple[tuple[str, int], ...]
-    first_error: str | None  # first error text among this candidate's unscored cells, if any
-
-    @property
-    def lost_scenarios(self) -> tuple[str, ...]:
-        """Swept scenarios this candidate has NO scored episode for."""
-        return tuple(sid for sid, count in self.scored_episodes if count == 0)
-
+BIAS_ACCEPTED_NOTE = (
+    "  --allow-uneven-coverage was passed: fitting on it anyway, with that bias accepted"
+)
 
 # Scenario ids shown per candidate before the column summarizes the rest: enough to see the pattern
 # in a table an operator reads, without a 20-id line per row.
 _LOST_SHOWN = 5
 
 
-class _Unevenness(StrEnum):
-    """How the candidates' scored evidence differs, when it does."""
+def print_deferred_risks(console: Console, deferred: tuple[DeferredRisk, ...]) -> None:
+    """Name what the request-free pre-flight could not close, per candidate that carries it."""
+    if not deferred:
+        return
+    console.print(
+        "[yellow]note[/yellow] the pre-flight makes no request, so one thing per candidate "
+        "below can still fail at its first cell (the matrix records it as that cell's `error`):"
+    )
+    for risk in deferred:
+        console.print(f"  {escape(risk.candidate)} (kind={risk.kind.value}): {risk.risk}")
 
-    EVEN = "even"
-    SCENARIOS = "scenarios"  # candidates were scored on different scenario SETS
-    EPISODES = "episodes"  # same scenarios, different numbers of scored episodes
+
+def print_tiny_corpus_note(console: Console, plan: SweepPlan) -> None:
+    """Say when the corpus was too small to leave a held-out band to measure on."""
+    if not plan.tiny_corpus:
+        return
+    console.print(
+        f"[yellow]note[/yellow] {plan.trace_count} trace(s) is too few for a held-out band, so "
+        "these scenarios come from the FULL corpus: they are not leak-free, and a policy "
+        "fitted on them is a smoke test, not evidence"
+    )
 
 
-def _coverage(matrix: OutcomeMatrix) -> list[_CandidateCoverage]:
-    """Per-candidate scored coverage over the swept scenarios, in pool order."""
-    swept = matrix.scenario_ids()
-    rows: list[_CandidateCoverage] = []
-    for name in matrix.model_names():
-        cells = [outcome for outcome in matrix.outcomes if outcome.model == name]
-        per_scenario: Counter[str] = Counter(cell.scenario_id for cell in cells if cell.scored)
-        errors = [cell.error for cell in cells if not cell.scored and cell.error]
-        rows.append(
-            _CandidateCoverage(
-                candidate=name,
-                scored=sum(1 for cell in cells if cell.scored),
-                unscored=sum(1 for cell in cells if not cell.scored),
-                scored_episodes=tuple((sid, per_scenario[sid]) for sid in swept),
-                first_error=errors[0] if errors else None,
-            )
+def cell_progress(console: Console, cells: int) -> Callable[[ScenarioOutcome], None]:
+    """A per-cell progress line: which cell, what it scored, what it cost."""
+    done = itertools.count(1)
+
+    def _on_outcome(outcome: ScenarioOutcome) -> None:
+        reward = "unscored" if outcome.reward is None else f"{outcome.reward:.2f}"
+        console.print(
+            f"  [{next(done)}/{cells}] {escape(outcome.model)} {escape(outcome.scenario_id)} "
+            f"ep{outcome.episode}: reward={reward} ${outcome.cost_usd:.5f} "
+            f"steps={outcome.steps}"
         )
-    return rows
+
+    return _on_outcome
 
 
-def _unevenness(coverage: list[_CandidateCoverage]) -> _Unevenness:
-    """Whether the candidates were scored on the same evidence, and if not, how it differs.
-
-    Compared as per-(candidate, scenario) scored EPISODE COUNTS, because that is what the fitters
-    weigh. Presence is not enough: `fit_rank_policy` averages every surviving EPISODE
-    independently, so a candidate that kept 3 episodes on a scenario and one that kept 1 carry
-    different effective scenario weights into the same cluster mean, and the models chosen as
-    `default_model` (`routing.py:_overall_best`) and as the knn fallback/guard
-    (`knn.py:best_single_on_fit`) are picked off those same episode-weighted means. The knn BANK is
-    milder, since its cells are per-scenario means, but "milder" is not "unbiased", and it is the
-    same matrix either way.
-
-    Losing the same episodes of the same scenarios for EVERY candidate is even: the comparison
-    stays like-for-like on less data, and the counts show the loss.
-    """
-    if len({row.scored_episodes for row in coverage}) <= 1:
-        return _Unevenness.EVEN
-    if len({row.lost_scenarios for row in coverage}) > 1:
-        return _Unevenness.SCENARIOS
-    return _Unevenness.EPISODES
-
-
-def _uneven_warning(coverage: list[_CandidateCoverage]) -> str | None:
+def uneven_warning(rows: list[CandidateCoverage]) -> str | None:
     """The warning for coverage that is not a comparison, or None when it is one.
 
     Two different failures, so two different messages: candidates ranked on different scenario
     SETS, and candidates ranked on the same scenarios with different numbers of surviving EPISODES.
     Both bias a fit; naming which one happened is what makes the message actionable.
     """
-    counts = ", ".join(f"{escape(row.candidate)} {row.scored}" for row in coverage)
-    match _unevenness(coverage):
-        case _Unevenness.EVEN:
+    counts = ", ".join(f"{escape(row.candidate)} {row.scored}" for row in rows)
+    match unevenness(rows):
+        case Unevenness.EVEN:
             return None
-        case _Unevenness.SCENARIOS:
+        case Unevenness.SCENARIOS:
             return (
                 "[yellow]warning[/yellow] candidates were scored on DIFFERENT scenarios (scored "
                 f"cells: {counts}), so `fit` would rank them on different task sets: it skips "
@@ -507,7 +368,7 @@ def _uneven_warning(coverage: list[_CandidateCoverage]) -> str | None:
                 "candidate lost. The paid cells are on disk and their `error` field says what "
                 "broke."
             )
-        case _Unevenness.EPISODES:
+        case Unevenness.EPISODES:
             return (
                 "[yellow]warning[/yellow] candidates cover the same scenarios but kept DIFFERENT "
                 f"numbers of scored episodes on them (scored cells: {counts}; the table above "
@@ -519,7 +380,7 @@ def _uneven_warning(coverage: list[_CandidateCoverage]) -> str | None:
             )
 
 
-def _print_coverage(coverage: list[_CandidateCoverage]) -> None:
+def print_coverage(console: Console, rows: list[CandidateCoverage]) -> None:
     """Show what each candidate would be weighed on: its scored cells, and what it lost.
 
     The last column names every scenario where this candidate holds less evidence than the
@@ -528,7 +389,7 @@ def _print_coverage(coverage: list[_CandidateCoverage]) -> None:
     what a fitter weighs, so both are per candidate here rather than summed into Unscored.
     """
     most: Counter[str] = Counter()
-    for row in coverage:
+    for row in rows:
         for sid, count in row.scored_episodes:
             most[sid] = max(most[sid], count)
     table = Table(title="Scored coverage per candidate (`fit` SKIPS unscored cells)")
@@ -536,7 +397,7 @@ def _print_coverage(coverage: list[_CandidateCoverage]) -> None:
     table.add_column("Scored", justify="right")
     table.add_column("Unscored", justify="right")
     table.add_column("Scenarios lost, or thinned (kept/most)")
-    for row in coverage:
+    for row in rows:
         gaps = [
             sid if count == 0 else f"{sid} {count}/{most[sid]}"
             for sid, count in row.scored_episodes
@@ -553,138 +414,23 @@ def _print_coverage(coverage: list[_CandidateCoverage]) -> None:
             f"{row.unscored:,}",
             escape(lost) if lost else "-",
         )
-    _console.print(table)
-    for row in coverage:
+    console.print(table)
+    for row in rows:
         if row.scored == 0 and row.first_error is not None:
             # A candidate that was never scored at all is the one failure a coverage table cannot
             # explain, and its cause is already on disk. Surfacing the first one names the entry
             # and points at the pool file, which is where the fix is.
-            _console.print(
+            console.print(
                 f"  [yellow]{escape(row.candidate)}[/yellow] was never scored; its first cell "
                 f"failed with: {escape(row.first_error)}\n"
                 "    fix that entry in the pool file, drop it, or retry once the cause has cleared"
             )
 
 
-def _check_out_writable(out_path: Path) -> None:
-    """Prove `--out` can be written BEFORE the sweep spends anything.
-
-    `OutcomeMatrix.save` creates the parent directory and writes, but only once every episode has
-    run: a destination that cannot be created (a parent component that is a regular file, an
-    unwritable directory, a path that is itself a directory) would throw the whole paid sweep
-    away with an OS error and no message. Checked without creating anything, so declining the
-    cost confirmation still leaves the filesystem untouched.
-
-    Raises:
-        typer.BadParameter: The matrix could not be written there.
-    """
-    resolved = out_path if out_path.is_absolute() else Path.cwd() / out_path
-    existing = resolved.parent
-    while not existing.exists() and existing != existing.parent:
-        existing = existing.parent
-    problem: str | None = None
-    if not existing.is_dir():
-        problem = f"{existing} is not a directory"
-    elif not os.access(existing, os.W_OK):
-        problem = f"{existing} is not writable"
-    elif resolved.is_dir():
-        problem = f"{resolved} is a directory"
-    elif resolved.exists() and not os.access(resolved, os.W_OK):
-        problem = f"{resolved} is not writable"
-    if problem is not None:
-        raise typer.BadParameter(
-            f"cannot write the outcome matrix to {out_path}: {problem}. --out must name a "
-            "writable JSON file path"
-        )
-
-
-def _corpus_traces(model_dir: Path, adapter_name: str, explicit: str | None) -> list[Trace]:
-    """Ingest the corpus the sweep takes its scenarios from: `--traces`, else the model's own.
-
-    A build does NOT persist the corpus it read (it keeps prompts, metrics and the retrieval
-    index), so `local_traces_path` finds a file only for a Hub-downloaded model or a shipped
-    example. `--traces` is the same escape hatch `wmo demo` carries for exactly this reason, and
-    the failure names it.
-    """
-    if explicit is not None:
-        path = Path(explicit)
-        if not path.is_file():
-            raise typer.BadParameter(f"no trace file at {path} (--traces)")
-    else:
-        found = local_traces_path(model_dir)
-        if found is None:
-            raise typer.BadParameter(
-                f"no trace corpus for world model '{model_dir.name}': looked for "
-                f"{model_dir / TRACES_FILENAME} and {model_dir.parent.parent / TRACES_FILENAME}. "
-                "Sweep scenarios are the model's OWN held-out task prompts, and a build keeps no "
-                "copy of the corpus it read, so pass `--traces <the file wmo build --file read>` "
-                f"or put that file at {model_dir / TRACES_FILENAME}"
-            )
-        path = found
-    try:
-        traces = get_adapter(adapter_name).from_file(str(path))
-    except (OSError, ValueError) as exc:  # unknown adapter, unreadable or malformed corpus
-        raise typer.BadParameter(f"cannot ingest {path}: {exc}") from exc
-    if not traces:
-        raise typer.BadParameter(
-            f"{path} ingested no traces with the '{adapter_name}' adapter, so there are no "
-            "scenarios to sweep"
-        )
-    return traces
-
-
-class _CostLine(BaseModel):
-    """One candidate's projected sweep spend under the stated per-call token assumption."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    candidate: str
-    episodes: int
-    calls: int
-    input_per_mtok: float
-    output_per_mtok: float
-    usd: float
-
-
-def _estimate_cost(
-    pool: ModelPool,
-    *,
-    episodes_per_candidate: int,
-    calls_per_episode: int,
-    input_tokens: int,
-    output_tokens: int,
-) -> list[_CostLine]:
-    """Project each candidate's spend, priced by its OWN pool entry (overrides included)."""
-    per_call = TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens)
-    calls = episodes_per_candidate * calls_per_episode
-    lines: list[_CostLine] = []
-    for entry in pool.models:
-        price = entry.price()
-        lines.append(
-            _CostLine(
-                candidate=entry.name,
-                episodes=episodes_per_candidate,
-                calls=calls,
-                input_per_mtok=price.input_per_mtok,
-                output_per_mtok=price.output_per_mtok,
-                usd=calls * entry.cost_usd(per_call),
-            )
-        )
-    return lines
-
-
-def _print_cost_estimate(
-    lines: list[_CostLine],
-    *,
-    scenario_count: int,
-    episodes: int,
-    max_steps: int,
-    input_tokens: int,
-    output_tokens: int,
-) -> None:
+def print_cost_estimate(console: Console, plan: SweepPlan) -> None:
     """Render the projected spend, stating exactly which parts are assumed.
 
-    Honest by construction: the CELL and CALL counts are real (`--max-steps` is the per-episode
+    Honest by construction: the CELL and CALL counts are real (the step budget is the per-episode
     cap, so calls are an upper bound), the tokens per call are an assumption the flags name, and
     the per-candidate $/Mtok is the pool entry's own price row. The world model's serve and judge
     calls are a separate meter (the D12 cost split) and are deliberately absent.
@@ -696,7 +442,7 @@ def _print_cost_estimate(
     table.add_column("$/Mtok in", justify="right")
     table.add_column("$/Mtok out", justify="right")
     table.add_column("USD (est)", justify="right")
-    for line in lines:
+    for line in plan.cost_lines:
         table.add_row(
             # A rich cell renders markup: an operator-chosen name like `gpt[a]` would print as
             # `gpt`, making two candidates indistinguishable in the table they confirm spend from
@@ -708,19 +454,20 @@ def _print_cost_estimate(
             f"{line.output_per_mtok:.3f}",
             f"{line.usd:.2f}",
         )
-    _console.print(table)
-    _console.print(
-        f"{len(lines) * scenario_count * episodes} cell(s) = {len(lines)} candidate(s) x "
-        f"{scenario_count} held-out scenario(s) x {episodes} episode(s); estimated total "
-        f"${sum(line.usd for line in lines):.2f}"
+    console.print(table)
+    console.print(
+        f"{plan.cells} cell(s) = {len(plan.cost_lines)} candidate(s) x "
+        f"{len(plan.scenarios)} held-out scenario(s) x {plan.episodes} episode(s); estimated "
+        f"total ${plan.total_usd:.2f}"
     )
-    _console.print(
-        f"  ASSUMPTION: {input_tokens:,} input + {output_tokens:,} output token(s) per policy "
-        f"call, and every episode running its full {max_steps}-call budget. Calls are capped, "
-        "tokens per call are NOT measured: set --assume-input-tokens/--assume-output-tokens from "
-        "your own numbers, or read the measured spend this command prints when it finishes."
+    console.print(
+        f"  ASSUMPTION: {plan.assume_input_tokens:,} input + {plan.assume_output_tokens:,} output "
+        f"token(s) per policy call, and every episode running its full {plan.max_steps}-call "
+        "budget. Calls are capped, tokens per call are NOT measured: set "
+        "--assume-input-tokens/--assume-output-tokens from your own numbers, or read the measured "
+        "spend this command prints when it finishes."
     )
-    _console.print(
+    console.print(
         "  Candidate side only: the world model's own serve and judge calls are metered "
         "separately and are NOT in this figure."
     )
@@ -747,49 +494,6 @@ def _confirm_cost(*, yes: bool) -> None:
         return
     if not Confirm.ask("Proceed?", default=True):
         raise typer.Exit(0)
-
-
-# Provenance carries a digest of the matrix, not just its path: a corpus is routinely rebuilt in
-# place under the same filename, and a fit is identified by the data it saw. 16 hex characters
-# is 64 bits, far past collision risk for the handful of matrices one artifact directory sees.
-_MATRIX_DIGEST_CHARS = 16
-
-
-def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
-    """The outcome matrix and its `<path> sha256=<digest>` provenance, from ONE read of the file.
-
-    The digest is what makes `fitted_from` an identity rather than a label. `tune` compares it
-    against the as-fitted snapshot beside a policy, and two fits of the same path with different
-    contents (or the same contents at two paths) have to come out different for that check to
-    protect anything.
-
-    Both come out of the same bytes on purpose. Digesting a SECOND read would let a corpus
-    rebuilt in place between the two describe the fit as having seen bytes it never saw: the
-    policy would be fitted from the old matrix and stamped with the new one's digest, so the
-    next fit of that new matrix would match its provenance and `tune` would accept the
-    superseded snapshot -- the exact failure the digest exists to catch, reintroduced by
-    reading twice.
-    """
-    payload = Path(matrix_file).read_bytes()
-    digest = hashlib.sha256(payload).hexdigest()
-    return (
-        OutcomeMatrix.model_validate_json(payload),
-        f"{matrix_file} sha256={digest[:_MATRIX_DIGEST_CHARS]}",
-    )
-
-
-def _embedder_provenance(spec: EmbedderSpec) -> str:
-    """The embedding-function half of `fitted_from`, taken from the spec serving rebuilds.
-
-    Derived from `EmbedderSpec` rather than from the flags, so it cannot describe an embedder
-    different from the one recorded in the artifact. The azure RESOURCE is part of the identity
-    and not just the deployment name: two accounts routinely hold a deployment of the same name
-    and dimension, their embeddings are not interchangeable, and a refit that only repointed
-    `--endpoint` therefore has to read as a different fit. The credential variable is left out
-    on purpose -- renaming it does not move a single vector.
-    """
-    tag = f"{spec.kind}-{spec.dim}"
-    return tag if spec.kind == "hashing" else f"{tag}/{spec.deployment}@{spec.endpoint}"
 
 
 @route_app.command("student")
@@ -1031,7 +735,7 @@ def fit(
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
-    matrix, source = _load_matrix(matrix_file)
+    matrix, source = load_matrix_with_digest(Path(matrix_file))
     if embedder not in ("hashing", "azure"):
         raise typer.BadParameter(f"unknown embedder '{embedder}'; use hashing or azure")
     spec = (
@@ -1050,8 +754,6 @@ def fit(
         # typer's min is inclusive but the artifact field requires > 0; fail before the fit
         # writes a sidecar it will then abandon.
         raise typer.BadParameter("--rag-thres must be greater than 0")
-    built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
-    embed_tag = _embedder_provenance(spec)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -1059,59 +761,54 @@ def fit(
                 "policy trades cost through its dial instead: fit it, then "
                 "`wmo optimize route tune <policy.json> --cost-quality <0..1>`"
             )
-        # The sidecar is named after --out and beside it, and the fit records that name in the
-        # policy JSON: serving then resolves THIS policy's evidence explicitly, so a second knn
-        # fit into the same directory gets its own bank instead of overwriting this one's.
-        policy = fit_knn_policy(
+        fitted = fit_knn_artifact(
             matrix,
-            bank_path=knn_bank_path_for(out_path),
+            out_path=out_path,
+            matrix_source=source,
             embedder=spec,
-            embed_with=built,
-            guard_model=fallback,
+            fallback=fallback,
+            z=z,
             rag_num=rag_num,
             rag_thres=rag_thres,
-            z=z,
             min_pairs=min_pairs,
             se_floor=se_floor,
             floor_q=floor_q,
-            fitted_from=(
-                f"{source} knn fallback={fallback or 'auto'} z={z:g} k={rag_num} "
-                f"thres={rag_thres:g} pairs={min_pairs} se_floor={se_floor} q={floor_q:g} "
-                f"{embed_tag}"
-            ),
         )
-    else:
-        policy = fit_rank_policy(
-            matrix,
-            embedder=spec,
-            n_clusters=clusters,
-            seed=seed,
-            top_k_clusters=top_k_clusters,
-            beta=beta,
-            fitted_from=(
-                f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
-                f"cost_weight={cost_weight:g} {embed_tag}"
-            ),
-        )
-        if cost_weight > 0.0:
-            policy = rerank_policy(policy, cost_weight=cost_weight)
+        print_knn_fit(_console, fitted, out=out, z=z)
+        return
+    built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
+    policy = fit_rank_policy(
+        matrix,
+        embedder=spec,
+        n_clusters=clusters,
+        seed=seed,
+        top_k_clusters=top_k_clusters,
+        beta=beta,
+        fitted_from=(
+            f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
+            f"cost_weight={cost_weight:g} {embedder_provenance(spec)}"
+        ),
+    )
+    if cost_weight > 0.0:
+        policy = rerank_policy(policy, cost_weight=cost_weight)
     policy.save(out_path)
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
-    if kind == "knn":
-        routed = 1.0 - result.model_mix.get(policy.default_model, 0.0)
-        _console.print(
-            f"[green]✓[/green] fitted knn policy over {result.scenarios} scenarios -> {out}\n"
-            f"  bank {policy.bank_path()}, fallback {policy.default_model}, z={z}\n"
-            f"  routed away from the fallback {routed:.1%} of the time; cost/scenario "
-            f"${result.cost_per_scenario:.5f}\n"
-            f"  fit-set accuracy {result.accuracy:.4f} is IN-SAMPLE (every request retrieves its "
-            "own row); measure on held-out scenarios with `wmo optimize route report`"
-        )
-        return
     _console.print(
         f"[green]✓[/green] fitted {len(policy.clusters)} clusters over "
         f"{result.scenarios} scenarios -> {out}\n"
         f"  fit-set accuracy {result.accuracy:.4f}, cost/scenario ${result.cost_per_scenario:.5f}"
+    )
+
+
+def print_knn_fit(console: Console, fitted: KnnFitOutcome, *, out: str, z: float) -> None:
+    """Report a written knn policy: where its evidence is, and what it scored in-sample."""
+    console.print(
+        f"[green]✓[/green] fitted knn policy over {fitted.scenarios} scenarios -> {out}\n"
+        f"  bank {fitted.bank_path}, fallback {fitted.policy.default_model}, z={z}\n"
+        f"  routed away from the fallback {fitted.routed_share:.1%} of the time; cost/scenario "
+        f"${fitted.cost_per_scenario:.5f}\n"
+        f"  fit-set accuracy {fitted.fit_accuracy:.4f} is IN-SAMPLE (every request retrieves its "
+        "own row); measure on held-out scenarios with `wmo optimize route report`"
     )
 
 
@@ -1230,51 +927,27 @@ def tune(
     The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
     touching files at all: `PUT /v1/endpoints/{name}/config`.
     """
-    path = Path(policy_file)
-    if not path.is_file():
-        raise typer.BadParameter(f"no policy file at {path}")
-    policy = RoutingPolicy.load(path)
-    base_path = path.with_name(f"{path.stem}.base{path.suffix}")
-    as_fitted = RoutingPolicy.load(base_path) if base_path.is_file() else None
-    if as_fitted is not None and (as_fitted.kind, fit_provenance(as_fitted)) != (
-        policy.kind,
-        fit_provenance(policy),
-    ):
-        # `fit` overwrites the policy without touching this snapshot, so a refit leaves one
-        # behind that describes a policy that no longer exists. Dialing it would report success
-        # while replacing the new fit with a slid copy of the superseded one.
-        raise typer.BadParameter(
-            f"{base_path} is the as-fitted snapshot of a different fit than {path}: the "
-            f"snapshot holds kind='{as_fitted.kind}' from '{fit_provenance(as_fitted)}', the "
-            f"policy holds kind='{policy.kind}' from '{fit_provenance(policy)}'. Tuning it "
-            f"would overwrite the current fit with a dialed copy of the old one. Delete "
-            f"{base_path} to re-baseline the dial on the fit that is on disk now."
-        )
     try:
-        tuned = apply_cost_quality(policy if as_fitted is None else as_fitted, cost_quality)
+        dialed = tune_policy_dial(Path(policy_file), cost_quality)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if as_fitted is None:
-        # Preserve the artifact as fitted, so `tune` is always re-appliable from the fit and
-        # never from an already-slid copy of itself. Written only now that the dial has applied:
-        # a snapshot left behind by a REJECTED tune would poison the path for the next fit.
-        # Both writes are atomic, so the only interruption that leaves a snapshot behind is one
-        # where the policy is still the as-fitted bytes the snapshot copied, which is consistent
-        # rather than stale.
-        write_artifact_atomically(base_path, path.read_bytes())
-    tuned.save(path)
-    knobs = cost_quality_knobs(cost_quality)
-    _console.print(
-        f"[green]✓[/green] cost_quality={cost_quality:g} "
-        f"({cost_quality_named_point(cost_quality)}) -> {path}\n"
+    print_dial(_console, dialed)
+
+
+def print_dial(console: Console, dialed: DialResult) -> None:
+    """Report an applied dial position against the frontier that was actually measured."""
+    knobs = dialed.knobs
+    console.print(
+        f"[green]✓[/green] cost_quality={dialed.cost_quality:g} "
+        f"({dialed.named_point}) -> {dialed.policy_path}\n"
         f"  knobs: floor_q={knobs.floor_q:g}, cost knob lam={knobs.pick_lam:g}, "
         f"guard={knobs.guard_mode}, z={knobs.knn_z:g}\n"
-        f"  as fitted: {base_path}\n"
+        f"  as fitted: {dialed.base_path}\n"
         f"  measured on routerbench-ours9 (5 held-out splits, vs the best single model):"
     )
     for anchor in COST_QUALITY_ANCHORS:
-        marker = "->" if anchor.cost_quality == cost_quality else "  "
-        _console.print(
+        marker = "->" if anchor.cost_quality == dialed.cost_quality else "  "
+        console.print(
             f"  {marker} {anchor.cost_quality:<5g} {anchor.quality_delta_points:+.2f}pt "
             f"@ {anchor.cost_delta_percent:+.1f}% cost"
             + (f"  [dim]{anchor.named_point}[/dim]" if anchor.named_point != "Custom" else "")
