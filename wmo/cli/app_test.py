@@ -1189,10 +1189,82 @@ def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noq
     assert not isinstance(result.exception, FileNotFoundError)
 
 
-def test_providers_verify_empty_project_is_friendly(tmp_path) -> None:  # noqa: ANN001
+def _record_verify_all(monkeypatch: pytest.MonkeyPatch, pinged: list[ProviderConfig]) -> None:
+    """Record exactly which providers `providers verify` decided to ping, and report them ok."""
+
+    def fake_verify_all(configs: list[ProviderConfig]) -> list[VerifyResult]:
+        pinged.extend(configs)
+        return [VerifyResult(ok=True, kind=c.kind, model=c.model) for c in configs]
+
+    monkeypatch.setattr(cli_app_module, "verify_all", fake_verify_all)
+
+
+def test_providers_verify_nothing_configured_is_actionable(tmp_path: Path) -> None:
+    # Nothing to check at all is a usage problem, not a pass: say which command fixes it and
+    # exit non-zero so a setup script does not read silence as "credentials are fine".
     result = runner.invoke(app, ["providers", "verify", "--root", str(tmp_path / ".wmo")])
-    assert result.exit_code == 0
-    assert "no world models built yet" in result.output
+    assert result.exit_code == 1
+    assert "nothing configured" in result.output
+    assert "wmo providers set" in result.output
+
+
+def test_providers_verify_without_a_world_model_checks_settings_roles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The repro this fixes: verifying credentials is what you do BEFORE `wmo build` (which
+    # aborts outright on bad ones), so an unbuilt project must still check what it has.
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="openai", model="gpt-5.4-mini")
+    settings.models.judge = ModelRole(provider="bedrock", model="claude-opus-4-8")
+    save_settings(settings, root)
+    pinged: list[ProviderConfig] = []
+    _record_verify_all(monkeypatch, pinged)
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert not (root / "models").exists()
+    # Both configured roles are pinged, the bedrock one at its runtime id (settings hold the
+    # canonical type), and each line names the role that asked for it.
+    assert [(c.kind, c.model) for c in pinged] == [
+        (ProviderKind.OPENAI, "gpt-5.4-mini"),
+        (ProviderKind.BEDROCK, "us.anthropic.claude-opus-4-8"),
+    ]
+    assert "ok openai (gpt-5.4-mini) (models.worker)" in result.output
+    assert "models.judge" in result.output
+    # The embed path belongs to a built model: skipped with a note, not fatal.
+    assert "embed path: skipped" in result.output
+
+
+def test_providers_verify_reports_a_role_failure_with_its_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="bedrock", model="claude-opus-4-8")
+    save_settings(settings, root)
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: [
+            VerifyResult(
+                ok=False,
+                kind=c.kind,
+                model=c.model,
+                # Rich markup in raw provider error text must not be interpreted.
+                detail="denied [foo]",
+            )
+            for c in configs
+        ],
+    )
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "fail bedrock" in result.output
+    assert "[foo]" in result.output
+    assert "AWS_ACCESS_KEY_ID" in result.output
 
 
 def test_providers_verify_reports_built_model_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -1202,6 +1274,82 @@ def test_providers_verify_reports_built_model_provider(patched_provider, tmp_pat
     assert result.exit_code == 0, result.output
     # The bedrock provider configured at build time shows up in the verify report.
     assert "bedrock" in result.output
+
+
+def test_providers_verify_checks_a_built_model_embed_path(
+    patched_provider: None, tmp_path: Path
+) -> None:
+    # A provider-backed embedder is verified alongside the completion provider; that check is
+    # the half a world model is genuinely needed for.
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "airline",
+            "--file",
+            _traces_file(tmp_path),
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--embed-provider",
+            "bedrock",
+            "--embed-model",
+            "amazon.titan-embed-text-v2:0",
+            "--fidelity",
+            "low",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "embed:bedrock (amazon.titan-embed-text-v2:0)" in result.output
+    assert "embed path: skipped" not in result.output
+
+
+def test_providers_verify_pings_a_role_shared_with_a_built_model_once(
+    patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Dedup spans both sources, so pointing the worker role at the model you already built does
+    # not bill a second ping, and the built artifact's own config is the one exercised.
+    root = tmp_path / ".wmo"
+    _build(root, "airline", tmp_path)
+    built = load_config(str(root / "models" / "airline")).providers[0]
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider=built.kind.value, model=built.model)
+    save_settings(settings, root)
+    pinged: list[ProviderConfig] = []
+    _record_verify_all(monkeypatch, pinged)
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert [(c.kind, c.model) for c in pinged] == [(built.kind, built.model)]
+    assert "(airline, models.worker)" in result.output
+
+
+def test_providers_verify_name_scopes_the_report_to_one_world_model(
+    patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `--name` answers "is THIS model's provider reachable?"; pulling the project's roles in
+    # would bill for a question the caller did not ask.
+    root = tmp_path / ".wmo"
+    _build(root, "airline", tmp_path)
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="openai", model="gpt-5.4-mini")
+    save_settings(settings, root)
+    pinged: list[ProviderConfig] = []
+    _record_verify_all(monkeypatch, pinged)
+
+    result = runner.invoke(app, ["providers", "verify", "--name", "airline", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert [c.kind for c in pinged] == [ProviderKind.BEDROCK]
+    assert "models.worker" not in result.output
 
 
 def test_research_concurrency_rejects_level_above_scenarios_fixed_n() -> None:

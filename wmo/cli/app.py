@@ -43,6 +43,7 @@ from wmo.cli.e2b_cmds import register as register_e2b_commands
 from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
 from wmo.cli.harness_app import harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
+from wmo.cli.model_roles import configured_role_configs
 from wmo.cli.platform_cmds import register as register_platform_commands
 from wmo.cli.ui import (
     BuildParams,
@@ -96,7 +97,7 @@ from wmo.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmo.evals.open_loop import EvalReport, OpenLoopEval
 from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.optimize.judge import JUDGE_VERSION, RubricJudge
-from wmo.providers import ProviderConfig, ProviderKind, verify_all, verify_embedder
+from wmo.providers import ProviderConfig, ProviderKind, VerifyResult, verify_all, verify_embedder
 from wmo.providers.base import Embedder, EmbedderKind, Provider
 from wmo.providers.models import resolve_provider_model
 from wmo.providers.pool import Tier
@@ -426,15 +427,18 @@ def providers_verify(
 ) -> None:
     """Ping every configured provider (completion + embed path) and report status.
 
-    Gathers provider configs from the built world models (one `--name`, or all of them, deduped by
-    kind+model), so a brand-new project with nothing built yet has nothing to verify. The phi embed
-    path of each model is checked too, unless it is the offline (creds-free) hashing embedder.
+    Two sources count as "configured", because checking that credentials work is what you do
+    BEFORE spending anything on `wmo build`: the `[models.<role>]` roles in
+    `<root>/settings.toml` (what `wmo providers set` writes), and the providers persisted inside
+    every built world model. Completion providers are deduped by kind+model across both, so a
+    role naming the same backend as a built model costs one ping, not two. The phi embed path
+    belongs to a BUILT model, so on a project with nothing built that half is skipped with a
+    note instead of aborting the command; otherwise every distinct provider-backed embedder is
+    checked (the offline hashing embedder needs no credentials and is skipped). `--name` scopes
+    the whole report to that one world model.
     """
     store = WorldModelStore(root)
     names = [name] if name is not None else store.list_names()
-    if not names:
-        _console.print("[yellow]no world models built yet[/yellow]; run `wmo build --name <name>`")
-        return
     configs: list[HarnessConfig] = []
     for model_name in names:
         try:
@@ -443,22 +447,50 @@ def providers_verify(
             raise typer.BadParameter(str(exc)) from exc
         configs.append(load_config(model_dir))
 
-    # Dedup completion providers by kind+model across all selected models.
-    seen: set[tuple[str, str]] = set()
-    providers: list[ProviderConfig] = []
-    for config in configs:
-        for pc in config.providers:
-            key = (pc.kind.value, pc.model)
-            if key not in seen:
-                seen.add(key)
-                providers.append(pc)
-    for result in verify_all(providers):
-        mark = "[green]ok[/green]" if result.ok else "[red]fail[/red]"
-        _console.print(f"{mark} {result.kind.value} ({result.model}) {result.detail}")
+    # Dedup completion providers by kind+model across all selected models, then across the
+    # settings roles. World models come FIRST so a pair configured in both is pinged with the
+    # built artifact's own config, exactly as before roles were a source.
+    labelled = [
+        (model_name, pc)
+        for model_name, cfg in zip(names, configs, strict=True)
+        for pc in cfg.providers
+    ]
+    # `--name` asks about one world model; widening it to the project's roles would answer a
+    # question the caller did not ask (and bill for it).
+    if name is None:
+        labelled += [(f"models.{role}", pc) for role, pc in configured_role_configs(root)]
+    index: dict[tuple[str, str], int] = {}
+    provider_configs: list[ProviderConfig] = []
+    sources: list[list[str]] = []
+    for label, pc in labelled:
+        key = (pc.kind.value, pc.model)
+        if key not in index:
+            index[key] = len(provider_configs)
+            provider_configs.append(pc)
+            sources.append([])
+        if label not in sources[index[key]]:
+            sources[index[key]].append(label)
+
+    if not provider_configs:
+        _console.print(
+            "[yellow]nothing configured[/yellow]; run `wmo providers set` to choose a provider, "
+            "or `wmo build --name <name>` to build a world model"
+        )
+        raise typer.Exit(1)
+
+    for result, origin in zip(verify_all(provider_configs), sources, strict=True):
+        _print_verify_result(result, origin)
+
+    if not configs:
+        _console.print(
+            "[dim]embed path: skipped, no world model built yet "
+            "(the embedder is chosen by `wmo build`)[/dim]"
+        )
+        return
 
     # Verify each distinct provider-backed embed path (skip the offline hashing embedder).
     embed_seen: set[tuple[str, str]] = set()
-    for config in configs:
+    for model_name, config in zip(names, configs, strict=True):
         if config.embed_provider is EmbedderKind.HASHING:
             continue
         embed_config = config.embed_provider_config()
@@ -467,8 +499,23 @@ def providers_verify(
             continue
         embed_seen.add(key)
         result = verify_embedder(embed_config)
-        mark = "[green]ok[/green]" if result.ok else "[red]fail[/red]"
-        _console.print(f"{mark} embed:{result.kind.value} ({result.model}) {result.detail}")
+        _print_verify_result(result, [model_name], prefix="embed:")
+
+
+def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: str = "") -> None:
+    """Print one `providers verify` line, plus the next step to take when the ping failed.
+
+    `sources` names what asked for this provider (world model names, `models.<role>` settings
+    roles) so a failure points at the thing to fix. The detail is escaped: it carries raw
+    provider error text, and an unescaped `[...]` in it would be read as rich markup and crash
+    the report.
+    """
+    mark = "[green]ok[/green]" if result.ok else "[red]fail[/red]"
+    origin = f" [dim]({', '.join(sources)})[/dim]" if sources else ""
+    detail = f" {escape(result.detail)}" if result.detail else ""
+    _console.print(f"{mark} {prefix}{result.kind.value} ({result.model}){origin}{detail}")
+    if not result.ok:
+        _console.print(f"  [yellow]{_credential_hint(result.kind, result.detail)}[/yellow]")
 
 
 @examples_app.command("list")
@@ -858,17 +905,22 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
             continue
         failed = True
         _console.print(f"  [red]✗ {label} ({result.model}) failed[/red]: {result.detail}")
-        if "No module named" in result.detail:
-            # SDKs are core deps; a missing module means the env is stale or hand-rolled.
-            _console.print("    [yellow]run `uv sync` to install the provider SDKs[/yellow]")
-        else:
-            envs = ", ".join(PROVIDER_ENV_VARS.get(cfg.kind, []))
-            hint = f" ({envs})" if envs else ""
-            _console.print(
-                f"    [yellow]check the model id and that your credentials are set{hint}[/yellow]"
-            )
+        _console.print(f"    [yellow]{_credential_hint(cfg.kind, result.detail)}[/yellow]")
     if failed:
         raise typer.Exit(1)
+
+
+def _credential_hint(kind: ProviderKind, detail: str) -> str:
+    """The next step for a failed provider ping: install the SDKs, or fix creds/model id.
+
+    Shared by the pre-build guard and `wmo providers verify` so both name the same env vars.
+    """
+    if "No module named" in detail:
+        # SDKs are core deps; a missing module means the env is stale or hand-rolled.
+        return "run `uv sync` to install the provider SDKs"
+    envs = ", ".join(PROVIDER_ENV_VARS.get(kind, []))
+    hint = f" ({envs})" if envs else ""
+    return f"check the model id and that your credentials are set{hint}"
 
 
 @app.command("list")

@@ -8,9 +8,14 @@ import typer
 
 from wmo.config.settings import ModelRole, load_settings
 from wmo.providers.base import Provider, ProviderConfig, ProviderKind
+from wmo.providers.models import resolve_provider_model
 from wmo.providers.registry import get_provider
 
 OptInModelRole = Literal["agent", "meta"]
+ModelRoleName = Literal["worker", "judge", "summary", "meta", "agent"]
+
+MODEL_ROLE_NAMES: tuple[ModelRoleName, ...] = ("worker", "judge", "summary", "meta", "agent")
+"""Every role `ModelsSettings` carries, in report order. Pinned to that model by a test."""
 
 # Azure OpenAI chat completions need an API version on every call. When an opt-in role (or a
 # pool entry, or the local worker role) does not pin one, this shared default applies. Imported
@@ -58,7 +63,52 @@ def resolve_required_model_config(root: str, role: OptInModelRole) -> ProviderCo
     return _model_config(configured, role=role)
 
 
-def _model_config(configured: ModelRole, *, role: OptInModelRole) -> ProviderConfig:
+def configured_role_configs(root: str) -> list[tuple[ModelRoleName, ProviderConfig]]:
+    """Resolve every model role a project has actually written down, in `MODEL_ROLE_NAMES` order.
+
+    This is the "what has this project configured?" view, as opposed to the "what serves this
+    call?" view of `ModelsSettings.resolve`: unset `judge`/`summary` fall back to `worker` at USE
+    time, and resolving that fallback here would report one backend three times under three role
+    names. So this reads the raw fields and returns only the roles the settings file sets.
+
+    The model is canonicalized through the built-in catalog, because that is what a role holds:
+    `wmo providers set` stores the canonical TYPE (`claude-opus-4-8`), not the backend's runtime
+    id (`us.anthropic.claude-opus-4-8`), so a caller that wants to reach the backend has to
+    resolve it (`wmo scenarios` does the same). Unknown ids pass through unchanged, which is
+    what a self-hosted model or a `tinker://` weights path needs.
+
+    Args:
+        root: Project artifact root containing ``settings.toml``.
+
+    Returns:
+        One ``(role, config)`` pair per configured role; empty when nothing is configured.
+
+    Raises:
+        typer.BadParameter: A configured role names an unknown provider kind.
+    """
+    models = load_settings(root).models
+    resolved: list[tuple[ModelRoleName, ProviderConfig]] = []
+    for role in MODEL_ROLE_NAMES:
+        configured: ModelRole | None = getattr(models, role)
+        if configured is None:
+            continue
+        config = _model_config(configured, role=role)
+        spec = resolve_provider_model(config.kind, config.model)
+        resolved.append(
+            (
+                role,
+                config.model_copy(
+                    update={
+                        "model": spec.model_id,
+                        "model_type": config.model_type or spec.model_type,
+                    }
+                ),
+            )
+        )
+    return resolved
+
+
+def _model_config(configured: ModelRole, *, role: ModelRoleName) -> ProviderConfig:
     """Turn one configured role into provider-neutral config with the Azure default."""
     try:
         kind = ProviderKind(configured.provider)

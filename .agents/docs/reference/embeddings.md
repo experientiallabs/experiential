@@ -60,6 +60,12 @@ never a raw numpy mismatch.
 produced `dim` (or the failure detail). It never raises — a missing key or wrong model comes back as
 `fail`.
 
+The embedder is chosen by `wmo build`, so the embed half only runs once a world model exists. The
+completion half does not wait for one: the command also pings the `[models.<role>]` roles in
+`<root>/settings.toml`, which is how a brand-new project checks its credentials before it spends
+anything on a build. With nothing built, the embed check is skipped with a note rather than
+failing the command; with nothing configured at all, the command says so and exits 1.
+
 ## Wiring at build time
 
 `wmo build --embed-provider <kind> [--embed-model <id>] [--embed-dim N]` constructs the embedder via

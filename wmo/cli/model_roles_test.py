@@ -9,8 +9,10 @@ import typer
 
 import wmo.cli.model_roles as model_roles_module
 from wmo.cli.model_roles import (
+    MODEL_ROLE_NAMES,
     OptInModelRole,
     _model_config,
+    configured_role_configs,
     resolve_opt_in_model_provider,
 )
 from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
@@ -220,3 +222,104 @@ def test_role_without_the_field_still_resolves_from_the_catalog() -> None:
 
     assert config.chat_max_tokens_field == "max_completion_tokens"
     assert config.resolved_chat_max_tokens_field() == "max_completion_tokens"
+
+
+def test_model_role_names_covers_every_settings_role() -> None:
+    # A role added to ModelsSettings but not here would silently drop out of every
+    # "what has this project configured?" report, `wmo providers verify` included.
+    assert set(MODEL_ROLE_NAMES) == set(ModelsSettings.model_fields)
+
+
+def test_configured_role_configs_is_empty_for_a_project_with_no_settings(tmp_path: Path) -> None:
+    assert configured_role_configs(str(tmp_path / ".wmo")) == []
+
+
+def test_configured_role_configs_reports_only_roles_the_file_sets(tmp_path: Path) -> None:
+    # `judge`/`summary` fall back to `worker` at USE time; reporting that fallback here would
+    # list one backend three times under three role names.
+    root = tmp_path / ".wmo"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(provider="openai", model="gpt-5.4-mini"),
+                judge=ModelRole(provider="anthropic", model="claude-opus-4-8"),
+            )
+        ),
+        root,
+    )
+
+    assert [(role, cfg.kind, cfg.model) for role, cfg in configured_role_configs(str(root))] == [
+        ("worker", ProviderKind.OPENAI, "gpt-5.4-mini"),
+        ("judge", ProviderKind.ANTHROPIC, "claude-opus-4-8"),
+    ]
+
+
+def test_configured_role_configs_canonicalizes_the_stored_model_type(tmp_path: Path) -> None:
+    # `wmo providers set` stores the canonical type; pinging Bedrock with "claude-opus-4-8"
+    # instead of its runtime id would report a healthy provider as broken.
+    root = tmp_path / ".wmo"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="bedrock", model="claude-opus-4-8"))
+        ),
+        root,
+    )
+
+    [(_role, config)] = configured_role_configs(str(root))
+
+    assert config.model == "us.anthropic.claude-opus-4-8"
+    assert config.model_type == "claude-opus-4-8"
+
+
+def test_configured_role_configs_passes_through_an_uncatalogued_model(tmp_path: Path) -> None:
+    # A self-hosted model or a tinker:// weights path is not in the catalog and must reach the
+    # backend byte for byte, with its declared model_type intact.
+    root = tmp_path / ".wmo"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                agent=ModelRole(
+                    provider="tinker",
+                    model="tinker://run/weights/42",
+                    model_type="Qwen/Qwen3-8B",
+                )
+            )
+        ),
+        root,
+    )
+
+    [(role, config)] = configured_role_configs(str(root))
+
+    assert role == "agent"
+    assert config.model == "tinker://run/weights/42"
+    assert config.model_type == "Qwen/Qwen3-8B"
+
+
+def test_configured_role_configs_defaults_the_azure_api_version(tmp_path: Path) -> None:
+    root = tmp_path / ".wmo"
+    save_settings(
+        ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(provider="azure", model="gpt-5.5", deployment="gpt-5-5")
+            )
+        ),
+        root,
+    )
+
+    [(_role, config)] = configured_role_configs(str(root))
+
+    assert config.api_version == "2024-05-01-preview"
+    assert config.deployment == "gpt-5-5"
+
+
+def test_configured_role_configs_names_the_role_with_the_bad_provider(tmp_path: Path) -> None:
+    root = tmp_path / ".wmo"
+    save_settings(
+        ProjectSettings(models=ModelsSettings(summary=ModelRole(provider="bogus", model="m"))),
+        root,
+    )
+
+    with pytest.raises(
+        typer.BadParameter, match=r"settings \[models\.summary\] has unknown provider 'bogus'"
+    ):
+        configured_role_configs(str(root))
