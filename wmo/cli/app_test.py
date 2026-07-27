@@ -2005,6 +2005,48 @@ def test_missing_suite_corpus_names_the_download_command(
     assert "`wmo download` with no arguments" in flat
 
 
+def test_missing_corpus_for_an_unpublished_bundle_does_not_promise_a_download(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `kimi-gui-control` is registered so the write side knows how to publish it, but no dataset
+    # repo exists yet. Naming `wmo download kimi-gui-control` would send the user at a command
+    # that refuses them, so the remedy has to say so and point at the picker instead.
+    examples_root = tmp_path / "environment-capture-data"
+    evals_dir = examples_root / "kimi-gui-control" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir / "default.toml").write_text('files = ["../traces.otel.jsonl"]\n', encoding="utf-8")
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
+
+    result = runner.invoke(
+        app, ["eval", "run", "kimi-gui-control", "--examples-root", str(examples_root)]
+    )
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "has no trace corpus" in flat
+    assert "has not been published to the Hub yet" in flat
+    assert "wmo download kimi-gui-control" not in flat
+
+
+def test_unpublished_remedy_survives_a_corpus_spec_without_the_published_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The wheel resolves environment-capture from PyPI, which still serves a `CorpusSpec` with no
+    # `published` field. Reading it must not raise from inside the error path: an older member
+    # keeps the assume-downloadable behaviour.
+    examples_root = tmp_path / "environment-capture-data"
+    _tau_bench_suite(examples_root)
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
+
+    class _OldSpec:
+        """environment-capture 0.1.0's CorpusSpec: no `published` attribute at all."""
+
+    monkeypatch.setitem(cli_app_module.CORPORA, "tau-bench", _OldSpec())
+
+    result = runner.invoke(app, ["eval", "run", "tau-bench", "--examples-root", str(examples_root)])
+    assert result.exit_code == 2, result.output
+    assert "wmo download tau-bench" in _flat(result.output)
+
+
 def test_missing_corpus_outside_the_bundle_root_does_not_promise_a_download(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

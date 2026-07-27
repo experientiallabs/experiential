@@ -1713,10 +1713,12 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
     suite that lists no files at all is a different defect — the TOML itself — so it keeps its
     own message pointing at the file to edit.
 
-    Whether that benchmark's bundle is PUBLISHED is deliberately not second-guessed here: the
-    registry entry can outrun the Hub push, and only `wmo download` (in environment-capture,
-    which the wheel resolves from PyPI) holds the current answer. Naming the picker alongside
-    the direct command means an unpublished name still lands somewhere useful.
+    A registry entry can also outrun the Hub push (`kimi-gui-control` ships a suite whose bundle
+    was never published), and naming `wmo download` for one of those sends the user at a command
+    that refuses them. `CorpusSpec.published` answers that, but it postdates environment-capture
+    0.1.0 — the version the wheel still resolves from PyPI — so it is read defensively: a member
+    that predates the field keeps the old assume-downloadable behaviour instead of raising
+    `AttributeError` inside the error path.
     """
     files = suite.resolve_files()
     if not files:
@@ -1725,15 +1727,25 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
         )
     missing = [path for path in files if not path.exists()]
     if missing:
-        fetched = corpus_path(suite.example) if suite.example in CORPORA else None
-        downloadable = fetched is not None and fetched.resolve() in {p.resolve() for p in missing}
-        remedy = (
-            f"fetch the bundle with `wmo download {suite.example}` (or `wmo download` with no "
-            "arguments to pick from what is published)"
-            if downloadable
-            else f"the suite resolves `files` relative to {suite.path.parent}; put a corpus there "
-            "(or edit `files` to point at one)"
-        )
+        spec = CORPORA.get(suite.example)
+        fetched = corpus_path(suite.example) if spec is not None else None
+        on_path = fetched is not None and fetched.resolve() in {p.resolve() for p in missing}
+        if on_path and getattr(spec, "published", True):
+            remedy = (
+                f"fetch the bundle with `wmo download {suite.example}` (or `wmo download` with "
+                "no arguments to pick from what is published)"
+            )
+        elif on_path:
+            remedy = (
+                f"{suite.example!r} is a registered benchmark whose data bundle has not been "
+                "published to the Hub yet, so there is nothing to download; run `wmo download` "
+                "with no arguments to pick one that has been"
+            )
+        else:
+            remedy = (
+                f"the suite resolves `files` relative to {suite.path.parent}; put a corpus there "
+                "(or edit `files` to point at one)"
+            )
         raise typer.BadParameter(
             f"suite {suite.id!r} has no trace corpus at {missing or files}; {remedy}"
         )
