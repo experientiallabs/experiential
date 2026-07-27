@@ -7,8 +7,10 @@ Deliverables (charter `../README.md`, conventions binding per `../common/README.
 2. `latency_quality_frontier`: quality (with cluster-bootstrap CI) vs per-task p50 across all
    measured configs, marker area encoding effective cost per completed task, the
    latency-quality Pareto front drawn, the noise-floor band under the best config shaded.
-3. `stage_vs_quality_latency_lens`: the SHARED training-stage-vs-quality chart rendered
-   through the latency lens (each stage point annotated with its p50 episode wall seconds).
+3. `training-stage`: the SHARED training-stage-vs-quality chart rendered through the
+   latency lens (each stage point annotated with its p50 episode wall seconds) - DELEGATED
+   to the canonical `common/ablation_chart.py` so the three chats' stage charts cannot
+   disagree on numbers; this script only picks the lens and the output path.
 4. `cold_start_first_vs_warm`: each config's first-call vs warm-call seconds, kimi-k3's
    documented 51 s serverless cold start called out explicitly.
 5. `latency_max_corner.json` + stdout table: the LATENCY-MAX named corner - the mountable
@@ -38,14 +40,7 @@ from pathlib import Path
 CORNERS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(CORNERS_DIR / "common"))
 
-from data import (
-    CYCLE1_JUDGE,
-    ArmSnapshot,
-    all_arm_snapshots,
-    cycle1_run_dir,
-    load_cycle1_rows,
-    rewards_by_scenario,
-)
+from data import ArmSnapshot, all_arm_snapshots, rewards_by_scenario
 from latency import (
     ARM_COLORS,
     ConfigPoint,
@@ -252,98 +247,6 @@ def fig_cold_start(snapshots: list[ArmSnapshot], status: str, out: Path) -> None
     _save(fig, out / "cold_start_first_vs_warm")
 
 
-def fig_stage_chart(grid_points: list[ConfigPoint], status: str, out: Path) -> None:
-    """Deliverable 3: the SHARED training-stage-vs-quality chart, latency lens.
-
-    Stage x-axis: student base -> cycle-1 (unpromoted; plotted and labeled per the charter).
-    Teacher is a reference line from the same cycle rows (real_episode). The fable-5 anchor
-    reference is drawn ONLY when the grid's identity arm has fable-5 rows, and is labeled
-    wm_simulated: cross-provenance series share a figure only as separately-labeled
-    reference lines (common/README.md), never a computed delta. The +routing / +compaction
-    ablation lines are pending (grid filling; per-arm fits are the joint-tau master's) and
-    the footnote says so rather than omitting them silently.
-    """
-    rows = load_cycle1_rows()
-    stages: dict[str, dict[str, float]] = {}
-    for arm in ("teacher", "student-before", "student-after"):
-        arm_rows = [r for r in rows if r.arm == arm and not r.infra_failed]
-        if not arm_rows:
-            continue
-        p50, _p95 = p50_p95([r.duration_s for r in arm_rows])
-        stages[arm] = {
-            "solve_rate": sum(1.0 for r in arm_rows if r.passed) / len(arm_rows),
-            "p50_episode_s": p50,
-            "n": len(arm_rows),
-        }
-    order = [a for a in ("student-before", "student-after") if a in stages]
-    if not order:
-        return
-
-    fig, ax = plt.subplots(figsize=(9, 6))
-    xs = list(range(len(order)))
-    ys = [stages[a]["solve_rate"] for a in order]
-    ax.plot(xs, ys, color=BLUE, marker="o", markersize=7, linewidth=1.6, label="distill-only")
-    for x, arm_name in zip(xs, order, strict=True):
-        stage = stages[arm_name]
-        ax.annotate(
-            f"{stage['solve_rate']:.1%}\np50 {stage['p50_episode_s']:.0f}s/episode "
-            f"(real tau2 wall)",
-            (x, stage["solve_rate"]), textcoords="offset points", xytext=(10, 8),
-            fontsize=8, color=INK,
-        )
-    if "student-after" in order:
-        ax.annotate(
-            "not promoted (gate refused: no teacher headroom)",
-            (order.index("student-after"), stages["student-after"]["solve_rate"]),
-            textcoords="offset points", xytext=(10, -14), fontsize=8, color=RED,
-        )
-
-    drawn = [*ys]
-    if "teacher" in stages:
-        teacher = stages["teacher"]
-        drawn.append(teacher["solve_rate"])
-        ax.axhline(teacher["solve_rate"], color=MUTED, linewidth=1.0, linestyle="--")
-        ax.annotate(
-            f"teacher Qwen3.6-27B {teacher['solve_rate']:.1%} "
-            f"(p50 {teacher['p50_episode_s']:.0f}s/episode) — real_episode",
-            (0.0, teacher["solve_rate"]), textcoords="offset points", xytext=(0, 5),
-            fontsize=8, color=MUTED,
-        )
-    fable = [p for p in grid_points if p.model == "fable-5" and p.arm == "identity"]
-    if fable:
-        ref = fable[0]
-        drawn.append(ref.mean_reward)
-        ax.axhline(ref.mean_reward, color=MUTED, linewidth=1.0, linestyle=":")
-        ax.annotate(
-            f"fable-5 anchor {ref.mean_reward:.1%} — wm_simulated, different judge/env, "
-            f"reference only (p50 {ref.p50_task_s:.0f}s/task model time)",
-            (0.0, ref.mean_reward), textcoords="offset points", xytext=(0, 5),
-            fontsize=8, color=MUTED,
-        )
-
-    labels = {
-        "student-before": "student base\nQwen3.5-9B",
-        "student-after": "cycle 1\nwarmup LoRA (unpromoted)",
-    }
-    ax.set_xticks(xs)
-    ax.set_xticklabels([labels[a] for a in order], fontsize=9, color=INK)
-    ax.set_xlim(-0.4, len(order) - 0.3)
-    ax.set_ylim(min(drawn) - 0.035, max(drawn) + 0.02)
-    ax.legend(fontsize=8, loc="center left")
-    ax.set_title("training stage vs quality — latency lens (each point: p50 episode wall)")
-    ax.set_ylabel("solve rate, 20 pinned holdout tasks x 3 episodes")
-    _footnote(
-        fig,
-        f"Stages + teacher: real_episode, {CYCLE1_JUDGE}, 60 executed episodes/arm, cycle-1 "
-        "run dir. Episode wall clock includes user simulator + env: NOT comparable to grid "
-        "per-task model seconds. Per-episode cost was not recorded in cycle-1 artifacts (run "
-        "total $34.94, spend.json). +routing/+compaction ablation lines pending: grid arms "
-        "filling, per-arm fits are the joint-tau master's (DECISIONS 2026-07-27). Grid "
-        f"overlay: {status}.",
-    )
-    _save(fig, out / "stage_vs_quality_latency_lens")
-
-
 def latency_max_corner(
     points: list[ConfigPoint],
     snapshots: list[ArmSnapshot],
@@ -518,10 +421,16 @@ def main() -> int:
     else:
         print("no config points yet; skipping grid figures (re-run when chunks land)")
 
-    if not args.synthetic and (cycle1_run_dir() / "episode-rows.jsonl").exists():
-        fig_stage_chart(points, status, out)
-        print("\nstage chart rendered from cycle-1 rows")
-    elif args.synthetic:
+    if not args.synthetic:
+        # The shared stage chart is the canonical implementation, rendered through this
+        # corner's lens; a second hand-rolled stage chart could disagree on the numbers.
+        from ablation_chart import build_shared_chart_data, render_training_stage_chart
+
+        rendered = render_training_stage_chart(
+            build_shared_chart_data(), out / "training-stage", lens="latency"
+        )
+        print(f"\nshared stage chart (latency lens) -> {rendered}")
+    else:
         print("synthetic mode: stage chart skipped (cycle artifacts are real data)")
 
     print(f"\nwrote figures to {out}")

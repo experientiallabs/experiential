@@ -111,7 +111,7 @@ serving-mechanics entry).
 
 | artifact | deliverable | state |
 | --- | --- | --- |
-| `stage_vs_quality_latency_lens.{png,svg}` | shared stage-vs-quality chart, p50-annotated | rendered (cycle-1 real data; ablation lines pending grid + master fits) |
+| `training-stage.{png,json}` | shared stage-vs-quality chart, p50-annotated (canonical `common/ablation_chart.py`, latency lens) | rendered (cycle-1 real data; WM panel + ablation lines named pending on-figure) |
 | `latency_per_config.{png,svg}` | per-config per-task p50/p95 | pending grid chunks |
 | `latency_quality_frontier.{png,svg}` | latency-quality frontier, cost as marker area | pending grid chunks |
 | `cold_start_first_vs_warm.{png,svg}` | K3 cold-start callout | pending grid chunks |
