@@ -627,11 +627,19 @@ class EndpointRuntime:
         object, so no request can ever read half of one dial position and half of another. The
         pool, baseline, and evidence bank are identical across positions, so a conversation that
         spans a swap is still served by a model this endpoint knows.
+
+        The write is a read-modify-write, not a fresh config. `endpoint.toml` holds settings this
+        endpoint never touches (today `[representation]` and the query-embedding switch), and
+        writing a config built from the dial alone would DELETE them: the endpoint would keep
+        serving, because the swap happens in memory, and the loss would only surface at the next
+        mount, as a representation mismatch that fails the whole app. A dial change must not be
+        able to do that.
         """
         adjusted = apply_cost_quality(self._base_policy, cost_quality)
         with self._dial_lock:
             if self._config_path is not None:
-                EndpointConfig(cost_quality=cost_quality).save(self._config_path)
+                settings = EndpointConfig.load(self._config_path)
+                settings.model_copy(update={"cost_quality": cost_quality}).save(self._config_path)
             self._install_policy(adjusted)
 
     def _install_policy(self, adjusted: RoutingPolicy) -> None:

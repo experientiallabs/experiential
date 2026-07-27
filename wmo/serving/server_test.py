@@ -16,8 +16,10 @@ from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmo.serving.builds import BuildManager
+from wmo.serving.chat import ChatMessage as EndpointMessage
 from wmo.serving.chat import RequestLog
 from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmo.serving.query_embeddings import QUERY_EMBEDDING_FILENAME, QueryEmbeddingStore
 from wmo.serving.server import (
     _endpoint_runtimes,
     _load_card_or_none,
@@ -464,3 +466,49 @@ def test_a_malformed_endpoint_toml_names_the_endpoint_and_the_file(tmp_path: Pat
     assert "support" in str(error.value)
     assert ENDPOINT_CONFIG_FILENAME in str(error.value)
     assert "cost_qualty" in str(error.value)
+
+
+def test_moving_the_dial_preserves_other_endpoint_toml_keys(tmp_path: Path) -> None:
+    """A dial PUT must not delete settings it does not own.
+
+    Regression for a server-wide outage: `set_cost_quality` used to write a config built from
+    the dial alone, dropping every other key. The live endpoint kept serving, so nothing looked
+    wrong until the next mount, where `create_app` failed for EVERY endpoint, off the platform's
+    most-used write path.
+
+    Guarded here through `log_query_embeddings`, which is simply another key the dial does not
+    own. It stood in for `[representation]` when that table was dropped from this PR in favour of
+    #265's canonical `fit_compression`; the write path being protected is the same one.
+    """
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    config_path = model_dir / ENDPOINT_CONFIG_FILENAME
+    EndpointConfig(cost_quality=0.25, log_query_embeddings=False).save(config_path)
+
+    runtimes = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    runtimes["support"].set_cost_quality(0.75)
+
+    reloaded = EndpointConfig.load(config_path)
+    assert reloaded.cost_quality == 0.75
+    assert reloaded.log_query_embeddings is False
+    # And the endpoint still mounts, which is the failure the dropped key used to cause.
+    remounted = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
+    assert remounted["support"].cost_quality == 0.75
+
+
+def test_endpoint_toml_can_switch_the_query_embedding_store_off(tmp_path: Path) -> None:
+    # "Default on and undisableable" is not a choice an operator should be denied: an embedding
+    # is request content at rest, and whether to keep it is a tenancy decision.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    EndpointConfig(log_query_embeddings=False).save(model_dir / ENDPOINT_CONFIG_FILENAME)
+    runtimes = _endpoint_runtimes(
+        {"support": policy},
+        {"support": model_dir},
+        RequestLog(None),
+        QueryEmbeddingStore(tmp_path / QUERY_EMBEDDING_FILENAME),
+    )
+    decision = runtimes["support"].decide(
+        [EndpointMessage(role="user", content="SELECT count(*) FROM superheroes")]
+    )
+    assert decision.query_embedding() is not None  # the policy still embeds
+    assert runtimes["support"].record_query_embedding("chatcmpl-x", decision) is None
+    assert not (tmp_path / QUERY_EMBEDDING_FILENAME).exists()
