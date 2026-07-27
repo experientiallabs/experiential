@@ -626,7 +626,14 @@ def tune_policy_dial(policy_path: Path, cost_quality: float) -> DialResult:
             superseded fit, or the policy has no dial (see `apply_cost_quality`).
     """
     if not policy_path.is_file():
-        raise ValueError(f"no policy file at {policy_path}")
+        # Name the producer, as the not-dialable branch of `apply_cost_quality` does: the default
+        # argument is a bare `policy.json`, so this is the first thing a new user hits.
+        raise ValueError(
+            f"no policy file at {policy_path}; fit one first with "
+            "`wmo optimize route fit <matrix.json> --kind knn`, or pass the path of an "
+            "installed policy (`wmo optimize route pin` and `wmo optimize model` write it to "
+            "<root>/models/<name>/policy.json)"
+        )
     policy = RoutingPolicy.load(policy_path)
     base_path = policy_path.with_name(f"{policy_path.stem}.base{policy_path.suffix}")
     as_fitted = RoutingPolicy.load(base_path) if base_path.is_file() else None

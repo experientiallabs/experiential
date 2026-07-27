@@ -238,7 +238,12 @@ class ModelPool(BaseModel):
 
 
 def load_pool(path: Path = DEFAULT_POOL_PATH) -> ModelPool:
-    """Load and validate the pool file at `path`."""
+    """Load and validate the pool file at `path`.
+
+    A file that exists but declares no candidate is answered like a missing one: with the path and
+    the commands that write an entry. Falling through to pydantic instead named neither, and the
+    caller only ever sees `str(exc)`.
+    """
     if not path.is_file():
         raise FileNotFoundError(
             f"no model pool file at {path}; create it with one [[model]] table per candidate "
@@ -246,7 +251,23 @@ def load_pool(path: Path = DEFAULT_POOL_PATH) -> ModelPool:
             "output_per_mtok; endpoint/deployment/api_version/api_key_env as the backend needs)"
         )
     data = tomllib.loads(path.read_text(encoding="utf-8"))
-    return ModelPool.model_validate({"models": data.get("model", [])})
+    entries = data.get("model", [])
+    if not isinstance(entries, list):
+        # `[model]` declares ONE table; the roster is an array of tables, which needs the doubled
+        # brackets. Worth naming, since it is a typo on the very syntax the missing-file message
+        # above recommends.
+        raise ValueError(
+            f"{path} declares a single [model] table; the candidate pool is an array of tables, "
+            "so each candidate needs DOUBLED brackets: [[model]]"
+        )
+    if not entries:
+        raise ValueError(
+            f"no [[model]] tables in {path}, so the candidate pool is empty; register a hosted "
+            "model with `wmo providers set <provider>`, add a distilled student with "
+            "`wmo optimize route student <run-dir> --input-per-mtok <p> --output-per-mtok <p>`, "
+            "or write one [[model]] table per candidate by hand"
+        )
+    return ModelPool.model_validate({"models": entries})
 
 
 def pool_api_key(entry: PoolEntry) -> str | None:

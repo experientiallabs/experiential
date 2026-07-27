@@ -43,6 +43,7 @@ from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.compression import (
     CompressingEmbedder,
     compression_signature,
+    registered_compressor_ids,
     resolve_compression,
     same_compression,
 )
@@ -63,6 +64,7 @@ from wmo.optimize.policy import (
     embedder_provenance,
     probe_embedder,
     resolve_embedder,
+    write_artifact_atomically,
 )
 from wmo.optimize.report import build_report
 from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
@@ -100,6 +102,12 @@ _console = Console()
 
 DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
+
+COMPRESSOR_IDS_HELP = " | ".join(registered_compressor_ids())
+"""What `--compressor` accepts, rendered from the registry so the help cannot go stale."""
+
+_MATRIX_DIGEST_MARK = "sha256="
+"""How `load_matrix_with_digest` spells the digest inside a policy's `fitted_from`."""
 
 
 @route_app.command("sweep")
@@ -170,9 +178,9 @@ def sweep(
     compressor: str = typer.Option(
         None,
         "--compressor",
-        help="D-COMPRESS: measure every candidate call through this compressor (identity | "
-        "truncate), so the matrix is the compressed ARM of the grid. Default: uncompressed. "
-        "`fit` requires the matrix arm to match the policy it stamps.",
+        help="D-COMPRESS: measure every candidate call through this compressor "
+        f"({COMPRESSOR_IDS_HELP}), so the matrix is the compressed ARM of the grid. Default: "
+        "uncompressed. `fit` requires the matrix arm to match the policy it stamps.",
     ),
     aggressiveness: float = typer.Option(
         0.0,
@@ -755,14 +763,74 @@ def _confirm_replace(path: Path, name: str) -> bool:
         return False
 
 
+# ------------------------------------------------------------------ artifact loading boundary
+# `fit` and `report` are handed paths a user typed, and the loaders behind them raise pathlib and
+# pydantic errors. Both artifacts come through here so a wrong path, a truncated file, or the two
+# `report` positionals in the wrong order is a usage error naming the fix, instead of the
+# traceback every other input in this file is already careful not to produce.
+
+
+def _reads_as(model: type[OutcomeMatrix] | type[RoutingPolicy], path: Path) -> bool:
+    """Whether `path` parses as the OTHER artifact, which is what a swapped pair looks like."""
+    try:
+        model.model_validate_json(path.read_bytes())
+    except (ValidationError, OSError):
+        return False
+    return True
+
+
+def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
+    """The outcome matrix at `matrix_file`, with the digest provenance a fit stamps."""
+    path = Path(matrix_file)
+    try:
+        return load_matrix_with_digest(path)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(
+            f"no outcome matrix at {path}; `wmo optimize route sweep <world-model>` measures the "
+            f"pool and writes one (its --out, default {DEFAULT_MATRIX_FILENAME})"
+        ) from exc
+    except OSError as exc:
+        raise typer.BadParameter(f"cannot read the outcome matrix at {path}: {exc}") from exc
+    except ValidationError as exc:
+        if _reads_as(RoutingPolicy, path):
+            raise typer.BadParameter(
+                f"{path} holds a fitted policy, not an outcome matrix. The matrix is what "
+                "`wmo optimize route sweep` writes, and it comes FIRST: "
+                "`wmo optimize route report <matrix.json> <policy.json>`"
+            ) from exc
+        raise typer.BadParameter(f"{path} is not a readable OutcomeMatrix: {exc}") from exc
+
+
+def _load_policy(policy_file: str) -> RoutingPolicy:
+    """The fitted policy at `policy_file`."""
+    path = Path(policy_file)
+    try:
+        return RoutingPolicy.load(path)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(
+            f"no policy file at {path}; fit one with "
+            "`wmo optimize route fit <matrix.json> --kind knn`"
+        ) from exc
+    except OSError as exc:
+        raise typer.BadParameter(f"cannot read the policy at {path}: {exc}") from exc
+    except ValidationError as exc:
+        if _reads_as(OutcomeMatrix, path):
+            raise typer.BadParameter(
+                f"{path} holds an outcome matrix, not a fitted policy. The policy is what "
+                "`wmo optimize route fit` writes, and it comes SECOND: "
+                "`wmo optimize route report <matrix.json> <policy.json>`"
+            ) from exc
+        raise typer.BadParameter(f"{path} is not a readable routing policy: {exc}") from exc
+
+
 @route_app.command("fit")
 def fit(
     matrix_file: str = typer.Argument(..., help="OutcomeMatrix JSON (closed-loop eval output)."),
     kind: str = typer.Option(
-        "rank",
+        "knn",
         "--kind",
-        help="knn (guarded nearest-neighbor evidence, the validated champion) | rank "
-        "(Avengers cluster ranks).",
+        help="knn (guarded nearest-neighbor evidence, the validated champion, and what `tune`, "
+        "`sweep`'s handoff and the docs all assume) | rank (Avengers cluster ranks).",
     ),
     out: str = typer.Option(
         POLICY_FILENAME, "--out", help="Where to write the fitted policy JSON."
@@ -841,8 +909,8 @@ def fit(
     compressor: str = typer.Option(
         None,
         "--compressor",
-        help="D-COMPRESS: compressor id the endpoint applies before routing (identity | "
-        "truncate). Default: compression off.",
+        help="D-COMPRESS: compressor id the endpoint applies before routing "
+        f"({COMPRESSOR_IDS_HELP}). Default: compression off.",
     ),
     aggressiveness: float = typer.Option(
         0.0,
@@ -857,7 +925,16 @@ def fit(
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
-    matrix, source = load_matrix_with_digest(Path(matrix_file))
+    matrix, source = _load_matrix(matrix_file)
+    if not any(outcome.scored for outcome in matrix.outcomes):
+        # `sweep` already exits 1 saying "fitting will fail" on this matrix, so it is a state a
+        # user arrives here from: answer it the way sweep does instead of letting the fitter's
+        # own ValueError out (the rank one names no remedy at all).
+        raise typer.BadParameter(
+            f"no cell in {matrix_file} carries a reward, so there is nothing to fit: read the "
+            "`error` field of a row to see what broke, fix it, then re-run "
+            "`wmo optimize route sweep <world-model>`"
+        )
     try:
         spec, resolution = resolve_embedder(
             embedder, dim=dim, deployment=deployment, endpoint=endpoint, api_key_env=api_key_env
@@ -911,20 +988,25 @@ def fit(
                 "policy trades cost through its dial instead: fit it, then "
                 "`wmo optimize route tune <policy.json> --cost-quality <0..1>`"
             )
-        fitted = fit_knn_artifact(
-            matrix,
-            out_path=out_path,
-            matrix_source=source,
-            embedder=spec,
-            fallback=fallback,
-            z=z,
-            rag_num=rag_num,
-            rag_thres=rag_thres,
-            min_pairs=min_pairs,
-            se_floor=se_floor,
-            floor_q=floor_q,
-            compression=compression,
-        )
+        try:
+            fitted = fit_knn_artifact(
+                matrix,
+                out_path=out_path,
+                matrix_source=source,
+                embedder=spec,
+                fallback=fallback,
+                z=z,
+                rag_num=rag_num,
+                rag_thres=rag_thres,
+                min_pairs=min_pairs,
+                se_floor=se_floor,
+                floor_q=floor_q,
+                compression=compression,
+            )
+        except ValueError as exc:
+            # What the fitter can still refuse once the matrix loads: an unknown --fallback, or a
+            # fit split whose own rows are all unscored. Both are about the arguments.
+            raise typer.BadParameter(str(exc)) from exc
         print_knn_fit(_console, fitted, out=out, z=z)
         return
     built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
@@ -933,18 +1015,21 @@ def fit(
         # text serving will embed, which is the COMPRESSED text (see `fit_knn_artifact`, which
         # applies the same rule to the bank on the knn path).
         built = CompressingEmbedder(built, compression)
-    policy = fit_rank_policy(
-        matrix,
-        embedder=spec,
-        n_clusters=clusters,
-        seed=seed,
-        top_k_clusters=top_k_clusters,
-        beta=beta,
-        fitted_from=(
-            f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
-            f"cost_weight={cost_weight:g} {embedder_provenance(spec)}"
-        ),
-    )
+    try:
+        policy = fit_rank_policy(
+            matrix,
+            embedder=spec,
+            n_clusters=clusters,
+            seed=seed,
+            top_k_clusters=top_k_clusters,
+            beta=beta,
+            fitted_from=(
+                f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
+                f"cost_weight={cost_weight:g} {embedder_provenance(spec)}"
+            ),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     if cost_weight > 0.0:
         policy = rerank_policy(policy, cost_weight=cost_weight)
     if compression is not None:
@@ -1012,10 +1097,19 @@ def pin(
     say so. Replace it with `wmo optimize route fit` on a real outcome matrix to let the router
     choose per request.
     """
+    store = WorldModelStore(root)
     try:
-        model_dir = WorldModelStore(root).resolve(world_model)
-    except (FileNotFoundError, ValueError) as exc:
+        model_dir = store.resolve(world_model)
+    except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except ValueError as exc:
+        # `resolve` says "pass --name", the option `wmo serve`/`play`/`demo` carry. This command
+        # has no --name (its --model is the POOL entry), so say what a user of it actually types.
+        names = store.list_names()
+        raise typer.BadParameter(
+            f"multiple world models built ({', '.join(names)}); name one as the WORLD_MODEL "
+            f"argument, e.g. `wmo optimize route pin {names[0]} --model {model}`"
+        ) from exc
     pool_path = Path(pool)
     try:
         roster = load_pool(pool_path)
@@ -1123,25 +1217,71 @@ def report(
     matrix_file: str = typer.Argument(..., help="OutcomeMatrix JSON with held-out scenarios."),
     policy_file: str = typer.Argument(..., help="Fitted policy JSON."),
     baseline: str = typer.Option(
-        ..., "--baseline", help="Frontier pool model the report compares against."
+        ...,
+        "--baseline",
+        # The doubled brackets are escaped for the same reason `sweep --pool`'s are: typer
+        # renders help through rich markup, which otherwise prints an empty pair.
+        help="Pool entry HANDLE to compare against: the `name` of a \\[\\[model]] table in the "
+        "matrix's pool, NOT the model id. Normally the frontier candidate.",
     ),
     endpoint: str = typer.Option("endpoint", "--endpoint", help="Endpoint id for the report."),
     out: str = typer.Option("report.json", "--out", help="Where to write the report JSON."),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
-    matrix = OutcomeMatrix.load(Path(matrix_file))
-    policy = RoutingPolicy.load(Path(policy_file))
-    improvement = build_report(
-        matrix,
-        policy,
-        baseline=baseline,
-        endpoint=endpoint,
-        generated_at=datetime.now(tz=UTC).isoformat(),
-    )
-    Path(out).write_text(improvement.model_dump_json(indent=2), encoding="utf-8")
+    matrix, matrix_source = _load_matrix(matrix_file)
+    policy = _load_policy(policy_file)
+    try:
+        improvement = build_report(
+            matrix,
+            policy,
+            baseline=baseline,
+            endpoint=endpoint,
+            generated_at=datetime.now(tz=UTC).isoformat(),
+        )
+    except KeyError as exc:
+        # `--baseline` is a pool entry handle; the KeyError already lists the ones this matrix
+        # has. `str()` on a KeyError quotes its own argument, so unwrap it.
+        raise typer.BadParameter(
+            f"{exc.args[0]}. --baseline names a pool entry handle (the `name` of a [[model]] "
+            "table), not a model id."
+        ) from exc
+    except FileNotFoundError as exc:
+        # A knn policy carries its evidence in a sidecar; `knn_bank` says how to restore it.
+        raise typer.BadParameter(str(exc)) from exc
+    except ValueError as exc:
+        # Nothing scored on both sides, so there is no paired comparison to report.
+        raise typer.BadParameter(str(exc)) from exc
+    # mkdir + atomic, exactly as `fit --out` and `pin --out` write their policies: a report whose
+    # parent directory does not exist must not throw away the work that produced it.
+    write_artifact_atomically(Path(out), improvement.model_dump_json(indent=2).encode("utf-8"))
     headline = improvement.headline
     _console.print(
         f"[green]✓[/green] report -> {out}\n"
         f"  routed acc {headline.accuracy:.4f} @ ${headline.cost_per_run_usd:.5f}/run vs "
         f"{baseline} {headline.baseline_accuracy:.4f} @ ${headline.baseline_cost_per_run_usd:.5f}"
+    )
+    in_sample = _in_sample_warning(policy, matrix_source)
+    if in_sample is not None:
+        _console.print(in_sample)
+
+
+def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
+    """The caveat for a report measured on the very matrix the policy was fitted on.
+
+    `fit` sends the user here precisely to escape its own in-sample number, and the report labels
+    its scenarios held-out, so a report over the fit matrix is the one case where both surfaces
+    say the opposite of what happened. The digest in `fitted_from` is an identity rather than a
+    label (`load_matrix_with_digest`), so the collision is detectable even when the matrix was
+    renamed or moved after the fit, and a matrix with the same path but different bytes does not
+    trip it.
+    """
+    digest = matrix_source.partition(_MATRIX_DIGEST_MARK)[2]
+    stamped = policy.fitted_from or ""
+    if not digest or f"{_MATRIX_DIGEST_MARK}{digest}" not in stamped:
+        return None
+    return (
+        f"[yellow]warning[/yellow] this policy was FITTED on this matrix "
+        f"({_MATRIX_DIGEST_MARK}{digest}), so these numbers are IN-SAMPLE, not held out: every "
+        "request retrieves its own row. Sweep a second matrix over scenarios the fit never saw "
+        "and report against that one."
     )

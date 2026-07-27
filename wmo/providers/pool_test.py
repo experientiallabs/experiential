@@ -97,8 +97,25 @@ def test_duplicate_names_rejected(tmp_path: Path) -> None:
 
 
 def test_empty_pool_rejected(tmp_path: Path) -> None:
-    with pytest.raises(ValueError):
-        load_pool(_write_pool(tmp_path, "# no models\n"))
+    """And it names the file and a command that writes an entry, as the missing case does.
+
+    Falling through to pydantic here printed `List should have at least 1 item ... [too_short]`
+    plus an errors.pydantic.dev URL: no path, no remedy. Every caller only ever shows `str(exc)`.
+    """
+    path = _write_pool(tmp_path, "# no models\n")
+    with pytest.raises(ValueError, match="wmo providers set") as excinfo:
+        load_pool(path)
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert "wmo optimize route student" in message
+    assert "too_short" not in message
+
+
+def test_single_bracket_model_table_says_to_double_the_brackets(tmp_path: Path) -> None:
+    # `[model]` is a typo on the very syntax the missing-file message recommends, and pydantic
+    # answered it with `Input should be a valid list`.
+    with pytest.raises(ValueError, match=r"\[\[model\]\]"):
+        load_pool(_write_pool(tmp_path, '[model]\nname = "fable"\n'))
 
 
 def test_unknown_model_requires_explicit_price() -> None:

@@ -21,7 +21,7 @@ Three optimizers, named for the artifact each produces.
 | Command | Purpose | Artifact |
 |---|---|---|
 | `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. | `matrix.json` (an `OutcomeMatrix`) |
-| `wmo optimize route fit` | Fit a routing policy on a matrix: `--kind knn` guarded neighbor evidence, or `--kind rank` cluster ranks. | `policy.json` + its evidence bank |
+| `wmo optimize route fit` | Fit a routing policy on a matrix: `--kind knn` guarded neighbor evidence (the default), or `--kind rank` cluster ranks. | `policy.json` + its evidence bank |
 | `wmo optimize route tune` | Set a fitted policy's cost/quality dial in place, no refit. | the policy, rewritten; `policy.base.json` snapshot |
 | `wmo optimize route report` | Build the three-objective improvement report for a policy over a matrix. | `report.json` (an `ImprovementReport`) |
 | `wmo optimize route pin` | Serve one pool model as an endpoint, with no matrix and no fit. | a `kind="static"` `policy.json` |
