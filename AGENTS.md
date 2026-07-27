@@ -94,10 +94,13 @@ uv run pytest -q
   core in `wmo/optimize/sweep.py`.
 - `wmo optimize distill run` is the third optimization surface, named for the artifact it produces
   (`adapter`, beside harness's `prompt` and route's `routing_policy`): instead of editing the
-  harness it trains the agent MODEL, an on-policy distillation of a Tinker LoRA student from
-  rollouts of harbor's OWN `terminus_2` agent on harbor tasks (measured: our pi scaffold needed
+  harness it trains the agent MODEL, a distillation of a Tinker LoRA student from real
+  benchmark rollouts. The rollout source is config-selected, exactly one of `[harbor]` (harbor's
+  OWN `terminus_2` agent on harbor tasks; measured: our pi scaffold needed
   2-3x terminus-2's turns on the same TerminalBench-2 tasks and drove 39-59% harness loss, and
-  this command measures model quality, not scaffold quality). The harbor environment is implicit
+  this command measures model quality, not scaffold quality) or `[tau2]` (real tau2-bench
+  episodes through a loopback proxy whose per-episode Tinker provider records the exact sampled
+  spans; see `docs/reference/distill.md`). The environment is implicit
   and the harness is pinned, never edited: `--harness` (default `pi`) only selects the stored
   document supplying the rollout params (`sampling.temperature`, `rollout.max_turns`,
   `sampling.max_tokens`) and the hash that keys every harbor job. Terminus-2 samples
@@ -108,8 +111,9 @@ uv run pytest -q
   passing trajectories), and promotion is gated on holdout solve rates: student-after must
   reach `gate.min_teacher_fraction` of the teacher and not regress against student-before;
   only then does the adapter version land in `AdapterStore` with the champion alias. Run
-  configuration is a per-run TOML passed via `--config` (student, teacher, harbor,
-  rollout, train, sampling, warmup, eval, gate, pricing, budget, tripwire, wandb sections),
+  configuration is a per-run TOML passed via `--config` (student, teacher, one of
+  harbor/tau2, plus rollout, train, sampling, warmup, eval, gate, pricing, budget, tripwire,
+  wandb sections),
   snapshotted into the run dir; `wmo optimize distill report --run-dir <dir>` reads a finished run
   back. The CLI face lives in `wmo/cli/model_app.py` and the loop
   in `wmo/distill/`. Degeneration tripwires (`[tripwire]`, `wmo/distill/tripwire.py`) watch the

@@ -130,8 +130,8 @@ def parse_tau2_task_id(task_id: str) -> tuple[str, str]:
     if not separator or not rest or domain not in TAU2_DOMAINS:
         raise ValueError(
             f"invalid tau2 task id {task_id!r}: expected 'domain/task_id' with the "
-            f"domain one of {', '.join(TAU2_DOMAINS)} (e.g. 'airline/12'); regenerate "
-            "the split files with .agents/distill/pin_tau2_task_ids.py"
+            f"domain one of {', '.join(TAU2_DOMAINS)} (e.g. 'airline/12'); fix the "
+            "task-id split files so every entry carries its domain prefix"
         )
     return domain, rest
 
@@ -253,6 +253,17 @@ def _agent_llm_args(cfg: DistillConfig, proxy_base_url: str) -> JsonObject:
         "api_key": "wmo-local-proxy",
         "temperature": cfg.sampling.temperature,
         "max_tokens": cfg.sampling.max_tokens,
+        # ZERO litellm-level retries, for the same span-sink integrity reason as
+        # the runner-level --max-retries 0: tau2's generate() defaults
+        # num_retries to 3, and a retried HTTP request does not stop the
+        # abandoned one, so two threads would call complete_chat on the SAME
+        # per-episode provider and race its prompt state and recorder (both
+        # single-thread by contract). Retry on this side of the proxy belongs
+        # to wmo's RetryingToolCallingProvider. The explicit timeout keeps
+        # litellm's client clock from firing before a slow long-prompt Tinker
+        # sample returns; the episode budget is the real wall clock.
+        "num_retries": 0,
+        "timeout": cfg.rollout.episode_timeout_s,
     }
 
 
@@ -346,6 +357,13 @@ async def _run_episode_subprocess(
                 process.wait(),
                 timeout=cfg.rollout.episode_timeout_s + _SUBPROCESS_KILL_MARGIN_S,
             )
+        except asyncio.CancelledError:
+            # A cancelled await does NOT signal the child: without this, a
+            # batch aborted mid-flight leaves tau2 runners burning user-sim
+            # tokens against a proxy that is about to stop.
+            process.kill()
+            await process.wait()
+            raise
         except TimeoutError:
             process.kill()
             await process.wait()
@@ -528,10 +546,16 @@ async def _run_batch(
         proxy.register(spec.name, provider)
         try:
             await _run_episode_subprocess(spec, cfg, proxy.base_url)
-        except RuntimeError as error:
-            # No results file this attempt; the retry loop (or, on the last
-            # attempt, the assembled infra_failed record) owns what happens next.
-            logger.warning("%s", error)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - one episode must not kill the batch
+            # RuntimeError is the expected shape (hard deadline, missing
+            # results), but ANY per-episode failure is still just an episode
+            # with no verifier evidence: letting it escape would cancel every
+            # sibling through asyncio.gather and orphan their tau2 runners.
+            # The retry loop (or, on the last attempt, the assembled
+            # infra_failed record) owns what happens next.
+            logger.warning("episode %s attempt failed: %s", spec.name, error)
         finally:
             proxy.release(spec.name)
 

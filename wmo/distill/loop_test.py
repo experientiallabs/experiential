@@ -3638,3 +3638,36 @@ def test_a_missing_deferred_baseline_does_not_cost_the_trained_weights(
 
     checkpoints = json.loads((env.run_dir / "checkpoints.json").read_text())["checkpoints"]
     assert checkpoints, "the trained weights must be saved before the baseline import can fail"
+
+
+def test_deferred_baselines_still_run_the_warmup_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defer_baselines early return used to sit ABOVE the only `_warmup()` call.
+
+    A deferred run silently lost its supervised phase, and with `train.steps = 0`
+    (warmup-only) that meant gating a completely untrained student, past the
+    validator written to prevent exactly that. Warmup now runs before the branch.
+    """
+    monkeypatch.setattr(loop_module, "_DEFERRED_BASELINE_WAIT_S", 0.0)
+    env = _setup(tmp_path, monkeypatch)
+    base = _warmup_cfg()
+    cfg = base.model_copy(
+        update={
+            "eval": base.eval.model_copy(
+                update={
+                    "defer_baselines": True,
+                    "student_baseline_from": str(tmp_path / "never-written.json"),
+                }
+            ),
+        }
+    )
+
+    # The missing baseline import still fails at finalize (covered elsewhere);
+    # what this test pins is that warmup ran BEFORE that.
+    with pytest.raises(ValueError, match="student_baseline_from"):
+        _run(env, cfg)
+
+    (warmup_call,) = _warmup_calls(env)
+    assert warmup_call.provider_model == _TEACHER
+    assert "cross_entropy" in _loss_fns(env), "the supervised passes must have trained"

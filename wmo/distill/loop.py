@@ -3274,22 +3274,19 @@ class _DistillRun:
         except BudgetExhausted as exc:
             self._abort_for_budget(exc, completed_step=None)
 
-        # Baselines feed the GATE only -- nothing in the training loop reads them -- so they are
-        # not on the critical path for starting work. Deferred, they run at finalize instead,
-        # which frees the training loop to start immediately while a SEPARATE process measures
-        # them concurrently. That process must have its own HOME: harbor's task cache is a
-        # hardcoded `~/.cache/harbor` (no env override) and `_copy_task_source_to_target` does an
-        # UNCONDITIONAL rmtree+copytree of the task dir even when the cache is warm, so two
-        # concurrent harbor jobs sharing a HOME delete each other's tasks mid-run.
-        if cfg.eval.defer_baselines:
-            self._deferred_baselines = True
-            for step in range(start_step, cfg.train.steps):
-                self._train_step(step)
-            return self._finalize(None, None)
+        def _maybe_warmup() -> None:
+            """Run the supervised phase unless a resume already covers it.
 
-        teacher_report, before_report = self._gate_baselines(reuse=resume)
-
-        if cfg.warmup.steps > 0:
+            Shared by both baseline paths: warmup must run AFTER the in-process
+            student-before baseline (which has to sample the pre-warmup
+            weights), but a DEFERRED run measures student-before in a separate
+            process on the base weights, so warmup runs immediately there.
+            Before this was shared, the deferred path skipped warmup entirely,
+            which train.steps = 0 would have turned into gating a completely
+            untrained student.
+            """
+            if cfg.warmup.steps <= 0:
+                return
             if warmup_record is not None:
                 logger.info(
                     "warmup already recorded in %s; skipping (%s)",
@@ -3305,6 +3302,24 @@ class _DistillRun:
                 )
             else:
                 self._warmup()
+
+        # Baselines feed the GATE only -- nothing in the training loop reads them -- so they are
+        # not on the critical path for starting work. Deferred, they run at finalize instead,
+        # which frees the training loop to start immediately while a SEPARATE process measures
+        # them concurrently. That process must have its own HOME: harbor's task cache is a
+        # hardcoded `~/.cache/harbor` (no env override) and `_copy_task_source_to_target` does an
+        # UNCONDITIONAL rmtree+copytree of the task dir even when the cache is warm, so two
+        # concurrent harbor jobs sharing a HOME delete each other's tasks mid-run.
+        if cfg.eval.defer_baselines:
+            self._deferred_baselines = True
+            _maybe_warmup()
+            for step in range(start_step, cfg.train.steps):
+                self._train_step(step)
+            return self._finalize(None, None)
+
+        teacher_report, before_report = self._gate_baselines(reuse=resume)
+
+        _maybe_warmup()
 
         if start_step >= cfg.train.steps:
             logger.info(

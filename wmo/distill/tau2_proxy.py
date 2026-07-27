@@ -48,14 +48,47 @@ _STARTUP_TIMEOUT_S = 15.0
 """How long `start()` waits for uvicorn to bind before giving up."""
 
 
-def _losslessly_aligned(value: JsonValue, expected: str) -> JsonValue:
-    """`value` converted to the schema's scalar type when that loses nothing.
+def _declared_type(declared: JsonValue) -> tuple[str | None, JsonValue]:
+    """The scalar/array type a property schema declares, plus its items schema.
+
+    Handles the two shapes tau2's pydantic-derived schemas produce: a plain
+    `{"type": ...}` and an `anyOf` optional (`Optional[str]` renders as
+    `anyOf: [{type: string}, {type: "null"}]`), where the single non-null
+    branch is the declared type. Anything else is None (left untouched).
+    """
+    if not isinstance(declared, dict):
+        return None, None
+    expected = declared.get("type")
+    if isinstance(expected, str):
+        return expected, declared.get("items")
+    branches = declared.get("anyOf")
+    if isinstance(branches, list):
+        non_null = [
+            b for b in branches if isinstance(b, dict) and b.get("type") not in (None, "null")
+        ]
+        if len(non_null) == 1:
+            branch_type = non_null[0].get("type")
+            if isinstance(branch_type, str):
+                return branch_type, non_null[0].get("items")
+    return None, None
+
+
+def _losslessly_aligned(value: JsonValue, expected: str, items: JsonValue = None) -> JsonValue:
+    """`value` converted to the schema's declared type when that loses nothing.
 
     Only conversions whose text round-trips exactly are applied; anything else
     (including a value that already matches, or a type this cannot align
     losslessly) comes back unchanged, so a genuinely malformed argument still
     reaches the environment and fails there, which is real behavioral signal.
+    Arrays align per element against their `items` scalar type (retail's
+    reward-bearing write tools take `List[str]` of all-numeric item ids, the
+    exact shape the top-level fix exists for).
     """
+    if expected == "array" and isinstance(value, list):
+        item_type, _ = _declared_type(items)
+        if item_type is None:
+            return value
+        return [_losslessly_aligned(item, item_type) for item in value]
     if expected == "string" and isinstance(value, int | float) and not isinstance(value, bool):
         # json.dumps, not str(): it renders floats exactly as JSON parsed them,
         # so int(19122) -> "19122" and 3.5 -> "3.5" with no repr drift.
@@ -118,11 +151,10 @@ def realign_tool_argument_types(response: ChatResponse, tools: list[ChatTool] | 
                 continue
             changed = False
             for name, value in arguments.items():
-                declared = properties.get(name)
-                expected = declared.get("type") if isinstance(declared, dict) else None
-                if not isinstance(expected, str):
+                expected, items = _declared_type(properties.get(name))
+                if expected is None:
                     continue
-                aligned = _losslessly_aligned(value, expected)
+                aligned = _losslessly_aligned(value, expected, items)
                 if aligned is not value:
                     arguments[name] = aligned
                     changed = True
@@ -272,6 +304,10 @@ class EpisodeProxy:
                 raise RuntimeError("the tau2 proxy server thread died during startup")
             time.sleep(0.05)
         else:
+            # Without this the daemon thread keeps serving (and holding its
+            # port) for the life of the process after the failure is raised.
+            server.should_exit = True
+            thread.join(timeout=5.0)
             raise RuntimeError(f"the tau2 proxy did not start within {_STARTUP_TIMEOUT_S:.0f}s")
         self._server = server
         self._thread = thread

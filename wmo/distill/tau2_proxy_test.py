@@ -251,3 +251,38 @@ class TestToolArgumentRealignment:
         response2 = self._response('{"zip": 19122}')
         realign_tool_argument_types(response2, None)
         assert self._arguments(response2) == {"zip": 19122}
+
+    def test_array_items_align_per_element(self) -> None:
+        # Retail's reward-bearing write tools take List[str] of all-numeric item
+        # ids; a model emitting them unquoted must be repaired element-wise.
+        response = self._response('{"item_ids": [9612497925, 8124970213], "note": "x"}')
+        tools = self._tools(
+            {
+                "item_ids": {"type": "array", "items": {"type": "string"}},
+                "note": {"type": "string"},
+            }
+        )
+        realign_tool_argument_types(response, tools)
+        assert self._arguments(response) == {
+            "item_ids": ["9612497925", "8124970213"],
+            "note": "x",
+        }
+
+    def test_anyof_optional_string_aligns(self) -> None:
+        # Optional[str] renders as anyOf [string, null]; the single non-null
+        # branch is the declared type.
+        response = self._response('{"origin": 90210, "leave_after": null}')
+        tools = self._tools(
+            {
+                "origin": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "leave_after": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            }
+        )
+        realign_tool_argument_types(response, tools)
+        assert self._arguments(response) == {"origin": "90210", "leave_after": None}
+
+    def test_untyped_array_items_are_left_alone(self) -> None:
+        response = self._response('{"values": [1, "two"]}')
+        tools = self._tools({"values": {"type": "array"}})
+        realign_tool_argument_types(response, tools)
+        assert self._arguments(response) == {"values": [1, "two"]}
