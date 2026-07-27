@@ -398,6 +398,69 @@ def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> N
     assert "available: good-example" in unknown.output
 
 
+def _flat(output: str) -> str:
+    """Rich wraps error panels; flatten box drawing and newlines before matching a message."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def test_examples_data_only_bundle_is_marked_and_points_at_wmo_build(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # What `wmo download` fetches: a corpus with no launcher. `list` must say so, and `run` must
+    # name what the bundle IS for instead of dead-ending on "no run.sh launcher".
+    bundle = tmp_path / "demo-corpus"
+    bundle.mkdir()
+    (bundle / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    listed = runner.invoke(app, ["examples", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "demo-corpus" in listed.output
+    assert "data only" in listed.output
+
+    result = runner.invoke(app, ["examples", "run", "demo-corpus"])
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "data-only bundle" in output
+    assert "wmo build --file" in output
+    assert "--name demo-corpus" in output
+
+
+def test_examples_run_rejects_a_non_executable_launcher(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A run.sh that lost its exec bit (archive, checkout) must be a usage error naming chmod,
+    # not a PermissionError traceback out of subprocess.
+    example = tmp_path / "noexec"
+    example.mkdir()
+    launcher = example / "run.sh"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o644)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    result = runner.invoke(app, ["examples", "run", "noexec"])
+
+    assert result.exit_code == 2, result.output  # usage error, not a traceback
+    assert "chmod +x" in _flat(result.output)
+
+
+def test_config_help_does_not_reuse_the_harness_group_name() -> None:
+    # `wmo harness` is a different group managing a different object; `wmo config` manages the
+    # project's own settings file.
+    result = runner.invoke(app, ["config", "--help"])
+    assert result.exit_code == 0, result.output
+    output = _flat(result.output)
+    assert "project-local wmo settings" in output
+    assert "harness" not in output
+
+
+def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
+    # The OpenAI-compatible surface is what README step 3 exists for, and examples/tau-bench
+    # moved to packages/environment-capture/ — the help must name both correctly.
+    result = runner.invoke(app, ["serve", "--help"])
+    assert result.exit_code == 0, result.output
+    output = _flat(result.output)
+    assert "/v1/chat/completions" in output
+    assert "examples/tau-bench" not in output
+    assert "packages/environment-capture/tau-bench" in output
+
+
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     # The persistence half of the wizard's credential flow: keys saved to .env must be back in
     # os.environ on the next `wmo` invocation (main), and importing the module must NOT load.

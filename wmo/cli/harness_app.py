@@ -116,9 +116,17 @@ def show_harness(
     """Print one harness version's surfaces."""
     base, _, ref = name.partition("@")
     try:
-        doc = HarnessStore(root).load(base, ref or None)
-    except (FileNotFoundError, ValueError) as exc:
+        validate_name(base, kind="harness")  # a bad name is a name error, not a missing ref
+    except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    try:
+        doc = HarnessStore(root).load(base, ref or None)
+    except FileNotFoundError as exc:  # no such harness: nothing to list, so offer to create it
+        raise typer.BadParameter(f"{exc}; `wmo harness init {base}` creates the baseline") from exc
+    except ValueError as exc:  # the harness exists, the ref does not
+        raise typer.BadParameter(
+            f"{exc}; run `wmo harness list` to see its versions and aliases"
+        ) from exc
     _console.print(f"[bold]{doc.name}[/bold] v{doc.version}  doc_hash={doc.doc_hash[:12]}")
     for surface in doc.surfaces:
         budget = f"  budget={surface.budget}" if surface.budget is not None else ""
@@ -372,7 +380,7 @@ def optimize(
         raise typer.BadParameter(f"unknown --backend {backend!r}; choose local or e2b")
     # Fail on a bad name NOW, not after the search has spent its eval budget on the save.
     try:
-        validate_name(name)
+        validate_name(name, kind="harness")
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     tasks = _load_task_file(tasks_file)
@@ -909,7 +917,7 @@ def _resolve_harbor_seed(root: str, agent_ref: str) -> tuple[str, HarnessSourceT
     """
     base, _, ref = agent_ref.partition("@")
     try:
-        validate_name(base)
+        validate_name(base, kind="harness")
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     if base == DEFAULT_SEED_AGENT and not ref:
@@ -1050,13 +1058,21 @@ def init_harness(
     store = HarnessStore(root)
     try:
         if store.exists(name):
+            # Only name commands that exist: there is no CLI surface for moving an alias by
+            # hand, so point at the command that appends a version and moves `champion` itself.
             raise typer.BadParameter(
-                f"harness {name!r} already exists; new versions are appended by "
-                "`wmo optimize harness`, and aliases move with `set_alias`"
+                f"harness {name!r} already exists; run `wmo harness show {name}` to inspect it, "
+                f"or `wmo optimize harness {name} <world-model>` to append a new version and "
+                "move `champion` to it"
             )
         doc = store.save_version(HarnessDoc.baseline(name), alias=CHAMPION_ALIAS)
     except ValueError as exc:  # invalid name -> usage error, not a traceback
         raise typer.BadParameter(str(exc)) from exc
+    except OSError as exc:  # unusable --root -> usage error, not a traceback
+        raise typer.BadParameter(
+            f"cannot write the harness store under {root!r} ({exc.strerror or exc}); "
+            "pass a writable project dir with --root"
+        ) from exc
     _console.print(
         f"[green]wrote[/green] {name} v{doc.version} (champion) -> {store.dir_for(name)}"
     )

@@ -60,9 +60,10 @@ a wrong key surfaces there rather than inside a paid sweep. Step 3's preflight t
 every candidate's backend as far as it can without making a request, before it asks you to confirm
 any spend.
 
-(`wmo providers verify` is worth knowing about from step 1 onward: it reads the providers a
-**built** world model recorded and pings them on both the completion and the embedding path. On a
-fresh project it has nothing to read, so run it after a build, not before one.)
+(`wmo providers verify` is worth running from step 0 onward: it pings the `[models.<role>]` roles
+in `.wmo/settings.toml` as well as the providers a **built** world model recorded. On a fresh
+project it still checks the roles and skips the embedding half with a note, so it is the cheapest
+credential preflight there is — run it before a build, not only after one.)
 
 ## Step 1: build the world model
 

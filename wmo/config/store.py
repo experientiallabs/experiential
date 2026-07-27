@@ -35,11 +35,16 @@ DEFAULT_MODEL_NAME = "default"
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def validate_name(name: str) -> str:
-    """Return `name` if it is a safe single path segment, else raise a friendly ValueError."""
+def validate_name(name: str, *, kind: str = "world model") -> str:
+    """Return `name` if it is a safe single path segment, else raise a friendly ValueError.
+
+    `kind` names the object being named, because this validator guards several stores and the
+    error is read by a user who typed one command: a bad `wmo harness init` name must say
+    "harness", not "world model".
+    """
     if not _NAME_RE.match(name) or name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError(
-            f"invalid world model name {name!r}: use letters, digits, '.', '_', '-' "
+            f"invalid {kind} name {name!r}: use letters, digits, '.', '_', '-' "
             "(must start with a letter or digit, no path separators)"
         )
     return name

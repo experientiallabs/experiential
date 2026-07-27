@@ -984,3 +984,70 @@ def test_model_identity_pins_model_type_and_endpoint() -> None:
     identity = _model_identity(config)
     assert identity["model_type"] == "Qwen/Qwen3-8B"
     assert identity["endpoint"] == "https://serve.example/v1"
+
+
+# -- `wmo harness init` / `wmo harness show`: unusable roots and errors that name a next step ---
+
+
+def _flat(output: str) -> str:
+    """Rich wraps error panels; flatten box drawing and newlines before matching a message."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def test_harness_init_rejects_an_unusable_root_with_a_usage_error(tmp_path: Path) -> None:
+    """A --root that is a file (or otherwise unwritable) is a usage error naming --root, not a
+    NotADirectoryError traceback out of `mkdir(parents=True)`."""
+    not_a_dir = tmp_path / "root.txt"
+    not_a_dir.write_text("x", encoding="utf-8")
+
+    result = runner.invoke(app, ["harness", "init", "demo", "--root", str(not_a_dir)])
+
+    assert result.exit_code == 2, result.output  # usage error, not a traceback
+    output = _flat(result.output)
+    assert "cannot write the harness store" in output
+    assert "--root" in output
+
+
+def test_harness_init_twice_names_commands_that_exist(tmp_path: Path) -> None:
+    """`set_alias` is a HarnessStore method, not a CLI command; the error must not send a user
+    looking for it."""
+    root = str(tmp_path / ".wmo")
+    first = runner.invoke(app, ["harness", "init", "--root", root])
+    assert first.exit_code == 0, first.output
+
+    result = runner.invoke(app, ["harness", "init", "--root", root])
+
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "already exists" in output
+    assert "wmo optimize harness baseline" in output
+    assert "set_alias" not in output
+
+
+def test_harness_init_bad_name_names_the_object_it_creates(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["harness", "init", "bad/name", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "invalid harness name 'bad/name'" in output
+    assert "world model" not in output
+
+
+def test_harness_show_missing_harness_names_init(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["harness", "show", "baseline", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "no harness named 'baseline'" in output
+    assert "wmo harness init baseline" in output
+
+
+@pytest.mark.parametrize("ref", ["baseline@v9", "baseline@prod"])
+def test_harness_show_unknown_ref_names_list(tmp_path: Path, ref: str) -> None:
+    root = str(tmp_path / ".wmo")
+    assert runner.invoke(app, ["harness", "init", "--root", root]).exit_code == 0
+
+    result = runner.invoke(app, ["harness", "show", ref, "--root", root])
+
+    assert result.exit_code == 2, result.output
+    assert "wmo harness list" in _flat(result.output)
