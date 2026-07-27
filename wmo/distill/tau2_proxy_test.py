@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
+from collections.abc import Iterator
 
 import pytest
 from llm_waterfall.types import (
     ChatChoice,
+    ChatFunctionCall,
+    ChatFunctionDefinition,
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    ChatTool,
+    ChatToolCall,
     ChatUsage,
 )
 
-from wmo.distill.tau2_proxy import EpisodeProxy
+from wmo.distill.tau2_proxy import EpisodeProxy, realign_tool_argument_types
 
 
 class _FakeProvider:
@@ -58,7 +64,7 @@ def _post(url: str, payload: dict) -> tuple[int, dict]:
 
 
 @pytest.fixture
-def proxy() -> EpisodeProxy:
+def proxy() -> Iterator[EpisodeProxy]:
     instance = EpisodeProxy()
     instance.start()
     yield instance
@@ -147,3 +153,98 @@ class TestLifecycle:
     def test_double_start_raises(self, proxy: EpisodeProxy) -> None:
         with pytest.raises(RuntimeError, match="twice"):
             proxy.start()
+
+
+class TestToolArgumentRealignment:
+    """The cookbook XML parser JSON-decodes parameter values schema-blind; the
+    proxy must re-align them with the declared schema (measured live: retail's
+    all-numeric string ids came out as ints and every DB lookup failed)."""
+
+    @staticmethod
+    def _arguments(response: ChatResponse) -> dict:
+        calls = response.choices[0].message.tool_calls
+        assert calls is not None
+        return json.loads(calls[0].function.arguments)
+
+    @staticmethod
+    def _response(arguments: str, name: str = "find_user_id_by_name_zip") -> ChatResponse:
+        return ChatResponse(
+            choices=[
+                ChatChoice(
+                    index=0,
+                    message=ChatMessage(
+                        role="assistant",
+                        content=None,
+                        tool_calls=[
+                            ChatToolCall(
+                                id="call-1",
+                                function=ChatFunctionCall(name=name, arguments=arguments),
+                            )
+                        ],
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+
+    @staticmethod
+    def _tools(properties: dict) -> list[ChatTool]:
+        return [
+            ChatTool(
+                function=ChatFunctionDefinition(
+                    name="find_user_id_by_name_zip",
+                    parameters={"type": "object", "properties": properties},
+                )
+            )
+        ]
+
+    def test_the_live_failure_shape_is_fixed(self) -> None:
+        # The exact arguments observed in the failing teacher episode.
+        response = self._response('{"first_name": "Yusuf", "last_name": "Rossi", "zip": 19122}')
+        tools = self._tools(
+            {
+                "first_name": {"type": "string"},
+                "last_name": {"type": "string"},
+                "zip": {"type": "string"},
+            }
+        )
+        realign_tool_argument_types(response, tools)
+        arguments = self._arguments(response)
+        assert arguments == {"first_name": "Yusuf", "last_name": "Rossi", "zip": "19122"}
+
+    def test_reverse_direction_and_booleans(self) -> None:
+        response = self._response('{"quantity": "5", "ratio": "3.5", "confirm": "true"}')
+        tools = self._tools(
+            {
+                "quantity": {"type": "integer"},
+                "ratio": {"type": "number"},
+                "confirm": {"type": "boolean"},
+            }
+        )
+        realign_tool_argument_types(response, tools)
+        arguments = self._arguments(response)
+        assert arguments == {"quantity": 5, "ratio": 3.5, "confirm": True}
+
+    def test_lossy_or_unknown_conversions_are_left_alone(self) -> None:
+        response = self._response(
+            '{"zip": "007", "note": "hello", "count": "not-a-number", "flag": true}'
+        )
+        tools = self._tools(
+            {
+                "zip": {"type": "integer"},  # "007" -> 7 would lose the leading zeros
+                "note": {"type": "string"},
+                "count": {"type": "integer"},
+                "flag": {"type": "string"},  # bools are never stringified
+            }
+        )
+        realign_tool_argument_types(response, tools)
+        arguments = self._arguments(response)
+        assert arguments == {"zip": "007", "note": "hello", "count": "not-a-number", "flag": True}
+
+    def test_unknown_tool_and_absent_tools_are_untouched(self) -> None:
+        response = self._response('{"zip": 19122}', name="unknown_tool")
+        realign_tool_argument_types(response, self._tools({"zip": {"type": "string"}}))
+        assert self._arguments(response) == {"zip": 19122}
+        response2 = self._response('{"zip": 19122}')
+        realign_tool_argument_types(response2, None)
+        assert self._arguments(response2) == {"zip": 19122}

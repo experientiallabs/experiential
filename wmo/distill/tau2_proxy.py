@@ -27,6 +27,7 @@ which is why it does not mount that router).
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -35,7 +36,8 @@ from dataclasses import dataclass, field
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from llm_waterfall.types import ChatRequest
+from llm_waterfall.types import ChatRequest, ChatResponse, ChatTool
+from pydantic import JsonValue
 
 from wmo.core.types import JsonObject
 from wmo.providers.base import ToolCallingProvider
@@ -44,6 +46,88 @@ logger = logging.getLogger(__name__)
 
 _STARTUP_TIMEOUT_S = 15.0
 """How long `start()` waits for uvicorn to bind before giving up."""
+
+
+def _losslessly_aligned(value: JsonValue, expected: str) -> JsonValue:
+    """`value` converted to the schema's scalar type when that loses nothing.
+
+    Only conversions whose text round-trips exactly are applied; anything else
+    (including a value that already matches, or a type this cannot align
+    losslessly) comes back unchanged, so a genuinely malformed argument still
+    reaches the environment and fails there, which is real behavioral signal.
+    """
+    if expected == "string" and isinstance(value, int | float) and not isinstance(value, bool):
+        # json.dumps, not str(): it renders floats exactly as JSON parsed them,
+        # so int(19122) -> "19122" and 3.5 -> "3.5" with no repr drift.
+        return json.dumps(value)
+    if expected == "integer" and isinstance(value, str):
+        stripped = value.strip()
+        try:
+            converted = int(stripped)
+        except ValueError:
+            return value
+        return converted if str(converted) == stripped else value
+    if expected == "number" and isinstance(value, str):
+        stripped = value.strip()
+        try:
+            converted = float(stripped)
+        except ValueError:
+            return value
+        return converted if json.dumps(converted) == stripped else value
+    if expected == "boolean" and isinstance(value, str) and value.strip() in ("true", "false"):
+        return value.strip() == "true"
+    return value
+
+
+def realign_tool_argument_types(response: ChatResponse, tools: list[ChatTool] | None) -> None:
+    """Re-align each sampled tool call's argument types with its declared schema.
+
+    The cookbook's Qwen3.5 XML tool parser JSON-decodes every parameter value
+    with no schema in hand, so a string-typed id that happens to be numeric
+    comes out an integer: `<parameter=zip>19122</parameter>` parses to
+    `{"zip": 19122}` where the tool schema says `"zip": {"type": "string"}`.
+    tau2's DB keys are strings, so every such lookup fails "not found". Measured
+    before this existed: retail (all-numeric product/item ids) sat at a uniform
+    0.00 while airline (alphanumeric ids) scored normally, for the TEACHER as
+    well as the student.
+
+    The schema is authoritative and the proxy is the one place that holds both
+    the parsed call and the schema, so alignment happens here, in place, on the
+    top-level properties (tau2's tools are flat). Conversions are strictly
+    lossless (`_losslessly_aligned`); a call whose tool is unknown or whose
+    arguments do not parse as a JSON object is left untouched.
+    """
+    if not tools:
+        return
+    properties_by_tool: dict[str, JsonObject] = {}
+    for tool in tools:
+        parameters = tool.function.parameters
+        properties = parameters.get("properties")
+        if isinstance(properties, dict):
+            properties_by_tool[tool.function.name] = properties
+    for choice in response.choices:
+        for call in choice.message.tool_calls or []:
+            properties = properties_by_tool.get(call.function.name)
+            if properties is None:
+                continue
+            try:
+                arguments = json.loads(call.function.arguments)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(arguments, dict):
+                continue
+            changed = False
+            for name, value in arguments.items():
+                declared = properties.get(name)
+                expected = declared.get("type") if isinstance(declared, dict) else None
+                if not isinstance(expected, str):
+                    continue
+                aligned = _losslessly_aligned(value, expected)
+                if aligned is not value:
+                    arguments[name] = aligned
+                    changed = True
+            if changed:
+                call.function.arguments = json.dumps(arguments)
 
 
 @dataclass
@@ -123,6 +207,7 @@ class EpisodeProxy:
             try:
                 chat_request = ChatRequest.model_validate(payload)
                 response = provider.complete_chat(chat_request)
+                realign_tool_argument_types(response, chat_request.tools)
             except Exception as exc:  # noqa: BLE001 - reported as an OpenAI-shaped 502
                 logger.error("proxy completion for %s failed: %s", alias, exc)
                 return JSONResponse(
@@ -182,9 +267,7 @@ class EpisodeProxy:
                 raise RuntimeError("the tau2 proxy server thread died during startup")
             time.sleep(0.05)
         else:
-            raise RuntimeError(
-                f"the tau2 proxy did not start within {_STARTUP_TIMEOUT_S:.0f}s"
-            )
+            raise RuntimeError(f"the tau2 proxy did not start within {_STARTUP_TIMEOUT_S:.0f}s")
         self._server = server
         self._thread = thread
         logger.info("tau2 episode proxy serving on %s", self.base_url)
