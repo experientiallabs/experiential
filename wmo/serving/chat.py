@@ -80,6 +80,7 @@ from wmo.optimize.compression import (
     CompressionConfig,
     CompressionStats,
     Compressor,
+    compress_segments,
     estimate_tokens,
     same_compression,
 )
@@ -954,11 +955,16 @@ def _compress_user_turns(
     and tool results are never touched. A tool payload is a structured contract the model has to
     read back exactly, so shortening it would change what the transcript MEANS, not just how
     long it is. Returns the rewritten messages plus the compressor's own cost.
+
+    Goes through `compress_segments`, which chunks to the compressor's declared cap and enforces
+    the return-shape contract. One request rarely carries enough user turns to need chunking,
+    but a replayed transcript has no bound on its length and a wrong-length return here would
+    otherwise desynchronize the whole conversation.
     """
     segments = [m.content for m in messages if m.role == "user"]
     if not segments:
         return list(messages), 0.0
-    result = compressor.compress(segments, config)
+    result = compress_segments(compressor, segments, config)
     replacements = iter(result.segments)
     rewritten = [
         m.model_copy(update={"content": next(replacements)}) if m.role == "user" else m
@@ -1449,6 +1455,9 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
         # latency-neutral however slow it was. `compressor_latency_s` breaks the stage out of
         # this total for anyone who needs the split.
         started = time.monotonic()
+        # Bound before the try so the failure path can report a compression stage that already
+        # RAN and already cost money before whatever failed next.
+        compression: CompressionStats | None = None
         try:
             # request -> [compress] -> [route]: the router embeds the compressed text below.
             provider_messages, compression = runtime.compress(request.messages)
@@ -1468,6 +1477,18 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     model="",
                     provider_model="",
                     routing_reason="error-before-routing",
+                    # A compressor that ran before the failure was PAID for, on real hardware.
+                    # Leaving these at zero would not be an omission, it would be a row
+                    # asserting that no compression happened, and the savings math reads these
+                    # rows. Still zero when the compression stage itself is what failed.
+                    tokens_in_raw=compression.tokens_in_raw if compression else 0,
+                    tokens_in_compressed=compression.tokens_in_compressed if compression else 0,
+                    compressor_id=compression.compressor_id if compression else "",
+                    compressor_version=compression.compressor_version if compression else "",
+                    aggressiveness=compression.aggressiveness if compression else 0.0,
+                    compressor_cost_usd=compression.cost_usd if compression else 0.0,
+                    compressor_latency_s=compression.latency_s if compression else 0.0,
+                    latency_ms=(time.monotonic() - started) * 1000,
                     status="error",
                     error_message=str(exc),
                 )

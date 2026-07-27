@@ -2824,3 +2824,107 @@ def test_installing_the_same_compression_config_keeps_the_prefixes(tmp_path: Pat
 
     with runtime._lock:
         assert dict(runtime._compressed) == before
+
+
+def test_a_pre_routing_failure_still_bills_the_compression_that_ran(tmp_path: Path) -> None:
+    # Finding 13: the compressor ran on real hardware and was paid before routing blew up, so a
+    # row encoding compressor_id="" with zero cost would not be an omission, it would be an
+    # assertion that no compression happened. The savings math reads these rows.
+    register_compressor(_PRICED)
+    log_path = tmp_path / "requests.jsonl"
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id=_PRICED.id, aggressiveness=0.5),
+    )
+
+    def _explode(entry: PoolEntry) -> _EchoProvider:
+        raise RuntimeError("api_key_env is unset")
+
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=_explode, log=RequestLog(log_path)
+    )
+    response = TestClient(_app_for(runtime)).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "one two three four five six"}],
+        },
+    )
+
+    assert response.status_code == 502
+    row = _rows(log_path)[-1]
+    assert row["routing_reason"] == "error-before-routing"
+    assert row["compressor_id"] == _PRICED.id
+    assert row["compressor_cost_usd"] == pytest.approx(0.00054)
+    assert cast("float", row["compressor_latency_s"]) >= 0.02
+    assert cast("int", row["tokens_in_compressed"]) < cast("int", row["tokens_in_raw"])
+
+
+def test_a_failure_inside_the_compression_stage_bills_nothing(tmp_path: Path) -> None:
+    # The other half of "the zero encoding must never lie": when the stage itself is what
+    # failed, no compression was delivered and the row must say exactly that.
+    class _Exploding:
+        id = "exploding-for-tests"
+        version = "1"
+        append_stable = True
+
+        def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+            raise RuntimeError("compressor endpoint unreachable")
+
+    register_compressor(cast("Compressor", _Exploding()))
+    log_path = tmp_path / "requests.jsonl"
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id="exploding-for-tests"),
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=_EchoProvider, log=RequestLog(log_path)
+    )
+    response = TestClient(_app_for(runtime)).post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hello there"}]},
+    )
+
+    assert response.status_code == 502
+    row = _rows(log_path)[-1]
+    assert row["compressor_id"] == ""
+    assert row["compressor_cost_usd"] == 0.0
+    assert row["tokens_in_raw"] == 0
+
+
+def test_a_compressor_that_returns_the_wrong_segment_count_is_named(tmp_path: Path) -> None:
+    # Finding 12 at the serving boundary: one segment too few used to surface as an anonymous
+    # 502 from a StopIteration, one too many was served with the extra silently discarded.
+    class _Splitter:
+        id = "splitter-for-tests"
+        version = "1"
+        append_stable = True
+
+        def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+            out = [part for segment in segments for part in segment.split(" ", 1)]
+            return CompressionResult(
+                segments=out, tokens_in_raw=1, tokens_in_compressed=1, latency_s=0.0
+            )
+
+    register_compressor(cast("Compressor", _Splitter()))
+    log_path = tmp_path / "requests.jsonl"
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id="splitter-for-tests"),
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=_EchoProvider, log=RequestLog(log_path)
+    )
+    response = TestClient(_app_for(runtime)).post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "two words"}]},
+    )
+
+    assert response.status_code == 502  # refused, not served with a corrupted transcript
+    assert "splitter-for-tests" in _error_message(_rows(log_path)[-1])

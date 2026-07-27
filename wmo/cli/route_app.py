@@ -44,6 +44,7 @@ from wmo.optimize.compression import (
     CompressingEmbedder,
     CompressionConfig,
     compression_signature,
+    get_compressor,
     same_compression,
     servable_compressor,
 )
@@ -101,6 +102,26 @@ _console = Console()
 
 DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
+
+
+def _compression_for(compressor: str, aggressiveness: float) -> CompressionConfig:
+    """The compression config `--compressor` names, stamped with the version that will RUN.
+
+    The version is read off the resolved implementation rather than defaulted, because that is
+    what the field means: the version this config was fitted against. Defaulting it to "1" made
+    every fit against a version-bumped compressor stamp a lie, which the mount gate would then
+    correctly refuse with a remedy the CLI has no flag to carry out.
+
+    Raises (naming the compressor) when the id is unknown or the implementation is not servable.
+    """
+    resolved = get_compressor(compressor)
+    config = CompressionConfig(
+        compressor_id=compressor,
+        compressor_version=resolved.version,
+        aggressiveness=aggressiveness,
+    )
+    servable_compressor(config)
+    return config
 
 
 @route_app.command("sweep")
@@ -248,13 +269,10 @@ def sweep(
         raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
     sweep_compression = None
     if compressor is not None:
-        sweep_compression = CompressionConfig(
-            compressor_id=compressor, aggressiveness=aggressiveness
-        )
         try:
             # Checked before a single episode is paid for, and against the SERVING rule: there
             # is no point measuring an arm whose compressor could never be mounted.
-            servable_compressor(sweep_compression)
+            sweep_compression = _compression_for(compressor, aggressiveness)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     store = WorldModelStore(root)
@@ -872,11 +890,10 @@ def fit(
         raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
     compression = None
     if compressor is not None:
-        compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)
         try:
             # Fail before the fit spends anything: model_copy below skips validators, and an
             # unservable compressor would otherwise only surface when serving mounts the result.
-            servable_compressor(compression)
+            compression = _compression_for(compressor, aggressiveness)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
         compression = CompressionConfig(compressor_id=compressor, aggressiveness=aggressiveness)

@@ -22,7 +22,12 @@ from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, S
 from wmo.distill.store import DistillModelCard
 from wmo.engine.world_model import WorldModel
 from wmo.ingest.otel_writer import write_traces_jsonl
-from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression import (
+    CompressionConfig,
+    Compressor,
+    TruncateCompressor,
+    register_compressor,
+)
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy, select_model
 from wmo.optimize.reward import EpisodeScore
@@ -2447,3 +2452,42 @@ def test_route_sweep_rejects_orphan_aggressiveness(tmp_path: Path) -> None:
     )
     assert result.exit_code != 0
     assert "--compressor" in result.output
+
+
+def test_route_fit_stamps_the_running_compressor_version(tmp_path: Path) -> None:
+    # Regression: the config was built without a version, so it defaulted to "1" and any fit
+    # against a version-bumped compressor stamped a lie. The mount gate then hard-stopped the
+    # result with a remedy the CLI has no flag to carry out. Latent while everything is v1,
+    # which is exactly why it needs a test.
+    class _V3(TruncateCompressor):
+        id = "cli-v3-for-tests"
+        version = "3"
+
+    register_compressor(cast("Compressor", _V3()))
+    config = CompressionConfig(
+        compressor_id="cli-v3-for-tests", compressor_version="3", aggressiveness=0.5
+    )
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_matrix_file(tmp_path, compression=config)),
+            "--out",
+            str(policy_file),
+            "--dim",
+            "64",
+            "--compressor",
+            "cli-v3-for-tests",
+            "--aggressiveness",
+            "0.5",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    policy = RoutingPolicy.load(policy_file)  # loads, so the version gate is satisfied
+    assert policy.compression is not None
+    assert policy.compression.compressor_version == "3"
+    assert policy.fit_compression == policy.compression
+    assert policy.serving_compressor() is not None  # and it mounts
