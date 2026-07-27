@@ -7,20 +7,25 @@ cases are cheaper to state than to stage through a command.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from wmo.config import HarnessConfig, save_config
-from wmo.core.types import Action, ActionKind, Observation, Step, Trace
+from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.reward import EpisodeScore
 from wmo.optimize.sweep import (
     SweepError,
     SweepPlan,
     SweepRun,
     Unevenness,
     coverage,
+    execute_sweep,
     plan_sweep,
     preflight_pool,
     resolve_config,
@@ -29,7 +34,11 @@ from wmo.optimize.sweep import (
 from wmo.providers.base import ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.serving.traces_source import TRACES_FILENAME
-from wmo.tracking import RunRecord, UsageTotals
+from wmo.tracking import Phase, RunRecord, UsageTotals
+
+if TYPE_CHECKING:
+    from wmo.engine.world_model import WorldModel
+    from wmo.env.base import Env
 
 
 def _traces(count: int = 30) -> list[Trace]:
@@ -265,3 +274,111 @@ def test_partial_metering_says_how_partial() -> None:
     gap = _run(metered=4, unmetered=2, cost=0.08).metering_gap
     assert gap is not None
     assert "partial: 4 of 6 episode(s)" in gap
+
+
+class _StubEnv:
+    """A scoring env that reports a fixed world-model usage record after it closes."""
+
+    def __init__(self, usd: float, *, metered: bool = True, raises: bool = False) -> None:
+        self._usd = usd
+        self._metered = metered
+        self._raises = raises
+        self.last_score = EpisodeScore(reward=0.5, success=True, critique="fine")
+
+    def reset(self, task: str | None = None, seed_state: object | None = None) -> EnvState:
+        if self._raises:
+            raise RuntimeError("env exploded mid-sweep")
+        return EnvState()
+
+    def step(self, action: Action) -> Observation:
+        return Observation(content="ok")
+
+    def close(self) -> None:
+        return
+
+    @property
+    def usage(self) -> RunRecord | None:
+        """None models an env that keeps no metering at all (any `Env` may be handed in)."""
+        if not self._metered:
+            return None
+        totals = UsageTotals(calls=1, input_tokens=10, output_tokens=2, cost_usd=self._usd)
+        return RunRecord(run_id="s", kind="serve", total=totals, by_phase={Phase.SERVE: totals})
+
+
+class _FrozenWorldModel:
+    """Just the `frozen()` surface `execute_sweep` needs."""
+
+    def __init__(self) -> None:
+        self.froze = False
+
+    @contextmanager
+    def frozen(self) -> Iterator[_FrozenWorldModel]:
+        self.froze = True
+        yield self
+
+
+def _execute(tmp_path: Path, envs: list[_StubEnv]):  # noqa: ANN202 - returns the SweepRun
+    """Run `execute_sweep` over a one-candidate, N-scenario plan handing out `envs` in order."""
+    plan = _plan(tmp_path, scenarios=len(envs))
+    handed = iter(envs)
+    world_model = _FrozenWorldModel()
+    return (
+        execute_sweep(
+            plan,
+            world_model=cast("WorldModel", world_model),
+            env_factory=lambda: cast("Env", next(handed)),
+            runs_dir=tmp_path / "runs",
+        ),
+        world_model,
+    )
+
+
+def test_every_episodes_world_model_usage_is_harvested_exactly_once(tmp_path: Path) -> None:
+    # The harvest takes the PREVIOUS env's record when the next episode starts, plus one at the
+    # end. Three episodes must therefore contribute three records, not two and not four.
+    run, world_model = _execute(tmp_path, [_StubEnv(0.10), _StubEnv(0.10), _StubEnv(0.10)])
+    assert world_model.froze  # the sweep ran frozen, so no cell feeds another cell's retrieval
+    assert run.episodes_metered == 3 and run.episodes_unmetered == 0
+    assert run.world_model_usd == pytest.approx(0.30)
+    assert run.metering_gap is None
+    assert run.usage_path is not None and run.usage_path.is_file()
+    assert run.world_model_usage.kind == "sweep"
+
+
+def test_an_env_that_keeps_no_metering_is_counted_not_guessed_at(tmp_path: Path) -> None:
+    # `evaluate_pool` accepts any Env. One that exposes no usage leaves the world-model cost
+    # UNKNOWN for that episode, and the run says how much of the sweep it could not see.
+    run, _wm = _execute(tmp_path, [_StubEnv(0.10), _StubEnv(0.0, metered=False)])
+    assert run.episodes_metered == 1 and run.episodes_unmetered == 1
+    gap = run.metering_gap
+    assert gap is not None and "partial: 1 of 2 episode(s)" in gap
+
+
+def test_nothing_metered_writes_no_run_record_and_says_it_is_unknown(tmp_path: Path) -> None:
+    run, _wm = _execute(tmp_path, [_StubEnv(0.0, metered=False)])
+    assert run.episodes_metered == 0
+    assert run.usage_path is None  # a $0.00 record would read as "the simulator was free"
+    assert not (tmp_path / "runs").exists()
+    gap = run.metering_gap
+    assert gap is not None and "unknown rather than zero" in gap
+
+
+def test_a_sweep_that_dies_mid_flight_still_accounts_for_what_it_already_spent(
+    tmp_path: Path,
+) -> None:
+    """The episodes that ran before the failure were paid for on the world model's side.
+
+    `evaluate_pool` raises unguarded on a provider it cannot build or an env that does not score.
+    Letting the harvest die with the exception would make that spend unaccountable.
+    """
+    envs = [_StubEnv(0.10), _StubEnv(0.03, raises=True)]
+    with pytest.raises(RuntimeError, match="env exploded"):
+        _execute(tmp_path, envs)
+    written = list((tmp_path / "runs").glob("*.json"))
+    assert len(written) == 1
+    salvaged = RunRecord.model_validate_json(written[0].read_text(encoding="utf-8"))
+    assert salvaged.kind == "sweep"
+    # Both sessions: the episode that completed AND the one that died. The failing episode's
+    # session was still opened against the world model and still metered, so leaving it out
+    # would under-report what the aborted sweep actually cost.
+    assert salvaged.total.cost_usd == pytest.approx(0.13)

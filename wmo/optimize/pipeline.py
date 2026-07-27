@@ -28,6 +28,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from wmo.optimize.policy import write_artifact_atomically
+
 
 class Stage(StrEnum):
     """One step of `wmo optimize model`, in the order the run walks them."""
@@ -121,22 +123,40 @@ class RunManifest(BaseModel):
     version: int = MANIFEST_VERSION
     world_model: str
     stages: list[StageRecord] = Field(default_factory=list)
+    # Every dollar this model's optimization has ever spent, both sides, across every run.
+    # `stages` holds only the LATEST record per stage, so a re-swept stage overwrites its
+    # predecessor and the stage rows alone cannot answer "what has this cost so far". A spend cap
+    # asks exactly that, so the total accumulates here and is never rewritten downward.
+    lifetime_spend_usd: float = 0.0
 
     def record_for(self, stage: Stage) -> StageRecord | None:
         """The recorded run of `stage`, or None when it has never completed."""
         return next((record for record in self.stages if record.stage == stage), None)
 
     def with_record(self, record: StageRecord) -> RunManifest:
-        """A copy with `record` replacing any earlier run of the same stage, in stage order."""
+        """A copy with `record` replacing any earlier run of the same stage, in stage order.
+
+        The replaced record's spend is NOT forgotten: that money left the account whether or not
+        the artifact it bought is still the current one, so it stays counted in
+        `lifetime_spend_usd`.
+        """
         kept = [existing for existing in self.stages if existing.stage != record.stage]
         kept.append(record)
         return self.model_copy(
-            update={"stages": sorted(kept, key=lambda item: STAGE_ORDER.index(item.stage))}
+            update={
+                "stages": sorted(kept, key=lambda item: STAGE_ORDER.index(item.stage)),
+                "lifetime_spend_usd": self.lifetime_spend_usd + record.total_spend_usd,
+            }
         )
 
     def save(self, path: Path) -> None:
+        """Write the manifest atomically; a half-written one must not be loadable.
+
+        Non-atomic would be the worst file in this run to tear: an unreadable manifest resets
+        resume, and resetting resume re-buys the sweep, which is the entire spend of the command.
+        """
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        write_artifact_atomically(path, self.model_dump_json(indent=2).encode("utf-8"))
 
 
 class ManifestRead(BaseModel):
@@ -152,9 +172,11 @@ def load_manifest(path: Path, *, world_model: str) -> ManifestRead:
     """Read the manifest, resetting to an empty one rather than failing on anything unusable.
 
     A manifest is a cache of decisions, never the source of truth for an artifact, so a corrupt,
-    truncated, or version-skewed one costs re-running stages and nothing else. Refusing to start
-    over it would strand an operator behind a file they have no reason to know how to repair.
-    Every reset says so, because silently redoing paid work is worse than saying why.
+    truncated, or version-skewed one is recoverable by re-running stages. Be clear about the
+    price of that: the sweep is the command's entire spend, so a reset re-buys it. That is still
+    better than refusing to start, which would strand an operator behind a file they have no
+    reason to know how to repair, and every reset says so out loud rather than silently redoing
+    paid work. `save` is atomic precisely to keep this path rare.
     """
     empty = RunManifest(world_model=world_model)
     if not path.is_file():
@@ -195,7 +217,6 @@ class StageStatus(StrEnum):
 
     RUN = "run"
     SKIP = "skip"
-    RESERVED = "reserved"  # a named slot this build does not implement
 
 
 class StageDecision(BaseModel):
@@ -209,6 +230,7 @@ class StageDecision(BaseModel):
 
     @property
     def will_run(self) -> bool:
+        """Whether this stage does its work on this run."""
         return self.status is StageStatus.RUN
 
 
@@ -297,6 +319,7 @@ _SHOWN = 12
 
 
 def _short(value: str) -> str:
+    """A fingerprint value truncated to something readable in a one-line change message."""
     return value if len(value) <= _SHOWN else f"{value[:_SHOWN]}…"
 
 
@@ -325,6 +348,7 @@ class SweepSpendProjection(BaseModel):
 
     @property
     def total_usd(self) -> float:
+        """Both sides of the projection: what the cap is checked against."""
         return self.candidate_usd + self.world_model_usd
 
     @property

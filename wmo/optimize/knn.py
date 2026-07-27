@@ -268,10 +268,9 @@ def fit_knn_policy(
 class KnnFitOutcome(BaseModel):
     """A written knn policy plus what replaying it over its own fit matrix scored."""
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     policy: RoutingPolicy
-    out_path: Path
     bank_path: Path
     scenarios: int
     # IN-SAMPLE: every request retrieves its own row. Held-out numbers come from the report.
@@ -337,7 +336,6 @@ def fit_knn_artifact(
     result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
     return KnnFitOutcome(
         policy=policy,
-        out_path=out_path,
         bank_path=policy.bank_path(),
         scenarios=result.scenarios,
         fit_accuracy=result.accuracy,

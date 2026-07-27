@@ -269,6 +269,15 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
+    if baseline is not None:
+        # Knowable from the pool the pre-flight already loaded, so it is a boundary error rather
+        # than a surprise after the sweep has been paid for and the fit written.
+        known = [entry.name for entry in preflight.pool.models]
+        if baseline not in known:
+            raise typer.BadParameter(
+                f"--baseline '{baseline}' is not a model in {pool_file}; the report can only "
+                f"anchor on a candidate the sweep measures. Available: {', '.join(known)}"
+            )
 
     embedder = EmbedderSpec()
     # The world-model side of a sweep is not projectable from arithmetic, but once this model has
@@ -284,6 +293,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         fallback=fallback,
         baseline=baseline,
         cost_quality=cost_quality,
+        allow_uneven=allow_uneven_coverage,
         redo=redo,
     )
     _print_plan(
@@ -298,16 +308,23 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         anchor=_report_anchor(paths.policy, baseline=baseline, fallback=fallback),
         embedder=embedder,
         projection=projection,
+        paths=paths,
     )
-    if not _confirm(decisions, plan, yes=yes):
+    # Seeded from every dollar this model's optimization has already spent, both sides:
+    # --max-usd bounds the optimization, not one invocation of it (see `SpendLedger`).
+    ledger = SpendLedger(max_usd=max_usd, spent_usd=manifest.lifetime_spend_usd)
+    try:
+        # Before the question, not after it: being asked to approve a run and then told it cannot
+        # start is a worse experience than being told first, and both numbers are known here.
+        if _will_sweep(decisions):
+            ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
+    except BudgetExceeded as exc:
+        _print_budget_stop(model_dir.name, exc)
+        raise typer.Exit(1) from exc
+    if not _confirm(decisions, yes=yes):
         _console.print("nothing was run and nothing was spent")
         raise typer.Exit(0)
 
-    ledger = SpendLedger(max_usd=max_usd)
-    for record in manifest.stages:
-        # Spend already paid for in an earlier run counts against the cap: --max-usd bounds the
-        # optimization, not one invocation of it. Both sides count (see `SpendLedger`).
-        ledger.record(record.total_spend_usd)
     try:
         manifest = _run_stages(
             decisions,
@@ -325,24 +342,22 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             allow_uneven_coverage=allow_uneven_coverage,
         )
     except BudgetExceeded as exc:
-        _console.print(
-            f"\n[yellow]stopped at the spend cap[/yellow] {escape(str(exc))}\n"
-            f"  every finished stage is on disk and recorded, so nothing is lost. Resume with a "
-            f"higher cap: [bold]wmo optimize model {escape(model_dir.name)} --max-usd <more>[/bold]"
-        )
+        _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
+    # No save here: `_run_stages` persists after every stage it runs, which is what keeps a run
+    # that dies mid-flight resumable.
     _print_payoff(_console, model_dir.name, paths=paths, cost_quality=cost_quality)
-    manifest.save(paths.manifest)
 
 
-class _RunPaths:
+class _RunPaths(BaseModel):
     """Where this run's artifacts live. Serving paths stay where serving already looks."""
 
-    def __init__(self, *, manifest: Path, matrix: Path, policy: Path, report: Path) -> None:
-        self.manifest = manifest
-        self.matrix = matrix
-        self.policy = policy
-        self.report = report
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    manifest: Path
+    matrix: Path
+    policy: Path
+    report: Path
 
 
 def _parse_force_from(force_from: str | None) -> frozenset[Stage]:
@@ -380,6 +395,7 @@ def _plan_stages(
     fallback: str | None,
     baseline: str | None,
     cost_quality: float,
+    allow_uneven: bool,
     redo: frozenset[Stage],
 ) -> list[StageDecision]:
     """Decide every stage against what is on disk, upstream first.
@@ -413,6 +429,7 @@ def _plan_stages(
             fallback=fallback,
             baseline=baseline,
             cost_quality=cost_quality,
+            allow_uneven=allow_uneven,
         )
         decision = decide_stage(
             stage,
@@ -450,6 +467,7 @@ def _live_inputs(
     fallback: str | None,
     baseline: str | None,
     cost_quality: float,
+    allow_uneven: bool,
 ) -> _StageInputs:
     """What `stage` would consume and produce right now, read off the filesystem."""
     match stage:
@@ -473,6 +491,11 @@ def _live_inputs(
                     "fallback": fallback or "auto",
                     "knobs": _KNN_KNOBS,
                     "embedder": embedder_provenance(embedder),
+                    # Whether the operator accepted biased evidence is part of what produced this
+                    # fit. Without it here, consent given once would stick silently: a later run
+                    # WITHOUT the flag would skip the fit, never reach the coverage gate, and
+                    # leave a policy fitted on knowingly-uneven evidence with nothing saying so.
+                    "allow_uneven": str(allow_uneven),
                 },
                 artifact=paths.policy,
                 artifact_identity=_policy_fit_identity(paths.policy),
@@ -558,16 +581,28 @@ def _stage_plan_text(
                 f"x {plan.episodes} episode(s)"
             )
         case Stage.FIT:
-            return f"knn (guarded, fallback {fallback or 'best single on the sweep'})"
+            return f"knn (guarded, fallback {escape(fallback or 'best single on the sweep')})"
         case Stage.TUNE:
             return f"cost_quality {cost_quality:g} ({cost_quality_named_point(cost_quality)})"
         case _:
-            return f"3-objective headline vs {anchor}"
+            return f"3-objective headline vs {escape(anchor)}"
 
 
-def _report_estimate(embedder: EmbedderSpec) -> str:
-    """What the report stage costs, or why that cannot honestly be a number."""
-    if embedder.kind == "hashing":
+def _report_estimate(policy_path: Path, fitting_with: EmbedderSpec) -> str:
+    """What the report stage costs, or why that cannot honestly be a number.
+
+    Priced off the embedder the report will ACTUALLY use, which `build_report` takes from the
+    policy, not off the one this command fits with. They differ exactly when the fit is skipped
+    and the policy on disk came from a manual `route fit --embedder azure`: quoting this run's
+    hashing spec would then print "free" for a stage about to embed every scenario for money.
+    """
+    spec = fitting_with
+    if policy_path.is_file():
+        try:
+            spec = RoutingPolicy.load(policy_path).embedder
+        except (OSError, ValueError):
+            spec = fitting_with  # unreadable: the fit stage is about to replace it anyway
+    if spec.kind == "hashing":
         return "free"
     return "unpriced (embeds every scenario; the pool prices completions, not embeddings)"
 
@@ -585,6 +620,7 @@ def _print_plan(
     anchor: str,
     embedder: EmbedderSpec,
     projection: SweepSpendProjection,
+    paths: _RunPaths,
 ) -> None:
     """The whole run in one table, printed before anything spends.
 
@@ -622,7 +658,7 @@ def _print_plan(
                 fallback=fallback,
                 anchor=anchor,
             ),
-            _estimate_text(decision.stage, plan=plan, embedder=embedder),
+            _estimate_text(decision.stage, plan=plan, embedder=embedder, paths=paths),
             _status_text(decision),
         )
     console.print(table)
@@ -634,19 +670,36 @@ def _print_plan(
             "(pass --force-from <stage> to redo one anyway)"
         )
         return
+    if not _will_sweep(decisions):
+        # Only free stages left to do. A "~$0.00" line with a paragraph of token assumptions
+        # under it is noise about spend that cannot happen.
+        console.print(
+            "\n  nothing here spends: the sweep is current, and fit, tune, and report are free"
+        )
+        return
     console.print(
         f"\n  estimated candidate spend ~${total:.2f} (a projection: {ASSUMED_INPUT_TOKENS:,} "
         f"input + {ASSUMED_OUTPUT_TOKENS:,} assumed output token(s) per call, times the real cell "
         f"and call counts, at each candidate's own pool price)"
     )
-    console.print(_world_model_forecast(projection, sweeping=_will_sweep(decisions)))
+    console.print(_world_model_forecast(projection))
+
+
+def _print_budget_stop(name: str, exc: BudgetExceeded) -> None:
+    """Report a cap stop as a pause, not a failure: everything finished is on disk and recorded."""
+    _console.print(
+        f"\n[yellow]stopped at the spend cap[/yellow] {escape(str(exc))}\n"
+        "  every finished stage is on disk and recorded, so nothing is lost. Resume with a "
+        f"higher cap: [bold]wmo optimize model {escape(name)} --max-usd <more>[/bold]"
+    )
 
 
 def _will_sweep(decisions: list[StageDecision]) -> bool:
+    """Whether this run will buy cells, which is the only thing that costs candidate money."""
     return any(decision.stage is Stage.SWEEP and decision.will_run for decision in decisions)
 
 
-def _world_model_forecast(projection: SweepSpendProjection, *, sweeping: bool) -> str:
+def _world_model_forecast(projection: SweepSpendProjection) -> str:
     """What to say about the OTHER side of the bill before the operator authorizes the run.
 
     Two honest answers, never a zero. With a prior sweep of this model there is a measured ratio
@@ -655,11 +708,6 @@ def _world_model_forecast(projection: SweepSpendProjection, *, sweeping: bool) -
     be, or "not in this figure" reads as "not much" and the operator plans against the wrong
     number.
     """
-    if not sweeping:
-        return (
-            "  the world model's own serve and judge calls are metered separately; no sweep will "
-            "run, so this run adds none of that cost"
-        )
     if projection.projected:
         return (
             f"  plus a projected ~${projection.world_model_usd:.2f} world-model side "
@@ -676,12 +724,15 @@ def _world_model_forecast(projection: SweepSpendProjection, *, sweeping: bool) -
     )
 
 
-def _estimate_text(stage: Stage, *, plan: SweepPlan, embedder: EmbedderSpec) -> str:
+def _estimate_text(
+    stage: Stage, *, plan: SweepPlan, embedder: EmbedderSpec, paths: _RunPaths
+) -> str:
+    """One stage's `est. cost` cell: a projection, `free`, or why neither can be honest."""
     match stage:
         case Stage.SWEEP:
             return f"~${plan.total_usd:.2f}"
         case Stage.REPORT:
-            return _report_estimate(embedder)
+            return _report_estimate(paths.policy, embedder)
         case _:
             return "free"
 
@@ -696,22 +747,27 @@ def _projected_total(decisions: list[StageDecision], plan: SweepPlan) -> float:
 
 
 def _status_text(decision: StageDecision) -> str:
+    """One stage's `status` cell, carrying the reason on both the skip and the run path."""
     if decision.status is StageStatus.SKIP:
         return f"[dim]SKIP ({escape(decision.reason)})[/dim]"
     return f"will run [dim]({escape(decision.reason)})[/dim]"
 
 
-def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> bool:
+def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
     """The run's single spend confirmation. One question, before the first paid call.
 
-    Nothing to ask about when nothing will run, and nothing to ask about when nothing costs
-    anything: a free run of free stages does not need permission to happen. A non-interactive
-    session cannot answer, so it proceeds and says so rather than hanging (the `route sweep`
-    rule: every pool entry is priced, so the spend is accountable).
+    Asked whenever the SWEEP will run, rather than whenever the candidate projection is nonzero.
+    A pool priced at zero still spends on the world-model side, and that is exactly the case
+    where the simulator's cost is the whole bill, so keying the question on a candidate-side
+    number would skip it precisely when it matters most. Fit, tune, and report cost nothing, so a
+    run of only those does not need permission to happen.
+
+    A non-interactive session cannot answer, so it proceeds and says so rather than hanging (the
+    `route sweep` rule: every pool entry is priced, so the spend is accountable).
     """
     if not any(decision.will_run for decision in decisions):
         return False
-    if yes or _projected_total(decisions, plan) <= 0.0:
+    if yes or not _will_sweep(decisions):
         return True
     if not _console.is_terminal:
         _console.print(
@@ -746,6 +802,9 @@ def _run_stages(
     The manifest is saved after EVERY stage, not once at the end: a run that dies on the fit has
     still paid for its sweep, and the next run must know that.
     """
+    # The loop saves after every stage, which is what makes a rejected sweep survive: the
+    # coverage gate lives in the FIT iteration, so the SWEEP iteration's save has already run by
+    # the time the gate can stop the run.
     for decision in decisions:
         if not decision.will_run:
             _console.print(
@@ -760,14 +819,14 @@ def _run_stages(
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
                 record = _stage_sweep(plan, model_dir=model_dir, pool_file=pool_file)
                 ledger.record(record.total_spend_usd)
-                # Recorded and saved BEFORE the coverage gate can stop the run, so a sweep whose
-                # evidence the contract rejects is never bought twice. The gate itself sits with
-                # the fit (see `_enforce_coverage`).
-                manifest = manifest.with_record(record)
-                manifest.save(paths.manifest)
             case Stage.FIT:
                 _enforce_coverage(paths.matrix, allow_uneven=allow_uneven_coverage)
-                record = _stage_fit(paths, embedder=embedder, fallback=fallback)
+                record = _stage_fit(
+                    paths,
+                    embedder=embedder,
+                    fallback=fallback,
+                    allow_uneven=allow_uneven_coverage,
+                )
             case Stage.TUNE:
                 record = _stage_tune(paths, cost_quality=cost_quality)
             case _:
@@ -778,6 +837,7 @@ def _run_stages(
 
 
 def _now() -> str:
+    """This moment as an ISO-8601 UTC stamp, for the manifest's completion times."""
     return datetime.now(tz=UTC).isoformat()
 
 
@@ -864,7 +924,9 @@ def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
     _console.print(BIAS_ACCEPTED_NOTE)
 
 
-def _stage_fit(paths: _RunPaths, *, embedder: EmbedderSpec, fallback: str | None) -> StageRecord:
+def _stage_fit(
+    paths: _RunPaths, *, embedder: EmbedderSpec, fallback: str | None, allow_uneven: bool
+) -> StageRecord:
     """Fit the guarded kNN policy on the swept matrix, into the path `wmo serve` reads."""
     matrix, source = load_matrix_with_digest(paths.matrix)
     try:
@@ -876,7 +938,10 @@ def _stage_fit(paths: _RunPaths, *, embedder: EmbedderSpec, fallback: str | None
             fallback=fallback,
         )
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        # Nothing is wrong with the flags: the matrix this run measured cannot be fitted. Exit 1
+        # like the coverage gate, not 2 with a usage banner (`route_app.student` precedent).
+        _console.print(f"[red]fit failed[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
     _rebaseline_dial_snapshot(paths.policy, fitted.policy)
     _console.print(
         f"  [green]✓[/green] knn policy over {fitted.scenarios} scenario(s) -> "
@@ -894,6 +959,7 @@ def _stage_fit(paths: _RunPaths, *, embedder: EmbedderSpec, fallback: str | None
             "fallback": fallback or "auto",
             "knobs": _KNN_KNOBS,
             "embedder": embedder_provenance(embedder),
+            "allow_uneven": str(allow_uneven),
         },
         artifact_path=str(paths.policy),
         artifact_identity=fit_provenance(fitted.policy),
@@ -938,7 +1004,8 @@ def _stage_tune(paths: _RunPaths, *, cost_quality: float) -> StageRecord:
     try:
         dialed = tune_policy_dial(paths.policy, cost_quality)
     except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+        _console.print(f"[red]tune failed[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
     knobs = dialed.knobs
     _console.print(
         f"  [green]✓[/green] cost_quality={dialed.cost_quality:g} ({dialed.named_point})\n"
@@ -964,10 +1031,12 @@ def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) ->
     try:
         report = build_endpoint_scorecard(matrix, policy, baseline=anchor, endpoint=model_dir.name)
     except (KeyError, ValueError) as exc:
-        raise typer.BadParameter(
-            f"cannot report against '{anchor}': {exc}. Name a pool model the sweep scored with "
-            "--baseline, or re-run the sweep so the anchor has scored episodes."
-        ) from exc
+        _console.print(
+            f"[red]report failed[/red] cannot report against {escape(anchor)}: {escape(str(exc))}\n"
+            "  name a pool model the sweep scored with --baseline, or re-run the sweep so the "
+            "anchor has scored episodes"
+        )
+        raise typer.Exit(1) from exc
     paths.report.parent.mkdir(parents=True, exist_ok=True)
     paths.report.write_text(report.model_dump_json(indent=2), encoding="utf-8")
     _console.print(

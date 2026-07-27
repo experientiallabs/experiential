@@ -23,7 +23,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
@@ -287,6 +287,7 @@ class SweepRun(BaseModel):
 
     @property
     def world_model_usd(self) -> float:
+        """What the simulator itself charged to run this sweep."""
         return self.world_model_usage.total.cost_usd
 
     @property
@@ -307,13 +308,6 @@ class SweepRun(BaseModel):
             f"partial: {self.episodes_metered} of "
             f"{self.episodes_metered + self.episodes_unmetered} episode(s) reported usage"
         )
-
-
-class _MeteredEnv(Protocol):
-    """The metering surface `WorldModelEnv` adds on top of `Env`, read after the episode closes."""
-
-    @property
-    def usage(self) -> RunRecord | None: ...
 
 
 def execute_sweep(
@@ -349,27 +343,25 @@ def execute_sweep(
             path to redirect it, and nothing is written when the sweep metered no session at all.
     """
     harvest = _SessionHarvest(env_factory)
-    with world_model.frozen():
-        matrix = evaluate_pool(
-            harvest,
-            plan.pool,
-            list(plan.scenarios),
-            episodes_per_scenario=plan.episodes,
-            max_steps=plan.max_steps,
-            tools_hint=plan.tools_hint,
-            on_outcome=on_outcome,
-        )
-    harvest.finish()
+    destination = runs_dir or ArtifactPaths(plan.model_dir).runs
+    try:
+        with world_model.frozen():
+            matrix = evaluate_pool(
+                harvest,
+                plan.pool,
+                list(plan.scenarios),
+                episodes_per_scenario=plan.episodes,
+                max_steps=plan.max_steps,
+                tools_hint=plan.tools_hint,
+                on_outcome=on_outcome,
+            )
+    finally:
+        # `evaluate_pool` can raise (a provider that fails to build, an env that does not score),
+        # and the episodes it already ran were still paid for on the world model's side. Persisting
+        # the harvest here keeps that spend accountable instead of dying with the exception; the
+        # candidate-side matrix is lost either way, because there is no matrix to save.
+        usage, usage_path = _persist_harvest(harvest, destination)
     matrix.save(plan.out_path)
-
-    usage = merge_run_records(
-        harvest.records,
-        run_id=f"sweep-{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}",
-        kind=SWEEP_RUN_KIND,
-    )
-    usage_path: Path | None = None
-    if harvest.records:
-        usage_path = save_run(usage, runs_dir or ArtifactPaths(plan.model_dir).runs)
     return SweepRun(
         matrix=matrix,
         candidate_usd=sum(outcome.cost_usd for outcome in matrix.outcomes),
@@ -378,6 +370,17 @@ def execute_sweep(
         episodes_unmetered=harvest.unmetered,
         usage_path=usage_path,
     )
+
+
+def _persist_harvest(harvest: _SessionHarvest, runs_dir: Path) -> tuple[RunRecord, Path | None]:
+    """Roll the harvested sessions into one record and write it, unless nothing was metered."""
+    harvest.finish()
+    usage = merge_run_records(
+        harvest.records,
+        run_id=f"sweep-{datetime.now(tz=UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:8]}",
+        kind=SWEEP_RUN_KIND,
+    )
+    return usage, (save_run(usage, runs_dir) if harvest.records else None)
 
 
 SWEEP_RUN_KIND = "sweep"
@@ -403,6 +406,7 @@ class _SessionHarvest:
         self.unmetered = 0
 
     def __call__(self) -> Env:
+        """Build the next episode's env, banking the previous one's record first."""
         self.finish()
         self._open = self._inner()
         return self._open
@@ -412,7 +416,7 @@ class _SessionHarvest:
         if self._open is None:
             return
         env, self._open = self._open, None
-        record = getattr(cast("_MeteredEnv", env), "usage", None)
+        record = getattr(env, "usage", None)
         if isinstance(record, RunRecord):
             self.records.append(record)
         else:
@@ -516,8 +520,8 @@ def _check_out_writable(out_path: Path) -> None:
         problem = f"{resolved} is not writable"
     if problem is not None:
         raise SweepError(
-            f"cannot write the outcome matrix to {out_path}: {problem}. --out must name a "
-            "writable JSON file path"
+            f"cannot write the outcome matrix to {out_path}: {problem}. The matrix destination "
+            "must be a writable JSON file path"
         )
 
 

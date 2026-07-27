@@ -448,18 +448,21 @@ def test_deleting_the_optimize_dir_resets_resume_without_touching_the_policy(
 def test_a_corrupt_manifest_warns_and_replans_instead_of_failing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
+    world_model = _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
     root = _project(tmp_path)
     assert _run(tmp_path, root, "--yes").exit_code == 0
+    before = len(world_model.tasks)
     _matrix, _policy, _report, manifest_path = _paths(root)
     manifest_path.write_text("{ truncated", encoding="utf-8")
 
     again = _run(tmp_path, root, "--yes")
     assert again.exit_code == 0, again.output
     assert _says(again.output, "could not be read as a run manifest")
-    # Replanned from disk, so the unchanged artifacts still short-circuit the paid stage: the
-    # reset costs re-deciding, never re-buying.
+    # Be honest about the price of a reset rather than claiming it is free: with no records to
+    # match against, every stage reads as "never completed here" and the sweep is measured again.
+    # `RunManifest.save` is atomic precisely so this path stays rare.
     assert _says(again.output, "never completed here")
+    assert len(world_model.tasks) == before * 2  # re-bought, which is what a reset costs
     assert RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8")).stages
 
 
@@ -604,8 +607,7 @@ def test_the_sweep_stage_and_route_sweep_produce_identical_matrices(
     Both faces call `wmo.optimize.sweep`, so a divergence here would mean one of them grew its
     own copy of the scenario cut, the tools hint, or the cell ordering.
     """
-    rewards = {"cheap-1": 0.4, "pricey-1": 0.9}
-    _patch_seams(monkeypatch, rewards=rewards, modules=(route_module,))
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, modules=(route_module,))
     root = _project(tmp_path)
     pool = _pool_file(tmp_path)
 
@@ -638,10 +640,14 @@ def test_the_sweep_stage_and_route_sweep_produce_identical_matrices(
 
     assert orchestrated["pool"] == manually["pool"]
     assert len(orchestrated["outcomes"]) == len(manually["outcomes"])
+    # Compared as WHOLE cells minus a named exclusion, not as an allowlist of fields: an
+    # allowlist silently stops covering anything added to ScenarioOutcome later, and cost and
+    # error capture are exactly where two faces would drift.
+    wall_clock = {"call_seconds"}
     for cell, other in zip(orchestrated["outcomes"], manually["outcomes"], strict=True):
-        # Wall-clock fields are measurements of this machine, not of the sweep's decisions.
-        for field in ("scenario_id", "task", "model", "episode", "reward", "success", "steps"):
-            assert cell[field] == other[field], field
+        assert {k: v for k, v in cell.items() if k not in wall_clock} == {
+            k: v for k, v in other.items() if k not in wall_clock
+        }
 
 
 def test_the_closing_numbers_name_their_anchor_and_their_provenance(
@@ -662,15 +668,23 @@ def test_the_closing_numbers_name_their_anchor_and_their_provenance(
     assert "policy:knn(guarded,fallback" in flat
 
 
-def test_an_anchor_outside_the_pool_says_what_to_pass_instead(
+def test_an_anchor_outside_the_pool_is_refused_before_anything_is_spent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
+    """A flag error must not surface after the sweep has been paid for.
+
+    The anchor has to name a pool model, and the pool is fully loaded by the pre-flight, so this
+    is knowable for free. It used to be caught only in the report stage, by which point the sweep
+    was bought, the policy fitted, and the dial set.
+    """
+    world_model = _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
     root = _project(tmp_path)
     result = _run(tmp_path, root, "--yes", "--baseline", "ghost")
     assert result.exit_code != 0
-    assert _says(result.output, "cannot report against 'ghost'")
-    assert "--baseline" in _flat(result.output)
+    assert _says(result.output, "--baseline 'ghost' is not a model in")
+    assert _says(result.output, "Available: cheap, pricey")
+    assert world_model.tasks == []  # not one cell bought
+    assert not _paths(root)[0].exists()
 
 
 def test_a_missing_world_model_names_the_command_a_user_types(
@@ -975,3 +989,93 @@ def test_the_coverage_contract_still_binds_when_the_sweep_is_skipped(
     assert _says(again.output, "matrix.json is current")  # the sweep really was skipped
     assert _says(again.output, "DIFFERENT scenarios")  # and the gate still ran
     assert not policy_path.exists()
+
+
+def test_accepting_biased_evidence_does_not_stick_silently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consent to fit on uneven evidence is an input to the fit, so revoking it must be noticed.
+
+    Without `allow_uneven` in the fit's fingerprint the flag is a one-way door: grant it once and
+    every later run skips the fit, never reaches the coverage gate, and serves a policy fitted on
+    knowingly-biased evidence with nothing in the output saying so.
+    """
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4}, throttled_models=frozenset({"pricey-1"}))
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 1  # withheld
+    accepted = _run(tmp_path, root, "--yes", "--allow-uneven-coverage")
+    assert accepted.exit_code == 0, accepted.output
+
+    # Same project, flag withdrawn: the fit is re-planned because its inputs changed, the gate
+    # runs again, and the bias is refused rather than silently inherited.
+    revoked = _run(tmp_path, root, "--yes")
+    assert revoked.exit_code == 1, revoked.output
+    assert _says(revoked.output, "allow_uneven changed")
+    assert _says(revoked.output, "DIFFERENT scenarios")
+
+
+def test_the_cap_refuses_before_asking_rather_than_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Being asked to approve a run and then told it cannot start is the wrong order."""
+    world_model = _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    answer = _Answer(True)
+    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    result = _run(tmp_path, root, "--max-usd", "0.01")
+    assert result.exit_code == 1, result.output
+    assert answer.asked == []  # never asked
+    assert world_model.tasks == []
+    assert _says(result.output, "stopped at the spend cap")
+
+
+def test_a_zero_priced_pool_is_still_confirmed_because_the_simulator_is_not_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keying the question on the candidate projection skips it exactly when it matters most.
+
+    A pool priced at zero projects $0.00 candidate-side, but the sweep still spends on the world
+    model. That is the case where the simulator's cost IS the whole bill, so the question has to
+    key on "will this run buy cells", not on a candidate-side number.
+    """
+    world_model = _patch_seams(monkeypatch, session_usd=0.05)
+    root = _project(tmp_path)
+    free_pool = tmp_path / "free-pool.toml"
+    free_pool.write_text(
+        "[[model]]\n"
+        'name = "cheap"\n'
+        'kind = "openai"\n'
+        'model = "cheap-1"\n'
+        "input_per_mtok = 0.0\n"
+        "output_per_mtok = 0.0\n",
+        encoding="utf-8",
+    )
+    answer = _Answer(False)
+    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    result = _run(tmp_path, root, pool=free_pool)
+    assert result.exit_code == 0, result.output
+    assert len(answer.asked) == 1  # asked, despite a $0.00 candidate projection
+    assert world_model.tasks == []  # and declining bought nothing
+
+
+def test_the_cap_counts_spend_from_runs_whose_records_were_superseded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--max-usd` bounds the optimization, and a re-swept stage's money still left the account.
+
+    The manifest keeps only the LATEST record per stage, so seeding the cap from the stage rows
+    forgets every superseded sweep. Three sweeps of $0.30 must read as $0.90 spent, not $0.30.
+    """
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9}, session_usd=0.05)
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 0
+    assert _run(tmp_path, root, "--yes", "--force-from", "sweep").exit_code == 0
+
+    _matrix, _policy, _report, manifest_path = _paths(root)
+    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    sweep = manifest.record_for(Stage.SWEEP)
+    assert sweep is not None
+    # One sweep's record survives, but both sweeps' spend does.
+    assert manifest.lifetime_spend_usd == pytest.approx(sweep.total_spend_usd * 2, rel=1e-6)
