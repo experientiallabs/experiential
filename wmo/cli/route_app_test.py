@@ -13,10 +13,18 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import typer
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.cli.app import app
+from wmo.cli.route_app import (
+    AZURE_EMBEDDER_DEPLOYMENT,
+    AZURE_EMBEDDER_DIM,
+    HASHING_DOWNGRADE_NOTICE,
+    HASHING_EMBEDDER_DIM,
+    resolve_embedder,
+)
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.distill.store import DistillModelCard
@@ -2233,3 +2241,94 @@ def test_route_sweep_persists_the_world_models_own_spend_as_a_run_record(
     assert _says(result.output, "measured candidate spend")
     assert _says(result.output, "measured world-model spend $0.1200 over 4 session(s)")
     assert _says(result.output, "eval infrastructure, not serving cost")
+def test_embedder_auto_resolves_to_azure_when_the_standard_env_is_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert spec.kind == "azure"
+    assert spec.deployment == AZURE_EMBEDDER_DEPLOYMENT
+    assert spec.dim == AZURE_EMBEDDER_DIM  # the champion's width, not the hashing default
+    assert spec.endpoint == "https://sheets.openai.azure.com"
+    assert spec.api_key_env == "AZURE_OPENAI_API_KEY"
+    assert "azure text-embedding-3-large (3072d)" in line
+
+
+def test_embedder_auto_falls_back_to_hashing_and_quotes_the_measured_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert spec.kind == "hashing"
+    assert spec.dim == HASHING_EMBEDDER_DIM
+    # The downgrade is never silent, and it quotes the numbers rather than warning vaguely.
+    assert HASHING_DOWNGRADE_NOTICE in line
+    assert "AZURE_OPENAI_API_KEY" in line and "AZURE_OPENAI_ENDPOINT" in line
+
+
+def test_embedder_auto_needs_both_variables_not_just_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A key with no endpoint cannot embed anything; falling back is right, and the line says
+    # which half is missing so the operator can finish the setup.
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert spec.kind == "hashing"
+    assert "AZURE_OPENAI_ENDPOINT unset" in line
+
+
+def test_explicit_hashing_is_unchanged_even_with_the_azure_env_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    spec, line = resolve_embedder(
+        "hashing", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert (spec.kind, spec.dim) == ("hashing", HASHING_EMBEDDER_DIM)
+    assert "explicit" in line
+
+
+def test_explicit_azure_keeps_its_flags_and_its_dim_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unchanged on purpose: only an auto-resolved spec adopts the deployment's native width,
+    # because nobody typed a dimension there to be overridden.
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, line = resolve_embedder(
+        "azure", dim=None, deployment="embed-3", endpoint="https://x", api_key_env="MY_KEY"
+    )
+    assert (spec.kind, spec.deployment, spec.endpoint) == ("azure", "embed-3", "https://x")
+    assert spec.dim == HASHING_EMBEDDER_DIM
+    assert spec.api_key_env == "MY_KEY"
+    assert "explicit" in line
+
+
+def test_an_explicit_dim_wins_over_the_auto_resolved_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    spec, _ = resolve_embedder("auto", dim=256, deployment=None, endpoint=None, api_key_env=None)
+    assert spec.dim == 256
+
+
+def test_explicit_azure_without_a_deployment_says_which_flag_is_missing() -> None:
+    with pytest.raises(typer.BadParameter) as caught:
+        resolve_embedder("azure", dim=None, deployment=None, endpoint="https://x", api_key_env=None)
+    assert "--deployment" in str(caught.value)
+
+
+def test_an_unknown_embedder_is_a_usage_error() -> None:
+    with pytest.raises(typer.BadParameter) as caught:
+        resolve_embedder("word2vec", dim=None, deployment=None, endpoint=None, api_key_env=None)
+    assert "auto, hashing or azure" in str(caught.value)
