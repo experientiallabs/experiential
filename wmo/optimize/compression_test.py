@@ -19,6 +19,7 @@ from wmo.optimize.compression import (
     register_compressor,
     register_compressor_factory,
     same_compression,
+    segment_batch_limit,
     servable_compressor,
 )
 
@@ -426,3 +427,76 @@ def test_a_factory_that_builds_the_wrong_compressor_is_caught() -> None:
     )
     with pytest.raises(ValueError, match="built one with id 'truncate'"):
         get_compressor("mislabelled-for-tests")
+
+
+def test_a_factory_failure_keeps_the_original_message_and_cause() -> None:
+    # A served compressor's construction error is the actionable part (which env var, which
+    # host), so the wrapper must not swallow it. The TYPE is normalized to ValueError on
+    # purpose: this resolves inside a pydantic validator, which converts ValueError into a
+    # ValidationError and lets anything else escape raw, and the CLI catches ValueError to turn
+    # it into a usage error. The original exception stays reachable as __cause__.
+    class _EndpointDown(RuntimeError):
+        pass
+
+    detail = "set WMO_COMPRESSOR_URL and WMO_COMPRESSOR_API_KEY, then retry"
+
+    def factory() -> Compressor:
+        raise _EndpointDown(detail)
+
+    register_compressor_factory("actionable-for-tests", factory)
+    with pytest.raises(ValueError) as caught:
+        get_compressor("actionable-for-tests")
+    assert detail in str(caught.value)  # the operator keeps the fix
+    assert "actionable-for-tests" in str(caught.value)  # and learns which compressor
+    assert isinstance(caught.value.__cause__, _EndpointDown)
+
+
+def test_a_second_factory_cannot_displace_the_first() -> None:
+    def first() -> Compressor:  # pragma: no cover - never resolved
+        raise NotImplementedError
+
+    def second() -> Compressor:  # pragma: no cover - never resolved
+        raise NotImplementedError
+
+    register_compressor_factory("one-factory-for-tests", first)
+    register_compressor_factory("one-factory-for-tests", first)  # idempotent for the same object
+    with pytest.raises(ValueError, match="already has a registered factory"):
+        register_compressor_factory("one-factory-for-tests", second)
+
+
+def test_a_factory_cannot_shadow_a_live_instance() -> None:
+    # A test that registered a fake under an id must not be silently replaced by the real one.
+    register_compressor(_CHURNY)
+    with pytest.raises(ValueError, match="already registered"):
+        register_compressor_factory(_CHURNY.id, lambda: _CHURNY)
+
+
+def test_unknown_compressor_lists_registered_factories_too() -> None:
+    # A factory-registered compressor IS available; leaving it out of the known list would tell
+    # an operator to register something that is already there.
+    def factory() -> Compressor:  # pragma: no cover - never resolved
+        raise NotImplementedError
+
+    register_compressor_factory("listed-for-tests", factory)
+    with pytest.raises(ValueError, match="listed-for-tests"):
+        get_compressor("definitely-not-registered")
+
+
+def test_the_cap_is_read_off_the_constructed_instance() -> None:
+    # A served compressor learns its cap from the server, so the value only exists after
+    # construction. Nothing may require it as a class-level constant inspected beforehand.
+    class _LearnsItsCap(TruncateCompressor):
+        id = "learned-cap-for-tests"
+
+        def __init__(self) -> None:
+            self.max_segments_per_call = 2  # as if read from /healthz
+
+    register_compressor_factory(
+        "learned-cap-for-tests", lambda: cast("Compressor", _LearnsItsCap())
+    )
+    resolved = get_compressor("learned-cap-for-tests")
+    assert segment_batch_limit(resolved) == 2
+    result = compress_segments(
+        resolved, ["a b", "c d", "e f"], CompressionConfig(compressor_id="learned-cap-for-tests")
+    )
+    assert len(result.segments) == 3

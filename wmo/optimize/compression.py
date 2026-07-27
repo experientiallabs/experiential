@@ -405,15 +405,28 @@ def register_compressor_factory(compressor_id: str, factory: CompressorFactory) 
     and a failure mode into every `import wmo`. Importing stays side-effect-free; the cost and
     the risk move to the first policy that actually names the compressor.
 
-    `factory` runs at most once, on first resolution, and its result is registered normally
-    (attestation checked, id rebinding refused). A factory that raises propagates with the id
-    named, and stays registered, so a transient failure can be retried by resolving again.
+    `factory` runs at most once, on SUCCESS, and its result is registered normally (attestation
+    checked, id rebinding refused). Failures are never cached: a factory that raises propagates
+    with the id named and stays registered, so an endpoint that was down or an env var that was
+    unset at first resolution can be fixed and retried rather than poisoning the id for the life
+    of the process.
+
+    Rebinding is refused the same way `register_compressor` refuses it, and against BOTH
+    registries: an id that already resolves to a live instance cannot be shadowed by a factory
+    (a test that registered a fake must not be silently replaced by the real thing), and a
+    second factory cannot displace a first.
     """
     if compressor_id in _COMPRESSORS:
         raise ValueError(
             f"compressor id '{compressor_id}' is already registered by "
             f"{type(_COMPRESSORS[compressor_id]).__name__}; ids are stable policy references "
             "and cannot be silently rebound"
+        )
+    existing = _COMPRESSOR_FACTORIES.get(compressor_id)
+    if existing is not None and existing is not factory:
+        raise ValueError(
+            f"compressor id '{compressor_id}' already has a registered factory; ids are stable "
+            "policy references and cannot be silently rebound"
         )
     _COMPRESSOR_FACTORIES[compressor_id] = factory
 
