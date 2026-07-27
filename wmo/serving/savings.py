@@ -96,7 +96,8 @@ class EndpointSavings(BaseModel):
     expected_quality_delta_pt: float
     estimate_basis: list[str]
     window: SavingsWindow
-    # The two sums the cost saving is the difference of: logged spend, and the counterfactual.
+    # The two sums the cost saving is the difference of: logged spend (provider bill plus any
+    # compressor bill, per the track's effective-cost rule), and the counterfactual.
     actual_cost_usd: float = Field(ge=0.0)
     baseline_cost_estimate_usd: float = Field(ge=0.0)
 
@@ -186,6 +187,14 @@ def compute_savings(
     accrues, and until there are fallback requests to take a median of, no figure is reported.
     Differences are summed signed, so a routed model that ran slower subtracts. Requests that
     failed are excluded from every total: nobody was served.
+
+    The compressor's own bill is part of what the endpoint spent. The compression track's
+    accounting rule is explicit about it ("every savings number is cache-adjusted effective cost
+    per completed task, compressor cost and latency included"), so `compressor_cost_usd` is
+    added to the actual side and never to the counterfactual: the fallback-only baseline runs no
+    compressor. Crediting the token reduction while omitting what the reduction cost would
+    inflate every compressed endpoint's savings by the compressor's entire bill. Compressor
+    latency needs no separate handling: `latency_ms` already spans the compression stage.
     """
     entries = {entry.name: entry for entry in policy.pool}
     fallback = policy.guard_model or policy.default_model
@@ -208,7 +217,7 @@ def compute_savings(
             baseline_cost_estimate_usd=0.0,
         )
 
-    actual = sum(record.cost_usd for record in served)
+    actual = sum(record.cost_usd + record.compressor_cost_usd for record in served)
     baseline_entry = entries.get(fallback)
     baseline = actual
     if baseline_entry is not None:

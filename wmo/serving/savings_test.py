@@ -73,6 +73,7 @@ def _row(
     latency_ms: float = 1000.0,
     ts: datetime | None = None,
     status: str = "ok",
+    compressor_cost_usd: float = 0.0,
 ) -> RequestLogRecord:
     entry = _OPUS if model == "opus" else _HAIKU
     cost = (
@@ -89,6 +90,7 @@ def _row(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cost_usd=cost,
+        compressor_cost_usd=compressor_cost_usd,
         latency_ms=latency_ms,
         status=status,  # ty: ignore[invalid-argument-type]
     )
@@ -268,3 +270,26 @@ def test_the_counterfactual_states_both_of_its_assumptions() -> None:
     assert "same number of tokens" in counterfactual  # the token assumption
     assert "cached reads" in counterfactual  # the cache assumption
     assert "understate" in counterfactual  # and which way both of them lean
+
+
+def test_the_compressors_own_bill_counts_against_the_saving() -> None:
+    # The track's accounting rule: every savings number is effective cost per completed task,
+    # compressor cost INCLUDED. Crediting the token reduction while omitting what the reduction
+    # cost would inflate a compressed endpoint's savings by the compressor's entire bill.
+    # Same two requests as the exact-dollars test ($96 provider spend, $180 counterfactual),
+    # plus $1 of compression each.
+    rows = [_row("opus", compressor_cost_usd=1.0), _row("haiku", compressor_cost_usd=1.0)]
+    savings = compute_savings(rows, _policy(cost_quality=1.0))
+    assert savings.actual_cost_usd == pytest.approx(98.0)  # 96 provider + 2 compressor
+    # The counterfactual runs no compressor, so it is unchanged and the saving shrinks by $2.
+    assert savings.baseline_cost_estimate_usd == pytest.approx(180.0)
+    assert savings.cost_saved_usd == pytest.approx(82.0)
+
+
+def test_a_compressor_that_costs_more_than_it_saves_shows_a_smaller_saving() -> None:
+    # The honest direction: an expensive compressor must be able to eat the whole saving rather
+    # than hide inside it.
+    cheap = compute_savings([_row("haiku")], _policy(cost_quality=1.0))
+    pricey = compute_savings([_row("haiku", compressor_cost_usd=50.0)], _policy(cost_quality=1.0))
+    assert pricey.cost_saved_usd == pytest.approx(cheap.cost_saved_usd - 50.0)
+    assert pricey.cost_saved_usd < cheap.cost_saved_usd

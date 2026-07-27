@@ -516,6 +516,16 @@ class RequestLogRecord(BaseModel):
     compressor_id: str = ""
     compressor_version: str = ""
     aggressiveness: float = 0.0
+    # The compressor's OWN bill and wall clock, named as on `ScenarioOutcome` so eval and
+    # serving rows read the same. Both are real money and real time the customer paid: the
+    # track's rule is that every savings number is cache-adjusted effective cost per completed
+    # task, compressor cost and latency INCLUDED, so a row that logged the token reduction
+    # without these would overstate the saving (see `wmo.serving.savings.compute_savings`).
+    compressor_cost_usd: float = 0.0
+    compressor_latency_s: float = 0.0
+    # Wall clock for the whole served request, compression stage included: the client waits for
+    # the compressor's round trip too, so excluding it would make compression read as
+    # latency-neutral no matter what it cost.
     latency_ms: float = 0.0
     ttfb_ms: float | None = None
     status: Literal["ok", "error"] = "ok"
@@ -1356,6 +1366,11 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 err_type="invalid_request_error",
                 code="invalid_messages",
             )
+        # Started BEFORE the compression stage, not after: the compressor's round trip is time
+        # the client spends waiting, so a clock that skipped it would report compression as
+        # latency-neutral however slow it was. `compressor_latency_s` breaks the stage out of
+        # this total for anyone who needs the split.
+        started = time.monotonic()
         try:
             # request -> [compress] -> [route]: the router embeds the compressed text below.
             provider_messages, compression = runtime.compress(request.messages)
@@ -1387,7 +1402,6 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             )
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
-        started = time.monotonic()
         # Written once per request, keyed by the id every log row for this call carries, so the
         # vector is stored exactly once no matter which path below reports the outcome.
         embedding_ref = runtime.record_query_embedding(completion_id, decision)
@@ -1425,6 +1439,8 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     compressor_id=compression.compressor_id if compression else "",
                     compressor_version=compression.compressor_version if compression else "",
                     aggressiveness=compression.aggressiveness if compression else 0.0,
+                    compressor_cost_usd=compression.cost_usd if compression else 0.0,
+                    compressor_latency_s=compression.latency_s if compression else 0.0,
                     latency_ms=(time.monotonic() - started) * 1000,
                     ttfb_ms=ttfb_ms,
                     status=status,

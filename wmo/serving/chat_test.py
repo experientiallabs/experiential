@@ -24,7 +24,13 @@ from llm_waterfall.types import (
 )
 
 from wmo.core.types import JsonObject
-from wmo.optimize.compression import CompressionConfig, CompressionResult, Compressor
+from wmo.optimize.compression import (
+    CompressionConfig,
+    CompressionResult,
+    Compressor,
+    get_compressor,
+    register_compressor,
+)
 from wmo.optimize.policy import (
     KNN_BANK_FILENAME,
     POLICY_FILENAME,
@@ -2648,3 +2654,91 @@ def test_the_stage_makes_one_compressor_call_per_request(tmp_path: Path) -> None
     assert response.status_code == 200
     # One call (a cold transcript: no affinity to reuse), carrying BOTH user turns.
     assert spy.calls == [["first user turn here", "second user turn here"]]
+
+
+class _PricedCompressor:
+    """A compressor with a real bill and a real wall clock, so the log fields have something
+    non-zero to carry."""
+
+    id = "priced-for-tests"
+    version = "1"
+    append_stable = True
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        time.sleep(0.02)  # a stand-in for the endpoint round trip
+        inner = get_compressor("truncate").compress(segments, config)
+        return inner.model_copy(update={"cost_usd": 0.00054})
+
+
+_PRICED = _PricedCompressor()
+
+
+def test_the_compressors_bill_and_wall_clock_reach_the_log(tmp_path: Path) -> None:
+    # They were computed and then dropped at the log boundary, which left savings crediting the
+    # token reduction without ever subtracting what the reduction cost.
+    register_compressor(_PRICED)
+    config = CompressionConfig(compressor_id=_PRICED.id, aggressiveness=0.5)
+    client, log_path, _, _ = _compressed_runtime(tmp_path, config)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "one two three four five six"}],
+        },
+    )
+
+    assert response.status_code == 200
+    row = _rows(log_path)[-1]
+    assert row["compressor_cost_usd"] == pytest.approx(0.00054)
+    assert cast("float", row["compressor_latency_s"]) >= 0.02
+    # And the request's own clock SPANS the compression stage rather than starting after it.
+    assert cast("float", row["latency_ms"]) >= 20.0
+
+
+def test_an_uncompressed_row_carries_no_compressor_bill(tmp_path: Path) -> None:
+    client, log_path = _client(tmp_path)
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    row = _rows(log_path)[-1]
+    assert row["compressor_cost_usd"] == 0.0
+    assert row["compressor_latency_s"] == 0.0
+
+
+def test_the_compressor_bill_reaches_the_log_on_the_error_path_too(tmp_path: Path) -> None:
+    # The compressor was paid even though the provider call failed, so the row must say so.
+    register_compressor(_PRICED)
+
+    class _FailingProvider(_EchoProvider):
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 8192,
+        ) -> Completion:
+            raise RuntimeError("upstream on fire")
+
+    log_path = tmp_path / "requests.jsonl"
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id=_PRICED.id, aggressiveness=0.5),
+    )
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=_FailingProvider, log=RequestLog(log_path)
+    )
+    response = TestClient(_app_for(runtime)).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "one two three four five six"}],
+        },
+    )
+    assert response.status_code == 502
+    row = _rows(log_path)[-1]
+    assert row["status"] == "error"
+    assert row["compressor_cost_usd"] == pytest.approx(0.00054)
