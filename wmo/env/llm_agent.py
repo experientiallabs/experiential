@@ -49,14 +49,18 @@ class _AgentReply(BaseModel):
 
 
 class _BareCall(NamedTuple):
-    """A `tool_name({...})` call recovered from prose, and where its argument object starts."""
+    """A `tool_name({...})` call recovered from prose."""
 
     name: str
     arguments: JsonObject
-    arguments_at: int
 
 
-_CALL_HEAD = re.compile(r"([A-Za-z_]\w*)\s*\(\s*\{")
+# `tool_name({` with no space before the paren: real call syntax never has one, while prose
+# ("use the search tool ({...})") always does, and allowing it made the reply's own envelope
+# parse as a call to a tool named "tool". The lookbehind stops a hyphenated or dotted name from
+# matching only its last segment, which turned `get-user-details({...})` into a call to
+# `details`; an unknown-but-whole name is a tool error the env can report honestly.
+_CALL_HEAD = re.compile(r"(?<![\w.\-])([A-Za-z_][\w\-]*)\(\s*\{")
 
 
 def _parse_bare_call(text: str) -> _BareCall | None:
@@ -64,8 +68,8 @@ def _parse_bare_call(text: str) -> _BareCall | None:
 
     Some models emit function-call syntax instead of the JSON envelope the system prompt asks
     for. Without this the turn is wasted: the call never executes and the argument object gets
-    read as an envelope or echoed back as a message. Returns the FIRST well-formed call, which
-    is the one a sequential executor would have run when a reply stacks several.
+    echoed back as a message. Returns the FIRST well-formed call, which is the one a sequential
+    executor would have run when a reply stacks several.
 
     Args:
         text: The raw completion text.
@@ -75,14 +79,46 @@ def _parse_bare_call(text: str) -> _BareCall | None:
     """
     decoder = json.JSONDecoder()
     for match in _CALL_HEAD.finditer(text):
-        start = text.index("{", match.end() - 1)
+        start = match.end() - 1
         try:
             arguments, end = decoder.raw_decode(text, start)
         except ValueError:
             continue
         rest = text[end:].lstrip()
         if isinstance(arguments, dict) and rest.startswith(")"):
-            return _BareCall(name=match.group(1), arguments=arguments, arguments_at=start)
+            return _BareCall(name=match.group(1), arguments=arguments)
+    return None
+
+
+def _parse_envelope(text: str) -> _AgentReply | None:
+    """The first object in `text` that speaks the envelope's language, or None.
+
+    Scans EVERY balanced object rather than only the first, because a reasoning model states its
+    conclusion after its deliberation: the leading object is often an example or a rejected
+    hypothesis, and the envelope it actually chose comes later in the reply.
+    """
+    offset = 0
+    while offset < len(text):
+        relative = text[offset:].find("{")
+        if relative == -1:
+            return None
+        start = offset + relative
+        raw = extract_json_object(text[start:])
+        if raw is None:
+            return None
+        offset = start + len(raw)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            continue
+        # An object with neither key is not the envelope: a bare argument payload validates
+        # against `_AgentReply`'s all-optional fields and would read as a silent finish.
+        if not (isinstance(data, dict) and ("tool" in data or "done" in data)):
+            continue
+        try:
+            return _AgentReply.model_validate(data)
+        except ValidationError:
+            continue
     return None
 
 
@@ -96,10 +132,14 @@ class LLMAgent:
         temperature: float = 0.0,
         tools_hint: str | None = None,
         history_chars: int = _MAX_HISTORY_CHARS,
+        empty_retries: int = _EMPTY_RETRIES,
     ) -> None:
         self._provider = provider
         self._temperature = temperature
         self._history_chars = history_chars
+        # Callers measuring per-call latency can set this to 0: each retry is one more timed
+        # provider call at the metering boundary (see `wmo.optimize.report`).
+        self._empty_retries = empty_retries
         # Corpus-derived tool surface (names + argument keys observed in the traces). Without
         # it, capable models honestly refuse to invent tools while weaker ones hallucinate
         # them, and closed-loop rewards measure affordance-guessing instead of capability.
@@ -108,30 +148,23 @@ class LLMAgent:
     def act(self, task: str | None, state: EnvState, history: list[Step]) -> Action:
         prompt = _render_turn(task, state, history, self._history_chars)
         completion = self._complete_retrying_empty(prompt)
+        # Precedence: an envelope anywhere in the reply is the model's DECISION and always wins.
+        # A call written in prose is only ever a fallback, because prose that mentions a call is
+        # routinely deliberation about one ("the schema is update_order({...}), not applicable
+        # here") rather than an instruction to run it. Letting such a mention outrank a later
+        # envelope executed a hypothesis the model had just rejected, and turned
+        # `finish({"done": true})` into a tool call that never terminated the episode.
+        reply = _parse_envelope(completion.text)
+        if reply is not None:
+            if reply.done:
+                return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL)
+            if reply.tool is not None:
+                return Action(kind=ActionKind.TOOL_CALL, name=reply.tool, arguments=reply.arguments)
+        # No envelope. A JSON object with neither `done` nor `tool` is NOT a finish signal:
+        # models that write prose-style calls (`get_user(...)` around a bare argument object)
+        # land here, and treating it as done ended their episodes unexecuted at step 1 and
+        # scored them 0 (measured: 34% of glm-5.2 wm episodes, 0% for other pool models).
         bare = _parse_bare_call(completion.text)
-        raw = extract_json_object(completion.text)
-        # An object that a bare call opens is that call's ARGUMENTS, never the envelope, even
-        # when its keys happen to collide with the envelope's ("tool", "done"). Reading
-        # `book_trip({"tool": "train"})` as an envelope would run a tool named "train".
-        if raw is not None and not (
-            bare is not None and _text_starts_object(completion.text, bare)
-        ):
-            try:
-                reply = _AgentReply.model_validate_json(raw)
-            except ValidationError:
-                reply = None
-            if reply is not None:
-                if reply.done:
-                    return Action(kind=ActionKind.MESSAGE, content=DONE_SIGNAL)
-                if reply.tool is not None:
-                    return Action(
-                        kind=ActionKind.TOOL_CALL, name=reply.tool, arguments=reply.arguments
-                    )
-                # A JSON object with neither `done` nor `tool` is NOT a finish signal: models
-                # that write prose-style calls (`get_user(...)` around a bare argument object)
-                # land here, and treating it as done ended their episodes unexecuted at step 1
-                # and scored them 0 (measured: 34% of glm-5.2 wm episodes, 0% for other pool
-                # models). Fall through so the call is recovered or the env answers.
         if bare is not None:
             return Action(kind=ActionKind.TOOL_CALL, name=bare.name, arguments=bare.arguments)
         # Unparseable reply: surface it as a message action; the env will answer and the episode
@@ -154,7 +187,7 @@ class LLMAgent:
             temperature=self._temperature,
             max_tokens=1024,
         )
-        for _attempt in range(_EMPTY_RETRIES):
+        for _attempt in range(self._empty_retries):
             if completion.text.strip():
                 break
             completion = self._provider.complete(
@@ -164,11 +197,6 @@ class LLMAgent:
                 max_tokens=1024,
             )
         return completion
-
-
-def _text_starts_object(text: str, bare: _BareCall) -> bool:
-    """True when the first JSON object in `text` is the one `bare`'s call opens."""
-    return text.find("{") == bare.arguments_at
 
 
 def _render_turn(

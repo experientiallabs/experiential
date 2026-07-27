@@ -211,3 +211,35 @@ def test_report_requires_baseline_in_matrix() -> None:
             endpoint="e",
             generated_at="2026-07-24T00:00:00Z",
         )
+
+
+def test_blank_retry_calls_do_not_deflate_latency() -> None:
+    # `LLMAgent` retries a blank completion, and the metering wrapper records each attempt as
+    # its own fast call. Counting those would make a model that blanks often look FASTER.
+    from wmo.optimize.report import _productive_call_seconds
+
+    outcome = ScenarioOutcome(
+        scenario_id="s",
+        task="t",
+        model="m",
+        reward=1.0,
+        call_seconds=[0.01, 0.01, 2.0],
+        replies=["", "   ", '{"done": true}'],
+    )
+    assert _productive_call_seconds([outcome]) == [2.0]
+
+
+def test_latency_counts_every_call_when_replies_are_not_call_aligned() -> None:
+    # The real-episode runner records one reply per message that HAS content but one duration
+    # per timed call, so durations must not be attributed to replies by index there.
+    from wmo.optimize.report import _productive_call_seconds
+
+    outcome = ScenarioOutcome(
+        scenario_id="s",
+        task="t",
+        model="m",
+        reward=1.0,
+        call_seconds=[1.0, 2.0, 3.0],
+        replies=["only one reply"],
+    )
+    assert _productive_call_seconds([outcome]) == [1.0, 2.0, 3.0]

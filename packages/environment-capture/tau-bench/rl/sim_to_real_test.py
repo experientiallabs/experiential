@@ -123,9 +123,12 @@ def test_rank_agreement_uses_only_shared_models() -> None:
 
 def test_inline_call_detection() -> None:
     assert has_inline_call(_wm_outcome("a", "airline:0", 1.0, ['get_user_details({"id": 1})']))
+    # The discriminating negative: a proper envelope whose STRING VALUES name a tool. It has
+    # no call syntax, so a regex that merely looks for a tool name must not fire.
     assert not has_inline_call(
         _wm_outcome("a", "airline:0", 1.0, ['{"tool": "get_user_details", "arguments": {}}'])
     )
+    assert not has_inline_call(_wm_outcome("a", "airline:0", 1.0, ["I will get_user_details."]))
 
 
 def test_paired_scores_prefer_exact_scenario_ids() -> None:
@@ -191,8 +194,11 @@ def test_glm_clean_arm_scores_broken_scenarios_on_their_clean_episode() -> None:
         outcomes.append(_wm_outcome("glm-5.2", scenario, 0.9, episode=1))
     text = "\n".join(report(rows, OutcomeMatrix(pool=pool, outcomes=outcomes), glm_clean=True))
     assert "glm-format-corrected" in text
-    # headline averages the broken and clean episodes (0.45); corrected keeps only the clean one.
-    assert "glm-5.2          0.500 +/- 0.000     2 0.450" in text
+    # headline averages the broken and clean episodes (0.45); corrected keeps only the clean
+    # one (0.9). Assert the numbers, not the column padding.
+    glm_row = next(line for line in text.splitlines() if line.startswith("glm-5.2"))
+    assert "0.450" in glm_row
+    assert "50%" in glm_row  # one of each scenario's two wm episodes carries an inline call
 
 
 def test_main_writes_the_report(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -210,3 +216,41 @@ def test_main_says_what_to_run_when_there_are_no_rows(tmp_path: Path) -> None:
     _agreeing_corpus()[1].save(matrix_path)
     with pytest.raises(SystemExit):
         main(["--real", str(tmp_path / "missing.jsonl"), "--wm", str(matrix_path)])
+
+
+def test_paired_fallback_drops_keys_ambiguous_on_the_world_model_side() -> None:
+    # Two DISTINCT wm scenarios sharing a reason_for_call must not average into one paired
+    # cell. The real side alone cannot detect that.
+    rows = [_real_row(m, "airline:0", 0.5) for m in ("alpha", "beta", "gamma")]
+    outcomes = [
+        _wm_outcome(m, sid, 0.5)
+        for m in ("alpha", "beta", "gamma")
+        for sid in ("hash-a", "hash-b")  # both normalize to "do airline:0"
+    ]
+    for outcome in outcomes:
+        outcome.task = json.dumps({"reason_for_call": "do airline:0"})
+    _real, _wm, shared = paired_scores(rows, outcomes)
+    assert shared == 0
+
+
+def test_report_survives_a_model_whose_wm_cells_are_all_unscored() -> None:
+    # closed_loop leaves a cell unscored on a throttle; a candidate rate-limited across the
+    # sweep must not take down a report over an already-paid capture.
+    rows, matrix = _agreeing_corpus()
+    matrix.outcomes.append(
+        ScenarioOutcome(scenario_id="airline:0", task="{}", model="alpha", reward=None)
+    )
+    ghost = ScenarioOutcome(scenario_id="airline:0", task="{}", model="delta", reward=None)
+    silent = OutcomeMatrix(
+        pool=_POOL, outcomes=[o for o in matrix.outcomes if o.model != "delta"] + [ghost]
+    )
+    text = "\n".join(report(rows, silent, glm_clean=False))
+    assert "delta" not in text.split("== rank agreement")[0]
+    assert "spearman" in text
+
+
+def test_constant_input_correlation_is_reported_as_undefined() -> None:
+    agreement = RankAgreement({"a": 0.2, "b": 0.4, "c": 0.6}, {"a": 0.5, "b": 0.5, "c": 0.5})
+    text = "\n".join(agreement.lines("flat", 6))
+    assert "n/a (undefined: one side is constant)" in text
+    assert "nan" not in text

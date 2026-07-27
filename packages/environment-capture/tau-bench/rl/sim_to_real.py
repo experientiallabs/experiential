@@ -31,14 +31,20 @@ tool-call format failures. Two estimators, because the obvious one is biased:
 - `clean_if_available` keeps every scenario and, for those with one good and one broken episode,
   scores the scenario on its clean episode only. This is the number to report.
 
-Two `wmo/env/llm_agent.py` changes split world-model matrices into a before and an after, so do
+Three `wmo/env/llm_agent.py` changes split world-model matrices into a before and an after, so do
 not pool them:
 
-1. It now parses inline `tool_name({...})` calls and executes them, so matrices built after the
-   change should show `inline%` near zero. The correction arms above exist for older matrices.
+1. It now parses inline `tool_name({...})` calls and EXECUTES them. Note what this does and does
+   not do to `inline%` below: the column counts replies whose TEXT contains call syntax, and the
+   change alters how such a reply is dispatched, not whether the model writes one, so `inline%`
+   stays roughly flat across the change. What changes is that those episodes stop scoring 0 for
+   a formatting reason. Consequently `--glm-clean` is only meaningful on a matrix captured
+   BEFORE the change; run against a newer one it would correct away episodes that ran fine.
 2. Its observation/history cap went from 500 to 2000 characters, which gives the agent strictly
    more context per turn on tool-heavy domains. A matrix captured before that change measured a
    different (more starved) agent; recapture rather than mix.
+3. It retries a blank completion up to twice. That shifts both cost (the blank attempts are
+   billed) and per-call latency for models that blank often.
 
 Run from the repo root:
 
@@ -51,15 +57,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import math
 import re
 import statistics as st
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
 from real_episodes import RealEpisodeRow, load_rows
 from scipy import stats  # present in every wmo install: scikit-learn requires it
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+
+logger = logging.getLogger("sim-to-real")
 
 # A tool call the model wrote into its prose instead of emitting as a structured call, e.g.
 # `get_user_details({"user_id": ...})`. Harnesses without the bare-call parser never execute
@@ -125,7 +135,13 @@ class RankAgreement:
             ("kendall", self.kendall),
             ("pearson", self.pearson),
         ):
-            out.append(f"  {name:9} {result.statistic:+.3f}  (p={result.pvalue:.3f})")
+            # A correlation is undefined when either side is constant (every candidate scored
+            # the same). Printing "+nan (p=nan)" in a column of real numbers reads as a
+            # measurement that came out near zero, so say what actually happened.
+            if math.isnan(result.statistic):
+                out.append(f"  {name:9} n/a (undefined: one side is constant)")
+            else:
+                out.append(f"  {name:9} {result.statistic:+.3f}  (p={result.pvalue:.3f})")
         out.append(f"  top-3 real: {self.top3_real}")
         out.append(f"  top-3 wm:   {self.top3_wm}")
         out.append(
@@ -133,6 +149,14 @@ class RankAgreement:
             f"best real={self.best_real} best wm={self.best_wm}"
         )
         return out
+
+
+def _repeated(keys: Iterable[str]) -> set[str]:
+    """The keys that appear more than once, i.e. cannot identify a single scenario."""
+    counts: dict[str, int] = {}
+    for key in keys:
+        counts[key] = counts.get(key, 0) + 1
+    return {key for key, count in counts.items() if count > 1}
 
 
 def _reason(blob: str) -> str:
@@ -168,10 +192,20 @@ def paired_scores(
         real_key = {row.scenario_id: _reason(row.task) for row in real}
         wm_key = {outcome.scenario_id: _reason(outcome.task) for outcome in wm}
         shared = (set(real_key.values()) & set(wm_key.values())) - {""}
-        counts: dict[str, int] = {}
-        for key in real_key.values():
-            counts[key] = counts.get(key, 0) + 1
-        shared -= {key for key in shared if counts[key] > 1}
+        # A key must identify ONE scenario on BOTH sides. Checking only the real side let two
+        # distinct world-model scenarios that share a `reason_for_call` average into a single
+        # paired cell. On the committed split this is not hypothetical: two telecom pairs
+        # normalize to the same text, so 4 of 20 scenarios are ambiguous.
+        ambiguous = _repeated(real_key.values()) | _repeated(wm_key.values())
+        dropped = sorted(shared & ambiguous)
+        shared -= ambiguous
+        if dropped:
+            logger.warning(
+                "dropping %d scenario(s) whose reason_for_call is shared by more than one "
+                "scenario on one side: %s",
+                len(dropped),
+                [key[:40] for key in dropped],
+            )
     if not shared:
         return {}, {}, 0
 
@@ -204,9 +238,17 @@ def paired_scores(
 def report(real: Sequence[RealEpisodeRow], matrix: OutcomeMatrix, glm_clean: bool) -> list[str]:
     """Build the whole report as lines, so callers (and tests) can assert on it."""
     scored = [row for row in real if row.reward is not None]
-    models = sorted({row.model for row in scored} & {o.model for o in matrix.outcomes})
+    # Both sides must be SCORED, not merely present. `wmo.env.closed_loop` leaves a cell
+    # unscored on a provider throttle or an agent crash, so a candidate that was rate-limited
+    # across the whole sweep appears in the matrix with nothing to average, and taking its mean
+    # used to abort the entire report after a capture that had already been paid for.
+    wm_scored = {o.model for o in matrix.outcomes if o.reward is not None}
+    models = sorted({row.model for row in scored} & wm_scored)
     if not models:
-        return ["no model appears in both the real rows and the world-model matrix"]
+        return ["no model is scored in both the real rows and the world-model matrix"]
+    silent = sorted({o.model for o in matrix.outcomes} - wm_scored)
+    if silent:
+        logger.warning("world-model models with no scored episode, excluded: %s", silent)
 
     lines = [
         f"== REAL (tau2 reward, {len(scored)} rows) vs WM (LLM judge), per model",

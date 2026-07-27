@@ -499,3 +499,113 @@ def test_resolves_against_the_real_tau2_clone_when_present() -> None:
 def test_row_model_rejects_a_missing_meter() -> None:
     with pytest.raises(ValueError, match="duration_s"):
         RealEpisodeRow.model_validate({"scenario_id": "airline:0"})
+
+
+def test_torn_final_line_does_not_brick_resume(tmp_path: Path) -> None:
+    # A kill during the append leaves a truncated record. Refusing to load it would lose every
+    # episode already bought, including for --write-matrix-only.
+    index = _scenario_index(tmp_path)
+    path = tmp_path / "rows.jsonl"
+    append_rows(path, rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"scenario_id": "airline:0", "domain": "air')  # torn write, no newline
+    rows = load_rows(path)
+    assert len(rows) == 1
+    assert rows[0].reward == 1.0
+
+
+def test_append_rows_writes_a_batch_atomically(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    path = tmp_path / "rows.jsonl"
+    batch = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    append_rows(path, batch * 3)
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 3
+    append_rows(path, [])  # an empty batch must not leave a stray newline
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_null_token_meters_do_not_lose_the_episode() -> None:
+    # A provider that omits usage on an errored turn serializes nulls; rejecting them would
+    # discard a whole paid batch.
+    results = Tau2Results.model_validate(
+        {
+            "simulations": [
+                {
+                    "task_id": "0",
+                    "duration": None,
+                    "reward_info": {"reward": 1.0},
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "usage": {"prompt_tokens": None, "completion_tokens": 5},
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    [sim] = results.simulations
+    assert sim.duration == 0.0
+    assert sim.messages[0].usage is not None
+    assert sim.messages[0].usage.prompt_tokens == 0
+
+
+def test_structured_content_blocks_do_not_lose_the_episode(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].messages[0].content = [{"type": "text", "text": "hi"}]
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.reward == 1.0
+    assert row.replies == []  # non-string content is not a text reply
+
+
+def test_telecom_task_ids_survive_argv_construction(tmp_path: Path) -> None:
+    # Telecom is 5 of the 20 pinned scenarios and its ids carry | [ ] : characters.
+    telecom_id = (
+        "[mobile_data_issue]airplane_mode_on|bad_network_preference|data_mode_off[PERSONA:Hard]"
+    )
+    command = batch_command(
+        tmp_path, _AZURE_AI, _AZURE_OPENAI, "telecom", [telecom_id], "s", 4
+    )
+    assert command[command.index("--task-ids") + 1] == telecom_id
+
+
+def test_only_rejects_a_model_that_is_not_in_the_pool(tmp_path: Path) -> None:
+    _fake_capture_from_pinned_split(tmp_path)
+    assert (
+        main(
+            [
+                "--capture-dir",
+                str(tmp_path),
+                "--pool",
+                str(_pool_file(tmp_path / "pool.toml")),
+                "--out-dir",
+                str(tmp_path / "out"),
+                "--only",
+                "glm-5.2",
+                "gml-5.2",  # typo
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+
+
+def test_self_hosted_openai_endpoint_is_not_dropped(tmp_path: Path) -> None:
+    student = PoolEntry(
+        name="student",
+        kind=ProviderKind.OPENAI,
+        model="qwen3.5-9b",
+        endpoint="https://tinker.example/v1",
+        api_key_env="TINKER_API_KEY",
+        input_per_mtok=0.1,
+        output_per_mtok=0.2,
+    )
+    env = build_env(tmp_path, student, _AZURE_OPENAI, {**_ENVIRON, "TINKER_API_KEY": "tk"})
+    assert env["OPENAI_API_KEY"] == "tk"
+    assert env["OPENAI_BASE_URL"] == "https://tinker.example/v1"
+
+
+def test_missing_pinned_split_says_how_to_regenerate(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="pin_scenarios.py"):
+        load_pinned_scenarios(tmp_path, tmp_path / "absent.jsonl")

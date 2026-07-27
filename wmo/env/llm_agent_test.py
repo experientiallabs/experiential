@@ -152,20 +152,56 @@ def test_envelope_wins_over_a_later_prose_call() -> None:
     assert action.name == "search"
 
 
-def test_call_arguments_are_never_read_as_the_envelope() -> None:
-    # The envelope guard: `book_trip({"tool": "train"})` extracts an object carrying a "tool"
-    # key, which would otherwise validate as an envelope and run a tool named "train".
-    action = LLMAgent(FakeProvider('book_trip({"tool": "train", "seats": 2})')).act(
+def test_a_rejected_hypothesis_does_not_outrank_the_chosen_envelope() -> None:
+    # A reasoning model deliberates before it decides. An earlier draft let the mentioned call
+    # suppress the envelope, so this reply issued a DB write the model had just ruled out.
+    reply = (
+        'Thinking: the schema is update_order({"order_id": "A1"}). Not applicable here.\n'
+        '```json\n{"done": true, "summary": "nothing to do"}\n```'
+    )
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
+    assert action.kind is ActionKind.MESSAGE
+    assert action.content == DONE_SIGNAL
+
+
+def test_envelope_is_found_after_a_leading_non_envelope_object() -> None:
+    reply = 'Let me think about search({"q": 1}) as an option.\n{"tool": "list_orders"}'
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
+    assert action.kind is ActionKind.TOOL_CALL
+    assert action.name == "list_orders"
+
+
+def test_a_done_envelope_wrapped_in_call_syntax_still_terminates() -> None:
+    # `finish({"done": true})` must not become a call to a tool named "finish": that stopped
+    # terminating the episode and burned the rest of the step budget.
+    action = LLMAgent(FakeProvider('finish({"done": true, "summary": "all set"})')).act(
         "task", EnvState(), []
     )
+    assert action.content == DONE_SIGNAL
+
+
+def test_prose_naming_a_tool_before_an_envelope_does_not_become_the_tool() -> None:
+    # The space before "(" is what tells prose apart from call syntax. Without that, this ran
+    # a tool literally named "tool" with the whole envelope as its arguments.
+    reply = 'I will use the search tool ({"tool": "search", "arguments": {"q": "x"}})'
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
     assert action.kind is ActionKind.TOOL_CALL
-    assert action.name == "book_trip"
-    assert action.arguments == {"tool": "train", "seats": 2}
+    assert action.name == "search"
+    assert action.arguments == {"q": "x"}
+
+
+def test_a_hyphenated_call_name_is_not_truncated_to_its_last_segment() -> None:
+    # Matching only "details" invented a tool nobody offers; the whole name at least produces
+    # an honest unknown-tool error from the env.
+    action = LLMAgent(FakeProvider('get-user-details({"id": "x"})')).act("task", EnvState(), [])
+    assert action.name == "get-user-details"
 
 
 def test_unclosed_prose_call_still_falls_back_to_a_message() -> None:
-    action = LLMAgent(FakeProvider('get_user_details({"user_id": "x"')).act("task", EnvState(), [])
+    reply = 'get_user_details({"user_id": "x"'
+    action = LLMAgent(FakeProvider(reply)).act("task", EnvState(), [])
     assert action.kind is ActionKind.MESSAGE
+    assert action.content == reply
 
 
 def test_explicit_done_still_terminates() -> None:
@@ -226,3 +262,10 @@ def test_history_chars_bounds_the_rendered_observation() -> None:
 def test_history_chars_bounds_the_message_fallback() -> None:
     action = LLMAgent(FakeProvider("z" * 40), history_chars=10).act("task", EnvState(), [])
     assert action.content == "z" * 10
+
+
+def test_empty_retries_can_be_disabled_for_latency_measurement() -> None:
+    provider = ScriptedProvider([""])
+    action = LLMAgent(provider, empty_retries=0).act("task", EnvState(), [])
+    assert provider.calls == 1
+    assert action.kind is ActionKind.MESSAGE

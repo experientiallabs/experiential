@@ -58,9 +58,9 @@ import subprocess
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 
-from wmo.core.types import JsonValue
+from wmo.core.types import JsonObject, JsonValue
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import DEFAULT_POOL_PATH, PoolEntry, load_pool
@@ -90,21 +90,36 @@ _AZURE_OPENAI_HOST = ".openai.azure.com"
 _AZURE_AI_HOST = ".services.ai.azure.com"
 
 
+def _zero_if_null(value: JsonValue) -> JsonValue:
+    """Treat an explicitly null meter as zero: providers omit usage on errored/streamed turns."""
+    return 0 if value is None else value
+
+
 class Tau2Usage(BaseModel):
     """Per-message token counts as tau2 records them."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
+    _null_is_zero = field_validator("prompt_tokens", "completion_tokens", mode="before")(
+        _zero_if_null
+    )
+
 
 class Tau2Message(BaseModel):
     """The fields of a tau2 transcript message this leg meters. Everything else is ignored."""
 
     role: str = ""
-    content: str | None = None
+    # Multimodal/structured replies arrive as a list of content blocks rather than a string;
+    # kept as raw JSON so one such message cannot invalidate the episode around it.
+    content: JsonValue = None
     generation_time_seconds: float | None = None
     tool_calls: list[JsonValue] | None = None
     usage: Tau2Usage | None = None
+
+    def text(self) -> str:
+        """The reply as text, or "" when this message carries no plain-string content."""
+        return self.content if isinstance(self.content, str) else ""
 
 
 class Tau2RewardInfo(BaseModel):
@@ -123,6 +138,8 @@ class Tau2Simulation(BaseModel):
     user_cost: float | None = None
     reward_info: Tau2RewardInfo | None = None
     messages: list[Tau2Message] = []
+
+    _null_is_zero = field_validator("duration", mode="before")(_zero_if_null)
 
 
 class Tau2Results(BaseModel):
@@ -180,11 +197,11 @@ def domains_dir(capture_dir: Path) -> Path:
     return capture_dir / "tau2-bench" / "data" / "tau2" / "domains"
 
 
-def _instructions_key(instructions: object) -> str:
+def _instructions_key(instructions: JsonValue) -> str:
     return json.dumps(instructions, sort_keys=True, ensure_ascii=False)
 
 
-def _task_index(capture_dir: Path, domain: str) -> dict[str, dict[str, object]]:
+def _task_index(capture_dir: Path, domain: str) -> dict[str, JsonObject]:
     """Canonical instructions blob -> tau2 task, for one domain's `tasks.json`."""
     path = domains_dir(capture_dir) / domain / "tasks.json"
     if not path.is_file():
@@ -193,14 +210,14 @@ def _task_index(capture_dir: Path, domain: str) -> dict[str, dict[str, object]]:
             "(see packages/environment-capture/tau-bench/README.md § Setup), or pass "
             "--capture-dir pointing at an existing clone."
         )
-    index: dict[str, dict[str, object]] = {}
+    index: dict[str, JsonObject] = {}
     for task in json.loads(path.read_text(encoding="utf-8")):
         scenario = task.get("user_scenario") or {}
         index[_instructions_key(scenario.get("instructions") or {})] = task
     return index
 
 
-def _has_nl_assertion(task: dict[str, object]) -> bool:
+def _has_nl_assertion(task: JsonObject) -> bool:
     criteria = task.get("evaluation_criteria")
     if not isinstance(criteria, dict):
         return False
@@ -228,10 +245,15 @@ def load_pinned_scenarios(
     Raises:
         SystemExit: When the task data is missing or a scenario does not resolve.
     """
+    if not scenarios_path.is_file():
+        raise SystemExit(
+            f"no pinned eval split at {scenarios_path}. Regenerate it with "
+            "`uv run python packages/environment-capture/tau-bench/rl/pin_scenarios.py`."
+        )
     lines = [
         line for line in scenarios_path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
-    indexes: dict[str, dict[str, dict[str, object]]] = {}
+    indexes: dict[str, dict[str, JsonObject]] = {}
     resolved: list[RealScenario] = []
     unmatched: list[str] = []
     for line in lines:
@@ -240,7 +262,14 @@ def load_pinned_scenarios(
         if domain not in indexes:
             indexes[domain] = _task_index(capture_dir, domain)
         task_text = str(pinned["task"])
-        task = indexes[domain].get(_instructions_key(json.loads(task_text)))
+        try:
+            instructions = json.loads(task_text)
+        except ValueError as error:
+            raise SystemExit(
+                f"pinned scenario {pinned.get('provenance')} has a `task` field that is not the "
+                f"tau2 instructions JSON ({error}). Re-pin the split with pin_scenarios.py."
+            ) from error
+        task = indexes[domain].get(_instructions_key(instructions))
         if task is None:
             unmatched.append(f"{domain}/{pinned['provenance'][0]}")
             continue
@@ -340,7 +369,14 @@ def _credentials(entry: PoolEntry, environ: dict[str, str]) -> dict[str, str]:
                 f"pool model '{entry.name}' needs {entry.api_key_env or 'OPENAI_API_KEY'} "
                 "in the environment"
             )
-        return {"OPENAI_API_KEY": key}
+        credentials = {"OPENAI_API_KEY": key}
+        if entry.endpoint:
+            # A self-hosted OpenAI-compatible server (a Tinker-served student, a local vLLM).
+            # Dropping its endpoint would send this candidate's episodes to api.openai.com
+            # under the wrong key and quietly measure a different model.
+            credentials["OPENAI_API_BASE"] = entry.endpoint
+            credentials["OPENAI_BASE_URL"] = entry.endpoint
+        return credentials
     if family == "openrouter":
         key = environ.get(entry.api_key_env or "OPENROUTER_API_KEY")
         if not key:
@@ -480,7 +516,7 @@ def rows_from_results(
                     for m in assistant
                     if m.generation_time_seconds is not None
                 ],
-                replies=[m.content for m in assistant if m.content],
+                replies=[m.text() for m in assistant if m.text()],
                 user_sim=user_sim.name,
             )
         )
@@ -488,21 +524,41 @@ def rows_from_results(
 
 
 def load_rows(path: Path) -> list[RealEpisodeRow]:
-    """Read the resumable sidecar, or an empty list when nothing has run yet."""
+    """Read the resumable sidecar, or an empty list when nothing has run yet.
+
+    A kill during the append leaves a torn final line. Refusing to load it would brick both the
+    resume and `--write-matrix-only`, losing every episode already bought, so an unreadable line
+    is dropped with a warning instead: its cell simply looks unrun and gets bought again, which
+    costs one episode rather than the whole grid.
+    """
     if not path.exists():
         return []
-    return [
-        RealEpisodeRow.model_validate_json(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    rows: list[RealEpisodeRow] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(RealEpisodeRow.model_validate_json(line))
+        except ValidationError:
+            logger.warning(
+                "  %s line %d is unreadable (torn write?); dropping it, so its cell will be "
+                "treated as unrun and bought again",
+                path,
+                number,
+            )
+    return rows
 
 
 def append_rows(path: Path, rows: Iterable[RealEpisodeRow]) -> None:
+    """Append a batch as ONE write, then fsync, so a kill lands between batches not mid-line."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(row.model_dump_json() + "\n" for row in rows)
+    if not payload:
+        return
     with path.open("a", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(row.model_dump_json() + "\n")
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def spend_usd(rows: Iterable[RealEpisodeRow]) -> float:
@@ -548,26 +604,78 @@ def _run_batch(
 
     A failed batch is reported and skipped rather than raised: earlier batches are already on
     disk, and the rerun that resumes them will retry exactly this cell.
+
+    `--save-to` is deterministic per cell, so a previous attempt may have left a `results.json`
+    at this path. Accepting that file when tau2 dies before rewriting it would append episodes
+    from an OLD run as though this run had just produced them, and the grid would report
+    coverage it never bought. The modification time before the run is therefore the guard: a
+    file that did not change is a leftover, not a result.
     """
-    completed = subprocess.run(
-        list(command),
-        cwd=capture_dir,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=BATCH_TIMEOUT_S,
-        check=False,
-    )
     results = capture_dir / "tau2-bench" / "data" / "simulations" / save_to / "results.json"
+    before = results.stat().st_mtime_ns if results.is_file() else None
+    try:
+        completed = subprocess.run(
+            list(command),
+            cwd=capture_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=BATCH_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error("  tau2 exceeded %ds and was killed; skipping this batch", BATCH_TIMEOUT_S)
+        return None
+    except OSError as error:
+        raise SystemExit(
+            f"could not launch tau2 ({error}). Expected the CLI at {command[0]}; create the "
+            "venv per packages/environment-capture/tau-bench/README.md § Setup, or pass "
+            "--capture-dir pointing at an existing clone."
+        ) from error
+
     if not results.is_file():
         logger.error("  no results.json (exit %d); stderr tail:", completed.returncode)
         logger.error("  %s", (completed.stderr or "")[-600:])
         return None
-    try:
-        return Tau2Results.model_validate_json(results.read_text(encoding="utf-8"))
-    except ValidationError as error:
-        logger.error("  %s does not match the tau2 results schema: %s", results, error)
+    if before is not None and results.stat().st_mtime_ns == before:
+        logger.error(
+            "  tau2 exited %d without rewriting %s; refusing to reuse the previous run's "
+            "results. stderr tail:",
+            completed.returncode,
+            results,
+        )
+        logger.error("  %s", (completed.stderr or "")[-600:])
         return None
+    if completed.returncode != 0:
+        # Fresh output from a nonzero exit is a PARTIAL batch: the episodes it holds were paid
+        # for and are worth keeping, and resume will retry whatever is still missing.
+        logger.warning("  tau2 exited %d; keeping the partial batch it wrote", completed.returncode)
+    return _parse_results(results)
+
+
+def _parse_results(results: Path) -> Tau2Results | None:
+    """Read `results.json`, keeping the simulations that validate and naming the ones that fail.
+
+    tau2 owns this schema. Rejecting the whole file over one unexpected field would discard a
+    batch of episodes already paid for, and because `--save-to` is deterministic the rerun would
+    overwrite the evidence, so per-simulation validation is what keeps a schema surprise cheap.
+    """
+    try:
+        payload = json.loads(results.read_text(encoding="utf-8"))
+    except ValueError as error:
+        logger.error("  %s is not valid JSON: %s", results, error)
+        return None
+    simulations = payload.get("simulations") if isinstance(payload, dict) else None
+    if not isinstance(simulations, list):
+        logger.error("  %s has no 'simulations' list", results)
+        return None
+    kept: list[Tau2Simulation] = []
+    for index, raw in enumerate(simulations):
+        try:
+            kept.append(Tau2Simulation.model_validate(raw))
+        except ValidationError as error:
+            logger.error("  dropping simulation %d of %s: %s", index, results, error)
+    return Tau2Results(simulations=kept)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -614,6 +722,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("user simulator '%s' is not in the pool %s", args.user_sim, sorted(by_name))
         return 2
     user_sim = by_name[args.user_sim]
+
+    # A typo in --only would otherwise be silently ignored and quietly buy a smaller grid than
+    # the operator asked for, which is only discovered after the spend.
+    unknown_models = sorted(set(args.only or []) - set(by_name))
+    if unknown_models:
+        logger.error("--only names models that are not in the pool: %s", unknown_models)
+        return 2
 
     scenarios = load_pinned_scenarios(args.capture_dir)
     if args.scenario:

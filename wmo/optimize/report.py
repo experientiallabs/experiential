@@ -116,9 +116,32 @@ def _aggregate(outcomes: list[ScenarioOutcome]) -> tuple[float, float, float, fl
     accuracy = _mean(rewards)
     success = _mean([1.0 if o.success else 0.0 for o in scored])
     cost = _mean([o.cost_usd for o in scored])
-    calls = [s for o in scored for s in o.call_seconds]
-    p50, p95 = _p50_p95_ms(calls)
+    p50, p95 = _p50_p95_ms(_productive_call_seconds(scored))
     return accuracy, success, cost, p50, p95
+
+
+def _productive_call_seconds(scored: list[ScenarioOutcome]) -> list[float]:
+    """Per-call seconds, skipping calls the provider answered with blank text.
+
+    `wmo.env.closed_loop._TimedProvider` appends `call_seconds` and `replies` in lockstep per
+    provider call, so there a blank reply is identifiable by index. Those calls return fast and
+    carry no action, and `LLMAgent` buys another completion to replace them, so counting them
+    would report a latency at which the endpoint never delivered work: a model that blanks often
+    would look FASTER than one that answers first time. Cost is deliberately left alone, because
+    the blank attempts were really paid for.
+
+    Other producers do not promise that pairing (the real-episode runner records one reply per
+    message that HAS content but one duration per timed call), so equal lengths are required
+    before attributing a duration to a reply; otherwise every call counts.
+    """
+    seconds: list[float] = []
+    for outcome in scored:
+        if len(outcome.replies) != len(outcome.call_seconds):
+            seconds.extend(outcome.call_seconds)
+            continue
+        paired = zip(outcome.call_seconds, outcome.replies, strict=True)
+        seconds.extend(value for value, reply in paired if reply.strip())
+    return seconds
 
 
 def build_report(
