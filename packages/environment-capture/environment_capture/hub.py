@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from http.client import HTTPMessage
 from pathlib import Path
@@ -40,6 +40,17 @@ _CORPUS_FILE = "traces.otel.jsonl"
 # Honors enterprise/mirror endpoints the way huggingface_hub does.
 _HUB = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 _CHUNK_BYTES = 1 << 20
+
+# Dataset-repo name prefixes, most-preferred first. LEGACY FALLBACK: the project renamed
+# `wmh` -> `wmo`, but the org's dataset repos on the Hub are still published under the old
+# `wmh-<benchmark>-traces` name, so every read must try both. Once the Hub repos are renamed,
+# drop "wmh" from this tuple and the fallback disappears with it.
+_REPO_PREFIXES = ("wmo", "wmh")
+_REPO_SUFFIX = "-traces"
+# What the Hub answers for a repo id that does not resolve: 404 anonymously, 401 when a token
+# is attached (it will not admit a repo is missing to a caller that might lack access), 403
+# for a gated repo. Any of these means "try the next candidate name", not "the Hub is broken".
+_MISSING_REPO_CODES = frozenset({401, 403, 404})
 
 # on_progress(bytes_done, bytes_total): called after every streamed chunk, across ALL files in
 # the fetch (front-ends render one bar for the whole bundle).
@@ -182,9 +193,63 @@ class PublishedCorpus:
     last_modified: str  # ISO date, "" when the Hub omits it
 
 
+class CorpusRepoUnavailable(urllib.error.HTTPError):
+    """Every candidate dataset repo for one benchmark was refused by the Hub.
+
+    Subclasses ``HTTPError`` so front-ends that already catch it (``wmo download`` skips the
+    benchmark and keeps fetching the rest) behave exactly as before. A bare code cannot say
+    WHICH name was wrong once there is more than one candidate, so the message and
+    ``attempted`` name every repo id that was tried.
+    """
+
+    def __init__(
+        self,
+        benchmark: str,
+        revision: str,
+        failures: Sequence[tuple[str, urllib.error.HTTPError]],
+    ) -> None:
+        """Build the combined error from each (repo id, Hub refusal) attempt, in order."""
+        last = failures[-1][1]
+        tried = ", ".join(f"{repo_id} answered {error.code}" for repo_id, error in failures)
+        super().__init__(
+            last.url,
+            last.code,
+            f"no dataset repo for {benchmark!r} at revision {revision!r}: {tried}",
+            last.headers,
+            None,
+        )
+        self.attempted: tuple[str, ...] = tuple(repo_id for repo_id, _ in failures)
+
+
 def repo_id_for(benchmark: str) -> str:
-    """The dataset repo backing one benchmark's corpus."""
-    return f"{_ORG}/wmo-{benchmark}-traces"
+    """The canonical dataset repo backing one benchmark's corpus (the id we publish to)."""
+    return candidate_repo_ids(benchmark)[0]
+
+
+def candidate_repo_ids(benchmark: str) -> tuple[str, ...]:
+    """Every dataset repo id that may hold this benchmark's bundle, most-preferred first.
+
+    Reads walk this tuple and take the first id the Hub resolves; see ``_REPO_PREFIXES`` for
+    why there is more than one.
+    """
+    return tuple(f"{_ORG}/{prefix}-{benchmark}{_REPO_SUFFIX}" for prefix in _REPO_PREFIXES)
+
+
+def _benchmark_from_repo_name(name: str) -> str | None:
+    """The benchmark a bare repo name encodes, or ``None`` when it is not a corpus repo.
+
+    Args:
+        name: Repo name without the org prefix, e.g. ``wmo-gaia2-traces``.
+
+    Returns:
+        The benchmark name, or ``None`` when ``name`` matches no known prefix convention.
+    """
+    if not name.endswith(_REPO_SUFFIX):
+        return None
+    for prefix in _REPO_PREFIXES:
+        if name.startswith(f"{prefix}-"):
+            return name[len(prefix) + 1 : -len(_REPO_SUFFIX)]
+    return None
 
 
 def corpus_path(benchmark: str) -> Path:
@@ -199,28 +264,30 @@ def corpus_path(benchmark: str) -> Path:
 def published_corpora(*, token: str | None = None) -> list[PublishedCorpus]:
     """The org's live corpus datasets (Hub REST API), newest first, mapped to benchmark names.
 
-    Only repos that follow the ``wmo-<benchmark>-traces`` convention AND appear in the local
-    manifest are returned — those are the ones ``fetch_corpus`` knows where to place.
+    Only repos that follow a ``<prefix>-<benchmark>-traces`` convention (see
+    ``_REPO_PREFIXES``) AND appear in the local manifest are returned: those are the ones
+    ``fetch_corpus`` knows where to place. A benchmark published under two prefixes at once
+    (mid-rename) is listed once, under the most-preferred repo.
     """
     token = token if token is not None else _default_token()
     listing = _http_json_pages(f"{_HUB}/api/datasets?author={_ORG}&limit=100", token=token)
-    published: list[PublishedCorpus] = []
+    by_benchmark: dict[str, PublishedCorpus] = {}
     for entry in listing:
         if not isinstance(entry, dict):
             continue
         repo_id = str(entry.get("id", ""))
-        name = repo_id.removeprefix(f"{_ORG}/")
-        if not (name.startswith("wmo-") and name.endswith("-traces")):
+        benchmark = _benchmark_from_repo_name(repo_id.removeprefix(f"{_ORG}/"))
+        if benchmark is None or benchmark not in CORPORA:
             continue
-        benchmark = name.removeprefix("wmo-").removesuffix("-traces")
-        if benchmark not in CORPORA:
-            continue
+        candidates = candidate_repo_ids(benchmark)
+        kept = by_benchmark.get(benchmark)
+        if kept is not None and candidates.index(kept.repo_id) <= candidates.index(repo_id):
+            continue  # already listed under a more-preferred repo name
         modified = str(entry.get("lastModified") or "")
-        published.append(
-            PublishedCorpus(benchmark=benchmark, repo_id=repo_id, last_modified=modified[:10])
+        by_benchmark[benchmark] = PublishedCorpus(
+            benchmark=benchmark, repo_id=repo_id, last_modified=modified[:10]
         )
-    published.sort(key=lambda c: c.last_modified, reverse=True)
-    return published
+    return sorted(by_benchmark.values(), key=lambda c: c.last_modified, reverse=True)
 
 
 def fetch_corpus(
@@ -242,20 +309,20 @@ def fetch_corpus(
     streamed chunk across the whole bundle.
 
     Raises ``ValueError`` for unknown/unpublished corpora and ``urllib.error.URLError`` (incl.
-    ``HTTPError``) when the Hub is unreachable — front-ends translate those for their users.
+    ``HTTPError``, and ``CorpusRepoUnavailable`` when no candidate repo id resolves) when the
+    Hub is unreachable: front-ends translate those for their users.
     """
     spec = CORPORA.get(benchmark)
     if spec is None:
         publishable = ", ".join(sorted(CORPORA))
         raise ValueError(f"{benchmark!r} has no published corpus (available: {publishable})")
     token = token if token is not None else _default_token()
-    repo_id = repo_id_for(benchmark)
     root = _data_root()
     target = dest or corpus_path(benchmark)
 
     # One recursive tree call covers the whole repo; sizes make the total known up front so a
     # single progress bar can span the bundle.
-    sizes = dict(_repo_tree(repo_id, revision, token=token))
+    repo_id, sizes = _resolve_repo(benchmark, revision, token=token)
     work: list[tuple[str, Path, int]] = []
     if not target.exists() or force:
         if _CORPUS_FILE not in sizes:
@@ -312,6 +379,31 @@ def fetch_corpus(
                 "truncated transfer; re-run the fetch"
             )
     return target
+
+
+def _resolve_repo(
+    benchmark: str, revision: str, *, token: str | None
+) -> tuple[str, dict[str, int]]:
+    """The repo id that actually serves this benchmark, plus its file tree (path -> size).
+
+    Catch-and-retry over ``candidate_repo_ids``, not probe-then-fetch: the tree call the fetch
+    already needs IS the existence check, so the preferred id costs exactly one request and
+    only a miss pays for a second lookup. The resolved id is returned so every file in the
+    bundle streams from the same repo the tree came from.
+
+    Raises:
+        CorpusRepoUnavailable: every candidate id was refused (404/401/403), naming them all.
+        urllib.error.HTTPError: any other Hub failure, from the first candidate that hit it.
+    """
+    failures: list[tuple[str, urllib.error.HTTPError]] = []
+    for repo_id in candidate_repo_ids(benchmark):
+        try:
+            return repo_id, dict(_repo_tree(repo_id, revision, token=token))
+        except urllib.error.HTTPError as error:
+            if error.code not in _MISSING_REPO_CODES:
+                raise
+            failures.append((repo_id, error))
+    raise CorpusRepoUnavailable(benchmark, revision, failures)
 
 
 def _data_root() -> Path:

@@ -25,6 +25,7 @@ import typer
 import uvicorn
 from environment_capture.hub import (
     CORPORA,
+    CorpusRepoUnavailable,
     corpus_path,
     fetch_corpus,
     published_corpora,
@@ -934,7 +935,7 @@ def download(
         except urllib.error.HTTPError as exc:
             # One unpublished/broken dataset must not abort the REST of a multi-download:
             # record it, keep fetching, and fail (with every name) at the end.
-            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url}")
+            failures.append(f"{name}: {_hub_failure_detail(exc)}")
             _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
             continue
         except urllib.error.URLError as exc:
@@ -949,6 +950,13 @@ def download(
             "some datasets could not be downloaded (unpublished? `wmo download` with no "
             "arguments lists what is):\n  " + "\n  ".join(failures)
         )
+
+
+def _hub_failure_detail(exc: urllib.error.HTTPError) -> str:
+    """One line saying what the Hub refused, naming every repo id the fetch tried."""
+    if isinstance(exc, CorpusRepoUnavailable):
+        return exc.reason  # already names every attempted repo id and its code
+    return f"the Hub answered {exc.code} for {exc.url}"
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:

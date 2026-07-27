@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
+import urllib.error
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Container
+from dataclasses import dataclass, field
+from http.client import HTTPMessage
 from pathlib import Path
 
 import pytest
 
 from environment_capture import hub
-from environment_capture.hub import CORPORA, fetch_corpus, published_corpora, repo_id_for
+from environment_capture.hub import (
+    CORPORA,
+    CorpusRepoUnavailable,
+    candidate_repo_ids,
+    fetch_corpus,
+    published_corpora,
+    repo_id_for,
+)
 
 
 @pytest.fixture()
@@ -18,11 +28,42 @@ def data_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
-    """Stand in for the Hub REST API: a tree listing plus resolve-URL streaming."""
+@dataclass
+class _HubCalls:
+    """The repo ids the fake Hub was asked for, in order (one entry per request)."""
+
+    trees: list[str] = field(default_factory=list)
+    resolves: list[str] = field(default_factory=list)
+
+
+def _fake_hub(
+    monkeypatch: pytest.MonkeyPatch,
+    files: dict[str, bytes],
+    *,
+    live_repos: Container[str] | None = None,
+    missing_code: int = 404,
+) -> _HubCalls:
+    """Stand in for the Hub REST API: a tree listing plus resolve-URL streaming.
+
+    Args:
+        monkeypatch: The patcher used to swap the module's HTTP seams.
+        files: Repo path -> content, served by every live repo.
+        live_repos: Repo ids that resolve; every other id answers ``missing_code``. ``None``
+            (the default) means every id resolves.
+        missing_code: Status the Hub returns for a repo id outside ``live_repos``.
+
+    Returns:
+        A live record of the repo ids requested, so a test can assert the request COUNT and
+        not just the downloaded bytes.
+    """
+    calls = _HubCalls()
 
     def http_json_page(url: str, *, token: str | None) -> tuple[object, None]:
         assert "/api/datasets/" in url and "/tree/main?recursive=true" in url
+        repo_id = url.split("/api/datasets/", 1)[1].split("/tree/", 1)[0]
+        calls.trees.append(repo_id)
+        if live_repos is not None and repo_id not in live_repos:
+            raise urllib.error.HTTPError(url, missing_code, "not found", HTTPMessage(), None)
         listing = [
             {"type": "file", "path": path, "size": len(content)} for path, content in files.items()
         ]
@@ -31,6 +72,7 @@ def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
     def stream_to(
         url: str, dest: Path, *, token: str | None, chunk_done: Callable[[int], None]
     ) -> int:
+        calls.resolves.append(url.split("/datasets/", 1)[1].split("/resolve/", 1)[0])
         remote_path = urllib.parse.unquote(url.split("/resolve/main/", 1)[1])
         dest.parent.mkdir(parents=True, exist_ok=True)
         content = files[remote_path]
@@ -40,6 +82,7 @@ def _fake_hub(monkeypatch: pytest.MonkeyPatch, files: dict[str, bytes]) -> None:
 
     monkeypatch.setattr(hub, "_http_json_page", http_json_page)
     monkeypatch.setattr(hub, "_stream_to", stream_to)
+    return calls
 
 
 def test_fetch_downloads_corpus_and_data_dirs_with_one_progress_bar(
@@ -97,6 +140,78 @@ def test_fetch_with_dest_writes_only_the_corpus_file(
     assert not (data_root / "gaia2" / "data").exists()
 
 
+def test_fetch_falls_back_to_the_legacy_repo_name(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The org's datasets are still published under the pre-rename ``wmh-`` name (the code
+    renamed wmh -> wmo, the Hub repos did not), so the canonical id 404s and the whole bundle
+    must come from the legacy repo instead of failing the download."""
+    canonical, legacy = candidate_repo_ids("gaia2")
+    calls = _fake_hub(
+        monkeypatch,
+        {"traces.otel.jsonl": b"spans\n", "data/train.jsonl": b"tasks\n"},
+        live_repos={legacy},
+    )
+
+    path = fetch_corpus("gaia2")
+
+    assert path.read_bytes() == b"spans\n"
+    assert (data_root / "gaia2" / "data" / "train.jsonl").read_bytes() == b"tasks\n"
+    assert calls.trees == [canonical, legacy]
+    # every file streams from the repo that actually resolved, not the preferred name
+    assert set(calls.resolves) == {legacy}
+
+
+def test_fetch_asks_once_when_the_canonical_repo_resolves(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch-and-retry, not probe-then-fetch: once the Hub repos are renamed the fallback
+    costs nothing, because a resolving canonical id is never followed by a legacy lookup."""
+    canonical, _legacy = candidate_repo_ids("gaia2")
+    calls = _fake_hub(monkeypatch, {"traces.otel.jsonl": b"spans\n"}, live_repos={canonical})
+
+    fetch_corpus("gaia2")
+
+    assert calls.trees == [canonical]
+
+
+@pytest.mark.parametrize("code", [404, 401])
+def test_fetch_names_every_repo_id_it_tried_when_none_resolve(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """A miss on BOTH names is a real error (404 anonymously, 401 with a token attached), and
+    it has to say which ids were looked for or the user cannot tell what to publish."""
+    calls = _fake_hub(
+        monkeypatch, {"traces.otel.jsonl": b"spans\n"}, live_repos=set(), missing_code=code
+    )
+
+    with pytest.raises(CorpusRepoUnavailable) as caught:
+        fetch_corpus("gaia2")
+
+    assert isinstance(caught.value, urllib.error.HTTPError)  # front-ends still catch it
+    assert caught.value.code == code
+    assert caught.value.attempted == candidate_repo_ids("gaia2")
+    assert all(repo_id in str(caught.value) for repo_id in candidate_repo_ids("gaia2"))
+    assert calls.trees == list(candidate_repo_ids("gaia2"))
+
+
+def test_fetch_does_not_try_another_name_on_a_non_missing_hub_error(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rate limiting is the Hub misbehaving, not the wrong repo name: surface it as-is rather
+    than burning a second request and reporting it as an unpublished corpus."""
+    calls = _fake_hub(
+        monkeypatch, {"traces.otel.jsonl": b"spans\n"}, live_repos=set(), missing_code=429
+    )
+
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        fetch_corpus("gaia2")
+
+    assert not isinstance(caught.value, CorpusRepoUnavailable)
+    assert caught.value.code == 429
+    assert calls.trees == [repo_id_for("gaia2")]
+
+
 def test_fetch_unknown_benchmark_names_the_available_ones(data_root: Path) -> None:
     with pytest.raises(ValueError, match="no published corpus"):
         fetch_corpus("nope")
@@ -135,6 +250,43 @@ def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPa
         ("bird-sql", "2026-07-05"),
     ]
     assert published[0].repo_id == repo_id_for("gaia2")
+
+
+def test_published_corpora_accepts_the_legacy_repo_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`wmo download` with no arguments lists what the org publishes; everything it publishes
+    today still carries the pre-rename ``wmh-`` prefix, and dropping those empties the picker."""
+    listing = [
+        {"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-07T06:00:00.000Z"},
+        {
+            "id": "experiential-labs/wmh-bird-sql-traces",
+            "lastModified": "2026-07-05T00:00:00.000Z",
+        },
+        {"id": "experiential-labs/unrelated-dataset", "lastModified": "2026-07-06T00:00:00.000Z"},
+        {"id": "experiential-labs/wmh-not-a-benchmark-traces", "lastModified": ""},
+    ]
+    monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
+
+    published = published_corpora()
+    assert [(c.benchmark, c.repo_id) for c in published] == [
+        ("gaia2", "experiential-labs/wmh-gaia2-traces"),
+        ("bird-sql", "experiential-labs/wmh-bird-sql-traces"),
+    ]
+
+
+def test_published_corpora_lists_a_double_published_benchmark_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-rename both repo names can exist at once; the picker shows one row per benchmark,
+    under the canonical id (which is also the one a fetch resolves first)."""
+    listing = [
+        {"id": "experiential-labs/wmh-gaia2-traces", "lastModified": "2026-07-01T00:00:00.000Z"},
+        {"id": "experiential-labs/wmo-gaia2-traces", "lastModified": "2026-07-07T00:00:00.000Z"},
+    ]
+    monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
+
+    assert [(c.benchmark, c.repo_id) for c in published_corpora()] == [
+        ("gaia2", repo_id_for("gaia2"))
+    ]
 
 
 def test_every_committed_corpus_is_publishable_or_documented_local_only() -> None:

@@ -1365,6 +1365,30 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
     assert "broken" in result.output
 
 
+def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    # A fetch now tries more than one dataset repo name (the wmh -> wmo rename), so a bare
+    # "404" cannot be acted on: the report must say which ids were looked for.
+    import urllib.error
+    from http.client import HTTPMessage
+
+    from environment_capture.hub import CorpusRepoUnavailable, candidate_repo_ids
+
+    attempts = [
+        (repo_id, urllib.error.HTTPError(f"https://hub/{repo_id}", 404, "nf", HTTPMessage(), None))
+        for repo_id in candidate_repo_ids("dabstep")
+    ]
+
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        raise CorpusRepoUnavailable(name, "main", attempts)
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "dabstep"])
+    assert result.exit_code != 0
+    for repo_id in candidate_repo_ids("dabstep"):
+        assert repo_id in result.output
+
+
 def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "nope"])

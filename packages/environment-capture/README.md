@@ -89,8 +89,9 @@ from environment_capture import (
 python -m environment_capture.hub fetch dabstep
 python -m environment_capture.hub fetch all --force   # explicit overwrite
 
-# or straight from the Hub with no dependencies at all
-curl -LO https://huggingface.co/datasets/experiential-labs/wmo-dabstep-traces/resolve/main/traces.otel.jsonl
+# or straight from the Hub with no dependencies at all (the org's repos still carry the
+# pre-rename `wmh-` prefix; `fetch` tries `wmo-` first and falls back to it)
+curl -LO https://huggingface.co/datasets/experiential-labs/wmh-dabstep-traces/resolve/main/traces.otel.jsonl
 ```
 
 Fetching is plain-HTTP stdlib: no extra dependency, no token for public repos, per-chunk
