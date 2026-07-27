@@ -20,6 +20,7 @@ from llm_waterfall import TokenUsage as WfTokenUsage
 from llm_waterfall import VerifyResult as WfVerifyResult
 
 from wmo.providers.base import Message, ProviderConfig, ProviderKind
+from wmo.providers.bedrock import AWS_DEFAULT_REGION_ENV, AWS_REGION_ENV
 from wmo.providers.waterfall import WaterfallProvider, provider_or_chain, to_backend
 
 
@@ -130,6 +131,27 @@ def test_to_backend_rejects_kinds_without_real_adapters() -> None:
     # openai_responses has no package equivalent (the package speaks chat-completions).
     with pytest.raises(ValueError, match="no llm-waterfall backend"):
         to_backend(ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="m"))
+
+
+def test_to_backend_resolves_a_bedrock_rungs_region_from_aws_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The package hands `Backend.region` straight to `boto3.Session`, and boto3 reads only
+    # AWS_DEFAULT_REGION: leaving None here would fail a regionless rung with NoRegionError on a
+    # machine where AWS_REGION alone is set, taking the fallback down with the primary.
+    monkeypatch.setenv(AWS_REGION_ENV, "us-east-1")
+    monkeypatch.delenv(AWS_DEFAULT_REGION_ENV, raising=False)
+
+    backend = to_backend(ProviderConfig(kind=ProviderKind.BEDROCK, model="us.anthropic.opus"))
+
+    assert backend.region == "us-east-1"
+
+
+def test_to_backend_leaves_a_non_bedrock_region_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only Bedrock reads AWS_REGION; an OpenAI rung's region stays exactly what the config said.
+    monkeypatch.setenv(AWS_REGION_ENV, "us-east-1")
+
+    assert to_backend(ProviderConfig(kind=ProviderKind.OPENAI, model="gpt-5.5")).region is None
 
 
 def test_complete_maps_to_wmo_completion() -> None:

@@ -48,6 +48,7 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
+from wmo.providers.bedrock import resolve_region
 from wmo.providers.registry import get_provider
 
 # ProviderKinds with a REAL llm-waterfall adapter, mapped to the package's provider names
@@ -67,6 +68,12 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
 
     `profile` selects a named AWS profile (Bedrock), letting one chain span multiple accounts —
     wmo configs don't model that, so it's a separate argument (see `WaterfallProvider(profiles=)`).
+
+    A Bedrock rung's region goes through `resolve_region`, the same order the direct provider
+    uses. The package hands `Backend.region` straight to `boto3.Session`, and boto3 reads only
+    AWS_DEFAULT_REGION, so a rung with no explicit region would otherwise die with NoRegionError
+    on a machine where AWS_REGION alone is set: exactly the failure this resolution order exists
+    to remove, and worse inside a chain, where it takes down the fallback as well as the primary.
     """
     provider = _KIND_TO_PROVIDER.get(config.kind)
     if provider is None:
@@ -74,11 +81,14 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
             f"provider kind {config.kind.value!r} has no llm-waterfall backend; supported: "
             f"{', '.join(sorted(k.value for k in _SUPPORTED_KINDS))}"
         )
+    region = config.region
+    if config.kind is ProviderKind.BEDROCK:
+        region = resolve_region(region)
     return Backend(
         provider,
         config.model,
         profile=profile,
-        region=config.region,
+        region=region,
         endpoint=config.endpoint,
         deployment=config.deployment,
         api_version=config.api_version,

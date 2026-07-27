@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from wmo.core.types import JsonValue
@@ -31,6 +32,29 @@ _ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31"
 
 # Default Titan text-embeddings model (confirmed reachable; v2 supports `dimensions` 256/512/1024).
 _DEFAULT_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
+
+AWS_REGION_ENV = "AWS_REGION"
+"""The region variable WMO reads itself. `wmo.config.PROVIDER_ENV_VARS` pins the same literal."""
+
+AWS_DEFAULT_REGION_ENV = "AWS_DEFAULT_REGION"
+"""The only region variable boto3 reads on its own; accepted here so both names work."""
+
+REGION_SOURCES: tuple[str, ...] = (
+    "the entry/config `region`",
+    AWS_REGION_ENV,
+    AWS_DEFAULT_REGION_ENV,
+    "the active AWS profile's `region` (~/.aws/config), then the instance role",
+)
+"""Every region source, in the order they are consulted. Named in the no-region error."""
+
+NO_REGION_ERROR = (
+    "BedrockProvider has no region, and botocore refuses to build a bedrock-runtime client "
+    "without one. Region is resolved in this order, first hit wins: "
+    + ", ".join(REGION_SOURCES)
+    + ". Set one of them."
+)
+"""The user-facing no-region failure. Replaces botocore's `NoRegionError`, whose whole message
+is "You must specify a region." and which names no variable to set."""
 
 
 class _ContentBlock(TypedDict):
@@ -81,6 +105,32 @@ def _is_nova(model_id: str) -> bool:
     return ".nova-" in model_id or model_id.startswith("amazon.nova-")
 
 
+def resolve_region(configured: str | None) -> str | None:
+    """The region to hand boto3 explicitly, or None to defer to boto3's own resolution.
+
+    boto3 reads exactly one region variable from the environment: botocore's session mapping for
+    `region` is `("region", "AWS_DEFAULT_REGION", None, None)`, so `AWS_REGION` set on its own has
+    no effect and a client built with `region_name=None` dies with `NoRegionError` ("You must
+    specify a region."). `AWS_REGION` is nonetheless the name WMO documents, prompts for, writes
+    into `.env`, and points at in its failure hints, so reading it here is what makes the
+    documented variable true. Both names work; nothing boto3 resolves for itself is taken away.
+
+    Order, first hit wins:
+
+    1. `configured`: an explicit `region` on the pool entry or `ProviderConfig`.
+    2. `AWS_REGION`.
+    3. Returning None, which leaves `AWS_DEFAULT_REGION` and the rest of boto3's chain (the
+       active profile's `region` in `~/.aws/config`, then the instance role) untouched.
+
+    Args:
+        configured: The explicit region carried by the entry or config, if any.
+
+    Returns:
+        The region to pass as boto3's `region_name`, or None to let boto3 resolve it.
+    """
+    return configured or os.environ.get(AWS_REGION_ENV) or None
+
+
 class BedrockProvider:
     """Claude 4.8 via the Bedrock Runtime (InvokeModel with the Anthropic Messages body)."""
 
@@ -100,11 +150,13 @@ class BedrockProvider:
         self._forward_temperature = config.resolved_chat_forward_temperature()
 
     def _get_client(self) -> BaseClient:
-        # Lazy: import boto3 and open the client only on first use. region falls back to
-        # AWS_REGION / the default boto3 chain when config.region is unset.
+        # Lazy: import boto3 and open the client only on first use. The region comes from
+        # `resolve_region` (config, then AWS_REGION), and None hands the rest of the chain
+        # (AWS_DEFAULT_REGION, profile, instance role) back to boto3.
         if self._client is None:
             import boto3
             from botocore.config import Config
+            from botocore.exceptions import NoRegionError
 
             # Bound each request so a stalled connection RAISES instead of blocking forever. Without
             # this, a single hung InvokeModel wedges the whole run (long GEPA/eval jobs never
@@ -128,9 +180,19 @@ class BedrockProvider:
                 read_timeout=600,
                 retries={"max_attempts": 1, "mode": "standard"},
             )
-            self._client = boto3.client(
-                "bedrock-runtime", region_name=self.config.region, config=client_config
-            )
+            try:
+                self._client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=resolve_region(self.config.region),
+                    config=client_config,
+                )
+            except NoRegionError as exc:
+                # botocore's whole message here is "You must specify a region.", which names
+                # nothing to set. It reaches the user verbatim through `verify_via_ping`'s detail
+                # (so through `wmo build`'s pre-flight, `wmo providers set` and
+                # `wmo providers verify`) and raw from any call that skipped `prepare`. Restate it
+                # once, here, as the full resolution order.
+                raise ValueError(NO_REGION_ERROR) from exc
         return self._client
 
     def prepare(self) -> None:
@@ -149,25 +211,23 @@ class BedrockProvider:
            failure.
 
         The region is a different story: free to resolve and fatal when missing, because botocore
-        raises `NoRegionError` while creating a bedrock-runtime client with no region. It is
-        resolved through boto3's own session so this check cannot drift from what the client does
-        (`config.region` first, then AWS_DEFAULT_REGION, then the active profile's `region`; note
-        botocore's session config does NOT read AWS_REGION).
+        raises `NoRegionError` while creating a bedrock-runtime client with no region. It goes
+        through the same two steps `_get_client` uses, so this check cannot drift from what the
+        client does: `resolve_region` (the entry/config, then AWS_REGION), then a fresh boto3
+        session for everything boto3 owns (AWS_DEFAULT_REGION, then the active profile's
+        `region`). A fresh `Session` is deliberate: `boto3.client` goes through the cached
+        process-wide default session, which snapshots the environment as it was at first use.
 
         Raises:
-            ValueError: No region resolves for this configuration.
+            ValueError: No region resolves for this configuration, from any source.
         """
         # Lazy for the same reason as `_get_client`: importing boto3 costs real time, and the
         # registry constructs every backend on any `wmo` command.
         import boto3
 
-        if self.config.region or boto3.Session().region_name:
+        if resolve_region(self.config.region) or boto3.Session().region_name:
             return
-        raise ValueError(
-            "BedrockProvider has no region, and botocore refuses to build a bedrock-runtime "
-            "client without one: set the region on the entry/config, export AWS_DEFAULT_REGION, "
-            "or set `region` in the AWS profile this run uses"
-        )
+        raise ValueError(NO_REGION_ERROR)
 
     def complete(
         self,

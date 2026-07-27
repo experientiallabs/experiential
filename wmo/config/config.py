@@ -133,6 +133,13 @@ FIDELITY_TIERS: dict[FidelityTier, TierSpec] = {
 # Env var names each provider backend reads its credentials from (documented for the user).
 PROVIDER_ENV_VARS: dict[ProviderKind, list[str]] = {
     ProviderKind.ANTHROPIC: ["ANTHROPIC_API_KEY"],
+    # AWS_REGION is the region variable the Bedrock provider reads itself
+    # (`wmo.providers.bedrock.AWS_REGION_ENV`, pinned by a test; same literal-not-import rule as
+    # OPENROUTER and TINKER below). AWS_DEFAULT_REGION is accepted by the provider too but is
+    # deliberately NOT listed: this dict is an ALL-must-be-set presence contract
+    # (`wmo.cli.ui.has_credentials`) whose prompt writes every missing name into `.env`, so an
+    # ALTERNATIVE spelling of the same value would report "credentials missing" for a correct
+    # environment and then ask the user to duplicate the region under a second name.
     ProviderKind.BEDROCK: ["AWS_REGION", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
     ProviderKind.AZURE_OPENAI: ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
     ProviderKind.OPENAI: ["OPENAI_API_KEY"],
