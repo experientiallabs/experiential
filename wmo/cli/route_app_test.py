@@ -2756,6 +2756,22 @@ def test_route_report_rejects_a_policy_that_is_not_readable(tmp_path: Path) -> N
     assert _says(result.output, "is not a readable routing policy")
 
 
+def test_route_report_rejects_a_policy_that_is_not_utf8_text(tmp_path: Path) -> None:
+    """`RoutingPolicy.load` decodes before pydantic runs, so this never reached the other clause.
+
+    UnicodeDecodeError is a ValueError but NOT a ValidationError, so undecodable bytes (a
+    truncated download, or the `.npz` evidence bank handed over as the policy) walked straight
+    past the boundary and tracebacked.
+    """
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b'{"kind": "\xff\xfeknn"}')
+    result = _report(_knn_matrix_file(tmp_path), bad, tmp_path / "report.json")
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "cannot read the policy at")
+    assert not (tmp_path / "report.json").exists()
+
+
 def test_route_report_delivers_the_missing_sidecar_message_cleanly(tmp_path: Path) -> None:
     """The message was already written; it arrived as the last line of a stack trace.
 
@@ -2838,6 +2854,16 @@ def test_route_report_warns_when_it_measures_the_matrix_the_policy_was_fitted_on
     moved = _report(renamed, policy_file, tmp_path / "report_renamed.json")
     assert moved.exit_code == 0, moved.output
     assert _says(moved.output, "IN-SAMPLE")
+
+    # The provenance marker is appended LAST, so a matrix stored under a content-addressed
+    # directory carries `sha256=` in its path too. Splitting from the left read THAT one and
+    # dropped the warning on exactly the layout most likely to keep a fit matrix around.
+    addressed = tmp_path / "artifacts" / "sha256=deadbeef" / "matrix.json"
+    addressed.parent.mkdir(parents=True)
+    addressed.write_bytes(matrix_file.read_bytes())
+    content_addressed = _report(addressed, policy_file, tmp_path / "report_addressed.json")
+    assert content_addressed.exit_code == 0, content_addressed.output
+    assert _says(content_addressed.output, "IN-SAMPLE")
 
 
 def test_route_report_stays_quiet_on_a_matrix_the_fit_never_saw(tmp_path: Path) -> None:

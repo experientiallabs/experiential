@@ -811,7 +811,12 @@ def _load_policy(policy_file: str) -> RoutingPolicy:
             f"no policy file at {path}; fit one with "
             "`wmo optimize route fit <matrix.json> --kind knn`"
         ) from exc
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # `RoutingPolicy.load` decodes before pydantic sees anything, so bytes that are not UTF-8
+        # (a truncated download, a `.npz` bank passed as the policy) raise UnicodeDecodeError,
+        # which is a ValueError and NOT a ValidationError. `_load_matrix` needs no such clause:
+        # `load_matrix_with_digest` hands raw bytes to pydantic, which reports undecodable input
+        # as a ValidationError.
         raise typer.BadParameter(f"cannot read the policy at {path}: {exc}") from exc
     except ValidationError as exc:
         if _reads_as(OutcomeMatrix, path):
@@ -1275,9 +1280,12 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
     renamed or moved after the fit, and a matrix with the same path but different bytes does not
     trip it.
     """
-    digest = matrix_source.partition(_MATRIX_DIGEST_MARK)[2]
+    # `load_matrix_with_digest` appends the marker LAST, so split from the right: a matrix under a
+    # content-addressed directory (`artifacts/sha256=.../matrix.json`) carries the marker in its
+    # path too, and splitting from the left would read that one and silently drop the warning.
+    _, mark, digest = matrix_source.rpartition(_MATRIX_DIGEST_MARK)
     stamped = policy.fitted_from or ""
-    if not digest or f"{_MATRIX_DIGEST_MARK}{digest}" not in stamped:
+    if not mark or not digest or f"{_MATRIX_DIGEST_MARK}{digest}" not in stamped:
         return None
     return (
         f"[yellow]warning[/yellow] this policy was FITTED on this matrix "
