@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+from wmo.optimize.compression import (
+    CompressionConfig,
+    CompressionResult,
+    estimate_tokens,
+    register_compressor,
+)
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmo.optimize.report import build_report
@@ -243,3 +249,64 @@ def test_latency_counts_every_call_when_replies_are_not_call_aligned() -> None:
         replies=["only one reply"],
     )
     assert _productive_call_seconds([outcome]) == [1.0, 2.0, 3.0]
+
+
+class _RecordingCompressor:
+    """Records every segment it is handed and returns it unchanged (a pass-through spy)."""
+
+    id = "report-test-recorder"
+    version = "1"
+    append_stable = True
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        del config
+        self.seen.extend(segments)
+        tokens = sum(estimate_tokens(segment) for segment in segments)
+        return CompressionResult(
+            segments=list(segments),
+            tokens_in_raw=tokens,
+            tokens_in_compressed=tokens,
+            latency_s=0.0,
+        )
+
+
+_RECORDER = _RecordingCompressor()
+register_compressor(_RECORDER)
+
+
+def test_a_compressed_policys_report_replays_in_the_geometry_it_was_fitted_in() -> None:
+    """The reporting half of representation consistency (C2's Q2 rule).
+
+    A compressed endpoint's bank lives in the geometry of compressed text, and serving compresses
+    each request before the router embeds it. A report that embedded RAW task text against that
+    bank would measure a policy nobody serves: the queries land farther from every row, the novelty
+    floor trips, and routing reads as collapsed to the fallback.
+    """
+    _RECORDER.seen.clear()
+    arm = CompressionConfig(compressor_id=_RecordingCompressor.id, aggressiveness=0.5)
+    policy = _cluster_policy().model_copy(update={"compression": arm, "fit_compression": arm})
+    report = build_report(
+        _matrix(),
+        policy,
+        baseline="fable-5",
+        endpoint="tau-bench",
+        generated_at="2026-07-24T00:00:00Z",
+    )
+    assert report.scenario_count == 2
+    # Every routed scenario's task text went through the compressor on its way to the embedder.
+    assert sorted(_RECORDER.seen) == sorted([_SQL_TASK, _PROSE_TASK])
+
+
+def test_an_uncompressed_policys_report_embeds_the_task_text_as_it_is() -> None:
+    _RECORDER.seen.clear()
+    build_report(
+        _matrix(),
+        _cluster_policy(),
+        baseline="fable-5",
+        endpoint="tau-bench",
+        generated_at="2026-07-24T00:00:00Z",
+    )
+    assert _RECORDER.seen == []
