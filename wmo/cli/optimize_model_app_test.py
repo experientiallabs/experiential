@@ -202,11 +202,18 @@ class _FakeWorldModel:
 
 
 class _ScriptedCandidate:
-    """A candidate that calls one tool and then declares itself done."""
+    """A candidate that calls one tool and then declares itself done.
 
-    def __init__(self, config: ProviderConfig, world_model: _FakeWorldModel) -> None:
+    `throttled` makes every completion raise instead, the way a rate-limited candidate does: the
+    episode errors, `run_episode` records it, and the cell comes back unscored.
+    """
+
+    def __init__(
+        self, config: ProviderConfig, world_model: _FakeWorldModel, *, throttled: bool = False
+    ) -> None:
         self.config = config
         self._world_model = world_model
+        self._throttled = throttled
         self._script = ['{"tool": "ls", "arguments": {}}', '{"done": true, "summary": "ok"}']
         self._index = 0
 
@@ -218,6 +225,8 @@ class _ScriptedCandidate:
         temperature: float = 0.7,
         max_tokens: int = 8192,
     ) -> Completion:
+        if self._throttled:
+            raise RuntimeError("rate limit exceeded (429)")
         # The env scores on close, after this provider's last call, so recording which candidate
         # is live here is what lets the fake judge give different candidates different rewards.
         self._world_model.current_model = self.config.model
@@ -250,6 +259,7 @@ def _patch_seams(
     rewards: dict[str, float] | None = None,
     modules: tuple[object, ...] = (),
     session_usd: float = 0.02,
+    throttled_models: frozenset[str] = frozenset(),
 ) -> _FakeWorldModel:
     """Stub the world model and every pool provider; return the fake for post-run assertions."""
     world_model = _FakeWorldModel(rewards=rewards, session_usd=session_usd)
@@ -261,7 +271,10 @@ def _patch_seams(
         return cast("WorldModel", world_model), cast("Provider", provider)
 
     def _get_provider(config: ProviderConfig, api_key: str | None = None) -> Provider:
-        return cast("Provider", _ScriptedCandidate(config, world_model))
+        return cast(
+            "Provider",
+            _ScriptedCandidate(config, world_model, throttled=config.model in throttled_models),
+        )
 
     for module in (optimize_module, *modules):
         monkeypatch.setattr(module, "load_world_model", _load)
@@ -562,13 +575,25 @@ def test_an_unscored_sweep_withholds_the_fit_and_keeps_the_matrix(
         "WorldModelEnv",
         lambda world_model, *, score_on_close=False: real_env(world_model),
     )
+    world_model = _patch_seams(monkeypatch)
     result = _run(tmp_path, root, "--yes")
     assert result.exit_code == 1, result.output
-    matrix_path, policy_path, _report, _manifest = _paths(root)
+    matrix_path, policy_path, _report, manifest_path = _paths(root)
     assert matrix_path.is_file()  # the paid cells are on disk with their errors
     assert all(not outcome.scored for outcome in OutcomeMatrix.load(matrix_path).outcomes)
     assert not policy_path.exists()  # the fit was withheld
     assert _says(result.output, "no cell was scored")
+
+    # ...and the rejected sweep is RECORDED, so the second attempt costs nothing. Before this was
+    # fixed the contract's exit ran before the record was saved, and every retry re-bought every
+    # cell while the printed message claimed otherwise.
+    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    assert manifest.record_for(Stage.SWEEP) is not None
+    bought = len(world_model.tasks)
+    again = _run(tmp_path, root, "--yes")
+    assert again.exit_code == 1, again.output
+    assert len(world_model.tasks) == bought  # not one cell re-bought
+    assert _says(again.output, "no cell was scored")  # and still refused
 
 
 def test_the_sweep_stage_and_route_sweep_produce_identical_matrices(
@@ -888,3 +913,65 @@ def test_without_the_forecast_that_same_cap_would_not_have_stopped_it(
     again = _run(tmp_path, root, "--yes", "--max-usd", "5", "--force-from", "sweep")
     assert again.exit_code == 0, again.output
     assert len(world_model.tasks) > after_first
+
+
+def test_a_sweep_the_coverage_contract_rejects_is_recorded_and_not_re_bought(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected sweep still cost money, so resume has to preserve it.
+
+    `pricey` is throttled on every call, so its cells go unscored while `cheap` is scored on all
+    three scenarios: the two would be ranked on different task sets, and the contract withholds
+    the fit. The cells were paid for either way, and the printed message promises re-running will
+    not buy them again. It has to be true.
+    """
+    world_model = _patch_seams(
+        monkeypatch, rewards={"cheap-1": 0.4}, throttled_models=frozenset({"pricey-1"})
+    )
+    root = _project(tmp_path)
+    rejected = _run(tmp_path, root, "--yes")
+    assert rejected.exit_code == 1, rejected.output
+    matrix_path, policy_path, _report, manifest_path = _paths(root)
+    assert matrix_path.is_file() and not policy_path.exists()
+    assert _says(rejected.output, "DIFFERENT scenarios")
+    assert _says(rejected.output, "will not buy these cells again")
+    bought = len(world_model.tasks)
+
+    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    sweep = manifest.record_for(Stage.SWEEP)
+    assert sweep is not None and sweep.spend_usd > 0.0
+
+    # The documented way forward: accept the bias. It must skip the sweep, not repeat it.
+    accepted = _run(tmp_path, root, "--yes", "--allow-uneven-coverage")
+    assert accepted.exit_code == 0, accepted.output
+    assert len(world_model.tasks) == bought  # not one cell re-bought
+    assert _says(accepted.output, "matrix.json is current")
+    assert _says(accepted.output, "bias accepted")
+    assert policy_path.is_file()  # and the fit finally happened
+
+
+def test_the_coverage_contract_still_binds_when_the_sweep_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording a rejected sweep must not become a way to smuggle a biased matrix into a fit.
+
+    This is the hole that opens if the contract is enforced at the end of the sweep instead of in
+    front of the fit: the sweep is recorded, the next run skips it, and nothing re-checks the
+    evidence. So the gate lives with the fit and binds on the skip path too.
+    """
+    world_model = _patch_seams(
+        monkeypatch, rewards={"cheap-1": 0.4}, throttled_models=frozenset({"pricey-1"})
+    )
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 1
+    bought = len(world_model.tasks)
+    _matrix, policy_path, _report, _manifest = _paths(root)
+
+    # Same inputs, no --allow-uneven-coverage: the sweep is skipped (so nothing is spent) and the
+    # fit is STILL withheld rather than quietly proceeding on the biased matrix.
+    again = _run(tmp_path, root, "--yes")
+    assert again.exit_code == 1, again.output
+    assert len(world_model.tasks) == bought
+    assert _says(again.output, "matrix.json is current")  # the sweep really was skipped
+    assert _says(again.output, "DIFFERENT scenarios")  # and the gate still ran
+    assert not policy_path.exists()

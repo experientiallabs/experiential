@@ -758,14 +758,15 @@ def _run_stages(
         match decision.stage:
             case Stage.SWEEP:
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
-                record = _stage_sweep(
-                    plan,
-                    model_dir=model_dir,
-                    pool_file=pool_file,
-                    allow_uneven_coverage=allow_uneven_coverage,
-                )
+                record = _stage_sweep(plan, model_dir=model_dir, pool_file=pool_file)
                 ledger.record(record.total_spend_usd)
+                # Recorded and saved BEFORE the coverage gate can stop the run, so a sweep whose
+                # evidence the contract rejects is never bought twice. The gate itself sits with
+                # the fit (see `_enforce_coverage`).
+                manifest = manifest.with_record(record)
+                manifest.save(paths.manifest)
             case Stage.FIT:
+                _enforce_coverage(paths.matrix, allow_uneven=allow_uneven_coverage)
                 record = _stage_fit(paths, embedder=embedder, fallback=fallback)
             case Stage.TUNE:
                 record = _stage_tune(paths, cost_quality=cost_quality)
@@ -780,14 +781,18 @@ def _now() -> str:
     return datetime.now(tz=UTC).isoformat()
 
 
-def _stage_sweep(
-    plan: SweepPlan, *, model_dir: Path, pool_file: Path, allow_uneven_coverage: bool
-) -> StageRecord:
-    """Measure every candidate closed-loop, enforcing `route sweep`'s coverage contract verbatim.
+def _stage_sweep(plan: SweepPlan, *, model_dir: Path, pool_file: Path) -> StageRecord:
+    """Measure every candidate closed-loop and record what it cost.
 
-    The matrix is written whichever way the contract lands, because those cells were paid for and
-    their `error` fields are the diagnosis, and the stage is RECORDED even when the contract
-    withholds the fit: re-running after fixing the pool must not buy the same cells twice.
+    Deliberately does NOT judge the evidence it produced. The coverage contract that withholds a
+    fit lives in `_enforce_coverage`, which runs against whatever matrix the fit is about to
+    consume, so it binds a matrix this stage just bought AND one an earlier run bought that this
+    run skipped past. Enforcing it here instead would let a recorded-then-skipped sweep carry a
+    biased matrix into the fit with no gate at all.
+
+    The matrix is written and this stage is recorded whatever the evidence looks like: those cells
+    were paid for, their `error` fields are the diagnosis, and re-running after fixing the cause
+    must not buy them a second time.
     """
     world_model, _serve_provider = load_world_model(model_dir)
     run = execute_sweep(
@@ -820,23 +825,43 @@ def _stage_sweep(
         spend_usd=run.candidate_usd,
         world_model_spend_usd=run.world_model_usd,
     )
+    return record
+
+
+def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
+    """Show what the fit would be weighed on, and withhold it when that is not a comparison.
+
+    `route sweep`'s contract, applied at the point it actually protects something: the fit. Running
+    it here rather than at the end of the sweep is what lets a rejected sweep be RECORDED, because
+    a later run that skips the sweep still passes through this gate on its way to the fit. So a
+    biased matrix cannot reach a fitter by having been bought on an earlier invocation, and the
+    cells that were paid for are never bought twice.
+
+    Both refusals are free and repeatable: nothing has spent anything by the time this runs on a
+    resumed run. Zero scored cells has no opt-out, exactly as in `route sweep`, since there is
+    nothing to fit and `fit` would fail anyway.
+
+    Raises:
+        typer.Exit: The matrix is not fit-ready (exit code 1).
+    """
+    matrix = OutcomeMatrix.load(matrix_path)
     rows = coverage(matrix)
     print_coverage(_console, rows)
-    if scored == 0:
+    if not any(outcome.scored for outcome in matrix.outcomes):
         _console.print(NO_EVIDENCE_WARNING)
         raise typer.Exit(1)
     warning = uneven_warning(rows)
-    if warning is not None:
-        _console.print(warning)
-        if not allow_uneven_coverage:
-            _console.print(
-                "  fix the lost cells and re-run, drop the candidate that lost them, or re-run "
-                "with [bold]--allow-uneven-coverage[/bold] to fit on this matrix anyway (the "
-                "matrix is on disk and recorded, so re-running will not buy these cells again)"
-            )
-            raise typer.Exit(1)
-        _console.print(BIAS_ACCEPTED_NOTE)
-    return record
+    if warning is None:
+        return
+    _console.print(warning)
+    if not allow_uneven:
+        _console.print(
+            "  fix the lost cells and re-run, drop the candidate that lost them, or re-run "
+            "with [bold]--allow-uneven-coverage[/bold] to fit on this matrix anyway (the "
+            "matrix is on disk and recorded, so re-running will not buy these cells again)"
+        )
+        raise typer.Exit(1)
+    _console.print(BIAS_ACCEPTED_NOTE)
 
 
 def _stage_fit(paths: _RunPaths, *, embedder: EmbedderSpec, fallback: str | None) -> StageRecord:
