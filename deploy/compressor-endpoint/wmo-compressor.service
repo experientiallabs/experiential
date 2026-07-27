@@ -1,0 +1,35 @@
+[Unit]
+Description=WMO compressor endpoint (LLMLingua-2, fp32, fixed threshold)
+Documentation=https://github.com/experientiallabs/world-model-optimizer/tree/main/deploy/compressor-endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/nvme/work/wmo-compressor
+# The bearer token lives here and only here on the box (chmod 600, root-owned dir).
+EnvironmentFile=/etc/wmo-compressor/env
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HOME=/nvme/work/wmo-compressor/hf
+Environment=HF_HUB_OFFLINE=1
+Environment=TMPDIR=/nvme/work/wmo-compressor/tmp
+ExecStart=/nvme/work/wmo-compressor/venv/bin/python /nvme/work/wmo-compressor/server.py \
+    --port 8443 \
+    --ssl-certfile /nvme/work/wmo-compressor/tls/cert.pem \
+    --ssl-keyfile /nvme/work/wmo-compressor/tls/key.pem
+Restart=always
+RestartSec=10
+# A failing startup self-test exits nonzero on purpose: better a visible restart loop in
+# journald than a service quietly emitting non-deterministic compressions.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wmo-compressor
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

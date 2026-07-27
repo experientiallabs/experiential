@@ -162,7 +162,7 @@ uv run pytest -q
    workflow; avoid both unrelated command sprawl and hiding useful behavior behind internal APIs.
 
 5. **Keep the top-level layout intentional.** The default tracked top-level directories are: `wmo/`,
-   `examples/`, `docs/`, `assets/`, `web/`, `.agents/`, `.claude/`, `.github/`, plus
+   `examples/`, `docs/`, `assets/`, `web/`, `deploy/`, `.agents/`, `.claude/`, `.github/`, plus
    `packages/`: the monorepo workspace members (see § Monorepo). A new top-level concept requires
    an explicit architecture rationale plus updates to this guide and `wmo/repo_layout_test.py`;
    do not force it into an unrelated directory merely to preserve the current list. What each
@@ -197,6 +197,13 @@ uv run pytest -q
    - `web/` — the project website (Next.js/TypeScript). Excluded from the Python gate; carries
      its own gate instead: `npm run lint` and `npx tsc --noEmit` from `web/` must be clean
      before every commit that touches it.
+   - `deploy/` — **services we run ourselves**, one directory per service, each holding its
+     server code, unit file, deploy script, and operator README. These are neither library code
+     (nothing in `wmo/` imports them; they run on other machines) nor workspace scratch (they
+     are long-lived infrastructure the team depends on and rotates credentials for), which is
+     why they are not folded into `wmo/` or `.agents/`. A service here must be reproducible from
+     its own directory alone: someone with ssh access and no other context can redeploy it.
+     Secrets never live here, only the public half of pinned certificates.
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.

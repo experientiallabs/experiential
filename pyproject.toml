@@ -163,7 +163,9 @@ python-version = "3.12"
 [tool.ty.src]
 # `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
 # (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
-exclude = ["examples/", ".agents/",
+# `deploy/` is box-side service code: it imports torch and transformers, which live in the
+# GPU box's venv and are deliberately not project dependencies. Ruff still lints it.
+exclude = ["examples/", ".agents/", "deploy/",
     "packages/environment-capture/*/backend/",
     "packages/environment-capture/tau-bench/",
     "packages/environment-capture/terminal-tasks/",

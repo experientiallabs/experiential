@@ -1,0 +1,8 @@
+# Server-side deps for the compressor endpoint. torch and transformers come from the box's
+# pip cache (the wheels C1's GPU bench already downloaded); everything here is small.
+# Pinned so a redeploy cannot silently change what is serving.
+torch==2.13.0
+transformers==5.14.1
+fastapi==0.121.2
+uvicorn==0.40.0
+pydantic==2.13.0

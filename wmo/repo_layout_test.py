@@ -29,6 +29,7 @@ ALLOWED_TOP_DIRS = {
     ".claude",
     ".github",
     "packages",  # monorepo workspace members live here (AGENTS.md § Monorepo)
+    "deploy",  # service deployments we operate ourselves (AGENTS.md rule 5)
 }
 
 
