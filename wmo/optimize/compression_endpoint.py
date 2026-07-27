@@ -6,10 +6,13 @@ a laptop CPU), and one warm copy serves the whole team. This module is the thin 
 that, registered into the D-COMPRESS seam like any other compressor, so a policy can name it
 without anything else in the harness knowing a network hop exists.
 
-Configuration is two environment variables, `WMO_COMPRESSOR_URL` and `WMO_COMPRESSOR_API_KEY`.
-There is no fallback. If the endpoint is unreachable this raises: a compressor that silently
+Configuration is `WMO_COMPRESSOR_URL`, `WMO_COMPRESSOR_API_KEY`, and the pinned certificate
+(`WMO_COMPRESSOR_CA`, defaulted to the copy beside the deploy scripts in a source checkout).
+All three fail closed. If the endpoint is unreachable this raises: a compressor that silently
 served uncompressed text on failure would make cost and accuracy results depend on the health
-of a box nobody was watching, and would quietly invalidate any grid that hit a bad minute.
+of a box nobody was watching, and would quietly invalidate any grid that hit a bad minute. If
+the certificate is missing this also raises, rather than verifying a deliberately self-signed
+endpoint against the public CA store, which would trust every public CA and gain nothing.
 
 Importing this module registers a FACTORY for `llmlingua2-endpoint`, not the compressor: the
 compressor is built on the first policy that names it. That split is the point. Building it
@@ -47,13 +50,16 @@ log = logging.getLogger(__name__)
 
 URL_ENV = "WMO_COMPRESSOR_URL"
 KEY_ENV = "WMO_COMPRESSOR_API_KEY"
-CERT_ENV = "WMO_COMPRESSOR_CERT"
+CA_ENV = "WMO_COMPRESSOR_CA"
 
-# The pinned self-signed certificate shipped beside the deploy scripts. The endpoint has no
-# domain, so clients trust exactly this certificate rather than a public CA. Resolved from this
-# file rather than the working directory, so it is found from anywhere in a source checkout; in
-# an installed wheel `deploy/` is absent and WMO_COMPRESSOR_CERT must point at a copy.
-DEFAULT_CERT_PATH = (
+# The pinned self-signed certificate shipped beside the deploy scripts, resolved from this file
+# rather than the working directory so a source checkout finds it from anywhere. It is NOT a
+# fallback: an installed wheel has no `deploy/` directory, and quietly dropping back to the
+# public CA store there would mean either a confusing TLS failure or, worse, trusting every
+# public CA against an endpoint that no public CA has ever vouched for. When this path is
+# missing, WMO_COMPRESSOR_CA must supply the certificate and the client refuses to build
+# without it.
+BUNDLED_CERT_PATH = (
     Path(__file__).resolve().parents[2] / "deploy" / "compressor-endpoint" / "compressor-cert.pem"
 )
 
@@ -141,17 +147,33 @@ class LLMLingua2EndpointCompressor:
         self._max_chars = max_chars_per_request
         if client is not None:
             self._client = client
-        else:
-            # Pinning: when a certificate is given it becomes the client's ENTIRE trust store,
-            # so a public CA cannot be substituted for the box.
-            verify: ssl.SSLContext | bool = (
-                ssl.create_default_context(cafile=cert_path) if cert_path else True
+        elif cert_path is None:
+            # Only an injected client (tests, or a caller who built their own TLS context) may
+            # skip the pin. Building one here without a certificate would mean verifying a
+            # self-signed endpoint against the public CA store, which is not a weaker version
+            # of pinning: it trusts every public CA and none of them has vouched for this box.
+            raise CompressorEndpointError(
+                f"refusing to build a compressor client without the pinned certificate. Set "
+                f"{CA_ENV} to a copy of deploy/compressor-endpoint/compressor-cert.pem. The "
+                "endpoint is self-signed on purpose (it has no domain), so the public CA trust "
+                "store cannot verify it and must never be used as a fallback."
             )
-            self._client = httpx.Client(timeout=timeout_s, verify=verify)
+        else:
+            # Pinning: the certificate becomes the client's ENTIRE trust store, so no public CA
+            # can be substituted for the box.
+            self._client = httpx.Client(
+                timeout=timeout_s, verify=ssl.create_default_context(cafile=cert_path)
+            )
 
     @classmethod
     def from_env(cls, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> LLMLingua2EndpointCompressor:
-        """Build from `WMO_COMPRESSOR_URL` / `WMO_COMPRESSOR_API_KEY`, or say what is missing."""
+        """Build from `WMO_COMPRESSOR_URL` / `WMO_COMPRESSOR_API_KEY` / `WMO_COMPRESSOR_CA`.
+
+        Fails closed on all three. The certificate resolves from `WMO_COMPRESSOR_CA` if set,
+        otherwise from the copy bundled beside the deploy scripts in a source checkout; if
+        neither exists (the installed-wheel case, where `deploy/` is absent) this raises rather
+        than falling back to the public CA store.
+        """
         base_url = os.environ.get(URL_ENV, "").strip()
         api_key = os.environ.get(KEY_ENV, "").strip()
         missing = [name for name, value in ((URL_ENV, base_url), (KEY_ENV, api_key)) if not value]
@@ -163,10 +185,31 @@ class LLMLingua2EndpointCompressor:
                 "from the box (see deploy/compressor-endpoint/README.md), or select the "
                 "'identity' compressor to run without compression."
             )
-        cert_path = os.environ.get(CERT_ENV, "").strip() or None
-        if cert_path is None and DEFAULT_CERT_PATH.is_file():
-            cert_path = str(DEFAULT_CERT_PATH)
-        return cls(base_url, api_key, cert_path=cert_path, timeout_s=timeout_s)
+        return cls(base_url, api_key, cert_path=cls._resolve_ca_path(), timeout_s=timeout_s)
+
+    @staticmethod
+    def _resolve_ca_path() -> str:
+        """The pinned certificate to verify against, or an error naming how to supply one."""
+        configured = os.environ.get(CA_ENV, "").strip()
+        if configured:
+            if not Path(configured).is_file():
+                raise CompressorEndpointError(
+                    f"{CA_ENV} points at '{configured}', which is not a file. It must be a copy "
+                    "of deploy/compressor-endpoint/compressor-cert.pem, the certificate the "
+                    "endpoint serves."
+                )
+            return configured
+        if BUNDLED_CERT_PATH.is_file():
+            return str(BUNDLED_CERT_PATH)
+        raise CompressorEndpointError(
+            f"the pinned certificate for the compressor endpoint was not found, so {CA_ENV} "
+            f"must be set. This build has no bundled copy at {BUNDLED_CERT_PATH} (expected when "
+            "WMO is installed from a wheel, which does not ship deploy/). Copy "
+            "deploy/compressor-endpoint/compressor-cert.pem from the repository, or fetch it "
+            f"with `scp h100-dev-box-6:/nvme/work/wmo-compressor/tls/cert.pem .`, and point "
+            f"{CA_ENV} at it. The endpoint is self-signed by design, so the public CA trust "
+            "store is not a fallback and is never used."
+        )
 
     def handshake(self) -> None:
         """Read the running box once: verify its selection rule and adopt its request caps.
@@ -330,7 +373,7 @@ class LLMLingua2EndpointCompressor:
         raise CompressorEndpointError(
             f"compressor endpoint at {self.base_url} is unreachable ({last_error}). The "
             f"compressor never silently falls back to uncompressed input. Check {URL_ENV}, "
-            f"{KEY_ENV}, and the pinned certificate ({CERT_ENV}), or select the 'identity' "
+            f"{KEY_ENV}, and the pinned certificate ({CA_ENV}), or select the 'identity' "
             "compressor to run without compression."
         ) from last_error
 

@@ -21,6 +21,8 @@ cp .env.example .env      # then fill in the two variables below
 ```
 WMO_COMPRESSOR_URL=https://40.80.93.150:8443
 WMO_COMPRESSOR_API_KEY=<ask whoever administers the box>
+# Only needed outside a source checkout; see the certificate note below.
+WMO_COMPRESSOR_CA=/path/to/compressor-cert.pem
 ```
 
 Nothing to register by hand. `wmo.optimize` registers a lazy FACTORY for
@@ -64,7 +66,10 @@ result.segments, result.tokens_in_compressed, result.cost_usd
 The endpoint serves a self-signed certificate, pinned rather than CA-signed (there is no domain
 to buy a certificate for, and a pinned certificate is strictly stronger than trusting every
 public CA). Clients verify against `compressor-cert.pem` in this directory, which the client
-picks up automatically; `WMO_COMPRESSOR_CERT` overrides the path. From the shell:
+picks up automatically; `WMO_COMPRESSOR_CA` overrides the path, and is REQUIRED when WMO is
+installed from a wheel (which does not ship `deploy/`). There is no fallback to the public CA
+store: the client refuses to build rather than verify a deliberately self-signed endpoint
+against every public CA. From the shell:
 
 ```bash
 curl --cacert deploy/compressor-endpoint/compressor-cert.pem https://40.80.93.150:8443/healthz
@@ -211,6 +216,15 @@ sudo cat /etc/wmo-compressor/env    # read it once, hand it out over a private c
 Then every client updates `WMO_COMPRESSOR_API_KEY` in their own `.env`. Rotating the TLS
 certificate is the same shape: delete `/nvme/work/wmo-compressor/tls/*`, re-run `./deploy.sh`,
 and commit the refreshed `compressor-cert.pem`.
+
+### TLS is required to start
+
+`server.py` refuses to start without both `--ssl-certfile` and `--ssl-keyfile`. Uvicorn treats
+missing SSL arguments as "serve plaintext", so a typo in the unit file would otherwise
+downgrade a process bound to `0.0.0.0` while it still looked healthy, sending the reusable
+bearer token in cleartext on every request. There is an escape hatch for local experiments,
+`--insecure-dev-no-tls`, named so nobody types it by accident; it logs a loud warning for the
+life of the process.
 
 ### Security posture
 

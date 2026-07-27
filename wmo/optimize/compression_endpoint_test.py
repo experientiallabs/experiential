@@ -13,12 +13,13 @@ import os
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import BaseModel
 
-from wmo.optimize import compression
+from wmo.optimize import compression, compression_endpoint
 from wmo.optimize.compression import (
     CompressionConfig,
     CompressionResult,
@@ -29,6 +30,8 @@ from wmo.optimize.compression import (
     servable_compressor,
 )
 from wmo.optimize.compression_endpoint import (
+    BUNDLED_CERT_PATH,
+    CA_ENV,
     KEY_ENV,
     REQUIRED_SELECTION_RULE,
     URL_ENV,
@@ -123,7 +126,11 @@ def endpoint() -> Iterator[tuple[LLMLingua2EndpointCompressor, FakeEndpointState
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address[0], server.server_address[1]
-    client = LLMLingua2EndpointCompressor(f"http://{host}:{port}", "test-token")
+    # Injected client: the fake is plain HTTP on loopback, so there is no certificate to
+    # pin. Building one without a cert is refused, which is its own test below.
+    client = LLMLingua2EndpointCompressor(
+        f"http://{host}:{port}", "test-token", client=httpx.Client(timeout=10)
+    )
     try:
         yield client, state
     finally:
@@ -246,7 +253,9 @@ def test_segment_count_mismatch_is_rejected(
 def test_unreachable_endpoint_raises_instead_of_serving_uncompressed() -> None:
     """A down endpoint is an error, never a silent pass-through of the raw input."""
     # Port 1 on loopback refuses immediately: a real transport failure, no server involved.
-    client = LLMLingua2EndpointCompressor("http://127.0.0.1:1", "test-token", timeout_s=2.0)
+    client = LLMLingua2EndpointCompressor(
+        "http://127.0.0.1:1", "test-token", client=httpx.Client(timeout=2.0)
+    )
     with pytest.raises(CompressorEndpointError) as caught:
         client.compress(SEGMENTS, CompressionConfig(compressor_id="x", aggressiveness=0.5))
     message = str(caught.value)
@@ -301,6 +310,55 @@ def test_transport_fault_gives_up_after_one_retry() -> None:
     with pytest.raises(CompressorEndpointError):
         client.compress(SEGMENTS, CompressionConfig(compressor_id="x", aggressiveness=0.5))
     assert len(attempts) == 2
+
+
+def test_building_without_a_pinned_certificate_is_refused() -> None:
+    """No certificate and no injected client means no client at all, never the public CA store.
+
+    The endpoint is self-signed by design. Falling back to the system trust store would not be
+    a weaker pin, it would be trusting every public CA against a box none of them has vouched
+    for, which is the shape a MITM needs.
+    """
+    with pytest.raises(CompressorEndpointError, match=CA_ENV):
+        LLMLingua2EndpointCompressor("https://40.80.93.150:8443", "x" * 64)
+
+
+def test_installed_wheel_without_the_bundled_cert_says_what_to_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wheel case: `deploy/` is absent, so the error has to name the variable and the fix."""
+    monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443")
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.delenv(CA_ENV, raising=False)
+    monkeypatch.setattr(
+        compression_endpoint, "BUNDLED_CERT_PATH", tmp_path / "absent" / "cert.pem"
+    )
+
+    with pytest.raises(CompressorEndpointError) as caught:
+        LLMLingua2EndpointCompressor.from_env()
+    message = str(caught.value)
+    assert CA_ENV in message
+    assert "wheel" in message
+    assert "public CA" in message
+
+
+def test_ca_pointing_at_a_missing_file_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo in the path must not degrade into an unpinned client."""
+    monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443")
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.setenv(CA_ENV, "/nonexistent/compressor-cert.pem")
+
+    with pytest.raises(CompressorEndpointError, match="not a file"):
+        LLMLingua2EndpointCompressor.from_env()
+
+
+def test_from_env_pins_the_bundled_certificate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In a source checkout the committed cert is found without any configuration."""
+    monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443")
+    monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.delenv(CA_ENV, raising=False)
+    assert BUNDLED_CERT_PATH.is_file()
+    assert LLMLingua2EndpointCompressor.from_env().base_url == "https://40.80.93.150:8443"
 
 
 def test_from_env_names_every_missing_variable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -358,7 +416,7 @@ def test_first_resolution_builds_through_the_factory(
     state.max_segments = 512
     monkeypatch.setenv(URL_ENV, client.base_url)
     monkeypatch.setenv(KEY_ENV, "x" * 64)
-    monkeypatch.delenv("WMO_COMPRESSOR_CERT", raising=False)
+    monkeypatch.setenv(CA_ENV, str(BUNDLED_CERT_PATH))
 
     built = get_compressor("llmlingua2-endpoint")
 
@@ -405,7 +463,7 @@ def test_registration_publishes_the_compressor_and_it_is_servable(
     client, _ = endpoint
     monkeypatch.setenv(URL_ENV, client.base_url)
     monkeypatch.setenv(KEY_ENV, "x" * 64)
-    monkeypatch.delenv("WMO_COMPRESSOR_CERT", raising=False)
+    monkeypatch.setenv(CA_ENV, str(BUNDLED_CERT_PATH))
 
     registered = register_endpoint_compressor()
 

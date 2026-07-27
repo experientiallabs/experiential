@@ -366,18 +366,24 @@ def build_app(compressor: LLMLingua2FixedThreshold, token: str, self_test: str) 
     def authorize(
         credentials: HTTPAuthorizationCredentials | None = Depends(scheme),  # noqa: B008
     ) -> str:
-        """Constant-time bearer check, then the per-token rate limit."""
+        """Constant-time bearer check, then the per-token rate limit.
+
+        Returns the token's HASH, never the token. The value a dependency returns is handed to
+        the route and is one careless log line away from a transcript, so the secret stops here
+        and only an identifier that is useless to an attacker travels onward.
+        """
         presented = credentials.credentials if credentials else ""
         if not hmac.compare_digest(presented, token):
             raise HTTPException(status_code=401, detail="invalid or missing bearer token")
-        wait = bucket.take(hashlib.sha256(presented.encode()).hexdigest())
+        caller = hashlib.sha256(presented.encode()).hexdigest()
+        wait = bucket.take(caller)
         if wait > 0:
             raise HTTPException(
                 status_code=429,
                 detail=f"rate limit exceeded ({rate_per_min:g}/min, burst {burst:g})",
                 headers={"Retry-After": str(max(1, int(wait + 0.999)))},
             )
-        return presented
+        return caller
 
     @app.get("/healthz", response_model=HealthResponse)
     def healthz() -> HealthResponse:
@@ -451,8 +457,16 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8443)
     parser.add_argument("--device", default=os.environ.get("WMO_COMPRESSOR_DEVICE", "cuda:0"))
     parser.add_argument("--model", default=os.environ.get("WMO_COMPRESSOR_MODEL", DEFAULT_MODEL_ID))
-    parser.add_argument("--ssl-certfile", default=os.environ.get("WMO_COMPRESSOR_CERT"))
-    parser.add_argument("--ssl-keyfile", default=os.environ.get("WMO_COMPRESSOR_KEY"))
+    parser.add_argument("--ssl-certfile", default=os.environ.get("WMO_COMPRESSOR_TLS_CERT"))
+    parser.add_argument("--ssl-keyfile", default=os.environ.get("WMO_COMPRESSOR_TLS_KEY"))
+    parser.add_argument(
+        "--insecure-dev-no-tls",
+        action="store_true",
+        help=(
+            "Serve plaintext HTTP. Every request then carries a reusable bearer token in "
+            "cleartext. Local experiments only, never on a box reachable from the network."
+        ),
+    )
     args = parser.parse_args()
 
     token = os.environ.get("WMO_COMPRESSOR_TOKEN", "")
@@ -460,6 +474,26 @@ def main() -> None:
         raise SystemExit(
             "WMO_COMPRESSOR_TOKEN is missing or shorter than 32 chars; generate one with "
             "`openssl rand -hex 32` and put it in the systemd EnvironmentFile"
+        )
+
+    # Fail closed on TLS. Uvicorn treats missing ssl arguments as "serve plaintext", so a typo
+    # in the unit file would otherwise downgrade the endpoint silently while it still looks
+    # healthy: the bearer token, which is reusable and shared, would go out in cleartext on
+    # every request to a process bound to 0.0.0.0.
+    if not args.insecure_dev_no_tls and not (args.ssl_certfile and args.ssl_keyfile):
+        raise SystemExit(
+            "refusing to start without TLS: --ssl-certfile and --ssl-keyfile are both required "
+            "(bootstrap.sh generates them at /nvme/work/wmo-compressor/tls/). Every request "
+            "carries a reusable bearer token, so plaintext would expose it to anyone on the "
+            "path. Pass --insecure-dev-no-tls only for a local experiment on a loopback bind."
+        )
+    if args.insecure_dev_no_tls:
+        log.warning(
+            "SERVING PLAINTEXT HTTP on %s:%d because --insecure-dev-no-tls was passed. The "
+            "bearer token is sent in cleartext with every request and can be replayed by "
+            "anyone who observes it. Never use this on a network-reachable box.",
+            args.host,
+            args.port,
         )
 
     log.info("loading %s on %s (fp32)", args.model, args.device)

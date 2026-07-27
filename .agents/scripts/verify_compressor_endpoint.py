@@ -10,7 +10,7 @@ so the s/10k and $/10k here are directly comparable with the on-box bench number
 
     uv run python .agents/scripts/verify_compressor_endpoint.py
 
-Reads WMO_COMPRESSOR_URL / WMO_COMPRESSOR_API_KEY / WMO_COMPRESSOR_CERT from .env (gitignored).
+Reads WMO_COMPRESSOR_URL / WMO_COMPRESSOR_API_KEY / WMO_COMPRESSOR_CA from .env (gitignored).
 Prints no secrets.
 """
 
@@ -20,14 +20,18 @@ import concurrent.futures
 import json
 import logging
 import os
+import ssl
 import statistics
 import time
 from pathlib import Path
 
 import httpx
 
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.compression_endpoint import (
-    CompressionConfig,
+    BUNDLED_CERT_PATH,
+    CA_ENV,
+    KEY_ENV,
     CompressorEndpointError,
     LLMLingua2EndpointCompressor,
 )
@@ -51,6 +55,29 @@ def load_env(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip())
+
+
+def ca_path() -> str:
+    """The pinned certificate this run verifies against, resolved the way the client does."""
+    configured = os.environ.get(CA_ENV, "").strip()
+    return configured or str(BUNDLED_CERT_PATH)
+
+
+def authenticated_client(cert: str) -> httpx.Client:
+    """An httpx client that already carries the bearer token, pinned to the endpoint's cert.
+
+    The token is read here and nowhere else in this script, and it never becomes a local in
+    `main` or an argument to a check function. That is deliberate: the checks return pass/fail
+    values that get serialized into the summary log line, and a secret threaded through those
+    functions is a secret one refactor away from being logged (CodeQL flagged exactly that
+    shape). Handing the checks a ready-authenticated client keeps the credential out of every
+    frame that produces a logged value.
+    """
+    return httpx.Client(
+        verify=ssl.create_default_context(cafile=cert),
+        timeout=60,
+        headers={"Authorization": f"Bearer {os.environ[KEY_ENV]}"},
+    )
 
 
 def check_health(client: LLMLingua2EndpointCompressor) -> None:
@@ -125,7 +152,7 @@ def check_bank_fit_batch(client: LLMLingua2EndpointCompressor) -> bool:
     return ok
 
 
-def check_queue_not_billed(base_url: str, api_key: str, cert: str) -> bool:
+def check_queue_not_billed(base_url: str, authed: httpx.Client) -> bool:
     """Concurrent callers must not bill each other's queueing as their own GPU-seconds.
 
     The GPU is serialized by a lock. When the clock started before that lock, a request queued
@@ -141,16 +168,14 @@ def check_queue_not_billed(base_url: str, api_key: str, cert: str) -> bool:
         * 8,
         "threshold": THRESHOLD,
     }
-    headers = {"Authorization": f"Bearer {api_key}"}
     concurrency = 8
-    with httpx.Client(verify=cert, timeout=60) as raw:
-        baseline = raw.post(f"{base_url}/v1/compress", json=body, headers=headers).json()
+    baseline = authed.post(f"{base_url}/v1/compress", json=body).json()
 
-        def fire(_: int) -> dict[str, float]:
-            return raw.post(f"{base_url}/v1/compress", json=body, headers=headers).json()
+    def fire(_: int) -> dict[str, float]:
+        return authed.post(f"{base_url}/v1/compress", json=body).json()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-            burst = list(pool.map(fire, range(concurrency)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        burst = list(pool.map(fire, range(concurrency)))
 
     serial_cost = float(baseline["cost_usd"])
     worst_cost = max(float(row["cost_usd"]) for row in burst)
@@ -182,21 +207,19 @@ def check_selection_rule(client: LLMLingua2EndpointCompressor) -> bool:
     return True
 
 
-def wait_for_capacity(base_url: str, api_key: str, cert: str, need: int = 50) -> None:
+def wait_for_capacity(base_url: str, authed: httpx.Client, need: int = 50) -> None:
     """Idle until the rate limiter has refilled enough budget for the measurement run.
 
     Only matters when this script is re-run: the rate-limit check deliberately drains the
     bucket, and a throttled measurement would report latency of the limiter, not the model.
     """
-    headers = {"Authorization": f"Bearer {api_key}"}
     body = {"segments": ["ping"], "threshold": THRESHOLD}
-    with httpx.Client(verify=cert, timeout=30) as raw:
-        for _ in range(30):
-            if raw.post(f"{base_url}/v1/compress", json=body, headers=headers).status_code == 200:
-                break
-            time.sleep(5)
-        else:
-            raise SystemExit("endpoint stayed rate limited; wait a minute and re-run")
+    for _ in range(30):
+        if authed.post(f"{base_url}/v1/compress", json=body).status_code == 200:
+            break
+        time.sleep(5)
+    else:
+        raise SystemExit("endpoint stayed rate limited; wait a minute and re-run")
     # The bucket refills at the sustained rate (1/s by default); give it room for the run.
     log.info("waiting %ds for rate-limit budget before measuring", need)
     time.sleep(need)
@@ -217,7 +240,8 @@ def measure(
     compressed_proxy = 0
     start = time.perf_counter()
     for index in range(0, len(transcripts), group_size):
-        segments = [turn for transcript in transcripts[index : index + group_size] for turn in transcript]
+        group = transcripts[index : index + group_size]
+        segments = [turn for transcript in group for turn in transcript]
         call_start = time.perf_counter()
         result = client.compress(segments, config)
         latencies.append(time.perf_counter() - call_start)
@@ -256,22 +280,19 @@ def measure(
     return stats
 
 
-def check_rate_limit(base_url: str, api_key: str, cert: str) -> bool:
+def check_rate_limit(base_url: str, authed: httpx.Client) -> bool:
     """Hammer the endpoint with cheap calls until the limiter answers 429.
 
     Runs LAST: it deliberately drains the token bucket, so anything measured after it would be
     throttled.
     """
     body = {"segments": ["hi"], "threshold": THRESHOLD}
-    headers = {"Authorization": f"Bearer {api_key}"}
-    statuses: list[int] = []
-    with httpx.Client(verify=cert, timeout=20) as raw:
 
-        def fire(_: int) -> int:
-            return raw.post(f"{base_url}/v1/compress", json=body, headers=headers).status_code
+    def fire(_: int) -> int:
+        return authed.post(f"{base_url}/v1/compress", json=body).status_code
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-            statuses = list(pool.map(fire, range(200)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        statuses = list(pool.map(fire, range(200)))
     limited = statuses.count(429)
     served = statuses.count(200)
     ok = limited > 0
@@ -296,21 +317,24 @@ def main() -> None:
 
     client = LLMLingua2EndpointCompressor.from_env(timeout_s=120.0)
     base_url = client.base_url
-    cert = os.environ["WMO_COMPRESSOR_CERT"]
-    api_key = os.environ["WMO_COMPRESSOR_API_KEY"]
+    cert = ca_path()
 
     check_health(client)
     rule_ok = check_selection_rule(client)
     deterministic = check_determinism(client, transcripts)
     authorized = check_auth(base_url, cert)
     bank_fit = check_bank_fit_batch(client)
-    queue_billing = check_queue_not_billed(base_url, api_key, cert)
-    wait_for_capacity(base_url, api_key, cert)
-    measure(client, transcripts)
-    rate_limited = check_rate_limit(base_url, api_key, cert)
+    with authenticated_client(cert) as authed:
+        queue_billing = check_queue_not_billed(base_url, authed)
+        wait_for_capacity(base_url, authed)
+        measure(client, transcripts)
+        rate_limited = check_rate_limit(base_url, authed)
 
-    # A down endpoint must raise, never quietly pass the input through.
-    down = LLMLingua2EndpointCompressor("https://127.0.0.1:1", api_key, timeout_s=2.0)
+    # A down endpoint must raise, never quietly pass the input through. Built with an injected
+    # client so this script never has to hold the token itself.
+    down = LLMLingua2EndpointCompressor(
+        "https://127.0.0.1:1", "", client=httpx.Client(timeout=2.0), timeout_s=2.0
+    )
     try:
         down.compress(["x"], CompressionConfig(compressor_id="x", aggressiveness=0.5))
     except CompressorEndpointError:
