@@ -25,7 +25,6 @@ import typer
 import uvicorn
 from environment_capture.hub import (
     CORPORA,
-    CorpusRepoUnavailable,
     corpus_path,
     fetch_corpus,
     published_corpora,
@@ -934,8 +933,12 @@ def download(
             raise typer.BadParameter(str(exc)) from exc
         except urllib.error.HTTPError as exc:
             # One unpublished/broken dataset must not abort the REST of a multi-download:
-            # record it, keep fetching, and fail (with every name) at the end.
-            failures.append(f"{name}: {_hub_failure_detail(exc)}")
+            # record it, keep fetching, and fail (with every name) at the end. The reason is
+            # quoted rather than summarized here: a fetch tries more than one dataset repo id
+            # and only the error it raises knows which ones the Hub refused. Reading it off
+            # plain HTTPError attributes keeps this working against the PUBLISHED
+            # environment-capture, which the WMO wheel resolves from PyPI.
+            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url} ({exc.reason})")
             _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
             continue
         except urllib.error.URLError as exc:
@@ -950,13 +953,6 @@ def download(
             "some datasets could not be downloaded (unpublished? `wmo download` with no "
             "arguments lists what is):\n  " + "\n  ".join(failures)
         )
-
-
-def _hub_failure_detail(exc: urllib.error.HTTPError) -> str:
-    """One line saying what the Hub refused, naming every repo id the fetch tried."""
-    if isinstance(exc, CorpusRepoUnavailable):
-        return exc.reason  # already names every attempted repo id and its code
-    return f"the Hub answered {exc.code} for {exc.url}"
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:

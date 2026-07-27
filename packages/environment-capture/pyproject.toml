@@ -1,6 +1,6 @@
 [project]
 name = "environment-capture"
-version = "0.1.0"
+version = "0.1.1"
 description = "Run benchmarks for real and record agent-environment transitions as OTel GenAI JSONL."
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -1367,7 +1367,9 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
 
 def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     # A fetch now tries more than one dataset repo name (the wmh -> wmo rename), so a bare
-    # "404" cannot be acted on: the report must say which ids were looked for.
+    # "404" cannot be acted on: the report must say which ids were looked for. The CLI reads
+    # that off plain HTTPError attributes (no import of the newer member symbol), so this also
+    # covers the wheel, which resolves environment-capture from PyPI.
     import urllib.error
     from http.client import HTTPMessage
 

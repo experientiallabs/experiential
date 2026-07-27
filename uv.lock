@@ -775,7 +775,7 @@ wheels = [
 
 [[package]]
 name = "environment-capture"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/environment-capture" }
 
 [package.optional-dependencies]
