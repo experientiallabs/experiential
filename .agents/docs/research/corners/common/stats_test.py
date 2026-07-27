@@ -69,6 +69,25 @@ def test_paired_delta_pairs_on_the_intersection_and_counts_movement() -> None:
     assert set(result.scenario_deltas) == {"a", "b", "c"}
 
 
+def test_verdict_requires_both_a_clear_ci_and_a_mean_outside_the_floor() -> None:
+    scenarios = {f"s{i}": [1.0] for i in range(6)}
+    zeros = {f"s{i}": [0.0] for i in range(6)}
+    big = paired_delta(scenarios, zeros, resamples=100)
+    assert big.verdict == "measurable"
+    # Consistent direction but tiny magnitude: significant is not the same as headline-able.
+    tiny = paired_delta(
+        {f"s{i}": [0.51] for i in range(6)}, {f"s{i}": [0.5] for i in range(6)}, resamples=100
+    )
+    assert tiny.verdict == "within_noise_floor"
+    # The cycle-1 shape: a large mean whose CI spans zero is noise, never a regression.
+    mixed = paired_delta(
+        {"a": [1.0], "b": [0.0], "c": [1.0], "d": [0.0]},
+        {"a": [0.0], "b": [1.0], "c": [0.0], "d": [1.0]},
+        resamples=200,
+    )
+    assert mixed.verdict == "no_effect"
+
+
 def test_paired_delta_flags_the_noise_floor_and_handles_no_movement() -> None:
     inside = paired_delta({"a": [0.51], "b": [0.5]}, {"a": [0.5], "b": [0.5]}, resamples=100)
     assert inside.within_noise_floor

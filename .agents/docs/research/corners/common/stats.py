@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from math import comb, fsum
 from random import Random
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
@@ -80,6 +80,11 @@ class PairedDelta(BaseModel):
     sign_test_p: float | None
     within_noise_floor: bool
     noise_floor: float
+    # The one-word honest reading, shared so three chats cannot phrase the same delta three
+    # ways: "measurable" requires BOTH a CI that excludes zero AND a mean outside the noise
+    # floor; a CI spanning zero is "no_effect" no matter how large the mean (cycle-1's -0.067
+    # with CI [-0.167, +0.033] is the canonical example: noise, not a regression).
+    verdict: Literal["no_effect", "within_noise_floor", "measurable"]
     scenario_deltas: dict[str, float]
 
 
@@ -168,6 +173,12 @@ def paired_delta(
     n_up = sum(1 for d in values if d > TIE_EPSILON)
     n_down = sum(1 for d in values if d < -TIE_EPSILON)
     mean_delta = fsum(values) / len(values)
+    if low <= 0.0 <= high:
+        verdict: Literal["no_effect", "within_noise_floor", "measurable"] = "no_effect"
+    elif abs(mean_delta) < noise_floor:
+        verdict = "within_noise_floor"
+    else:
+        verdict = "measurable"
     return PairedDelta(
         mean_delta=mean_delta,
         ci_low=low,
@@ -179,6 +190,7 @@ def paired_delta(
         sign_test_p=sign_test_p(n_up, n_down) if n_up + n_down else None,
         within_noise_floor=abs(mean_delta) < noise_floor,
         noise_floor=noise_floor,
+        verdict=verdict,
         scenario_deltas=deltas,
     )
 

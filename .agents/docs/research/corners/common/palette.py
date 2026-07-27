@@ -86,16 +86,17 @@ def apply_style() -> None:
     )
 
 
-def footnote(fig: Figure, text: str) -> None:
+def footnote(fig: Figure, text: str, *, y: float = -0.02) -> None:
     """The provenance line under a corner figure (labeling rules in common/README.md).
 
     Wrapped to the figure width: a long single-line provenance string inflates the tight
     bounding box and shrinks the axes to a fraction of the canvas (measured on the cost
-    chat's first render).
+    chat's first render). `y` drops further (e.g. -0.1) when the figure has an x-axis label
+    that would otherwise collide (measured on the quality chat's lever chart).
     """
     width = int(fig.get_figwidth() * 16)
     wrapped = "\n".join(textwrap.wrap(text, width=width))
-    fig.text(0.005, -0.02, wrapped, fontsize=7.5, color=MUTED, ha="left", va="top")
+    fig.text(0.005, y, wrapped, fontsize=7.5, color=MUTED, ha="left", va="top")
 
 
 def label_point(ax: Axes, x: float, y: float, text: str) -> None:
