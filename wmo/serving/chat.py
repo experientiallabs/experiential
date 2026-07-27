@@ -71,7 +71,14 @@ from wmo.optimize.knn import (
     apply_cost_quality,
     cost_quality_named_point,
 )
-from wmo.optimize.policy import Embedder, RoutingDecision, RoutingPolicy, select_model
+from wmo.optimize.policy import (
+    Embedder,
+    GateOutcome,
+    Propensity,
+    RoutingDecision,
+    RoutingPolicy,
+    select_model,
+)
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
     Message,
@@ -82,6 +89,7 @@ from wmo.providers.base import (
 )
 from wmo.providers.pool import PoolEntry, pool_provider
 from wmo.serving.endpoint_config import EndpointConfig
+from wmo.serving.query_embeddings import QueryEmbeddingStore
 from wmo.serving.savings import EndpointSavings, SavingsWindow, compute_savings
 
 if TYPE_CHECKING:
@@ -486,6 +494,20 @@ class RequestLogRecord(BaseModel):
     ttfb_ms: float | None = None
     status: Literal["ok", "error"] = "ok"
     error_message: str | None = None
+    # The routing decision's evidence, flattened (see `wmo.optimize.policy.RoutingEvidence`).
+    # Flat rather than nested because this row is a JSONL contract the platform reads column-wise:
+    # counting fallback-forced requests or histogramming n_pairs should not need a JSON path. All
+    # nullable, and all null for the kinds that compute no paired evidence (static, rank) and for
+    # requests the guard never reached.
+    mean_diff: float | None = None
+    se: float | None = None
+    n_pairs: int | None = None
+    gate: GateOutcome | None = None
+    propensity: Propensity | None = None
+    # Resolves to the vector this request was routed on
+    # (`wmo.serving.query_embeddings.QueryEmbeddingStore.get`). Null when the store is off, when
+    # the policy embeds nothing (static), or when the write failed.
+    query_embedding_ref: str | None = None
 
 
 class RequestLog:
@@ -550,6 +572,11 @@ class EndpointRuntime:
     mounting never silently re-tunes an artifact. `config_path` is the `endpoint.toml` a live
     dial change is persisted to, so the setting survives a restart; None keeps changes in memory
     (injected-policy tests, and any caller that owns persistence itself).
+
+    `embeddings` is the query-vector sidecar (`wmo.serving.query_embeddings`); requests are
+    recorded into it by default, and `log_query_embeddings=False` switches that off per endpoint
+    without disturbing the request log. A store constructed on no path is already inert, which is
+    what an in-memory serving setup gets.
     """
 
     def __init__(
@@ -561,10 +588,13 @@ class EndpointRuntime:
         log: RequestLog,
         cost_quality: float | None = None,
         config_path: Path | None = None,
+        embeddings: QueryEmbeddingStore | None = None,
+        log_query_embeddings: bool = True,
     ) -> None:
         self.name = name
         self.policy = policy
         self.log = log
+        self._embeddings = embeddings if log_query_embeddings else None
         self._base_policy = policy
         self._config_path = config_path
         self._provider_factory = provider_factory
@@ -647,6 +677,19 @@ class EndpointRuntime:
                 incumbent = self._affinity.get(_fingerprint(remembered))
         text = _routable_text(messages)
         return select_model(self.policy, text, incumbent=incumbent, embedder=self._embedder())
+
+    def record_query_embedding(self, record_id: str, decision: RoutingDecision) -> str | None:
+        """Persist the vector `decision` was routed on, returning the log row's ref (or None).
+
+        None whenever there is nothing to record OR nothing to record it to: a static policy
+        embeds no query, a sticky decision never consulted the policy, and the store is inert
+        when logging is off. The caller writes the ref straight onto the log row, so those cases
+        simply leave the column null.
+        """
+        vector = decision.query_embedding()
+        if self._embeddings is None or vector is None:
+            return None
+        return self._embeddings.append(record_id, vector)
 
     def _embedder(self) -> Embedder | None:
         """Build the policy's embedder once per runtime, not once per request.
@@ -1201,6 +1244,10 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         started = time.monotonic()
+        # Written once per request, keyed by the id every log row for this call carries, so the
+        # vector is stored exactly once no matter which path below reports the outcome.
+        embedding_ref = runtime.record_query_embedding(completion_id, decision)
+        evidence = decision.evidence
 
         def _record(
             usage: TokenUsage,
@@ -1219,6 +1266,12 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     cluster_id=decision.cluster_id,
                     cluster_label=decision.cluster_label,
                     routing_reason=decision.reason,
+                    mean_diff=evidence.mean_diff if evidence else None,
+                    se=evidence.se if evidence else None,
+                    n_pairs=evidence.n_pairs if evidence else None,
+                    gate=evidence.gate if evidence else None,
+                    propensity=evidence.propensity if evidence else None,
+                    query_embedding_ref=embedding_ref,
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                     cached_tokens=usage.cached_input_tokens,

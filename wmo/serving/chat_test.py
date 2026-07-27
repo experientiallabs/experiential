@@ -52,6 +52,7 @@ from wmo.serving.chat import (
     install_openai_error_shapes,
 )
 from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
+from wmo.serving.query_embeddings import QUERY_EMBEDDING_FILENAME, QueryEmbeddingStore
 from wmo.serving.savings import EndpointSavings, SavingsWindow
 from wmo.tracking.pricing import ModelPrice
 
@@ -2190,3 +2191,85 @@ def test_an_openrouter_candidate_is_served_end_to_end(
     assert response.status_code == 200
     assert response.headers["x-wmo-routed-model"] == "or-glm"
     assert response.json()["choices"][0]["message"]["content"] == "served by or-glm"
+
+
+def _evidence_client(tmp_path: Path) -> tuple[TestClient, Path, QueryEmbeddingStore]:
+    """A knn endpoint whose query vectors are recorded, as `create_app` wires them by default."""
+    store = QueryEmbeddingStore(tmp_path / QUERY_EMBEDDING_FILENAME)
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        embeddings=store,
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    return TestClient(app), tmp_path / "requests.jsonl", store
+
+
+def test_a_served_request_logs_its_evidence_and_a_resolvable_embedding_ref(
+    tmp_path: Path,
+) -> None:
+    """End to end: one real request, and the row it leaves carries the decision's numbers."""
+    client, log_path, store = _evidence_client(tmp_path)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+        },
+    )
+    assert response.status_code == 200
+    row = _rows(log_path)[0]
+
+    # The routed pick cleared the guard, so the row says so in fields, not only in prose.
+    assert row["gate"] == "passed"
+    assert row["propensity"] == "greedy"
+    assert isinstance(row["n_pairs"], int) and row["n_pairs"] > 0
+    assert isinstance(row["mean_diff"], float)
+    assert isinstance(row["se"], float)
+
+    # And the vector it was routed on resolves from the ref the same row carries.
+    ref = row["query_embedding_ref"]
+    assert isinstance(ref, str)
+    assert ref.endswith(f"#{row['id']}")
+    vector = store.get(ref)
+    assert vector is not None
+    assert vector.shape == (64,)
+    assert float(np.linalg.norm(vector)) == pytest.approx(1.0, abs=1e-3)
+
+
+def test_a_static_endpoint_leaves_the_evidence_columns_null(tmp_path: Path) -> None:
+    # Nothing was embedded and no guard ran, so every added column is null rather than zero.
+    client, log_path = _client(tmp_path)
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    row = _rows(log_path)[0]
+    for column in ("mean_diff", "se", "n_pairs", "gate", "propensity", "query_embedding_ref"):
+        assert row[column] is None, column
+
+
+def test_query_embedding_logging_can_be_switched_off(tmp_path: Path) -> None:
+    store = QueryEmbeddingStore(tmp_path / QUERY_EMBEDDING_FILENAME)
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        embeddings=store,
+        log_query_embeddings=False,
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    TestClient(app).post(
+        "/v1/chat/completions",
+        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    row = _rows(tmp_path / "requests.jsonl")[0]
+    # The decision's evidence is still logged; only the vector is withheld.
+    assert row["query_embedding_ref"] is None
+    assert row["propensity"] is not None
+    assert not (tmp_path / QUERY_EMBEDDING_FILENAME).exists()
