@@ -10,6 +10,7 @@ import pytest
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
 from wmo.optimize.scorecard import (
+    EFFECTIVE_COST_RULE,
     Arm,
     CompletionRule,
     ConditionLabel,
@@ -149,7 +150,7 @@ def test_priced_tokens_recorded_at_zero_dollars_are_surfaced() -> None:
 
 
 def test_overhead_naming_an_episode_the_arm_lacks_is_rejected() -> None:
-    with pytest.raises(ValueError, match="overhead rows name episodes this arm does not contain"):
+    with pytest.raises(ValueError, match="overhead rows name episodes not present here"):
         Arm(
             name="a",
             condition=_BASE,
@@ -270,9 +271,9 @@ def test_latency_is_per_task_and_includes_optimizer_overhead() -> None:
 
     # Per task: s1 = 1.0 + 1.0 + 0.5 = 2.5, s2 = 2.0 + 0.5 = 2.5. A per-CALL p50 would have
     # read 1.0 here and understated the arm against the anchor's single 3.0s call.
-    assert card.latency.p50_s == pytest.approx(2.5)
+    assert card.latency.p50_model_s == pytest.approx(2.5)
     assert card.latency.n_tasks == 2
-    assert card.anchor_latency.p50_s == pytest.approx(3.0)
+    assert card.anchor_latency.p50_model_s == pytest.approx(3.0)
     assert card.latency_p50_delta_percent == pytest.approx((2.5 - 3.0) / 3.0 * 100.0)
 
 
@@ -391,11 +392,12 @@ def test_ladder_needs_at_least_one_rung() -> None:
 
 
 def test_pareto_front_on_a_hand_built_matrix() -> None:
-    # Objectives are (mean reward up, cost per completed task down, latency down).
-    #   cheap-fast : 0.5 reward, $0.02/task, 1.0s  -> best on cost and latency
-    #   balanced   : 0.8 reward, $0.05/task, 2.0s  -> best on nothing alone, dominated by nobody
-    #   dominated  : 0.5 reward, $0.06/task, 3.0s  -> worse than cheap-fast on all three
-    #   best-quality: 1.0 reward, $0.09/task, 4.0s -> best on quality
+    # Objectives are (mean reward up, cost per completed task down, latency down). Each arm has
+    # two scenarios, both completed, so cost per task equals the per-row cost.
+    #   cheap-fast  : 0.5 reward, $0.010/task, 1.0s -> best on cost and latency
+    #   balanced    : 0.8 reward, $0.025/task, 2.0s -> best on nothing alone, dominated by nobody
+    #   dominated   : 0.5 reward, $0.030/task, 3.0s -> worse than cheap-fast on all three
+    #   best-quality: 1.0 reward, $0.045/task, 4.0s -> best on quality
     arms = [
         _ladder_arm("cheap-fast", reward=0.5, cost=0.01, seconds=1.0),
         _ladder_arm("balanced", reward=0.8, cost=0.025, seconds=2.0),
@@ -429,7 +431,7 @@ def test_pareto_can_dominate_on_p95_instead_of_p50() -> None:
         rows=[_row(f"s{i}", "steady", reward=1.0, cost=0.01, seconds=[1.0]) for i in range(1, 4)],
     )
     # Identical p50 and cheaper, but one very slow tail episode: only the p95 objective sees it
-    # (three tasks, so the 9.0s outlier moves p95 to 15.4s and leaves the median at 1.0s).
+    # (three tasks, so the 9.0s outlier moves p95 to 8.2s and leaves the median at 1.0s).
     spiky = Arm(
         name="spiky",
         condition=_BASE.replace(optimizer="spiky"),
@@ -441,9 +443,9 @@ def test_pareto_can_dominate_on_p95_instead_of_p50() -> None:
     )
     ladder = build_ladder("joint-tau", anchor=_anchor_arm(scenarios=3), arms=[steady, spiky])
 
-    assert ladder.rungs[0].scorecard.latency.p50_s == pytest.approx(1.0)
-    assert ladder.rungs[1].scorecard.latency.p50_s == pytest.approx(1.0)
-    assert ladder.rungs[1].scorecard.latency.p95_s == pytest.approx(15.4)
+    assert ladder.rungs[0].scorecard.latency.p50_model_s == pytest.approx(1.0)
+    assert ladder.rungs[1].scorecard.latency.p50_model_s == pytest.approx(1.0)
+    assert ladder.rungs[1].scorecard.latency.p95_model_s == pytest.approx(8.2)
 
     # On p50 the two tie on latency and spiky is strictly cheaper, so steady drops off.
     assert [r.scorecard.arm for r in ladder.pareto(latency="p50")] == ["spiky"]
@@ -628,3 +630,344 @@ def test_overhead_keys_on_episode_not_just_scenario() -> None:
 
     assert cost.overhead_cost_usd == pytest.approx(0.05)
     assert cost.cost_per_completed_task_usd == pytest.approx(0.045)
+
+
+# --- invariants the mutation pass found unprotected -----------------------------------------
+
+
+def test_effective_cost_rule_is_shipped_verbatim_in_every_basis() -> None:
+    cost = effective_cost_per_completed_task([_row("s1", "m", reward=1.0)])
+    assert EFFECTIVE_COST_RULE in cost.cost_assumptions
+
+
+def test_unscored_episode_inside_a_kept_scenario_is_not_averaged_in_as_zero() -> None:
+    # Invariant #1 at the one place it is reachable: a scenario the anchor scored, where the arm
+    # has one scored episode and one that never returned. Averaging the failure in as 0 would
+    # halve the arm's reward and manufacture a regression out of an infrastructure fault.
+    arm = Arm(
+        name="flaky",
+        condition=_BASE.replace(optimizer="flaky"),
+        rows=[
+            _row("s1", "flaky", reward=1.0, episode=0),
+            _row("s1", "flaky", reward=None, episode=1),
+        ],
+    )
+    anchor = Arm(
+        name="teacher",
+        condition=_BASE.replace(base_model="glm-5.2"),
+        rows=[_row("s1", "teacher", reward=1.0)],
+    )
+    card = build_scorecard(arm=arm, anchor=anchor)
+
+    assert card.quality.mean_reward == pytest.approx(1.0)
+    assert card.quality.n_scored == 1
+    assert card.quality.n_excluded == 1
+    assert card.quality.task_success_rate == pytest.approx(1.0)
+    assert card.quality_delta_points == pytest.approx(0.0)
+
+
+def test_quality_is_averaged_per_scenario_not_per_episode() -> None:
+    # The arm ran three episodes on the easy scenario and one on the hard one. Episode-weighted
+    # means would read 0.75 and hand the arm a win it did not earn; scenario-weighted reads 0.5.
+    arm = Arm(
+        name="lopsided",
+        condition=_BASE.replace(optimizer="lopsided"),
+        rows=[
+            _row("easy", "lopsided", reward=1.0, episode=0),
+            _row("easy", "lopsided", reward=1.0, episode=1),
+            _row("easy", "lopsided", reward=1.0, episode=2),
+            _row("hard", "lopsided", reward=0.0, episode=0),
+        ],
+    )
+    anchor = Arm(
+        name="teacher",
+        condition=_BASE.replace(base_model="glm-5.2"),
+        rows=[
+            _row("easy", "teacher", reward=1.0),
+            _row("hard", "teacher", reward=0.0),
+        ],
+    )
+    card = build_scorecard(arm=arm, anchor=anchor)
+
+    assert card.quality.mean_reward == pytest.approx(0.5)
+    assert card.quality.n_scenarios == 2
+    assert card.quality.n_scored == 4
+    assert card.quality_delta_points == pytest.approx(0.0)
+
+
+def test_tied_rungs_both_stay_on_the_frontier() -> None:
+    # Strict improvement is what keeps mutual domination from emptying the front. Two rungs
+    # equal on all three objectives dominate nobody, so both belong on it.
+    first = _ladder_arm("tie-a", reward=1.0, cost=0.01, seconds=1.0)
+    second = _ladder_arm("tie-b", reward=1.0, cost=0.01, seconds=1.0)
+    ladder = build_ladder("joint-tau", anchor=_anchor_arm(), arms=[first, second])
+
+    assert [r.scorecard.arm for r in ladder.pareto()] == ["tie-a", "tie-b"]
+
+
+def test_one_strict_improvement_is_enough_to_dominate() -> None:
+    # Equal on quality and latency, strictly cheaper: that alone removes the costlier rung.
+    cheap = _ladder_arm("cheap", reward=1.0, cost=0.01, seconds=1.0)
+    dear = _ladder_arm("dear", reward=1.0, cost=0.02, seconds=1.0)
+    ladder = build_ladder("joint-tau", anchor=_anchor_arm(), arms=[cheap, dear])
+
+    assert [r.scorecard.arm for r in ladder.pareto()] == ["cheap"]
+
+
+# --- money is conserved ----------------------------------------------------------------------
+
+
+def test_spend_on_scenarios_held_out_of_the_comparison_is_still_reported() -> None:
+    # The arm scored s3 and paid $5.00 there; the anchor left s3 unscored, so the scenario drops
+    # out entirely. Without the withheld bucket that $5.00 would leave no trace on the card,
+    # while n_excluded stayed 0 and the assumptions string claimed a clean accounting.
+    arm = Arm(
+        name="expensive",
+        condition=_BASE.replace(optimizer="expensive"),
+        rows=[
+            _row("s1", "expensive", reward=1.0, cost=0.01),
+            _row("s3", "expensive", reward=1.0, cost=5.00),
+        ],
+    )
+    anchor = Arm(
+        name="teacher",
+        condition=_BASE.replace(base_model="glm-5.2"),
+        rows=[
+            _row("s1", "teacher", reward=1.0, cost=0.10),
+            _row("s3", "teacher", reward=None, cost=7.00),
+        ],
+    )
+    card = build_scorecard(arm=arm, anchor=anchor)
+
+    assert card.scenarios_compared == 1
+    assert card.scenarios_excluded == 1
+    assert card.withheld_cost_usd == pytest.approx(5.00)
+    assert card.anchor_withheld_cost_usd == pytest.approx(7.00)
+    assert "held out of this comparison" in card.cost_assumptions
+    # Conservation: nothing either side spent is missing from the card.
+    assert card.cost.total_cost_usd + card.cost.excluded_cost_usd + card.withheld_cost_usd == (
+        pytest.approx(sum(r.cost_usd for r in arm.rows))
+    )
+    assert (
+        card.anchor_cost.total_cost_usd
+        + card.anchor_cost.excluded_cost_usd
+        + card.anchor_withheld_cost_usd
+    ) == pytest.approx(sum(r.cost_usd for r in anchor.rows))
+
+
+def test_scorecard_assumptions_quote_both_sides() -> None:
+    arm = _arm("distill", [_row("s1", "student", reward=1.0)])
+    anchor = _arm(
+        "teacher",
+        [_row("s1", "teacher", reward=1.0), _row("s2", "teacher", reward=None)],
+        base_model="glm-5.2",
+    )
+    card = build_scorecard(arm=arm, anchor=anchor)
+
+    assert "Arm 'distill':" in card.cost_assumptions
+    assert "Anchor 'teacher':" in card.cost_assumptions
+
+
+def test_tiny_excluded_spend_never_renders_as_zero_dollars() -> None:
+    rows = [_row("s1", "m", reward=1.0), _row("s2", "m", reward=None, cost=0.00002)]
+    cost = effective_cost_per_completed_task(rows)
+
+    assert "less than $0.0001" in cost.cost_assumptions
+    assert "$0.0000" not in cost.cost_assumptions
+
+
+# --- unpriced arms ----------------------------------------------------------------------------
+
+
+def test_a_wholly_unpriced_arm_is_flagged_not_reported_as_free() -> None:
+    # Every scored row has tokens and $0, so cost per task is $0 and the saving against a priced
+    # anchor reads -100%. The number is arithmetically right and substantively meaningless, so a
+    # renderer needs a field it can branch on, not a sentence it will not parse.
+    arm = Arm(
+        name="unpriced",
+        condition=_BASE.replace(optimizer="unpriced"),
+        rows=[
+            _row("s1", "unpriced", reward=1.0, cost=0.0, tokens=1000),
+            _row("s2", "unpriced", reward=1.0, cost=0.0, tokens=1000),
+        ],
+    )
+    anchor = Arm(
+        name="teacher",
+        condition=_BASE.replace(base_model="glm-5.2"),
+        rows=[
+            _row("s1", "teacher", reward=1.0, cost=0.10),
+            _row("s2", "teacher", reward=1.0, cost=0.10),
+        ],
+    )
+    card = build_scorecard(arm=arm, anchor=anchor)
+
+    assert card.cost.cost_is_unpriced is True
+    assert card.cost_delta_percent == pytest.approx(-100.0)
+    assert "Treat the cost figures as absent, not as free" in card.cost_assumptions
+    assert card.anchor_cost.cost_is_unpriced is False
+
+
+def test_a_partially_priced_arm_is_not_flagged_unpriced() -> None:
+    rows = [
+        _row("s1", "m", reward=1.0, cost=0.0, tokens=1000),
+        _row("s2", "m", reward=1.0, cost=0.01, tokens=1000),
+    ]
+    cost = effective_cost_per_completed_task(rows)
+
+    assert cost.zero_cost_rows == 1
+    assert cost.cost_is_unpriced is False
+
+
+# --- arm hygiene --------------------------------------------------------------------------------
+
+
+def test_duplicate_episode_keys_are_rejected_so_overhead_cannot_double_bill() -> None:
+    with pytest.raises(ValueError, match="share the episode key"):
+        Arm(
+            name="dupe",
+            condition=_BASE,
+            rows=[_row("s1", "m", reward=1.0), _row("s1", "m", reward=1.0)],
+        )
+
+
+@pytest.mark.parametrize("reward", [1.5, -0.5, 8.0])
+def test_rewards_outside_the_unit_interval_are_rejected(reward: float) -> None:
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        Arm(name="rubric", condition=_BASE, rows=[_row("s1", "m", reward=reward)])
+
+
+def test_public_effective_cost_rejects_orphan_overhead_like_the_arm_does() -> None:
+    with pytest.raises(ValueError, match="overhead rows name episodes not present here"):
+        effective_cost_per_completed_task(
+            [_row("s1", "m", reward=1.0)],
+            overheads=[
+                RowOverhead(scenario_id="TYPO", model="m", component="router", cost_usd=99.0)
+            ],
+        )
+
+
+def test_condition_label_replace_rejects_an_unknown_axis() -> None:
+    with pytest.raises(ValueError, match="unknown condition axes"):
+        _BASE.replace(optimzer="typo")
+
+
+def test_condition_label_replace_revalidates_the_new_value() -> None:
+    with pytest.raises(ValueError):
+        _BASE.replace(base_model="")
+
+
+# --- the anchor is an operating point too ------------------------------------------------------
+
+
+def test_a_rung_the_anchor_dominates_is_kept_off_the_frontier() -> None:
+    # Worse than the teacher on quality, cost, and latency. Reporting it as a frontier point
+    # would advertise an operating point the untouched baseline beats on every axis.
+    anchor = _anchor_arm(reward=1.0, cost=0.001, seconds=0.5)
+    loser = _ladder_arm("worse-everywhere", reward=0.5, cost=1.0, seconds=9.0)
+    ladder = build_ladder("joint-tau", anchor=anchor, arms=[loser])
+
+    assert ladder.rungs[0].dominated_by_anchor is True
+    assert ladder.pareto() == []
+    assert ladder.operating_points() == []
+    # It is still on the ladder: suppressed from the frontier, not hidden from the report.
+    assert [r.scorecard.arm for r in ladder.rungs] == ["worse-everywhere"]
+
+
+def test_a_rung_that_beats_the_anchor_on_one_axis_stays_on_the_frontier() -> None:
+    anchor = _anchor_arm(reward=1.0, cost=0.10, seconds=3.0)
+    cheaper = _ladder_arm("cheaper", reward=0.9, cost=0.01, seconds=1.0)
+    ladder = build_ladder("joint-tau", anchor=anchor, arms=[cheaper])
+
+    assert ladder.rungs[0].dominated_by_anchor is False
+    assert [r.scorecard.arm for r in ladder.pareto()] == ["cheaper"]
+
+
+# --- restrict_to --------------------------------------------------------------------------------
+
+
+def test_restrict_to_narrows_a_standalone_scorecard() -> None:
+    arm = _arm(
+        "distill",
+        [_row("s1", "student", reward=1.0), _row("s2", "student", reward=0.0)],
+    )
+    anchor = _arm(
+        "teacher",
+        [_row("s1", "teacher", reward=1.0), _row("s2", "teacher", reward=1.0)],
+        base_model="glm-5.2",
+    )
+    assert build_scorecard(arm=arm, anchor=anchor).scenarios_compared == 2
+    narrowed = build_scorecard(arm=arm, anchor=anchor, restrict_to=["s1"])
+    assert narrowed.scenarios_compared == 1
+    assert narrowed.quality.mean_reward == pytest.approx(1.0)
+
+
+def test_restrict_to_that_excludes_everything_raises() -> None:
+    arm = _arm("distill", [_row("s1", "student", reward=1.0)])
+    anchor = _arm("teacher", [_row("s1", "teacher", reward=1.0)], base_model="glm-5.2")
+    with pytest.raises(ValueError, match="share no scored scenario inside"):
+        build_scorecard(arm=arm, anchor=anchor, restrict_to=["nowhere"])
+
+
+# --- routed rungs: unmeasured choices ------------------------------------------------------------
+
+
+def test_a_routed_choice_the_matrix_never_measured_becomes_an_unscored_row() -> None:
+    # The policy sends everything to "strong", but the matrix only measured "strong" on s1.
+    # Emitting nothing for s2 would shrink the routed arm's scenario set invisibly.
+    matrix = OutcomeMatrix(
+        pool=[
+            PoolEntry(
+                name="cheap",
+                kind=ProviderKind.OPENAI,
+                model="custom-cheap",
+                tier="open",
+                input_per_mtok=0.1,
+                output_per_mtok=0.2,
+            ),
+            PoolEntry(name="strong", kind=ProviderKind.ANTHROPIC, model="claude-fable-5"),
+        ],
+        outcomes=[
+            _row("s1", "cheap", reward=0.2),
+            _row("s1", "strong", reward=1.0),
+            _row("s2", "cheap", reward=1.0),
+        ],
+    )
+    policy = RoutingPolicy(kind="static", default_model="strong", pool=matrix.pool)
+    rows = rows_for_policy(matrix, policy)
+
+    assert [(r.scenario_id, r.model, r.reward) for r in rows] == [
+        ("s1", "strong", 1.0),
+        ("s2", "strong", None),
+    ]
+    assert "never measured on this scenario" in (rows[1].error or "")
+    cost = effective_cost_per_completed_task(rows)
+    assert cost.n_excluded == 1
+
+
+def test_cost_delta_is_undefined_when_the_anchor_itself_cost_nothing() -> None:
+    # A free anchor makes the ratio a division by zero. None is the only honest answer; a raw
+    # divide would crash the report and a 0.0 would claim the arm matched a free baseline.
+    arm = Arm(
+        name="priced",
+        condition=_BASE.replace(optimizer="priced"),
+        rows=[_row("s1", "priced", reward=1.0, cost=0.05)],
+    )
+    anchor = Arm(
+        name="free-teacher",
+        condition=_BASE.replace(base_model="local"),
+        rows=[_row("s1", "free-teacher", reward=1.0, cost=0.0, tokens=1000)],
+    )
+    card = build_scorecard(arm=arm, anchor=anchor)
+
+    assert card.anchor_cost.cost_per_completed_task_usd == pytest.approx(0.0)
+    assert card.cost_delta_percent is None
+
+
+def test_an_episode_with_no_tokens_is_not_counted_as_unpriced() -> None:
+    # $0 with zero tokens is an episode that never called the model, not a missing price.
+    # Counting it would let an empty run masquerade as an unpriced pool entry.
+    rows = [_row("s1", "m", reward=1.0, cost=0.0, tokens=0)]
+    cost = effective_cost_per_completed_task(rows)
+
+    assert cost.zero_cost_rows == 0
+    assert cost.cost_is_unpriced is False

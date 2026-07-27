@@ -324,17 +324,31 @@ def route_scenarios(
     the scoring math is shared rather than reimplemented).
 
     `embedder` overrides the function built from `policy.embedder`, exactly as in `select_model`:
-    one client for the whole replay, or cached vectors in research code.
+    one client for the whole replay, or cached vectors in research code. It must be the function
+    this policy's spec describes, or the fitted centroids (rank) and neighbor bank (knn) are
+    meaningless.
 
     Raises:
-        ValueError: when none of `ids` names a scenario the matrix measured.
+        ValueError: when none of `ids` names a scenario the matrix measured, or when `ids`
+            repeats a scenario. The return is keyed by scenario, so a repeat cannot be
+            represented and would weight that scenario differently for different callers.
     """
+    repeated = sorted({sid for sid, count in Counter(ids).items() if count > 1})
+    if repeated:
+        raise ValueError(
+            f"scenario ids repeat in this replay request: {repeated[:5]}; a policy decides once "
+            f"per scenario and the result is keyed by scenario id, so pass each id once (to "
+            f"weight a scenario more heavily, add episodes to the matrix instead)"
+        )
     scenario_tasks: dict[str, str] = {}
     for outcome in matrix.outcomes:
         scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
     wanted = [sid for sid in ids if sid in scenario_tasks]
     if not wanted:
-        raise ValueError("none of the requested ids are in the matrix")
+        raise ValueError(
+            f"none of the {len(ids)} requested ids are in the matrix; the matrix measured "
+            f"{len(scenario_tasks)} scenarios, so check the ids come from this matrix"
+        )
 
     if policy.kind == "static":
         return {
@@ -356,7 +370,12 @@ def evaluate_policy(
 ) -> PolicyEval:
     """Replay `policy` over the scenarios in `ids`, scoring via each routed model's rows.
 
-    Selection is `route_scenarios`; this adds the scoring pass over the routed rows.
+    Selection is `route_scenarios` (the shared offline replay); this adds the scoring pass over
+    the routed rows.
+
+    `embedder` is forwarded to `route_scenarios`: one client for the whole replay, or cached
+    vectors in research code. It must be the function `policy.embedder` describes, or the fitted
+    centroids (rank) and neighbor bank (knn) are meaningless.
     """
     decisions = route_scenarios(policy, matrix, ids, embedder=embedder)
     wanted = list(decisions)

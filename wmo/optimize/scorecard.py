@@ -4,28 +4,34 @@ The accounting rule (D-COMPRESS, binding for every savings claim this project ma
 are **cache-adjusted effective cost per completed task, compressor inference cost and latency
 included**. The rule was written for the compression track, but it binds any optimizer that
 buys cheaper tokens by spending inference somewhere else, so this module generalizes its
-"compressor" to an *optimizer overhead*: cost and wall time an arm incurs OUTSIDE the worker
-model's own bill (a compactor pass, a router's embedding call). Nothing aggregated the rule
-before this module existed; report.py's `Headline` reports mean cost per RUN against one
-baseline model, which is a different (and, for an ablation, misleading) quantity: an arm that
-fails half its tasks looks cheap per run and is ruinous per completed task.
+"compressor" to an *optimizer overhead*: cost and time an arm incurs OUTSIDE the worker model's
+own bill (a compactor pass, a router's embedding call). Nothing aggregated the rule before this
+module existed; report.py's `Headline` reports mean cost per RUN against one baseline model,
+which is a different (and, for an ablation, misleading) quantity: an arm that fails half its
+tasks looks cheap per run and is ruinous per completed task.
 
 Three objectives, never one:
 
-1. Quality: mean reward plus task success rate over scored episodes.
+1. Quality: mean reward plus task success rate, averaged per scenario (see below).
 2. Effective cost per completed task: cache-adjusted provider spend plus optimizer overhead,
    divided by the number of tasks actually completed.
-3. Latency: p50 and p95 of per-task wall seconds, optimizer overhead included.
+3. Latency: p50 and p95 of per-task MODEL seconds, optimizer overhead included.
 
 Discipline inherited from the surrounding code, and where this module deliberately differs:
 
 - Unscored episodes (`reward is None`) are an infrastructure failure, not a judge verdict of 0.
-  They are excluded from every numerator and denominator, counted, and their unattributed spend
-  is reported separately so the money never vanishes silently.
+  They are excluded from every numerator and denominator, counted, and their spend is reported
+  separately. Money is conserved: for either side of a scorecard,
+  `cost.total_cost_usd + cost.excluded_cost_usd + withheld_cost_usd` equals everything that
+  side spent, so no dollar can leave the artifact silently.
 - "Same scenarios" is literal and enforced, as in `report.py`: an arm and its anchor are
   compared over the intersection of scenarios scored on BOTH sides, and the counts in and out
   are on the artifact. A LADDER goes further and holds every rung to one common scenario set,
   because its Pareto front compares rungs against each other and not only against the anchor.
+- Quality is averaged per SCENARIO, not per episode. Cost per completed task is legitimately
+  episode-level (each episode is a task attempt that cost money), but a mean reward over
+  episodes silently reweights the comparison when two arms ran different episode counts on the
+  same scenario, which is the scenario-level version of the bug the common set exists to stop.
 - Comparability invariants fail loudly rather than merge, as in `wmo.evals.grid.merge_results`.
   A `wm_simulated` arm never silently scores against a `real_episode` anchor, and two arms whose
   condition labels collide are rejected: the GEPA program lost runs to colliding labels, so a
@@ -35,15 +41,20 @@ Discipline inherited from the surrounding code, and where this module deliberate
   where "cache-adjusted" comes from and re-pricing here would drop negotiated rates.
 - Every estimate names its basis, as in `wmo.serving.savings`: `cost_assumptions` is composed
   from what the rows actually contained and is mandatory non-empty.
-- Latency is per TASK (seconds), not per call as in `report.py`. Cost per completed task and
-  seconds per task are the pair an operator reasons about; a per-call p95 cannot be compared
-  against a per-task cost.
+- Latency is per TASK, not per call as in `report.py`, and it is MODEL time: `call_seconds`
+  excludes environment and tool time by contract (`outcomes.py`), so these numbers understate
+  an operator's wall clock and flatter any optimizer that only shortens prompts. Cost per
+  completed task and seconds per task are still the pair to reason about together; a per-call
+  p95 cannot be compared against a per-task cost at all.
 
 A rung is a CONFIG evaluated offline against one existing matrix, never a rerun: a single-model
 arm selects its rows with `rows_for_model`, and a routed arm replays its policy's own choices
 with `rows_for_policy`. Buy the matrix once, then every rung is a lookup.
 
 Call site (the joint tau-bench ablation ladder):
+
+    from wmo.optimize.scorecard import Arm, ConditionLabel, build_ladder, rows_for_model
+    from wmo.optimize.scorecard import rows_for_policy
 
     tau = ConditionLabel(
         dataset="tau-bench-retail", split="test", judge="tau2-verifier",
@@ -70,6 +81,7 @@ Call site (the joint tau-bench ablation ladder):
 
 from __future__ import annotations
 
+from math import isclose
 from statistics import median, quantiles
 from typing import TYPE_CHECKING, Literal
 
@@ -93,6 +105,11 @@ Provenance = Literal["wm_simulated", "real_episode"]
 # Which latency statistic the Pareto front dominates on. p95 is reported on every scorecard but
 # is not the dominance coordinate by default: at ablation sample sizes it is one slow episode.
 LatencyObjective = Literal["p50", "p95"]
+
+# Floats that differ by less than this are a tie, not an improvement. Summation order differs
+# between the arm side and the anchor side, so two genuinely equal rungs can land 1 ULP apart;
+# without a tolerance one of them would silently fall off the frontier.
+DOMINANCE_TOLERANCE = 1e-9
 
 # The rule, shipped verbatim on every result. Specifics measured from the rows are appended.
 EFFECTIVE_COST_RULE = (
@@ -136,8 +153,25 @@ class ConditionLabel(BaseModel):
         )
 
     def replace(self, **axes: str | int) -> ConditionLabel:
-        """A copy with some axes changed: how ladder rungs are derived from a shared base."""
-        return self.model_copy(update=dict(axes))
+        """A copy with some axes changed: how ladder rungs are derived from a shared base.
+
+        Re-validates rather than using `model_copy(update=...)` directly. An unrecognized axis
+        name is rejected instead of silently doing nothing: a typo would otherwise leave the
+        intended field unchanged and surface later as an inexplicable ladder label collision,
+        which is the exact failure this class exists to prevent.
+
+        Raises:
+            ValueError: when an axis is not a field of this model, or when the new value fails
+                the field's own validation (an empty string, a bad provenance).
+        """
+        unknown = sorted(set(axes) - set(type(self).model_fields))
+        if unknown:
+            raise ValueError(
+                f"unknown condition axes {unknown}; the axes are "
+                f"{sorted(type(self).model_fields)}, so fix the spelling or record the change "
+                f"in `notes`, which is part of the label identity"
+            )
+        return ConditionLabel.model_validate({**self.model_dump(), **axes})
 
 
 class RowOverhead(BaseModel):
@@ -184,8 +218,8 @@ class Arm(BaseModel):
     """One condition under test: its rows, its overhead, and the label that identifies it.
 
     An arm is a set of measured rows, not a policy: the caller decides what "the routed mix"
-    means (replaying a policy, selecting one pool model via `rows_for_model`) and this module
-    stays pure aggregation with no embedder, no network, and no fitting.
+    means (replaying a policy via `rows_for_policy`, selecting one pool model via
+    `rows_for_model`) and this module stays pure aggregation with no fitting.
     """
 
     name: str = Field(min_length=1)
@@ -199,22 +233,33 @@ class Arm(BaseModel):
     dial_position: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
-    def _overheads_name_rows(self) -> Arm:
-        """Overhead must attach to a row of THIS arm, or the cost lands on nothing.
+    def _rows_are_well_formed(self) -> Arm:
+        """Reject row sets whose aggregation would be quietly wrong.
 
-        Silently ignoring an unmatched key would understate effective cost, which is exactly the
-        direction of error this module exists to prevent.
+        Three checks, all guarding the same direction of error (a plausible number nobody can
+        reproduce): duplicate episode keys would charge one overhead twice, an out-of-range
+        reward would inflate `quality_delta_points` (which is scaled by 100 and read as
+        percentage points by the D-DIAL contract), and orphan overhead would land real spend on
+        no episode at all.
         """
-        keys = {_row_key(row) for row in self.rows}
-        orphans = sorted(
-            {str(_overhead_key(o)) for o in self.overheads if _overhead_key(o) not in keys}
-        )
-        if orphans:
-            raise ValueError(
-                f"arm '{self.name}': overhead rows name episodes this arm does not contain: "
-                f"{orphans[:5]}; keys are (scenario_id, model, episode) and must match the arm's "
-                f"own rows, so attach the overhead to the arm whose episodes it was spent on"
-            )
+        seen: set[tuple[str, str, int]] = set()
+        for row in self.rows:
+            key = _row_key(row)
+            if key in seen:
+                raise ValueError(
+                    f"arm '{self.name}': two rows share the episode key {key}; overhead is "
+                    f"charged per (scenario_id, model, episode), so a duplicate would be billed "
+                    f"twice. Give the repeat run a distinct `episode` number."
+                )
+            seen.add(key)
+            if row.reward is not None and not 0.0 <= row.reward <= 1.0:
+                raise ValueError(
+                    f"arm '{self.name}': row {key} has reward {row.reward}, outside [0, 1]. "
+                    f"Quality deltas are reported in points (reward x 100) against the D-DIAL "
+                    f"contract, so a rubric on another scale would be published as a wildly "
+                    f"wrong percentage. Normalize the reward to [0, 1] before building the arm."
+                )
+        _require_overheads_match(self.rows, self.overheads, owner=f"arm '{self.name}'")
         return self
 
 
@@ -237,23 +282,32 @@ class EffectiveCost(BaseModel):
     # Scored episodes that recorded tokens but $0. Legitimate for a self-hosted model, and the
     # signature of an unpriced pool entry otherwise, so it is reported rather than guessed at.
     zero_cost_rows: int = 0
+    # True when EVERY scored episode was unpriced, which makes `cost_per_completed_task_usd`
+    # exactly $0 and any saving against it read as -100%. A typed flag rather than a sentence
+    # in `cost_assumptions`, because a renderer can check a field and cannot check prose.
+    cost_is_unpriced: bool = False
     cost_assumptions: str = Field(min_length=1)
 
 
 class QualityBlock(BaseModel):
-    """Mean reward and task success rate over an arm's scored episodes."""
+    """Mean reward and task success rate, averaged per scenario then across scenarios."""
 
     mean_reward: float
     task_success_rate: float
-    n_scored: int
-    n_excluded: int
+    n_scenarios: int  # what the two means above are averaged over
+    n_scored: int  # scored EPISODES behind those scenarios
+    n_excluded: int  # unscored episodes inside the compared scenarios
 
 
 class LatencyBlock(BaseModel):
-    """Per-task wall seconds, optimizer overhead included."""
+    """Per-task model seconds, optimizer overhead included, environment time excluded.
 
-    p50_s: float
-    p95_s: float
+    Named `_model_s` on purpose: `ScenarioOutcome.call_seconds` is model call time only, so
+    these are not an operator's wall clock (see the module docstring).
+    """
+
+    p50_model_s: float
+    p95_model_s: float
     n_tasks: int
 
 
@@ -276,8 +330,17 @@ class Scorecard(BaseModel):
     latency: LatencyBlock
     anchor_latency: LatencyBlock
 
+    # Spend on scenarios held OUT of the comparison entirely (one side left them unscored, so
+    # neither side's rows for them are aggregated). Distinct from `cost.excluded_cost_usd`,
+    # which is spend on unscored episodes INSIDE the compared scenarios. Both are needed for
+    # the conservation identity in the module docstring: without this bucket, a scenario the
+    # anchor failed to score would take the arm's real (possibly large) spend with it silently.
+    withheld_cost_usd: float = 0.0
+    anchor_withheld_cost_usd: float = 0.0
+
     # Deltas in the D-DIAL sign convention: quality points positive = better, cost percent
-    # negative = cheaper. None when the anchor's own figure is undefined or zero.
+    # negative = cheaper. A percent delta is None when either side's figure is undefined, or
+    # when the anchor's is zero and the ratio would divide by nothing.
     quality_delta_points: float
     cost_delta_percent: float | None
     latency_p50_delta_percent: float | None
@@ -290,6 +353,10 @@ class LadderRung(BaseModel):
     index: int
     scorecard: Scorecard
     dial_position: float | None = None
+    # Whether the ANCHOR is at least as good on all three objectives and strictly better on one,
+    # at the default p50 latency objective. Such a rung bought nothing and is kept off the
+    # frontier (`pareto`). Stored so a serialized ladder says so without recomputation.
+    dominated_by_anchor: bool = False
 
 
 class OperatingPoint(BaseModel):
@@ -306,7 +373,18 @@ class OperatingPoint(BaseModel):
     dial_position: float | None = None
 
     def as_cost_quality_anchor(self) -> CostQualityAnchor:
-        """This point as a D-DIAL anchor row. Requires a measured dial position and cost delta."""
+        """This point as a D-DIAL anchor row. Requires a measured dial position and cost delta.
+
+        Contract the caller must satisfy, which this method cannot check: `CostQualityAnchor`
+        rows state their deltas against the BEST SINGLE POOL MODEL on the same held-out split
+        (see `wmo.optimize.knn`). A ladder anchor is whatever arm the caller passed, so convert
+        only when that anchor IS the best single pool model. Mixing a differently-anchored row
+        into `COST_QUALITY_ANCHORS` would put two baselines on one frontier.
+
+        Raises:
+            ValueError: when this point has no measured dial position, or when its cost delta is
+                undefined because one side completed no task.
+        """
         if self.dial_position is None:
             raise ValueError(
                 f"operating point '{self.name}' has no dial position, so it cannot become a "
@@ -316,9 +394,10 @@ class OperatingPoint(BaseModel):
             )
         if self.cost_delta_percent is None:
             raise ValueError(
-                f"operating point '{self.name}' has no cost delta (its anchor completed no "
-                f"tasks, so there is no cost to compare against); it cannot become a "
-                f"CostQualityAnchor"
+                f"operating point '{self.name}' has no cost delta: one side of its scorecard "
+                f"completed no task, so there is no cost per completed task to compare and the "
+                f"ratio is undefined. Rerun that side's failed episodes, or drop this rung from "
+                f"the dial rather than publishing a point with no measured saving."
             )
         return CostQualityAnchor(
             cost_quality=self.dial_position,
@@ -342,17 +421,28 @@ class Ladder(BaseModel):
     anchor_condition: ConditionLabel
     scenarios_compared: int  # the common set every rung and the anchor were scored on
     scenarios_excluded: int  # scenarios some side left unscored, held out of the whole ladder
-    rungs: list[LadderRung]
+    rungs: list[LadderRung] = Field(min_length=1)
 
     def pareto(self, *, latency: LatencyObjective = "p50") -> list[LadderRung]:
         """The non-dominated rungs, in ladder order.
 
         Rung A dominates rung B when A is no worse on all three objectives (reward higher, cost
-        per completed task lower, latency lower) and strictly better on at least one. Rungs whose
-        cost per completed task is undefined (nothing completed) cannot be placed on the frontier
-        and are omitted; they remain in `rungs`.
+        per completed task lower, latency lower) and strictly better on at least one. Floats
+        within `DOMINANCE_TOLERANCE` count as equal, so two genuinely tied rungs both stay on
+        the frontier.
+
+        Two kinds of rung never appear. One whose cost per completed task is undefined (nothing
+        completed) cannot be placed on a cost axis at all. One the ANCHOR dominates bought
+        nothing: it is not an operating point a reader should be offered, and including it would
+        let a ladder advertise a frontier the untouched baseline beats. Both remain in `rungs`.
+        An empty result is the honest answer that no rung improved on the anchor.
         """
-        placed = [r for r in self.rungs if r.scorecard.cost.cost_per_completed_task_usd is not None]
+        placed = [
+            rung
+            for rung in self.rungs
+            if rung.scorecard.cost.cost_per_completed_task_usd is not None
+            and not _anchor_dominates(rung.scorecard, latency)
+        ]
         return [
             rung
             for rung in placed
@@ -398,6 +488,12 @@ def rows_for_policy(
     matrix: no episode is rerun, and the routed arm is measured on exactly the rows the pool
     already produced.
 
+    When the policy routes a scenario to a model the matrix never measured there, this emits an
+    UNSCORED placeholder row rather than nothing. Dropping it would shrink the routed arm's
+    scenario set invisibly, which is the same silent-narrowing bug `build_ladder`'s common set
+    exists to prevent, and it would make the arm disagree with `evaluate_policy`, which counts
+    that case as `unscored_scenarios`.
+
     Args:
         matrix: the precomputed pool x scenario grid.
         policy: the routing policy this rung represents.
@@ -411,12 +507,27 @@ def rows_for_policy(
     """
     wanted = list(ids) if ids is not None else matrix.scenario_ids()
     decisions = route_scenarios(policy, matrix, wanted, embedder=embedder)
-    return [
-        row
-        for scenario_id, decision in decisions.items()
-        for row in matrix.for_scenario(scenario_id)
-        if row.model == decision.model
-    ]
+
+    rows: list[ScenarioOutcome] = []
+    for scenario_id, decision in decisions.items():
+        scenario_rows = matrix.for_scenario(scenario_id)
+        chosen = [row for row in scenario_rows if row.model == decision.model]
+        if chosen:
+            rows.extend(chosen)
+            continue
+        rows.append(
+            ScenarioOutcome(
+                scenario_id=scenario_id,
+                task=scenario_rows[0].task if scenario_rows else "",
+                model=decision.model,
+                reward=None,
+                error=(
+                    f"policy routed to '{decision.model}', which the matrix never measured on "
+                    f"this scenario; the choice is unmeasured, not failed"
+                ),
+            )
+        )
+    return rows
 
 
 def effective_cost_per_completed_task(
@@ -440,7 +551,13 @@ def effective_cost_per_completed_task(
 
     Returns:
         An `EffectiveCost` whose `cost_per_completed_task_usd` is None when nothing completed.
+
+    Raises:
+        ValueError: when an overhead names an episode absent from `rows`. Ignoring it would
+            understate effective cost, so this matches the identical guard on `Arm`.
     """
+    _require_overheads_match(rows, overheads, owner="these rows")
+
     by_row: dict[tuple[str, str, int], list[RowOverhead]] = {}
     for overhead in overheads:
         by_row.setdefault(_overhead_key(overhead), []).append(overhead)
@@ -463,6 +580,7 @@ def effective_cost_per_completed_task(
     n_completed = sum(1 for row in scored if completion.completed(row))
     total = provider_cost + overhead_cost
     per_task = total / n_completed if n_completed else None
+    unpriced = bool(scored) and provider_cost == 0.0 and zero_cost == len(scored)
 
     return EffectiveCost(
         n_scored=len(scored),
@@ -475,6 +593,7 @@ def effective_cost_per_completed_task(
         cost_per_completed_task_usd=per_task,
         overhead_components=components,
         zero_cost_rows=zero_cost,
+        cost_is_unpriced=unpriced,
         cost_assumptions=_assumptions(
             components=components,
             completion=completion,
@@ -482,6 +601,7 @@ def effective_cost_per_completed_task(
             excluded_cost=excluded_cost,
             n_completed=n_completed,
             zero_cost=zero_cost,
+            unpriced=unpriced,
         ),
     )
 
@@ -498,7 +618,8 @@ def build_scorecard(
     Both sides are aggregated over the intersection of scenarios scored on BOTH sides, for the
     reason report.py states: unscored episodes are not random, so per-side means over different
     subsets let an arm that times out on the hard scenarios out-score an anchor that answered
-    everything.
+    everything. Spend on the scenarios that drop out is reported in `withheld_cost_usd` rather
+    than vanishing.
 
     Args:
         arm: the condition under test.
@@ -550,6 +671,8 @@ def build_scorecard(
     anchor_quality = _quality(anchor_kept, completion)
     latency = _latency(arm_kept, arm_overhead)
     anchor_latency = _latency(anchor_kept, anchor_overhead)
+    withheld = _withheld_cost(arm, kept)
+    anchor_withheld = _withheld_cost(anchor, kept)
 
     return Scorecard(
         arm=arm.name,
@@ -566,12 +689,22 @@ def build_scorecard(
         anchor_cost=anchor_cost,
         latency=latency,
         anchor_latency=anchor_latency,
+        withheld_cost_usd=withheld,
+        anchor_withheld_cost_usd=anchor_withheld,
         quality_delta_points=(quality.mean_reward - anchor_quality.mean_reward) * 100.0,
         cost_delta_percent=_percent_delta(
             cost.cost_per_completed_task_usd, anchor_cost.cost_per_completed_task_usd
         ),
-        latency_p50_delta_percent=_percent_delta(latency.p50_s, anchor_latency.p50_s),
-        cost_assumptions=cost.cost_assumptions,
+        latency_p50_delta_percent=_percent_delta(latency.p50_model_s, anchor_latency.p50_model_s),
+        cost_assumptions=_card_assumptions(
+            arm=arm.name,
+            anchor=anchor.name,
+            cost=cost,
+            anchor_cost=anchor_cost,
+            scenarios_excluded=len(all_ids) - len(compared),
+            withheld=withheld,
+            anchor_withheld=anchor_withheld,
+        ),
     )
 
 
@@ -593,17 +726,24 @@ def build_ladder(
     scenarios that drop out are counted on the ladder, not discarded quietly.
 
     Raises:
-        ValueError: when `arms` is empty, when two arms share a name, when two arms (or an arm
-            and the anchor) share a condition label, or when no scenario was scored by the anchor
-            and every rung. A collision means two rungs are the same experiment under different
-            display names, which is how ablation results get silently overwritten.
+        ValueError: when `arms` is empty, when two arms share a name or a condition label, when
+            an arm collides with the anchor on either, or when no scenario was scored by the
+            anchor and every rung. A label collision means two rungs are the same experiment
+            under different display names, which is how ablation results get silently
+            overwritten.
     """
     if not arms:
         raise ValueError(f"ladder '{name}' needs at least one arm besides the anchor")
 
-    seen_names = {anchor.name: "anchor"}
+    seen_names: dict[str, str] = {}
     seen_keys = {anchor.condition.key(): anchor.name}
     for arm in arms:
+        if arm.name == anchor.name:
+            raise ValueError(
+                f"ladder '{name}': rung '{arm.name}' has the same name as the anchor; every "
+                f"scorecard names the anchor it was measured against, so the rung and the "
+                f"anchor need distinct names"
+            )
         if arm.name in seen_names:
             raise ValueError(
                 f"ladder '{name}': two rungs are both named '{arm.name}'; rung names are the "
@@ -629,9 +769,7 @@ def build_ladder(
     for arm in arms:
         _require_comparable(arm, anchor)
         arm_rows = _by_scenario(arm.rows)
-        for sid in arm_rows:
-            if sid not in common and sid not in universe:
-                universe.append(sid)
+        universe.extend(sid for sid in arm_rows if sid not in universe)
         common &= set(_pairwise_scored(arm_rows, anchor_rows, universe))
     if not common:
         raise ValueError(
@@ -642,31 +780,54 @@ def build_ladder(
         )
     ordered = [sid for sid in universe if sid in common]
 
+    rungs: list[LadderRung] = []
+    for index, arm in enumerate(arms):
+        card = build_scorecard(arm=arm, anchor=anchor, completion=completion, restrict_to=ordered)
+        rungs.append(
+            LadderRung(
+                index=index,
+                scorecard=card,
+                dial_position=arm.dial_position,
+                dominated_by_anchor=_anchor_dominates(card, "p50"),
+            )
+        )
     return Ladder(
         name=name,
         anchor=anchor.name,
         anchor_condition=anchor.condition,
         scenarios_compared=len(ordered),
         scenarios_excluded=len(universe) - len(ordered),
-        rungs=[
-            LadderRung(
-                index=index,
-                scorecard=build_scorecard(
-                    arm=arm, anchor=anchor, completion=completion, restrict_to=ordered
-                ),
-                dial_position=arm.dial_position,
-            )
-            for index, arm in enumerate(arms)
-        ],
+        rungs=rungs,
     )
 
 
 def _row_key(row: ScenarioOutcome) -> tuple[str, str, int]:
+    """The episode identity overhead is charged against."""
     return (row.scenario_id, row.model, row.episode)
 
 
 def _overhead_key(overhead: RowOverhead) -> tuple[str, str, int]:
+    """The episode an overhead claims to belong to; matched against `_row_key`."""
     return (overhead.scenario_id, overhead.model, overhead.episode)
+
+
+def _require_overheads_match(
+    rows: Sequence[ScenarioOutcome], overheads: Sequence[RowOverhead], *, owner: str
+) -> None:
+    """Reject overhead that names an episode absent from `rows`.
+
+    Silently ignoring an unmatched key would understate effective cost, which is exactly the
+    direction of error this module exists to prevent, so both entry points (the `Arm` validator
+    and `effective_cost_per_completed_task`) run this same check.
+    """
+    keys = {_row_key(row) for row in rows}
+    orphans = sorted({str(_overhead_key(o)) for o in overheads if _overhead_key(o) not in keys})
+    if orphans:
+        raise ValueError(
+            f"{owner}: overhead rows name episodes not present here: {orphans[:5]}; keys are "
+            f"(scenario_id, model, episode) and must match the rows they are charged to, so "
+            f"attach the overhead to the episodes it was actually spent on"
+        )
 
 
 def _pairwise_scored(
@@ -684,27 +845,64 @@ def _pairwise_scored(
 
 
 def _by_scenario(rows: Sequence[ScenarioOutcome]) -> dict[str, list[ScenarioOutcome]]:
+    """Group rows by scenario id, preserving first-seen scenario order."""
     grouped: dict[str, list[ScenarioOutcome]] = {}
     for row in rows:
         grouped.setdefault(row.scenario_id, []).append(row)
     return grouped
 
 
+def _withheld_cost(arm: Arm, kept: set[str]) -> float:
+    """What `arm` spent on scenarios held out of the comparison, overhead included."""
+    overhead_by_row: dict[tuple[str, str, int], float] = {}
+    for overhead in arm.overheads:
+        key = _overhead_key(overhead)
+        overhead_by_row[key] = overhead_by_row.get(key, 0.0) + overhead.cost_usd
+    return sum(
+        row.cost_usd + overhead_by_row.get(_row_key(row), 0.0)
+        for row in arm.rows
+        if row.scenario_id not in kept
+    )
+
+
 def _quality(rows: Sequence[ScenarioOutcome], completion: CompletionRule) -> QualityBlock:
+    """Mean reward and success rate, averaged within each scenario then across scenarios.
+
+    Per-scenario first (see the module docstring): an arm that ran three episodes on an easy
+    scenario and one on a hard one would otherwise weight the easy scenario three times against
+    an anchor that ran one of each.
+    """
     scored = [row for row in rows if row.reward is not None]
-    rewards = [row.reward for row in scored if row.reward is not None]
+    by_scenario = _by_scenario(scored)
+    scenario_rewards: list[float] = []
+    scenario_success: list[float] = []
+    for scenario_rows in by_scenario.values():
+        rewards = [row.reward for row in scenario_rows if row.reward is not None]
+        scenario_rewards.append(sum(rewards) / len(rewards))
+        scenario_success.append(
+            sum(1.0 for row in scenario_rows if completion.completed(row)) / len(scenario_rows)
+        )
+    # 0.0 on empty is unreachable through `build_scorecard`, which raises before it can pass an
+    # unscored-only side; kept total rather than raising in a helper no caller can trip.
     return QualityBlock(
-        mean_reward=sum(rewards) / len(rewards) if rewards else 0.0,
-        task_success_rate=(
-            sum(1 for row in scored if completion.completed(row)) / len(scored) if scored else 0.0
-        ),
+        mean_reward=sum(scenario_rewards) / len(scenario_rewards) if scenario_rewards else 0.0,
+        task_success_rate=sum(scenario_success) / len(scenario_success)
+        if scenario_success
+        else 0.0,
+        n_scenarios=len(by_scenario),
         n_scored=len(scored),
         n_excluded=sum(1 for row in rows if row.reward is None),
     )
 
 
 def _latency(rows: Sequence[ScenarioOutcome], overheads: Sequence[RowOverhead]) -> LatencyBlock:
-    """Per-task seconds over scored rows: the episode's own calls plus its optimizer overhead."""
+    """Per-task model seconds over scored rows: the episode's calls plus its optimizer overhead.
+
+    p95 uses the INCLUSIVE quantile method, which is bounded by the observed data. The default
+    exclusive method extrapolates past the sample at the small n an ablation runs on: three
+    tasks at 1s, 1s and 9s report a p95 of 15.4s, a tail longer than anything measured, and p95
+    is a supported Pareto dominance coordinate.
+    """
     by_row: dict[tuple[str, str, int], float] = {}
     for overhead in overheads:
         key = _overhead_key(overhead)
@@ -714,10 +912,10 @@ def _latency(rows: Sequence[ScenarioOutcome], overheads: Sequence[RowOverhead]) 
         for row in rows
         if row.reward is not None
     ]
-    if not per_task:
-        return LatencyBlock(p50_s=0.0, p95_s=0.0, n_tasks=0)
-    p95 = quantiles(per_task, n=20)[-1] if len(per_task) > 1 else per_task[0]
-    return LatencyBlock(p50_s=median(per_task), p95_s=p95, n_tasks=len(per_task))
+    if not per_task:  # unreachable via `build_scorecard`, as in `_quality`
+        return LatencyBlock(p50_model_s=0.0, p95_model_s=0.0, n_tasks=0)
+    p95 = quantiles(per_task, n=20, method="inclusive")[-1] if len(per_task) > 1 else per_task[0]
+    return LatencyBlock(p50_model_s=median(per_task), p95_model_s=p95, n_tasks=len(per_task))
 
 
 def _percent_delta(value: float | None, anchor: float | None) -> float | None:
@@ -727,20 +925,55 @@ def _percent_delta(value: float | None, anchor: float | None) -> float | None:
     return (value - anchor) / anchor * 100.0
 
 
+def _no_worse(x: float, y: float) -> bool:
+    """Whether `x` is at least as good as `y` on a lower-is-better axis, ties included."""
+    return x <= y or isclose(x, y, rel_tol=DOMINANCE_TOLERANCE)
+
+
+def _strictly_better(x: float, y: float) -> bool:
+    """Whether `x` beats `y` on a lower-is-better axis by more than float noise."""
+    return x < y and not isclose(x, y, rel_tol=DOMINANCE_TOLERANCE)
+
+
+def _objectives(card: Scorecard, latency: LatencyObjective) -> tuple[float, float, float]:
+    """The arm's three objectives, all as lower-is-better numbers."""
+    cost = card.cost.cost_per_completed_task_usd
+    if cost is None:  # guarded by every caller; keeps the tuple total
+        raise ValueError(f"scorecard '{card.arm}' has no cost per completed task to compare")
+    lat = card.latency.p50_model_s if latency == "p50" else card.latency.p95_model_s
+    return (-card.quality.mean_reward, cost, lat)
+
+
+def _anchor_objectives(card: Scorecard, latency: LatencyObjective) -> tuple[float, float, float]:
+    """The same three objectives for the card's anchor side."""
+    cost = card.anchor_cost.cost_per_completed_task_usd
+    if cost is None:
+        raise ValueError(f"scorecard '{card.arm}' has no anchor cost per completed task")
+    lat = card.anchor_latency.p50_model_s if latency == "p50" else card.anchor_latency.p95_model_s
+    return (-card.anchor_quality.mean_reward, cost, lat)
+
+
+def _pareto_dominates(
+    better: tuple[float, float, float], worse: tuple[float, float, float]
+) -> bool:
+    """Whether `better` is no worse on all three axes and strictly better on at least one."""
+    pairs = tuple(zip(better, worse, strict=True))
+    return all(_no_worse(x, y) for x, y in pairs) and any(_strictly_better(x, y) for x, y in pairs)
+
+
 def _dominates(a: LadderRung, b: LadderRung, latency: LatencyObjective) -> bool:
     """Whether rung `a` is no worse than `b` on all three objectives and better on one."""
-    a_cost = a.scorecard.cost.cost_per_completed_task_usd
-    b_cost = b.scorecard.cost.cost_per_completed_task_usd
-    if a_cost is None or b_cost is None:  # unreachable: `pareto` filters these out first
+    return _pareto_dominates(_objectives(a.scorecard, latency), _objectives(b.scorecard, latency))
+
+
+def _anchor_dominates(card: Scorecard, latency: LatencyObjective) -> bool:
+    """Whether the anchor beats this arm outright, making the rung a non-operating-point."""
+    if (
+        card.cost.cost_per_completed_task_usd is None
+        or card.anchor_cost.cost_per_completed_task_usd is None
+    ):
         return False
-    a_lat = a.scorecard.latency.p50_s if latency == "p50" else a.scorecard.latency.p95_s
-    b_lat = b.scorecard.latency.p50_s if latency == "p50" else b.scorecard.latency.p95_s
-    pairs = (
-        (b.scorecard.quality.mean_reward, a.scorecard.quality.mean_reward),  # higher is better
-        (a_cost, b_cost),  # lower is better
-        (a_lat, b_lat),
-    )
-    return all(x <= y for x, y in pairs) and any(x < y for x, y in pairs)
+    return _pareto_dominates(_anchor_objectives(card, latency), _objectives(card, latency))
 
 
 def _require_comparable(arm: Arm, anchor: Arm) -> None:
@@ -780,6 +1013,13 @@ def _require_comparable(arm: Arm, anchor: Arm) -> None:
         )
 
 
+def _usd(amount: float) -> str:
+    """Format dollars so a nonzero figure never renders as $0.0000 in an honesty string."""
+    if 0.0 < amount < 0.0001:
+        return "less than $0.0001"
+    return f"${amount:.4f}"
+
+
 def _assumptions(
     *,
     components: Sequence[str],
@@ -788,6 +1028,7 @@ def _assumptions(
     excluded_cost: float,
     n_completed: int,
     zero_cost: int,
+    unpriced: bool,
 ) -> str:
     """Compose the basis sentence from what the rows actually contained."""
     parts = [EFFECTIVE_COST_RULE]
@@ -807,17 +1048,53 @@ def _assumptions(
         )
     if n_excluded:
         parts.append(
-            f"{n_excluded} unscored episode(s) were excluded, along with ${excluded_cost:.4f} of "
-            f"spend that no completed task is charged for."
+            f"{n_excluded} unscored episode(s) were excluded, along with {_usd(excluded_cost)} "
+            f"of spend that no completed task is charged for."
         )
     if not n_completed:
         parts.append(
             "No task completed, so there is no cost per completed task to quote and the figure "
             "is reported as undefined rather than as zero."
         )
-    if zero_cost:
+    if unpriced:
+        parts.append(
+            "Every scored episode recorded tokens but $0, so the cost per completed task is $0 "
+            "and any saving against it would read as -100%. Treat the cost figures as absent, "
+            "not as free, unless this arm really did run on hardware you do not pay per token "
+            "for."
+        )
+    elif zero_cost:
         parts.append(
             f"{zero_cost} scored episode(s) recorded tokens but $0, which is expected for a "
             f"self-hosted model and otherwise means a pool entry carried no price."
+        )
+    return " ".join(parts)
+
+
+def _card_assumptions(
+    *,
+    arm: str,
+    anchor: str,
+    cost: EffectiveCost,
+    anchor_cost: EffectiveCost,
+    scenarios_excluded: int,
+    withheld: float,
+    anchor_withheld: float,
+) -> str:
+    """Both sides' bases plus what the comparison itself held out.
+
+    A card states a DELTA over two sides, so quoting only the arm's basis would hide an anchor
+    that went unscored on half its episodes.
+    """
+    parts = [
+        f"Arm '{arm}': {cost.cost_assumptions}",
+        f"Anchor '{anchor}': {anchor_cost.cost_assumptions}",
+    ]
+    if scenarios_excluded:
+        parts.append(
+            f"{scenarios_excluded} scenario(s) were held out of this comparison because one "
+            f"side left them unscored, taking {_usd(withheld)} of arm spend and "
+            f"{_usd(anchor_withheld)} of anchor spend with them; that money bought no "
+            f"comparable measurement."
         )
     return " ".join(parts)

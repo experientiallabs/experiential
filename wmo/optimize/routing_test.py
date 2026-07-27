@@ -6,7 +6,12 @@ import pytest
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
-from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
+from wmo.optimize.routing import (
+    evaluate_policy,
+    fit_rank_policy,
+    rerank_policy,
+    route_scenarios,
+)
 from wmo.providers.base import ProviderKind
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval.embedders import HashingEmbedder
@@ -294,3 +299,33 @@ def test_baseline_guard_keeps_real_winners() -> None:
     # The prose-majority cluster has strong prose evidence (support >= 2, mean 1.0 vs 0.0):
     # prose-model must survive the guard there.
     assert any(c.ranking[0] == "prose-model" for c in policy.clusters)
+
+
+def test_evaluate_policy_scores_the_decisions_route_scenarios_returns() -> None:
+    """The two consumers of the shared replay must agree on who was routed where.
+
+    `evaluate_policy` and `wmo.optimize.scorecard.rows_for_policy` both build on
+    `route_scenarios`. A rebase that reinstated an inline selection block inside
+    `evaluate_policy` would silently give the two different mixes; this turns that into a red
+    test rather than a discrepancy nobody notices.
+    """
+    matrix = _matrix()
+    policy = _fit()
+    ids = matrix.scenario_ids()
+
+    decisions = route_scenarios(policy, matrix, ids)
+    result = evaluate_policy(policy, matrix, ids)
+
+    expected: dict[str, float] = {}
+    for decision in decisions.values():
+        expected[decision.model] = expected.get(decision.model, 0.0) + 1 / len(decisions)
+    assert result.model_mix == pytest.approx(expected)
+    assert result.scenarios == len(decisions)
+
+
+def test_route_scenarios_rejects_repeated_ids() -> None:
+    matrix = _matrix()
+    policy = RoutingPolicy(kind="static", default_model="sql-model", pool=_entries())
+    ids = matrix.scenario_ids()
+    with pytest.raises(ValueError, match="scenario ids repeat"):
+        route_scenarios(policy, matrix, [*ids, ids[0]])
