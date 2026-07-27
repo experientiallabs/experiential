@@ -13,9 +13,11 @@ from wmo.optimize.compression import (
     Compressor,
     IdentityCompressor,
     TruncateCompressor,
+    compress_segments,
     estimate_tokens,
     get_compressor,
     register_compressor,
+    register_compressor_factory,
     same_compression,
     servable_compressor,
 )
@@ -237,3 +239,190 @@ def test_a_version_bumped_implementation_refuses_the_old_stamp() -> None:
     )
     with pytest.raises(ValueError, match="version 2 in this build.*fitted against version 1"):
         servable_compressor(CompressionConfig(compressor_id=_V2.id, compressor_version="1"))
+
+
+class _CappedCompressor:
+    """A compressor whose server refuses batches over its cap, like the real endpoint's 413."""
+
+    id = "capped-for-tests"
+    version = "1"
+    append_stable = True
+    max_segments_per_call = 3
+
+    def __init__(self) -> None:
+        self.batches: list[int] = []
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        if len(segments) > self.max_segments_per_call:
+            raise RuntimeError(
+                f"413: {len(segments)} segments over cap {self.max_segments_per_call}"
+            )
+        self.batches.append(len(segments))
+        out = [segment.split(" ")[0] for segment in segments]
+        return CompressionResult(
+            segments=out,
+            tokens_in_raw=sum(estimate_tokens(s) for s in segments),
+            tokens_in_compressed=sum(estimate_tokens(s) for s in out),
+            latency_s=0.5,
+            cost_usd=0.001,
+        )
+
+
+def test_a_capped_compressor_is_chunked_instead_of_overflowed() -> None:
+    # The fit path hands over every scenario in the matrix at once, which is far past any served
+    # compressor's per-call cap. Chunking is what makes those two facts compatible.
+    capped = _CappedCompressor()
+    segments = [f"segment {index} tail" for index in range(7)]
+    result = compress_segments(capped, segments, CompressionConfig(compressor_id=capped.id))
+    assert capped.batches == [3, 3, 1]  # chunked to the cap, nothing dropped
+    assert result.segments == ["segment" for _ in range(7)]
+    assert len(result.segments) == len(segments)
+    # Per-chunk accounting is summed, not taken from the last chunk.
+    assert result.latency_s == pytest.approx(1.5)
+    assert result.cost_usd == pytest.approx(0.003)
+
+
+def test_chunking_does_not_change_the_bytes() -> None:
+    # Safe only because the protocol requires per-segment determinism; this pins that the seam
+    # relies on nothing else. Same segments, two different chunk sizes, identical output.
+    segments = [f"one two three {index}" for index in range(10)]
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    whole = compress_segments(get_compressor("truncate"), segments, config)
+
+    class _Capped2(TruncateCompressor):
+        max_segments_per_call = 2
+
+    chunked = compress_segments(cast("Compressor", _Capped2()), segments, config)
+    assert chunked.segments == whole.segments
+
+
+def test_an_uncapped_compressor_still_gets_one_call() -> None:
+    calls: list[int] = []
+
+    class _Counting(TruncateCompressor):
+        def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+            calls.append(len(segments))
+            return super().compress(segments, config)
+
+    compress_segments(
+        cast("Compressor", _Counting()),
+        ["a b", "c d", "e f"],
+        CompressionConfig(compressor_id="truncate"),
+    )
+    assert calls == [3]
+
+
+def test_a_malformed_cap_is_refused_at_registration() -> None:
+    class _BadCap:
+        id = "bad-cap-for-tests"
+        version = "1"
+        append_stable = True
+        max_segments_per_call = 0
+
+        def compress(
+            self, segments: list[str], config: CompressionConfig
+        ) -> CompressionResult:  # pragma: no cover - never reached
+            raise NotImplementedError
+
+    with pytest.raises(ValueError, match="max_segments_per_call"):
+        register_compressor(cast("Compressor", _BadCap()))
+
+
+class _WrongLength:
+    """Returns the wrong number of segments, the contract violation nothing used to catch."""
+
+    id = "wrong-length-for-tests"
+    version = "1"
+    append_stable = True
+
+    def __init__(self, delta: int) -> None:
+        self.delta = delta
+
+    def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+        del config
+        out = list(segments)
+        if self.delta < 0:
+            out = out[:-1]
+        else:
+            out = [*out, "extra"]
+        return CompressionResult(
+            segments=out, tokens_in_raw=1, tokens_in_compressed=1, latency_s=0.0
+        )
+
+
+def test_a_short_return_is_a_named_error_not_a_stopiteration() -> None:
+    # It used to surface as StopIteration from the caller's zip, i.e. an anonymous 502 that
+    # blamed nothing in particular.
+    with pytest.raises(ValueError, match="wrong-length-for-tests.*returned 1 segments for 2"):
+        compress_segments(
+            cast("Compressor", _WrongLength(-1)),
+            ["a", "b"],
+            CompressionConfig(compressor_id="x"),
+        )
+
+
+def test_a_long_return_is_refused_instead_of_silently_truncated() -> None:
+    # The worse direction: the extra segment used to be discarded and the request served, so a
+    # compressor that split a segment corrupted the transcript with nobody the wiser.
+    with pytest.raises(ValueError, match="returned 3 segments for 2"):
+        compress_segments(
+            cast("Compressor", _WrongLength(1)),
+            ["a", "b"],
+            CompressionConfig(compressor_id="x"),
+        )
+
+
+def test_a_factory_compressor_is_built_on_first_resolution_not_at_import() -> None:
+    # The endpoint client has to reach its server to verify the selection rule before it can
+    # attest append_stable, and doing that at import would put a network call in `import wmo`.
+    built: list[int] = []
+
+    class _Lazy(TruncateCompressor):
+        id = "lazy-for-tests"
+
+    def factory() -> Compressor:
+        built.append(1)
+        return cast("Compressor", _Lazy())
+
+    register_compressor_factory("lazy-for-tests", factory)
+    assert built == []  # registering builds nothing
+
+    first = get_compressor("lazy-for-tests")
+    assert built == [1]
+    assert get_compressor("lazy-for-tests") is first  # built once, then cached
+    assert built == [1]
+
+
+def test_a_failing_factory_names_the_compressor_and_can_be_retried() -> None:
+    attempts: list[int] = []
+
+    class _Flaky(TruncateCompressor):
+        id = "flaky-for-tests"
+
+    def factory() -> Compressor:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("endpoint unreachable")
+        return cast("Compressor", _Flaky())
+
+    register_compressor_factory("flaky-for-tests", factory)
+    with pytest.raises(ValueError, match="'flaky-for-tests' could not be constructed"):
+        get_compressor("flaky-for-tests")
+    # Still registered, so a transient failure is retried rather than poisoning the id.
+    assert get_compressor("flaky-for-tests") is not None
+
+
+def test_a_factory_cannot_shadow_a_registered_compressor() -> None:
+    with pytest.raises(ValueError, match="already registered"):
+        register_compressor_factory("truncate", lambda: cast("Compressor", TruncateCompressor()))
+
+
+def test_a_factory_that_builds_the_wrong_compressor_is_caught() -> None:
+    # Otherwise it lands in the registry under ITS id while this lookup hands it back for a
+    # different one, so a policy naming the registered id gets an implementation that does not
+    # answer to it.
+    register_compressor_factory(
+        "mislabelled-for-tests", lambda: cast("Compressor", TruncateCompressor())
+    )
+    with pytest.raises(ValueError, match="built one with id 'truncate'"):
+        get_compressor("mislabelled-for-tests")

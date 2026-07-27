@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
@@ -106,10 +107,19 @@ class Compressor(Protocol):
     no-op, and the dial is monotone; see `CompressionConfig`), and it attests `append_stable`
     truthfully.
 
-    One `compress` call takes ALL of a request's mutable segments at once, so an implementation
-    backed by a network endpoint pays one round trip per request rather than one per message,
-    and can batch internally. Per-segment determinism still holds: a segment's output may not
-    depend on which other segments accompanied it.
+    Callers hand over as many segments per call as the implementation's cap allows, chunked
+    deterministically (`compress_segments`), so a network-backed implementation pays as few
+    round trips as it can rather than one per message. Per-segment determinism still holds and
+    is what makes chunking safe: a segment's output may not depend on which other segments
+    accompanied it, so where the chunk boundaries fall cannot change the bytes.
+
+    `max_segments_per_call` is the OPTIONAL cap (absent or None = unlimited): the most segments
+    one call may carry, which for a served implementation is whatever its server enforces.
+    Declaring it is how a compressor gets chunked instead of 413'd.
+
+    A `compress` call must return EXACTLY as many segments as it was given, in order. A
+    compressor rewrites segments; it never merges, splits, drops, or reorders them, because the
+    caller owns the conversation structure and maps the result back onto it positionally.
 
     `append_stable` is the implementation's ATTESTATION that appending a segment never rewrites
     the bytes of the segments already emitted (C1's audit calls this append-only; the selection
@@ -128,6 +138,10 @@ class Compressor(Protocol):
     def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
         """Compress the mutable segments; never sees the cached prefix by construction."""
         ...
+
+
+type CompressorFactory = Callable[[], Compressor]
+"""Builds a compressor on first use (see `register_compressor_factory`)."""
 
 
 class IdentityCompressor:
@@ -191,6 +205,10 @@ _COMPRESSORS: dict[str, Compressor] = {
     TruncateCompressor.id: TruncateCompressor(),
 }
 
+# Compressors that are too expensive to build at import (see `register_compressor_factory`).
+# Constructed on first resolution, then they live in `_COMPRESSORS` like any other.
+_COMPRESSOR_FACTORIES: dict[str, CompressorFactory] = {}
+
 
 def register_compressor(compressor: Compressor) -> None:
     """Register a compressor implementation under its `id` (research-track entry point).
@@ -211,6 +229,7 @@ def register_compressor(compressor: Compressor) -> None:
             "Compressor protocol). Measure it with the append-stability audit, then set the "
             "attribute."
         )
+    segment_batch_limit(compressor)  # a malformed cap fails here, not on the first big batch
     existing = _COMPRESSORS.get(compressor.id)
     if existing is not None and existing is not compressor:
         raise ValueError(
@@ -219,6 +238,73 @@ def register_compressor(compressor: Compressor) -> None:
             "silently rebound"
         )
     _COMPRESSORS[compressor.id] = compressor
+
+
+def segment_batch_limit(compressor: Compressor) -> int | None:
+    """The most segments `compressor` accepts in one call, or None for unlimited.
+
+    Optional by design: a local compressor has no reason to declare a cap, and every
+    implementation written before the attribute existed keeps working as unlimited. A served
+    one declares whatever its server enforces, which is how it gets chunked instead of refused.
+    """
+    limit = getattr(compressor, "max_segments_per_call", None)
+    if limit is None:
+        return None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError(
+            f"compressor '{compressor.id}' declares max_segments_per_call={limit!r}; it must be "
+            "a positive integer, or None for no limit"
+        )
+    return limit
+
+
+def compress_segments(
+    compressor: Compressor, segments: list[str], config: CompressionConfig
+) -> CompressionResult:
+    """Run `segments` through `compressor` in as few calls as its cap allows, and check the shape.
+
+    CHUNKING. A served compressor caps how many segments one request may carry (the endpoint
+    rejects oversized batches outright), and both callers can exceed any such cap easily: a bank
+    fit compresses every scenario in the matrix. Chunking is safe precisely because the protocol
+    requires per-segment determinism: a segment's output cannot depend on which other segments
+    travelled with it, so where the boundaries fall cannot change the bytes. For the compressors
+    this matters for, that property is measured rather than assumed (fixed-threshold selection
+    is per token, and fp32 output was verified batch-invariant at batch 1/4/16, which is why
+    serving pins fp32).
+
+    SHAPE. The protocol says a call returns exactly as many segments as it was given, in order,
+    and nothing enforced it: one short and the caller's zip ran out mid-transcript, surfacing as
+    an anonymous 502; one long and the extra was silently discarded, which serves a transcript
+    nobody checked. Both are now a named error against the compressor that did it.
+    """
+    limit = segment_batch_limit(compressor)
+    size = len(segments) if limit is None else limit
+    out: list[str] = []
+    tokens_in_raw = 0
+    tokens_in_compressed = 0
+    latency_s = 0.0
+    cost_usd = 0.0
+    for start in range(0, len(segments), max(size, 1)):
+        chunk = segments[start : start + max(size, 1)]
+        result = compressor.compress(chunk, config)
+        if len(result.segments) != len(chunk):
+            raise ValueError(
+                f"compressor '{compressor.id}' returned {len(result.segments)} segments for "
+                f"{len(chunk)}; a compressor rewrites segments in place and must return exactly "
+                "as many as it was given, in order (the caller maps them back positionally)"
+            )
+        out.extend(result.segments)
+        tokens_in_raw += result.tokens_in_raw
+        tokens_in_compressed += result.tokens_in_compressed
+        latency_s += result.latency_s
+        cost_usd += result.cost_usd
+    return CompressionResult(
+        segments=out,
+        tokens_in_raw=tokens_in_raw,
+        tokens_in_compressed=tokens_in_compressed,
+        latency_s=latency_s,
+        cost_usd=cost_usd,
+    )
 
 
 class CompressingEmbedder:
@@ -233,9 +319,10 @@ class CompressingEmbedder:
     Serving does NOT wrap its embedder: the compression stage has already rewritten the request
     by the time the router embeds it, so wrapping there would compress twice.
 
-    One `compress` call per `embed` batch, not one per text: fitting a bank means compressing
-    every fit scenario, which would otherwise be a round trip each against an endpoint-backed
-    compressor.
+    As few compressor calls per `embed` batch as the compressor's cap allows, not one per text:
+    fitting a bank means compressing every fit scenario, which would otherwise be a round trip
+    each against an endpoint-backed compressor. A matrix routinely has more scenarios than a
+    served compressor accepts per call, so this goes through `compress_segments` to be chunked.
     """
 
     def __init__(self, inner: Embedder, config: CompressionConfig) -> None:
@@ -244,7 +331,8 @@ class CompressingEmbedder:
         self._compressor = get_compressor(config.compressor_id)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
-        return self._inner.embed(self._compressor.compress(list(texts), self._config).segments)
+        compressed = compress_segments(self._compressor, list(texts), self._config)
+        return self._inner.embed(compressed.segments)
 
 
 def compression_signature(config: CompressionConfig | None) -> str:
@@ -307,14 +395,58 @@ def servable_compressor(config: CompressionConfig | None) -> Compressor | None:
     return compressor
 
 
+def register_compressor_factory(compressor_id: str, factory: CompressorFactory) -> None:
+    """Register a compressor to be CONSTRUCTED on first use, not at import.
+
+    The entry point for a compressor that cannot be built for free. A served one has to reach
+    its server to know what it is (the endpoint client verifies the server's selection rule
+    before it will attest `append_stable`, since attesting on faith is how a churny compressor
+    gets served), and doing that at import time would put a network call, a credential lookup,
+    and a failure mode into every `import wmo`. Importing stays side-effect-free; the cost and
+    the risk move to the first policy that actually names the compressor.
+
+    `factory` runs at most once, on first resolution, and its result is registered normally
+    (attestation checked, id rebinding refused). A factory that raises propagates with the id
+    named, and stays registered, so a transient failure can be retried by resolving again.
+    """
+    if compressor_id in _COMPRESSORS:
+        raise ValueError(
+            f"compressor id '{compressor_id}' is already registered by "
+            f"{type(_COMPRESSORS[compressor_id]).__name__}; ids are stable policy references "
+            "and cannot be silently rebound"
+        )
+    _COMPRESSOR_FACTORIES[compressor_id] = factory
+
+
 def get_compressor(compressor_id: str) -> Compressor:
     """Resolve a compressor by id, or raise naming the known ids (fail at mount, not mid-call)."""
     compressor = _COMPRESSORS.get(compressor_id)
-    if compressor is None:
-        known = ", ".join(sorted(_COMPRESSORS))
-        raise ValueError(
-            f"unknown compressor '{compressor_id}'; known compressors: {known}. "
-            "Register new compressors with wmo.optimize.compression.register_compressor "
-            "before referencing them in a policy's compression config."
-        )
-    return compressor
+    if compressor is not None:
+        return compressor
+    factory = _COMPRESSOR_FACTORIES.get(compressor_id)
+    if factory is not None:
+        try:
+            built = factory()
+        except Exception as exc:
+            # Name the compressor: the bare failure from a factory that reached out to a server
+            # and could not verify it says nothing about which policy field caused it.
+            raise ValueError(
+                f"compressor '{compressor_id}' could not be constructed: {exc}"
+            ) from exc
+        if built.id != compressor_id:
+            # Otherwise the factory's compressor lands in the registry under ITS id while this
+            # lookup hands it back for a different one, so a policy naming the registered id
+            # gets an implementation that does not answer to it.
+            raise ValueError(
+                f"the factory registered for compressor '{compressor_id}' built one with id "
+                f"'{built.id}'; a factory must build the compressor it was registered under"
+            )
+        register_compressor(built)
+        return built
+    known = ", ".join(sorted({*_COMPRESSORS, *_COMPRESSOR_FACTORIES}))
+    raise ValueError(
+        f"unknown compressor '{compressor_id}'; known compressors: {known}. "
+        "Register new compressors with wmo.optimize.compression.register_compressor "
+        "(or register_compressor_factory, for one that must be constructed on first use) "
+        "before referencing them in a policy's compression config."
+    )
