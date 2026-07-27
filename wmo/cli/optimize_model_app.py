@@ -7,14 +7,20 @@ manual command calls (`wmo.optimize.sweep`, `knn.fit_knn_artifact`, `knn.tune_po
 `report.build_report`), so consent, metering, and artifacts stay single-sourced and a user can
 drop to any manual command mid-flow. The only artifact format this command adds is its manifest.
 
-Not in this build: the `--distill` stage (train a student, gate it, add it to the pool, re-sweep)
-and the compaction slot reserved between sweep and fit. Both are named in
-`wmo.optimize.pipeline.STAGE_ORDER` so their arrival is additive; passing `--distill` today is a
-usage error that names the manual command instead.
+`--compressor` activates the compaction slot between sweep and fit. It is not a paid step of its
+own: it configures the sweep (which then measures that D-COMPRESS arm) and the fit (which embeds
+its bank through the compressor, the representation-consistency rule), so the plan table shows it
+as a row that spends nothing while the compressor's own per-call bill lands folded into the sweep's
+candidate spend.
+
+Not in this build: the `--distill` stage (train a student, gate it, add it to the pool, re-sweep).
+It is named in `wmo.optimize.pipeline.STAGE_ORDER` so its arrival is additive; passing `--distill`
+today is a usage error that names the manual command instead.
 """
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -40,7 +46,11 @@ from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.closed_loop import scenario_id
-from wmo.optimize.compression import compression_signature
+from wmo.optimize.compression import (
+    CompressionConfig,
+    compression_signature,
+    resolve_compression,
+)
 from wmo.optimize.knn import (
     COST_QUALITY_BALANCED,
     DEFAULT_KNN_MIN_PAIRS,
@@ -54,6 +64,7 @@ from wmo.optimize.knn import (
 from wmo.optimize.outcomes import OutcomeMatrix, load_matrix_with_digest
 from wmo.optimize.pipeline import (
     BUILT_STAGES,
+    CONFIGURED_STAGES,
     MANIFEST_DIRNAME,
     MANIFEST_FILENAME,
     MATRIX_FILENAME,
@@ -71,14 +82,19 @@ from wmo.optimize.pipeline import (
     file_sha256,
     forced_stages,
     load_manifest,
+    planned_stages,
     project_sweep_spend,
 )
 from wmo.optimize.policy import (
+    AZURE_EMBEDDER_DEPLOYMENT,
+    AZURE_EMBEDDER_ENV,
     DEFAULT_KNN_Z,
     POLICY_FILENAME,
     EmbedderSpec,
     RoutingPolicy,
     embedder_provenance,
+    probe_embedder,
+    resolve_embedder,
 )
 from wmo.optimize.report import ImprovementReport, build_report
 from wmo.optimize.sweep import (
@@ -163,6 +179,31 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         "--baseline",
         help="Compare the final numbers against this pool model instead of the fallback.",
     ),
+    compressor: str = typer.Option(
+        None,
+        "--compressor",
+        help="Compress every request through this compressor before routing it (identity | "
+        "truncate | llmlingua2-endpoint). The sweep then measures that arm and the fit embeds "
+        "its bank through the same compressor, so the endpoint serves what was measured. "
+        "Default: no compression.",
+    ),
+    aggressiveness: float = typer.Option(
+        0.0,
+        "--aggressiveness",
+        min=0.0,
+        max=1.0,
+        help="Compressor-defined dial in [0, 1] for --compressor: 0.0 is a no-op and higher never "
+        "removes less, but it is not an exact removal fraction (the achieved ratio is measured per "
+        "episode).",
+    ),
+    embedder: str = typer.Option(
+        "auto",
+        "--embedder",
+        help="What the fitted policy routes on: auto | hashing | azure. `auto` uses "
+        "text-embedding-3-large when AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT are set "
+        "(semantic features, billed to that resource) and hashing-512 otherwise; the resolution "
+        "is always printed.",
+    ),
     distill: str = typer.Option(
         None,
         "--distill",
@@ -217,6 +258,11 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         wmo optimize model support --force-from sweep   # buy fresh cells anyway
         wmo optimize model support --yes --max-usd 25   # scripted, with a hard spend cap
 
+    `--compressor` measures and fits a compressed arm end to end, which is the same thing a
+    `route sweep --compressor` plus `route fit --compressor` pair does by hand:
+
+        wmo optimize model support --compressor llmlingua2-endpoint --aggressiveness 0.4
+
     Artifacts land exactly where the manual commands put them, so you can drop to any of them
     mid-flow and this command resumes around it: `policy.json` (plus its evidence bank) in the
     model's own directory where `wmo serve` reads it, and the outcome matrix, report, and run
@@ -230,7 +276,23 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             "`wmo optimize route student <run-dir> --input-per-mtok ... --output-per-mtok ...` "
             "to put the student in the pool, then re-run this command without --distill."
         )
-    redo = _parse_force_from(force_from)
+    if compressor is None and aggressiveness > 0.0:
+        raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
+    compression: CompressionConfig | None = None
+    if compressor is not None:
+        try:
+            # Resolved at PLAN time, before the table: an unknown id, or an implementation that
+            # could never be mounted, is a usage error. Discovering it after the sweep this arm
+            # configured has been paid for would be discovering it too late to matter.
+            compression = resolve_compression(compressor, aggressiveness)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    try:
+        embedder_spec, resolution = _resolve_embedder_choice(embedder)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    redo = _parse_force_from(force_from, compacting=compression is not None)
+    stages = planned_stages(compacting=compression is not None)
     store = WorldModelStore(root)
     try:
         model_dir = store.resolve(world_model)
@@ -273,6 +335,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             max_steps=max_steps,
             assume_input_tokens=ASSUMED_INPUT_TOKENS,
             assume_output_tokens=ASSUMED_OUTPUT_TOKENS,
+            compression=compression,
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -287,17 +350,22 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
                 f"anchor on a candidate the sweep measures. Available: {', '.join(known)}"
             )
 
-    embedder = EmbedderSpec()
+    # Printed before the plan table, the way `route fit` prints it before the fit: the embedder
+    # decides what the policy can route on, and an operator who meant to fit on semantic vectors
+    # should see that it resolved to hashed features before authorizing any spend.
+    _console.print(resolution)
     # The world-model side of a sweep is not projectable from arithmetic, but once this model has
     # been swept once its OWN measured ratio is, and it is far too big to leave out of a cap
     # (7.0x the candidate side on a real tau corpus).
     projection = project_sweep_spend(plan.total_usd, manifest.record_for(Stage.SWEEP))
     decisions = _plan_stages(
+        stages,
         manifest=manifest,
         paths=paths,
         plan=plan,
         pool_file=Path(pool_file),
-        embedder=embedder,
+        embedder=embedder_spec,
+        compression=compression,
         fallback=fallback,
         baseline=baseline,
         cost_quality=cost_quality,
@@ -314,7 +382,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         cost_quality=cost_quality,
         fallback=fallback,
         anchor=_report_anchor(paths.policy, baseline=baseline, fallback=fallback),
-        embedder=embedder,
+        embedder=embedder_spec,
+        compression=compression,
         projection=projection,
         paths=paths,
     )
@@ -324,6 +393,17 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     if dry_run:
         _console.print("\ndry run: nothing was run and nothing was spent")
         raise typer.Exit(0)
+
+    # One throwaway embedding before anything is bought, and only when a fit will actually happen:
+    # `--embedder auto` turns the mere presence of AZURE_OPENAI_* into a network dependency, and
+    # those variables routinely point at a resource that serves chat but hosts no embedding
+    # deployment. Without this the failure lands after the sweep has been paid for. After the dry
+    # run exits, because a dry run promises to reach nothing.
+    if any(decision.stage is Stage.FIT and decision.will_run for decision in decisions):
+        try:
+            probe_embedder(embedder_spec)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
     # Seeded from every dollar this model's optimization has already spent, both sides:
     # --max-usd bounds the optimization, not one invocation of it (see `SpendLedger`).
@@ -350,7 +430,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             projection=projection,
             model_dir=model_dir,
             pool_file=Path(pool_file),
-            embedder=embedder,
+            embedder=embedder_spec,
+            compression=compression,
             fallback=fallback,
             baseline=baseline,
             cost_quality=cost_quality,
@@ -375,7 +456,39 @@ class _RunPaths(BaseModel):
     report: Path
 
 
-def _parse_force_from(force_from: str | None) -> frozenset[Stage]:
+def _resolve_embedder_choice(choice: str) -> tuple[EmbedderSpec, str]:
+    """`--embedder` as the spec to fit with, plus the one line explaining the choice.
+
+    The resolution itself is `wmo.optimize.policy.resolve_embedder`, shared with
+    `wmo optimize route fit` so the two commands cannot disagree about what `auto` means. What is
+    decided here is the narrower surface: this command takes no `--deployment`, `--endpoint`, or
+    `--dim`, because its whole promise is one command with no routing knobs in it. So `azure` reads
+    the same standard environment pair `auto` looks for rather than flags that do not exist, and
+    the operator who needs to name a specific deployment is pointed at the manual fit that has
+    those flags.
+
+    Raises:
+        ValueError: An unknown choice, or `azure` with nothing in the environment to point it at.
+    """
+    endpoint = os.environ.get(AZURE_EMBEDDER_ENV[1])
+    if choice == "azure" and not endpoint:
+        raise ValueError(
+            f"--embedder azure needs {' and '.join(AZURE_EMBEDDER_ENV)} in the environment: this "
+            "command resolves the azure deployment from that standard pair rather than taking "
+            "--deployment/--endpoint flags. Export them, or fit by hand with `wmo optimize route "
+            "fit <matrix.json> --kind knn --embedder azure --deployment <name> --endpoint <url>`."
+        )
+    explicit_azure = choice == "azure"
+    return resolve_embedder(
+        choice,
+        dim=None,
+        deployment=AZURE_EMBEDDER_DEPLOYMENT if explicit_azure else None,
+        endpoint=endpoint if explicit_azure else None,
+        api_key_env=AZURE_EMBEDDER_ENV[0] if explicit_azure else None,
+    )
+
+
+def _parse_force_from(force_from: str | None, *, compacting: bool) -> frozenset[Stage]:
     """`--force-from` as the set of stages it invalidates, or a usage error naming the choices."""
     if force_from is None:
         return frozenset()
@@ -387,6 +500,20 @@ def _parse_force_from(force_from: str | None) -> frozenset[Stage]:
             f"unknown stage '{force_from}' for --force-from; use "
             f"{' | '.join(item.value for item in redoable)}"
         ) from exc
+    if stage in CONFIGURED_STAGES:
+        # Forcing a configuration is a category error, whether or not it is active on this run:
+        # the compaction stage does no work to redo. What changes its outcome is the arm itself,
+        # and changing that already re-measures the sweep (the arm is in its fingerprint).
+        instead = (
+            "Change --compressor/--aggressiveness to measure a different arm"
+            if compacting
+            else "This run named no compressor for it to configure anything with"
+        )
+        raise typer.BadParameter(
+            f"stage '{stage.value}' configures the sweep and the fit rather than running on its "
+            f"own, so there is nothing to force. {instead}, or force one of "
+            f"{' | '.join(item.value for item in redoable)}"
+        )
     if stage in RESERVED_STAGES:
         raise typer.BadParameter(
             f"stage '{stage.value}' is a reserved slot that this build does not run, so there is "
@@ -401,12 +528,14 @@ def _parse_force_from(force_from: str | None) -> frozenset[Stage]:
 
 
 def _plan_stages(
+    stages: tuple[Stage, ...],
     *,
     manifest: RunManifest,
     paths: _RunPaths,
     plan: SweepPlan,
     pool_file: Path,
     embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
     fallback: str | None,
     baseline: str | None,
     cost_quality: float,
@@ -420,13 +549,19 @@ def _plan_stages(
     about to replace, so any verdict taken now would describe a state that no longer exists by the
     time the stage is reached. Saying "sweep reruns first" is both true and what the plan table
     then honors.
+
+    COMPACT is the exception, decided on its own fingerprint however dirty the run above it is. Its
+    only input is the arm the operator named, which no other stage writes, so borrowing the "runs
+    after sweep, which will change its input" line for it would print something false. It still
+    dirties what follows: the fit embeds its bank through the compressor, so a changed arm is a
+    changed fit.
     """
     decisions: list[StageDecision] = []
     running: Stage | None = None
-    for stage in BUILT_STAGES:
+    for stage in stages:
         if stage is Stage.PREFLIGHT:
             continue
-        if running is not None:
+        if running is not None and stage not in CONFIGURED_STAGES:
             decisions.append(
                 StageDecision(
                     stage=stage,
@@ -441,6 +576,7 @@ def _plan_stages(
             plan=plan,
             pool_file=pool_file,
             embedder=embedder,
+            compression=compression,
             fallback=fallback,
             baseline=baseline,
             cost_quality=cost_quality,
@@ -462,14 +598,65 @@ def _plan_stages(
 
 
 class _StageInputs(BaseModel):
-    """What one stage consumes and produces right now: everything `decide_stage` compares."""
+    """What one stage consumes and produces right now: everything `decide_stage` compares.
+
+    `artifact` is None for a stage that writes no file (compaction configures the two stages
+    around it), which leaves its fingerprint the whole of its verdict.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     fingerprint: dict[str, str]
-    artifact: Path
-    artifact_identity: str
+    artifact: Path | None = None
+    artifact_identity: str | None = None
     skip_summary: str
+
+
+def _compact_fingerprint(compression: CompressionConfig | None) -> dict[str, str]:
+    """The arm the compaction stage configured, rendered once for both the plan and the record.
+
+    Deliberately the same string `compression_signature` puts in the SWEEP fingerprint, and
+    deliberately recorded twice: the sweep's copy is the one that forces cells to be re-measured
+    when the arm moves, since that is what makes its rewards mean something different. This copy
+    only decides whether the compact ROW reads as run or skipped, and sharing the rendering is what
+    keeps the two from ever describing different arms.
+    """
+    return {"compression": compression_signature(compression)}
+
+
+def _fit_fingerprint(
+    *,
+    matrix: Path,
+    embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
+    fallback: str | None,
+    allow_uneven: bool,
+) -> dict[str, str]:
+    """Everything that decides what the fit produces, for both the plan and the record.
+
+    One function so the planned and recorded fingerprints cannot drift, which matters most for the
+    conditional key: `compression` is present only when a compressor is named. Adding it
+    unconditionally would refit every model whose manifest predates the flag in order to record a
+    value meaning "no compression", which is exactly what the key's absence already says. Both
+    directions still rerun the fit, since an added key and a removed one are each a difference.
+    """
+    fingerprint = {
+        "matrix": file_sha256(matrix),
+        "kind": "knn",
+        "fallback": fallback or "auto",
+        "knobs": _KNN_KNOBS,
+        "embedder": embedder_provenance(embedder),
+        # Whether the operator accepted biased evidence is part of what produced this fit. Without
+        # it here, consent given once would stick silently: a later run WITHOUT the flag would skip
+        # the fit, never reach the coverage gate, and leave a policy fitted on knowingly-uneven
+        # evidence with nothing saying so.
+        "allow_uneven": str(allow_uneven),
+    }
+    if compression is not None:
+        # The fit embeds its bank through the compressor and stamps the arm on the policy, so the
+        # arm is an input to the fit in its own right, not only through the matrix it reads.
+        fingerprint["compression"] = compression_signature(compression)
+    return fingerprint
 
 
 def _live_inputs(
@@ -479,6 +666,7 @@ def _live_inputs(
     plan: SweepPlan,
     pool_file: Path,
     embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
     fallback: str | None,
     baseline: str | None,
     cost_quality: float,
@@ -494,30 +682,29 @@ def _live_inputs(
                     "episodes": str(plan.episodes),
                     "max_steps": str(plan.max_steps),
                     # A matrix's rewards belong to ONE D-COMPRESS arm, so a changed compressor
-                    # means different evidence and the cells have to be bought again. The
-                    # orchestrator exposes no compression flag yet, so this reads "raw text"
-                    # today; recording it now means the reserved COMPACT stage cannot arrive
-                    # and silently reuse a matrix measured under a different arm.
+                    # means different evidence and the cells have to be bought again. This is the
+                    # fingerprint that makes `--compressor` re-measure rather than reuse cells
+                    # that ran under a different arm.
                     "compression": compression_signature(plan.compression),
                 },
                 artifact=paths.matrix,
                 artifact_identity=file_sha256(paths.matrix),
                 skip_summary="same pool, same scenarios, same episodes",
             )
+        case Stage.COMPACT:
+            return _StageInputs(
+                fingerprint=_compact_fingerprint(compression),
+                skip_summary="same compressor, same aggressiveness",
+            )
         case Stage.FIT:
             return _StageInputs(
-                fingerprint={
-                    "matrix": file_sha256(paths.matrix),
-                    "kind": "knn",
-                    "fallback": fallback or "auto",
-                    "knobs": _KNN_KNOBS,
-                    "embedder": embedder_provenance(embedder),
-                    # Whether the operator accepted biased evidence is part of what produced this
-                    # fit. Without it here, consent given once would stick silently: a later run
-                    # WITHOUT the flag would skip the fit, never reach the coverage gate, and
-                    # leave a policy fitted on knowingly-uneven evidence with nothing saying so.
-                    "allow_uneven": str(allow_uneven),
-                },
+                fingerprint=_fit_fingerprint(
+                    matrix=paths.matrix,
+                    embedder=embedder,
+                    compression=compression,
+                    fallback=fallback,
+                    allow_uneven=allow_uneven,
+                ),
                 artifact=paths.policy,
                 artifact_identity=_policy_fit_identity(paths.policy),
                 skip_summary="same matrix, same knn knobs",
@@ -590,7 +777,13 @@ def _policy_fit_identity(policy_path: Path) -> str:
 
 
 def _stage_plan_text(
-    stage: Stage, *, plan: SweepPlan, cost_quality: float, fallback: str | None, anchor: str
+    stage: Stage,
+    *,
+    plan: SweepPlan,
+    compression: CompressionConfig | None,
+    cost_quality: float,
+    fallback: str | None,
+    anchor: str,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
     match stage:
@@ -601,6 +794,9 @@ def _stage_plan_text(
                 f"{len(plan.pool.models)} candidate(s) x {len(plan.scenarios)} scenario(s) "
                 f"x {plan.episodes} episode(s)"
             )
+        case Stage.COMPACT:
+            # Says what it IS rather than implying a step: the arm plus the two stages it sets up.
+            return f"{escape(compression_signature(compression))}, configures sweep and fit"
         case Stage.FIT:
             return f"knn (guarded, fallback {escape(fallback or 'best single on the sweep')})"
         case Stage.TUNE:
@@ -640,6 +836,7 @@ def _print_plan(
     fallback: str | None,
     anchor: str,
     embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
     projection: SweepSpendProjection,
     paths: _RunPaths,
 ) -> None:
@@ -662,6 +859,7 @@ def _print_plan(
         _stage_plan_text(
             Stage.PREFLIGHT,
             plan=plan,
+            compression=compression,
             cost_quality=cost_quality,
             fallback=fallback,
             anchor=anchor,
@@ -675,6 +873,7 @@ def _print_plan(
             _stage_plan_text(
                 decision.stage,
                 plan=plan,
+                compression=compression,
                 cost_quality=cost_quality,
                 fallback=fallback,
                 anchor=anchor,
@@ -761,6 +960,12 @@ def _estimate_text(
     match stage:
         case Stage.SWEEP:
             return f"~${plan.total_usd:.2f}"
+        case Stage.COMPACT:
+            # Not free and not its own line: the compressor bills per call, and every one of those
+            # calls happens inside the sweep, so its cost arrives folded into the sweep's measured
+            # candidate spend (the D-COMPRESS accounting rule). Saying "free" here would promise
+            # the operator a compressor that costs nothing.
+            return "included in sweep"
         case Stage.REPORT:
             return _report_estimate(paths.policy, embedder)
         case _:
@@ -828,6 +1033,7 @@ def _run_stages(
     model_dir: Path,
     pool_file: Path,
     embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
     fallback: str | None,
     baseline: str | None,
     cost_quality: float,
@@ -855,11 +1061,14 @@ def _run_stages(
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
                 record = _stage_sweep(plan, model_dir=model_dir, pool_file=pool_file)
                 ledger.record(record.total_spend_usd)
+            case Stage.COMPACT:
+                record = _stage_compact(compression)
             case Stage.FIT:
                 _enforce_coverage(paths.matrix, allow_uneven=allow_uneven_coverage)
                 record = _stage_fit(
                     paths,
                     embedder=embedder,
+                    compression=compression,
                     fallback=fallback,
                     allow_uneven=allow_uneven_coverage,
                 )
@@ -926,6 +1135,35 @@ def _stage_sweep(plan: SweepPlan, *, model_dir: Path, pool_file: Path) -> StageR
     return record
 
 
+def _stage_compact(compression: CompressionConfig | None) -> StageRecord:
+    """Record the D-COMPRESS arm this run configured into the sweep and the fit.
+
+    The compaction slot as it actually turned out. The design reserved it as a step between sweep
+    and fit, and the seam that landed made it a configuration instead: one arm, applied by the sweep
+    to every candidate call it measures and by the fit to every text it embeds into the bank. So
+    this stage runs nothing and buys nothing, and it writes no artifact of its own. What it does own
+    is the record that the arm was applied, which is what lets a later run say the compact row is
+    current instead of silently assuming it.
+
+    The compressor's own per-call bill is real and is NOT lost by having no line here: it is
+    metered inside the sweep and reported as the compressor's share of that stage's candidate
+    spend (`StageRecord.compressor_spend_usd`).
+    """
+    signature = compression_signature(compression)
+    _console.print(
+        f"  [green]✓[/green] configured {escape(signature)}\n"
+        "  no separate step and no separate bill: this arm is what the sweep measures every "
+        "candidate through and what the fit embeds its bank through, so the endpoint routes on "
+        "the representation it will serve",
+        soft_wrap=True,
+    )
+    return StageRecord(
+        stage=Stage.COMPACT,
+        fingerprint=_compact_fingerprint(compression),
+        completed_at=_now(),
+    )
+
+
 def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
     """Show what the fit would be weighed on, and withhold it when that is not a comparison.
 
@@ -963,9 +1201,22 @@ def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
 
 
 def _stage_fit(
-    paths: _RunPaths, *, embedder: EmbedderSpec, fallback: str | None, allow_uneven: bool
+    paths: _RunPaths,
+    *,
+    embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
+    fallback: str | None,
+    allow_uneven: bool,
 ) -> StageRecord:
-    """Fit the guarded kNN policy on the swept matrix, into the path `wmo serve` reads."""
+    """Fit the guarded kNN policy on the swept matrix, into the path `wmo serve` reads.
+
+    `compression` is the compaction stage's arm, and passing it here is the fit half of
+    representation consistency: `fit_knn_artifact` embeds the bank through the compressor and stamps
+    both `compression` and `fit_compression` on the policy, which is what the mount gate re-checks.
+    The arm cannot disagree with the one the matrix was measured under, because the same flag
+    configured the sweep and the sweep re-measures whenever it moves (the arm is in its
+    fingerprint).
+    """
     matrix, source = load_matrix_with_digest(paths.matrix)
     try:
         fitted = fit_knn_artifact(
@@ -974,6 +1225,7 @@ def _stage_fit(
             matrix_source=source,
             embedder=embedder,
             fallback=fallback,
+            compression=compression,
         )
     except ValueError as exc:
         # Nothing is wrong with the flags: the matrix this run measured cannot be fitted. Exit 1
@@ -991,14 +1243,13 @@ def _stage_fit(
     )
     return StageRecord(
         stage=Stage.FIT,
-        fingerprint={
-            "matrix": file_sha256(paths.matrix),
-            "kind": "knn",
-            "fallback": fallback or "auto",
-            "knobs": _KNN_KNOBS,
-            "embedder": embedder_provenance(embedder),
-            "allow_uneven": str(allow_uneven),
-        },
+        fingerprint=_fit_fingerprint(
+            matrix=paths.matrix,
+            embedder=embedder,
+            compression=compression,
+            fallback=fallback,
+            allow_uneven=allow_uneven,
+        ),
         artifact_path=str(paths.policy),
         artifact_identity=fit_provenance(fitted.policy),
         completed_at=_now(),
