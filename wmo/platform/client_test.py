@@ -546,3 +546,58 @@ def test_whoami_maps_a_non_json_200() -> None:
 
     with _client(handler) as client, pytest.raises(PlatformError, match="not JSON"):
         client.whoami()
+
+
+def test_every_endpoint_maps_a_non_json_200() -> None:
+    """A proxy that answers 200 HTML everywhere must not reach any caller as a decoder error."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, html="<html>Sign in</html>")
+
+    with _client(handler) as client:
+        for call in (
+            lambda: client.resolve_run_target("wm_1"),
+            lambda: client.list_world_models("org-1"),
+            lambda: client.list_harnesses("org-1"),
+            lambda: client.get_harness_version("org-1", "pi", 1),
+            lambda: client.create_agent_session("agent-1", workspace=None),
+        ):
+            with pytest.raises(PlatformError, match="not JSON"):
+                call()
+
+
+def test_a_json_array_body_is_a_platform_error() -> None:
+    """Valid JSON that is not an object would crash `.get`/`model_validate` the same way."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    with _client(handler) as client, pytest.raises(PlatformError, match="not an object"):
+        client.list_world_models("org-1")
+
+
+def test_an_unreachable_storage_host_hides_the_signed_url(tmp_path: Path) -> None:
+    """Signed upload URLs carry their capability in the query; errors land in CI logs."""
+    bundle_path = tmp_path / "tau-bench.tar.gz"
+    bundle_path.write_bytes(b"bundle-bytes")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "storage.test":
+            raise httpx.ConnectError("[Errno 61] Connection refused", request=request)
+        return httpx.Response(
+            201,
+            json={
+                "upload_url": "https://storage.test/upload/x?token=SIGNATURE",
+                "token": "SIGNATURE",
+                "staging_path": "staging/cli/x.tar.gz",
+            },
+        )
+
+    with _client(handler) as client, pytest.raises(PlatformUnreachable) as info:
+        client.push_model_bundle("org-1", "tau-bench", bundle_path, "0" * 64, 12, {})
+
+    message = str(info.value)
+    assert "SIGNATURE" not in message
+    # The hop that failed still has to be named, host and path intact.
+    reached = message.removeprefix("cannot reach ").split(": ", 1)[0]
+    assert reached == "https://storage.test/upload/x"

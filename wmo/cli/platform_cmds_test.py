@@ -153,8 +153,10 @@ def test_status_falls_back_to_the_api_url(monkeypatch: pytest.MonkeyPatch) -> No
     result = runner.invoke(app, ["status"])
 
     assert result.exit_code == 0, result.output
-    assert "https://api.test" in result.output
-    assert "None" not in result.output
+    # Equality on the host, not a substring: the bug printed "None" here, so
+    # what matters is exactly which host got named.
+    connected = next(line for line in result.output.splitlines() if "Connected to" in line)
+    assert connected.split("Connected to ", 1)[1].strip() == "https://api.test"
 
 
 def test_pull_rejects_unknown_kind() -> None:

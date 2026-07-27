@@ -67,7 +67,7 @@ class _GuardedTransport(httpx.BaseTransport):
             # message: every caller re-raises it as its own clean CLI error.
             detail = str(error) or type(error).__name__
             raise PlatformUnreachable(
-                f"cannot reach {request.url}: {detail}; check your connection, "
+                f"cannot reach {_shown(request.url)}: {detail}; check your connection, "
                 "or re-run `wmo login --url <platform url>`"
             ) from error
 
@@ -80,25 +80,44 @@ def _guarded(transport: httpx.BaseTransport | None) -> _GuardedTransport:
     return _GuardedTransport(transport if transport is not None else httpx.HTTPTransport())
 
 
+def _shown(url: httpx.URL) -> str:
+    """The part of a URL safe to print: bundle transfers sign with query parameters.
+
+    Storage hands back capability URLs whose token lives in the query string, and
+    these messages land in terminals and CI logs. The host and path are what tell
+    the user which hop failed; the signature never is.
+    """
+    return str(url.copy_with(query=None, fragment=None))
+
+
 def _decode_json(response: httpx.Response) -> JsonObject:
     """Read a JSON object body, reporting anything else as a platform error.
 
     A 200 carrying HTML is how a marketing site, a login-walled preview, or a
-    captive portal answers: "this is not a platform", not a crash.
+    captive portal answers: "this is not a platform", not a crash. Every
+    successful response in this module is decoded here so that answer can never
+    reach the user as a `JSONDecodeError`.
     """
+    where = _shown(response.request.url)
     try:
         payload = response.json()
     except ValueError as error:
         content_type = response.headers.get("content-type", "no content type").split(";")[0]
-        msg = (
-            f"{response.request.url} answered HTTP {response.status_code} "
-            f"with {content_type}, not JSON"
-        )
+        msg = f"{where} answered HTTP {response.status_code} with {content_type}, not JSON"
         raise PlatformError(msg, status_code=response.status_code) from error
     if not isinstance(payload, dict):
-        msg = f"{response.request.url} answered with a JSON {type(payload).__name__}, not an object"
+        msg = f"{where} answered with a JSON {type(payload).__name__}, not an object"
         raise PlatformError(msg, status_code=response.status_code)
     return payload
+
+
+def _rows(payload: JsonObject, key: str) -> list[JsonValue]:
+    """Read a list of rows out of a decoded payload, or report the wrong shape."""
+    rows = payload.get(key, [])
+    if not isinstance(rows, list):
+        msg = f"platform answered with {key!r} as a JSON {type(rows).__name__}, not a list"
+        raise PlatformError(msg)
+    return rows
 
 
 class ActorInfo(BaseModel):
@@ -316,7 +335,7 @@ class PlatformClient:
         """Resolve an opaque platform id without guessing from failed requests."""
         response = self._client.get(f"/api/run-targets/{target_id}")
         self._raise_for_error(response)
-        return RunTarget.model_validate(response.json())
+        return RunTarget.model_validate(_decode_json(response))
 
     def create_world_model_session(
         self, world_model_id: str, *, task: str | None = None
@@ -326,7 +345,7 @@ class PlatformClient:
             f"/api/world-models/{world_model_id}/sessions", json={"task": task}
         )
         self._raise_for_error(response)
-        return RemoteWorldModelSession.model_validate(response.json())
+        return RemoteWorldModelSession.model_validate(_decode_json(response))
 
     def step_world_model_session(self, session_id: str, action: Action) -> Observation:
         """Advance a hosted world-model session by one action."""
@@ -335,7 +354,7 @@ class PlatformClient:
             json={"action": action.model_dump(mode="json")},
         )
         self._raise_for_error(response)
-        return Observation.model_validate(response.json()["observation"])
+        return Observation.model_validate(_decode_json(response)["observation"])
 
     def create_agent_session(
         self,
@@ -353,31 +372,31 @@ class PlatformClient:
                 timeout=_WORKSPACE_TIMEOUT_SECONDS,
             )
             self._raise_for_error(upload)
-            payload["workspace_upload_id"] = str(upload.json()["id"])
+            payload["workspace_upload_id"] = str(_decode_json(upload)["id"])
         response = self._client.post(
             f"/api/agents/{agent_id}/sessions",
             json=payload,
         )
         self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(response.json())
+        return RemoteAgentSession.model_validate(_decode_json(response))
 
     def get_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
         """Read current hosted agent session state."""
         response = self._client.get(f"/api/agents/{agent_id}/sessions/{session_id}")
         self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(response.json())
+        return RemoteAgentSession.model_validate(_decode_json(response))
 
     def resolve_agent_session(self, session_id: str) -> RemoteAgentSession:
         """Resolve a bare session id to its owning agent and current state."""
         response = self._client.get(f"/api/agent-sessions/{session_id}")
         self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(response.json())
+        return RemoteAgentSession.model_validate(_decode_json(response))
 
     def end_agent_session(self, agent_id: str, session_id: str) -> RemoteAgentSession:
         """Request an end, reconciling directly when the hosted driver is gone."""
         response = self._client.post(f"/api/agents/{agent_id}/sessions/{session_id}/end")
         self._raise_for_error(response)
-        return RemoteAgentSession.model_validate(response.json())
+        return RemoteAgentSession.model_validate(_decode_json(response))
 
     def list_agent_session_events(
         self, agent_id: str, session_id: str, *, after: int
@@ -388,7 +407,7 @@ class PlatformClient:
             params={"after": after},
         )
         self._raise_for_error(response)
-        return RemoteAgentEventPage.model_validate(response.json())
+        return RemoteAgentEventPage.model_validate(_decode_json(response))
 
     def post_agent_session_command(
         self, agent_id: str, session_id: str, kind: str, *, text: str | None = None
@@ -410,7 +429,7 @@ class PlatformClient:
             timeout=_WORKSPACE_TIMEOUT_SECONDS,
         )
         self._raise_for_error(response)
-        return WorkspacePatchResult.model_validate(response.json())
+        return WorkspacePatchResult.model_validate(_decode_json(response))
 
     def download_agent_workspace_patch(
         self, agent_id: str, session_id: str, revision: str
@@ -451,7 +470,7 @@ class PlatformClient:
     def list_world_models(self, org_id: str) -> list[RemoteWorldModel]:
         response = self._client.get(f"/api/orgs/{org_id}/world-models")
         self._raise_for_error(response)
-        rows = response.json().get("world_models", [])
+        rows = _rows(_decode_json(response), "world_models")
         return [RemoteWorldModel.model_validate(row) for row in rows]
 
     def push_model_bundle(
@@ -473,7 +492,7 @@ class PlatformClient:
             f"/api/orgs/{org_id}/world-models/{name}/bundle/uploads"
         )
         self._raise_for_error(ticket_response)
-        ticket = ticket_response.json()
+        ticket = _decode_json(ticket_response)
         upload_url = str(ticket["upload_url"])
         with bundle_path.open("rb") as fh:
             upload_response = self._transfer.put(
@@ -502,7 +521,7 @@ class PlatformClient:
             },
         )
         self._raise_for_error(finalize)
-        return RemoteWorldModel.model_validate(finalize.json())
+        return RemoteWorldModel.model_validate(_decode_json(finalize))
 
     def download_model_bundle(self, org_id: str, name: str, dest: Path) -> str:
         """Stream a model's bundle from storage to ``dest``, verifying its digest.
@@ -516,7 +535,7 @@ class PlatformClient:
         """
         response = self._client.get(f"/api/orgs/{org_id}/world-models/{name}/bundle")
         self._raise_for_error(response)
-        payload = response.json()
+        payload = _decode_json(response)
         declared = str(payload["sha256"])
 
         digest = hashlib.sha256()
@@ -542,7 +561,7 @@ class PlatformClient:
     def list_harnesses(self, org_id: str) -> list[RemoteHarness]:
         response = self._client.get(f"/api/orgs/{org_id}/harnesses")
         self._raise_for_error(response)
-        rows = response.json().get("harnesses", [])
+        rows = _rows(_decode_json(response), "harnesses")
         return [RemoteHarness.model_validate(row) for row in rows]
 
     def get_harness(
@@ -550,15 +569,15 @@ class PlatformClient:
     ) -> tuple[RemoteHarness, list[RemoteHarnessVersion]]:
         response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}")
         self._raise_for_error(response)
-        payload = response.json()
+        payload = _decode_json(response)
         harness = RemoteHarness.model_validate(payload["harness"])
-        versions = [RemoteHarnessVersion.model_validate(row) for row in payload["versions"]]
+        versions = [RemoteHarnessVersion.model_validate(r) for r in _rows(payload, "versions")]
         return harness, versions
 
     def get_harness_version(self, org_id: str, name: str, version: int) -> HarnessVersionDoc:
         response = self._client.get(f"/api/orgs/{org_id}/harnesses/{name}/versions/{version}")
         self._raise_for_error(response)
-        return HarnessVersionDoc.model_validate(response.json())
+        return HarnessVersionDoc.model_validate(_decode_json(response))
 
     def push_harness_version(
         self,
@@ -572,7 +591,7 @@ class PlatformClient:
             json={"doc": doc, "doc_hash": doc_hash},
         )
         self._raise_for_error(response)
-        return PushedHarnessVersion.model_validate(response.json())
+        return PushedHarnessVersion.model_validate(_decode_json(response))
 
     # -- built-in local pi runs ---------------------------------------------------------------
 
@@ -580,7 +599,7 @@ class PlatformClient:
         """Open a metered platform run for WMO's built-in local pi harness."""
         response = self._client.post(f"/api/orgs/{org_id}/local-pi-runs")
         self._raise_for_error(response)
-        return LocalPiRunInfo.model_validate(response.json())
+        return LocalPiRunInfo.model_validate(_decode_json(response))
 
     def complete_local_pi_worker(
         self, org_id: str, run_id: str, request: ChatRequest
@@ -591,7 +610,7 @@ class PlatformClient:
             json=request.model_dump(mode="json", exclude_none=True),
         )
         self._raise_for_error(response)
-        return ChatResponse.model_validate(response.json())
+        return ChatResponse.model_validate(_decode_json(response))
 
     def finish_local_pi_run(
         self,
