@@ -154,6 +154,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.5,
+          "high": -42.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": 2.75,
         "quality_delta_paired": {
           "mean": 0.0275,
@@ -185,6 +191,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -23.8,
+          "high": 36.7,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -8.13,
         "quality_delta_paired": {
           "mean": -0.0813,
@@ -218,6 +230,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -98.2,
+          "high": -68.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 1183
+        },
         "quality_delta_points": -34.12,
         "quality_delta_paired": {
           "mean": -0.3412,
@@ -249,6 +267,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -95.1,
+          "high": -26.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 1183
+        },
         "quality_delta_points": -45.0,
         "quality_delta_paired": {
           "mean": -0.45,
@@ -282,6 +306,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -93.8,
+          "high": -58.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 31
+        },
         "quality_delta_points": -18.12,
         "quality_delta_paired": {
           "mean": -0.1812,
@@ -313,6 +343,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -85.3,
+          "high": 10.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 31
+        },
         "quality_delta_points": -29.0,
         "quality_delta_paired": {
           "mean": -0.29,
@@ -346,6 +382,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -79.8,
+          "high": -31.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -0.87,
         "quality_delta_paired": {
           "mean": -0.0087,
@@ -377,6 +419,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -52.9,
+          "high": 77.0,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -11.75,
         "quality_delta_paired": {
           "mean": -0.1175,
@@ -410,6 +458,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -89.0,
+          "high": -61.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -5.75,
         "quality_delta_paired": {
           "mean": -0.0575,
@@ -441,6 +495,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.4,
+          "high": -8.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -16.62,
         "quality_delta_paired": {
           "mean": -0.1663,
@@ -474,6 +534,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -67.0,
+          "high": 16.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -1.82,
         "quality_delta_paired": {
           "mean": -0.0182,
@@ -505,6 +571,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -21.6,
+          "high": 161.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -12.7,
         "quality_delta_paired": {
           "mean": -0.127,
@@ -538,6 +610,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -94.2,
+          "high": -75.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 9
+        },
         "quality_delta_points": -14.32,
         "quality_delta_paired": {
           "mean": -0.1432,
@@ -569,6 +647,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -85.7,
+          "high": -36.0,
+          "n_scenarios": 20,
+          "undefined_resamples": 9
+        },
         "quality_delta_points": -25.2,
         "quality_delta_paired": {
           "mean": -0.252,
@@ -602,6 +686,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.7,
+          "high": -33.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
         "quality_delta_points": -5.25,
         "quality_delta_paired": {
           "mean": -0.0525,
@@ -633,6 +723,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -35.5,
+          "high": 85.0,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
         "quality_delta_points": -16.13,
         "quality_delta_paired": {
           "mean": -0.1613,
@@ -666,6 +762,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -74.1,
+          "high": -39.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": 10.88,
         "quality_delta_paired": {
           "mean": 0.1088,
@@ -697,6 +799,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 0.0,
+          "high": 0.0,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": 0.0,
         "quality_delta_paired": {
           "mean": 0.0,
@@ -730,6 +838,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -68.3,
+          "high": 29.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -8.12,
         "quality_delta_paired": {
           "mean": -0.0813,
@@ -761,6 +875,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -19.1,
+          "high": 196.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -19.0,
         "quality_delta_paired": {
           "mean": -0.19,
@@ -794,6 +914,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -66.6,
+          "high": 34.7,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -5.5,
         "quality_delta_paired": {
           "mean": -0.055,
@@ -827,6 +953,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -8.9,
+          "high": 213.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -16.38,
         "quality_delta_paired": {
           "mean": -0.1638,
@@ -862,6 +994,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -95.9,
+          "high": -53.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 1232
+        },
         "quality_delta_points": -38.25,
         "quality_delta_paired": {
           "mean": -0.3825,
@@ -895,6 +1033,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -90.4,
+          "high": 18.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 1232
+        },
         "quality_delta_points": -49.12,
         "quality_delta_paired": {
           "mean": -0.4912,
@@ -930,6 +1074,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -92.6,
+          "high": -50.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 7
+        },
         "quality_delta_points": -23.75,
         "quality_delta_paired": {
           "mean": -0.2375,
@@ -963,6 +1113,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -81.6,
+          "high": 24.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 7
+        },
         "quality_delta_points": -34.62,
         "quality_delta_paired": {
           "mean": -0.3463,
@@ -998,6 +1154,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -77.2,
+          "high": 0.7,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -9.57,
         "quality_delta_paired": {
           "mean": -0.0957,
@@ -1031,6 +1193,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -38.2,
+          "high": 134.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -20.45,
         "quality_delta_paired": {
           "mean": -0.2045,
@@ -1066,6 +1234,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -82.0,
+          "high": 47.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 8
+        },
         "quality_delta_points": -22.07,
         "quality_delta_paired": {
           "mean": -0.2208,
@@ -1099,6 +1273,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -49.8,
+          "high": 240.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 8
+        },
         "quality_delta_points": -32.95,
         "quality_delta_paired": {
           "mean": -0.3295,
@@ -1134,6 +1314,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -21.9,
+          "high": 175.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -8.87,
         "quality_delta_paired": {
           "mean": -0.0887,
@@ -1167,6 +1353,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 99.9,
+          "high": 573.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -19.75,
         "quality_delta_paired": {
           "mean": -0.1975,
@@ -1202,6 +1394,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -65.9,
+          "high": 98.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -13.37,
         "quality_delta_paired": {
           "mean": -0.1337,
@@ -1235,6 +1433,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -15.0,
+          "high": 372.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -24.25,
         "quality_delta_paired": {
           "mean": -0.2425,
@@ -1270,6 +1474,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -83.3,
+          "high": -0.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 37
+        },
         "quality_delta_points": -25.5,
         "quality_delta_paired": {
           "mean": -0.255,
@@ -1303,6 +1513,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -60.5,
+          "high": 163.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 37
+        },
         "quality_delta_points": -36.38,
         "quality_delta_paired": {
           "mean": -0.3637,
@@ -1338,6 +1554,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -65.3,
+          "high": 20.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
         "quality_delta_points": -9.75,
         "quality_delta_paired": {
           "mean": -0.0975,
@@ -1371,6 +1593,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -10.2,
+          "high": 195.8,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
         "quality_delta_points": -20.63,
         "quality_delta_paired": {
           "mean": -0.2062,
@@ -1406,6 +1634,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -63.1,
+          "high": 42.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": 3.25,
         "quality_delta_paired": {
           "mean": 0.0325,
@@ -1439,6 +1673,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -2.6,
+          "high": 247.0,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -7.63,
         "quality_delta_paired": {
           "mean": -0.0763,
@@ -1474,6 +1714,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -63.4,
+          "high": 99.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
         "quality_delta_points": -15.12,
         "quality_delta_paired": {
           "mean": -0.1512,
@@ -1507,6 +1753,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 1.7,
+          "high": 347.8,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
         "quality_delta_points": -26.0,
         "quality_delta_paired": {
           "mean": -0.26,
@@ -1542,6 +1794,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -61.0,
+          "high": -9.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -8.57,
         "quality_delta_paired": {
           "mean": -0.0858,
@@ -1575,6 +1833,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -13.6,
+          "high": 153.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -19.45,
         "quality_delta_paired": {
           "mean": -0.1945,
@@ -1610,6 +1874,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -98.4,
+          "high": -83.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 1232
+        },
         "quality_delta_points": -36.25,
         "quality_delta_paired": {
           "mean": -0.3625,
@@ -1643,6 +1913,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -96.2,
+          "high": -60.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 1232
+        },
         "quality_delta_points": -47.13,
         "quality_delta_paired": {
           "mean": -0.4713,
@@ -1678,6 +1954,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -90.0,
+          "high": -22.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 363
+        },
         "quality_delta_points": -28.5,
         "quality_delta_paired": {
           "mean": -0.285,
@@ -1711,6 +1993,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -76.6,
+          "high": 99.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 363
+        },
         "quality_delta_points": -39.38,
         "quality_delta_paired": {
           "mean": -0.3937,
@@ -1746,6 +2034,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -64.0,
+          "high": 108.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -18.92,
         "quality_delta_paired": {
           "mean": -0.1893,
@@ -1779,6 +2073,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -6.1,
+          "high": 414.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -29.8,
         "quality_delta_paired": {
           "mean": -0.298,
@@ -1814,6 +2114,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -80.3,
+          "high": -26.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 8
+        },
         "quality_delta_points": -19.15,
         "quality_delta_paired": {
           "mean": -0.1915,
@@ -1847,6 +2153,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -53.1,
+          "high": 101.4,
+          "n_scenarios": 20,
+          "undefined_resamples": 8
+        },
         "quality_delta_points": -30.03,
         "quality_delta_paired": {
           "mean": -0.3003,
@@ -1882,6 +2194,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -29.6,
+          "high": 147.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 9
+        },
         "quality_delta_points": -8.3,
         "quality_delta_paired": {
           "mean": -0.083,
@@ -1915,6 +2233,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 58.0,
+          "high": 565.9,
+          "n_scenarios": 20,
+          "undefined_resamples": 9
+        },
         "quality_delta_points": -19.18,
         "quality_delta_paired": {
           "mean": -0.1918,
@@ -1950,6 +2274,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -71.4,
+          "high": 23.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 10
+        },
         "quality_delta_points": -19.0,
         "quality_delta_paired": {
           "mean": -0.19,
@@ -1983,6 +2313,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -33.4,
+          "high": 239.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 10
+        },
         "quality_delta_points": -29.88,
         "quality_delta_paired": {
           "mean": -0.2987,
@@ -2018,6 +2354,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -87.4,
+          "high": -9.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 102
+        },
         "quality_delta_points": -28.75,
         "quality_delta_paired": {
           "mean": -0.2875,
@@ -2051,6 +2393,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -66.4,
+          "high": 131.7,
+          "n_scenarios": 20,
+          "undefined_resamples": 102
+        },
         "quality_delta_points": -39.62,
         "quality_delta_paired": {
           "mean": -0.3962,
@@ -2086,6 +2434,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -51.7,
+          "high": 201.0,
+          "n_scenarios": 20,
+          "undefined_resamples": 35
+        },
         "quality_delta_points": -24.32,
         "quality_delta_paired": {
           "mean": -0.2432,
@@ -2119,6 +2473,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 18.4,
+          "high": 696.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 35
+        },
         "quality_delta_points": -35.2,
         "quality_delta_paired": {
           "mean": -0.352,
@@ -2154,6 +2514,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -53.1,
+          "high": 73.5,
+          "n_scenarios": 20,
+          "undefined_resamples": 11
+        },
         "quality_delta_points": -7.5,
         "quality_delta_paired": {
           "mean": -0.075,
@@ -2187,6 +2553,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 13.2,
+          "high": 353.7,
+          "n_scenarios": 20,
+          "undefined_resamples": 11
+        },
         "quality_delta_points": -18.38,
         "quality_delta_paired": {
           "mean": -0.1837,
@@ -2222,6 +2594,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -73.4,
+          "high": -12.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -5.0,
         "quality_delta_paired": {
           "mean": -0.05,
@@ -2255,6 +2633,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -34.9,
+          "high": 115.6,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
         "quality_delta_points": -15.88,
         "quality_delta_paired": {
           "mean": -0.1588,
@@ -2298,6 +2682,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -84.9,
+          "high": -44.6,
+          "n_scenarios": 6,
+          "undefined_resamples": 158
+        },
         "quality_delta_points": 12.5,
         "quality_delta_paired": {
           "mean": 0.125,
@@ -2331,6 +2721,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 0.0,
+          "high": 0.0,
+          "n_scenarios": 6,
+          "undefined_resamples": 6
+        },
         "quality_delta_points": 0.0,
         "quality_delta_paired": {
           "mean": 0.0,
@@ -2372,6 +2768,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -84.9,
+          "high": -44.6,
+          "n_scenarios": 6,
+          "undefined_resamples": 158
+        },
         "quality_delta_points": 12.5,
         "quality_delta_paired": {
           "mean": 0.125,
@@ -2405,6 +2807,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 0.0,
+          "high": 0.0,
+          "n_scenarios": 6,
+          "undefined_resamples": 6
+        },
         "quality_delta_points": 0.0,
         "quality_delta_paired": {
           "mean": 0.0,
@@ -2447,6 +2855,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -81.8,
+          "high": -43.6,
+          "n_scenarios": 6,
+          "undefined_resamples": 158
+        },
         "quality_delta_points": 6.25,
         "quality_delta_paired": {
           "mean": 0.0625,
@@ -2480,6 +2894,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 0.0,
+          "high": 57.2,
+          "n_scenarios": 6,
+          "undefined_resamples": 6
+        },
         "quality_delta_points": -6.25,
         "quality_delta_paired": {
           "mean": -0.0625,
@@ -2522,6 +2942,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -81.8,
+          "high": -43.6,
+          "n_scenarios": 6,
+          "undefined_resamples": 158
+        },
         "quality_delta_points": 6.25,
         "quality_delta_paired": {
           "mean": 0.0625,
@@ -2555,6 +2981,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 0.0,
+          "high": 57.2,
+          "n_scenarios": 6,
+          "undefined_resamples": 6
+        },
         "quality_delta_points": -6.25,
         "quality_delta_paired": {
           "mean": -0.0625,
@@ -2597,6 +3029,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -81.8,
+          "high": -43.6,
+          "n_scenarios": 6,
+          "undefined_resamples": 158
+        },
         "quality_delta_points": 6.25,
         "quality_delta_paired": {
           "mean": 0.0625,
@@ -2630,6 +3068,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 0.0,
+          "high": 57.2,
+          "n_scenarios": 6,
+          "undefined_resamples": 6
+        },
         "quality_delta_points": -6.25,
         "quality_delta_paired": {
           "mean": -0.0625,
@@ -2671,6 +3115,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.6,
+          "high": 277.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 315
+        },
         "quality_delta_points": 3.75,
         "quality_delta_paired": {
           "mean": 0.0375,
@@ -2705,6 +3155,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 12.8,
+          "high": 1222.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 163
+        },
         "quality_delta_points": -8.75,
         "quality_delta_paired": {
           "mean": -0.0875,
@@ -2747,6 +3203,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.6,
+          "high": 277.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 315
+        },
         "quality_delta_points": 3.75,
         "quality_delta_paired": {
           "mean": 0.0375,
@@ -2781,6 +3243,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 12.8,
+          "high": 1222.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 163
+        },
         "quality_delta_points": -8.75,
         "quality_delta_paired": {
           "mean": -0.0875,
@@ -2823,6 +3291,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.6,
+          "high": 277.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 315
+        },
         "quality_delta_points": 3.75,
         "quality_delta_paired": {
           "mean": 0.0375,
@@ -2857,6 +3331,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 12.8,
+          "high": 1222.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 163
+        },
         "quality_delta_points": -8.75,
         "quality_delta_paired": {
           "mean": -0.0875,
@@ -2899,6 +3379,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -72.6,
+          "high": 277.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 315
+        },
         "quality_delta_points": 3.75,
         "quality_delta_paired": {
           "mean": 0.0375,
@@ -2933,6 +3419,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": 12.8,
+          "high": 1222.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 163
+        },
         "quality_delta_points": -8.75,
         "quality_delta_paired": {
           "mean": -0.0875,
@@ -2976,6 +3468,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -76.2,
+          "high": 203.8,
+          "n_scenarios": 6,
+          "undefined_resamples": 315
+        },
         "quality_delta_points": 1.67,
         "quality_delta_paired": {
           "mean": 0.0167,
@@ -3010,6 +3508,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -1.8,
+          "high": 930.2,
+          "n_scenarios": 6,
+          "undefined_resamples": 163
+        },
         "quality_delta_points": -10.83,
         "quality_delta_paired": {
           "mean": -0.1083,
@@ -3052,6 +3556,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -83.5,
+          "high": 70.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 170
+        },
         "quality_delta_points": -9.17,
         "quality_delta_paired": {
           "mean": -0.0917,
@@ -3086,6 +3596,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -41.7,
+          "high": 502.8,
+          "n_scenarios": 6,
+          "undefined_resamples": 18
+        },
         "quality_delta_points": -21.67,
         "quality_delta_paired": {
           "mean": -0.2167,
@@ -3128,6 +3644,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -83.5,
+          "high": 70.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 170
+        },
         "quality_delta_points": -9.17,
         "quality_delta_paired": {
           "mean": -0.0917,
@@ -3162,6 +3684,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -41.7,
+          "high": 502.8,
+          "n_scenarios": 6,
+          "undefined_resamples": 18
+        },
         "quality_delta_points": -21.67,
         "quality_delta_paired": {
           "mean": -0.2167,
@@ -3204,6 +3732,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -83.5,
+          "high": 70.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 170
+        },
         "quality_delta_points": -9.17,
         "quality_delta_paired": {
           "mean": -0.0917,
@@ -3238,6 +3772,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -41.7,
+          "high": 502.8,
+          "n_scenarios": 6,
+          "undefined_resamples": 18
+        },
         "quality_delta_points": -21.67,
         "quality_delta_paired": {
           "mean": -0.2167,
@@ -3280,6 +3820,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -83.5,
+          "high": 70.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 170
+        },
         "quality_delta_points": -9.17,
         "quality_delta_paired": {
           "mean": -0.0917,
@@ -3314,6 +3860,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -41.7,
+          "high": 502.8,
+          "n_scenarios": 6,
+          "undefined_resamples": 18
+        },
         "quality_delta_points": -21.67,
         "quality_delta_paired": {
           "mean": -0.2167,
@@ -3356,6 +3908,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -83.5,
+          "high": 70.9,
+          "n_scenarios": 6,
+          "undefined_resamples": 170
+        },
         "quality_delta_points": -9.17,
         "quality_delta_paired": {
           "mean": -0.0917,
@@ -3390,6 +3948,12 @@
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -41.7,
+          "high": 502.8,
+          "n_scenarios": 6,
+          "undefined_resamples": 18
+        },
         "quality_delta_points": -21.67,
         "quality_delta_paired": {
           "mean": -0.2167,

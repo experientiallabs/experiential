@@ -37,17 +37,20 @@ Savings behind an optimized endpoint can come from four places. Their current sh
    routerbench-ours9 (different corpus, quoted as measured there, never blended), the
    dial runs -13.9% (quality max, +1.14 pt) to -46.2% (max savings, -0.54 pt) vs ITS best
    single model.
-2. **Compression share: the cost inversion on strong models is CONFIRMED for the dumb
-   control and MILD for the learned compressor** [measured, same provenance; compressor
-   bill folded as RowOverhead. CORRECTION 2026-07-28: the first quote of this section rode
-   pre-repair matrices with outage-shaped missingness; the master's re-render flag was
-   right, and the repaired numbers moved a lot]. On the FINAL truncate arm (440/440),
-   truncation raises fable-5's effective cost **+47.1%** at -8.9 pt quality (n=20; the
-   pre-repair read was +23.6% at n=15). On the repaired llmlingua2 arm (mid-straggler-pass,
-   provisional), fable-5's inversion collapsed from the outage-inflated +146.2% to
-   **+6.7%** at -8.1 pt (n=20): the learned compressor is dramatically better than the
-   matched-keep dumb control on cost, while still not a net win on strong models (quality
-   pays). The financebench mechanism (deleting load-bearing observations fails tasks and
+2. **Compression share [measured, FINAL matrices; SIGNIFICANCE AUDIT 2026-07-28 applied]:
+   compression on tau buys no cost win and SIGNIFICANTLY hurts quality on the anchor
+   model.** With paired cluster-bootstrap CIs on the cost deltas (n=20): truncation's
+   fable-5 inversion is **+47.1%, CI -21.9 to +175.1** - the point estimate is a large
+   cost increase but the tau data alone does NOT resolve it (per-scenario cost variance is
+   huge); the independent financebench result (+21-36% on matched controls) remains the
+   resolved evidence for the inversion, and tau is directionally consistent. The learned
+   llmlingua2-endpoint's fable-5 cost delta is **+14.1%, CI -29.6 to +147.3** (unresolved),
+   while its QUALITY harm IS resolved: **-8.3 pt, CI -16.4 to -1.4**. So the defensible tau
+   statement is: compression shows no evidence of saving money on strong models and
+   measurably costs quality on the anchor; the learned compressor's cost damage is far
+   below the dumb control's in point estimate. (Earlier +146.2%/+23.6% figures were
+   pre-repair artifacts, retracted; and this section's earlier "CONFIRMED on tau" phrasing
+   overclaimed - financebench confirms, tau is consistent-but-unresolved on cost.) The financebench mechanism (deleting load-bearing observations fails tasks and
    lengthens episodes) still shows in truncate's latency column (p50 +170-480% on several
    models). Per-token accounting would have called every arm cheaper; effective cost per
    completed task catches the inversion. Compaction rungs stay "measured tradeoff, not
@@ -175,3 +178,27 @@ within a small tolerance".
 - `figures/savings_vs_fable5.png`, `figures/effective_cost_per_task.png`: [PENDING grid].
 - `numbers.json`: every computed figure with provenance and the scorecard's own
   cost-assumptions sentence per entry.
+
+## Significance audit (2026-07-28, paired cluster-bootstrap CIs on BOTH axes)
+
+What survives a CI-excludes-zero bar today, on the FINAL grid:
+
+- **RESOLVED, the headline**: routed/opus-5 vs fable-5 cost (-59.0%, CI -74.1..-39.4 at
+  n=20; routed replay -67.3%, CI -84.9..-44.6 at n=6) AND opus-5's quality gain (+10.9 pt,
+  CI +0.2..+21.9). gpt-5.5's -59.2% cost is resolved (CI -72.5..-42.6) with quality parity
+  (CI spans zero, which IS the parity claim). llmlingua2's quality harm on fable-5 is
+  resolved (-8.3 pt, CI -16.4..-1.4).
+- **UNRESOLVED at this n**: every compression COST delta on strong models (see above); the
+  routed rung's +12.5 pt quality edge over fable-5 (n=6, CI -4.2..+29.6; its claim stays
+  cost-at-parity-or-better); the kimi-k2.6 delegation's harm vs opus-5 (borderline: cost
+  CI +0.0..+57.2, quality CI -18.8..+0.0, both touching zero at n=6); everything about
+  routed-compressed-kimi-k3 beyond "no evidence it beats opus-5" (CI -41.7..+502.8).
+
+The power plan, cheap to expensive: (1) DONE - cost CIs on every delta (offline, free).
+(2) Leave-one-out CV of the fits: refit on 19, replay the held-out 1, x20 - turns the
+routed rung's n=6 into n=20 with zero episode spend (~cents of embeddings). (3) An
+episode-addendum cohort on the decision-relevant cells (test band x {opus-5, kimi-k2.6,
+fable-5 compressed} x +4 episodes ~ 240 cells ~ $120-160) to resolve the compression cost
+inversion and the delegation question on tau itself - needs a Silen cap + master cohort
+discipline. (4) The real-episode leg (planned, master's task) is the independent check,
+not a power fix (same n=20 pin).

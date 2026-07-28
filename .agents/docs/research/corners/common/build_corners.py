@@ -73,7 +73,12 @@ from palette import (  # noqa: E402
     footnote,
     save_fig,
 )
-from stats import NOISE_FLOOR_REWARD, PairedDelta, paired_delta  # noqa: E402
+from stats import (  # noqa: E402
+    BOOTSTRAP_RESAMPLES,
+    NOISE_FLOOR_REWARD,
+    PairedDelta,
+    paired_delta,
+)
 
 DEFAULT_ANCHOR = "fable-5"
 
@@ -95,6 +100,90 @@ ROUTED_DIALS = (0.0, 0.25, 0.5, 0.75, 1.0)
 # text-embedding-3-large list rate, used ONLY to estimate the router's per-query embedding
 # overhead on routed rows (labeled estimate; the pool prices carry no embedder entry).
 EMBED_LIST_USD_PER_MTOK = 0.13
+
+
+class CostDeltaCI(BaseModel):
+    """Cluster-bootstrap CI on an effective-cost delta, following the stats conventions.
+
+    Scenarios are the resampling unit (episodes within one are correlated), seeded so a
+    rerun reproduces its numbers. A resample where either side completes zero tasks has no
+    defined cost ratio; those are dropped and COUNTED, because at small n they are the
+    signal that the ratio itself is fragile, not an inconvenience to hide.
+    """
+
+    delta_percent: float
+    ci_low: float
+    ci_high: float
+    n_scenarios: int
+    resamples: int
+    undefined_resamples: int
+
+
+def _scenario_cost(rows: list, overheads: list[RowOverhead]) -> dict[str, tuple[float, int]]:
+    """Per scenario: (spend incl. overhead over scored rows, completed count)."""
+    by_key: dict[tuple[str, str, int], float] = {}
+    for o in overheads:
+        key = (o.scenario_id, o.model, o.episode)
+        by_key[key] = by_key.get(key, 0.0) + o.cost_usd
+    out: dict[str, tuple[float, int]] = {}
+    for row in rows:
+        if row.reward is None:
+            continue
+        cost = row.cost_usd + by_key.get((row.scenario_id, row.model, row.episode), 0.0)
+        spent, done = out.get(row.scenario_id, (0.0, 0))
+        out[row.scenario_id] = (spent + cost, done + int(row.success))
+    return out
+
+
+def cost_delta_ci(
+    arm: dict[str, tuple[float, int]],
+    anchor: dict[str, tuple[float, int]],
+    *,
+    resamples: int = BOOTSTRAP_RESAMPLES,
+    seed: int = 0,
+) -> CostDeltaCI | None:
+    """Paired cluster bootstrap of the effective-cost-per-completed-task percent delta.
+
+    None when the point estimate itself is undefined (a side completed nothing overall).
+    """
+    from random import Random
+
+    ids = sorted(set(arm) & set(anchor))
+    if not ids:
+        return None
+
+    def ratio(sample: list[str]) -> float | None:
+        arm_cost = sum(arm[s][0] for s in sample)
+        arm_done = sum(arm[s][1] for s in sample)
+        ref_cost = sum(anchor[s][0] for s in sample)
+        ref_done = sum(anchor[s][1] for s in sample)
+        if not arm_done or not ref_done or ref_cost == 0.0:
+            return None
+        return ((arm_cost / arm_done) - (ref_cost / ref_done)) / (ref_cost / ref_done) * 100.0
+
+    point = ratio(ids)
+    if point is None:
+        return None
+    rng = Random(seed)
+    draws: list[float] = []
+    undefined = 0
+    for _ in range(resamples):
+        value = ratio(rng.choices(ids, k=len(ids)))
+        if value is None:
+            undefined += 1
+        else:
+            draws.append(value)
+    draws.sort()
+    lo = draws[int(0.025 * len(draws))]
+    hi = draws[min(len(draws) - 1, int(0.975 * len(draws)))]
+    return CostDeltaCI(
+        delta_percent=point,
+        ci_low=lo,
+        ci_high=hi,
+        n_scenarios=len(ids),
+        resamples=resamples,
+        undefined_resamples=undefined,
+    )
 
 
 class FigureSpec(BaseModel):
@@ -125,8 +214,10 @@ class ConfigRecord(BaseModel):
     model: str
     vs_anchor: Scorecard
     vs_anchor_evidence: PairedDelta
+    vs_anchor_cost_ci: CostDeltaCI | None = None
     vs_best: Scorecard | None = None
     vs_best_evidence: PairedDelta | None = None
+    vs_best_cost_ci: CostDeltaCI | None = None
 
 
 class RoutedRecord(BaseModel):
@@ -143,8 +234,10 @@ class RoutedRecord(BaseModel):
     dial: float
     vs_anchor: Scorecard
     vs_anchor_evidence: PairedDelta
+    vs_anchor_cost_ci: CostDeltaCI | None = None
     vs_best: Scorecard | None = None
     vs_best_evidence: PairedDelta | None = None
+    vs_best_cost_ci: CostDeltaCI | None = None
     n_eval_scenarios: int
     routed_mix: dict[str, int]  # model -> scenarios routed to it
 
@@ -281,6 +374,7 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
             except ValueError as exc:
                 dataset.notes.append(f"{key}: not comparable yet ({exc})")
                 continue
+            config_cost = _scenario_cost(config.rows, config.overheads)
             record = ConfigRecord(
                 key=key,
                 arm=snapshot.name,
@@ -288,6 +382,9 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
                 vs_anchor=card,
                 vs_anchor_evidence=paired_delta(
                     config_rewards, rewards_by_scenario(anchor.rows, model=anchor_model)
+                ),
+                vs_anchor_cost_ci=cost_delta_ci(
+                    config_cost, _scenario_cost(anchor.rows, [])
                 ),
             )
             if best_anchor is not None and config.condition.key() != best_anchor.condition.key():
@@ -298,6 +395,9 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
                         rewards_by_scenario(
                             best_anchor.rows, model=best_anchor.condition.base_model
                         ),
+                    )
+                    record.vs_best_cost_ci = cost_delta_ci(
+                        config_cost, _scenario_cost(best_anchor.rows, [])
                     )
                 except ValueError as exc:
                     dataset.notes.append(f"{key} vs best-single: not comparable yet ({exc})")
@@ -394,6 +494,7 @@ def _routed_records(
                 chosen = {row.model for row in rows if row.scenario_id == sid}
                 for model in chosen:
                     mix[model] = mix.get(model, 0) + 1
+            routed_cost = _scenario_cost(rows, overheads)
             record = RoutedRecord(
                 arm=snapshot.name,
                 dial=dial,
@@ -402,6 +503,7 @@ def _routed_records(
                     routed_rewards,
                     rewards_by_scenario(anchor.rows, model=anchor.condition.base_model),
                 ),
+                vs_anchor_cost_ci=cost_delta_ci(routed_cost, _scenario_cost(anchor.rows, [])),
                 n_eval_scenarios=len(eval_ids),
                 routed_mix=mix,
             )
@@ -412,6 +514,9 @@ def _routed_records(
                     rewards_by_scenario(
                         best_anchor.rows, model=best_anchor.condition.base_model
                     ),
+                )
+                record.vs_best_cost_ci = cost_delta_ci(
+                    routed_cost, _scenario_cost(best_anchor.rows, [])
                 )
             dataset.routed.append(record)
     except Exception as exc:  # noqa: BLE001 - the runner renders what it can and names the rest
@@ -731,10 +836,10 @@ def dump_numbers(dataset: CornersDataset, lens: LensSpec) -> Path:
         "teacher_unavailable_reason": dataset.teacher_unavailable_reason,
         "records": {
             r.key: {
-                "vs_anchor": _summary(r.vs_anchor, r.vs_anchor_evidence),
+                "vs_anchor": _summary(r.vs_anchor, r.vs_anchor_evidence, r.vs_anchor_cost_ci),
                 "vs_best_single": None
                 if r.vs_best is None or r.vs_best_evidence is None
-                else _summary(r.vs_best, r.vs_best_evidence),
+                else _summary(r.vs_best, r.vs_best_evidence, r.vs_best_cost_ci),
             }
             for r in dataset.records
         },
@@ -744,10 +849,10 @@ def dump_numbers(dataset: CornersDataset, lens: LensSpec) -> Path:
                 "dial": r.dial,
                 "n_eval_scenarios": r.n_eval_scenarios,
                 "routed_mix": r.routed_mix,
-                "vs_anchor": _summary(r.vs_anchor, r.vs_anchor_evidence),
+                "vs_anchor": _summary(r.vs_anchor, r.vs_anchor_evidence, r.vs_anchor_cost_ci),
                 "vs_best_single": None
                 if r.vs_best is None or r.vs_best_evidence is None
-                else _summary(r.vs_best, r.vs_best_evidence),
+                else _summary(r.vs_best, r.vs_best_evidence, r.vs_best_cost_ci),
             }
             for r in dataset.routed
         ],
@@ -762,12 +867,22 @@ def dump_numbers(dataset: CornersDataset, lens: LensSpec) -> Path:
     return out
 
 
-def _summary(card: Scorecard, evidence: PairedDelta) -> dict[str, object]:
+def _summary(
+    card: Scorecard, evidence: PairedDelta, cost_ci: CostDeltaCI | None = None
+) -> dict[str, object]:
     """The numbers a reader needs, plus what they must never be read without."""
     return {
         "label": "measured",
         "provenance": card.provenance,
         "judge": card.judge,
+        "cost_delta_percent_ci95": None
+        if cost_ci is None
+        else {
+            "low": round(cost_ci.ci_low, 1),
+            "high": round(cost_ci.ci_high, 1),
+            "n_scenarios": cost_ci.n_scenarios,
+            "undefined_resamples": cost_ci.undefined_resamples,
+        },
         "quality_delta_points": round(card.quality_delta_points, 2),
         "quality_delta_paired": {
             "mean": round(evidence.mean_delta, 4),
