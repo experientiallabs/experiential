@@ -338,10 +338,31 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
         fontsize=7.5,
         color=MUTED,
     )
-    for record in dataset.records:
+    plotted = [r for r in dataset.records if r.vs_anchor.cost_delta_percent is not None]
+    # Selective direct labels (never a label on every point): the cost/quality Pareto
+    # frontier, the cost-inversion outliers (compression made it dearer than the anchor),
+    # and the within-noise-floor triangles. Everything else is in numbers.json.
+    def dominated(r: ConfigRecord) -> bool:
+        c, q = r.vs_anchor.cost_delta_percent, r.vs_anchor.quality_delta_points
+        return any(
+            o.vs_anchor.cost_delta_percent <= c
+            and o.vs_anchor.quality_delta_points >= q
+            and (
+                o.vs_anchor.cost_delta_percent < c or o.vs_anchor.quality_delta_points > q
+            )
+            for o in plotted
+            if o is not r and o.vs_anchor.cost_delta_percent is not None
+        )
+
+    labeled = {
+        r.key
+        for r in plotted
+        if not dominated(r)
+        or r.vs_anchor.cost_delta_percent > 0.0
+        or r.vs_anchor_evidence.within_noise_floor
+    }
+    for index, record in enumerate(plotted):
         card = record.vs_anchor
-        if card.cost_delta_percent is None:
-            continue
         marker = "^" if record.vs_anchor_evidence.within_noise_floor else "o"
         ax.scatter(
             card.cost_delta_percent,
@@ -351,14 +372,15 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
             marker=marker,
             zorder=3,
         )
-        ax.annotate(
-            f"{record.model} · p50 {card.latency.p50_model_s:.0f}s"
-            f" · n{card.scenarios_compared}",
-            xy=(card.cost_delta_percent, card.quality_delta_points),
-            xytext=(6, 4),
-            textcoords="offset points",
-            fontsize=8,
-        )
+        if record.key in labeled:
+            ax.annotate(
+                f"{record.model} · p50 {card.latency.p50_model_s:.0f}s"
+                f" · n{card.scenarios_compared}",
+                xy=(card.cost_delta_percent, card.quality_delta_points),
+                xytext=(6, 4 if index % 2 == 0 else -12),
+                textcoords="offset points",
+                fontsize=8,
+            )
     ax.axhline(0.0, color=MUTED, linewidth=0.8, linestyle=":")
     ax.axvline(0.0, color=MUTED, linewidth=0.8, linestyle=":")
     handles = [

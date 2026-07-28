@@ -35,6 +35,12 @@
       "mean_reward": 0.7333333333333333,
       "provenance": "real_episode",
       "judge": "tau2 reward (7/20 holdout tasks include tau2's NL-assertion judge)"
+    },
+    {
+      "name": "fable-5 anchor 0.447",
+      "mean_reward": 0.44749999999999995,
+      "provenance": "wm_simulated",
+      "judge": "WM verifier (see grid matrix.meta.json cohort pins)"
     }
   ],
   "stages": [
@@ -43,13 +49,16 @@
   ],
   "pending": {
     "wm_simulated": [
-      "all WM series + fable-5 anchor: identity arm matrix still merging"
+      "distill-only (WM): student per-arm sweep cells pending",
+      "+routing (WM): per-arm policy fits pending (master owns fit timing)",
+      "+compaction (WM): fits over the llmlingua2-endpoint arm pending; measured tradeoff, not recommendation"
     ],
     "real_episode": [
       "+routing / +compaction real legs: run after the master's canonical-pins runner fix"
     ]
   },
   "sources": [
-    "cycle-1 episode-rows.jsonl (180 rows) in /Users/silen/Desktop/Projects/world-model-harness/.wmo/distill-runs/tau2-cycle1"
+    "cycle-1 episode-rows.jsonl (180 rows) in /Users/silen/Desktop/Projects/world-model-harness/.wmo/distill-runs/tau2-cycle1",
+    "grid identity arm matrix (440 cells)"
   ]
 }
