@@ -1331,12 +1331,13 @@ def report(
 def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
     """The caveat for a report measured on the very matrix the policy was fitted on.
 
-    `fit` sends the user here precisely to escape its own in-sample number, and the report labels
-    its scenarios held-out, so a report over the fit matrix is the one case where both surfaces
-    say the opposite of what happened. The digest in `fitted_from` is an identity rather than a
-    label (`load_matrix_with_digest`), so the collision is detectable even when the matrix was
-    renamed or moved after the fit, and a matrix with the same path but different bytes does not
-    trip it.
+    Since the router split (#308), `build_report` excludes the policy's recorded fit scenarios,
+    so a report over the fit matrix IS held out whenever that split is recoverable - the note
+    says so, with the count. The in-sample WARNING remains only for a policy that records no
+    split and whose evidence cannot name one: those numbers retrieve their own rows. The digest
+    in `fitted_from` is an identity rather than a label (`load_matrix_with_digest`), so the
+    collision is detectable even when the matrix was renamed or moved after the fit, and a
+    matrix with the same path but different bytes does not trip it.
     """
     # `load_matrix_with_digest` appends the marker LAST, so split from the right: a matrix under a
     # content-addressed directory (`artifacts/sha256=.../matrix.json`) carries the marker in its
@@ -1345,9 +1346,26 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
     stamped = policy.fitted_from or ""
     if not mark or not digest or f"{_MATRIX_DIGEST_MARK}{digest}" not in stamped:
         return None
+    fit_ids = set(policy.fit_scenario_ids)
+    if not fit_ids and policy.kind == "knn":
+        # The same recovery `build_report` uses for legacy kNN artifacts: their evidence bank
+        # names the fit scenarios even when the policy predates recording them.
+        try:
+            fit_ids = set(policy.knn_bank().scenario_ids)
+        except (FileNotFoundError, ValueError):
+            fit_ids = set()
+    if fit_ids:
+        # Same matrix as the fit, but the report excluded the fit scenarios (the split is
+        # recorded on the policy), so the numbers above ARE held out. Say what happened instead
+        # of contradicting the report's own label.
+        return (
+            f"note: same matrix as the fit ({_MATRIX_DIGEST_MARK}{digest}); the "
+            f"{len(fit_ids)} fit scenario(s) were excluded, so the numbers above are over "
+            "held-out scenarios only."
+        )
     return (
         f"[yellow]warning[/yellow] this policy was FITTED on this matrix "
-        f"({_MATRIX_DIGEST_MARK}{digest}), so these numbers are IN-SAMPLE, not held out: every "
-        "request retrieves its own row. Sweep a second matrix over scenarios the fit never saw "
-        "and report against that one."
+        f"({_MATRIX_DIGEST_MARK}{digest}) and records no fit split, so these numbers are "
+        "IN-SAMPLE, not held out: every request retrieves its own row. Sweep a second matrix "
+        "over scenarios the fit never saw and report against that one."
     )

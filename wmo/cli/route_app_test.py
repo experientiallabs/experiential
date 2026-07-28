@@ -2936,37 +2936,36 @@ def test_route_report_creates_the_out_directory_like_fit_does(tmp_path: Path) ->
     assert json.loads(out.read_text(encoding="utf-8"))["headline"]
 
 
-def test_route_report_warns_when_it_measures_the_matrix_the_policy_was_fitted_on(
+def test_route_report_notes_the_excluded_fit_split_on_the_fit_matrix(
     tmp_path: Path,
 ) -> None:
-    """`fit` sends the user here to escape its in-sample number; report never checked.
-
-    The report even labels its scenarios held-out, so this is the one case where both surfaces
-    say the opposite of what happened. The matrix digest in `fitted_from` is an identity, so a
-    renamed copy of the fit matrix has to trip it too.
+    """Same matrix as the fit: since #308 the report excludes the fit split, so the surface says
+    "held-out with N fit scenarios excluded" rather than contradicting the report's own label.
+    The matrix digest in `fitted_from` is an identity, so a renamed copy has to trip it too.
     """
     matrix_file = _knn_matrix_file(tmp_path)
     policy_file = _fitted_knn_policy(tmp_path)
 
     result = _report(matrix_file, policy_file, tmp_path / "report.json")
     assert result.exit_code == 0, result.output
-    assert _says(result.output, "IN-SAMPLE")
+    assert _says(result.output, "fit scenario(s) were excluded")
+    assert "IN-SAMPLE" not in _flat(result.output)
 
     renamed = tmp_path / "renamed.json"
     renamed.write_bytes(matrix_file.read_bytes())
     moved = _report(renamed, policy_file, tmp_path / "report_renamed.json")
     assert moved.exit_code == 0, moved.output
-    assert _says(moved.output, "IN-SAMPLE")
+    assert _says(moved.output, "fit scenario(s) were excluded")
 
     # The provenance marker is appended LAST, so a matrix stored under a content-addressed
     # directory carries `sha256=` in its path too. Splitting from the left read THAT one and
-    # dropped the warning on exactly the layout most likely to keep a fit matrix around.
+    # dropped the caveat on exactly the layout most likely to keep a fit matrix around.
     addressed = tmp_path / "artifacts" / "sha256=deadbeef" / "matrix.json"
     addressed.parent.mkdir(parents=True)
     addressed.write_bytes(matrix_file.read_bytes())
     content_addressed = _report(addressed, policy_file, tmp_path / "report_addressed.json")
     assert content_addressed.exit_code == 0, content_addressed.output
-    assert _says(content_addressed.output, "IN-SAMPLE")
+    assert _says(content_addressed.output, "fit scenario(s) were excluded")
 
 
 def test_route_report_stays_quiet_on_a_matrix_the_fit_never_saw(tmp_path: Path) -> None:
