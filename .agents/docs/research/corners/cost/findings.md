@@ -188,6 +188,18 @@ What survives a CI-excludes-zero bar today, on the FINAL grid:
   CI +0.2..+21.9). gpt-5.5's -59.2% cost is resolved (CI -72.5..-42.6) with quality parity
   (CI spans zero, which IS the parity claim). llmlingua2's quality harm on fable-5 is
   resolved (-8.3 pt, CI -16.4..-1.4).
+- **LOO-CV UPGRADE (the power fix, run 2026-07-28)**: leave-one-out over all 20 scenarios
+  (20 fold-fits, every scenario routed by a fit that never saw it, same recipe via
+  fit_knn_policy's own scaling; ~cents embeddings). The ROUTED rung at n=20: **cost vs
+  fable-5 -57.1%, CI -72.7..-37.3 - RESOLVED**; quality +9.0 pt, CI -0.9..+19.8 (still
+  leaning-better-not-resolved: the claim stays at-least-parity). vs opus-5 the router is
+  within +4.7% cost (CI +0.0..+17.1) and -1.9 pt (CI -5.6..+0.0): cost-at-parity with
+  best-single, now at n=20. DISCOVERY REPLICATES: 20 of 20 independent fold-fits chose
+  opus-5 as fallback and routed 90-95% of held-out scenarios to it at every detent. The
+  single-split kimi-k2.6 delegation harm (+13.2%/-6.25 pt) was substantially a
+  one-scenario artifact: pooled across folds it shrinks to an unresolved +4.0%/-1.75 pt
+  drag. Dial position barely moves the LOO mix (19-18/20 opus-5 at every detent): on a
+  ~19-scenario bank the savings leg is inert, the small-bank law again.
 - **UNRESOLVED at this n**: every compression COST delta on strong models (see above); the
   routed rung's +12.5 pt quality edge over fable-5 (n=6, CI -4.2..+29.6; its claim stays
   cost-at-parity-or-better); the kimi-k2.6 delegation's harm vs opus-5 (borderline: cost

@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.core.types import JsonObject
 from wmo.optimize.compression import CompressingEmbedder
-from wmo.optimize.knn import COST_QUALITY_ANCHORS, apply_cost_quality
+from wmo.optimize.knn import COST_QUALITY_ANCHORS, apply_cost_quality, fit_knn_policy
 from wmo.optimize.policy import RoutingPolicy
 from wmo.optimize.scorecard import (
     Arm,
@@ -338,6 +338,7 @@ def build_dataset(
     root: Path | None = None,
     dataset_label: str = "tau-bench",
     judge: str = GRID_JUDGE,
+    loo: bool = False,
 ) -> CornersDataset:
     """Load once, aggregate once. Every figure below renders from this object.
 
@@ -437,6 +438,17 @@ def build_dataset(
             snapshot, anchor, best_anchor, dataset, root=root, dataset_label=dataset_label,
             judge=judge,
         )
+
+    if loo:
+        from data import grid_dir
+
+        reference_path = (root or grid_dir()) / IDENTITY_ARM / "policy.json"
+        if reference_path.exists():
+            loo_routed_records(
+                dataset, anchor, best_anchor, identity, RoutingPolicy.load(reference_path)
+            )
+        else:
+            dataset.notes.append("loo: no identity policy.json to take the recipe from")
 
     try:
         dataset.teacher = select_teacher(identity.matrix)
@@ -559,6 +571,102 @@ def _routed_records(
             dataset.routed.append(record)
     except Exception as exc:  # noqa: BLE001 - the runner renders what it can and names the rest
         dataset.notes.append(f"routed rung [{snapshot.name}]: failed ({exc})")
+
+
+def loo_routed_records(
+    dataset: CornersDataset,
+    anchor: Arm,
+    best_anchor: Arm | None,
+    snapshot: ArmSnapshot,
+    reference_policy: RoutingPolicy,
+) -> None:
+    """Leave-one-out routed rungs: every scenario measured held-out (the power fix).
+
+    For each of the matrix's scenarios, fit the SAME recipe as the reference policy on the
+    other n-1 (fit_knn_policy's own small-bank scaling reproduces the recipe at any bank
+    size; the guard/fallback is re-discovered per fold exactly as the real fit does), dial
+    it, and route only the left-out scenario. Pooled across folds this yields a routed
+    measurement on EVERY scenario, none of it seen by the fit that routed it. Banks go to a
+    temp dir, never the cohort's. Appended to `dataset.routed` as arm
+    "<arm>+loo" so downstream summaries and the n=6 single-split records stay distinct.
+    """
+    import tempfile
+
+    embedder = reference_policy.embedder.build()
+    if reference_policy.fit_compression is not None:
+        embedder = CompressingEmbedder(embedder, reference_policy.fit_compression)
+    all_ids = snapshot.matrix.scenario_ids()
+    per_dial_rows: dict[float, list] = {d: [] for d in ROUTED_DIALS}
+    with tempfile.TemporaryDirectory() as tmp:
+        for index, held_out in enumerate(all_ids):
+            fold_policy = fit_knn_policy(
+                snapshot.matrix,
+                bank_path=Path(tmp) / f"fold-{index}.bank.npz",
+                fit_ids=[sid for sid in all_ids if sid != held_out],
+                embedder=reference_policy.embedder,
+                embed_with=embedder,
+                floor_q=reference_policy.floor_q,
+            )
+            for dial in ROUTED_DIALS:
+                rows = rows_for_policy(
+                    snapshot.matrix,
+                    apply_cost_quality(fold_policy, dial),
+                    ids=[held_out],
+                    embedder=embedder,
+                )
+                per_dial_rows[dial].extend(rows)
+            dataset.embedding_replay_calls += len(all_ids) + len(ROUTED_DIALS)
+
+    for dial, rows in per_dial_rows.items():
+        overheads = [
+            RowOverhead(
+                scenario_id=row.scenario_id,
+                model=row.model,
+                episode=row.episode,
+                component="router-embedding(list-price estimate)",
+                cost_usd=len(row.task) // 4 / 1e6 * EMBED_LIST_USD_PER_MTOK,
+            )
+            for row in rows
+        ] + _compressor_overheads(rows)
+        arm = Arm(
+            name=f"routed-loo@{dial:g} [{snapshot.name}]",
+            condition=_condition(
+                "pool(routed)",
+                f"routing(knn loo dial={dial:g})",
+                dataset=dataset.dataset_label,
+                judge=dataset.judge_label,
+            ),
+            rows=rows,
+            overheads=overheads,
+        )
+        routed_rewards = _by_scenario_rewards(rows)
+        routed_cost = _scenario_cost(rows, overheads)
+        mix: dict[str, int] = {}
+        for sid in all_ids:
+            for model in {row.model for row in rows if row.scenario_id == sid}:
+                mix[model] = mix.get(model, 0) + 1
+        record = RoutedRecord(
+            arm=f"{snapshot.name}+loo",
+            dial=dial,
+            vs_anchor=build_scorecard(arm=arm, anchor=anchor),
+            vs_anchor_evidence=paired_delta(
+                routed_rewards,
+                rewards_by_scenario(anchor.rows, model=anchor.condition.base_model),
+            ),
+            vs_anchor_cost_ci=cost_delta_ci(routed_cost, _scenario_cost(anchor.rows, [])),
+            n_eval_scenarios=len(all_ids),
+            routed_mix=mix,
+        )
+        if best_anchor is not None:
+            record.vs_best = build_scorecard(arm=arm, anchor=best_anchor)
+            record.vs_best_evidence = paired_delta(
+                routed_rewards,
+                rewards_by_scenario(best_anchor.rows, model=best_anchor.condition.base_model),
+            )
+            record.vs_best_cost_ci = cost_delta_ci(
+                routed_cost, _scenario_cost(best_anchor.rows, [])
+            )
+        dataset.routed.append(record)
 
 
 def fig_dial_curve(dataset: CornersDataset, spec: FigureSpec, out: Path) -> None:
@@ -712,19 +820,20 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
         card = routed.vs_anchor
         if card.cost_delta_percent is None:
             continue
+        is_loo = routed.arm.endswith("+loo")
         ax.scatter(
             card.cost_delta_percent,
             card.quality_delta_points,
-            color=ARM_COLORS[routed.arm],
+            color=ARM_COLORS[routed.arm.removesuffix("+loo")],
             s=110,
             marker="*",
             zorder=4,
         )
         if routed.dial in (0.25, 1.0):
             ax.annotate(
-                f"routed@{routed.dial:g} · n{card.scenarios_compared}",
+                f"routed{'-loo' if is_loo else ''}@{routed.dial:g} · n{card.scenarios_compared}",
                 xy=(card.cost_delta_percent, card.quality_delta_points),
-                xytext=(6, -12),
+                xytext=(6, -12 if not is_loo else 6),
                 textcoords="offset points",
                 fontsize=8,
             )
@@ -1160,6 +1269,11 @@ def main() -> None:
     parser.add_argument("--lens", default="cost")
     parser.add_argument("--anchor", default=DEFAULT_ANCHOR)
     parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument(
+        "--loo",
+        action="store_true",
+        help="add leave-one-out routed rungs (refit per fold; every scenario held out once)",
+    )
     args = parser.parse_args()
 
     if args.lens in FROZEN_LENSES:
@@ -1179,6 +1293,7 @@ def main() -> None:
         root=Path(lens.dataset_root).expanduser() if lens.dataset_root else None,
         dataset_label=lens.dataset_label,
         judge=lens.judge_label or GRID_JUDGE,
+        loo=args.loo,
     )
     out = render_lens(lens, dataset, args.out_dir)
     numbers = dump_numbers(dataset, lens)
