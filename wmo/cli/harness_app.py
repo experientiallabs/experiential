@@ -462,7 +462,8 @@ def optimize(
         _console.print(f"  \\[{tag}] {escape(variant)}: success_rate={score:.3f} {state}")
 
     def _note(message: str) -> None:
-        # Dead proposals narrate here; scored proposals use the structured callback below.
+        # Lightweight search notes narrate dead proposals and perfect-score early stops.
+        # Scored proposals use the structured callback below.
         _console.print(f"  [dim]{message}[/dim]")
 
     def _proposal(record: ProposalRecord) -> None:
