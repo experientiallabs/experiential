@@ -1,18 +1,19 @@
 """Tests for the cross-process write lock.
 
 The lost-update guarantee is what this module exists for, and atomic replace does not provide it,
-so every test here is about two writers rather than about one failing.
+so every test here is about two writers rather than about one failing. Contending locks are taken
+through `filelock` rather than a raw `fcntl.flock`, so these tests exercise the same backend the
+module picks on whatever platform they run on.
 """
 
 from __future__ import annotations
 
-import fcntl
-import os
 import threading
 import time
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 
 from wmo.core.files import write_text_atomic
 from wmo.core.locks import FileLockTimeout, file_write_lock
@@ -20,18 +21,17 @@ from wmo.core.locks import FileLockTimeout, file_write_lock
 
 def test_file_write_lock_reports_a_stuck_holder_instead_of_hanging(tmp_path: Path) -> None:
     path = tmp_path / "roster.toml"
-    lock_path = path.with_name("roster.toml.lock")
-    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-    fcntl.flock(holder, fcntl.LOCK_EX)
+    holder = FileLock(path.with_name("roster.toml.lock"))
+    holder.acquire()
     try:
         with pytest.raises(FileLockTimeout, match=r"writing the roster at .*roster\.toml"):
             with file_write_lock(path, what="the roster", timeout_s=0.05):
                 pass  # pragma: no cover - the lock is held, so this is never reached
     finally:
-        os.close(holder)
+        holder.release()
 
-    # Once the holder is gone the lock is free again: the kernel owns that release, so a leftover
-    # lock FILE is never a held lock and cannot wedge the next run.
+    # Once the holder is gone the lock is free again: the OS owns that release, so a leftover lock
+    # FILE is never a held lock and cannot wedge the next run.
     with file_write_lock(path, what="the roster", timeout_s=0.05):
         pass
 
@@ -87,3 +87,18 @@ def test_file_write_lock_does_not_lock_the_file_being_written(tmp_path: Path) ->
 
     assert path.with_name("roster.toml.lock").is_file()
     assert path.read_text(encoding="utf-8") == "payload"
+
+
+def test_file_write_lock_is_not_reentrant_and_says_so_within_the_bound(tmp_path: Path) -> None:
+    """Nesting on one path deadlocks against itself, so it must TIME OUT rather than hang.
+
+    The docstring warns against it; this pins that the warning is the whole story, and that the
+    obvious next feature (promoting two aliases together by wrapping a locked helper twice) fails
+    fast instead of wedging a terminal.
+    """
+    path = tmp_path / "roster.toml"
+
+    with file_write_lock(path, what="the roster", timeout_s=0.05):
+        with pytest.raises(FileLockTimeout):
+            with file_write_lock(path, what="the roster", timeout_s=0.05):
+                pass  # pragma: no cover - the outer lock is held

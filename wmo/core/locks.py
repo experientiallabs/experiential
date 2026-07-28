@@ -1,30 +1,35 @@
 """The cross-process write lock for a file that is read, edited, and written back.
 
-Separate from `wmo.core.files` because this is the half that needs `fcntl`, which is Unix only.
-Atomic writing needs no locking, and `.wmo/config.toml`, `.wmo/settings.toml`, a model card, a
-fitted policy and an outcome matrix are all written whole from their source of truth, so they take
-`write_text_atomic` alone. Keeping the two in one module put `fcntl` on the import path of
-`wmo.config`, and therefore of almost every command.
+Rename atomicity (`wmo.core.files`) is what stops a reader seeing half a file. It does NOT stop
+two writers from each reading the same file, each applying an edit, and the later write erasing
+the earlier one with both commands reporting success. A roster or an alias table needs this too.
 
-Rename atomicity is what stops a reader seeing half a file. It does NOT stop two writers from each
-reading the same file, each applying an edit, and the later write erasing the earlier one with both
-commands reporting success. A roster or an alias table needs this as well.
+Kept in its own module, separate from the atomic writers, because locking is what a file that is
+edited in place needs and most of the files wmo writes are not: `.wmo/config.toml`,
+`.wmo/settings.toml`, a model card, a fitted policy, an outcome matrix and an endpoint dial are all
+rendered whole from their source of truth, so they take `write_text_atomic` alone. Folding the two
+together put this module's dependency on the import path of `wmo.config`, and therefore of almost
+every command.
+
+`filelock` rather than a direct `fcntl.flock`: it is the same advisory-lock semantics, but it
+selects `fcntl` on POSIX and `msvcrt` on Windows, so nothing here is the reason wmo cannot be
+imported on a non-POSIX platform. It is already in the resolved dependency graph (torch, datasets,
+huggingface-hub and harbor all require it) and is declared directly in `pyproject.toml` because
+this module imports it rather than inheriting it.
 """
 
 from __future__ import annotations
 
-import fcntl
-import os
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+from filelock import FileLock, Timeout
 
 # How long a writer waits for another process to finish. These writes are a few file operations,
 # so real contention never comes close; the bound exists so a hung holder is REPORTED instead of
 # hanging the terminal forever.
 DEFAULT_LOCK_TIMEOUT_S = 10.0
-_LOCK_POLL_S = 0.01
 
 
 class FileLockTimeout(RuntimeError):
@@ -46,17 +51,16 @@ def file_write_lock(
     atomic rename, which swaps the inode, so a lock taken on the file would stop protecting
     anything the moment the first writer landed.
 
-    `flock` belongs to the open file description, so the kernel drops it when the holder exits,
-    crashes, or is killed. A leftover `.lock` FILE is therefore never a held lock and can never
-    wedge a later run (which is also why it is left in place: unlinking it would let a waiter
-    block on an inode nobody else can reach). A live holder that hangs still could, so the wait is
-    bounded and reports what to do instead of blocking forever.
+    The lock is released by the OS when the holder exits, crashes, or is killed, so a leftover
+    `.lock` FILE is never a held lock and can never wedge a later run. That is also why it is left
+    in place: unlinking it would let a waiter block on an inode nobody else can reach. A live
+    holder that hangs still could, so the wait is bounded and reports what to do about it.
 
-    NOT REENTRANT. Each `with` opens its own file description, and flock conflicts between two
-    descriptions of one file even inside a single process, so nesting this on the same path blocks
-    for the full timeout and then reports a stuck OTHER process, which would be a lie. A caller
-    that wants several edits to land together (promoting `champion` and `staging` in one step)
-    must take the lock ONCE around all of them rather than calling a locked helper per edit.
+    NOT REENTRANT. Each `with` takes its own lock on the file, and two holders of one file conflict
+    even inside a single process, so nesting this on the same path blocks for the full timeout and
+    then reports a stuck OTHER process, which would be a lie. A caller that wants several edits to
+    land together (promoting `champion` and `staging` in one step) must take the lock ONCE around
+    all of them rather than calling a locked helper per edit.
 
     Args:
         path: The file being written. The lock file is created beside it.
@@ -69,31 +73,21 @@ def file_write_lock(
 
     Raises:
         FileLockTimeout: The lock was still held after `timeout_s`.
-        OSError: The lock could not be taken at all, which on a filesystem with no working
-            advisory locks (NFS without lockd, some container volume drivers) is ENOLCK.
     """
     lock_path = path.with_name(f"{path.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + timeout_s
-    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+    lock = FileLock(lock_path, timeout=timeout_s, mode=0o600)
     try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise FileLockTimeout(
-                        f"another process has been writing {what} at {path} for more than "
-                        f"{timeout_s:g}s (lock file {lock_path}); this write takes milliseconds, "
-                        "so retry, and if it keeps failing look for a stuck process holding that "
-                        "lock (the lock is released automatically when that process exits, so "
-                        "the lock file itself is never the problem)"
-                    ) from None
-                time.sleep(_LOCK_POLL_S)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        lock.acquire()
+    except Timeout:
+        raise FileLockTimeout(
+            f"another process has been writing {what} at {path} for more than "
+            f"{timeout_s:g}s (lock file {lock_path}); this write takes milliseconds, so retry, "
+            "and if it keeps failing look for a stuck process holding that lock (the lock is "
+            "released automatically when that process exits, so the lock file itself is never "
+            "the problem)"
+        ) from None
+    try:
+        yield
     finally:
-        os.close(fd)
+        lock.release()

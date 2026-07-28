@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import fcntl
 import importlib
 import itertools
 import json
-import os
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,6 +12,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from filelock import FileLock
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
@@ -984,10 +983,9 @@ def test_route_student_reports_a_busy_pool_without_claiming_it_registered(
     """
     monkeypatch.setattr(pool_module, "POOL_LOCK_TIMEOUT_S", 0.05)
     pool_file = tmp_path / "pool.toml"
-    lock_path = pool_file.with_name(f"{pool_file.name}.lock")
     pool_file.parent.mkdir(parents=True, exist_ok=True)
-    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-    fcntl.flock(holder, fcntl.LOCK_EX)
+    holder = FileLock(pool_file.with_name(f"{pool_file.name}.lock"))
+    holder.acquire()
     try:
         result = runner.invoke(
             app,
@@ -1005,7 +1003,7 @@ def test_route_student_reports_a_busy_pool_without_claiming_it_registered(
             ],
         )
     finally:
-        os.close(holder)
+        holder.release()
 
     assert result.exit_code == 1, result.output
     assert "pool busy" in result.output

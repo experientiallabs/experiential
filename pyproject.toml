@@ -7,6 +7,11 @@ readme = "README.md"
 # environment, so the whole package moves to 3.12 (deliberate 3.11 drop, noted in the PR body).
 requires-python = ">=3.12"
 dependencies = [
+    # Cross-platform advisory file locking for the durable registries wmo edits in place (the
+    # candidate pool, the harness and adapter alias tables). Declared directly because
+    # `wmo.core.locks` imports it; it was already in the resolved graph via torch/datasets/
+    # huggingface-hub/harbor. It is what keeps a Unix-only `fcntl` off wmo's import path.
+    "filelock>=3.12",
     # typer/rich/fastapi/uvicorn floors match harbor 0.20.0's requirements so the harbor
     # extra resolves against the core install without downgrades.
     "typer>=0.16",

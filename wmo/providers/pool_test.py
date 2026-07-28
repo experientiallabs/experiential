@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import subprocess
 import sys
@@ -12,6 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 from pydantic import ValidationError
 
 from wmo.core.locks import FileLockTimeout
@@ -973,19 +973,18 @@ def test_upsert_pool_entry_reports_a_stuck_writer_instead_of_hanging(tmp_path: P
     """A held lock must fail with an actionable message inside the bound, never wedge the CLI."""
     path = tmp_path / "pool.toml"
     path.write_text(_COMMENTED_POOL, encoding="utf-8")
-    lock_path = path.with_name(f"{path.name}.lock")
-    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-    fcntl.flock(holder, fcntl.LOCK_EX)
+    holder = FileLock(path.with_name(f"{path.name}.lock"))
+    holder.acquire()
     try:
         with pytest.raises(FileLockTimeout, match=r"writing the model pool at .*pool\.toml"):
             upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05)
     finally:
-        os.close(holder)
+        holder.release()
 
     assert [entry.name for entry in load_pool(path).models] == ["gpt-5.5", "haiku"]  # untouched
     assert list(tmp_path.glob("*.tmp")) == []
-    # Once the holder is gone the lock is free again: the kernel owns that release, so a leftover
-    # lock FILE is never a held lock and cannot wedge the next run.
+    # Once the holder is gone the lock is free again: the OS owns that release, so a leftover lock
+    # FILE is never a held lock and cannot wedge the next run.
     assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05).replaced is False
 
 
