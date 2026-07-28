@@ -28,7 +28,7 @@ from wmo.harness.population import CandidateProposal, EvaluatedCandidate, candid
 from wmo.harness.proposer import ProviderDeltaProposer
 from wmo.harness.scoring import ScoreCell, ScoreReport, ScoreRequest
 from wmo.harness.source_tree import HarnessSourceFile, HarnessSourceTree
-from wmo.harness.store import HarnessStore
+from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 # The Typer object `harness_app` shadows the submodule name on plain attribute access; go
@@ -298,6 +298,8 @@ def test_create_default_local_loads_the_world_model(
     assert call["eval_concurrency"] is None  # backend default decided downstream (local -> 1)
     assert call["e2b_template"] is None
     flat = " ".join(result.output.split())
+    assert HarnessStore(project_root / ".wmo").versions("made") == [1]
+    assert "created made v1 (champion)" in flat
     assert "world model" in flat and "wm-alpha" in flat
     assert "sandbox" not in flat  # no sandbox note on the local path
     expected = shlex.join(
@@ -319,6 +321,44 @@ def test_create_default_local_loads_the_world_model(
     )
     assert expected in flat
     assert "--harness-backend" not in flat  # and the run-it hint stays plain
+
+
+def test_unchanged_search_reuses_the_destination_champion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-gain run must not append an identical immutable version."""
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+    store = HarnessStore(tmp_path / ".wmo")
+    original = store.save_version(HarnessDoc.baseline("made"), alias=CHAMPION_ALIAS)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert store.versions("made") == [original.version]
+    assert store.aliases("made") == {CHAMPION_ALIAS: original.version}
+    flat = " ".join(result.output.split())
+    assert "unchanged made v1 (champion)" in flat
+    assert "created made" not in flat
+
+
+def test_unchanged_search_publishes_when_the_destination_has_no_champion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Latest is only a load fallback, not an existing champion publication."""
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+    store = HarnessStore(tmp_path / ".wmo")
+    store.save_version(HarnessDoc.baseline("made"))
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert store.versions("made") == [1, 2]
+    assert store.aliases("made") == {CHAMPION_ALIAS: 2}
+    assert "created made v2 (champion)" in " ".join(result.output.split())
 
 
 def test_optimize_accepts_world_model_as_second_argument(
