@@ -507,12 +507,15 @@ def run_build_wizard(
         # stamped on (mirrors HarnessConfig.embed_provider_config).
         console.print(f"verifying embed:{embed_provider}…")
         ping = check_embed(
-            ProviderConfig(
-                kind=ProviderKind(embed_provider),
-                model=embed_model,
-                embed_model=embed_model,
-                embed_dim=defaults.embed_dim,
-                region=region if embed_provider == "bedrock" else None,
+            inherit_provider_connection(
+                ProviderConfig(
+                    kind=ProviderKind(embed_provider),
+                    model=embed_model,
+                    embed_model=embed_model,
+                    embed_dim=defaults.embed_dim,
+                    region=region if embed_provider == "bedrock" else None,
+                ),
+                configured_provider,
             )
         )
         if ping.ok:

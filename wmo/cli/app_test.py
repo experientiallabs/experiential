@@ -247,6 +247,38 @@ def test_build_does_not_validate_an_unrelated_model_role(
     assert config.serve_provider is ProviderKind.OPENAI
 
 
+def test_explicit_build_provider_ignores_an_invalid_configured_worker(
+    patched_provider: None, tmp_path: Path
+) -> None:
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="bogus", model="stale")
+    save_settings(settings, root)
+
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "explicit-provider",
+            "--file",
+            _traces_file(tmp_path),
+            "--provider",
+            "bedrock",
+            "--model",
+            "claude-haiku-4-5",
+            "--fidelity",
+            "low",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = load_config(root / "models" / "explicit-provider")
+    assert config.serve_provider is ProviderKind.BEDROCK
+
+
 def test_build_explicit_model_keeps_configured_azure_connection(
     patched_provider: None, tmp_path: Path
 ) -> None:
@@ -2057,12 +2089,18 @@ def test_build_wizard_verifies_the_configured_custom_endpoint(
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("WMO_ENDPOINT_API_KEY", "endpoint-key")
     verified: list[ProviderConfig] = []
+    verified_embedders: list[ProviderConfig] = []
 
     def verify(configs: list[ProviderConfig]) -> list[VerifyResult]:
         verified.extend(configs)
         return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
 
+    def verify_embedder(config: ProviderConfig) -> VerifyResult:
+        verified_embedders.append(config)
+        return VerifyResult(ok=True, kind=config.kind, model=config.model)
+
     monkeypatch.setattr(ui_module, "verify_all", verify)
+    monkeypatch.setattr(ui_module, "verify_embedder", verify_embedder)
     answers = "\n".join(
         [
             "wizard-custom",
@@ -2072,7 +2110,8 @@ def test_build_wizard_verifies_the_configured_custom_endpoint(
             "",
             "",
             "1",
-            "1",
+            "2",
+            "",
         ]
     )
 
@@ -2087,8 +2126,12 @@ def test_build_wizard_verifies_the_configured_custom_endpoint(
     assert len(verified) == 2
     assert all(config.kind is ProviderKind.OPENAI for config in verified)
     assert all(config.endpoint == endpoint for config in verified)
+    [embedder] = verified_embedders
+    assert embedder.kind is ProviderKind.OPENAI
+    assert embedder.endpoint == endpoint
     config = load_config(root / "models" / "wizard-custom")
     assert config.serve_provider_config().endpoint == endpoint
+    assert config.embed_provider_config().endpoint == endpoint
 
 
 def test_build_non_interactive_without_source_errors(tmp_path) -> None:  # noqa: ANN001
