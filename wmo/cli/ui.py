@@ -53,6 +53,7 @@ from wmo.core.types import Action, ActionKind, Session
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT
 from wmo.engine.play import PlayTurn, parse_action, play_turn
 from wmo.engine.world_model import WorldModel
+from wmo.hub import corpus_path
 from wmo.providers import verify_all, verify_embedder
 from wmo.providers.base import ProviderConfig, ProviderKind, VerifyResult
 from wmo.providers.models import resolve_provider_model
@@ -223,7 +224,10 @@ def _collect_source(
             ask,
             f"Path to the {source} export to ingest",
             None,
-            example="packages/environment-capture/tau-bench/traces.otel.jsonl",
+            # Where `wmo download tau-bench` would put a corpus HERE: the checkout's benchmark
+            # dir in a clone, `./environment-capture-data/` after a pip install. A hardcoded
+            # `packages/...` path is a dead end for everyone who installed the wheel.
+            example=str(corpus_path("tau-bench")),
         )
         if not file:
             console.print("[red]a trace export path is required[/red]")

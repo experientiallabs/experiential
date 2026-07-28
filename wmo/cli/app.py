@@ -26,12 +26,6 @@ from uuid import uuid4
 
 import typer
 import uvicorn
-from environment_capture.hub import (
-    CORPORA,
-    corpus_path,
-    fetch_corpus,
-    published_corpora,
-)
 from llm_waterfall import is_capacity_error
 from pydantic import ValidationError
 from rich.console import Console
@@ -103,6 +97,7 @@ from wmo.env.llm_agent import LLMAgent
 from wmo.evals.grid import GridResult, ModelSpec, merge_results, run_grid
 from wmo.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmo.evals.open_loop import EvalReport, OpenLoopEval
+from wmo.hub import CORPORA, CorpusSpec, corpus_path, data_root, fetch_corpus, published_corpora
 from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.ingest.base import load_payloads
 from wmo.ingest.detect import detect_format
@@ -1226,9 +1221,7 @@ def download(
             # One unpublished/broken dataset must not abort the REST of a multi-download:
             # record it, keep fetching, and fail (with every name) at the end. The reason is
             # quoted rather than summarized here: a fetch tries more than one dataset repo id
-            # and only the error it raises knows which ones the Hub refused. Reading it off
-            # plain HTTPError attributes keeps this working against the PUBLISHED
-            # environment-capture, which the WMO wheel resolves from PyPI.
+            # and only the error it raises knows which ones the Hub refused.
             failures.append(f"{name}: the Hub answered {exc.code} for {exc.url} ({exc.reason})")
             _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
             continue
@@ -1284,7 +1277,7 @@ def serve(
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
     Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root packages/environment-capture/tau-bench`). Two surfaces are
+    (e.g. `--root .wmo --root ../other-project/.wmo`). Two surfaces are
     exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
     `.../step`; and, for every served model whose dir carries a `policy.json` (written by
     `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint
@@ -1702,22 +1695,18 @@ def _no_suites_hint(examples_roots: list[str]) -> str:
     )
 
 
-def _fetch_writes(path: Path, spec: object | None, fetched: Path | None) -> bool:
+def _fetch_writes(path: Path, spec: CorpusSpec | None, fetched: Path | None) -> bool:
     """Would `wmo download <benchmark>` put a file at `path`?
 
     `fetch_corpus` writes the canonical corpus file plus whatever lives under the benchmark's
-    registered `data_dirs`, and nothing else — not every path in the bundle dir. `data_dirs` is
-    read defensively for the same reason as `published`: the wheel resolves environment-capture
-    from PyPI, so the installed member may predate the field, and guessing "nothing but the
-    corpus" errs toward naming a file the fetch would have produced rather than promising one
-    it never will.
+    registered `data_dirs`, and nothing else — not every path in the bundle dir.
     """
-    if fetched is None:
+    if fetched is None or spec is None:
         return False
     if path == fetched.resolve():
         return True
     bundle = fetched.parent.resolve()
-    return any(path.is_relative_to(bundle / name) for name in getattr(spec, "data_dirs", ()))
+    return any(path.is_relative_to(bundle / name) for name in spec.data_dirs)
 
 
 def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
@@ -1733,10 +1722,7 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
 
     A registry entry can also outrun the Hub push (`kimi-gui-control` ships a suite whose bundle
     was never published), and naming `wmo download` for one of those sends the user at a command
-    that refuses them. `CorpusSpec.published` answers that, but it postdates environment-capture
-    0.1.0 — the version the wheel still resolves from PyPI — so it is read defensively: a member
-    that predates the field keeps the old assume-downloadable behaviour instead of raising
-    `AttributeError` inside the error path.
+    that refuses them. `CorpusSpec.published` answers that.
 
     A suite may list several `files`, and a fetch writes exactly two things: the canonical corpus
     file, and the payloads under the benchmark's registered `data_dirs`. Anything else the suite
@@ -1756,7 +1742,7 @@ def _suite_corpus_files(suite: EvalSuite) -> list[Path]:
         resolved = [path.resolve() for path in missing]
         on_path = fetched is not None and fetched.resolve() in resolved
         elsewhere = [p for p in resolved if not _fetch_writes(p, spec, fetched)]
-        if on_path and getattr(spec, "published", True):
+        if on_path and spec is not None and spec.published:
             remedy = (
                 f"fetch the bundle with `wmo download {suite.example}` (or `wmo download` with "
                 "no arguments to pick from what is published)"
@@ -3031,14 +3017,12 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
 def _bundle_root() -> Path:
     """The dir `wmo download` lands benchmark bundles in (`<root>/<benchmark>/...`).
 
-    Read off `corpus_path`, environment-capture's published "is it local, and where" resolver,
-    which already handles `$ENVCAP_DATA_ROOT`, a repo checkout, and an installed wheel (bundles
-    land in `./environment-capture-data/`, never inside site-packages). Deriving it keeps one
-    source of truth and stays inside the API the PUBLISHED member exposes: outside this
-    workspace `environment-capture` resolves from PyPI, so `wmo` cannot reach for a helper that
-    only exists in the checkout's copy of it.
+    `wmo.hub.data_root` is the one resolver for this: it already handles `$ENVCAP_DATA_ROOT`, a
+    repo checkout, and an installed wheel (bundles land in `./environment-capture-data/`, never
+    inside site-packages). Kept as a named seam because discovery, the empty-listing hint, and
+    their tests all pivot on it.
     """
-    return corpus_path("any-benchmark").parent.parent
+    return data_root()
 
 
 def _benchmark_roots() -> tuple[Path, ...]:

@@ -30,6 +30,7 @@ ALLOWED_TOP_DIRS = {
     ".github",
     "packages",  # monorepo workspace members live here (AGENTS.md § Monorepo)
     "deploy",  # service deployments we operate ourselves (AGENTS.md rule 5)
+    "contracts",  # cross-package contract tests, owned by neither tree (AGENTS.md § Monorepo)
 }
 
 
@@ -159,6 +160,51 @@ def test_no_tracked_file_is_matched_by_ignore_rules() -> None:
     assert not offenders, (
         f"tracked files matched by ignore rules: {offenders[:5]}; fix the .gitignore pattern "
         "(add a ! negation or narrow the glob) so tracked artifacts stay re-addable"
+    )
+
+
+def _bundled_import_packages() -> set[str]:
+    """Import packages the flagship wheel physically ships (from the hatch wheel config)."""
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        root = tomllib.load(fh)
+    shipped = root["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
+    return {Path(entry).name for entry in shipped}
+
+
+def test_wmo_imports_no_workspace_member_it_does_not_ship() -> None:
+    """`pip install world-model-optimizer` must pull in nothing from `packages/`.
+
+    `llm_waterfall` is the documented exception because the wheel BUNDLES it, so importing it is
+    importing our own shipped code. Every other member is a separate distribution: importing one
+    puts it back in `Requires-Dist`, which couples every `wmo` release to a member release and
+    strands the member's unreleased fixes (that is exactly what happened to the `wmh-`/`wmo-`
+    dataset-name fallback, now vendored in `wmo/hub.py`). Tests count too — a test import is
+    still an import of the member, and cross-package contract tests belong in `contracts/`,
+    which is owned by neither tree.
+    """
+    forbidden = sorted(
+        {
+            package.name
+            for member in _workspace_member_dirs()
+            for package in member.iterdir()
+            if package.is_dir() and (package / "__init__.py").is_file()
+        }
+        - _bundled_import_packages()
+    )
+    assert forbidden, "this test is meaningless if every member is bundled into the wheel"
+    pattern = re.compile(rf"^\s*(?:from|import)\s+({'|'.join(forbidden)})\b", re.MULTILINE)
+    offenders = sorted(
+        f"{path}: {match.group(1)}"
+        for path in _tracked_files()
+        if path.startswith("wmo/")
+        and path.endswith(".py")
+        and (REPO_ROOT / path).is_file()  # tolerate uncommitted deletes/renames mid-edit
+        for match in pattern.finditer((REPO_ROOT / path).read_text(encoding="utf-8"))
+    )
+    assert not offenders, (
+        f"wmo/ imports workspace members the wheel does not ship: {offenders}; vendor what the "
+        "flagship needs, or move a cross-package contract test into contracts/ "
+        "(AGENTS.md § Monorepo)"
     )
 
 

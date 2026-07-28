@@ -1,8 +1,15 @@
 """Round-trip test: environment-capture's emitted spans parse through the real ingest adapter.
 
-Lives on the wmo side of the workspace boundary (flagship -> member is the legal dependency
-direction; members never import wmo). Pins the OTel GenAI wire format against its actual
-consumer — this is the acceptance contract the future standalone package must keep.
+`environment_capture.otel` writes OTel GenAI span JSONL; `wmo.ingest.otel_genai` reads it. There
+is no longer any code dependency between the two — `wmo` vendors the bundle-fetch core it used
+to import (`wmo/hub.py`) and the wheel carries no `environment-capture` requirement — but the
+WIRE format is still a shared contract, and drift in it fails silently on users: the producer
+keeps writing, the consumer keeps parsing, and the fields just stop lining up.
+
+That is why this file lives in `contracts/` and not in either tree. It imports BOTH packages, so
+it cannot sit under `wmo/` (which must import nothing from `packages/`) or under
+`packages/environment-capture/` (members never import `wmo`). It belongs to neither party; it
+belongs to the boundary. See AGENTS.md § Monorepo.
 """
 
 from __future__ import annotations

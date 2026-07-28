@@ -77,7 +77,9 @@ uv run wmo build \
 ```
 
 `wmo download` fetches the published data bundle (trace corpus plus task data) into
-`packages/environment-capture/tau-bench/`; run it with no arguments for a picker over everything
+`packages/environment-capture/tau-bench/` — that is where it lands in this checkout; from a
+`pip install` it lands in `environment-capture-data/tau-bench/` under the current directory, and
+`ENVCAP_DATA_ROOT` overrides both. Run it with no arguments for a picker over everything
 published. `--source` defaults to `otel-genai`, which is what that corpus is. Traces from an
 observability stack (Phoenix, Langfuse, LangSmith, Braintrust, PostHog, Mastra) go through the
 same command with `--source <name>`, or through `wmo ingest` first.

@@ -36,6 +36,7 @@ from wmo.config import (
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 from wmo.engine.eval_suites import EvalSuiteConfig
+from wmo.hub import CorpusRepoUnavailable, PublishedCorpus, candidate_repo_ids
 from wmo.ingest import VendorPull
 from wmo.providers.base import (
     Completion,
@@ -629,14 +630,17 @@ def test_config_help_does_not_reuse_the_harness_group_name() -> None:
 
 
 def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
-    # The OpenAI-compatible surface is what README step 3 exists for, and examples/tau-bench
-    # moved to packages/environment-capture/ — the help must name both correctly.
+    # The OpenAI-compatible surface is what README step 3 exists for. The extra-root example
+    # must be one a pip user can actually have: `packages/environment-capture/tau-bench` (and
+    # `examples/tau-bench` before it) exists only in a git checkout, and `--root` takes a
+    # PROJECT dir (one holding `models/`), not a benchmark bundle dir.
     result = runner.invoke(app, ["serve", "--help"])
     assert result.exit_code == 0, result.output
     output = _flat(result.output)
     assert "/v1/chat/completions" in output
     assert "examples/tau-bench" not in output
-    assert "packages/environment-capture/tau-bench" in output
+    assert "packages/environment-capture" not in output
+    assert ".wmo" in output
 
 
 def test_benchmark_roots_include_the_download_destination(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -2068,26 +2072,6 @@ def test_missing_corpus_for_an_unpublished_bundle_does_not_promise_a_download(
     assert "has no trace corpus" in flat
     assert "has not been published to the Hub yet" in flat
     assert "wmo download kimi-gui-control" not in flat
-
-
-def test_unpublished_remedy_survives_a_corpus_spec_without_the_published_field(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The wheel resolves environment-capture from PyPI, which still serves a `CorpusSpec` with no
-    # `published` field. Reading it must not raise from inside the error path: an older member
-    # keeps the assume-downloadable behaviour.
-    examples_root = tmp_path / "environment-capture-data"
-    _tau_bench_suite(examples_root)
-    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(examples_root))
-
-    class _OldSpec:
-        """environment-capture 0.1.0's CorpusSpec: no `published` attribute at all."""
-
-    monkeypatch.setitem(cli_app_module.CORPORA, "tau-bench", _OldSpec())
-
-    result = runner.invoke(app, ["eval", "run", "tau-bench", "--examples-root", str(examples_root)])
-    assert result.exit_code == 2, result.output
-    assert "wmo download tau-bench" in _flat(result.output)
 
 
 def test_missing_corpus_outside_the_bundle_root_does_not_promise_a_download(
@@ -3598,14 +3582,12 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
 
 
 def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    # A fetch now tries more than one dataset repo name (the wmh -> wmo rename), so a bare
-    # "404" cannot be acted on: the report must say which ids were looked for. The CLI reads
-    # that off plain HTTPError attributes (no import of the newer member symbol), so this also
-    # covers the wheel, which resolves environment-capture from PyPI.
+    # A fetch tries more than one dataset repo name (the wmh -> wmo rename), so a bare "404"
+    # cannot be acted on: the report must say which ids were looked for. The CLI reads that off
+    # plain HTTPError attributes rather than the subclass, so a caller that catches the base
+    # `HTTPError` still sees every id.
     import urllib.error
     from http.client import HTTPMessage
-
-    from environment_capture.hub import CorpusRepoUnavailable, candidate_repo_ids
 
     attempts = [
         (repo_id, urllib.error.HTTPError(f"https://hub/{repo_id}", 404, "nf", HTTPMessage(), None))
@@ -3634,8 +3616,6 @@ def test_download_picker_lists_published_and_fetches_choice(
     monkeypatch,  # noqa: ANN001
     tmp_path: Path,
 ) -> None:
-    from environment_capture.hub import PublishedCorpus
-
     published = [
         PublishedCorpus(
             benchmark="gaia2",

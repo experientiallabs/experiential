@@ -20,11 +20,6 @@ dependencies = [
     "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
-    # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
-    # read core behind `wmo download` (stdlib-only; pushing needs the member's fetch extra).
-    # RELEASE ORDER: environment-capture must be published to PyPI before any wmo release —
-    # outside the workspace this dependency resolves from PyPI, not [tool.uv.sources].
-    "environment-capture",
     "gepa>=0.1.1",
     "tomli-w>=1.0",  # writing .wmo/config.toml (stdlib tomllib reads); every `wmo build` needs it
     "posthog>=7.0",
@@ -79,11 +74,13 @@ dev = [
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests. Both members have graduated to [project.dependencies] —
-# environment-capture when `wmo download` started consuming it, llm-waterfall when
-# wmo.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
-# members' heavy extras. The flagship wheel includes llm_waterfall's import package, while the
-# workspace dependency keeps its own metadata and extras available for development and testing.
+# gate covers their tests and `contracts/` can import both sides of a cross-package contract.
+# A dependency GROUP is not published metadata, so nothing here reaches a `pip install
+# world-model-optimizer`: `environment-capture` is a development dependency only, and `wmo/`
+# imports nothing from it (`wmo/hub.py` vendors the bundle-fetch core `wmo download` needs).
+# llm-waterfall IS a runtime import of `wmo`, bundled into the flagship wheel rather than
+# declared as a requirement; the group keeps its own metadata and extras available for
+# development and testing.
 dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]
@@ -105,7 +102,7 @@ force-include = { "packages/llm-waterfall/LICENSE" = "llm_waterfall/LICENSE" }
 
 [tool.hatch.build.targets.sdist]
 # Publish one flagship distribution. llm_waterfall is bundled because WMO imports it as a core
-# implementation module; the environment-capture dependency already resolves from PyPI.
+# implementation module; nothing else under packages/ is a dependency of the flagship.
 include = [
     "/wmo",
     "/packages/llm-waterfall/llm_waterfall",
@@ -122,6 +119,10 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 # Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
+# Both entries now serve the `dev` dependency group only — neither member is a runtime
+# requirement of the published wheel — but the mapping must stay: without it `uv sync` would
+# resolve `environment-capture` from PyPI, where the latest release is 0.1.0 and predates
+# everything the workspace develops against.
 llm-waterfall = { workspace = true }
 environment-capture = { workspace = true }
 
@@ -131,7 +132,9 @@ python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
 # `deploy/` carries the operated services; their tests cover the deploy scripts themselves
 # (a deploy that deletes the box's generated trees rotates the pinned TLS certificate).
-testpaths = ["wmo", "packages", "deploy"]
+# `contracts/` holds cross-package contract tests, which belong to neither tree because they
+# import both (AGENTS.md § Monorepo) — without this entry they would silently stop running.
+testpaths = ["wmo", "packages", "deploy", "contracts"]
 # tau2-bench is a local clone of the external real-environment runner (own test suite, own
 # deps) that lives beside the tau-bench member data; it is not part of this gate.
 norecursedirs = ["tau2-bench"]
