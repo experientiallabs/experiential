@@ -49,7 +49,13 @@ from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
 # mode-inapplicable flags exactly the way `wmo optimize harness` already does.
 from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
-from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
+from wmo.cli.model_roles import (
+    DEFAULT_AZURE_API_VERSION,
+    configured_role_configs,
+    configured_role_provider_config,
+    inherit_provider_connection,
+    load_settings_or_abort,
+)
 from wmo.cli.platform_cmds import register as register_platform_commands
 from wmo.cli.ui import (
     BuildParams,
@@ -267,7 +273,7 @@ def _worker_provider_config(
         config = config.model_copy(
             update={
                 "deployment": deployment,
-                "api_version": api_version or "2024-05-01-preview",
+                "api_version": api_version or DEFAULT_AZURE_API_VERSION,
             }
         )
     return config
@@ -336,11 +342,17 @@ def providers_set(
         _provider_kind(provider)
     existing = load_settings_or_abort(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
+    config: ProviderConfig | None = None
     if used_picker:
         existing_azure_deployment = (
             existing.deployment if existing is not None and existing.provider == "azure" else None
         )
-        provider, model, region, deployment = select_provider_and_model(
+        existing_provider = (
+            configured_role_provider_config(existing, role="worker")
+            if existing is not None
+            else None
+        )
+        config = select_provider_and_model(
             _console,
             lambda text: _console.input(text),
             lambda text: _console.input(text, password=True),
@@ -351,21 +363,16 @@ def providers_set(
             default_deployment_model=(
                 existing.model if deployment is None and existing_azure_deployment else None
             ),
-            ask_azure_deployment=True,
             interactive=True,
-            check=lambda cfg: verify_all(
-                [
-                    _worker_provider_config(
-                        cfg.kind.value,
-                        cfg.model_type or cfg.model,
-                        cfg.region,
-                        endpoint=endpoint,
-                        deployment=cfg.deployment,
-                        api_version=api_version,
-                    )
-                ]
-            )[0],
+            check=lambda cfg: verify_all([cfg])[0],
+            configured_provider=existing_provider,
+            endpoint=endpoint,
+            api_version=api_version,
         )
+        provider = config.kind.value
+        model = config.model_type or config.model
+        region = config.region
+        deployment = config.deployment
     if provider is None or model is None:
         raise typer.BadParameter(
             "provide --provider and --model, or run `wmo providers set` in a terminal"
@@ -375,14 +382,15 @@ def providers_set(
             "--deployment is required for Azure because deployment names are operator-created "
             "and cannot be inferred from --model"
         )
-    config = _worker_provider_config(
-        provider,
-        model,
-        region,
-        endpoint=endpoint,
-        deployment=deployment,
-        api_version=api_version,
-    )
+    if config is None:
+        config = _worker_provider_config(
+            provider,
+            model,
+            region,
+            endpoint=endpoint,
+            deployment=deployment,
+            api_version=api_version,
+        )
     if not used_picker:
         result = verify_all([config])[0]
         if not result.ok:
@@ -810,6 +818,11 @@ def build(
     use_configured_worker = configured_worker is not None and (
         provider is None or provider == configured_worker.provider
     )
+    configured_worker_config = (
+        configured_role_provider_config(configured_worker, role="worker")
+        if use_configured_worker and configured_worker is not None
+        else None
+    )
     # Settle the serve provider here so the model default can follow it. A single hard-coded
     # Anthropic default wrote artifacts configured to call e.g. OpenAI with `claude-opus-4-8`.
     resolved_provider = (
@@ -825,6 +838,19 @@ def build(
             f"--provider {resolved_provider} has no default serve model: pass `--model <id>` "
             f"(`wmo build --provider {resolved_provider} --model <id> --file <export>`)"
         )
+    default_provider_config = inherit_provider_connection(
+        _provider_config(
+            resolved_provider,
+            resolved_model or "",
+            region
+            or (
+                configured_worker.region
+                if use_configured_worker and configured_worker is not None
+                else None
+            ),
+        ),
+        configured_worker_config,
+    )
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
         source=source,
@@ -842,6 +868,9 @@ def build(
             region
             or (configured_worker.region if use_configured_worker and configured_worker else None)
         ),
+        endpoint=default_provider_config.endpoint,
+        deployment=default_provider_config.deployment,
+        api_version=default_provider_config.api_version,
         fidelity=fidelity,
         train_split=train_split,
         judge_model=judge_model,
@@ -850,7 +879,22 @@ def build(
         embed_dim=embed_dim,
     )
     if use_wizard:
-        params = run_build_wizard(_console, params)
+        params = run_build_wizard(
+            _console,
+            params,
+            configured_provider=configured_worker_config,
+        )
+        if (
+            configured_worker_config is not None
+            and params.provider != configured_worker_config.kind.value
+        ):
+            params = params.model_copy(
+                update={
+                    "endpoint": None,
+                    "deployment": None,
+                    "api_version": None,
+                }
+            )
     elif params.file is None and not params.pull:
         # This guard also required `name is None`, so `wmo build --name x` (verbatim the
         # empty-state hint `wmo list` prints) fell through to a raw ValueError from the ingest
@@ -867,12 +911,6 @@ def build(
         raise typer.BadParameter(f"--limit must be at least 1, got {params.limit}")
     # The wizard always resolves a provider; the flag path keeps its historical default.
     params.provider = params.provider or _BUILD_PROVIDER
-    # The wizard may replace the configured worker's provider. Re-evaluate the match before
-    # carrying provider-specific connection fields into the build config.
-    use_configured_worker = (
-        configured_worker is not None and params.provider == configured_worker.provider
-    )
-
     # Flag-supplied names get the same whitespace-to-dash normalization as the wizard.
     params.name = normalize_name(params.name)
     try:
@@ -928,14 +966,13 @@ def build(
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
         trace_adapter=params.source,
     )
-    if use_configured_worker and configured_worker is not None:
-        config.providers[0] = config.providers[0].model_copy(
-            update={
-                "endpoint": configured_worker.endpoint,
-                "deployment": configured_worker.deployment,
-                "api_version": configured_worker.api_version,
-            }
-        )
+    config.providers[0] = config.providers[0].model_copy(
+        update={
+            "endpoint": params.endpoint,
+            "deployment": params.deployment,
+            "api_version": params.api_version,
+        }
+    )
     if grounder not in GROUNDER_KINDS:
         raise typer.BadParameter(
             f"unknown grounder {grounder!r}; choose one of: {', '.join(GROUNDER_KINDS)}"
@@ -2691,7 +2728,7 @@ def demo(
             # failed step — completed steps stay done.
             _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
             _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
-            provider_name, model_type, region, _deployment = select_provider_and_model(
+            switched = select_provider_and_model(
                 _console,
                 lambda text: _console.input(text),
                 lambda text: _console.input(text, password=True),
@@ -2701,7 +2738,8 @@ def demo(
                 interactive=True,
                 check=lambda cfg: verify_all([cfg])[0],
             )
-            switched = _provider_config(provider_name, model_type, region)
+            provider_name = switched.kind.value
+            model_type = switched.model_type or switched.model
             provider = wrap_provider_with_retries(
                 providers.get_provider(switched), on_retry=_NARRATOR.on_retry, sleep=_NARRATOR.sleep
             )

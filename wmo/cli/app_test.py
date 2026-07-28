@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import inspect
+import io
 import json
 import os
 import subprocess
@@ -17,6 +18,7 @@ from typing import cast
 import pytest
 import typer
 from pydantic import ValidationError
+from rich.console import Console
 from typer.testing import CliRunner
 
 from wmo.cli import app, pool_registry
@@ -56,6 +58,7 @@ from wmo.tracking.pricing import ModelPrice
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
 # plain `import wmo.cli.app as ...`; go through importlib to monkeypatch module globals.
 cli_app_module = importlib.import_module("wmo.cli.app")
+ui_module = importlib.import_module("wmo.cli.ui")
 
 runner = CliRunner()
 
@@ -274,7 +277,8 @@ def test_build_wizard_does_not_reuse_connection_for_changed_provider(
     )
     save_settings(settings, root)
 
-    def switch_provider(_console, params):  # noqa: ANN001, ANN202
+    def switch_provider(_console, params, *, configured_provider):  # noqa: ANN001, ANN202
+        assert configured_provider is not None
         return params.model_copy(
             update={
                 "name": "wizard-switch",
@@ -835,6 +839,78 @@ def test_demo_off_a_terminal_calls_an_outage_an_outage(
     assert "wmoprovidersverify" not in flat  # it would only re-report the same outage
 
 
+def test_demo_recovery_uses_the_exact_verified_azure_config(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The capacity picker result must reach the replacement provider unchanged."""
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    selected = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="kimi-k2.6",
+        model_type="kimi-k2.6",
+        endpoint="https://custom.example",
+        deployment="prod-kimi",
+        api_version="2024-05-01-preview",
+    )
+    verified: list[ProviderConfig] = []
+    constructed: list[ProviderConfig] = []
+    attempts = 0
+
+    def run(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("capacity exhausted")
+
+    def select(*_args, **kwargs) -> ProviderConfig:  # noqa: ANN002, ANN003
+        result = kwargs["check"](selected)
+        assert result.ok
+        return selected
+
+    def verify(configs: list[ProviderConfig]) -> list[VerifyResult]:
+        verified.extend(configs)
+        return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
+
+    def construct(config: ProviderConfig) -> FakeProvider:
+        constructed.append(config)
+        return FakeProvider()
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "_console",
+        Console(force_terminal=True, no_color=True, file=io.StringIO()),
+    )
+    monkeypatch.setattr(cli_app_module, "run_demo", run)
+    monkeypatch.setattr(cli_app_module, "is_capacity_error", lambda _exc: True)
+    monkeypatch.setattr(cli_app_module, "select_provider_and_model", select)
+    monkeypatch.setattr(cli_app_module, "verify_all", verify)
+    monkeypatch.setattr(providers_pkg, "get_provider", construct)
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert attempts == 2
+    assert verified == [selected]
+    assert constructed[-1] == selected
+
+
 def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """Only backend SDK failures are re-rendered; our own bugs must not be dressed up as setup."""
     root = tmp_path / ".wmo"
@@ -1101,7 +1177,13 @@ def test_providers_set_offers_the_saved_azure_deployment_on_interactive_rerun(
 
     def select(*_args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         offered.append((kwargs["default_deployment"], kwargs["default_deployment_model"]))
-        return "azure", "kimi-k2.6", None, kwargs["default_deployment"]
+        return ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="kimi-k2.6",
+            model_type="kimi-k2.6",
+            deployment=kwargs["default_deployment"],
+            api_version="2024-05-01-preview",
+        )
 
     monkeypatch.setattr(
         cli_app_module,
@@ -1124,6 +1206,46 @@ def test_providers_set_offers_the_saved_azure_deployment_on_interactive_rerun(
     assert offered == [("prod-kimi", "kimi-k2.6")]
     worker = load_settings(root).models.worker
     assert worker is not None and worker.deployment == "prod-kimi"
+
+
+def test_providers_set_passes_custom_endpoint_into_the_credential_aware_picker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Interactive setup must classify credentials against the endpoint it will save."""
+    root = tmp_path / ".wmo"
+    endpoint = "https://custom.example"
+    received: list[str | None] = []
+
+    def select(*_args, **kwargs) -> ProviderConfig:  # noqa: ANN002, ANN003
+        received.append(kwargs["endpoint"])
+        return ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="kimi-k2.6",
+            model_type="kimi-k2.6",
+            endpoint=kwargs["endpoint"],
+            deployment="prod-kimi",
+            api_version="2024-05-01-preview",
+        )
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "_console",
+        SimpleNamespace(is_terminal=True, print=lambda *_: None),
+    )
+    monkeypatch.setattr(cli_app_module, "select_provider_and_model", select)
+    monkeypatch.setattr(cli_app_module, "_register_pool_models", lambda **_kwargs: None)
+
+    result = runner.invoke(
+        app,
+        ["providers", "set", "--endpoint", endpoint, "--root", str(root)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert received == [endpoint]
+    worker = load_settings(root).models.worker
+    assert worker is not None
+    assert worker.endpoint == endpoint
+    assert worker.deployment == "prod-kimi"
 
 
 def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2078,6 +2200,53 @@ def test_build_interactive_wizard_creates_model(
     )
     assert result.exit_code == 0, result.output
     assert (root / "models" / "wizard-built" / "config.toml").exists()
+
+
+def test_build_interactive_azure_verifies_and_persists_the_entered_deployment(
+    patched_provider: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deployment verified by the wizard must be the one stored in the model."""
+    root = tmp_path / ".wmo"
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    verified: list[ProviderConfig] = []
+
+    def verify(configs: list[ProviderConfig]) -> list[VerifyResult]:
+        verified.extend(configs)
+        return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
+
+    monkeypatch.setattr(ui_module, "verify_all", verify)
+    answers = "\n".join(
+        [
+            "azure-wizard",
+            "",
+            _traces_file(tmp_path),
+            "4",
+            "4",
+            "prod-kimi",
+            "",
+            "1",
+            "1",
+        ]
+    )
+
+    result = runner.invoke(
+        app,
+        ["build", "--interactive", "--root", str(root)],
+        input=answers + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    [pinged] = verified
+    assert pinged.kind is ProviderKind.AZURE_OPENAI
+    assert pinged.deployment == "prod-kimi"
+    assert pinged.api_version == "2024-05-01-preview"
+    persisted = load_config(root / "models" / "azure-wizard").serve_provider_config()
+    assert persisted.kind is ProviderKind.AZURE_OPENAI
+    assert persisted.deployment == "prod-kimi"
+    assert persisted.api_version == "2024-05-01-preview"
 
 
 def test_build_non_interactive_without_source_errors(tmp_path) -> None:  # noqa: ANN001

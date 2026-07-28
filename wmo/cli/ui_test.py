@@ -288,7 +288,7 @@ def test_provider_picker_collects_azure_deployment_before_verification() -> None
         verified.append(config)
         return VerifyResult(ok=True, kind=config.kind, model=config.model)
 
-    provider, model, region, deployment = select_provider_and_model(
+    selected = select_provider_and_model(
         console,
         read,
         read,
@@ -296,17 +296,14 @@ def test_provider_picker_collects_azure_deployment_before_verification() -> None
         default_model="kimi-k2.6",
         default_region=None,
         default_deployment=None,
-        ask_azure_deployment=True,
         interactive=False,
         check=verify,
     )
 
-    assert (provider, model, region, deployment) == (
-        "azure",
-        "kimi-k2.6",
-        None,
-        "prod-kimi",
-    )
+    assert selected.kind is ProviderKind.AZURE_OPENAI
+    assert selected.model_type == "kimi-k2.6"
+    assert selected.region is None
+    assert selected.deployment == "prod-kimi"
     assert verified[0].deployment == "prod-kimi"
     deployment_prompt = next(i for i, prompt in enumerate(prompts) if "deployment" in prompt)
     assert deployment_prompt == len(prompts) - 1
@@ -336,7 +333,7 @@ def test_provider_picker_reuses_saved_deployment_and_retains_it_across_retry() -
             detail="temporary failure",
         )
 
-    provider, model, region, deployment = select_provider_and_model(
+    selected = select_provider_and_model(
         console,
         _scripted_reader(list(answers)),
         _scripted_reader([]),
@@ -345,18 +342,132 @@ def test_provider_picker_reuses_saved_deployment_and_retains_it_across_retry() -
         default_region=None,
         default_deployment="prod-kimi",
         default_deployment_model="kimi-k2.6",
-        ask_azure_deployment=True,
         interactive=False,
         check=verify,
     )
 
-    assert (provider, model, region, deployment) == (
-        "azure",
-        "kimi-k2.6",
-        None,
-        "prod-kimi",
-    )
+    assert selected.kind is ProviderKind.AZURE_OPENAI
+    assert selected.model_type == "kimi-k2.6"
+    assert selected.region is None
+    assert selected.deployment == "prod-kimi"
     assert [config.deployment for config in verified] == ["prod-kimi", "prod-kimi"]
+
+
+def test_provider_picker_does_not_default_a_saved_deployment_for_another_model() -> None:
+    """Azure deployment names cannot be transferred between canonical models."""
+    console = Console(force_terminal=False, no_color=True, width=100)
+    prompts: list[str] = []
+    answers = iter(["", "", "prod-deepseek"])
+    configured = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="kimi-k2.6",
+        model_type="kimi-k2.6",
+        deployment="prod-kimi",
+        api_version="2024-05-01-preview",
+    )
+
+    def read(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    selected = select_provider_and_model(
+        console,
+        read,
+        read,
+        default_provider="azure",
+        default_model="deepseek-v4-pro",
+        default_region=None,
+        configured_provider=configured,
+        interactive=False,
+        check=_ok_verify,
+    )
+
+    deployment_prompt = next(prompt for prompt in prompts if "deployment" in prompt)
+    assert "prod-kimi" not in deployment_prompt
+    assert selected.deployment == "prod-deepseek"
+
+
+def test_provider_picker_custom_azure_endpoint_prompts_only_for_endpoint_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A config endpoint must use the same credential boundary as AzureOpenAIProvider."""
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("WMO_ENDPOINT_API_KEY", raising=False)
+    saved: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        ui_module,
+        "upsert_env_var",
+        lambda var, value: (saved.append((var, value)), os.environ.__setitem__(var, value)),
+    )
+    console = Console(force_terminal=False, no_color=True, width=100)
+    prompts: list[str] = []
+    answers = iter(["", "endpoint-secret", "", "prod-kimi"])
+
+    def read(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    selected = select_provider_and_model(
+        console,
+        read,
+        read,
+        default_provider="azure",
+        default_model="kimi-k2.6",
+        default_region=None,
+        endpoint="https://custom.example",
+        interactive=False,
+        check=_ok_verify,
+    )
+
+    credential_prompts = [prompt for prompt in prompts if "saved to .env" in prompt]
+    assert len(credential_prompts) == 1
+    assert "WMO_ENDPOINT_API_KEY" in credential_prompts[0]
+    assert "AZURE_OPENAI_API_KEY" not in credential_prompts[0]
+    assert "AZURE_OPENAI_ENDPOINT" not in credential_prompts[0]
+    assert saved == [("WMO_ENDPOINT_API_KEY", "endpoint-secret")]
+    assert selected.endpoint == "https://custom.example"
+    assert selected.deployment == "prod-kimi"
+
+
+def test_build_wizard_verifies_and_returns_effective_azure_config() -> None:
+    """The Azure config verified in the wizard must survive into BuildParams."""
+    console = Console(force_terminal=False, no_color=True, width=100)
+    verified: list[ProviderConfig] = []
+    reader = _scripted_reader(
+        [
+            "azure-build",
+            "",
+            "/tmp/t.jsonl",
+            "azure",
+            "kimi-k2.6",
+            "prod-kimi",
+            "",
+            "low",
+            "hashing",
+        ]
+    )
+
+    def verify(config: ProviderConfig) -> VerifyResult:
+        verified.append(config)
+        return VerifyResult(ok=True, kind=config.kind, model=config.model)
+
+    params = run_build_wizard(
+        console,
+        BuildParams(name="default"),
+        reader=reader,
+        verify=verify,
+        verify_embed=_ok_verify,
+    )
+
+    [selected] = verified
+    assert selected.kind is ProviderKind.AZURE_OPENAI
+    assert selected.deployment == "prod-kimi"
+    assert selected.api_version == "2024-05-01-preview"
+    assert params.provider == "azure"
+    assert params.model == "kimi-k2.6"
+    assert params.deployment == "prod-kimi"
+    assert params.api_version == "2024-05-01-preview"
 
 
 def test_build_wizard_select_by_number() -> None:

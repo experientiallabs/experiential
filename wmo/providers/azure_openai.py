@@ -72,8 +72,9 @@ class AzureOpenAIProvider:
         # Compare canonically so a trailing slash or host-casing difference between the config
         # value and the trusted env endpoint doesn't misclassify the same Azure resource as an
         # untrusted host (which would strip the real key and break the call).
-        is_config_endpoint = self.config.endpoint is not None and not _same_endpoint(
-            self.config.endpoint, env_endpoint
+        is_config_endpoint = is_untrusted_azure_endpoint(
+            self.config.endpoint,
+            trusted_endpoint=env_endpoint,
         )
         return endpoint, is_config_endpoint
 
@@ -308,6 +309,23 @@ class AzureOpenAIProvider:
             # chat-completions ping would prove the wrong endpoint and api surface.
             return verify_via_ping(self, ping=lambda: self.complete_chat(_REASONING_PING))
         return verify_via_ping(self)
+
+
+def is_untrusted_azure_endpoint(
+    endpoint: str | None,
+    *,
+    trusted_endpoint: str | None = None,
+) -> bool:
+    """Whether an explicit Azure endpoint must use the isolated endpoint credential.
+
+    The configured endpoint is trusted only when it canonically matches the operator's
+    ``AZURE_OPENAI_ENDPOINT``. Both provider dispatch and CLI credential prompts call this
+    function so they cannot choose different keys for the same URL.
+    """
+    if endpoint is None:
+        return False
+    trusted = trusted_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT")
+    return not _same_endpoint(endpoint, trusted)
 
 
 def _same_endpoint(a: str, b: str | None) -> bool:

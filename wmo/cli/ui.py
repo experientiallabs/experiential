@@ -42,6 +42,7 @@ from rich.segment import ControlType
 from rich.table import Table
 from rich.text import Text
 
+from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION, inherit_provider_connection
 from wmo.config import (
     PROVIDER_ENV_VARS,
     ModelInfo,
@@ -54,6 +55,7 @@ from wmo.engine.build import DEFAULT_TRAIN_SPLIT
 from wmo.engine.play import PlayTurn, parse_action, play_turn
 from wmo.engine.world_model import WorldModel
 from wmo.providers import verify_all, verify_embedder
+from wmo.providers.azure_openai import is_untrusted_azure_endpoint
 from wmo.providers.base import ProviderConfig, ProviderKind, VerifyResult
 from wmo.providers.models import resolve_provider_model
 
@@ -144,6 +146,9 @@ class BuildParams(BaseModel):
     # Canonical GEPA judge model type; None = pick the cheap per-provider default.
     judge_model: str | None = None
     region: str | None = None
+    endpoint: str | None = None
+    deployment: str | None = None
+    api_version: str | None = None
     fidelity: str = "medium"
     train_split: float = DEFAULT_TRAIN_SPLIT
     embed_provider: str = "hashing"
@@ -240,23 +245,40 @@ def select_provider_and_model(
     default_region: str | None,
     default_deployment: str | None = None,
     default_deployment_model: str | None = None,
-    ask_azure_deployment: bool = False,
     interactive: bool,
     check: Callable[[ProviderConfig], VerifyResult],
-) -> tuple[str, str, str | None, str | None]:
+    configured_provider: ProviderConfig | None = None,
+    endpoint: str | None = None,
+    api_version: str | None = None,
+) -> ProviderConfig:
     """The wizard's serve-provider block: pick provider + model (+ region), creds, live verify.
 
     Providers with credentials present are annotated and the first becomes the suggested default
     (none otherwise); a failed live ping loops back to the picker with the failed pick as the
-    retry default. A caller that owns persistent Azure setup may request the deployment prompt;
-    the exact operator-entered deployment is included in the config passed to `check`. Also reused
-    by `wmo demo`'s switch-provider flow. Returns (provider, model, region, deployment).
+    retry default. Every Azure selection asks for its operator-created deployment. The exact
+    config passed to `check` is returned so build, setup, and demo cannot reconstruct a different
+    endpoint or deployment after verification.
     """
     providers = list(_PROVIDER_MODELS)
-    with_creds = [p for p in providers if has_credentials(p)]
+
+    def connection_endpoint(provider: str) -> str | None:
+        if endpoint is not None:
+            return endpoint
+        if configured_provider is not None and configured_provider.kind.value == provider:
+            return configured_provider.endpoint
+        return None
+
+    with_creds = [
+        provider
+        for provider in providers
+        if has_credentials(provider, endpoint=connection_endpoint(provider))
+    ]
     # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
     # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
-    notes = {p: creds_note(p) for p in with_creds}
+    notes = {
+        provider: creds_note(provider, endpoint=connection_endpoint(provider))
+        for provider in with_creds
+    }
     provider_default = default_provider or (with_creds[0] if with_creds else None)
     retry_deployment: tuple[str, str] | None = None
     while True:
@@ -269,7 +291,12 @@ def select_provider_and_model(
             interactive=interactive,
             notes=notes,
         )
-        ensure_credentials(console, ask_secret, provider)
+        ensure_credentials(
+            console,
+            ask_secret,
+            provider,
+            endpoint=connection_endpoint(provider),
+        )
         model = _select(
             console,
             ask,
@@ -283,17 +310,27 @@ def select_provider_and_model(
         if provider == "bedrock":
             region_default = default_region or _DEFAULT_REGIONS.get(provider)
             region = _prompt_text(console, ask, "AWS region", region_default) or None
-        deployment = None
-        if provider == "azure" and ask_azure_deployment:
+        deployment: str | None = None
+        if provider == "azure":
+            configured_deployment = None
+            if (
+                configured_provider is not None
+                and configured_provider.kind is ProviderKind.AZURE_OPENAI
+            ):
+                configured_model = configured_provider.model_type or configured_provider.model
+                if configured_model.casefold() == model.casefold():
+                    configured_deployment = configured_provider.deployment
             deployment_default = (
                 retry_deployment[1]
                 if retry_deployment is not None and retry_deployment[0] == model
                 else (
                     default_deployment
                     if default_deployment_model is None or default_deployment_model == model
-                    else None
+                    else configured_deployment
                 )
             )
+            if deployment_default is None:
+                deployment_default = configured_deployment
             while not deployment:
                 deployment = (
                     _prompt_text(
@@ -311,19 +348,30 @@ def select_provider_and_model(
         # Live ping now, not at the end: a bad key or model id loops straight back to the
         # picker (the failed pick becomes the suggested retry default).
         console.print(f"verifying {provider}…")
-        model_spec = resolve_provider_model(ProviderKind(provider), model)
-        ping = check(
+        kind = ProviderKind(provider)
+        model_spec = resolve_provider_model(kind, model)
+        selected = inherit_provider_connection(
             ProviderConfig(
-                kind=ProviderKind(provider),
+                kind=kind,
                 model_type=model_spec.model_type,
                 model=model_spec.model_id,
                 region=region,
-                deployment=deployment,
-            )
+            ),
+            configured_provider,
         )
+        updates: dict[str, str | None] = {}
+        if endpoint is not None:
+            updates["endpoint"] = endpoint
+        if kind is ProviderKind.AZURE_OPENAI:
+            updates["deployment"] = deployment
+            updates["api_version"] = (
+                api_version or selected.api_version or DEFAULT_AZURE_API_VERSION
+            )
+        selected = selected.model_copy(update=updates) if updates else selected
+        ping = check(selected)
         if ping.ok:
             console.print(f"  {_CHECK} {provider} ({escape(model)}) reachable")
-            return provider, model, region, deployment
+            return selected
         console.print(
             f"  [red]✗ {provider} ({escape(model)}) failed[/red]: {escape(ping.detail or '')}"
         )
@@ -338,6 +386,7 @@ def run_build_wizard(
     reader: PromptReader | None = None,
     verify: Callable[[ProviderConfig], VerifyResult] | None = None,
     verify_embed: Callable[[ProviderConfig], VerifyResult] | None = None,
+    configured_provider: ProviderConfig | None = None,
 ) -> BuildParams:
     """Guided creation flow: prompt for each build input, pre-filled with `defaults`.
 
@@ -404,16 +453,22 @@ def run_build_wizard(
         console, ask, ask_secret, defaults, interactive
     )
 
-    provider, model, region, _deployment = select_provider_and_model(
+    selected_provider = select_provider_and_model(
         console,
         ask,
         ask_secret,
         default_provider=defaults.provider,
         default_model=defaults.model,
         default_region=defaults.region,
+        default_deployment=defaults.deployment,
+        default_deployment_model=defaults.model if defaults.deployment is not None else None,
         interactive=interactive,
         check=check,
+        configured_provider=configured_provider,
     )
+    provider = selected_provider.kind.value
+    model = selected_provider.model_type or selected_provider.model
+    region = selected_provider.region
 
     # GEPA judge model: defaults to a cheap model of the same provider (haiku / gpt-5.4-mini);
     # picking the serve model itself is always on the list. Same inline verify + retry.
@@ -436,11 +491,11 @@ def run_build_wizard(
         console.print(f"verifying {provider} (judge)…")
         judge_spec = resolve_provider_model(ProviderKind(provider), judge_model)
         ping = check(
-            ProviderConfig(
-                kind=ProviderKind(provider),
-                model_type=judge_spec.model_type,
-                model=judge_spec.model_id,
-                region=region,
+            selected_provider.model_copy(
+                update={
+                    "model_type": judge_spec.model_type,
+                    "model": judge_spec.model_id,
+                }
             )
         )
         if ping.ok:
@@ -510,15 +565,21 @@ def run_build_wizard(
         # Same inline ping for the embed path, with the embeddings model and phi dimension
         # stamped on (mirrors HarnessConfig.embed_provider_config).
         console.print(f"verifying embed:{embed_provider}…")
-        ping = check_embed(
-            ProviderConfig(
-                kind=ProviderKind(embed_provider),
-                model=embed_model,
-                embed_model=embed_model,
-                embed_dim=defaults.embed_dim,
-                region=region if embed_provider == "bedrock" else None,
-            )
+        embed_config = ProviderConfig(
+            kind=ProviderKind(embed_provider),
+            model=embed_model,
+            embed_model=embed_model,
+            embed_dim=defaults.embed_dim,
+            region=region if embed_provider == "bedrock" else None,
         )
+        if embed_config.kind is selected_provider.kind:
+            embed_config = selected_provider.model_copy(
+                update={
+                    "embed_model": embed_model,
+                    "embed_dim": defaults.embed_dim,
+                }
+            )
+        ping = check_embed(embed_config)
         if ping.ok:
             console.print(f"  {_CHECK} embed:{embed_provider} ({escape(embed_model)}) reachable")
             break
@@ -542,6 +603,9 @@ def run_build_wizard(
         model=model,
         judge_model=judge_model,
         region=region,
+        endpoint=selected_provider.endpoint,
+        deployment=selected_provider.deployment,
+        api_version=selected_provider.api_version,
         fidelity=fidelity,
         train_split=defaults.train_split,
         embed_provider=embed_provider,
@@ -727,33 +791,43 @@ def _select(
         console.print(f"[red]pick 1-{len(options)} or an option name[/red]")
 
 
-def _provider_env_vars(provider: str) -> list[str]:
+def _provider_env_vars(provider: str, *, endpoint: str | None = None) -> list[str]:
     """The env vars `provider` reads its credentials from ([] for unknown/offline kinds)."""
+    if provider == ProviderKind.OPENAI.value and endpoint is not None:
+        return ["WMO_ENDPOINT_API_KEY"]
+    if provider == ProviderKind.AZURE_OPENAI.value and is_untrusted_azure_endpoint(endpoint):
+        return ["WMO_ENDPOINT_API_KEY"]
     try:
         return PROVIDER_ENV_VARS[ProviderKind(provider)]
     except (ValueError, KeyError):
         return []
 
 
-def creds_note(provider: str) -> str:
+def creds_note(provider: str, *, endpoint: str | None = None) -> str:
     """Picker annotation for a provider whose credentials are present, naming what was found."""
-    env_vars = _provider_env_vars(provider)
+    env_vars = _provider_env_vars(provider, endpoint=endpoint)
     return f"{env_vars[0]} set" if len(env_vars) == 1 else "creds set"
 
 
-def has_credentials(provider: str) -> bool:
+def has_credentials(provider: str, *, endpoint: str | None = None) -> bool:
     """Offline presence check: every credential env var for `provider` is set (not validated)."""
-    env_vars = _provider_env_vars(provider)
+    env_vars = _provider_env_vars(provider, endpoint=endpoint)
     return bool(env_vars) and all(os.environ.get(var) for var in env_vars)
 
 
-def ensure_credentials(console: Console, ask_secret: PromptReader, provider: str) -> None:
+def ensure_credentials(
+    console: Console,
+    ask_secret: PromptReader,
+    provider: str,
+    *,
+    endpoint: str | None = None,
+) -> None:
     """Prompt for any missing credential env vars and persist entered values to `.env`.
 
     Presence only — the live ping that confirms the creds actually work happens once before
     the build (see `wmo build`). Enter skips a var, leaving it to the shell environment.
     """
-    for var in _provider_env_vars(provider):
+    for var in _provider_env_vars(provider, endpoint=endpoint):
         if os.environ.get(var):
             console.print(f"  {_CHECK} {var} is set")
             continue
