@@ -130,6 +130,11 @@ _KNN_KNOBS = (
 )
 """The knn fit this command performs. Fixed: the validated champion, dialed after the fact."""
 
+# Four columns leave too little room for the sweep's authorization details at the usual 80-column
+# redirected terminal width. Keep those details in one readable stream there instead of interleaving
+# wrapped plan and status cells line by line.
+_PLAN_TABLE_MIN_WIDTH = 120
+
 
 def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (see the help text)
     world_model: str = typer.Argument(
@@ -934,40 +939,28 @@ def _print_plan(
         f"\n[bold]optimize model: {escape(name)}[/bold]    "
         f"pool: {pool_size} candidate(s) ({escape(str(pool_file))})\n"
     )
-    table = Table(show_header=True, box=None, pad_edge=False, padding=(0, 2))
-    table.add_column("stage", no_wrap=True)
-    table.add_column("plan")
-    table.add_column("est. cost", justify="right")
-    table.add_column("status")
-    table.add_row(
-        Stage.PREFLIGHT.value,
-        _stage_plan_text(
-            Stage.PREFLIGHT,
-            plan=plan,
-            compression=compression,
-            cost_quality=cost_quality,
-            fallback=fallback,
-            anchor=anchor,
-        ),
-        "free",
-        "[green]ok[/green]",
+    rows = _plan_rows(
+        plan=plan,
+        decisions=decisions,
+        cost_quality=cost_quality,
+        fallback=fallback,
+        anchor=anchor,
+        embedder=embedder,
+        compression=compression,
+        paths=paths,
+        already_measured=already_measured,
     )
-    for decision in decisions:
-        table.add_row(
-            decision.stage.value,
-            _stage_plan_text(
-                decision.stage,
-                plan=plan,
-                compression=compression,
-                cost_quality=cost_quality,
-                fallback=fallback,
-                anchor=anchor,
-                already_measured=already_measured,
-            ),
-            _estimate_text(decision.stage, plan=plan, embedder=embedder, paths=paths),
-            _status_text(decision),
-        )
-    console.print(table)
+    if console.width < _PLAN_TABLE_MIN_WIDTH:
+        _print_compact_plan(console, rows)
+    else:
+        table = Table(show_header=True, box=None, pad_edge=False, padding=(0, 2))
+        table.add_column("stage", no_wrap=True)
+        table.add_column("plan")
+        table.add_column("est. cost", justify="right")
+        table.add_column("status")
+        for stage, stage_plan, estimate, status in rows:
+            table.add_row(stage, stage_plan, estimate, status)
+        console.print(table)
     running = [decision for decision in decisions if decision.will_run]
     total = _projected_total(decisions, plan)
     if not running:
@@ -989,6 +982,62 @@ def _print_plan(
         f"and call counts, at each candidate's own pool price)"
     )
     console.print(_world_model_forecast(projection, compressed=plan.compression is not None))
+
+
+def _plan_rows(
+    *,
+    plan: SweepPlan,
+    decisions: list[StageDecision],
+    cost_quality: float,
+    fallback: str | None,
+    anchor: str,
+    embedder: EmbedderSpec,
+    compression: CompressionConfig | None,
+    paths: _RunPaths,
+    already_measured: int,
+) -> list[tuple[str, str, str, str]]:
+    """Build the stage rows once for the wide table and the narrow readable layout."""
+    rows = [
+        (
+            Stage.PREFLIGHT.value,
+            _stage_plan_text(
+                Stage.PREFLIGHT,
+                plan=plan,
+                compression=compression,
+                cost_quality=cost_quality,
+                fallback=fallback,
+                anchor=anchor,
+            ),
+            "free",
+            "[green]ok[/green]",
+        )
+    ]
+    rows.extend(
+        (
+            decision.stage.value,
+            _stage_plan_text(
+                decision.stage,
+                plan=plan,
+                compression=compression,
+                cost_quality=cost_quality,
+                fallback=fallback,
+                anchor=anchor,
+                already_measured=already_measured,
+            ),
+            _estimate_text(decision.stage, plan=plan, embedder=embedder, paths=paths),
+            _status_text(decision),
+        )
+        for decision in decisions
+    )
+    return rows
+
+
+def _print_compact_plan(console: Console, rows: list[tuple[str, str, str, str]]) -> None:
+    """Print plan details linearly when a four-column table would interleave them."""
+    for stage, stage_plan, estimate, status in rows:
+        console.print(
+            f"[bold]{stage}[/bold]: {stage_plan}\n  est. cost: {estimate}; status: {status}"
+        )
 
 
 def _print_budget_stop(name: str, exc: BudgetExceeded) -> None:

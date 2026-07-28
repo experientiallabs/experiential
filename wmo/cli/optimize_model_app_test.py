@@ -92,7 +92,7 @@ def _wide_console(monkeypatch: pytest.MonkeyPatch) -> None:
     three and spliced through the plan column, and every assertion on a printed sentence becomes
     an assertion about where the wrap landed. Width is presentation, not behavior.
     """
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240))
+    monkeypatch.setattr(optimize_module, "_console", Console(width=240, height=25))
 
 
 @pytest.fixture(autouse=True)
@@ -606,7 +606,9 @@ def test_declining_the_confirmation_spends_nothing(
     root = _project(tmp_path)
     answer = _Answer(False)
     monkeypatch.setattr(optimize_module, "Confirm", answer)
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=240, height=25, force_terminal=True)
+    )
     result = _run(tmp_path, root)
     assert result.exit_code == 0, result.output
     assert answer.asked  # exactly one question, and it was asked before any episode
@@ -622,7 +624,9 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     root = _project(tmp_path)
     answer = _Answer(False)
     monkeypatch.setattr(optimize_module, "Confirm", answer)
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=240, height=25, force_terminal=True)
+    )
     result = _run(tmp_path, root)
     flat = _flat(result.output)
     # 3 scenarios x 1 episode x 4 calls = 12 calls; cheap = 12 x (2000 + 250x2)/1e6 = $0.03,
@@ -645,7 +649,9 @@ def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
     monkeypatch.setattr(optimize_module, "Confirm", _Answer(False))
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=240, height=25, force_terminal=True)
+    )
     paced = _run(tmp_path, root, "--concurrency", "6")
     assert "2candidate(s)x3scenario(s)x1episode(s),6atatime" in _flat(paced.output)
 
@@ -668,6 +674,24 @@ def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
     )
     resumed = _run(tmp_path, root)
     assert "1alreadymeasured,5tobuy" in _flat(resumed.output)
+
+
+def test_the_plan_stays_linear_in_a_narrow_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A redirected 80-column run keeps the authorization facts out of interleaved table cells."""
+    _patch_seams(monkeypatch)
+    root = _project(tmp_path)
+    monkeypatch.setattr(optimize_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=80, height=25, force_terminal=True)
+    )
+
+    result = _run(tmp_path, root, "--concurrency", "6")
+
+    assert result.exit_code == 0, result.output
+    assert _says(result.output, "sweep: 2 candidate(s) x 3 scenario(s) x 1 episode(s), 6 at a time")
+    assert _says(result.output, "est. cost: ~$0.33; status: will run")
 
 
 def _sweep_plan(tmp_path: Path, root: Path) -> SweepPlan:
@@ -1014,7 +1038,9 @@ def test_the_first_sweep_says_the_world_model_side_is_not_projectable(
     root = _project(tmp_path)
     answer = _Answer(False)
     monkeypatch.setattr(optimize_module, "Confirm", answer)
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=240, height=25, force_terminal=True)
+    )
     result = _run(tmp_path, root)
     assert result.exit_code == 0, result.output
     assert _says(result.output, "not projectable before this model's first sweep")
@@ -1175,7 +1201,9 @@ def test_the_cap_refuses_before_asking_rather_than_after(
     root = _project(tmp_path)
     answer = _Answer(True)
     monkeypatch.setattr(optimize_module, "Confirm", answer)
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=240, height=25, force_terminal=True)
+    )
     result = _run(tmp_path, root, "--max-usd", "0.01")
     assert result.exit_code == 1, result.output
     assert answer.asked == []  # never asked
@@ -1206,7 +1234,9 @@ def test_a_zero_priced_pool_is_still_confirmed_because_the_simulator_is_not_free
     )
     answer = _Answer(False)
     monkeypatch.setattr(optimize_module, "Confirm", answer)
-    monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
+    monkeypatch.setattr(
+        optimize_module, "_console", Console(width=240, height=25, force_terminal=True)
+    )
     result = _run(tmp_path, root, pool=free_pool)
     assert result.exit_code == 0, result.output
     assert len(answer.asked) == 1  # asked, despite a $0.00 candidate projection
