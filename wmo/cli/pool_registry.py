@@ -40,6 +40,7 @@ from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION
 from wmo.cli.ui import PromptReader, creds_note, ensure_credentials, has_credentials, select_option
 from wmo.config import PROVIDER_ENV_VARS
 from wmo.core.locks import FileLockTimeout
+from wmo.providers.azure_openai import is_untrusted_azure_endpoint
 from wmo.providers.base import ProviderKind, VerifyResult
 from wmo.providers.catalog import CatalogModel, CatalogSource, ProviderCatalog, list_provider_models
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
@@ -653,7 +654,7 @@ def _ask_shared_options(
             _ask_text(console, ask, "AWS region (blank = AWS_REGION)", options.region or "") or None
         )
     else:
-        default_env = _default_key_env(kind)
+        default_env = _default_key_env(kind, endpoint=options.endpoint)
         updates["api_key_env"] = (
             _ask_text(
                 console,
@@ -699,8 +700,13 @@ def _ask_per_model_options(
     return options.model_copy(update=updates) if updates else options
 
 
-def _default_key_env(kind: ProviderKind) -> str:
-    """The variable this backend reads by default, named so the blank answer is not a mystery."""
+def _default_key_env(kind: ProviderKind, *, endpoint: str | None = None) -> str:
+    """The variable this exact route reads by default, named so blank is not a mystery."""
+    if kind is ProviderKind.AZURE_OPENAI and is_untrusted_azure_endpoint(endpoint):
+        # Keep the registry on the same trust boundary as AzureOpenAIProvider and the provider
+        # picker: a config-controlled host must never be described as receiving the trusted
+        # resource credential.
+        return "WMO_ENDPOINT_API_KEY"
     env_vars = PROVIDER_ENV_VARS.get(kind, [])
     return env_vars[0] if env_vars else "the backend default"
 

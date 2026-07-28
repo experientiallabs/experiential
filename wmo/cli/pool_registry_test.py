@@ -189,6 +189,49 @@ def test_a_second_pass_adds_a_second_provider_without_dropping_the_first(tmp_pat
     assert azure.api_version == "2025-01-01-preview"
 
 
+def test_custom_azure_endpoint_pool_prompt_uses_only_endpoint_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry must describe the same custom-endpoint credential that dispatch will use."""
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://trusted.openai.azure.com")
+    pool = tmp_path / "pool.toml"
+    verified: list[PoolEntry] = []
+
+    def record(entry: PoolEntry) -> VerifyResult:
+        verified.append(entry)
+        return _ok(entry)
+
+    written, _, script = _drive(
+        pool,
+        [
+            "y",
+            "azure",
+            "gpt-5.4",
+            "",
+            "frontier",
+            "",  # accept the custom endpoint's safe credential default
+            "prod-gpt54",
+            "2025-01-01-preview",
+            "",
+            "n",
+        ],
+        kind=ProviderKind.AZURE_OPENAI,
+        options=EntryOptions(endpoint="https://custom.example"),
+        verify=record,
+    )
+
+    assert written == 1
+    credential_prompt = next(prompt for prompt in script.prompts if "Env var holding" in prompt)
+    assert "WMO_ENDPOINT_API_KEY" in credential_prompt
+    assert "AZURE_OPENAI_API_KEY" not in credential_prompt
+    entry = read_pool_entries(pool)[0]
+    assert len(verified) == 1
+    assert verified[0].endpoint == entry.endpoint
+    assert verified[0].api_key_env == entry.api_key_env
+    assert entry.endpoint == "https://custom.example"
+    assert entry.api_key_env is None
+
+
 def test_re_registering_the_same_model_leaves_the_file_byte_identical(tmp_path: Path) -> None:
     # Idempotence has to be at the FILE level: writing the same entry again would go through
     # upsert's replacement path, which re-renders the roster and drops its comments.
