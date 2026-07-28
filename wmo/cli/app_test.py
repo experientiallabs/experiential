@@ -263,17 +263,15 @@ def test_build_explicit_model_keeps_configured_azure_connection(
     assert provider.api_version == "2026-01-01"
 
 
-def test_build_wizard_does_not_reuse_connection_for_changed_provider(
+def test_build_wizard_preserves_verified_connection_for_changed_provider(
     patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = tmp_path / ".wmo"
     settings = load_settings(root)
     settings.models.worker = ModelRole(
-        provider="azure",
-        model="gpt-5.4",
-        endpoint="https://azure.example/v1",
-        deployment="configured-deployment",
-        api_version="2026-01-01",
+        provider="openai",
+        model="gpt-5.4-mini",
+        endpoint="https://old.example/v1",
     )
     save_settings(settings, root)
 
@@ -283,9 +281,12 @@ def test_build_wizard_does_not_reuse_connection_for_changed_provider(
             update={
                 "name": "wizard-switch",
                 "file": _traces_file(tmp_path),
-                "provider": "openai",
-                "model": "gpt-5.4-mini",
+                "provider": "azure",
+                "model": "kimi-k2.6",
                 "region": None,
+                "endpoint": None,
+                "deployment": "prod-kimi",
+                "api_version": "2024-05-01-preview",
             }
         )
 
@@ -296,10 +297,10 @@ def test_build_wizard_does_not_reuse_connection_for_changed_provider(
     assert result.exit_code == 0, result.output
     config = load_config(root / "models" / "wizard-switch")
     provider = config.serve_provider_config()
-    assert provider.kind is ProviderKind.OPENAI
+    assert provider.kind is ProviderKind.AZURE_OPENAI
     assert provider.endpoint is None
-    assert provider.deployment is None
-    assert provider.api_version is None
+    assert provider.deployment == "prod-kimi"
+    assert provider.api_version == "2024-05-01-preview"
 
 
 def test_build_writes_model_card(patched_provider, tmp_path) -> None:  # noqa: ANN001

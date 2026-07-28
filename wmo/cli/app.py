@@ -884,17 +884,6 @@ def build(
             params,
             configured_provider=configured_worker_config,
         )
-        if (
-            configured_worker_config is not None
-            and params.provider != configured_worker_config.kind.value
-        ):
-            params = params.model_copy(
-                update={
-                    "endpoint": None,
-                    "deployment": None,
-                    "api_version": None,
-                }
-            )
     elif params.file is None and not params.pull:
         # This guard also required `name is None`, so `wmo build --name x` (verbatim the
         # empty-state hint `wmo list` prints) fell through to a raw ValueError from the ingest
