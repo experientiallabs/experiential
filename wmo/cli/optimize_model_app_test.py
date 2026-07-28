@@ -633,7 +633,10 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     assert "2candidate(s)x3scenario(s)x1episode(s)" in flat
     # The free stages say free rather than showing a fabricated number, and the estimate names
     # itself a projection with its assumption spelled out.
-    assert _says(result.output, "knn (guarded, fallback best single on the fit split)")
+    # 3 scenarios split 70/30 for router fit vs report: 2 fit, 1 reserved (PR #308).
+    assert _says(
+        result.output, "knn over 2 fit scenario(s) (guarded, fallback best single on the fit split)"
+    )
     assert _says(result.output, "cost_quality 0.25 (Balanced (default))")
     assert "aprojection" in flat and "assumedoutputtoken" in flat
     assert _says(result.output, "are NOT in that figure")

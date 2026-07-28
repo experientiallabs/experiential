@@ -870,9 +870,7 @@ def _stage_plan_text(
     already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
-    router_split = split_router_scenarios(
-        [scenario_id(scenario) for scenario in plan.scenarios]
-    )
+    router_split = split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
     match stage:
         case Stage.PREFLIGHT:
             return f"resolve {len(plan.pool.models)} backend(s), check prices"

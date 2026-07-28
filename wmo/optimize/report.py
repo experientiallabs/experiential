@@ -243,9 +243,7 @@ def build_report(
     candidates: list[CandidateResult] = []
     for entry in matrix.pool:
         rows = [
-            o
-            for o in matrix.outcomes
-            if o.model == entry.name and o.scenario_id in scenario_tasks
+            o for o in matrix.outcomes if o.model == entry.name and o.scenario_id in scenario_tasks
         ]
         accuracy, success, cost, p50, p95 = _aggregate(rows)
         candidates.append(
