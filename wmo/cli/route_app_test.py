@@ -3196,7 +3196,7 @@ def test_fit_compaction_control_win_is_an_investigation_gate(tmp_path: Path) -> 
 
 
 def test_fit_compaction_knn_writes_a_sidecar_overlay(tmp_path: Path) -> None:
-    from wmo.optimize.compaction_fit import COMPACTION_SIDECAR_FILENAME, CompactionArtifact
+    from wmo.optimize.compaction_fit import CompactionArtifact, compaction_path_for
 
     off_path, arm_path = _compaction_grid(tmp_path)
     policy_file = tmp_path / "policy.json"
@@ -3221,7 +3221,7 @@ def test_fit_compaction_knn_writes_a_sidecar_overlay(tmp_path: Path) -> None:
     policy = RoutingPolicy.load(policy_file)
     assert policy.kind == "knn" and not policy.clusters  # routing untouched
     sidecar = CompactionArtifact.model_validate_json(
-        (tmp_path / COMPACTION_SIDECAR_FILENAME).read_text()
+        compaction_path_for(policy_file).read_text()
     )
     assert sum(1 for c in sidecar.clusters if c.compression is not None) == 1
 
@@ -3230,7 +3230,7 @@ def test_fit_compaction_rejected_run_leaves_no_mountable_artifact(tmp_path: Path
     # The investigation gate must not leave a policy or sidecar behind (a rejected fit that
     # still writes its outputs hands the rejected result to whatever consumes the directory
     # next); only the evidence file, which IS the investigation record, may exist.
-    from wmo.optimize.compaction_fit import COMPACTION_SIDECAR_FILENAME
+    from wmo.optimize.compaction_fit import compaction_path_for
 
     off_path, arm_path = _compaction_grid(tmp_path)
     for kind in ("rank", "knn"):
@@ -3256,5 +3256,69 @@ def test_fit_compaction_rejected_run_leaves_no_mountable_artifact(tmp_path: Path
         )
         assert result.exit_code == 1
         assert not policy_file.exists()
-        assert not (out_dir / COMPACTION_SIDECAR_FILENAME).exists()
+        assert not compaction_path_for(policy_file).exists()
         assert policy_file.with_suffix(".compaction-evidence.json").exists()
+
+
+def test_fit_compaction_aa_kill_bar_fires_and_writes_nothing(tmp_path: Path) -> None:
+    # M5: the A/A bar's FIRING path. An off arm with a systematic episode-parity effect
+    # (episode 1 wins where episode 0 fails, in one lexical group) must trip the bar, exit
+    # nonzero, and leave NO artifact of any kind behind, evidence included: the fit never ran.
+    from wmo.optimize.compaction_fit import compaction_path_for
+
+    pool = [
+        PoolEntry(
+            name="a", kind=ProviderKind.OPENAI, model="a", input_per_mtok=1.0, output_per_mtok=1.0
+        ),
+        PoolEntry(
+            name="b", kind=ProviderKind.OPENAI, model="b", input_per_mtok=1.0, output_per_mtok=1.0
+        ),
+    ]
+    groups = {
+        "sql": "SELECT revenue balance sheet fiscal audit dividend capital table",
+        "prose": "write a warm poem about rivers meadows sunsets and quiet mornings",
+    }
+    rows = []
+    for group, text_ in groups.items():
+        for index in range(6):
+            for model in ("a", "b"):
+                for episode in range(2):
+                    reward = 1.0 if (group == "prose" or episode == 1 or index < 2) else 0.0
+                    rows.append(
+                        ScenarioOutcome(
+                            scenario_id=f"{group}-{index}",
+                            task=f"{text_} variant {index}",
+                            model=model,
+                            episode=episode,
+                            reward=reward,
+                            success=reward >= 1.0,
+                            cost_usd=0.01,
+                        )
+                    )
+    off_path = tmp_path / "off-aa.json"  # its own name: _compaction_grid writes off.json
+    OutcomeMatrix(pool=pool, outcomes=rows).save(off_path)
+    _dummy, arm_path = _compaction_grid(tmp_path)
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit-compaction",
+            str(off_path),
+            "--arm",
+            str(arm_path),
+            "--kind",
+            "rank",
+            "--clusters",
+            "2",
+            "--out",
+            str(policy_file),
+            "--allow-uneven-coverage",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "A/A kill bar failed" in result.output
+    assert not policy_file.exists()
+    assert not compaction_path_for(policy_file).exists()
+    assert not policy_file.with_suffix(".compaction-evidence.json").exists()

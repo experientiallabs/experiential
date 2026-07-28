@@ -41,11 +41,13 @@ from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.compaction_fit import (
-    COMPACTION_SIDECAR_FILENAME,
+    DEFAULT_NONINFERIORITY_MARGIN,
     ArmMatrices,
+    EvidenceProvenance,
     aa_report,
     apply_compaction,
     assign_to_clusters,
+    compaction_path_for,
     fit_compaction,
     overlay_clusters,
     save_compaction_sidecar,
@@ -1149,11 +1151,32 @@ def fit_compaction_cmd(
         "--z",
         min=0.0,
         help="Quality-gate confidence bar: a cluster deviates from uncompressed only when the "
-        "paired per-cell reward delta clears mean - z*SE >= 0 (small-sample SE floor applied). "
-        "Raise it if the A/A bar reports deviations.",
+        "paired per-cell delta clears mean - z*SE >= -margin (small-sample SE floor applied). "
+        "This is a BACKSTOP floor, not a tuning knob: raise it when the A/A bar reports "
+        "deviations, never lower it after seeing results.",
+    ),
+    margin: float = typer.Option(
+        DEFAULT_NONINFERIORITY_MARGIN,
+        "--margin",
+        min=0.0,
+        help="Non-inferiority margin in absolute reward (the 2026-07-28 ruling: 0.02, the "
+        "fleet's noise-floor bar). An arm that PRESERVES quality at lower cost passes; 0.0 "
+        "recovers the stricter superiority form for comparison sweeps.",
     ),
     min_pairs: int = typer.Option(
-        8, "--min-pairs", min=1, help="Paired cells a cluster needs before it may deviate."
+        8,
+        "--min-pairs",
+        min=1,
+        help="Paired cells a cluster needs before it may deviate. A BACKSTOP floor like --z: "
+        "with the SE floor active below 30 pairs, thin clusters cannot clear the margin "
+        "anyway; this bound refuses them explicitly rather than numerically.",
+    ),
+    scorer_era: str = typer.Option(
+        "",
+        "--scorer-era",
+        help="Provenance label for the judge/scorer state the matrices' rewards were produced "
+        "under (e.g. post-rescore-2026-07-28). Empty or containing 'broken' marks every "
+        "quality-side number PENDING-RESCORE on the fit output and sidecar.",
     ),
     fallback: str = typer.Option(
         None, "--fallback", help="(knn) Baseline model, as in `route fit`."
@@ -1249,7 +1272,7 @@ def fit_compaction_cmd(
         policy_clusters = policy.clusters
         assignment = assign_to_clusters(policy_clusters, off, embed_with=built)
 
-    deviations = aa_report(assignment, off, z=z, min_pairs=min_pairs)
+    deviations = aa_report(assignment, off, z=z, min_pairs=min_pairs, margin=margin)
     if deviations:
         for row in deviations:
             _console.print(
@@ -1263,13 +1286,30 @@ def fit_compaction_cmd(
         raise typer.Exit(1)
     _console.print(f"[green]✓[/green] A/A bar clean at z={z:g} (no cluster deviates on noise)")
 
+    provenance = EvidenceProvenance.build(
+        off_source=off_source,
+        arm_sources={
+            compression_signature(a.config): str(path)
+            for a, path in zip(arms, [*arm, *control], strict=True)
+        },
+        scorer_era=scorer_era,
+    )
+    if provenance.quality_label:
+        _console.print(
+            f"[yellow]PENDING-RESCORE[/yellow]: scorer era is "
+            f"{'unlabeled' if not scorer_era else repr(scorer_era)}; every quality-side number "
+            "below carries that label until the master's rescore (pass --scorer-era once the "
+            "matrices are rescored)."
+        )
     fit = fit_compaction(
         assignment,
         off,
         arms,
         z=z,
         min_pairs=min_pairs,
+        margin=margin,
         allow_uneven=allow_uneven_coverage,
+        provenance=provenance,
     )
     evidence_path = out_path.with_suffix(".compaction-evidence.json")
     evidence_path.write_text(fit.model_dump_json(indent=2))
@@ -1284,12 +1324,13 @@ def fit_compaction_cmd(
             f"quality {'pass' if row.quality_pass else 'fail'} "
             f"cost {'pass' if row.cost_pass else 'fail'} {verdict}"
         )
-    if fit.controls_would_win:
+    if fit.control_flags:
         _console.print(
-            f"[red]INVESTIGATION GATE[/red]: control arms would have won clusters: "
-            f"{fit.controls_would_win}. A control beating the learned arms through the full "
-            "gate is a finding to investigate, not a policy to ship. No policy or sidecar "
-            f"was written; the evidence is in {evidence_path}."
+            f"[red]INVESTIGATION GATE[/red]: {len(fit.control_flags)} control flag(s): "
+            f"{fit.control_flags}. A control matching or beating the learned arms' quality "
+            "signal (at any cost rank) means the signal is not compression-specific: a finding "
+            "to investigate, not a policy to ship. No policy or sidecar was written; the "
+            f"evidence is in {evidence_path}."
         )
         raise typer.Exit(1)
 
@@ -1303,10 +1344,10 @@ def fit_compaction_cmd(
             floor_q=floor_q,
             compression=None,  # per-cluster mode routes on raw text (exclusivity rule)
         )
-        del fitted
-        sidecar = out_path.parent / COMPACTION_SIDECAR_FILENAME
-        save_compaction_sidecar(policy_clusters, fit, sidecar, fitted_from=off_source)
-        target = f"sidecar {sidecar}"
+        save_compaction_sidecar(
+            out_path, fitted.policy, policy_clusters, fit, fitted_from=off_source
+        )
+        target = f"sidecar {compaction_path_for(out_path)}"
     else:
         policy = apply_compaction(policy, fit)
         policy.save(out_path)
