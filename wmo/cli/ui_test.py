@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import io
 import os
+from pathlib import Path
 
 import pytest
 import typer
@@ -270,6 +271,36 @@ def test_build_wizard_collects_all_inputs() -> None:
     assert params.fidelity == "high"
     assert params.embed_provider == "hashing"
     assert params.train_split == 0.5
+
+
+def test_build_wizard_trace_prompt_names_a_path_a_download_would_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The hint used to be a hardcoded `packages/environment-capture/...`, which exists only in a
+    # git checkout: from a pip install the wizard's one worked example was a path the user could
+    # not have. It now tracks the shared data root, and is spelled relative to the cwd so the
+    # hint stays readable.
+    monkeypatch.setenv("ENVCAP_DATA_ROOT", str(tmp_path / "bundles"))
+    monkeypatch.chdir(tmp_path)
+    prompts: list[str] = []
+    answers = iter(["m", "", "/tmp/t.jsonl", "2", "2", "", "1", "1"])
+
+    def reader(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    run_build_wizard(
+        Console(force_terminal=False, no_color=True, width=100),
+        BuildParams(name="default"),
+        reader=reader,
+        verify=_ok_verify,
+        verify_embed=_ok_verify,
+    )
+
+    hint = next(p for p in prompts if "export to ingest" in p)
+    assert "bundles/tau-bench/traces.otel.jsonl" in hint
+    assert "packages/environment-capture" not in hint
+    assert str(tmp_path) not in hint  # relative to the cwd, not an absolute /private/var/... path
 
 
 def test_build_wizard_select_by_number() -> None:

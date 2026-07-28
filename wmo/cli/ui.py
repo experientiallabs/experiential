@@ -20,6 +20,7 @@ import os
 import sys
 from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 
 import click
 import typer
@@ -224,10 +225,11 @@ def _collect_source(
             ask,
             f"Path to the {source} export to ingest",
             None,
-            # Where `wmo download tau-bench` would put a corpus HERE: the checkout's benchmark
-            # dir in a clone, `./environment-capture-data/` after a pip install. A hardcoded
-            # `packages/...` path is a dead end for everyone who installed the wheel.
-            example=str(corpus_path("tau-bench")),
+            # Where `wmo download tau-bench` would put a corpus HERE, spelled the way the user
+            # would type it: `packages/environment-capture/...` from the checkout root,
+            # `environment-capture-data/...` after a pip install. A hardcoded `packages/...`
+            # path is a dead end for everyone who installed the wheel.
+            example=_as_typed(corpus_path("tau-bench")),
         )
         if not file:
             console.print("[red]a trace export path is required[/red]")
@@ -787,6 +789,19 @@ def select_model(
         interactive=reader is None,
         notes=notes,
     )
+
+
+def _as_typed(path: Path) -> str:
+    """`path` spelled the way a user at this cwd would type it: relative when it is under it.
+
+    Prompt hints are read at a glance, and an absolute path from `/Users/...` down buries the
+    part that carries the information. Falls back to the absolute form when the path is
+    elsewhere, which is the only spelling that would actually work from here.
+    """
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
 
 
 def _prompt_text(

@@ -97,7 +97,15 @@ from wmo.env.llm_agent import LLMAgent
 from wmo.evals.grid import GridResult, ModelSpec, merge_results, run_grid
 from wmo.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmo.evals.open_loop import EvalReport, OpenLoopEval
-from wmo.hub import CORPORA, CorpusSpec, corpus_path, data_root, fetch_corpus, published_corpora
+from wmo.hub import (
+    CORPORA,
+    CorpusSpec,
+    corpus_path,
+    data_root,
+    downloadable_benchmarks,
+    fetch_corpus,
+    published_corpora,
+)
 from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.ingest.base import load_payloads
 from wmo.ingest.detect import detect_format
@@ -1180,12 +1188,7 @@ def download(
     """
     selected = list(benchmarks or [])
     if selected == ["all"]:
-        # Prefer the Hub's live list: the static registry can name corpora that aren't
-        # published yet (a 404 mid-loop used to abort the remaining downloads).
-        try:
-            selected = sorted(corpus.benchmark for corpus in published_corpora())
-        except urllib.error.URLError:
-            selected = sorted(CORPORA)
+        selected = _all_downloadable()
     if not selected:
         try:
             published = published_corpora()
@@ -1216,7 +1219,16 @@ def download(
         try:
             path = _fetch_with_progress(name, force=force)
         except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
+            # Unknown or registered-but-unpublished: `fetch_corpus` decides this offline, before
+            # it touches the Hub. As the only thing asked for it is a plain usage error, but
+            # inside a multi-bundle run it must NOT abort the rest — that is the same
+            # strand-everything-queued-behind-it defect as the 404 below, and it is reachable
+            # from a hand-typed list as well as from an offline `all`.
+            if len(selected) == 1:
+                raise typer.BadParameter(str(exc)) from exc
+            failures.append(f"{name}: {exc}")
+            _console.print(f"[yellow]skipping {name}: {exc}[/yellow]")
+            continue
         except urllib.error.HTTPError as exc:
             # One unpublished/broken dataset must not abort the REST of a multi-download:
             # record it, keep fetching, and fail (with every name) at the end. The reason is
@@ -1237,6 +1249,35 @@ def download(
             "some datasets could not be downloaded (unpublished? `wmo download` with no "
             "arguments lists what is):\n  " + "\n  ".join(failures)
         )
+
+
+def _all_downloadable() -> list[str]:
+    """The bundles `wmo download all` should fetch, live Hub list preferred.
+
+    The Hub's own listing is authoritative, so it is tried first. Offline the local registry
+    answers instead — but only the entries it marks as published. The whole registry is the wrong
+    answer twice over: `fetch_corpus` refuses an unpushed bundle before it touches the network,
+    which used to abort every fetch queued alphabetically behind it, and even one that survived
+    would be a name the Hub can only answer 401 for.
+
+    Both narrowings are announced. A quiet substitution of a stale local list for the live one,
+    or a quiet drop of a registered benchmark, reads afterwards as "everything was fetched".
+    """
+    try:
+        return sorted(corpus.benchmark for corpus in published_corpora())
+    except urllib.error.URLError as exc:
+        selected = downloadable_benchmarks()
+        _console.print(
+            f"[yellow]could not list the Hub's published datasets ({exc.reason}); falling back "
+            "to the bundles this release knows about[/yellow]"
+        )
+        skipped = sorted(set(CORPORA) - set(selected))
+        if skipped:
+            _console.print(
+                f"[yellow]not downloading {', '.join(skipped)}: registered here but never "
+                "pushed to the Hub, so there is nothing to fetch[/yellow]"
+            )
+        return selected
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:
@@ -1276,8 +1317,8 @@ def serve(
 ) -> None:
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
-    Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root ../other-project/.wmo`). Two surfaces are
+    Serves every built model by default, or just the `--name` ones, from one or more project
+    roots (e.g. `--root .wmo --root ../other-project/.wmo`). Two surfaces are
     exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
     `.../step`; and, for every served model whose dir carries a `policy.json` (written by
     `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint

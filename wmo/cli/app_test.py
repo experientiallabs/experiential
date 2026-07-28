@@ -3560,6 +3560,67 @@ def test_download_all_expands_to_the_published_list(monkeypatch, tmp_path: Path)
     assert fetched == ["a-bench", "b-bench"]
 
 
+def test_download_all_offline_skips_unpublished_and_says_so(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    # Offline, `all` falls back to the local registry. That registry carries entries whose bundle
+    # was never pushed (`kimi-gui-control`), and `fetch_corpus` refuses those before it reaches
+    # the network — alphabetically stranding swe-bench, tau-bench and terminal-tasks behind the
+    # refusal. The fallback must be the published subset, and it must SAY which names it dropped:
+    # a silent skip reads afterwards as "everything was fetched".
+    import urllib.error
+
+    fetched: list[str] = []
+
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        if not cli_app_module.CORPORA[name].published:
+            raise ValueError(f"{name!r} ... has not been published to the Hub yet ...")
+        fetched.append(name)
+        return tmp_path
+
+    def offline() -> list[object]:
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(cli_app_module, "published_corpora", offline)
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+
+    result = runner.invoke(app, ["download", "all"])
+
+    assert result.exit_code == 0, result.output
+    unpublished = sorted(n for n, spec in cli_app_module.CORPORA.items() if not spec.published)
+    assert unpublished, "this test is meaningless once every registered corpus is published"
+    assert fetched == cli_app_module.downloadable_benchmarks()
+    # Everything published came down, including the names that sort after the unpublished one.
+    for name in ("swe-bench", "tau-bench", "terminal-tasks"):
+        assert name in fetched
+    flat = _flat(result.output)
+    assert "falling back" in flat
+    for name in unpublished:
+        assert name not in fetched
+        assert name in flat  # named, not silently dropped
+
+
+def test_download_multi_does_not_abort_on_an_unfetchable_name(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    # Belt and braces for the same class: whatever produced the list, one name `fetch_corpus`
+    # refuses offline must not strand the fetches queued behind it. The refusal is still reported
+    # at the end, so the run cannot look like a clean sweep.
+    fetched: list[str] = []
+
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        if name == "unpushed":
+            raise ValueError("'unpushed' has no published corpus (available: bird-sql)")
+        fetched.append(name)
+        return tmp_path
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+
+    result = runner.invoke(app, ["download", "a-bench", "unpushed", "z-bench"])
+
+    assert fetched == ["a-bench", "z-bench"]
+    assert result.exit_code != 0  # ...and the run still reports what it could not get
+    assert "unpushed" in _flat(result.output)
+
+
 def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
     # One unpublished dataset must not abort the remaining downloads (it used to kill `all`
     # mid-loop, alphabetically stranding everything after the 404).
