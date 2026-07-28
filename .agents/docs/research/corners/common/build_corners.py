@@ -37,6 +37,7 @@ from matplotlib.lines import Line2D
 from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.core.types import JsonObject
+from wmo.optimize.compression import CompressingEmbedder
 from wmo.optimize.knn import COST_QUALITY_ANCHORS, apply_cost_quality
 from wmo.optimize.policy import RoutingPolicy
 from wmo.optimize.scorecard import (
@@ -344,6 +345,12 @@ def _routed_records(
     try:
         policy = RoutingPolicy.load(policy_path)
         embedder = policy.embedder.build()
+        if policy.fit_compression is not None:
+            # Compressed-arm banks are fitted through CompressingEmbedder (queries embedded
+            # in the arm's SERVED geometry, C2's representation-consistency rule). Replaying
+            # with the raw embedder would query a compressed-geometry bank with raw vectors,
+            # which is the measured floor-tripping failure, so the replay compresses too.
+            embedder = CompressingEmbedder(embedder, policy.fit_compression)
         eval_ids = [
             sid
             for sid in snapshot.matrix.scenario_ids()
