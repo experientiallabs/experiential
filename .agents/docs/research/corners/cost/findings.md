@@ -1,10 +1,10 @@
 # COST-MAX corner: where the savings actually come from
 
-> Status 2026-07-28: ALL THREE grid-c2 arm matrices are MERGED (20 test-band scenarios x 11
-> models x 2 episodes per arm; identity 435/440 scored, truncate 327/440, llmlingua2-endpoint
-> 190/440 - coverage carried on every number below). Measured sections are filled from
-> `numbers.json`; routed rungs still await the master's per-arm fits. Publication of anything
-> on this page is gated (DECISIONS 2026-07-27, corner chats entry).
+> Status 2026-07-28 (post-repair): identity and truncate matrices are FINAL (440/440
+> scored); llmlingua2-endpoint is mid-straggler-pass (last merge 409/440, matrix currently
+> re-merging; its numbers are labeled provisional). The identity-arm routed rung is
+> measured (fit + dial replay on the held-out band). Coverage travels on every number.
+> Publication of anything on this page is gated (DECISIONS 2026-07-27, corner chats entry).
 
 ## The accounting rule every number obeys
 
@@ -31,26 +31,27 @@ Savings behind an optimized endpoint can come from four places. Their current sh
    +21.9 pt, excludes zero: better AND cheaper), and gpt-5.5 is **-59.2% at +2.8 pt**
    (CI -7.6 to +12.6, parity). Cheaper models buy more savings only by paying quality:
    glm-5.2 -80.5% at -5.8 pt, haiku-4-5 -89.8% at -14.3 pt, gpt-5.4-mini -93.0% at
-   -34.1 pt. The routed rung on top of this is [PENDING the master's per-arm fits]; the
-   structural caveat stands that tau's ~14-scenario fit band is deep in the small-bank
-   regime, so the routing rung's claim will be cost-at-parity, not accuracy lift. On
+   -34.1 pt. The routed rung on top of this is measured (see the routed bullet in the 40%
+   section): the router discovers opus-5 automatically and holds best-single parity; the
+   dial's savings leg does not pay on tau's ~14-scenario bank, per the small-bank law. On
    routerbench-ours9 (different corpus, quoted as measured there, never blended), the
    dial runs -13.9% (quality max, +1.14 pt) to -46.2% (max savings, -0.54 pt) vs ITS best
    single model.
-2. **Compression share: the tau grid CONFIRMS the financebench cost inversion on strong
-   models** [measured, same provenance; compressor bill folded in as RowOverhead]. For the
-   frontier tier, compression RAISES effective cost per completed task: fable-5 under
-   llmlingua2-endpoint is **+146.2%** vs uncompressed fable-5 (n=5 shared scenarios) and
-   +23.6% under truncate (n=15); opus-4-8 under the endpoint +88.6% (n=6); opus-5 +35.1%
-   (n=11). The mechanism financebench named (dropping load-bearing observations fails
-   tasks and lengthens episodes) shows in the latency column too: truncate p50 deltas of
-   +170-480% on several models. Only the already-cheap models gain, marginally, at extra
-   quality loss (gpt-5.4-mini -94.9% compressed vs -93.0% raw, quality -36.3 vs -34.1 pt).
-   Per-token accounting would have called every one of these arms cheaper; effective cost
-   per completed task is what catches the inversion. COVERAGE CAVEAT: the llmlingua2 arm
-   scored 190/440 cells and the strong-model comparisons ride on 5-11 shared scenarios;
-   excluded episodes and their spend are itemized per record in `numbers.json`. Compaction
-   rungs stay "measured tradeoff, not recommendation" pending that lane's accuracy verdict.
+2. **Compression share: the cost inversion on strong models is CONFIRMED for the dumb
+   control and MILD for the learned compressor** [measured, same provenance; compressor
+   bill folded as RowOverhead. CORRECTION 2026-07-28: the first quote of this section rode
+   pre-repair matrices with outage-shaped missingness; the master's re-render flag was
+   right, and the repaired numbers moved a lot]. On the FINAL truncate arm (440/440),
+   truncation raises fable-5's effective cost **+47.1%** at -8.9 pt quality (n=20; the
+   pre-repair read was +23.6% at n=15). On the repaired llmlingua2 arm (mid-straggler-pass,
+   provisional), fable-5's inversion collapsed from the outage-inflated +146.2% to
+   **+6.7%** at -8.1 pt (n=20): the learned compressor is dramatically better than the
+   matched-keep dumb control on cost, while still not a net win on strong models (quality
+   pays). The financebench mechanism (deleting load-bearing observations fails tasks and
+   lengthens episodes) still shows in truncate's latency column (p50 +170-480% on several
+   models). Per-token accounting would have called every arm cheaper; effective cost per
+   completed task catches the inversion. Compaction rungs stay "measured tradeoff, not
+   recommendation" pending that lane's accuracy verdict.
 3. **Student share (distillation): zero, and zero BY PROGRAM DECISION.** Silen's ruling
    (2026-07-28, this chat): distillation is not being pursued. Cycle 1's gate had already
    REJECTED the warmup adapter (teacher Qwen3.6-27B 73.3% vs student base 71.7% at k=3: no
@@ -123,15 +124,24 @@ within a small tolerance".
   reading: NOTHING measured beats it yet. opus-5 dominates this grid (it is the quality
   max AND cheaper than fable-5 at $0.393/task), so every other single model saves money
   only by losing quality (gpt-5.5: -0.5% at -8.1 pt), and the compressed arms lose on both
-  axes for strong models. Savings at parity vs best-single is exactly the routed rung's
-  job and remains [PENDING the fits]. On ours9 the dial bought -24.7% at +0.99 pt
-  (balanced); tau's small-bank regime will be weaker.
+  axes for strong models.
+- **The routed rung [measured, identity-arm fit, 6 held-out scenarios, embedding replay
+  ~$0.001 logged per the 2026-07-28 spend ruling]**: at the quality and balanced dials the
+  router routes ALL six eval scenarios to opus-5, i.e. it automatically discovers the
+  dominant model and delivers best-single parity (-67.3% vs fable-5 at +12.5 pt on ITS
+  eval band; CI spans zero at n=6; NOT comparable to the 20-scenario single-model numbers,
+  different scenario set). Past the balanced point the cost leg routes one scenario to
+  kimi-k2.6 and gets WORSE on both axes vs opus-5 (+13.2% cost, -6.25 pt): on a
+  ~14-scenario bank the dial's savings leg does not pay, exactly what the small-bank
+  caveat predicted. The routing rung's honest tau claim is **cost-at-parity with the best
+  single model via automatic discovery**, not savings beyond it (ours9's 1199-scenario
+  bank is where the savings leg earns -24.7% to -46.2%).
 - HONESTY NOTE the headline must carry: fable-5 is a WEAK anchor on this workload; it is
   dominated by opus-5 on both axes. A "-59% cheaper than frontier" claim that names
   fable-5 is true and clears the SLA, but the defensible optimizer contribution is the
-  best-single column, where the measured answer today is "pick opus-5" and routed savings
-  are unproven until the fits land. (Silen's PR #311 ruling on which column leads the
-  published headline is still open.)
+  best-single column, where the measured answer today is "pick opus-5, which the router
+  finds automatically". RULING: fable-5 leads all baselines (Silen 2026-07-28); this
+  column stays adjacent as the check.
 - The sales frame stays "run 10x more for the same budget" (an **estimate** derived from
   measured per-task cost, and labeled as such wherever quoted; vs fable-5 the measured
   multiplier at parity is ~2.5x, not 10x, on this workload).
