@@ -1,14 +1,14 @@
 {
-  "status": "identity: merged; truncate: merged; llmlingua2-endpoint: merged",
+  "status": "identity: merged + addendum grid-c2-qwen (2 model(s)); truncate: merged; llmlingua2-endpoint: merged",
   "dataset": "tau-bench",
   "judge": "rubric-v2 (opus-4-8)",
   "pending_arms": [],
   "anchor": "fable-5",
   "best_single": "opus-5",
   "teacher_verdict": {
-    "decision": "distill",
-    "student": "gpt-5.4-mini",
-    "teacher": "gpt-5.5",
+    "decision": "do_not_distill",
+    "student": "qwen3.5-9b",
+    "teacher": null,
     "n_scenarios": 20,
     "gains": [
       {
@@ -16,130 +16,156 @@
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.55625,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.45,
-        "standard_error": 0.1035552229997421,
-        "ci_low": 0.2470317629205055,
-        "ci_high": 0.6529682370794945,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": 0.0975,
+        "standard_error": 0.0706618150436511,
+        "ci_low": -0.04099715748555616,
+        "ci_high": 0.23599715748555616,
         "price": 0.39262074999999996,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "gpt-5.5",
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.475,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.36875,
-        "standard_error": 0.0887018030731115,
-        "ci_low": 0.1948944659767015,
-        "ci_high": 0.5426055340232986,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": 0.01624999999999999,
+        "standard_error": 0.038868663809240846,
+        "ci_low": -0.05993258106611207,
+        "ci_high": 0.09243258106611205,
         "price": 0.39074888888888887,
-        "clears_gap": true
+        "clears_gap": false
+      },
+      {
+        "model": "qwen3.6-27b",
+        "tier": "open",
+        "n_scenarios": 20,
+        "mean_reward": 0.45125000000000004,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.007500000000000004,
+        "standard_error": 0.04970637468384237,
+        "ci_low": -0.10492449438033105,
+        "ci_high": 0.08992449438033104,
+        "price": 0.03959662666666666,
+        "clears_gap": false
       },
       {
         "model": "fable-5",
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.44749999999999995,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.34125,
-        "standard_error": 0.10799115156247512,
-        "ci_low": 0.12958734293754878,
-        "ci_high": 0.5529126570624512,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.011250000000000008,
+        "standard_error": 0.07468078999807674,
+        "ci_low": -0.15762434839623043,
+        "ci_high": 0.13512434839623041,
         "price": 0.957891875,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "kimi-k2.6",
         "tier": "open",
         "n_scenarios": 20,
         "mean_reward": 0.43875000000000003,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.33249999999999996,
-        "standard_error": 0.09841005778722116,
-        "ci_low": 0.13961628673704649,
-        "ci_high": 0.5253837132629534,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.020000000000000004,
+        "standard_error": 0.06898226316654844,
+        "ci_low": -0.15520523580643497,
+        "ci_high": 0.11520523580643495,
         "price": 0.35326605233333336,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "sonnet-5",
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.42925,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.323,
-        "standard_error": 0.11319254671390226,
-        "ci_low": 0.10114260844075157,
-        "ci_high": 0.5448573915592485,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.0295,
+        "standard_error": 0.07352398462943553,
+        "ci_low": -0.17360700987369365,
+        "ci_high": 0.11460700987369365,
         "price": 0.541831125,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "opus-4-8",
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.39499999999999996,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.28874999999999995,
-        "standard_error": 0.11777089433570408,
-        "ci_low": 0.05791904710201998,
-        "ci_high": 0.5195809528979799,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.06375000000000001,
+        "standard_error": 0.07706531320899176,
+        "ci_low": -0.21479801388962388,
+        "ci_high": 0.08729801388962384,
         "price": 0.39396400000000004,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "glm-5.2",
         "tier": "open",
         "n_scenarios": 20,
         "mean_reward": 0.39,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.28375,
-        "standard_error": 0.10362309930959562,
-        "ci_low": 0.08064872535319259,
-        "ci_high": 0.48685127464680744,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.06875,
+        "standard_error": 0.05290492341032762,
+        "ci_low": -0.17244364988424216,
+        "ci_high": 0.03494364988424213,
         "price": 0.18673104866666668,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "kimi-k3",
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.36625,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.26,
-        "standard_error": 0.10221880556202129,
-        "ci_low": 0.059651141098438304,
-        "ci_high": 0.46034885890156174,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.0925,
+        "standard_error": 0.06254209108987911,
+        "ci_low": -0.21508249853616307,
+        "ci_high": 0.030082498536163058,
         "price": 0.5606110714285715,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "haiku-4-5",
         "tier": "frontier",
         "n_scenarios": 20,
         "mean_reward": 0.30425,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.198,
-        "standard_error": 0.08204251144504614,
-        "ci_low": 0.037196677567709585,
-        "ci_high": 0.3588033224322904,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.1545,
+        "standard_error": 0.05123976149334359,
+        "ci_low": -0.25492993252695345,
+        "ci_high": -0.05407006747304656,
         "price": 0.09814311111111111,
-        "clears_gap": true
+        "clears_gap": false
       },
       {
         "model": "deepseek-v4-pro",
         "tier": "open",
         "n_scenarios": 20,
         "mean_reward": 0.26625,
-        "student_mean_reward": 0.10625,
-        "mean_gain": 0.16,
-        "standard_error": 0.07498684095085932,
-        "ci_low": 0.01302579173631574,
-        "ci_high": 0.30697420826368427,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.1925,
+        "standard_error": 0.0621463679761865,
+        "ci_low": -0.31430688123332556,
+        "ci_high": -0.07069311876667446,
         "price": 0.12777847683333335,
-        "clears_gap": true
+        "clears_gap": false
+      },
+      {
+        "model": "gpt-5.4-mini",
+        "tier": "frontier",
+        "n_scenarios": 20,
+        "mean_reward": 0.10625,
+        "student_mean_reward": 0.45875000000000005,
+        "mean_gain": -0.3525,
+        "standard_error": 0.08100722839741882,
+        "ci_low": -0.5112741676589408,
+        "ci_high": -0.19372583234105908,
+        "price": 0.0673475,
+        "clears_gap": false
       }
     ],
     "unmeasured_models": [],
@@ -147,7 +173,7 @@
     "min_gap": 0.1,
     "min_scenarios": 8,
     "sufficiency": 0.8,
-    "reason": "DISTILL: 'opus-5' beats 'gpt-5.4-mini' by +45.0 points on 20 shared scenarios (95% CI +24.7 to +65.3 points), clearing the 10.0-point bar this gate requires, so there is something to teach. The cheapest sufficient teacher is 'gpt-5.5' at $0.3907 per completed task on this matrix, keeping 82% of the best measured gain (the bar is 80%). No open-weights candidate kept enough of the gain, so this teacher is frontier tier: check that provider's terms before training on its outputs."
+    "reason": "DO NOT DISTILL: no model in this matrix beats 'qwen3.5-9b' by the 10.0 points this gate requires. The best is 'opus-5' at +9.8 points on 20 shared scenarios (95% CI -4.1 to +23.6 points). 'qwen3.5-9b' already serves this workload and earns its traffic on price, so training has no teacher to learn from and this stage skips with zero spend."
   },
   "teacher_unavailable_reason": null,
   "records": {
@@ -909,6 +935,158 @@
         "excluded_cost_usd": 0.0,
         "overhead_components": [],
         "cost_assumptions": "Arm 'kimi-k3 [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/qwen3.5-9b": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -99.6,
+          "high": -98.7,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
+        "quality_delta_points": 1.13,
+        "quality_delta_paired": {
+          "mean": 0.0113,
+          "ci95": [
+            -0.1287,
+            0.1562
+          ],
+          "sign_test_p": 0.8145294189453125,
+          "n_pairs": 20,
+          "within_noise_floor": true
+        },
+        "cost_delta_percent": -99.3,
+        "latency_p50_delta_percent": 8.6,
+        "cost_per_completed_task_usd": 0.006547973529411765,
+        "anchor_cost_per_completed_task_usd": 0.957891875,
+        "task_success_rate": 0.425,
+        "mean_reward": 0.4588,
+        "latency_p50_model_s": 45.06,
+        "latency_p95_model_s": 157.72,
+        "scenarios_compared": 20,
+        "scenarios_excluded": 0,
+        "n_scored": 40,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'qwen3.5-9b [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -99.0,
+          "high": -97.2,
+          "n_scenarios": 20,
+          "undefined_resamples": 0
+        },
+        "quality_delta_points": -9.75,
+        "quality_delta_paired": {
+          "mean": -0.0975,
+          "ci95": [
+            -0.225,
+            0.0425
+          ],
+          "sign_test_p": 0.09625244140625,
+          "n_pairs": 20,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -98.3,
+        "latency_p50_delta_percent": 18.8,
+        "cost_per_completed_task_usd": 0.006547973529411765,
+        "anchor_cost_per_completed_task_usd": 0.39262074999999996,
+        "task_success_rate": 0.425,
+        "mean_reward": 0.4588,
+        "latency_p50_model_s": 45.06,
+        "latency_p95_model_s": 157.72,
+        "scenarios_compared": 20,
+        "scenarios_excluded": 0,
+        "n_scored": 40,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'qwen3.5-9b [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      }
+    },
+    "identity/qwen3.6-27b": {
+      "vs_anchor": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -97.5,
+          "high": -92.3,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
+        "quality_delta_points": 0.38,
+        "quality_delta_paired": {
+          "mean": 0.0038,
+          "ci95": [
+            -0.1025,
+            0.11
+          ],
+          "sign_test_p": 1.0,
+          "n_pairs": 20,
+          "within_noise_floor": true
+        },
+        "cost_delta_percent": -95.9,
+        "latency_p50_delta_percent": 147.0,
+        "cost_per_completed_task_usd": 0.03959662666666666,
+        "anchor_cost_per_completed_task_usd": 0.957891875,
+        "task_success_rate": 0.375,
+        "mean_reward": 0.4513,
+        "latency_p50_model_s": 102.49,
+        "latency_p95_model_s": 262.97,
+        "scenarios_compared": 20,
+        "scenarios_excluded": 0,
+        "n_scored": 40,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'qwen3.6-27b [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+      },
+      "vs_best_single": {
+        "label": "measured",
+        "provenance": "wm_simulated",
+        "judge": "rubric-v2 (opus-4-8)",
+        "cost_delta_percent_ci95": {
+          "low": -93.6,
+          "high": -81.1,
+          "n_scenarios": 20,
+          "undefined_resamples": 1
+        },
+        "quality_delta_points": -10.5,
+        "quality_delta_paired": {
+          "mean": -0.105,
+          "ci95": [
+            -0.2325,
+            0.0163
+          ],
+          "sign_test_p": 0.237884521484375,
+          "n_pairs": 20,
+          "within_noise_floor": false
+        },
+        "cost_delta_percent": -89.9,
+        "latency_p50_delta_percent": 170.2,
+        "cost_per_completed_task_usd": 0.03959662666666666,
+        "anchor_cost_per_completed_task_usd": 0.39262074999999996,
+        "task_success_rate": 0.375,
+        "mean_reward": 0.4513,
+        "latency_p50_model_s": 102.49,
+        "latency_p95_model_s": 262.97,
+        "scenarios_compared": 20,
+        "scenarios_excluded": 0,
+        "n_scored": 40,
+        "n_excluded_episodes": 0,
+        "excluded_cost_usd": 0.0,
+        "overhead_components": [],
+        "cost_assumptions": "Arm 'qwen3.6-27b [identity]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'opus-5 [best-single anchor]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
       }
     },
     "truncate/gpt-5.5": {
@@ -4253,17 +4431,18 @@
       "dial": 0.75,
       "n_eval_scenarios": 20,
       "routed_mix": {
-        "opus-5": 18,
+        "opus-5": 17,
         "opus-4-8": 1,
-        "kimi-k2.6": 1
+        "kimi-k2.6": 1,
+        "qwen3.5-9b": 1
       },
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
         "cost_delta_percent_ci95": {
-          "low": -72.9,
-          "high": -37.9,
+          "low": -74.1,
+          "high": -40.6,
           "n_scenarios": 20,
           "undefined_resamples": 0
         },
@@ -4278,13 +4457,13 @@
           "n_pairs": 20,
           "within_noise_floor": false
         },
-        "cost_delta_percent": -57.4,
-        "latency_p50_delta_percent": -4.8,
-        "cost_per_completed_task_usd": 0.40834362068421054,
+        "cost_delta_percent": -59.6,
+        "latency_p50_delta_percent": -3.0,
+        "cost_per_completed_task_usd": 0.3866073812105263,
         "anchor_cost_per_completed_task_usd": 0.957891875,
         "task_success_rate": 0.475,
         "mean_reward": 0.5388,
-        "latency_p50_model_s": 39.49,
+        "latency_p50_model_s": 40.23,
         "latency_p95_model_s": 198.9,
         "scenarios_compared": 20,
         "scenarios_excluded": 0,
@@ -4301,8 +4480,8 @@
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
         "cost_delta_percent_ci95": {
-          "low": -1.9,
-          "high": 16.7,
+          "low": -18.1,
+          "high": 14.6,
           "n_scenarios": 20,
           "undefined_resamples": 0
         },
@@ -4317,13 +4496,13 @@
           "n_pairs": 20,
           "within_noise_floor": true
         },
-        "cost_delta_percent": 4.0,
-        "latency_p50_delta_percent": 4.1,
-        "cost_per_completed_task_usd": 0.40834362068421054,
+        "cost_delta_percent": -1.5,
+        "latency_p50_delta_percent": 6.0,
+        "cost_per_completed_task_usd": 0.3866073812105263,
         "anchor_cost_per_completed_task_usd": 0.39262074999999996,
         "task_success_rate": 0.475,
         "mean_reward": 0.5388,
-        "latency_p50_model_s": 39.49,
+        "latency_p50_model_s": 40.23,
         "latency_p95_model_s": 198.9,
         "scenarios_compared": 20,
         "scenarios_excluded": 0,
@@ -4341,8 +4520,9 @@
       "dial": 1.0,
       "n_eval_scenarios": 20,
       "routed_mix": {
-        "opus-5": 18,
-        "opus-4-8": 1,
+        "opus-5": 13,
+        "qwen3.6-27b": 2,
+        "qwen3.5-9b": 4,
         "kimi-k2.6": 1
       },
       "vs_anchor": {
@@ -4350,29 +4530,29 @@
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
         "cost_delta_percent_ci95": {
-          "low": -72.9,
-          "high": -37.9,
+          "low": -74.8,
+          "high": -43.6,
           "n_scenarios": 20,
           "undefined_resamples": 0
         },
-        "quality_delta_points": 9.13,
+        "quality_delta_points": 5.75,
         "quality_delta_paired": {
-          "mean": 0.0912,
+          "mean": 0.0575,
           "ci95": [
-            -0.0063,
-            0.1975
+            -0.0537,
+            0.1762
           ],
-          "sign_test_p": 0.5810546875,
+          "sign_test_p": 1.0,
           "n_pairs": 20,
           "within_noise_floor": false
         },
-        "cost_delta_percent": -57.4,
-        "latency_p50_delta_percent": -4.8,
-        "cost_per_completed_task_usd": 0.40834362068421054,
+        "cost_delta_percent": -60.8,
+        "latency_p50_delta_percent": -2.2,
+        "cost_per_completed_task_usd": 0.3755526966470588,
         "anchor_cost_per_completed_task_usd": 0.957891875,
-        "task_success_rate": 0.475,
-        "mean_reward": 0.5388,
-        "latency_p50_model_s": 39.49,
+        "task_success_rate": 0.425,
+        "mean_reward": 0.505,
+        "latency_p50_model_s": 40.59,
         "latency_p95_model_s": 198.9,
         "scenarios_compared": 20,
         "scenarios_excluded": 0,
@@ -4389,29 +4569,29 @@
         "provenance": "wm_simulated",
         "judge": "rubric-v2 (opus-4-8)",
         "cost_delta_percent_ci95": {
-          "low": -1.9,
-          "high": 16.7,
+          "low": -30.0,
+          "high": 19.9,
           "n_scenarios": 20,
           "undefined_resamples": 0
         },
-        "quality_delta_points": -1.75,
+        "quality_delta_points": -5.13,
         "quality_delta_paired": {
-          "mean": -0.0175,
+          "mean": -0.0513,
           "ci95": [
-            -0.0563,
-            0.0037
+            -0.1038,
+            -0.0088
           ],
-          "sign_test_p": 1.0,
+          "sign_test_p": 0.21875,
           "n_pairs": 20,
-          "within_noise_floor": true
+          "within_noise_floor": false
         },
-        "cost_delta_percent": 4.0,
-        "latency_p50_delta_percent": 4.1,
-        "cost_per_completed_task_usd": 0.40834362068421054,
+        "cost_delta_percent": -4.3,
+        "latency_p50_delta_percent": 7.0,
+        "cost_per_completed_task_usd": 0.3755526966470588,
         "anchor_cost_per_completed_task_usd": 0.39262074999999996,
-        "task_success_rate": 0.475,
-        "mean_reward": 0.5388,
-        "latency_p50_model_s": 39.49,
+        "task_success_rate": 0.425,
+        "mean_reward": 0.505,
+        "latency_p50_model_s": 40.59,
         "latency_p95_model_s": 198.9,
         "scenarios_compared": 20,
         "scenarios_excluded": 0,
@@ -4429,6 +4609,64 @@
     "calls": 590,
     "est_usd_at_3large_list": 0.001948,
     "label": "estimate; analysis spend allowed by Silen 2026-07-28 ruling"
+  },
+  "real_probe": {
+    "label": "measured",
+    "provenance": "real_episode",
+    "judge": "tau2 reward (7/20 pinned tasks include tau2's NL-assertion judge)",
+    "deviation": "routed arm executed direct (served endpoint 501s tool calls on anthropic-kind entries; finding filed); balanced policy routes 100% opus-5, verified live + 20/20 LOO folds",
+    "vs_anchor": {
+      "label": "measured",
+      "provenance": "real_episode",
+      "judge": "tau2 reward (7/20 pinned tasks include tau2's NL-assertion judge)",
+      "cost_delta_percent_ci95": {
+        "low": -44.8,
+        "high": 6.6,
+        "n_scenarios": 20,
+        "undefined_resamples": 0
+      },
+      "quality_delta_points": -25.0,
+      "quality_delta_paired": {
+        "mean": -0.25,
+        "ci95": [
+          -0.425,
+          -0.05
+        ],
+        "sign_test_p": 0.01171875,
+        "n_pairs": 20,
+        "within_noise_floor": false
+      },
+      "cost_delta_percent": -25.0,
+      "latency_p50_delta_percent": -28.9,
+      "cost_per_completed_task_usd": 1.0917835714285713,
+      "anchor_cost_per_completed_task_usd": 1.4559035483870968,
+      "task_success_rate": 0.525,
+      "mean_reward": 0.525,
+      "latency_p50_model_s": 51.33,
+      "latency_p95_model_s": 171.74,
+      "scenarios_compared": 20,
+      "scenarios_excluded": 0,
+      "n_scored": 40,
+      "n_excluded_episodes": 0,
+      "excluded_cost_usd": 0.0,
+      "overhead_components": [],
+      "cost_assumptions": "Arm 'routed-decision-direct [real]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [real]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+    },
+    "sim_vs_real": {
+      "note": "sign agreement requires a scenario-id bridge (wm ids are trace hashes, real ids are domain:task); computed by the probe script via the pinned split order and reported in findings",
+      "wm_mean_delta_pt": 10.88,
+      "real_mean_delta_pt": -25.0,
+      "wm_n_up_down_tied": [
+        8,
+        5,
+        7
+      ],
+      "real_n_up_down_tied": [
+        1,
+        10,
+        9
+      ]
+    }
   },
   "notes": []
 }

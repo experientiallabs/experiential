@@ -227,3 +227,47 @@ not knowing ex ante that opus-5 is the corner. On tau the dial does not trace th
 frontier (the LOO mix pins to opus-5 at every detent; small-bank law); the frontier's
 cheap end is reachable only as static mounts of the cheap models. RULING logged: compaction
 analysis skipped going forward (rungs stay as recorded evidence); routing is the focus.
+
+## The real-episode leg (2026-07-28): THE QUALITY HEADLINE BREAKS IN REALITY - probe STOPPED per the pre-registered rule
+
+Setup [real_episode, tau2's own reward, canonical pins, fresh capture cohort, pinned 20 x 2
+episodes per arm]: the identity policy served at balanced (routing verified live:
+x-wmo-routed-model opus-5, D-DIAL config correct) - but the endpoint 501s tool calls on
+anthropic-kind entries (product finding, serving lane), so the routed arm executed ITS
+DECISION direct (opus-5; the balanced policy routes 100% there, verified live + 20/20 LOO
+folds). Deviation labeled on every row. Telecom required the full-task-split runner fix
+(committed 710e6582).
+
+THE VERDICT (paired per scenario, 40/40 episodes scored per arm):
+
+- QUALITY BREAKS, with the SIGN INVERTED: real routed-vs-fable-5 is **-25.0 pt
+  (CI -42.5..-5.0, sign test p=0.012, 1 up / 10 down / 9 tied)** where the WM said
+  **+10.9 pt (CI +0.3..+21.9)**. On real tau2, fable-5 is the quality king (0.775 mean
+  reward, 31/40 success) and opus-5 collapses (0.525, 21/40). Both legs are resolved;
+  they disagree in SIGN at the top of the pool.
+- COST DIRECTION HOLDS, magnitude shrinks: routed real $1.092/completed vs fable-5
+  $1.456 = **-25.0%** (the WM's -57.1% overstates real savings ~2.3x, partly because the
+  quality collapse shrinks the completion denominator).
+- Sign agreement is uninformative at this n (3/5 after 10 ties; 15/20 scenarios bridge
+  via row provenance, 5 do not map into the WM matrix ids - carried as a caveat).
+- DECISION RULE FIRED: quality at-least-parity broke, so the probe STOPPED (no phase-2
+  compressed config, no expansion). Bill: real episodes $68.06 candidate-side (fable-5
+  $45.13, routed $22.93) + qwen addendum $30.70.
+
+WHAT THIS MEANS FOR EVERY NUMBER ABOVE: the wm_simulated headline ("routed -57% at
+at-least-parity vs fable-5") is a SIMULATION claim and must not ship as a real one. The
+real, measured tau statement today: routing-to-opus-5 saves 25% per completed task and
+loses 25 quality points vs fable-5. The WM top-of-pool ranking inverts against reality;
+candidate mechanisms (not adjudicated here): rubric-v2-on-opus-4-8 judge affinity for the
+same-family opus-5, the WM's 20-step cap vs real 100-turn episodes (opus-5's WM episodes
+were conspicuously short at ~11 steps), and WM environment fidelity on long-horizon tool
+use. Corroboration that the WM misranks against real on a second model: qwen3.5-9b scores
+0.46 mid-pack in the WM yet solved 71.7% on real tau2 in cycle-1's cohort (vs fable-5's
+0.775 real here; different cohorts, noted not pooled).
+
+RECOMMENDED NEXT MEASUREMENTS (masters/Silen decide; probe spend stops here per the rule):
+(1) real qwen3.5-9b on this probe cohort (~$3-6 at its prices; if near-parity holds in
+THIS cohort, the real Pareto winner is a $0.10/$0.15 model and the product story flips to
+"we found a 50x cheaper parity model"); (2) a judge-affinity check (rescore a sample of WM
+episodes with a non-Anthropic judge); (3) refit the policy on real-validated evidence for
+this workload.
