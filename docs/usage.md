@@ -73,6 +73,15 @@ JSONL. The two formats are not interchangeable.
 | `wmo run` | Run a platform world model or agent by id, or the built-in local pi harness with no target. | a run record under `.wmo/runs/`; uploaded workspaces sync back |
 | `wmo login` / `logout` / `status` | Connect this machine to a platform account, disconnect, or show the current account and organizations. | a saved credential |
 | `wmo push` / `pull` | Publish a local world model or harness to the platform registry, or fetch one from it. | a registry entry, or a local artifact dir |
+| `wmo runs list` / `show` / `tail` | See the runs this organization is feeding: progress, spend, stages, per-candidate cells, and the live event log. `--json` on the first two. | nothing (prints) |
+| `wmo runs stop` / `retry` | Ask the process feeding a run to stop at its next safe boundary, or to re-measure its unscored cells. Pull-based: it takes effect when that process next reports in, and a runner that owns its own retry policy may refuse with a reason. | a queued command |
+| `wmo runs backfill <path>` | Replay a finished or interrupted run from its own artifacts (a grid directory, or a world model's `optimize/`), so a run nobody watched still has its history. The run's name comes from where the artifacts live; `--name` supplies it for artifacts that have moved. `--dry-run` writes the events as JSONL instead. | run history on the platform |
+
+A long run reports itself while it works, and only when a platform credential with an organization
+resolves: `wmo optimize model` and the tau grid runner both take `--no-emit` to turn that off.
+Reporting is buffered and fire-and-forget by construction, so it cannot slow a run down, change
+what it measures, or be the reason it fails. Re-running a backfill is free: events are keyed by the
+emitter's sequence number, and the platform discards ones it already holds.
 
 `wmo run` is the primary execution surface. Bare runs execute harness code and bash on your
 machine behind an explicit consent boundary and a `--dir` file-tool jail; hosted ids run their

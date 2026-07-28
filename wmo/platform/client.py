@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from importlib import metadata
 from pathlib import Path
 from typing import Literal
@@ -109,6 +111,30 @@ def _decode_json(response: httpx.Response) -> JsonObject:
         msg = f"{where} answered with a JSON {type(payload).__name__}, not an object"
         raise PlatformError(msg, status_code=response.status_code)
     return payload
+
+
+def _sse_frames(response: httpx.Response) -> Iterator[JsonObject]:
+    """Decode an SSE response into one JSON body per `data:` frame.
+
+    Only `data:` lines carry payload. `id:` lines restate the frame's `pos`, which
+    the body already holds, and comment lines (`:`) are the server's keep-alives —
+    both are skipped rather than surfaced, so a caller sees events and nothing else.
+    """
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        body = line[len("data:") :].strip()
+        if not body:
+            continue
+        try:
+            decoded = json.loads(body)
+        except ValueError:
+            # Skipped rather than raised, deliberately: this generator feeds `wmo runs tail`, which
+            # follows a run for hours, and one frame mangled by a proxy must not end the follow with
+            # a decode traceback. A frame nobody can read is a frame nobody can miss either.
+            continue
+        if isinstance(decoded, dict):
+            yield decoded
 
 
 def _rows(payload: JsonObject, key: str) -> list[JsonValue]:
@@ -629,7 +655,177 @@ class PlatformClient:
         )
         self._raise_for_error(response)
 
+    # -- run telemetry -------------------------------------------------------------------------
+
+    def push_run_events(
+        self,
+        org_id: str,
+        external_id: str,
+        *,
+        emitter_id: str,
+        events: Sequence[JsonObject],
+    ) -> JsonObject:
+        """Push one batch of run telemetry.
+
+        The run is named in the path (its name carries slashes, which the
+        platform routes as a path parameter) and the body is the feeding
+        process plus its events. The response carries the newly-accepted count,
+        the run's resume mark, and any pending control commands.
+        """
+        response = self._client.post(
+            f"/api/orgs/{org_id}/runs/{external_id}/events",
+            json={"emitter_id": emitter_id, "events": list(events)},
+        )
+        self._raise_for_error(response)
+        return _decode_json(response)
+
+    def ack_run_control(
+        self,
+        org_id: str,
+        external_id: str,
+        control_id: str,
+        *,
+        status: str,
+        note: str | None = None,
+    ) -> JsonObject:
+        """Answer one pulled control command; `rejected` with a note is legal."""
+        body: JsonObject = {"status": status}
+        if note is not None:
+            body["note"] = note
+        response = self._client.post(
+            f"/api/orgs/{org_id}/runs/{external_id}/control/{control_id}/ack",
+            json=body,
+        )
+        self._raise_for_error(response)
+        return _decode_json(response)
+
+    # -- run telemetry reads -------------------------------------------------------------------
+
+    def list_org_runs(
+        self,
+        org_id: str,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        cursor_ts: str | None = None,
+        cursor_id: str | None = None,
+        limit: int = 50,
+    ) -> JsonObject:
+        """One keyset page of an organization's runs, newest first.
+
+        `next_cursor` in the reply is two fields (`ts`, `id`) which echo back as `cursor_ts` and
+        `cursor_id`; there is no opaque cursor string.
+        """
+        params: dict[str, str | int] = {"limit": limit}
+        for key, value in (
+            ("status", status),
+            ("kind", kind),
+            ("cursor_ts", cursor_ts),
+            ("cursor_id", cursor_id),
+        ):
+            if value is not None:
+                params[key] = value
+        return self._read(f"/api/orgs/{org_id}/runs", params)
+
+    def get_org_run(self, org_id: str, external_id: str) -> JsonObject:
+        """One run with its stages, per-model cell rollup, and pending control commands."""
+        return self._read(f"/api/orgs/{org_id}/runs/{external_id}", {})
+
+    def list_org_run_cells(
+        self,
+        org_id: str,
+        external_id: str,
+        *,
+        model: str | None = None,
+        scored: bool | None = None,
+        error: bool | None = None,
+        cursor_key: str | None = None,
+        limit: int = 100,
+    ) -> JsonObject:
+        """One keyset page of a run's measured cells, `cell_key` ascending."""
+        params: dict[str, str | int | bool] = {"limit": limit}
+        for key, value in (("model", model), ("cursor_key", cursor_key)):
+            if value is not None:
+                params[key] = value
+        for key, flag in (("scored", scored), ("error", error)):
+            if flag is not None:
+                params[key] = flag
+        return self._read(f"/api/orgs/{org_id}/runs/{external_id}/cells", params)
+
+    def list_org_run_events(
+        self,
+        org_id: str,
+        external_id: str,
+        *,
+        after_pos: int = 0,
+        limit: int = 500,
+        tail: bool = False,
+        event_type: str | None = None,
+    ) -> JsonObject:
+        """One page of a run's raw event log in arrival order.
+
+        The cursor is `pos` (the server's arrival position), never the emitter's `seq`: writers
+        feeding one run own disjoint seq ranges, so a seq cursor would hide a late low-band write.
+        """
+        params: dict[str, str | int | bool] = {
+            "after_pos": after_pos,
+            "limit": limit,
+            "tail": tail,
+        }
+        if event_type is not None:
+            params["type"] = event_type
+        return self._read(f"/api/orgs/{org_id}/runs/{external_id}/events", params)
+
+    @contextmanager
+    def stream_org_run_events(
+        self, org_id: str, external_id: str, *, after_pos: int = 0, timeout_s: float = 300.0
+    ) -> Iterator[Iterator[JsonObject]]:
+        """Open the resumable SSE tail of a run's log, yielding one decoded frame body at a time.
+
+        `Last-Event-ID` travels beside the query cursor because the server prefers the header on a
+        reconnect; sending both is what keeps a resume exact. The stream closes on its own once a
+        terminal run is drained, which is what lets a tail exit instead of hanging.
+
+        A context manager, so the connection is always released; the caller owns the reconnect
+        policy (see `wmo.runs.reader`).
+        """
+        headers = {"Accept": "text/event-stream"}
+        if after_pos:
+            headers["Last-Event-ID"] = str(after_pos)
+        with self._client.stream(
+            "GET",
+            f"/api/orgs/{org_id}/runs/{external_id}/stream",
+            params={"after_pos": after_pos},
+            headers=headers,
+            timeout=httpx.Timeout(timeout_s, connect=30.0),
+        ) as response:
+            if not response.is_success:
+                response.read()
+                self._raise_for_error(response)
+            yield _sse_frames(response)
+
+    def request_org_run_control(
+        self, org_id: str, external_id: str, *, command: str, args: JsonObject | None = None
+    ) -> JsonObject:
+        """Queue one control command for whichever process is feeding a run.
+
+        Delivery is pull-based and queueing does not change the run's status: a stop that never
+        reaches its machine must not make the panel claim the run stopped.
+        """
+        response = self._client.post(
+            f"/api/orgs/{org_id}/runs/{external_id}/control",
+            json={"command": command, "args": args or {}},
+        )
+        self._raise_for_error(response)
+        return _decode_json(response)
+
     # -- internals -----------------------------------------------------------------------------
+
+    def _read(self, path: str, params: dict[str, str | int | bool]) -> JsonObject:
+        """One authenticated GET returning a JSON object, or a `PlatformError`."""
+        response = self._client.get(path, params=params)
+        self._raise_for_error(response)
+        return _decode_json(response)
 
     def _raise_for_error(self, response: httpx.Response) -> None:
         if response.is_success:
