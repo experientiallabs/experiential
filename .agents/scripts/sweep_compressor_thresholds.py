@@ -41,11 +41,32 @@ THRESHOLDS = [round(0.20 + 0.02 * i, 2) for i in range(31)]
 SPLIT_SEED = 0
 
 
+SERVER_CANDIDATES = (
+    HERE.parents[1] / "deploy/compressor-endpoint/server.py",  # in-repo canonical copy
+    HERE / "server.py",  # box-side manual copy (recorded via sha256 either way)
+)
+
+
 def _load_server_module():  # noqa: ANN202
-    spec = importlib.util.spec_from_file_location("compressor_server", HERE / "server.py")
+    """Load the canonical scorer, preferring the in-repo path, and record its sha256.
+
+    Gate finding M5: the canonicality guarantee must not rest on an unrecorded manual
+    copy. Whichever file loads, its digest lands in the results JSON next to the model
+    fingerprint, so a reviewer can diff it against deploy/compressor-endpoint/server.py
+    at the pinned commit.
+    """
+    import hashlib
+
+    path = next((p for p in SERVER_CANDIDATES if p.is_file()), None)
+    if path is None:
+        raise SystemExit(f"canonical server.py not found at any of: {SERVER_CANDIDATES}")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    spec = importlib.util.spec_from_file_location("compressor_server", path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["compressor_server"] = mod
     spec.loader.exec_module(mod)
+    mod.LOADED_SERVER_PATH = str(path)
+    mod.LOADED_SERVER_SHA256 = digest
     return mod
 
 
@@ -88,7 +109,13 @@ def main() -> None:
     comp = server.LLMLingua2FixedThreshold(server.DEFAULT_MODEL_ID, args.device)
     log.info("model fingerprint: %s  version: %s", comp.model_fingerprint, comp.version)
 
-    results: dict = {"fingerprint": comp.model_fingerprint, "version": comp.version, "rows": []}
+    results: dict = {
+        "fingerprint": comp.model_fingerprint,
+        "version": comp.version,
+        "server_path": server.LOADED_SERVER_PATH,
+        "server_sha256": server.LOADED_SERVER_SHA256,
+        "rows": [],
+    }
     for path in sorted(glob.glob(args.segments)):
         corpus = Path(path).stem.replace("live-segments-", "")
         episodes = [json.loads(ln) for ln in open(path)]

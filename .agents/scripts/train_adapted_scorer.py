@@ -36,10 +36,8 @@ BATCH = 8
 MAX_WORDS = 400  # window matching the server's chunk budget
 
 
-def load_examples(corpus: str) -> list[dict]:
-    path = HERE / f"labels-{corpus}-aggressive.jsonl"
-    if not path.exists():
-        path = HERE / f"labels-{corpus}.jsonl"
+def load_examples(corpus: str, suffix: str = "aggressive") -> list[dict]:
+    path = HERE / f"labels-{corpus}-{suffix}.jsonl"
     return [json.loads(ln) for ln in path.open()]
 
 
@@ -61,6 +59,7 @@ def main() -> None:
     ap.add_argument("--arm", choices=["lora", "full"], required=True)
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--labels-suffix", default="aggressive")
     args = ap.parse_args()
 
     import torch
@@ -82,7 +81,7 @@ def main() -> None:
         )
     model = model.to(device=args.device, dtype=torch.float32).train()
 
-    examples = load_examples(args.corpus)
+    examples = load_examples(args.corpus, args.labels_suffix)
     fit, holdout = split_by_trace(examples)
     log.info("%s/%s: %d fit / %d holdout segments", args.corpus, args.arm, len(fit), len(holdout))
 
@@ -157,7 +156,7 @@ def main() -> None:
     model.eval()
     log.info("ADAPTED holdout label agreement: P=%.3f R=%.3f F1=%.3f", precision, recall, f1)
 
-    out = args.out or str(HERE / f"adapted-{args.corpus}-{args.arm}")
+    out = args.out or str(HERE / f"adapted-{args.corpus}-{args.arm}-{args.labels_suffix}")
     model.save_pretrained(out)
     tokenizer.save_pretrained(out)
     Path(out, "eval.json").write_text(

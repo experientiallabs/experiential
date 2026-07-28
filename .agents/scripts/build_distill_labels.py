@@ -35,6 +35,7 @@ log = logging.getLogger("distill_labels")
 DATA_ROOT = Path.home() / "Desktop/Projects/wmh-compression-data"
 SEGMENTS_GLOB = "live-segments-*.jsonl"
 OUT_DIR = DATA_ROOT / "cache/distill-labels"
+METERING_PATH = DATA_ROOT / "cache/metering-c1.jsonl"
 LABEL_MODEL = "gpt-5.5"
 PRICE_IN, PRICE_OUT = 5.0, 30.0  # USD per Mtok, list
 CAP_PER_CORPUS = 2000
@@ -90,7 +91,15 @@ def main() -> None:
     ap.add_argument("--model", default=LABEL_MODEL)
     ap.add_argument("--instruction", choices=["strict", "aggressive"], default="strict")
     ap.add_argument("--corpora", default=None, help="comma list; default all")
+    ap.add_argument("--self-test", action="store_true", help="run align_labels assertions, no API")
     args = ap.parse_args()
+    if args.self_test:
+        assert align_labels("a b c d", "a c") == [1, 0, 1, 0]
+        assert align_labels("a b c", "c b") is None  # order violation
+        assert align_labels("a b", "") == [0, 0]
+        assert align_labels("x y x z", "x z") == [1, 0, 0, 1]
+        log.info("align_labels self-test passed")
+        return
     if not args.pilot and args.approved_cap_usd is None:
         raise SystemExit(
             "full label generation needs --approved-cap-usd matching the master-approved "
@@ -100,7 +109,12 @@ def main() -> None:
     instruction = INSTRUCTIONS[args.instruction]
 
     pool = load_pool()
-    provider = pool_provider(pool.entry(args.model))
+    entry = pool.entry(args.model)
+    price = entry.price()
+    global PRICE_IN, PRICE_OUT
+    PRICE_IN, PRICE_OUT = price.input_per_mtok, price.output_per_mtok
+    log.info("teacher %s priced at $%.2f/$%.2f per Mtok", args.model, PRICE_IN, PRICE_OUT)
+    provider = pool_provider(entry)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SEED)
     spent = 0.0
@@ -129,7 +143,11 @@ def main() -> None:
             segments = segments[:5]
         else:
             segments = segments[:CAP_PER_CORPUS]
-        suffix = ("-pilot" if args.pilot else "") + (f"-{args.instruction}" if args.instruction != "strict" else "")
+        suffix = (
+            ("-pilot" if args.pilot else "")
+            + (f"-{args.instruction}" if args.instruction != "strict" else "")
+            + (f"-{args.model}" if args.model != LABEL_MODEL else "")
+        )
         out_path = OUT_DIR / f"labels-{corpus}{suffix}.jsonl"
         done: set[tuple[str, int, int]] = set()
         if out_path.exists():
@@ -184,6 +202,32 @@ def main() -> None:
                 usage = completion.usage
                 cost = (usage.input_tokens * PRICE_IN + usage.output_tokens * PRICE_OUT) / 1e6
                 labels = align_labels(window, completion.text)
+                if labels is None:
+                    # One corrective retry: teachers occasionally rewrite a word; the
+                    # violation is named and the rule restated. Second failure discards.
+                    retry = provider.complete(
+                        instruction,
+                        [
+                            Message(role="user", content=user_content),
+                            Message(role="assistant", content=completion.text),
+                            Message(
+                                role="user",
+                                content=(
+                                    "Your output was NOT an exact subsequence of the input's "
+                                    "whitespace-delimited words. Redo it: only delete whole "
+                                    "words; every word you output must appear in the input in "
+                                    "the same order. Output ONLY the compressed text."
+                                ),
+                            ),
+                        ],
+                        temperature=0.0,
+                        max_tokens=2048,
+                    )
+                    cost += (
+                        retry.usage.input_tokens * PRICE_IN
+                        + retry.usage.output_tokens * PRICE_OUT
+                    ) / 1e6
+                    labels = align_labels(window, retry.text)
                 with lock:
                     state["spent_local"] += cost
                     if spent + state["spent_local"] > cap:
@@ -216,8 +260,38 @@ def main() -> None:
             n_discarded += state["discarded"]
             if state["over_cap"]:
                 raise SystemExit(f"spend ${spent:.2f} reached cap ${cap:.2f}; halting")
+        n_written = sum(1 for _ in out_path.open()) if out_path.exists() else 0
+        record_metering(
+            {
+                "ts": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
+                "provider_model": args.model,
+                "instruction": args.instruction,
+                "corpus": corpus,
+                "pilot": bool(args.pilot),
+                "spend_usd": round(spent, 4),
+                "windows_written_total": n_written,
+                "discarded": n_discarded,
+            }
+        )
+        if (n_written + n_discarded) >= 20 and n_discarded / max(1, n_written + n_discarded) > 0.30:
+            raise SystemExit(
+                f"{corpus}: discard rate {n_discarded}/{n_written + n_discarded} exceeds 30%; "
+                "stopping so a broken teacher or filter storm cannot silently burn the cap"
+            )
         log.info("%s: wrote %s, discarded(non-subsequence)=%d, spend so far $%.2f", corpus, out_path.name, n_discarded, spent)
     log.info("total spend $%.2f", spent)
+
+
+def record_metering(invocation: dict) -> None:
+    """M4: every invocation appends spend + discards; cumulative total is derivable
+    by summing the file, so grant reconciliation never rests on operator memory."""
+    prior = 0.0
+    if METERING_PATH.exists():
+        for ln in METERING_PATH.open():
+            prior += json.loads(ln).get("spend_usd", 0.0)
+    invocation["cumulative_spend_usd"] = round(prior + invocation["spend_usd"], 4)
+    with METERING_PATH.open("a") as f:
+        f.write(json.dumps(invocation) + "\n")
 
 
 if __name__ == "__main__":
