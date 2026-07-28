@@ -538,7 +538,11 @@ def test_static_policy_never_builds_its_embedder(
 
 
 def _dial_client(
-    tmp_path: Path, policy: RoutingPolicy, *, config_path: Path | None = None
+    tmp_path: Path,
+    policy: RoutingPolicy,
+    *,
+    config_path: Path | None = None,
+    compaction_enabled: bool = False,
 ) -> tuple[TestClient, EndpointRuntime]:
     """A client with OpenAI error shapes installed, so 400s look like the real server's."""
     runtime = EndpointRuntime(
@@ -547,6 +551,7 @@ def _dial_client(
         provider_factory=_EchoProvider,
         log=RequestLog(tmp_path / "requests.jsonl"),
         config_path=config_path,
+        compaction_enabled=compaction_enabled,
     )
     app = FastAPI()
     app.include_router(create_chat_router({"tau-bench": runtime}))
@@ -1051,6 +1056,7 @@ def _tool_client(
     *,
     finish_reason: str | None = "tool_calls",
     n_tool_calls: int = 1,
+    compaction_enabled: bool = False,
 ) -> tuple[TestClient, Path, list[ChatRequest]]:
     """A client whose pool models all speak the structured tool-calling contract."""
     seen: list[ChatRequest] = []
@@ -1062,6 +1068,7 @@ def _tool_client(
             entry, seen, finish_reason=finish_reason, n_tool_calls=n_tool_calls
         ),
         log=RequestLog(log_path),
+        compaction_enabled=compaction_enabled,
     )
     app = FastAPI()
     app.include_router(create_chat_router({"tau-bench": runtime}))
@@ -2337,9 +2344,27 @@ def _compressed_runtime(
         kind="static", default_model="haiku-4-5", pool=_pool(), compression=compression
     )
     runtime = EndpointRuntime(
-        name="tau-bench", policy=policy, provider_factory=factory, log=RequestLog(log_path)
+        name="tau-bench",
+        policy=policy,
+        provider_factory=factory,
+        log=RequestLog(log_path),
+        # These tests are ABOUT the compression stage, so they opt the endpoint in. The default
+        # is off, which `test_compaction_off_is_a_strict_no_op` covers separately.
+        compaction_enabled=True,
     )
     return TestClient(_app_for(runtime)), log_path, runtime, providers
+
+
+_COMPRESSIBLE: list[dict[str, str]] = [
+    {"role": "user", "content": "the task"},
+    {"role": "assistant", "content": "an earlier reply"},
+    {"role": "user", "content": "one two three four five six"},
+]
+"""A transcript the stage is actually allowed to shorten.
+
+Task protection makes a single-user-turn request incompressible by construction, so any test
+that needs the compressor to have RUN needs a later user turn to run on.
+"""
 
 
 def test_identity_compression_serves_bit_for_bit(tmp_path: Path) -> None:
@@ -2375,6 +2400,8 @@ def test_truncate_compresses_what_the_provider_sees(tmp_path: Path) -> None:
             "model": "tau-bench",
             "messages": [
                 {"role": "system", "content": "system prompts are never compressed"},
+                {"role": "user", "content": "the task statement is never compressed"},
+                {"role": "assistant", "content": "an earlier reply"},
                 {"role": "user", "content": "one two three four five six seven eight"},
             ],
         },
@@ -2383,7 +2410,8 @@ def test_truncate_compresses_what_the_provider_sees(tmp_path: Path) -> None:
     assert response.status_code == 200
     system, turns = providers["haiku-4-5"].seen[0]
     assert system == "system prompts are never compressed"  # verbatim
-    assert turns[0].content == "one two three four"  # trailing half dropped
+    assert turns[0].content == "the task statement is never compressed"  # verbatim, always
+    assert turns[2].content == "one two three four"  # trailing half dropped
     row = _rows(log_path)[-1]
     assert row["compressor_id"] == "truncate"
     assert row["compressor_version"] == "1"
@@ -2437,14 +2465,15 @@ def test_incumbent_prefix_is_reused_not_recompressed(tmp_path: Path) -> None:
 
     assert second.status_code == 200
     # The compressor only ever saw the turn-local segment on turn two: the cached prefix was
-    # RETRIEVED from the affinity state, not recompressed.
-    assert spy.calls == [[first_user], ["eta theta iota kappa"]]
+    # RETRIEVED from the affinity state, not recompressed. Turn one handed it nothing at all,
+    # because the conversation's only segment then was the protected task statement.
+    assert spy.calls == [["eta theta iota kappa"]]
     # And the provider-visible prefix is byte-identical across turns (prompt cache survives).
     second_turns = providers["haiku-4-5"].seen[1][1]
     assert [(m.role, m.content) for m in second_turns[: len(turn_one)]] == [
         (m.role, m.content) for m in turn_one
     ]
-    assert second_turns[0].content == "alpha beta gamma"  # compressed once, reused verbatim
+    assert second_turns[0].content == first_user  # the task, verbatim on every turn
     assert second_turns[1].content == reply  # the model's own reply is never compressed
     assert second_turns[2].content == "eta theta"
 
@@ -2494,7 +2523,11 @@ def test_compression_fields_populate_on_stream_path(tmp_path: Path) -> None:
         json={
             "model": "tau-bench",
             "stream": True,
-            "messages": [{"role": "user", "content": "one two three four five six"}],
+            "messages": [
+                {"role": "user", "content": "the task"},
+                {"role": "assistant", "content": "an earlier reply"},
+                {"role": "user", "content": "one two three four five six"},
+            ],
         },
     ) as response:
         assert response.status_code == 200
@@ -2502,7 +2535,7 @@ def test_compression_fields_populate_on_stream_path(tmp_path: Path) -> None:
     assert "[DONE]" in body
     assert "compress" not in body  # opaque on the stream too
     _, turns = providers["haiku-4-5"].seen[0]
-    assert turns[0].content == "one two three"
+    assert turns[2].content == "one two three"
     rows = _rows(log_path)
     assert len(rows) == 1  # one record per request, stream included
     assert rows[0]["compressor_id"] == "truncate"
@@ -2529,14 +2562,14 @@ def test_compression_fields_populate_on_error_path(tmp_path: Path) -> None:
         compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
     )
     runtime = EndpointRuntime(
-        name="tau-bench", policy=policy, provider_factory=_FailingProvider, log=RequestLog(log_path)
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_FailingProvider,
+        log=RequestLog(log_path),
+        compaction_enabled=True,
     )
     response = TestClient(_app_for(runtime)).post(
-        "/v1/chat/completions",
-        json={
-            "model": "tau-bench",
-            "messages": [{"role": "user", "content": "one two three four five six"}],
-        },
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
     )
     assert response.status_code == 502
     rows = _rows(log_path)
@@ -2570,17 +2603,13 @@ def test_dial_swap_keeps_the_compressor_matched_to_the_live_policy(tmp_path: Pat
     policy = _knn_policy(tmp_path).model_copy(
         update={"compression": config, "fit_compression": config}
     )
-    client, runtime = _dial_client(tmp_path, policy)
+    client, runtime = _dial_client(tmp_path, policy, compaction_enabled=True)
 
     response = client.put("/v1/endpoints/tau-bench/config", json={"cost_quality": 1.0})
     assert response.status_code == 200
 
     served = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "tau-bench",
-            "messages": [{"role": "user", "content": "one two three four five six"}],
-        },
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
     )
     assert served.status_code == 200
     assert runtime.policy.compression is not None  # the dial carried the config through
@@ -2589,29 +2618,172 @@ def test_dial_swap_keeps_the_compressor_matched_to_the_live_policy(tmp_path: Pat
     assert cast("int", row["tokens_in_compressed"]) < cast("int", row["tokens_in_raw"])
 
 
-def test_compression_leaves_tool_calls_and_tool_results_verbatim(tmp_path: Path) -> None:
-    # v1 scope (#278 x D-COMPRESS): the compressor shortens user prose only. A tool call's
-    # arguments and a tool result are a structured contract the model reads back exactly, so
-    # truncating them would change what the transcript MEANS, not just how long it is.
+def test_conversation_scope_leaves_tool_calls_and_tool_results_verbatim(tmp_path: Path) -> None:
+    # The default scope shortens user prose only. A tool call's arguments and a tool result are a
+    # structured contract the model reads back exactly, so truncating them would change what the
+    # transcript MEANS, not just how long it is. Tool-call ARGUMENTS are never a segment under
+    # any scope; a tool result is one, and this scope does not select it.
     policy = RoutingPolicy(
         kind="static",
         default_model="haiku-4-5",
         pool=_pool(),
         compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
     )
-    client, log_path, seen = _tool_client(tmp_path, policy)
+    client, log_path, seen = _tool_client(tmp_path, policy, compaction_enabled=True)
     response = client.post(
         "/v1/chat/completions",
-        json={"model": "tau-bench", "messages": _REPLAYED_TOOL_TRANSCRIPT},
+        json={
+            "model": "tau-bench",
+            "messages": [
+                *_REPLAYED_TOOL_TRANSCRIPT,
+                {"role": "user", "content": "one two three four"},
+            ],
+        },
     )
 
     assert response.status_code == 200
     served = seen[0].messages
-    assert served[0].content == "how many superheroes"  # the user turn, compressed
+    assert served[0].content == "how many superheroes are there?"  # the task, verbatim
     assert served[1].tool_calls is not None
     assert served[1].tool_calls[0].function.arguments == _TOOL_ARGUMENTS  # verbatim
-    assert served[2].content == "42 rows"  # the tool result, verbatim
+    assert served[2].content == "42 rows"  # the tool result, verbatim in this scope
+    assert served[3].content == "one two"  # a later user turn, compressed
     assert _rows(log_path)[-1]["compressor_id"] == "truncate"
+
+
+def test_observations_scope_compresses_tool_results_and_nothing_else(tmp_path: Path) -> None:
+    # The scope the measurements favor: compressing dialogue lost 6-17 accuracy points and
+    # inverted cost 2.3x, while removing observation bulk held accuracy inside the noise floor.
+    # So this scope reaches the tool result and leaves every conversational turn alone.
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(
+            compressor_id="truncate", aggressiveness=0.5, scope="observations"
+        ),
+    )
+    client, _, seen = _tool_client(tmp_path, policy, compaction_enabled=True)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                *_REPLAYED_TOOL_TRANSCRIPT[:2],
+                {"role": "tool", "tool_call_id": "call_1", "content": "alpha beta gamma delta"},
+                {"role": "user", "content": "one two three four"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    served = seen[0].messages
+    assert served[0].content == "how many superheroes are there?"  # the task, verbatim
+    assert served[1].tool_calls is not None
+    assert served[1].tool_calls[0].function.arguments == _TOOL_ARGUMENTS  # verbatim
+    assert served[2].content == "alpha beta"  # the observation, compressed
+    assert served[3].content == "one two three four"  # a user turn, untouched in this scope
+
+
+def test_bulk_scope_reaches_a_pasted_document_but_not_a_typed_turn(tmp_path: Path) -> None:
+    document = "word " * 800  # 4000 chars: pasted bulk, well past the default threshold
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5, scope="bulk")
+    client, _, _, providers = _compressed_runtime(tmp_path, config)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "the task"},
+                {"role": "assistant", "content": "an earlier reply"},
+                {"role": "user", "content": "one two three four"},
+                {"role": "assistant", "content": "another reply"},
+                {"role": "user", "content": document},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    _, turns = providers["haiku-4-5"].seen[0]
+    assert turns[0].content == "the task"  # verbatim, as in every scope
+    assert turns[2].content == "one two three four"  # short prose: below the threshold
+    assert len(turns[4].content) < len(document)  # the pasted document IS compressed
+
+
+def test_the_first_user_turn_survives_the_top_of_the_dial(tmp_path: Path) -> None:
+    # Aggressiveness 1.0 removes every word truncate is handed. The task statement still arrives
+    # byte-identical, because protection is a property of the stage and not of the dial.
+    task = "  cancel  my order\t3079 and refund   the difference  "
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=1.0)
+    client, _, _, providers = _compressed_runtime(tmp_path, config)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": task},
+                {"role": "assistant", "content": "an earlier reply"},
+                {"role": "user", "content": "everything here goes away"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    _, turns = providers["haiku-4-5"].seen[0]
+    assert turns[0].content == task  # whitespace and all
+    assert turns[2].content == ""  # the dial really is at the top
+
+
+def test_compaction_off_is_a_strict_no_op_even_when_the_policy_carries_one(tmp_path: Path) -> None:
+    # The per-endpoint default. Off means off: nothing rewritten, no compressor resolved, and log
+    # rows indistinguishable from an endpoint whose policy names no compressor at all.
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="haiku-4-5",
+        pool=_pool(),
+        compression=CompressionConfig(compressor_id="truncate", aggressiveness=1.0),
+    )
+    providers: dict[str, _CapturingProvider] = {}
+
+    def factory(entry: PoolEntry) -> _CapturingProvider:
+        providers[entry.name] = _CapturingProvider(entry)
+        return providers[entry.name]
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench", policy=policy, provider_factory=factory, log=RequestLog(log_path)
+    )
+    response = TestClient(_app_for(runtime)).post(
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
+    )
+
+    assert response.status_code == 200
+    assert runtime._compressor is None  # no compressor resolved at all
+    _, turns = providers["haiku-4-5"].seen[0]
+    assert [m.content for m in turns] == [m["content"] for m in _COMPRESSIBLE]
+    row = _rows(log_path)[-1]
+    assert row["compressor_id"] == ""
+    assert row["tokens_in_raw"] == 0
+    assert row["tokens_in_compressed"] == 0
+    assert row["compressor_cost_usd"] == 0.0
+    assert row["compressor_latency_s"] == 0.0
+
+
+def test_disabling_compaction_on_a_compressed_fit_refuses_to_mount(tmp_path: Path) -> None:
+    # The other direction of the representation-consistency gate. A bank fitted on compressed text
+    # queried with raw text is the same C2 failure as the reverse: the novelty floor trips, routing
+    # collapses to the fallback, and nothing downstream notices. So it does not come up.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    policy = _knn_policy(tmp_path).model_copy(
+        update={"compression": config, "fit_compression": config}
+    )
+    with pytest.raises(ValueError, match="compaction_enabled = true"):
+        EndpointRuntime(
+            name="tau-bench",
+            policy=policy,
+            provider_factory=_EchoProvider,
+            log=RequestLog(tmp_path / "requests.jsonl"),
+        )
 
 
 def test_mounting_a_mismatched_compression_artifact_fails_loudly(tmp_path: Path) -> None:
@@ -2645,16 +2817,18 @@ def test_the_stage_makes_one_compressor_call_per_request(tmp_path: Path) -> None
             "model": "tau-bench",
             "messages": [
                 {"role": "system", "content": "never compressed"},
-                {"role": "user", "content": "first user turn here"},
+                {"role": "user", "content": "the task, never compressed"},
                 {"role": "assistant", "content": "an earlier reply"},
                 {"role": "user", "content": "second user turn here"},
+                {"role": "assistant", "content": "a later reply"},
+                {"role": "user", "content": "third user turn here"},
             ],
         },
     )
 
     assert response.status_code == 200
-    # One call (a cold transcript: no affinity to reuse), carrying BOTH user turns.
-    assert spy.calls == [["first user turn here", "second user turn here"]]
+    # One call (a cold transcript: no affinity to reuse), carrying both ELIGIBLE user turns.
+    assert spy.calls == [["second user turn here", "third user turn here"]]
 
 
 class _PricedCompressor:
@@ -2681,11 +2855,7 @@ def test_the_compressors_bill_and_wall_clock_reach_the_log(tmp_path: Path) -> No
     config = CompressionConfig(compressor_id=_PRICED.id, aggressiveness=0.5)
     client, log_path, _, _ = _compressed_runtime(tmp_path, config)
     response = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "tau-bench",
-            "messages": [{"role": "user", "content": "one two three four five six"}],
-        },
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
     )
 
     assert response.status_code == 200
@@ -2730,14 +2900,14 @@ def test_the_compressor_bill_reaches_the_log_on_the_error_path_too(tmp_path: Pat
         compression=CompressionConfig(compressor_id=_PRICED.id, aggressiveness=0.5),
     )
     runtime = EndpointRuntime(
-        name="tau-bench", policy=policy, provider_factory=_FailingProvider, log=RequestLog(log_path)
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_FailingProvider,
+        log=RequestLog(log_path),
+        compaction_enabled=True,
     )
     response = TestClient(_app_for(runtime)).post(
-        "/v1/chat/completions",
-        json={
-            "model": "tau-bench",
-            "messages": [{"role": "user", "content": "one two three four five six"}],
-        },
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
     )
     assert response.status_code == 502
     row = _rows(log_path)[-1]
@@ -2843,14 +3013,14 @@ def test_a_pre_routing_failure_still_bills_the_compression_that_ran(tmp_path: Pa
         raise RuntimeError("api_key_env is unset")
 
     runtime = EndpointRuntime(
-        name="tau-bench", policy=policy, provider_factory=_explode, log=RequestLog(log_path)
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_explode,
+        log=RequestLog(log_path),
+        compaction_enabled=True,
     )
     response = TestClient(_app_for(runtime)).post(
-        "/v1/chat/completions",
-        json={
-            "model": "tau-bench",
-            "messages": [{"role": "user", "content": "one two three four five six"}],
-        },
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
     )
 
     assert response.status_code == 502
@@ -2882,11 +3052,14 @@ def test_a_failure_inside_the_compression_stage_bills_nothing(tmp_path: Path) ->
         compression=CompressionConfig(compressor_id="exploding-for-tests"),
     )
     runtime = EndpointRuntime(
-        name="tau-bench", policy=policy, provider_factory=_EchoProvider, log=RequestLog(log_path)
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_EchoProvider,
+        log=RequestLog(log_path),
+        compaction_enabled=True,
     )
     response = TestClient(_app_for(runtime)).post(
-        "/v1/chat/completions",
-        json={"model": "tau-bench", "messages": [{"role": "user", "content": "hello there"}]},
+        "/v1/chat/completions", json={"model": "tau-bench", "messages": _COMPRESSIBLE}
     )
 
     assert response.status_code == 502
@@ -2919,11 +3092,22 @@ def test_a_compressor_that_returns_the_wrong_segment_count_is_named(tmp_path: Pa
         compression=CompressionConfig(compressor_id="splitter-for-tests"),
     )
     runtime = EndpointRuntime(
-        name="tau-bench", policy=policy, provider_factory=_EchoProvider, log=RequestLog(log_path)
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_EchoProvider,
+        log=RequestLog(log_path),
+        compaction_enabled=True,
     )
     response = TestClient(_app_for(runtime)).post(
         "/v1/chat/completions",
-        json={"model": "tau-bench", "messages": [{"role": "user", "content": "two words"}]},
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "the task"},
+                {"role": "assistant", "content": "an earlier reply"},
+                {"role": "user", "content": "two words"},
+            ],
+        },
     )
 
     assert response.status_code == 502  # refused, not served with a corrupted transcript

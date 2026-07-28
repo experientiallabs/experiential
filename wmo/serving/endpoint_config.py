@@ -13,6 +13,7 @@ fit). At mount time the file wins; with no file the policy is served exactly as 
     # .wmo/models/support-endpoint/endpoint.toml
     cost_quality = 0.6
     log_query_embeddings = false
+    compaction_enabled = true
 """
 
 from __future__ import annotations
@@ -48,6 +49,18 @@ class EndpointConfig(BaseModel):
     # denied, and because the one legitimate reason to refuse it (query text is derivable from an
     # embedding, so it is request content at rest) is a tenancy decision, not ours.
     log_query_embeddings: bool = True
+    # Whether this endpoint applies the compression stage its mounted policy carries
+    # (`wmo.optimize.compression`, applied in `wmo.serving.chat.EndpointRuntime.compress`).
+    # DEFAULT OFF, and off is a true no-op: no compressor call, no compressor bill, and request
+    # log rows identical to an endpoint whose policy carries no compression at all. Compaction
+    # is the one optimizer output that rewrites what the customer's own text says before it
+    # reaches the model, so an operator opts in per endpoint rather than inheriting it from
+    # whatever the fit happened to stamp. Turning it on is this one key.
+    #
+    # RESEARCH IS NOT GATED BY THIS. Fits, sweeps, and closed-loop eval apply whatever
+    # compression they were asked for regardless: the flag is a serving control, so the track
+    # keeps measuring compressed arms on endpoints that serve raw.
+    compaction_enabled: bool = False
 
     @classmethod
     def load(cls, path: Path) -> EndpointConfig:
@@ -59,8 +72,8 @@ class EndpointConfig(BaseModel):
         except tomllib.TOMLDecodeError as error:
             raise ValueError(
                 f"invalid endpoint config at {path}: {error}. Expected TOML with at most a "
-                "`cost_quality` key between 0.0 and 1.0 and a `log_query_embeddings` "
-                "boolean, and no other keys"
+                "`cost_quality` key between 0.0 and 1.0, a `log_query_embeddings` boolean, and "
+                "a `compaction_enabled` boolean, and no other keys"
             ) from error
         return cls.model_validate(data)
 

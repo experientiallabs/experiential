@@ -32,16 +32,21 @@ result as OpenAI SSE (one `choices[0].delta.tool_calls` entry per call, carrying
 client reassembles the arguments exactly as it would from real fragments; the tradeoff is
 time-to-first-byte, which waits for the whole upstream response instead of the first token.
 
-Compression stage (D-COMPRESS): when the policy carries a compression config, the pipeline is
-request -> [compress] -> [route] -> provider call. Only user-message content is compressed;
-system prompts, the model's own prior replies, tool calls, and tool results pass through
-verbatim (v1 scope: a tool payload is a structured contract, not prose to shorten). The affinity
-state decides segment boundaries: an incumbent conversation's compressed prefix is stored
-alongside its fingerprint and REUSED, never recompressed, so the provider-visible prefix stays
-byte-identical across turns (the prompt cache survives by construction). Routing embeds the
-compressed text (the router sees what the model sees) while stickiness keys on the raw
-transcript the client resends. Compression fields go to the request log only, never response
-bodies or headers.
+Compression stage (D-COMPRESS): when the endpoint has ENABLED compaction
+(`EndpointConfig.compaction_enabled`, default false) and its policy carries a compression config,
+the pipeline is request -> [compress] -> [route] -> provider call. Without the flag the stage is a
+strict no-op, whatever the policy stamps: nothing is rewritten, no compressor is called or billed,
+and the log's compression columns keep their uncompressed defaults.
+Which segments are eligible is the config's `scope`, decided in `wmo.optimize.compression`, not
+here: message content maps to segments (a tool result is an observation), the whole staged
+transcript goes to `compress_conversation`, and the task segment is protected there in every
+scope. Tool-call arguments are never segments at all (a structured contract, not prose to
+shorten). The affinity state decides the rewritable window: an incumbent conversation's
+compressed prefix is stored alongside its fingerprint and REUSED, never recompressed, so the
+provider-visible prefix stays byte-identical across turns (the prompt cache survives by
+construction). Routing embeds the compressed text (the router sees what the model sees) while
+stickiness keys on the raw transcript the client resends. Compression fields go to the request
+log only, never response bodies or headers.
 
 Request log: one JSONL row per call with the D-SERVING-LOG fields (id, ts, endpoint, routed
 model, cluster, tokens incl. cached, cache-adjusted cost, latency, ttfb, status, reason).
@@ -77,10 +82,12 @@ from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validat
 from starlette.background import BackgroundTask
 
 from wmo.optimize.compression import (
-    CompressionConfig,
     CompressionStats,
     Compressor,
-    compress_segments,
+    Segment,
+    SegmentKind,
+    compress_conversation,
+    compression_signature,
     estimate_tokens,
     same_compression,
 )
@@ -519,9 +526,15 @@ class RequestLogRecord(BaseModel):
     cost_usd: float = 0.0  # effective cost: cached tokens billed at the cache-read rate
     router_cost_usd: float = 0.0  # the routing decision's own inference cost, passed through
     # D-COMPRESS fields: stored and OPAQUE like the routing fields above (log only, never in
-    # response bodies or headers). 0/"" defaults = the request served uncompressed. Token
-    # counts are the compressor's deterministic proxy totals (see wmo.optimize.compression);
-    # billable truth stays in input_tokens/cost_usd from the provider-reported usage.
+    # response bodies or headers). 0/"" defaults = the request served uncompressed, which is
+    # every request on an endpoint that has not enabled compaction. Token counts are the
+    # compressor's deterministic proxy totals (see wmo.optimize.compression); billable truth
+    # stays in input_tokens/cost_usd from the provider-reported usage.
+    # Both totals span the WHOLE request, every segment, not only the ones the config's scope
+    # selected: the provider bills the whole prompt, so `1 - compressed/raw` is the billed-input
+    # saving the admin view quotes. A scoped arm's achieved keep ratio over its eligible
+    # segments alone is a different (and always more flattering) number, and is deliberately not
+    # what these two fields carry.
     tokens_in_raw: int = 0
     tokens_in_compressed: int = 0
     compressor_id: str = ""
@@ -624,6 +637,12 @@ class EndpointRuntime:
     recorded into it by default, and `log_query_embeddings=False` switches that off per endpoint
     without disturbing the request log. A store constructed on no path is already inert, which is
     what an in-memory serving setup gets.
+
+    `compaction_enabled` is the per-endpoint opt-in to the compression stage
+    (`EndpointConfig.compaction_enabled`, default false). False leaves the stage a strict no-op
+    even when the mounted policy carries a compression config, so nothing is compressed, no
+    compressor is called or billed, and the request log's compression columns stay at their
+    uncompressed defaults.
     """
 
     def __init__(
@@ -637,6 +656,7 @@ class EndpointRuntime:
         config_path: Path | None = None,
         embeddings: QueryEmbeddingStore | None = None,
         log_query_embeddings: bool = True,
+        compaction_enabled: bool = False,
     ) -> None:
         self.name = name
         self.policy = policy
@@ -657,11 +677,12 @@ class EndpointRuntime:
         # `_compressed_bytes` is their running sum.
         self._compressed: OrderedDict[str, tuple[list[ChatMessage], int]] = OrderedDict()
         self._compressed_bytes = 0
+        self._compaction_enabled = compaction_enabled
         # Resolved at mount and re-resolved on every dial-driven policy install, mirroring the
         # embedder-once pattern: no per-request registry lookups. Resolving through the policy
         # re-runs the D-COMPRESS mount gates, so an artifact that was assembled in memory
         # (`model_copy`, which skips validators) cannot serve an unservable compressor either.
-        self._compressor: Compressor | None = policy.serving_compressor()
+        self._compressor: Compressor | None = self._resolve_compressor(policy)
         self._lock = threading.Lock()
         # Serializes dial changes end to end (persist + install); _lock alone only protects
         # the in-memory swap and would let two PUTs interleave file writes and installs.
@@ -701,11 +722,42 @@ class EndpointRuntime:
                 settings.model_copy(update={"cost_quality": cost_quality}).save(self._config_path)
             self._install_policy(adjusted)
 
+    def _resolve_compressor(self, policy: RoutingPolicy) -> Compressor | None:
+        """The compressor this endpoint will actually run, or None when it compresses nothing.
+
+        The mount gates run whether or not compaction is enabled, because they are not only
+        about the compressor: `RoutingPolicy._check_compression` also refuses a routing policy
+        whose evidence was fitted under a DIFFERENT representation than it would serve. An
+        artifact naming an unservable compressor should fail at mount even on an endpoint that
+        was never going to call it.
+
+        Raises:
+            ValueError: The policy fails a D-COMPRESS mount gate, or its routing evidence needs
+                the compressed representation that this endpoint has switched off.
+        """
+        compressor = policy.serving_compressor()
+        if self._compaction_enabled:
+            return compressor
+        if policy.kind != "static" and policy.fit_compression is not None:
+            # Serving raw text against a bank fitted on compressed text is the SAME failure as
+            # the reverse, which `_check_compression` already refuses: the query lands farther
+            # from every bank row, the novelty floor trips 10-13x more often, and routing
+            # collapses to the expensive fallback while accuracy sits flat (C2 Q2). Disabling
+            # compaction on such an endpoint would produce exactly that, silently, so it does
+            # not mount.
+            raise ValueError(
+                f"this {policy.kind} policy's routing evidence was fitted on "
+                f"{compression_signature(policy.fit_compression)}, so it can only be served "
+                "with compaction enabled: set `compaction_enabled = true` in this endpoint's "
+                "endpoint.toml, or serve a policy fitted on raw text."
+            )
+        return None
+
     def _install_policy(self, adjusted: RoutingPolicy) -> None:
         # Resolved OUTSIDE the lock and before the swap: it re-runs the D-COMPRESS mount gates,
         # and a policy that fails them must leave the live endpoint exactly as it was rather
         # than half-installed.
-        compressor = adjusted.serving_compressor()
+        compressor = self._resolve_compressor(adjusted)
         with self._lock:
             stale = not same_compression(self.policy.compression, adjusted.compression)
             self.policy = adjusted
@@ -799,10 +851,15 @@ class EndpointRuntime:
         Cache safety by construction: when the conversation's previous exchange is known
         (affinity hit on the remembered raw prefix), the stored compressed prefix is returned
         verbatim and only the turns appended since it pass through the compressor. On a miss
-        (new conversation, or affinity evicted) every user message is compressed fresh;
+        (new conversation, or affinity evicted) every eligible message is compressed fresh;
         per-segment determinism makes that reproduce the same bytes, so the provider-visible
         prefix stays append-only either way. Returns the input list untouched when compression
-        is off.
+        is off, which includes every endpoint that has not enabled compaction.
+
+        WHICH messages are eligible is not decided here. The whole staged transcript goes to
+        `compress_conversation`, which applies the config's scope and protects the task segment;
+        this method only says where the rewritable window starts. Handing over just the window
+        would move the first user turn and expose the task on the first prefix reuse.
 
         At most ONE compressor call per request, carrying every segment that needs compressing:
         an endpoint-backed compressor pays one round trip per request, not one per message.
@@ -827,13 +884,18 @@ class EndpointRuntime:
                 if cached is not None:
                     self._compressed.move_to_end(key)  # LRU is by USE, not just by write
                     prefix = cached[0]
-        if prefix is not None:
-            # The stored prefix has one entry per remembered message, so the tail is everything
-            # the client appended after the turn we already compressed.
-            tail, cost_usd = _compress_user_turns(messages[len(prefix) :], compressor, config)
-            compressed = [*prefix, *tail]
-        else:
-            compressed, cost_usd = _compress_user_turns(messages, compressor, config)
+        # The stored prefix has one entry per remembered message, so the staged transcript is
+        # that prefix (already compressed, reused verbatim) plus everything the client appended
+        # after it. Scope selection reads the whole thing; only the window is rewritten.
+        mutable_from = len(prefix) if prefix is not None else 0
+        staged = [*prefix, *messages[mutable_from:]] if prefix is not None else list(messages)
+        rewritten = compress_conversation(
+            compressor, _segments(staged), config, mutable_from=mutable_from
+        )
+        compressed = [
+            message if text == message.content else message.model_copy(update={"content": text})
+            for message, text in zip(staged, rewritten.texts, strict=True)
+        ]
         return compressed, CompressionStats(
             compressor_id=compressor.id,
             compressor_version=compressor.version,
@@ -841,7 +903,7 @@ class EndpointRuntime:
             tokens_in_raw=sum(estimate_tokens(m.content) for m in messages),
             tokens_in_compressed=sum(estimate_tokens(m.content) for m in compressed),
             latency_s=time.monotonic() - started,
-            cost_usd=cost_usd,
+            cost_usd=rewritten.cost_usd,
         )
 
     def _embedder(self) -> Embedder | None:
@@ -946,31 +1008,24 @@ def _transcript_bytes(messages: list[ChatMessage]) -> int:
     return total
 
 
-def _compress_user_turns(
-    messages: list[ChatMessage], compressor: Compressor, config: CompressionConfig
-) -> tuple[list[ChatMessage], float]:
-    """Rewrite user-turn content through the compressor; every other turn passes through.
+_SEGMENT_KINDS: dict[ChatRole, SegmentKind] = {
+    "system": "system",
+    "user": "user",
+    "assistant": "assistant",
+    # A tool result is environment output the model asked for, which is exactly what the seam
+    # calls an observation and what "observations" scope selects.
+    "tool": "observation",
+}
 
-    v1 scope: system prompts (the most cacheable segment), the model's own replies, tool calls,
-    and tool results are never touched. A tool payload is a structured contract the model has to
-    read back exactly, so shortening it would change what the transcript MEANS, not just how
-    long it is. Returns the rewritten messages plus the compressor's own cost.
 
-    Goes through `compress_segments`, which chunks to the compressor's declared cap and enforces
-    the return-shape contract. One request rarely carries enough user turns to need chunking,
-    but a replayed transcript has no bound on its length and a wrong-length return here would
-    otherwise desynchronize the whole conversation.
+def _segments(messages: list[ChatMessage]) -> list[Segment]:
+    """The transcript as compression segments, one per message, in order.
+
+    Only message CONTENT is a segment. A tool call's arguments never become one: they are a
+    structured contract the model reads back exactly, so shortening them would change what the
+    transcript MEANS rather than how long it is, and there is no scope that reaches them.
     """
-    segments = [m.content for m in messages if m.role == "user"]
-    if not segments:
-        return list(messages), 0.0
-    result = compress_segments(compressor, segments, config)
-    replacements = iter(result.segments)
-    rewritten = [
-        m.model_copy(update={"content": next(replacements)}) if m.role == "user" else m
-        for m in messages
-    ]
-    return rewritten, result.cost_usd
+    return [Segment(kind=_SEGMENT_KINDS[m.role], text=m.content) for m in messages]
 
 
 def _remembered_prefix(messages: list[ChatMessage]) -> list[ChatMessage] | None:

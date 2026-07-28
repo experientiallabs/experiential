@@ -74,3 +74,13 @@ def test_log_query_embeddings_defaults_on_and_round_trips_off(tmp_path: Path) ->
     path = tmp_path / ENDPOINT_CONFIG_FILENAME
     EndpointConfig(log_query_embeddings=False).save(path)
     assert EndpointConfig.load(path).log_query_embeddings is False
+
+
+def test_compaction_defaults_off_and_is_one_key_to_turn_on(tmp_path: Path) -> None:
+    # Compaction rewrites what the customer's own text says before it reaches the model, so an
+    # operator opts in per endpoint rather than inheriting whatever the fit stamped. Turning it on
+    # has to be exactly this one line.
+    assert EndpointConfig().compaction_enabled is False
+    path = tmp_path / ENDPOINT_CONFIG_FILENAME
+    path.write_text("compaction_enabled = true\n", encoding="utf-8")
+    assert EndpointConfig.load(path).compaction_enabled is True

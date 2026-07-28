@@ -227,6 +227,7 @@ def _endpoint_runtimes(
                 config_path=config_path,
                 embeddings=embeddings,
                 log_query_embeddings=settings.log_query_embeddings,
+                compaction_enabled=settings.compaction_enabled,
             )
         except ValueError as exc:
             # Fail fast and name the file: a dial the policy cannot honor (a savings position on

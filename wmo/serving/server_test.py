@@ -11,6 +11,7 @@ from wmo.config.card import CardCorpus, ModelCard, TracesSource
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.engine.knowledge import KnowledgeBase
 from wmo.engine.world_model import WorldModel
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.policy import RoutingPolicy
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.providers.pool import PoolEntry
@@ -502,7 +503,9 @@ def test_moving_the_dial_preserves_other_endpoint_toml_keys(tmp_path: Path) -> N
     """
     model_dir, policy = _knn_policy_dir(tmp_path)
     config_path = model_dir / ENDPOINT_CONFIG_FILENAME
-    EndpointConfig(cost_quality=0.25, log_query_embeddings=False).save(config_path)
+    EndpointConfig(cost_quality=0.25, log_query_embeddings=False, compaction_enabled=True).save(
+        config_path
+    )
 
     runtimes = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
     runtimes["support"].set_cost_quality(0.75)
@@ -510,9 +513,33 @@ def test_moving_the_dial_preserves_other_endpoint_toml_keys(tmp_path: Path) -> N
     reloaded = EndpointConfig.load(config_path)
     assert reloaded.cost_quality == 0.75
     assert reloaded.log_query_embeddings is False
+    assert reloaded.compaction_enabled is True  # a dial move must not switch compaction back off
     # And the endpoint still mounts, which is the failure the dropped key used to cause.
     remounted = _endpoint_runtimes({"support": policy}, {"support": model_dir}, RequestLog(None))
     assert remounted["support"].cost_quality == 0.75
+
+
+def test_endpoint_toml_is_where_compaction_gets_turned_on(tmp_path: Path) -> None:
+    # The ruling's "easy to turn on": one key in the file that already sits beside policy.json,
+    # read at mount, and off by default so no endpoint starts compressing because a fit stamped a
+    # compressor onto its artifact.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    compressed = policy.model_copy(
+        update={
+            "compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+            "fit_compression": CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+        }
+    )
+    (model_dir / ENDPOINT_CONFIG_FILENAME).write_text(
+        "compaction_enabled = true\n", encoding="utf-8"
+    )
+    runtimes = _endpoint_runtimes({"support": compressed}, {"support": model_dir}, RequestLog(None))
+    assert runtimes["support"]._compressor is not None
+
+    (model_dir / ENDPOINT_CONFIG_FILENAME).unlink()
+    plain = policy  # no compression stamped: the universal case, unaffected by the flag
+    runtimes = _endpoint_runtimes({"support": plain}, {"support": model_dir}, RequestLog(None))
+    assert runtimes["support"]._compressor is None
 
 
 def test_endpoint_toml_can_switch_the_query_embedding_store_off(tmp_path: Path) -> None:

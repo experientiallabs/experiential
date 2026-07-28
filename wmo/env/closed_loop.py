@@ -52,7 +52,15 @@ from wmo.env.base import Env
 from wmo.env.episode import run_episode
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS, LLMAgent
 from wmo.env.scenarios import Scenario
-from wmo.optimize.compression import CompressionConfig, estimate_tokens, get_compressor
+from wmo.optimize.compression import (
+    DEFAULT_BULK_MIN_CHARS,
+    CompressionConfig,
+    Segment,
+    SegmentKind,
+    compress_conversation,
+    estimate_tokens,
+    get_compressor,
+)
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
 from wmo.providers.base import (
@@ -116,15 +124,31 @@ class _TimedProvider:
         return self._provider.verify()
 
 
+# `Message` carries only the two conversational roles; the system prompt travels beside the
+# messages and is never a segment. There is no tool role here, so an eval transcript grows no
+# observation segments unless its agent renders them as turns of their own.
+_SEGMENT_KINDS: dict[str, SegmentKind] = {"user": "user", "assistant": "assistant"}
+
+
 class _CompressingProvider:
     """Applies the D-COMPRESS stage to the candidate's calls, so eval measures through it.
 
     Sits ABOVE `_TimedProvider` (agent -> compressing -> timed -> real): the timed layer then
-    records the latency and provider-reported usage of the ACTUAL, compressed call. Mirrors
-    the serving rule exactly: only user-role message content is compressed; the system prompt
-    and the model's own prior replies pass through verbatim. Determinism keeps the growing
-    transcript append-stable across the episode's calls, exactly as serving's affinity-miss
-    path reproduces bytes. Accumulates the compressor's own accounting per episode.
+    records the latency and provider-reported usage of the ACTUAL, compressed call. Segment
+    selection is not decided here: the call's messages become seam segments and go to
+    `compress_conversation`, which is the same choke point serving's stage uses, so the config's
+    scope and the unconditional task protection mean the same thing in a measurement as they do
+    in production. The system prompt is never a segment (it is passed beside the messages and
+    never reaches the compressor). Determinism keeps the growing transcript append-stable across
+    the episode's calls, exactly as serving's affinity-miss path reproduces bytes. Accumulates
+    the compressor's own accounting per episode.
+
+    CONSEQUENCE WORTH STATING: `LLMAgent` renders each turn as ONE user message that opens with
+    the task, so under task protection the eligible-segment set for an `LLMAgent` episode is
+    empty and this wrapper measures an uncompressed run (raw == compressed tokens, no compressor
+    call). That is the correct reading of the rule, and it is why the wrapper accounts honestly
+    instead of asserting that compression happened: an agent whose transcript separates the task
+    from the observations it accumulates gets real compression here with no change to this class.
     """
 
     def __init__(self, provider: Provider, config: CompressionConfig) -> None:
@@ -149,12 +173,11 @@ class _CompressingProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
         started = time.monotonic()
-        user_segments = [m.content for m in messages if m.role == "user"]
-        result = self.compressor.compress(user_segments, self._config)
-        replacements = iter(result.segments)
+        segments = [Segment(kind=_SEGMENT_KINDS[m.role], text=m.content) for m in messages]
+        result = compress_conversation(self.compressor, segments, self._config)
         compressed = [
-            Message(role="user", content=next(replacements)) if m.role == "user" else m
-            for m in messages
+            message if text == message.content else Message(role=message.role, content=text)
+            for message, text in zip(messages, result.texts, strict=True)
         ]
         self.tokens_in_raw += sum(estimate_tokens(m.content) for m in messages)
         self.tokens_in_compressed += sum(estimate_tokens(m.content) for m in compressed)
@@ -353,6 +376,10 @@ def run_cell(
         aggressiveness=compression.aggressiveness if compression else 0.0,
         compressor_latency_s=compressing.latency_s if compressing else 0.0,
         compressor_cost_usd=compressing.cost_usd if compressing else 0.0,
+        compressor_scope=compression.scope if compression else "conversation",
+        compressor_bulk_min_chars=(
+            compression.bulk_min_chars if compression else DEFAULT_BULK_MIN_CHARS
+        ),
     )
 
 

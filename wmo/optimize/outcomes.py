@@ -13,7 +13,11 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
-from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.compression import (
+    DEFAULT_BULK_MIN_CHARS,
+    CompressionConfig,
+    CompressionScope,
+)
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -106,6 +110,13 @@ class ScenarioOutcome(BaseModel):
     aggressiveness: float = 0.0
     compressor_latency_s: float = 0.0
     compressor_cost_usd: float = 0.0
+    # Which segments the arm compressed (`CompressionConfig.scope`). Part of the arm's identity,
+    # so it is recorded rather than derived: without it `measured_compression` would report every
+    # matrix as conversation-scoped and the fit gate in `wmo optimize route fit` would refuse a
+    # scoped fit against the scoped matrix that actually backs it. The defaults are what a
+    # pre-scope matrix means, so old files load unchanged.
+    compressor_scope: CompressionScope = "conversation"
+    compressor_bulk_min_chars: int = DEFAULT_BULK_MIN_CHARS
 
     @property
     def scored(self) -> bool:
@@ -151,12 +162,21 @@ class OutcomeMatrix(BaseModel):
         under cannot bias a fit.
         """
         configs = {
-            (o.compressor_id, o.compressor_version, o.aggressiveness)
+            (
+                o.compressor_id,
+                o.compressor_version,
+                o.aggressiveness,
+                o.compressor_scope,
+                o.compressor_bulk_min_chars,
+            )
             for o in self.outcomes
             if o.scored
         }
         if len(configs) > 1:
-            readable = sorted(f"{cid or 'uncompressed'}/{ver}/{agg:g}" for cid, ver, agg in configs)
+            readable = sorted(
+                f"{cid or 'uncompressed'}/{ver}/{agg:g}/{scope}"
+                for cid, ver, agg, scope, _chars in configs
+            )
             raise ValueError(
                 "this matrix mixes compression configs across its scored rows "
                 f"({', '.join(readable)}), so its rows are not comparable and no single policy "
@@ -164,13 +184,15 @@ class OutcomeMatrix(BaseModel):
             )
         if not configs:
             return None
-        compressor_id, compressor_version, aggressiveness = configs.pop()
+        compressor_id, compressor_version, aggressiveness, scope, bulk_min_chars = configs.pop()
         if not compressor_id:
             return None
         return CompressionConfig(
             compressor_id=compressor_id,
             compressor_version=compressor_version,
             aggressiveness=aggressiveness,
+            scope=scope,
+            bulk_min_chars=bulk_min_chars,
         )
 
     def model_names(self) -> list[str]:

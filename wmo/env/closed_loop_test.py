@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from wmo.core.types import Action, EnvState, Observation
+from wmo.env import closed_loop as closed_loop_module
 from wmo.env.closed_loop import evaluate_pool
 from wmo.env.scenarios import Scenario
 from wmo.optimize.compression import CompressionConfig
@@ -23,6 +24,9 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.providers.pool import ModelPool, PoolEntry
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class _FakeEnv:
@@ -360,52 +364,95 @@ class _RecordingProvider(_ScriptedProvider):
         return super().complete(system, messages, temperature=temperature, max_tokens=max_tokens)
 
 
-def test_evaluate_pool_threads_compression_through_the_measured_path() -> None:
-    providers: list[_RecordingProvider] = []
+def test_evaluate_pool_threads_the_compression_arm_onto_every_row() -> None:
+    # The arm's whole identity reaches the matrix, scope included, because `measured_compression`
+    # rebuilds the config from these columns and the fit gate compares it to what a fit stamps.
+    matrix = evaluate_pool(
+        lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
+        _pool(),
+        _SCENARIOS[:1],
+        provider_factory=_RecordingProvider,
+        max_steps=5,
+        compression=CompressionConfig(
+            compressor_id="truncate", aggressiveness=0.5, scope="observations"
+        ),
+    )
 
-    def factory(entry: PoolEntry) -> _RecordingProvider:
-        provider = _RecordingProvider(entry)
-        providers.append(provider)
-        return provider
+    outcome = matrix.outcomes[0]
+    assert outcome.compressor_id == "truncate"
+    assert outcome.compressor_version == "1"
+    assert outcome.aggressiveness == 0.5
+    assert outcome.compressor_scope == "observations"
+    assert outcome.compressor_latency_s >= 0.0
+    assert outcome.compressor_cost_usd == 0.0  # truncate has no inference cost
+    measured = matrix.measured_compression()
+    assert measured is not None
+    assert measured.scope == "observations"
+
+
+def test_an_llm_agent_episode_compresses_nothing_because_its_only_turn_is_the_task() -> None:
+    # Task protection is unconditional, and `LLMAgent` renders each turn as ONE user message that
+    # opens with `TASK:`. So an episode driven by that agent has no eligible segment at any dial,
+    # and the measured path must say so honestly rather than report a saving it did not make.
+    # Measuring observation-bulk compression in eval needs an agent whose transcript separates
+    # the task from the observations; the wrapper already handles that (see the test below).
+    compressed: list[_RecordingProvider] = []
+    control: list[_RecordingProvider] = []
+
+    def _capture(into: list[_RecordingProvider]) -> Callable[[PoolEntry], _RecordingProvider]:
+        def factory(entry: PoolEntry) -> _RecordingProvider:
+            provider = _RecordingProvider(entry)
+            into.append(provider)
+            return provider
+
+        return factory
 
     matrix = evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
         _SCENARIOS[:1],
-        provider_factory=factory,
+        provider_factory=_capture(compressed),
         max_steps=5,
-        compression=CompressionConfig(compressor_id="truncate", aggressiveness=0.5),
+        compression=CompressionConfig(compressor_id="truncate", aggressiveness=1.0),
     )
-
-    outcome = matrix.outcomes[0]
-    # The compressor's per-episode accounting landed on the row...
-    assert outcome.compressor_id == "truncate"
-    assert outcome.compressor_version == "1"
-    assert outcome.aggressiveness == 0.5
-    assert outcome.tokens_in_compressed < outcome.tokens_in_raw
-    assert outcome.compressor_latency_s >= 0.0
-    assert outcome.compressor_cost_usd == 0.0  # truncate has no inference cost
-    # ...and the provider genuinely received compressed input (measured path, not
-    # bookkeeping): the user content the model saw is strictly shorter than what an
-    # uncompressed control run sends, and non-user content is untouched.
-    control: list[_RecordingProvider] = []
-
-    def control_factory(entry: PoolEntry) -> _RecordingProvider:
-        provider = _RecordingProvider(entry)
-        control.append(provider)
-        return provider
-
     evaluate_pool(
         lambda: _FakeEnv(EpisodeScore(reward=0.8, success=True, critique="fine")),
         _pool(),
         _SCENARIOS[:1],
-        provider_factory=control_factory,
+        provider_factory=_capture(control),
         max_steps=5,
     )
-    compressed_users = [m.content for m in providers[0].seen[0] if m.role == "user"]
-    raw_users = [m.content for m in control[0].seen[0] if m.role == "user"]
-    assert len(compressed_users) == len(raw_users)
-    assert all(len(c) < len(r) for c, r in zip(compressed_users, raw_users, strict=True))
+
+    outcome = matrix.outcomes[0]
+    assert outcome.tokens_in_raw == outcome.tokens_in_compressed
+    assert outcome.tokens_in_raw > 0  # the accounting ran; it just had nothing to remove
+    assert [m.content for m in compressed[0].seen[0]] == [
+        m.content for m in control[0].seen[0]
+    ]  # byte-identical to an uncompressed run, at the top of the dial
+
+
+def test_the_eval_stage_protects_the_task_and_still_compresses_later_turns() -> None:
+    # The rule is the shared choke point's, not serving's alone: hand the eval wrapper a
+    # transcript that HAS later turns and it compresses exactly those.
+    inner = _RecordingProvider(_pool().models[0])
+    provider = closed_loop_module._CompressingProvider(
+        inner, CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    )
+    provider.complete(
+        "a system prompt that never becomes a segment",
+        [
+            Message(role="user", content="TASK: book the cheapest flight"),
+            Message(role="assistant", content="an earlier reply"),
+            Message(role="user", content="one two three four"),
+        ],
+    )
+
+    assert [m.content for m in inner.seen[0]] == [
+        "TASK: book the cheapest flight",  # verbatim
+        "an earlier reply",  # the model's own reply is never a candidate
+        "one two",  # compressed
+    ]
+    assert provider.tokens_in_compressed < provider.tokens_in_raw
 
 
 def test_uncompressed_rows_keep_default_compression_fields() -> None:
