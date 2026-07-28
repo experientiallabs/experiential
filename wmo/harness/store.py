@@ -30,7 +30,8 @@ from pathlib import Path
 import tomli_w
 
 from wmo.config.store import validate_name
-from wmo.core.files import file_write_lock, write_text_atomic
+from wmo.core.files import write_text_atomic
+from wmo.core.locks import file_write_lock
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.source_tree import SYSTEM_FILE, HarnessSourceFile, HarnessSourceTree
 

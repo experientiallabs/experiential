@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from wmo.core.files import FileLockTimeout
+from wmo.core.locks import FileLockTimeout
 from wmo.providers import pool as pool_module
 from wmo.providers.azure_openai import AzureOpenAIProvider
 from wmo.providers.base import ProviderConfig, ProviderKind, TokenUsage

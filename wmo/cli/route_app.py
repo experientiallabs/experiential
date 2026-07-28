@@ -37,7 +37,7 @@ from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
 from wmo.config import ARTIFACT_DIR, WorldModelStore
-from wmo.core.files import FileLockTimeout
+from wmo.core.locks import FileLockTimeout
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv

@@ -39,7 +39,7 @@ from rich.table import Table
 from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION
 from wmo.cli.ui import PromptReader, creds_note, ensure_credentials, has_credentials, select_option
 from wmo.config import PROVIDER_ENV_VARS
-from wmo.core.files import FileLockTimeout
+from wmo.core.locks import FileLockTimeout
 from wmo.providers.base import ProviderKind, VerifyResult
 from wmo.providers.catalog import CatalogModel, CatalogSource, ProviderCatalog, list_provider_models
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price

@@ -35,7 +35,8 @@ from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
-from wmo.core.files import DEFAULT_LOCK_TIMEOUT_S, file_write_lock, write_text_atomic
+from wmo.core.files import write_text_atomic
+from wmo.core.locks import DEFAULT_LOCK_TIMEOUT_S, file_write_lock
 from wmo.core.types import JsonObject
 from wmo.providers.base import (
     PreparableProvider,
@@ -384,7 +385,7 @@ def upsert_pool_entry(
     being added.
 
     The whole read-validate-write cycle runs under an exclusive cross-process lock (see
-    `wmo.core.files.file_write_lock`), so two racing registrations both land. Without it each reads
+    `wmo.core.locks.file_write_lock`), so two racing registrations both land. Without it each reads
     the same roster and the later write erases the earlier entry, while both commands report
     success: a model an operator registered is simply not in the pool, and nothing says so.
 

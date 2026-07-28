@@ -42,7 +42,8 @@ from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
-from wmo.core.files import file_write_lock, write_text_atomic
+from wmo.core.files import write_text_atomic
+from wmo.core.locks import file_write_lock
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig, load_distill_config, snapshot_toml
 from wmo.distill.gate import DistillGateRecord

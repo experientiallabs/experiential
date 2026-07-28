@@ -1,27 +1,21 @@
-"""Tests for the durable-write helpers: atomic replace and the cross-process write lock.
+"""Tests for the atomic writers.
 
 Every assertion is about what survives a FAILURE, because that is the whole point of the module:
 the happy path of any of these writers was already correct. Torn writes are modelled by failing
-`os.fsync`, which is reached with the payload already on the temp file and the rename not yet
+`os.fsync`, which is reached with the payload already on the staging file and the rename not yet
 done, so it is the moment where an in-place writer would have destroyed the previous contents.
 """
 
 from __future__ import annotations
 
-import fcntl
+import logging
 import os
 import threading
-import time
 from pathlib import Path
 
 import pytest
 
-from wmo.core.files import (
-    FileLockTimeout,
-    file_write_lock,
-    write_bytes_atomic,
-    write_text_atomic,
-)
+from wmo.core.files import write_bytes_atomic, write_text_atomic
 
 
 def _fail_fsync(monkeypatch: pytest.MonkeyPatch, message: str = "disk full") -> None:
@@ -174,15 +168,16 @@ def test_write_text_atomic_leaves_the_previous_file_intact_when_the_write_fails(
     assert path.read_text(encoding="utf-8") == "[aliases]\nchampion = 3\n"
 
 
-def test_a_failure_after_the_rename_reports_the_new_contents_not_the_old(
+def test_a_directory_fsync_failure_does_not_fail_a_write_that_landed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The parent-directory fsync runs AFTER the rename, so its failure is not a no-op write.
+    """The parent-directory fsync runs AFTER the rename, so raising there would be a lie.
 
-    Some FUSE, SMB and NFS mounts reject `fsync` on a directory fd. The write has landed by then,
-    and the docstring says so rather than claiming the file is untouched: a caller that reported
-    "the promotion failed" and rolled back on that basis would be acting on the opposite of the
-    truth. Only the durability of the rename against a power loss is unproven.
+    Some FUSE, SMB and NFS mounts reject `fsync` on a directory fd unconditionally. Propagating
+    that would report every write on such a mount as failed for a file written correctly every
+    time, and a caller acting on it (reporting a failed promotion, retrying, rolling back) would
+    act on the opposite of the truth. It is logged instead, because what is genuinely lost is the
+    proof of durability against a power loss, not the write.
     """
     path = tmp_path / "aliases.toml"
     write_text_atomic(path, "old")
@@ -196,113 +191,29 @@ def test_a_failure_after_the_rename_reports_the_new_contents_not_the_old(
         real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _fail_the_directory)
-    with pytest.raises(OSError, match="directory fsync unsupported"):
-        write_text_atomic(path, "new")
+    write_text_atomic(path, "new")  # must not raise
 
     assert path.read_text(encoding="utf-8") == "new"
     assert list(tmp_path.glob("*.partial")) == []
 
 
-def test_write_text_atomic_leaves_no_temp_behind_when_the_write_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_directory_fsync_failure_is_logged_rather_than_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    path = tmp_path / "aliases.toml"
-    write_text_atomic(path, "[aliases]\nchampion = 3\n")
-    _fail_fsync(monkeypatch)
-
-    with pytest.raises(OSError, match="disk full"):
-        write_text_atomic(path, "[aliases]\nchampion = 4\n")
-
-    assert list(tmp_path.glob("*.tmp")) == []
-
-
-def test_write_text_atomic_fsyncs_the_payload_and_the_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Both, or a power loss can persist the rename while the data blocks are lost.
-
-    The result of that is an EMPTY file behind a write that reported success, which is the
-    failure mode the whole helper exists to prevent, so it is worth pinning rather than trusting.
-    """
-    synced: list[int] = []
+    """Not raising is not the same as saying nothing: the durability gap has to be recorded."""
+    path = tmp_path / "state.json"
     real_fsync = os.fsync
+    calls: list[int] = []
 
-    def _record(fd: int) -> None:
-        synced.append(fd)
+    def _fail_the_directory(fd: int) -> None:
+        calls.append(fd)
+        if len(calls) == 2:
+            raise OSError("directory fsync unsupported")
         real_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", _record)
-    write_text_atomic(tmp_path / "state.json", "payload")
-
-    assert len(synced) == 2  # the temp file, then the directory that now holds the rename
-
-
-def test_file_write_lock_reports_a_stuck_holder_instead_of_hanging(tmp_path: Path) -> None:
-    path = tmp_path / "roster.toml"
-    lock_path = path.with_name("roster.toml.lock")
-    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-    fcntl.flock(holder, fcntl.LOCK_EX)
-    try:
-        with pytest.raises(FileLockTimeout, match=r"writing the roster at .*roster\.toml"):
-            with file_write_lock(path, what="the roster", timeout_s=0.05):
-                pass  # pragma: no cover - the lock is held, so this is never reached
-    finally:
-        os.close(holder)
-
-    # Once the holder is gone the lock is free again: the kernel owns that release, so a leftover
-    # lock FILE is never a held lock and cannot wedge the next run.
-    with file_write_lock(path, what="the roster", timeout_s=0.05):
-        pass
-
-
-def test_file_write_lock_releases_on_an_exception_inside_the_block(tmp_path: Path) -> None:
-    """A rejected write must not leave the file locked, or one bad input wedges every later run."""
-    path = tmp_path / "roster.toml"
-
-    with pytest.raises(ValueError, match="rejected"):
-        with file_write_lock(path, what="the roster", timeout_s=0.05):
-            raise ValueError("rejected")
-
-    with file_write_lock(path, what="the roster", timeout_s=0.05):
-        pass
-
-
-def test_file_write_lock_serializes_a_read_modify_write(tmp_path: Path) -> None:
-    """The lost-update guarantee: atomic replace alone does NOT give you this.
-
-    Both threads read, edit, and write back the same file. Unlocked, each reads the same starting
-    contents and the later write erases the earlier thread's line, with neither raising. The sleep
-    inside the critical section makes that interleaving certain rather than timing-dependent.
-    """
-    path = tmp_path / "roster.toml"
-    write_text_atomic(path, "")
-
-    def _append(line: str) -> None:
-        with file_write_lock(path, what="the roster"):
-            current = path.read_text(encoding="utf-8")
-            time.sleep(0.05)  # hold the section open so an unlocked version would interleave
-            write_text_atomic(path, f"{current}{line}\n")
-
-    writers = [threading.Thread(target=_append, args=(name,)) for name in ("a", "b")]
-    for writer in writers:
-        writer.start()
-    for writer in writers:
-        writer.join(timeout=30)
-        assert not writer.is_alive(), "the lock wait is not bounded"
-
-    assert sorted(path.read_text(encoding="utf-8").split()) == ["a", "b"]
-
-
-def test_file_write_lock_does_not_lock_the_file_being_written(tmp_path: Path) -> None:
-    """The lock has to live in a sibling, because an atomic write swaps the file's inode.
-
-    A lock taken on the roster itself would stop protecting anything the moment the first writer
-    renamed a new inode into place, and the failure would be silent.
-    """
-    path = tmp_path / "roster.toml"
-
-    with file_write_lock(path, what="the roster"):
+    monkeypatch.setattr(os, "fsync", _fail_the_directory)
+    with caplog.at_level(logging.WARNING, logger="wmo.core.files"):
         write_text_atomic(path, "payload")
 
-    assert path.with_name("roster.toml.lock").is_file()
-    assert path.read_text(encoding="utf-8") == "payload"
+    assert "not proven durable" in caplog.text
+    assert str(tmp_path) in caplog.text
