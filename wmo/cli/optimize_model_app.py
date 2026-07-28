@@ -70,6 +70,7 @@ from wmo.optimize.outcomes import (
     load_matrix_with_digest,
     split_router_scenarios,
 )
+from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
 from wmo.optimize.pipeline import (
     BUILT_STAGES,
     CONFIGURED_STAGES,
@@ -1457,6 +1458,24 @@ def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) ->
         f"scenario(s) -> {escape(str(paths.report))}",
         soft_wrap=True,
     )
+    # The measured cost/quality curve. It goes in MODEL_DIR (a serving artifact, mounted by
+    # GET /config beside policy.json), not the disposable optimize manifest dir, so the
+    # platform's Pareto graph renders this workload's real frontier (D-PARETO). Additive: a
+    # curve failure warns rather than failing a report that already succeeded.
+    try:
+        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        pareto_path = model_dir / PARETO_FILENAME
+        pareto_path.write_text(curve.model_dump_json(indent=2), encoding="utf-8")
+        _console.print(
+            f"  [green]✓[/green] pareto curve ({sum(1 for p in curve.points if p.on_frontier)} "
+            f"frontier point(s), recommended {curve.recommended}) -> "
+            f"{escape(str(pareto_path))}",
+            soft_wrap=True,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        _console.print(
+            f"  [yellow]![/yellow] pareto curve skipped: {escape(str(exc))}", soft_wrap=True
+        )
     return StageRecord(
         stage=Stage.REPORT,
         fingerprint={

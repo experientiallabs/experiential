@@ -62,6 +62,7 @@ from wmo.optimize.outcomes import (
     load_matrix_with_digest,
     split_router_scenarios,
 )
+from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DIM,
     AZURE_EMBEDDER_ENV,
@@ -1325,6 +1326,15 @@ def report(
     # mkdir + atomic, exactly as `fit --out` and `pin --out` write their policies: a report whose
     # parent directory does not exist must not throw away the work that produced it.
     write_artifact_atomically(Path(out), improvement.model_dump_json(indent=2).encode("utf-8"))
+    # The measured cost/quality curve rides beside every report (D-PARETO): GET /config
+    # serves it from the model dir so the platform's graph renders this workload's frontier.
+    try:
+        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        pareto_out = Path(out).parent / PARETO_FILENAME
+        write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
+        _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")
+    except (ValueError, FileNotFoundError) as exc:
+        _console.print(f"[yellow]![/yellow] pareto curve skipped: {exc}")
     headline = improvement.headline
     _console.print(
         f"[green]✓[/green] report -> {out}\n"

@@ -46,6 +46,10 @@ if TYPE_CHECKING:
 
 PointKind = Literal["model", "routed"]
 
+# The curve's artifact name, written beside `report.json` by the report writers and loaded
+# from the model directory at serving mount (GET /config carries it to the platform).
+PARETO_FILENAME = "pareto.json"
+
 
 class ParetoPoint(BaseModel):
     """One measured way to serve the workload, on all three objectives."""
@@ -143,7 +147,7 @@ def pareto_curve(
         )
 
     if policy is not None:
-        shared = embedder or policy.embedder.build()
+        shared = embedder or _replay_embedder(policy)
         for dial in dials:
             rows = rows_for_policy(
                 matrix, apply_cost_quality(policy, dial), ids=ids, embedder=shared
@@ -167,6 +171,51 @@ def pareto_curve(
         provenance=provenance,
         judge=judge,
     )
+
+
+def held_out_curve(
+    matrix: OutcomeMatrix,
+    policy: RoutingPolicy,
+    *,
+    judge: str,
+    provenance: str = "wm_simulated",
+    embedder: Embedder | None = None,
+) -> ParetoCurve:
+    """The curve a report ships: routed points on the fit's held-out band only.
+
+    Mirrors `wmo.optimize.report.build_report`'s split discipline: `fit_scenario_ids` are
+    excluded so no routed point is graded on the fit's own training data. A policy fitted
+    on EVERY scenario has no held-out band; the curve then carries the model points alone
+    (over all scenarios) rather than in-sample routed points dressed as measurements.
+    """
+    held_out = [
+        sid for sid in matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)
+    ]
+    if not held_out:
+        return pareto_curve(matrix, judge=judge, provenance=provenance)
+    return pareto_curve(
+        matrix,
+        judge=judge,
+        provenance=provenance,
+        policy=policy,
+        scenario_ids=held_out,
+        embedder=embedder,
+    )
+
+
+def _replay_embedder(policy: RoutingPolicy) -> Embedder:
+    """The function the policy's bank geometry was fitted with.
+
+    A compressed-fit policy embeds COMPRESSED text (C2's representation-consistency rule,
+    exactly as `build_report` replays); querying its bank with raw vectors trips the
+    novelty floor and mismeasures the routed points.
+    """
+    from wmo.optimize.compression import CompressingEmbedder
+
+    built = policy.embedder.build()
+    if policy.fit_compression is not None:
+        return CompressingEmbedder(built, policy.fit_compression)
+    return built
 
 
 def _point(
