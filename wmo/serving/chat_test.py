@@ -2710,6 +2710,34 @@ def test_bulk_scope_reaches_a_pasted_document_but_not_a_typed_turn(tmp_path: Pat
     assert len(turns[4].content) < len(document)  # the pasted document IS compressed
 
 
+def test_all_scope_reaches_dialogue_and_the_system_prompt_but_not_the_task(tmp_path: Path) -> None:
+    # The scope for a domain-adapted scorer at a calibrated threshold: nothing is excluded
+    # structurally, so the scorer decides what dialogue is worth keeping. The task statement is
+    # still the one exception, because that exclusion is stage law rather than a scope rule.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5, scope="all")
+    client, log_path, _, providers = _compressed_runtime(tmp_path, config)
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "system", "content": "alpha beta gamma delta"},
+                {"role": "user", "content": "the task statement stays whole"},
+                {"role": "assistant", "content": "one two three four"},
+                {"role": "user", "content": "five six seven eight"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    system, turns = providers["haiku-4-5"].seen[0]
+    assert system == "alpha beta"  # even the system prompt is a candidate in this scope
+    assert turns[0].content == "the task statement stays whole"  # the one structural exception
+    assert turns[1].content == "one two"  # the model's own reply, compressed here
+    assert turns[2].content == "five six"
+    assert _rows(log_path)[-1]["compressor_id"] == "truncate"
+
+
 def test_the_first_user_turn_survives_the_top_of_the_dial(tmp_path: Path) -> None:
     # Aggressiveness 1.0 removes every word truncate is handed. The task statement still arrives
     # byte-identical, because protection is a property of the stage and not of the dial.

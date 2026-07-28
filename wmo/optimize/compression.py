@@ -46,7 +46,7 @@ _CHARS_PER_TOKEN = 4
 # in the corpora the scope was ruled on.
 DEFAULT_BULK_MIN_CHARS = 2000
 
-CompressionScope = Literal["conversation", "observations", "bulk"]
+CompressionScope = Literal["conversation", "observations", "bulk", "all"]
 """Which segments of a conversation a config may rewrite (see `CompressionConfig`)."""
 
 SegmentKind = Literal["system", "user", "assistant", "observation"]
@@ -98,17 +98,23 @@ class CompressionConfig(BaseModel):
 
     `scope` is WHICH segments the dial is allowed to touch, and it is identity-bearing: two
     configs that differ only in scope are two different arms, not one (see `same_compression`).
-    The three values, each with the measurement behind it:
+    The four values, each with the measurement behind it:
 
     - "conversation" (the DEFAULT, and the only behavior that existed before this field):
       user-role segments. Every artifact, matrix, and policy written without a scope loads with
       its meaning unchanged.
     - "observations": tool results and other environment output only. User and assistant
-      segments pass through verbatim. This is the scope the measurements favor: compressing
+      segments pass through verbatim. With a STOCK scorer this is the safe scope: compressing
       dialogue lost 6-17 accuracy points and INVERTED cost by 2.3x, while removing 40% of
       document/observation bulk held accuracy inside the noise floor.
     - "bulk": "observations" plus user segments of at least `bulk_min_chars`, i.e. pasted
-      documents rather than typed turns.
+      documents rather than typed turns. The other safe scope for a stock scorer.
+    - "all": every segment, dialogue included. The target scope for a DOMAIN-ADAPTED scorer at a
+      calibrated threshold: at a fixed absolute threshold, a scorer that rates dialogue as
+      high-keep preserves conversation on its own, so excluding dialogue structurally is
+      redundant and costs the savings the adapted scorer could have made safely. Choosing it with
+      a stock scorer reintroduces exactly the measured dialogue harm above, which is why it is a
+      deliberate selection and never a default.
 
     Scope is not a way to reach the task statement. The first user segment of a conversation is
     never compressed in ANY scope, at any aggressiveness (`compressible_positions`): the one
@@ -385,8 +391,10 @@ def compressible_positions(
     statement is the one deletion this track measured real harm from, so it cannot be reachable
     by a config value, a new scope, or a caller that forgets to check.
 
-    Everything else follows `config.scope`; see `CompressionConfig` for what the three values
-    mean and what was measured behind them.
+    Everything else follows `config.scope`; see `CompressionConfig` for what the four values
+    mean and what was measured behind them. "all" means literally that, the protected task
+    aside: the system prompt and the model's own replies are candidates too, because the point of
+    that scope is to stop the SCOPE deciding what to keep and let a calibrated scorer decide.
     """
     protected = next((index for index, seg in enumerate(segments) if seg.kind == "user"), None)
     selected: list[int] = []
@@ -402,6 +410,8 @@ def compressible_positions(
                 eligible = segment.kind == "observation" or (
                     segment.kind == "user" and len(segment.text) >= config.bulk_min_chars
                 )
+            case "all":
+                eligible = True
         if eligible:
             selected.append(index)
     return tuple(selected)

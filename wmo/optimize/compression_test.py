@@ -239,7 +239,7 @@ _CONVERSATION = [
 def test_the_first_user_segment_is_protected_in_every_scope() -> None:
     # The one deletion harm this track measured was a compressed task statement, so no scope and
     # no dial can reach index 1 here.
-    scopes: tuple[CompressionScope, ...] = ("conversation", "observations", "bulk")
+    scopes: tuple[CompressionScope, ...] = ("conversation", "observations", "bulk", "all")
     for scope in scopes:
         config = CompressionConfig(
             compressor_id="truncate", aggressiveness=1.0, scope=scope, bulk_min_chars=1
@@ -260,6 +260,10 @@ def test_each_scope_selects_the_segments_it_names() -> None:
     # default threshold it is left alone and only the observation is selected.
     assert positions("bulk") == (3,)
     assert positions("bulk", bulk_min_chars=1) == (3, 4)
+    # "all" is literally all of it, the protected task at index 1 aside: the system prompt and the
+    # model's own reply are candidates too, because that scope exists to stop the SCOPE deciding
+    # what to keep and hand the decision to a calibrated scorer.
+    assert positions("all") == (0, 2, 3, 4)
 
 
 def test_the_task_is_byte_identical_through_the_stage_at_full_aggressiveness() -> None:
