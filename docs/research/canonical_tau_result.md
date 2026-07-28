@@ -47,42 +47,82 @@ functions they wrap.
 
 ## The evidence
 
-### The ablation ladder [PENDING: figure + table from the corner analyses]
+### The headline table (cross-benchmark; every cell from the corners' numbers.json)
 
-Rungs, each vs the fable-5 anchor on the same scenarios, quality / effective cost / latency:
-distill-only; +routing; +routing+compaction; with leave-one-out ablations. WM-simulated
-[wm], 20 held-out scenarios x 11 candidate models x 2 episodes per arm; judge rubric-v2
-(opus-4-8); compaction rungs labeled "measured tradeoff, not recommendation" pending the
-compression track's accuracy verdict.
+| Benchmark | Routed config | Quality | Effective cost/task | Basis |
+|---|---|---|---|---|
+| tau-bench (multi-turn tool agent) | 100% opus-5, discovered by 20/20 LOO fold-fits; guard refuses to degrade | +9.0 pt vs fable-5 (CI -0.9..+19.8: at-least-parity, leaning better) [wm] | **-57.1%** ($0.411 vs $0.958; CI -72.7..-37.3, RESOLVED) [wm] | LOO-CV n=20, judge rubric-v2 (opus-4-8) |
+| terminal-tasks (one-shot bash agent) | 100% sonnet-5 (constant policy; kimi-k3 ties 0.949 vs 0.948, broken on price) | -0.4 pt vs fable-5, within noise (paired CI touches 0) [wm] | **-69.4%** ($0.011 vs $0.035; CI -77..-61) [wm] | held-out 6, full pipeline via public commands |
+| routerbench-ours9 (1,199 QA prompts, 9 models) | frontier-pinned mix (37% gpt-5.5 / 33% sonnet-5 / 23% fable-5) | +0.84 pt over best single (0.978 vs 0.969) | -35.0% ($0.0023 vs $0.0035) | 360 held-out; measured on ours9, never blended with tau |
+
+The three-stage figures behind this table (model-selection stage, compression stage,
+distillation stage per benchmark): `corners/cost/figures/three_stage_tau.png`,
+`corners/tb2-cost/figures/three_stage_terminal.png`, `corners/cost/figures/three_stage_ours9.png`,
+all rendered by the ONE shared runner from the final matrices.
+
+### The ablation ladder (measured; the grid behind the tau row)
+
+Rungs vs the fable-5 anchor on the same 20 held-out scenarios x 11 candidates x 2 episodes
+per arm [wm], judge rubric-v2 (opus-4-8), cohort f1ebaca6, 1320/1320 cells scored:
+
+- **Model selection carries the measured savings.** opus-5 single: -59.0% cost (CI
+  -74.1..-39.4) at +10.9 pt (CI +0.2..+21.9, resolved better AND cheaper). gpt-5.5:
+  -59.2% at parity. fable-5 sits deep inside the single-model Pareto frontier.
+- **+routing = automatic best-single discovery plus a guard.** The LOO-CV routed rung
+  (-57.1%, resolved) is within +4.7% cost of knowing opus-5 ex ante (CI +0.0..+17.1) -
+  the discovery tax. On a ~19-scenario bank the dial's savings leg is inert (the
+  small-bank law): tau's routing claim is cost-at-parity via discovery, not accuracy lift.
+- **+compaction on tau: no cost win, resolved quality harm on the anchor.** Truncation
+  control +47.1% cost (CI -21.9..+175.1, unresolved on tau alone); learned
+  llmlingua2-endpoint +14.1% (CI -29.6..+147.3, unresolved) with quality harm resolved
+  (-8.3 pt, CI -16.4..-1.4). The resolved evidence for the cost inversion is the
+  companion financebench study (+21-36% on matched controls); tau is directionally
+  consistent. Under compressed serving the discovered best-single FLIPS (kimi-k3 replaces
+  opus-5 in the llmlingua2 arm's fit) - compaction changes the frontier, not just the
+  bill. Compaction rungs stay "measured tradeoff, not recommendation".
+- **Repair provenance**: the compressed arms' first pass lost 26%/57% of cells to a
+  compressor-endpoint outage and local connection exhaustion; all 368 cells were re-bought
+  under the same cohort pins (the earlier +146.2%/+23.6% inversion reads were pre-repair
+  artifacts and are retracted in the corner's findings).
 
 ### Quality across training stages [PENDING: the shared corners chart]
 
 Student quality by training stage with the three lever ablations. Cycle 1 (teacher
 Qwen3.6-27B) appears as measured: no promotion - teacher 73.3% / student-before 71.7% /
 student-after 65.0% at k=3 [real], paired sign test p=0.45, verdict "no measurable effect at
-this sample size; nothing to distill from a peer teacher". Later stages [PENDING: K3 cycle,
-gated on its headroom probe and Silen's go].
+this sample size; nothing to distill from a peer teacher". There are no later stages:
+distillation is not pursued (program ruling, 2026-07-28), and the teacher-search gate is now
+repo code (`wmo optimize distill probe`, PR #329) whose verdicts on these grids are recorded
+as descriptive output only. Chart: `corners/cost/figures/training_stage_cost_lens.png`.
 
-### The three corners [PENDING: one subsection per corner analysis]
+### The corners program (amended)
 
-Quality-max / cost-max (savings) / latency-max as named, mountable policy configurations,
-each reporting all three objectives. The latency corner is an offline mount choice - no
-online latency-aware routing rule exists yet, recorded as a limitation.
+The quality-max and latency-max analyses are suspended (their lens specs and findings are
+frozen on the branch, resumable); the COST corner drives, on two benchmarks (tau +
+terminal-tasks), through one shared runner (`corners/common/build_corners.py`) so a number
+appearing twice is the same computation. Every chart still reports all three objectives.
+The latency limitation stands: no online latency-aware routing rule exists yet; latency
+corners are offline mount choices.
 
-### Real-episode validation [PENDING]
+### Real-episode validation [PENDING: probe in flight]
 
-The named corners and the anchor, run on real tau2 through the served endpoint (the user
-path: tau2 -> OpenAI-compatible endpoint -> compress -> route -> provider). Preceded by the
-WM-vs-real difference probe that decides how much of the corner analysis the world model can
-carry alone [PENDING: probe result].
+The routed config and the anchor, run on real tau2 through the served endpoint (the user
+path: tau2 -> OpenAI-compatible endpoint -> compress -> route -> provider), pinned
+balanced-20 scenarios, canonical pins, tau2's own reward. Pre-registered decision rule: if
+the routed-vs-anchor per-scenario sign agreement and both headline directions (cost saving,
+quality at-least-parity) hold, the WM carries the corner analysis and the real leg is the
+independent check; if either breaks, the claims re-scope. [PENDING: probe verdict + rows.]
 
-### The compound loop [PENDING: traffic-share and effective-cost vs training step]
+### The compound loop: reported as designed, not as achieved
 
-The plot this product sells: as the personal model improves, the router measurably shifts
-traffic to it and effective cost falls at held quality. Status: infrastructure demonstrated
-end to end (train -> gate -> pool entry -> refit -> serve); the first measured shift awaits a
-cycle that gates. If no cycle gates on this benchmark, this section reports that plainly:
-the gate refusing to promote a non-improvement IS the mechanism working.
+The plot this product would sell - the router measurably shifting traffic to an improving
+personal model - has NO measured point, and this document says so plainly. The
+infrastructure exists end to end (train -> gate -> pool entry -> refit -> serve), and the
+gate is repo code that runs on data the router already buys (`wmo optimize distill probe`).
+On tau it measured no teacher headroom and refused (cycle 1, $34.94, kept); distillation
+was subsequently not pursued program-wide. The gate refusing to promote a non-improvement
+IS the mechanism working; a measured traffic-share shift requires a workload with real
+teacher headroom, deliberately left for the future.
 
 ## Honest limitations (standing, whatever the numbers say)
 
@@ -99,7 +139,23 @@ the gate refusing to promote a non-improvement IS the mechanism working.
 - Sim-to-real agreement is quoted as per-scenario paired sign agreement; model-mean rank
   correlations at n<=9 models sit inside their null noise band and are descriptive only.
 
-## Reproduce [PENDING: exact pins - corpus sha, model dir config, pool, tips, seeds, judge]
+## Reproduce (the pins)
+
+- Grid cohort: `.wmo/jt/grid-c2` at repo tip f1ebaca6, runner `.agents/scripts/run_tau_grid.py`
+  (+ the repair seeder, #348), pool = the cohort's pinned `pool.toml` copy (11 candidates),
+  20 test-band scenarios x 11 models x 2 episodes x 3 arms = 1320/1320 scored, max_steps 20,
+  history_chars 2000, judge rubric-v2 pinned on opus-4-8. All-in cost $943.86.
+- Compression arms ratio-matched by the persisted calibration (llmlingua2-endpoint v1 @ 0.5
+  keeps 0.5656; truncate @ 0.33 keeps 0.5604).
+- Fits: `wmo optimize route fit`, knn, z=0.5, rag_num=7, min_pairs=3, rag_thres=0.95,
+  floor_q=0.05, se_floor on, embedder azure text-embedding-3-large 3072d; identical 14/6
+  fit/held-out split across arms (verified); compressed arms fitted with their exact served
+  compression stamped (`fit_compression`); LOO-CV = 20 fold-fits, each scenario routed by a
+  fit that never saw it. Artifacts: `.wmo/jt/grid-c2/<arm>/policy.json` + `.bank.npz`.
+- Real leg (in flight): canonical tau2 pins - max_turns 100, timeout 1800, max_tokens 8192,
+  user sim gpt-5.4-mini, retries 0, fresh capture-cohort label.
+- Every aggregated number: `wmo.optimize.scorecard` only, via
+  `corners/common/build_corners.py`; per-record provenance in each corner's `numbers.json`.
 
 ## Provenance of this document
 
