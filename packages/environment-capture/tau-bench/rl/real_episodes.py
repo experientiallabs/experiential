@@ -531,11 +531,18 @@ def batch_command(
     pins: ProtocolPins,
 ) -> list[str]:
     """The exact tau2 CLI invocation for one (candidate, domain) batch, pins included."""
+    # The pinned telecom scenarios were captured from telecom's 2285-task "full" split;
+    # tau2's default task set for the domain does not contain them, so every telecom batch
+    # died with "Not all tasks were found" until this forwarded the same override the
+    # training lane pins (wmo/distill/tau2.py TASK_SPLIT_OVERRIDES). A property of the
+    # corpus, not a knob.
+    split_override = ["--task-split-name", "full"] if domain == "telecom" else []
     return [
         str(capture_dir / ".venv" / "bin" / "tau2"),
         "run",
         "--domain",
         domain,
+        *split_override,
         "--agent-llm",
         litellm_route(entry),
         "--agent-llm-args",
