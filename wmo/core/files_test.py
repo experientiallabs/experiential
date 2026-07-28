@@ -217,3 +217,40 @@ def test_a_directory_fsync_failure_is_logged_rather_than_swallowed(
 
     assert "not proven durable" in caplog.text
     assert str(tmp_path) in caplog.text
+
+
+def test_a_directory_close_failure_does_not_fail_a_write_that_landed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`close` is the last post-rename step, and it can fail for real.
+
+    NFS reports deferred write errors at `close`, so it can return EIO after the fsync succeeded.
+    Letting that out would report a landed write as failed, which is the same defect as an
+    unguarded directory fsync one line above, just harder to notice.
+
+    The stub closes the descriptor for real before raising, so the test cannot leak a handle.
+    """
+    path = tmp_path / "state.json"
+    real_open, real_close = os.open, os.close
+    directory_fds: set[int] = set()
+
+    def _record_open(target: object, flags: int, *args: int) -> int:
+        fd = real_open(target, flags, *args)  # ty: ignore[invalid-argument-type]
+        if target == path.parent:
+            directory_fds.add(fd)
+        return fd
+
+    def _fail_close(fd: int) -> None:
+        real_close(fd)
+        if fd in directory_fds:
+            raise OSError("close reported a deferred write error")
+
+    monkeypatch.setattr(os, "open", _record_open)
+    monkeypatch.setattr(os, "close", _fail_close)
+    with caplog.at_level(logging.WARNING, logger="wmo.core.files"):
+        write_text_atomic(path, "payload")  # must not raise
+
+    monkeypatch.undo()
+    assert path.read_text(encoding="utf-8") == "payload"
+    assert "could not close the directory handle" in caplog.text
+    assert list(tmp_path.glob("*.partial")) == []

@@ -82,7 +82,12 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
 
 
 def _fsync_directory(directory: Path) -> None:
-    """Persist the rename itself. Best effort, and deliberately so.
+    """Persist the rename itself. Best effort, and deliberately so: never raises `OSError`.
+
+    Every step is individually guarded, including the close. `close` is not a formality on every
+    filesystem: NFS reports deferred write errors there, so it can fail with EIO after everything
+    else succeeded, and letting that out would recreate the exact bug this function was written to
+    remove one line further down.
 
     The rename has already landed by the time this runs, so raising here would report a write that
     DID happen as a failure, and a caller acting on that (reporting a failed promotion, retrying,
@@ -113,7 +118,15 @@ def _fsync_directory(directory: Path) -> None:
             exc,
         )
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError as exc:
+            logger.warning(
+                "could not close the directory handle for %s after a rename (the file itself is "
+                "written): %s",
+                directory,
+                exc,
+            )
 
 
 def write_text_atomic(path: Path, text: str) -> None:
