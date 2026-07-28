@@ -275,69 +275,93 @@ def main() -> None:
         log.info("resuming: %d rows exist", len(done))
     spent = 0.0
     n_correct = n_total = 0
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    lock = threading.Lock()
+    stop = threading.Event()
     with rows_path.open("a") as f:
         for model_name in args.models.split(","):
             entry = pool.entry(model_name)
-            for task in tasks:
-                for episode in range(EPISODES):
-                    if (task["task_id"], model_name, episode) in done:
-                        continue
-                    timed = _TimedProvider(pool_provider(entry))
-                    compressing = (
-                        _CompressingProvider(timed, compression)
-                        if compression is not None
-                        else None
-                    )
-                    agent = LLMAgent(compressing or timed, temperature=0.0, tools_hint=tools_hint)
-                    wm = WorldModel.load(str(MODEL_DIR), get_provider(serve_config))
-                    env = WorldModelEnv(wm, score_on_close=False)
-                    framed = (
-                        task["prompt"]
-                        + "\n\nThe source financial documents are files under docs/ in this "
-                        "environment; list and read them with the bash tool (ls docs, grep, cat) "
-                        "and answer from what they contain."
-                    )
-                    result = run_episode(env, agent, framed, max_steps=MAX_STEPS)
-                    final = timed.replies[-1] if timed.replies else ""
-                    correct = gold_correct(final, task["gold_numeric"])
-                    answered = bool(extract_numbers(final))
-                    candidate_cost = entry.cost_usd(timed.usage)
+            jobs = [
+                (task, episode)
+                for task in tasks
+                for episode in range(EPISODES)
+                if (task["task_id"], model_name, episode) not in done
+            ]
+
+            def run_one(job):  # noqa: ANN001, ANN202
+                nonlocal spent, n_correct, n_total
+                if stop.is_set():
+                    return
+                task, episode = job
+                try:
+                    self_contained(task, episode)
+                except Exception as exc:  # noqa: BLE001 - one broken episode never kills the arm
+                    log.warning("episode error %s ep%d: %s", task["task_id"], episode, str(exc)[:150])
+
+            def self_contained(task, episode):  # noqa: ANN001, ANN202
+                nonlocal spent, n_correct, n_total
+                timed = _TimedProvider(pool_provider(entry))
+                compressing = (
+                    _CompressingProvider(timed, compression)
+                    if compression is not None
+                    else None
+                )
+                agent = LLMAgent(compressing or timed, temperature=0.0, tools_hint=tools_hint)
+                wm = WorldModel.load(str(MODEL_DIR), get_provider(serve_config))
+                env = WorldModelEnv(wm, score_on_close=False)
+                framed = (
+                    task["prompt"]
+                    + "\n\nThe source financial documents are files under docs/ in this "
+                    "environment; list and read them with the bash tool (ls docs, grep, cat) "
+                    "and answer from what they contain."
+                )
+                result = run_episode(env, agent, framed, max_steps=MAX_STEPS)
+                final = timed.replies[-1] if timed.replies else ""
+                correct = gold_correct(final, task["gold_numeric"])
+                answered = bool(extract_numbers(final))
+                candidate_cost = entry.cost_usd(timed.usage)
+                with lock:
                     spent += candidate_cost + 0.0685  # env at the master-measured rate
                     n_total += 1
                     n_correct += int(correct)
+                    if spent > args.cap_usd:
+                        stop.set()
                     f.write(
                         json.dumps(
-                            {
-                                "ts": datetime.now(UTC).isoformat(),
-                                "arm": args.arm,
-                                "aggressiveness": args.aggressiveness,
-                                "task_id": task["task_id"],
-                                "stratum": task["stratum"],
-                                "model": model_name,
-                                "episode": episode,
-                                "correct": correct,
-                                "answered": answered,
-                                "gold_numeric": task["gold_numeric"],
-                                "extracted": extract_numbers(final)[:6],
-                                "final_reply_tail": final[-400:],
-                                "steps": len(result.steps),
-                                "stop_reason": str(result.stop_reason),
-                                "candidate_cost_usd": round(candidate_cost, 5),
-                                "tokens_in_raw": compressing.tokens_in_raw if compressing else 0,
-                                "tokens_in_compressed": compressing.tokens_in_compressed
-                                if compressing
-                                else 0,
-                                "error": result.error,
-                            },
-                            ensure_ascii=False,
-                        )
+                        {
+                            "ts": datetime.now(UTC).isoformat(),
+                            "arm": args.arm,
+                            "aggressiveness": args.aggressiveness,
+                            "task_id": task["task_id"],
+                            "stratum": task["stratum"],
+                            "model": model_name,
+                            "episode": episode,
+                            "correct": correct,
+                            "answered": answered,
+                            "gold_numeric": task["gold_numeric"],
+                            "extracted": extract_numbers(final)[:6],
+                            "final_reply_tail": final[-400:],
+                            "steps": len(result.steps),
+                            "stop_reason": str(result.stop_reason),
+                            "candidate_cost_usd": round(candidate_cost, 5),
+                            "tokens_in_raw": compressing.tokens_in_raw if compressing else 0,
+                            "tokens_in_compressed": compressing.tokens_in_compressed
+                            if compressing
+                            else 0,
+                            "error": result.error,
+                        },
+                        ensure_ascii=False,
+                    )
                         + "\n"
                     )
                     f.flush()
-                    if spent > args.cap_usd:
-                        raise SystemExit(
-                            f"metered spend ${spent:.2f} exceeded cap ${args.cap_usd}; halting"
-                        )
+
+            with ThreadPoolExecutor(max_workers=4) as pool_exec:
+                list(pool_exec.map(run_one, jobs))
+            if stop.is_set():
+                raise SystemExit(f"metered spend ${spent:.2f} exceeded cap; halting")
             log.info(
                 "%s/%s: accuracy so far %d/%d, est spend $%.2f",
                 args.arm,
