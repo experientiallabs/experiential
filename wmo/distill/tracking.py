@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from wmo.core.files import write_text_atomic
 from wmo.core.types import JsonObject, JsonValue
 from wmo.distill.config import DistillConfig
 from wmo.distill.samples import SampleRollout
-from wmo.distill.store import write_text_atomic
 
 if TYPE_CHECKING:
     from wmo.distill.loop import StepMetrics, WarmupMetrics

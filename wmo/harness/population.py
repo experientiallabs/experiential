@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -31,6 +30,7 @@ from typing import Protocol
 
 from pydantic import JsonValue
 
+from wmo.core.files import write_text_atomic
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.runtime import HarnessSearchCancelled
 from wmo.harness.scoring import Scorer, ScoreReport
@@ -148,25 +148,12 @@ class PopulationResult:
 
 
 def write_json_atomic(path: Path, value: JsonValue) -> None:
-    """Write deterministic JSON through a same-directory fsynced tmp+rename.
+    """Write deterministic JSON durably: sorted keys, trailing newline, atomic replace.
 
-    The temp file is fsynced before the rename and the directory after it: without both, a
-    power loss can persist the rename while the data blocks are lost, leaving a truncated or
-    empty state file behind an apparently successful commit.
+    Determinism is this function's own contract (a state file that reorders between writes is
+    unreadable as a diff); the durability is `wmo.core.files.write_text_atomic`.
     """
-    temporary = path.with_name(f"{path.name}.tmp")
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    with temporary.open("w", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(path)
-    directory = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 class PopulationRunState:

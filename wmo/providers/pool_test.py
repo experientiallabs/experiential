@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from wmo.core.files import FileLockTimeout
 from wmo.providers import pool as pool_module
 from wmo.providers.azure_openai import AzureOpenAIProvider
 from wmo.providers.base import ProviderConfig, ProviderKind, TokenUsage
@@ -22,7 +23,6 @@ from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import (
     DEFAULT_POOL_PATH,
     PoolEntry,
-    PoolLockTimeout,
     load_pool,
     pool_api_key,
     pool_provider,
@@ -527,22 +527,27 @@ def test_upsert_pool_entry_uses_a_process_private_temp_file(
 ) -> None:
     """Two concurrent upserts must not be able to rename each other's half-written file.
 
-    A shared fixed `.tmp` path turns a lost update into a CORRUPT roster: writer A can rename
-    B's partially written file into place. Distinct temps bound the damage to last-writer-wins.
+    A shared fixed staging path turns a lost update into a CORRUPT roster: writer A can rename
+    B's partially written file into place. A name unique per call bounds the damage to
+    last-writer-wins. The property belongs to `wmo.core.files.write_bytes_atomic` and is covered
+    directly in `wmo/core/files_test.py`; this pins that the roster's write actually goes through
+    it, which is the reason it was documented on this function in the first place.
     """
-    seen: list[str] = []
-    real_write = Path.write_text
+    renamed: list[str] = []
+    real_replace = Path.replace
 
-    def _record(self: Path, data: str, **kwargs: object) -> int:
-        if self.suffix == ".tmp":
-            seen.append(self.name)
-        return real_write(self, data, **kwargs)  # ty: ignore[invalid-argument-type]
+    def _record(self: Path, target: object) -> Path:
+        renamed.append(self.name)
+        return real_replace(self, target)  # ty: ignore[invalid-argument-type]
 
-    monkeypatch.setattr(Path, "write_text", _record)
-    upsert_pool_entry(_student_entry(), tmp_path / "pool.toml")
+    monkeypatch.setattr(Path, "replace", _record)
+    path = tmp_path / "pool.toml"
+    upsert_pool_entry(_student_entry(), path)
+    upsert_pool_entry(_student_entry("other"), path)
 
-    assert seen == [f"pool.toml.{os.getpid()}.tmp"]
-    assert list(tmp_path.glob("*.tmp")) == []  # the temp is gone once renamed
+    assert len(set(renamed)) == 2, f"the staging name repeated across calls: {renamed}"
+    assert all(name.startswith(".pool.toml.") for name in renamed)
+    assert list(tmp_path.glob("*.partial")) == []  # the staging file is gone once renamed
 
 
 def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
@@ -553,7 +558,7 @@ def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
     real_replace = Path.replace
 
     def _boom(self: Path, target: object) -> Path:
-        if self.suffix == ".tmp":
+        if self.suffix == ".partial":
             raise OSError("disk full")
         return real_replace(self, target)  # ty: ignore[invalid-argument-type]
 
@@ -561,7 +566,7 @@ def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
     with pytest.raises(OSError, match="disk full"):
         upsert_pool_entry(_student_entry(), path)
 
-    assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.partial")) == []
     assert load_pool(path).models  # the roster is untouched and still loadable
 
 
@@ -785,7 +790,7 @@ def test_upsert_pool_entry_refuses_to_write_a_roster_that_does_not_read_back(
         upsert_pool_entry(_short_openai("gpt-5.5"), path)
 
     assert not path.exists()  # nothing was committed
-    assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.partial")) == []
 
 
 def test_load_pool_names_the_file_when_it_is_not_valid_toml(tmp_path: Path) -> None:
@@ -972,7 +977,7 @@ def test_upsert_pool_entry_reports_a_stuck_writer_instead_of_hanging(tmp_path: P
     holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
     fcntl.flock(holder, fcntl.LOCK_EX)
     try:
-        with pytest.raises(PoolLockTimeout, match=r"writing the model pool at .*pool\.toml"):
+        with pytest.raises(FileLockTimeout, match=r"writing the model pool at .*pool\.toml"):
             upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05)
     finally:
         os.close(holder)
