@@ -1,10 +1,9 @@
 # COST-MAX corner: where the savings actually come from
 
-> Status 2026-07-28 (post-repair): identity and truncate matrices are FINAL (440/440
-> scored); llmlingua2-endpoint is mid-straggler-pass (last merge 409/440, matrix currently
-> re-merging; its numbers are labeled provisional). The identity-arm routed rung is
-> measured (fit + dial replay on the held-out band). Coverage travels on every number.
-> Publication of anything on this page is gated (DECISIONS 2026-07-27, corner chats entry).
+> Status 2026-07-28: ALL THREE matrices FINAL (440/440 scored each). All three per-arm
+> routed rungs measured (fits + dial replays on the shared held-out 6). Cost deltas carry
+> paired cluster-bootstrap CIs (see the significance audit at the end). Remaining: the
+> real-episode leg + WM-vs-real probe (master). Publication gated (DECISIONS 2026-07-27).
 
 ## The accounting rule every number obeys
 
@@ -77,10 +76,11 @@ Savings behind an optimized endpoint can come from four places. Their current sh
    not cache-adjusted, so on cache-dominated workloads two adjacent models could in
    principle order differently than their real serving cost; any verdict quoted here with
    `price_basis="list"` says so. The z=1.96-at-n=8 nit is the master's logged note; it
-   matches the program-wide convention. Current live verdict (grid-c2 partial, cited
-   verbatim in numbers.json): INSUFFICIENT EVIDENCE, leading candidate opus-5 at +32.0
-   points over gpt-5.4-mini on only 5 shared scored scenarios, below the 8 the gate
-   requires: the gate refusing on thin evidence is the mechanism working.
+   matches the program-wide convention. Final-grid verdict (cited verbatim in
+   numbers.json): DISTILL, cheapest sufficient teacher gpt-5.5; recorded as descriptive
+   output only per the no-distillation ruling. (The partial-grid read earlier that day was
+   INSUFFICIENT EVIDENCE at 5 shared scenarios: the gate tightening as evidence arrived is
+   the mechanism working.)
 4. **Cheap-model-was-already-fine share (the anchor's weakness)**: the share of "savings"
    that any cheap model would have delivered because the anchor is overkill for part of the
    workload. This is real money but not an optimizer achievement, which is why every delta
