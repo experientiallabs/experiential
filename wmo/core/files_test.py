@@ -254,3 +254,79 @@ def test_a_directory_close_failure_does_not_fail_a_write_that_landed(
     assert path.read_text(encoding="utf-8") == "payload"
     assert "could not close the directory handle" in caplog.text
     assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_write_text_atomic_writes_through_a_symlinked_destination(tmp_path: Path) -> None:
+    """An operator who points a config at a shared file must get their writes there.
+
+    `replace` swaps the LINK for a regular file and leaves the target stale, with nothing raised.
+    An in-place `write_text` followed the link, so the three writers converted to atomic writes
+    (`HarnessStore.set_alias`, `wmo/config/card.py`, `OutcomeMatrix.save`) silently changed
+    meaning; the ones that were always atomic had been clobbering links all along.
+    """
+    target = tmp_path / "shared.toml"
+    target.write_text("original", encoding="utf-8")
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    write_text_atomic(link, "new")
+
+    assert link.is_symlink(), "the symlink was replaced by a regular file"
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_write_text_atomic_stages_beside_the_symlink_target_not_the_link(tmp_path: Path) -> None:
+    """Atomicity depends on this: `replace` across filesystems fails with EXDEV.
+
+    A symlink pointing into another mount is exactly the case where staging next to the LINK would
+    make the final rename cross a filesystem boundary and fail. Staging beside the resolved target
+    keeps the rename local. A separate directory stands in for a separate mount here, which pins
+    the staging location even though it cannot pin EXDEV itself.
+    """
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    target = elsewhere / "shared.toml"
+    target.write_text("original", encoding="utf-8")
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+    staged: list[Path] = []
+    real_replace = Path.replace
+
+    def _record(self: Path, destination: object) -> Path:
+        staged.append(self)
+        return real_replace(self, destination)  # ty: ignore[invalid-argument-type]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(Path, "replace", _record)
+        write_text_atomic(link, "new")
+
+    assert [item.parent for item in staged] == [elsewhere], "staged beside the link, not the target"
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_write_text_atomic_keeps_the_symlink_targets_mode(tmp_path: Path) -> None:
+    """The mode that matters is the target's, since that is the inode being replaced."""
+    target = tmp_path / "shared.toml"
+    target.write_text("original", encoding="utf-8")
+    target.chmod(0o600)
+    link = tmp_path / "config.toml"
+    link.symlink_to(target)
+
+    write_text_atomic(link, "new")
+
+    # Both halves matter: without the content assertion this passes on the broken behaviour,
+    # because a target that was never written trivially keeps its mode.
+    assert target.read_text(encoding="utf-8") == "new"
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_write_text_atomic_creates_the_target_of_a_dangling_symlink(tmp_path: Path) -> None:
+    """Writing through a broken link creates its target, as an in-place write would have."""
+    missing = tmp_path / "not-there-yet.toml"
+    link = tmp_path / "config.toml"
+    link.symlink_to(missing)
+
+    write_text_atomic(link, "created")
+
+    assert missing.read_text(encoding="utf-8") == "created"
+    assert link.is_symlink()
