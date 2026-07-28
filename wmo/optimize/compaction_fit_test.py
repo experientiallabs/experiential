@@ -379,3 +379,31 @@ def test_assign_to_clusters_matches_overlay_assignment(off: OutcomeMatrix) -> No
     )
     reassigned = assign_to_clusters(clusters, off, embed_with=embedder)
     assert reassigned == assignment
+
+
+def test_calibrator_selection_picks_the_most_aggressive_passing_arm(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
+    # calibrator-v1 (the learned-calibration-ratio directive): among arms passing BOTH
+    # gates, take the highest aggressiveness, so the learned operating point inherits the
+    # corrected gate's guarantee. The rule is recorded on the fit (identity-grained).
+    gentle = _winning_arm(cost=0.004, config=TRUNCATE)  # aggressiveness 0.2, cheaper
+    bold_cfg = CompressionConfig(
+        compressor_id="truncate", compressor_version="1", aggressiveness=0.6
+    )
+    bold = _winning_arm(cost=0.005, config=bold_cfg)  # more aggressive, still passing
+    arms = [
+        ArmMatrices(matrix=gentle, config=TRUNCATE),
+        ArmMatrices(matrix=bold, config=bold_cfg),
+    ]
+    conservative = fit_compaction(assignment, off, arms)
+    calibrated = fit_compaction(assignment, off, arms, selection="aggressiveness")
+    fin = assignment["fin-0"]
+    assert conservative.per_cluster[fin].aggressiveness == 0.2  # cheapest wins by default
+    assert calibrated.per_cluster[fin].aggressiveness == 0.6  # calibrator takes the ceiling
+    assert calibrated.selection == "aggressiveness" and conservative.selection == "cost"
+
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="selection rule"):
+        fit_compaction(assignment, off, arms, selection="vibes")

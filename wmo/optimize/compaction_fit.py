@@ -161,6 +161,9 @@ class CompactionFit(BaseModel):
     z: float
     min_pairs: int
     margin: float = DEFAULT_NONINFERIORITY_MARGIN
+    # Which selection rule chose among passing arms: "cost" (default) or "aggressiveness"
+    # (calibrator-v1). Part of the fit's identity; consumers must not mix maps across rules.
+    selection: str = "cost"
     coverage: list[str] = Field(default_factory=list)  # human-readable coverage notes
     # Investigation flags, one string per event: a control led the tie-break, or a control
     # quality-dominated the winner. Any entry means the fit must not ship without a human read.
@@ -338,6 +341,17 @@ def assign_to_clusters(
     return {sid: cluster_ids[int(np.argmax(sims[index]))] for index, sid in enumerate(scenario_ids)}
 
 
+# Selection rules among gate-passing arms. "cost" is the conservative default (cheapest,
+# then least aggressive). "aggressiveness" is calibrator-v1 (the learned-calibration-ratio
+# directive): the HIGHEST aggressiveness whose arm passes BOTH gates, so the learned
+# operating point inherits the corrected gate's guarantee instead of a point estimate.
+# Either way the choice is made at cluster/artifact grain from MEASURED arms only, and the
+# rule is part of the fit's identity (recorded on the output; a different rule = a
+# different artifact, exactly like a compressor version).
+SELECTION_RULES = ("cost", "aggressiveness")
+CALIBRATOR_VERSION = "calibrator-v1"
+
+
 def fit_compaction(
     assignment: dict[str, int],
     off: OutcomeMatrix,
@@ -349,6 +363,7 @@ def fit_compaction(
     completion: CompletionRule = DEFAULT_COMPLETION,
     allow_uneven: bool = False,
     provenance: EvidenceProvenance | None = None,
+    selection: str = "cost",
 ) -> CompactionFit:
     """The gates: per cluster, choose among measured arms or stay uncompressed.
 
@@ -356,6 +371,8 @@ def fit_compaction(
     `assign_to_clusters`, or from `overlay_clusters`). See the module docstring for the rule;
     every decision's paired statistics are returned as evidence rows.
     """
+    if selection not in SELECTION_RULES:
+        raise ValueError(f"unknown selection rule '{selection}'; use one of {SELECTION_RULES}")
     if off.measured_compression() is not None:
         raise ValueError("the off arm must be uncompressed; got a matrix with a compression arm")
     signatures = [compression_signature(arm.config) for arm in arms]
@@ -431,11 +448,18 @@ def fit_compaction(
         passing = [c for c in candidates if c.quality_pass and c.cost_pass]
         per_cluster[cluster_id] = None
         if passing:
-            # Tie-break lowest effective cost, then lower aggressiveness (conservative).
-            ranked = sorted(
-                passing,
-                key=lambda c: (c.arm_cost_per_completed, c.config.aggressiveness),
-            )
+            if selection == "aggressiveness":
+                # calibrator-v1: most aggressive passing arm, cheaper first on ties.
+                ranked = sorted(
+                    passing,
+                    key=lambda c: (-c.config.aggressiveness, c.arm_cost_per_completed),
+                )
+            else:
+                # Conservative default: lowest effective cost, then lower aggressiveness.
+                ranked = sorted(
+                    passing,
+                    key=lambda c: (c.arm_cost_per_completed, c.config.aggressiveness),
+                )
             ranked[0].would_win = True
             if ranked[0].control:
                 control_flags.append(
@@ -472,6 +496,7 @@ def fit_compaction(
         z=z,
         min_pairs=min_pairs,
         margin=margin,
+        selection=selection,
         coverage=coverage,
         control_flags=control_flags,
         provenance=provenance or EvidenceProvenance(),
