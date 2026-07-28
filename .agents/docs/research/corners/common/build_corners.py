@@ -30,6 +30,7 @@ import argparse
 import json
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 from matplotlib import pyplot as plt
@@ -807,11 +808,211 @@ def fig_training_stage(dataset: CornersDataset, spec: FigureSpec, out: Path) -> 
     ablation_chart.render_training_stage_chart(chart, out / spec.filename, lens=lens)
 
 
+def _bar(
+    ax: plt.Axes,
+    x: int,
+    cost: float | None,
+    color: str,
+    label: str,
+    detail: str,
+    dy: int = 4,
+) -> None:
+    """One three-stage bar: effective $/completed task, detail text above, name below.
+    `dy` staggers the annotation when neighboring bars are near-equal height."""
+    if cost is None:
+        ax.text(x, 0.02, "undefined\n(0 completed)", ha="center", fontsize=7.5, color=MUTED)
+        return
+    ax.bar(x, cost, width=0.62, color=color, zorder=3)
+    ax.annotate(
+        detail, xy=(x, cost), xytext=(0, dy), textcoords="offset points",
+        ha="center", fontsize=7.2,
+    )
+
+
+def fig_three_stage(dataset: CornersDataset, spec: FigureSpec, out: Path) -> None:
+    """The per-benchmark three-stage chart (Silen directive, DECISIONS 2026-07-28).
+
+    Stage 1 routing: anchor vs best-single vs routed, model mix annotated on routed bars,
+    both measured dials. Stage 2 +compaction: the compression arms added, negatives kept
+    and labeled. Stage 3 distillation: the gate verdicts rendered as the mechanism working
+    (text panel; there is no promoted student anywhere by decision). Every bar states all
+    three objectives (cost = bar height, quality delta + p50 in the detail text); held-out
+    basis for routed comparisons; provenance in the footnote.
+
+    Params: `constant_routed` annotates a fit that routes 0% away when no routed replay
+    exists (the terminal case); `distill_note` is the benchmark's stage-3 story.
+    """
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15.0, 5.2), width_ratios=(3, 3, 2))
+    anchor = dataset.anchor_model
+    best = dataset.best_single or "?"
+
+    def detail(cost: float, quality: float, p50: float, n: int, mix: str = "") -> str:
+        core = f"${cost:.2f}\n{quality:+.1f} pt · p50 {p50:.0f}s · n{n}"
+        return f"{core}\n{mix}" if mix else core
+
+    def _bar_ylim_headroom(ax: plt.Axes) -> None:
+        lo, hi = ax.get_ylim()
+        ax.set_ylim(lo, hi * 1.22)  # room for the three-line detail annotations
+
+    def mix_text(mix: dict[str, int]) -> str:
+        total = sum(mix.values())
+        ordered = sorted(mix.items(), key=lambda kv: -kv[1])
+        return " / ".join(f"{100 * v // total}% {m}" for m, v in ordered)
+
+    # Stage 1: routing. Common basis = the routed records' held-out band when replays
+    # exist; otherwise the per-model records' common scenario set with the fit's constant
+    # choice annotated.
+    routed_by_dial = {r.dial: r for r in dataset.routed if r.arm == IDENTITY_ARM}
+    x = 0
+    if routed_by_dial:
+        rec = routed_by_dial[0.25]
+        _bar(ax1, 0, rec.vs_anchor.anchor_cost.cost_per_completed_task_usd, MUTED, anchor,
+             detail(rec.vs_anchor.anchor_cost.cost_per_completed_task_usd or 0.0, 0.0,
+                    rec.vs_anchor.anchor_latency.p50_model_s, rec.vs_anchor.scenarios_compared))
+        best_cost = (
+            None if rec.vs_best is None else rec.vs_best.anchor_cost.cost_per_completed_task_usd
+        )
+        if rec.vs_best is not None and best_cost is not None:
+            _bar(ax1, 1, best_cost, BLUE, best,
+                 detail(best_cost, -rec.vs_best.quality_delta_points,
+                        rec.vs_best.anchor_latency.p50_model_s, rec.vs_best.scenarios_compared))
+        for i, dial in enumerate((0.25, 1.0)):
+            r = routed_by_dial.get(dial)
+            if r is None or r.vs_anchor.cost.cost_per_completed_task_usd is None:
+                continue
+            _bar(ax1, 2 + i, r.vs_anchor.cost.cost_per_completed_task_usd, PURPLE,
+                 f"routed@{dial:g}",
+                 detail(r.vs_anchor.cost.cost_per_completed_task_usd,
+                        r.vs_anchor.quality_delta_points, r.vs_anchor.latency.p50_model_s,
+                        r.vs_anchor.scenarios_compared, mix_text(r.routed_mix)),
+                 dy=4 if i == 0 else 44)
+        labels = [anchor, best, "routed@0.25", "routed@1.0"]
+        ax1.set_xticks(range(len(labels)), labels, fontsize=8)
+        _bar_ylim_headroom(ax1)
+    else:
+        by_key = {r.key: r for r in dataset.records}
+        best_rec = by_key.get(f"{IDENTITY_ARM}/{best}")
+        if best_rec is not None:
+            card = best_rec.vs_anchor
+            _bar(ax1, 0, card.anchor_cost.cost_per_completed_task_usd, MUTED, anchor,
+                 detail(card.anchor_cost.cost_per_completed_task_usd or 0.0, 0.0,
+                        card.anchor_latency.p50_model_s, card.scenarios_compared))
+            _bar(ax1, 1, card.cost.cost_per_completed_task_usd, BLUE, best,
+                 detail(card.cost.cost_per_completed_task_usd or 0.0,
+                        card.quality_delta_points, card.latency.p50_model_s,
+                        card.scenarios_compared))
+            constant = str(spec.params.get("constant_routed", ""))
+            if constant and card.cost.cost_per_completed_task_usd is not None:
+                _bar(ax1, 2, card.cost.cost_per_completed_task_usd, PURPLE, "routed",
+                     detail(card.cost.cost_per_completed_task_usd,
+                            card.quality_delta_points, card.latency.p50_model_s,
+                            card.scenarios_compared, constant))
+            ax1.set_xticks(range(3), [anchor, best, "routed"], fontsize=8)
+    ax1.set_title("Stage 1: routing")
+    ax1.set_ylabel("effective $ per completed task")
+
+    # Stage 2: +compaction, negatives kept. Anchor + best-single across the three arms.
+    arm_order = [IDENTITY_ARM, "truncate", "llmlingua2-endpoint"]
+    arm_short = {IDENTITY_ARM: "raw", "truncate": "trunc", "llmlingua2-endpoint": "llml2"}
+    positions: list[int] = []
+    ticks: list[str] = []
+    x = 0
+    by_key = {r.key: r for r in dataset.records}
+    for model in (anchor, best):
+        for arm_name in arm_order:
+            rec = by_key.get(f"{arm_name}/{model}")
+            if rec is None:
+                if model == anchor and arm_name == IDENTITY_ARM and routed_by_dial:
+                    cost = routed_by_dial[0.25].vs_anchor.anchor_cost.cost_per_completed_task_usd
+                    _bar(ax2, x, cost, ARM_COLORS[arm_name], "", f"${cost:.2f}\nanchor")
+                    positions.append(x)
+                    ticks.append(f"{model}\nraw")
+                    x += 1
+                continue
+            card = rec.vs_anchor
+            _bar(ax2, x, card.cost.cost_per_completed_task_usd, ARM_COLORS[arm_name], "",
+                 detail(card.cost.cost_per_completed_task_usd or 0.0,
+                        card.quality_delta_points, card.latency.p50_model_s,
+                        card.scenarios_compared))
+            positions.append(x)
+            ticks.append(f"{model}\n{arm_short[arm_name]}")
+            x += 1
+        x += 1  # gap between model groups
+    ax2.set_xticks(positions, ticks, fontsize=7)
+    _bar_ylim_headroom(ax2)
+    ax2.set_title("Stage 2: +compaction (taller = the finding)")
+
+    # Stage 3: distillation, the verdicts as text.
+    ax3.axis("off")
+    ax3.set_title("Stage 3: distillation")
+    verdict = (
+        dataset.teacher.reason
+        if dataset.teacher is not None
+        else f"teacher gate: {dataset.teacher_unavailable_reason}"
+    )
+    note = str(spec.params.get("distill_note", ""))
+    ax3.text(
+        0.0, 0.95,
+        (note + "\n\n" if note else "")
+        + "Teacher gate (descriptive only, per the\nno-distillation ruling):\n"
+        + "\n".join(textwrap.wrap(verdict, width=46)),
+        va="top", fontsize=8,
+    )
+
+    footnote(
+        fig,
+        f"measured · wm_simulated · dataset {dataset.dataset_label} · judge "
+        f"{dataset.judge_label} · anchor {anchor}, best-single {best} · effective cost per "
+        f"COMPLETED task (wmo.optimize.scorecard; compressor + router overhead folded in) · "
+        f"stage-1 routed bars on the fit's held-out band · compaction rungs are a measured "
+        f"tradeoff, not a recommendation · CIs per record in numbers.json · {dataset.status}",
+    )
+    save_fig(fig, out / spec.filename)
+
+
+def fig_three_stage_ours9(dataset: CornersDataset, spec: FigureSpec, out: Path) -> None:
+    """The routing-only benchmark's stage chart: routerbench-ours9 from the D-DIAL anchors.
+
+    ours9 has no compaction or distillation stages and no cost-per-task unit here (its
+    anchors are deltas vs ITS best single model), so this renders stage 1 alone in delta
+    space, with the frontier-pinned model mix the routing lane measured (DECISIONS
+    2026-07-28 three-stage directive). Never blended with the tau/terminal charts.
+    """
+    fig, ax = plt.subplots(figsize=(7.5, 4.6))
+    detents = {a.cost_quality: a for a in COST_QUALITY_ANCHORS}
+    for i, dial in enumerate((0.0, 0.25, 0.5, 1.0)):
+        a = detents[dial]
+        ax.bar(i, a.cost_delta_percent, width=0.62, color=PURPLE, zorder=3)
+        ax.annotate(
+            f"{a.cost_delta_percent:+.1f}%\n{a.quality_delta_points:+.2f} pt",
+            xy=(i, a.cost_delta_percent), xytext=(0, -16), textcoords="offset points",
+            ha="center", fontsize=7.5,
+        )
+    ax.set_xticks(range(4), [detents[d].named_point for d in (0.0, 0.25, 0.5, 1.0)], fontsize=8)
+    ax.axhline(0.0, color=MUTED, linewidth=0.8)
+    ax.set_ylabel("cost % vs ours9's best single model")
+    ax.set_title("Stage 1 (routing-only benchmark): routerbench-ours9 dial anchors")
+    mix = str(spec.params.get("mix", ""))
+    if mix:
+        ax.text(0.02, 0.04, "\n".join(textwrap.wrap(f"frontier-pinned routed mix: {mix}", 60)),
+                transform=ax.transAxes, fontsize=7.5, color=MUTED)
+    footnote(
+        fig,
+        "measured on routerbench-ours9 (1199 scenarios, 9 models, 5 seeds) vs ITS best "
+        "single pool model (wmo/optimize/knn.py COST_QUALITY_ANCHORS; mix per the routing "
+        "lane, DECISIONS 2026-07-28) · routing-only benchmark: no compaction or "
+        "distillation stage exists here · never blended with tau/terminal charts",
+    )
+    save_fig(fig, out / spec.filename)
+
+
 FIGURE_KINDS = {
     "dial_curve": fig_dial_curve,
     "savings_frontier": fig_savings_frontier,
     "cost_per_task": fig_cost_per_task,
     "training_stage": fig_training_stage,
+    "three_stage": fig_three_stage,
+    "three_stage_ours9": fig_three_stage_ours9,
 }
 
 # The suspended corners' lenses, renderable via their FROZEN standalone scripts (Amendment

@@ -11,9 +11,8 @@ there are no routed detents worth replaying (the runner still reports routed run
 pending/notes, honestly, if a policy.json ever lands beside the matrices).
 """
 
-from data import main_checkout
-
 from build_corners import FigureSpec, LensSpec
+from data import main_checkout
 
 LENS = LensSpec(
     name="tb2-cost",
@@ -24,5 +23,22 @@ LENS = LensSpec(
     figures=(
         FigureSpec(kind="savings_frontier", filename="savings_vs_fable5.png"),
         FigureSpec(kind="cost_per_task", filename="effective_cost_per_task.png"),
+        # The Silen three-stage directive (DECISIONS 2026-07-28); added by the cost chat
+        # under extend-never-fork, flagged in DECISIONS for the tb2 chat's review.
+        FigureSpec(
+            kind="three_stage",
+            filename="three_stage_terminal.png",
+            params={
+                "constant_routed": (
+                    "fit fallback sonnet-5, routes 0.0% away (the correct learned "
+                    "policy is a constant)"
+                ),
+                "distill_note": (
+                    "terminal-tasks: distillation skipped by\n"
+                    "directive (a distilled model already exists\n"
+                    "on HF from the earlier TB2 work)."
+                ),
+            },
+        ),
     ),
 )

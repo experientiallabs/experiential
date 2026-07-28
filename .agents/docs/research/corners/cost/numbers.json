@@ -1,5 +1,7 @@
 {
   "status": "identity: merged; truncate: merged; llmlingua2-endpoint: merged",
+  "dataset": "tau-bench",
+  "judge": "rubric-v2 (opus-4-8)",
   "pending_arms": [],
   "anchor": "fable-5",
   "best_single": "opus-5",
