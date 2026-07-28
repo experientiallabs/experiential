@@ -13,6 +13,7 @@ from wmo.cli.model_roles import (
     OptInModelRole,
     _model_config,
     configured_role_configs,
+    configured_role_provider_config,
     inherit_provider_connection,
     load_settings_or_abort,
     resolve_opt_in_model_provider,
@@ -398,3 +399,39 @@ def test_provider_connection_deployment_only_applies_to_the_same_model() -> None
     assert another_model.deployment is None
     assert another_model.endpoint == "https://azure.example"
     assert another_model.api_version == "2026-01-01"
+
+
+def test_provider_connection_does_not_inherit_an_implicit_token_field() -> None:
+    configured = configured_role_provider_config(
+        ModelRole(provider="azure", model="kimi-k2.6"),
+        role="worker",
+    )
+    assert "chat_max_tokens_field" not in configured.model_fields_set
+    selected = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="kimi-k2.6",
+        model_type="kimi-k2.6",
+        chat_max_tokens_field="max_tokens",
+    )
+
+    resolved = inherit_provider_connection(selected, configured)
+
+    assert resolved.chat_max_tokens_field == "max_tokens"
+
+
+def test_provider_connection_matches_canonical_model_identity_without_case() -> None:
+    configured = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="Kimi-K2.6",
+        model_type="Kimi-K2.6",
+        deployment="Kimi-Production",
+    )
+    selected = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="kimi-k2.6",
+        model_type="kimi-k2.6",
+    )
+
+    resolved = inherit_provider_connection(selected, configured)
+
+    assert resolved.deployment == "Kimi-Production"

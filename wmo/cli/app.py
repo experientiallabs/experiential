@@ -51,6 +51,7 @@ from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
 from wmo.cli.model_roles import (
     configured_role_configs,
+    configured_role_provider_config,
     inherit_provider_connection,
     load_settings_or_abort,
 )
@@ -800,9 +801,10 @@ def build(
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
     configured_worker = load_settings_or_abort(root).models.resolve("worker")
-    configured_worker_config = next(
-        (config for role, config in configured_role_configs(root) if role == "worker"),
-        None,
+    configured_worker_config = (
+        configured_role_provider_config(configured_worker, role="worker")
+        if configured_worker is not None
+        else None
     )
     use_configured_worker = configured_worker is not None and (
         provider is None or provider == configured_worker.provider

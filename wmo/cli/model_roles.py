@@ -114,20 +114,24 @@ def configured_role_configs(root: str) -> list[tuple[ModelRoleName, ProviderConf
         configured: ModelRole | None = getattr(models, role)
         if configured is None:
             continue
-        config = _model_config(configured, role=role)
-        spec = resolve_provider_model(config.kind, config.model)
-        resolved.append(
-            (
-                role,
-                config.model_copy(
-                    update={
-                        "model": spec.model_id,
-                        "model_type": config.model_type or spec.model_type,
-                    }
-                ),
-            )
-        )
+        resolved.append((role, configured_role_provider_config(configured, role=role)))
     return resolved
+
+
+def configured_role_provider_config(
+    configured: ModelRole,
+    *,
+    role: ModelRoleName,
+) -> ProviderConfig:
+    """Resolve one stored model role without inspecting unrelated role settings."""
+    config = _model_config(configured, role=role)
+    spec = resolve_provider_model(config.kind, config.model)
+    return config.model_copy(
+        update={
+            "model": spec.model_id,
+            "model_type": config.model_type or spec.model_type,
+        }
+    )
 
 
 def inherit_provider_connection(
@@ -150,14 +154,16 @@ def inherit_provider_connection(
     }
     selected_model = selected.model_type or selected.model
     configured_model = configured.model_type or configured.model
-    if selected_model == configured_model:
+    if selected_model.casefold() == configured_model.casefold():
         updates.update(
             {
                 field: value
-                for field in ("deployment", "reasoning_effort", "chat_max_tokens_field")
+                for field in ("deployment", "reasoning_effort")
                 if (value := getattr(configured, field)) is not None
             }
         )
+        if "chat_max_tokens_field" in configured.model_fields_set:
+            updates["chat_max_tokens_field"] = configured.chat_max_tokens_field
     return selected.model_copy(update=updates) if updates else selected
 
 

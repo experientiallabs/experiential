@@ -218,6 +218,35 @@ def test_build_uses_configured_worker_provider(patched_provider, tmp_path) -> No
     assert config.serve_provider_config().model_type == "gpt-5.4-mini"
 
 
+def test_build_does_not_validate_an_unrelated_model_role(
+    patched_provider: None, tmp_path: Path
+) -> None:
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="openai", model="gpt-5.4-mini")
+    settings.models.judge = ModelRole(provider="bogus", model="unused")
+    save_settings(settings, root)
+
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "valid-worker",
+            "--file",
+            _traces_file(tmp_path),
+            "--fidelity",
+            "low",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = load_config(root / "models" / "valid-worker")
+    assert config.serve_provider is ProviderKind.OPENAI
+
+
 def test_build_explicit_model_keeps_configured_azure_connection(
     patched_provider: None, tmp_path: Path
 ) -> None:
