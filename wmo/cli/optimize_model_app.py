@@ -443,6 +443,14 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         _console.print("\ndry run: nothing was run and nothing was spent")
         raise typer.Exit(0)
 
+    manifest = _migrate_legacy_sweep_fingerprint(
+        manifest,
+        decisions=decisions,
+        paths=paths,
+        plan=plan,
+        pool_file=Path(pool_file),
+    )
+
     # One throwaway embedding before anything is bought, and only when a fit will actually happen:
     # `--embedder auto` turns the mere presence of AZURE_OPENAI_* into a network dependency, and
     # those variables routinely point at a resource that serves chat but hosts no embedding
@@ -656,6 +664,10 @@ def _plan_stages(
     """
     decisions: list[StageDecision] = []
     running: Stage | None = None
+    sweep_record = manifest.record_for(Stage.SWEEP)
+    complete_sweep_identity = _matrix_has_complete_sweep_identity(
+        paths.matrix
+    ) or _sweep_record_has_content_identity(sweep_record)
     for stage in stages:
         if stage is Stage.PREFLIGHT:
             continue
@@ -679,6 +691,7 @@ def _plan_stages(
             baseline=baseline,
             cost_quality=cost_quality,
             allow_uneven=allow_uneven,
+            complete_sweep_identity=complete_sweep_identity,
         )
         decision = decide_stage(
             stage,
@@ -769,6 +782,7 @@ def _live_inputs(
     baseline: str | None,
     cost_quality: float,
     allow_uneven: bool,
+    complete_sweep_identity: bool,
 ) -> _StageInputs:
     """What `stage` would consume and produce right now, read off the filesystem."""
     match stage:
@@ -777,7 +791,7 @@ def _live_inputs(
                 fingerprint=_sweep_fingerprint(
                     plan,
                     pool_file,
-                    complete_identity=_matrix_has_complete_sweep_identity(paths.matrix),
+                    complete_identity=complete_sweep_identity,
                 ),
                 artifact=paths.matrix,
                 artifact_identity=file_sha256(paths.matrix),
@@ -882,6 +896,64 @@ def _sweep_fingerprint(
             }
         )
     return fingerprint
+
+
+_SWEEP_CONTENT_IDENTITY_KEYS = frozenset(
+    {"scenario_content", "tools_hint", "corpus", "world_model", "history_chars"}
+)
+
+
+def _sweep_record_has_content_identity(record: StageRecord | None) -> bool:
+    """Whether a sweep record already pins the post-upgrade measurement inputs."""
+    return record is not None and _SWEEP_CONTENT_IDENTITY_KEYS <= record.fingerprint.keys()
+
+
+def _migrate_legacy_sweep_fingerprint(
+    manifest: RunManifest,
+    *,
+    decisions: list[StageDecision],
+    paths: _RunPaths,
+    plan: SweepPlan,
+    pool_file: Path,
+) -> RunManifest:
+    """Snapshot today's inputs after one free skip of a legacy completed matrix.
+
+    A pre-identity matrix remains valid input to fit/report, and its existing manifest proves the
+    paid sweep is current under the old fingerprint. That grants exactly one compatibility skip.
+    Recording the expanded fingerprint now means future instruction, tool, corpus, model, or
+    history changes rerun the sweep instead of trusting that legacy exception forever. The matrix
+    itself stays identity-less, so direct active resume still refuses to merge unknown paid rows.
+    """
+    sweep_decision = next(
+        (decision for decision in decisions if decision.stage is Stage.SWEEP),
+        None,
+    )
+    record = manifest.record_for(Stage.SWEEP)
+    if (
+        sweep_decision is None
+        or sweep_decision.will_run
+        or record is None
+        or _matrix_has_complete_sweep_identity(paths.matrix)
+        or _sweep_record_has_content_identity(record)
+    ):
+        return manifest
+    migrated = record.model_copy(
+        update={"fingerprint": _sweep_fingerprint(plan, pool_file, complete_identity=True)}
+    )
+    updated = manifest.model_copy(
+        update={
+            "stages": [
+                migrated if existing.stage is Stage.SWEEP else existing
+                for existing in manifest.stages
+            ]
+        }
+    )
+    updated.save(paths.manifest)
+    _console.print(
+        "  recorded current content identity for the legacy matrix; this invocation keeps the "
+        "sweep free, and later measurement-input changes will re-run it"
+    )
+    return updated
 
 
 def _matrix_has_complete_sweep_identity(path: Path) -> bool:

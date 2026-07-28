@@ -454,6 +454,33 @@ def test_a_legacy_identityless_matrix_stays_usable_when_the_sweep_is_skipped(
     assert len(world_model.tasks) == episodes_after_first
     assert _says(again.output, "matrix.json is current")
     assert OutcomeMatrix.load(matrix_path).sweep_identity is None
+    assert _says(again.output, "recorded current content identity for the legacy matrix")
+    migrated = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    migrated_sweep = migrated.record_for(Stage.SWEEP)
+    assert migrated_sweep is not None
+    assert {
+        "scenario_content",
+        "tools_hint",
+        "corpus",
+        "world_model",
+        "history_chars",
+    } <= migrated_sweep.fingerprint.keys()
+
+    changed_corpus = [
+        trace.model_copy(
+            update={
+                "steps": [
+                    step.model_copy(update={"task": f"{step.task} revised"}) for step in trace.steps
+                ]
+            }
+        )
+        for trace in _corpus()
+    ]
+    write_traces_jsonl(changed_corpus, root / "models" / "support" / TRACES_FILENAME)
+    changed = _run(tmp_path, root, "--yes")
+    assert changed.exit_code == 0, changed.output
+    assert len(world_model.tasks) > episodes_after_first
+    assert _says(changed.output, "scenario_content changed")
 
 
 def test_force_from_sweep_redoes_the_sweep_and_everything_after_it(

@@ -82,6 +82,10 @@ class WorldModel:
         self._grounder = grounder
         self._ground_budget = ground_budget
         self._ground_spent: dict[str, int] = {}  # session id -> live web searches used
+        # Serving persists successful grounding so later sessions can reuse it. Evaluation
+        # freezes this alongside index enrichment: otherwise one cell mutates the knowledge
+        # rendered into later cells and changes the artifact identity during its own sweep.
+        self._persist_grounding_cache = True
         self._verify = verify
         # Online index enrichment (DreamGym-style): serving sessions feed generated steps back
         # into retrieval. Evaluation rollouts must NOT (see `frozen`), or one episode's
@@ -259,19 +263,24 @@ class WorldModel:
 
     @contextmanager
     def frozen(self) -> Iterator[WorldModel]:
-        """Suspend online index enrichment for the duration of the block.
+        """Suspend online artifact mutation for the duration of the block.
 
         Evaluation rollouts (scenario verification, score matrices) step the world model many
         times; if those generated steps were indexed, later episodes would retrieve earlier
-        episodes' predictions instead of only the built trace corpus — results would depend on
-        evaluation order. Serving resumes enrichment when the block exits.
+        episodes' predictions instead of only the built trace corpus. Successful grounding must
+        not enter `grounded.md` either, because later cells would observe an earlier cell's cache
+        and the sweep would mutate the knowledge tree its plan identity hashes. Serving resumes
+        both persistence paths when the block exits.
         """
-        previous = self._enrich_index
+        previous_enrichment = self._enrich_index
+        previous_grounding_cache = self._persist_grounding_cache
         self._enrich_index = False
+        self._persist_grounding_cache = False
         try:
             yield self
         finally:
-            self._enrich_index = previous
+            self._enrich_index = previous_enrichment
+            self._persist_grounding_cache = previous_grounding_cache
 
     def render_step_prompt(self, session_id: str, action: Action) -> str:
         """Assemble the exact (system + user) env prompt `step` would send, without calling the LLM.
@@ -522,7 +531,7 @@ class WorldModel:
         results_text = render_grounding(results)
         # Cache HITS only: persisting "(no results)" would negative-cache a transient failure
         # into the artifact forever (lookup_grounded returns it as a truthy hit).
-        if results and self._knowledge is not None:
+        if results and self._knowledge is not None and self._persist_grounding_cache:
             self._knowledge.append_grounded(query, results_text)
         return results_text
 

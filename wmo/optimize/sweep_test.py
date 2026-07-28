@@ -19,6 +19,9 @@ import pytest
 
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Step, Trace
+from wmo.engine.grounding import GroundingResult
+from wmo.engine.knowledge import KnowledgeBase
+from wmo.engine.world_model import WorldModel
 from wmo.env.closed_loop import CellKey
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.compression import CompressionConfig
@@ -47,13 +50,13 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.providers.pool import PoolEntry, load_pool
+from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from wmo.engine.world_model import WorldModel
     from wmo.env.base import Env
 
 
@@ -459,6 +462,107 @@ def candidates(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
     return built
+
+
+class _SuccessfulGrounder:
+    """A successful grounding backend whose cache writes would change plan identity."""
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def ground(self, query: str) -> list[GroundingResult]:
+        self.queries.append(query)
+        return [
+            GroundingResult(
+                title="package fact",
+                url="https://example.test/package",
+                snippet=f"facts about {query}",
+            )
+        ]
+
+
+class _GroundingEnv(_StubEnv):
+    """A scored env that exercises the real frozen world's successful grounding path."""
+
+    def __init__(self, world_model: WorldModel) -> None:
+        super().__init__(0.10)
+        self._world_model = world_model
+        self._session_id: str | None = None
+
+    def reset(self, task: str | None = None, seed_state: object | None = None) -> EnvState:
+        session = self._world_model.new_session(task=task)
+        self._session_id = session.id
+        assert self._world_model._ground(session.id, "package facts") is not None  # noqa: SLF001
+        return session.state
+
+    def close(self) -> None:
+        if self._session_id is not None:
+            self._world_model.end_session(self._session_id)
+            self._session_id = None
+
+
+def test_successful_grounding_cannot_stale_its_own_completed_sweep(
+    tmp_path: Path,
+    candidates: list[str],
+) -> None:
+    model_dir = _model_dir(tmp_path)
+    config = resolve_config(model_dir).model_copy(update={"knowledge": True, "grounder": "brave"})
+    save_config(config, model_dir)
+    knowledge = KnowledgeBase(model_dir / "knowledge")
+    knowledge.write_file("rules.md", "- use package facts when needed")
+    pool = load_pool(_pool_file(tmp_path))
+
+    def build_plan() -> SweepPlan:
+        return plan_sweep(
+            model_dir=model_dir,
+            config=resolve_config(model_dir),
+            pool=pool,
+            out_path=tmp_path / "matrix.json",
+            traces_file=None,
+            scenarios=1,
+            episodes=1,
+            max_steps=1,
+            assume_input_tokens=2000,
+            assume_output_tokens=250,
+        )
+
+    grounder = _SuccessfulGrounder()
+    retriever = EmbeddingRetriever(HashingEmbedder(dim=64))
+    retriever.index([])
+    world_model = WorldModel(
+        _DoneProvider(config.serve_provider_config()),
+        retriever,
+        telemetry_root=tmp_path / "telemetry",
+        knowledge=knowledge,
+        grounder=grounder,
+    )
+    plan = build_plan()
+    first = execute_sweep(
+        plan,
+        world_model=world_model,
+        env_factory=lambda: _GroundingEnv(world_model),
+        runs_dir=tmp_path / "runs",
+    )
+    assert first.matrix.sweep_identity == plan.identity
+    assert grounder.queries == ["package facts"]
+    assert knowledge.lookup_grounded("package facts") is None
+
+    exact_rerun = build_plan()
+    assert exact_rerun.identity == plan.identity
+    built_before = len(candidates)
+
+    def no_new_env() -> Env:
+        raise AssertionError("an exact completed rerun must not execute an environment")
+
+    resumed = execute_sweep(
+        exact_rerun,
+        world_model=world_model,
+        env_factory=no_new_env,
+        runs_dir=tmp_path / "runs",
+    )
+    assert resumed.resumed_cells == 1
+    assert len(candidates) == built_before
+    assert grounder.queries == ["package facts"]
 
 
 class _SlowEnv(_StubEnv):
