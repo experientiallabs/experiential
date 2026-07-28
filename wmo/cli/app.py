@@ -250,6 +250,42 @@ def config_telemetry(
     _console.print(f"telemetry {state} ({settings_path(root)})")
 
 
+def _azure_worker_deployment(
+    kind: ProviderKind, model: str, deployment: str | None, *, interactive: bool
+) -> str | None:
+    """Return Azure's explicitly named worker deployment, prompting only in the picker.
+
+    Azure sends a deployment name as the request model. The base model type is catalog metadata,
+    not a route an Azure resource necessarily exposes, so a command must never turn it into a
+    deployment name on the user's behalf.
+    """
+    if kind is not ProviderKind.AZURE_OPENAI:
+        return deployment
+    if deployment is not None:
+        chosen = deployment.strip()
+        if chosen:
+            return chosen
+    if not interactive:
+        raise typer.BadParameter(
+            "Azure deployment names are chosen by the resource owner and cannot be inferred "
+            f"from model {escape(model)}; pass --deployment <deployment>, for example "
+            f"`wmo providers set --provider azure --model {escape(model)} "
+            "--deployment <deployment>`"
+        )
+    while True:
+        try:
+            chosen = _console.input(
+                f"[bold]Azure deployment serving {escape(model)}[/bold]: "
+            ).strip()
+        except EOFError:
+            raise typer.Abort() from None
+        if chosen:
+            return chosen
+        _console.print(
+            "[red]an Azure deployment is required; it cannot be inferred from the model type[/red]"
+        )
+
+
 def _worker_provider_config(
     provider: str,
     model: str,
@@ -266,7 +302,9 @@ def _worker_provider_config(
     if config.kind is ProviderKind.AZURE_OPENAI:
         config = config.model_copy(
             update={
-                "deployment": deployment or config.model_type or config.model,
+                "deployment": _azure_worker_deployment(
+                    config.kind, config.model_type or config.model, deployment, interactive=False
+                ),
                 "api_version": api_version or "2024-05-01-preview",
             }
         )
@@ -279,7 +317,11 @@ def providers_set(
     model: str = typer.Option(None, "--model", help="Canonical model type for the worker."),
     region: str = typer.Option(None, "--region", help="AWS region for Bedrock."),
     endpoint: str = typer.Option(None, "--endpoint", help="OpenAI-compatible API endpoint."),
-    deployment: str = typer.Option(None, "--deployment", help="Azure deployment name."),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        help="Azure deployment name (required when --provider azure).",
+    ),
     api_version: str = typer.Option(None, "--api-version", help="Azure API version."),
     pool: str = typer.Option(
         None,
@@ -318,8 +360,10 @@ def providers_set(
     ones already registered.
 
     Scripts keep the old contract: with `--provider` and `--model` both given, nothing is
-    prompted. Registering non-interactively is `--pool-model <id>`, repeated per model, with
-    `--input-per-mtok`/`--output-per-mtok` when the model has no published price.
+    prompted. Azure scripts must also name `--deployment`, because Azure resources choose that
+    route name independently of the base model type. Registering non-interactively is
+    `--pool-model <id>`, repeated per model, with `--input-per-mtok`/`--output-per-mtok` when the
+    model has no published price.
     """
     if tier is not None and tier not in pool_registry.TIERS:
         raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")
@@ -337,6 +381,31 @@ def providers_set(
     existing = load_settings_or_abort(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:
+        deployment_was_flagged = deployment is not None and bool(deployment.strip())
+
+        def verify_selected_worker(selected: ProviderConfig) -> VerifyResult:
+            """Verify the picker choice after Azure's operator-owned route is known."""
+            nonlocal deployment
+            if selected.kind is ProviderKind.AZURE_OPENAI:
+                deployment = _azure_worker_deployment(
+                    selected.kind,
+                    selected.model_type or selected.model,
+                    deployment if deployment_was_flagged else None,
+                    interactive=True,
+                )
+            return verify_all(
+                [
+                    _worker_provider_config(
+                        selected.kind.value,
+                        selected.model_type or selected.model,
+                        selected.region,
+                        endpoint=endpoint,
+                        deployment=deployment,
+                        api_version=api_version,
+                    )
+                ]
+            )[0]
+
         provider, model, region = select_provider_and_model(
             _console,
             lambda text: _console.input(text),
@@ -345,18 +414,7 @@ def providers_set(
             default_model=model or (existing.model if existing else None),
             default_region=region or (existing.region if existing else None),
             interactive=True,
-            check=lambda cfg: verify_all(
-                [
-                    _worker_provider_config(
-                        cfg.kind.value,
-                        cfg.model_type or cfg.model,
-                        cfg.region,
-                        endpoint=endpoint,
-                        deployment=deployment,
-                        api_version=api_version,
-                    )
-                ]
-            )[0],
+            check=verify_selected_worker,
         )
     if provider is None or model is None:
         raise typer.BadParameter(

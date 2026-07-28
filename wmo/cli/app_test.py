@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from typing import cast
 import pytest
 import typer
 from pydantic import ValidationError
+from rich.console import Console
 from typer.testing import CliRunner
 
 from wmo.cli import app, pool_registry
@@ -1247,13 +1249,17 @@ def test_providers_set_rejects_an_unknown_tier(
     assert "frontier, open" in result.output
 
 
-def test_providers_set_never_guesses_an_azure_deployment_for_the_pool(
+def test_providers_set_requires_an_explicit_azure_worker_deployment(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The worker config fills an Azure deployment in from the model id when none was given; a
-    # pool entry must not inherit that guess, because Azure sends the deployment as the request
-    # model and a guessed name addresses a route that does not exist.
-    _accept_every_provider(monkeypatch)
+    # Azure sends the deployment as the request model. A script cannot discover the operator's
+    # deployment name, so fail before it pings a guessed route or writes a broken worker role.
+    checked: list[ProviderConfig] = []
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: checked.extend(configs) or [],
+    )
     root = tmp_path / ".wmo"
 
     result = runner.invoke(
@@ -1265,19 +1271,68 @@ def test_providers_set_never_guesses_an_azure_deployment_for_the_pool(
             "azure",
             "--model",
             "gpt-5.5",
-            "--pool-model",
-            "gpt-5.5",
             "--root",
             str(root),
         ],
     )
 
     assert result.exit_code != 0
-    assert "azure needs --deployment" in result.output
+    assert "cannot be inferred" in result.output
+    assert _squashed(
+        "wmo providers set --provider azure --model gpt-5.5 --deployment <deployment>"
+    ) in _squashed(result.output)
+    assert checked == []
+    assert not (root / "settings.toml").exists()
     assert not (root / "pool.toml").exists()
-    # The worker role is still saved with its derived deployment: only the pool is strict.
+
+
+def test_providers_set_prompts_for_an_azure_deployment_before_it_verifies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The terminal picker asks for a route before its first Azure request."""
+    prompts: list[str] = []
+    answers = iter(["", "chat-prod"])
+    console = SimpleNamespace(
+        is_terminal=True,
+        input=lambda prompt: prompts.append(prompt) or next(answers),
+        print=lambda *args, **kwargs: None,
+    )
+    checked: list[ProviderConfig] = []
+    monkeypatch.setattr(cli_app_module, "_console", console)
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: (
+            checked.extend(configs)
+            or [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
+        ),
+    )
+
+    def choose_provider(
+        _console: Console,
+        _ask: Callable[[str], str],
+        _ask_secret: Callable[[str], str],
+        **kwargs: object,
+    ) -> tuple[str, str, str | None]:
+        selected = ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI, model_type="gpt-5.5", model="gpt-5.5"
+        )
+        check = cast(Callable[[ProviderConfig], VerifyResult], kwargs["check"])
+        assert check(selected).ok
+        return "azure", "gpt-5.5", None
+
+    monkeypatch.setattr(cli_app_module, "select_provider_and_model", choose_provider)
+    monkeypatch.setattr(cli_app_module, "_register_pool_models", lambda **kwargs: None)
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(app, ["providers", "set", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert len(prompts) == 2
+    assert all("Azure deployment serving gpt-5.5" in prompt for prompt in prompts)
+    assert checked[0].deployment == "chat-prod"
     worker = load_settings(root).models.worker
-    assert worker is not None and worker.deployment == "gpt-5.5"
+    assert worker is not None and worker.deployment == "chat-prod"
 
 
 def test_providers_set_registers_a_named_azure_deployment(
