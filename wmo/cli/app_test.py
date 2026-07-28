@@ -3094,7 +3094,7 @@ def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # no
     from wmo.config.settings import ProjectSettings
 
     monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
-    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
     assert summary is worker
     assert worker is judge
@@ -3109,7 +3109,7 @@ def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch
     monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
     monkeypatch.setattr(
         cli_app_module,
-        "load_settings",
+        "load_settings_or_abort",
         lambda: ProjectSettings(
             models=ModelsSettings(worker=ModelRole(provider="openai", model="gpt-5.4-mini"))
         ),
@@ -3133,7 +3133,7 @@ def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None
 def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:  # noqa: ANN001
     from wmo.config.settings import ProjectSettings
 
-    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     config = cli_app_module._worker_role_provider_config(None, None, None)
     assert config.kind is ProviderKind.BEDROCK
     assert config.model == "us.anthropic.claude-opus-4-8"
@@ -3144,7 +3144,7 @@ def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str | No
 
     monkeypatch.setattr(
         cli_app_module,
-        "load_settings",
+        "load_settings_or_abort",
         lambda: ProjectSettings(
             models=ModelsSettings(
                 worker=ModelRole(
@@ -3237,7 +3237,7 @@ def test_worker_role_provider_config_provider_flag_uses_that_backends_flagship(
 
     monkeypatch.setattr(
         cli_app_module,
-        "load_settings",
+        "load_settings_or_abort",
         lambda: ProjectSettings(
             models=ModelsSettings(worker=ModelRole(provider="bedrock", model="claude-sonnet-4-6"))
         ),
@@ -3256,7 +3256,7 @@ def test_worker_role_provider_config_demands_a_model_for_a_catalog_less_provider
     # weights path — so the fix is to say which model, not to guess one.
     from wmo.config.settings import ProjectSettings
 
-    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
 
     with pytest.raises(typer.BadParameter) as excinfo:
         cli_app_module._worker_role_provider_config("openrouter", None, None)
