@@ -32,13 +32,12 @@ rationale no longer binds.
   lens (savings-vs-anchor per rung, effective-cost per rung, dial curve) on a second
   dataset keyed by the same scorecard fields.
 
-## Status
+## Status: COMPLETE (2026-07-28) - see findings.md
 
-- Corpus: local copy of the HF bundle in sync
-  (`packages/environment-capture/terminal-tasks/traces.otel.jsonl`). Distinct prompts
-  pre-measured per the tau lesson: 280, so the 20-scenario test band exists with room.
-- World model: `wmo build --fidelity medium` queued behind the grid-c2 repair (shared
-  Bedrock bucket); forecast $3-9 against tau's actual $8.97 medium rebuild.
-- Sweep: sized by `wmo optimize model --dry-run` after the build; >$50 projection goes to
-  DECISIONS as its own ask.
-- Chat program spend so far: $0.
+Pipeline ran end to end: build ($6.80, fidelity 0.808) -> identity arm ($49.90, 494/520)
+-> llmlingua2 arm ($64.14, 427/520, achieved ratio 0.777 @ dial 0.5) -> truncate arm
+(partial 149/520, Bedrock outage; $30.22 incl. a written-off re-buy) -> fit/tune/report ->
+figures through `common/build_corners.py --lens tb2-cost`. Total $151.06. Headline:
+model selection is the whole win here (opus-5 -63% cost at +6.7pt, CI excludes zero;
+routing correctly degenerates to best-single sonnet-5), and the compaction cost-inversion
+reproduces. Dataset: arm matrices preserved at main checkout `.wmo/jt/tb2cost/<arm>/`.

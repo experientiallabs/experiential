@@ -197,13 +197,23 @@ class FigureSpec(BaseModel):
 
 
 class LensSpec(BaseModel):
-    """A corner's declarative rendering request: which figures, into which subdirectory."""
+    """A corner's declarative rendering request: which figures, into which subdirectory.
+
+    A lens may point at a different arm-matrix root (`dataset_root`, grid dir layout:
+    `<root>/<arm>/matrix.json`) with its own provenance labels; the DEFAULT is the live tau
+    grid cohort, so existing lenses are unchanged. This is the tb2-cost sibling's seam
+    (DECISIONS 2026-07-28 lens-needs entry): same computation, second dataset, corpora
+    never blended because every record carries its dataset label.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     name: str
     corner_dir: str  # subdirectory of corners/ that owns the output
     figures: tuple[FigureSpec, ...]
+    dataset_root: str | None = None  # default: the live tau grid cohort (data.grid_dir)
+    dataset_label: str = "tau-bench"
+    judge_label: str | None = None  # default: GRID_JUDGE (the tau cohort's pin)
 
 
 class ConfigRecord(BaseModel):
@@ -253,6 +263,8 @@ class CornersDataset(BaseModel):
     """
 
     anchor_model: str
+    dataset_label: str = "tau-bench"
+    judge_label: str = GRID_JUDGE
     best_single: str | None = None
     records: list[ConfigRecord] = []
     routed: list[RoutedRecord] = []
@@ -265,13 +277,15 @@ class CornersDataset(BaseModel):
     notes: list[str] = []
 
 
-def _condition(model: str, optimizer: str) -> ConditionLabel:
+def _condition(
+    model: str, optimizer: str, *, dataset: str = "tau-bench", judge: str = GRID_JUDGE
+) -> ConditionLabel:
     return ConditionLabel(
         base_model=model,
         optimizer=optimizer,
-        dataset="tau-bench",
+        dataset=dataset,
         split="wm-test-band",
-        judge=GRID_JUDGE,
+        judge=judge,
         provenance="wm_simulated",
     )
 
@@ -292,12 +306,14 @@ def _compressor_overheads(rows: list) -> list[RowOverhead]:
     ]
 
 
-def _config_arm(snapshot: ArmSnapshot, model: str) -> Arm:
+def _config_arm(
+    snapshot: ArmSnapshot, model: str, *, dataset: str = "tau-bench", judge: str = GRID_JUDGE
+) -> Arm:
     rows = rows_for_model(snapshot.matrix, model)
     optimizer = "none" if snapshot.name == IDENTITY_ARM else f"compaction({snapshot.name})"
     return Arm(
         name=f"{model} [{snapshot.name}]",
-        condition=_condition(model, optimizer),
+        condition=_condition(model, optimizer, dataset=dataset, judge=judge),
         rows=rows,
         overheads=_compressor_overheads(rows),
     )
@@ -315,14 +331,26 @@ def _best_single(snapshot: ArmSnapshot) -> str | None:
     return max(means, key=lambda m: means[m]) if means else None
 
 
-def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
-    """Load once, aggregate once. Every figure below renders from this object."""
-    snapshots = all_arm_snapshots()
+def build_dataset(
+    anchor_model: str = DEFAULT_ANCHOR,
+    *,
+    root: Path | None = None,
+    dataset_label: str = "tau-bench",
+    judge: str = GRID_JUDGE,
+) -> CornersDataset:
+    """Load once, aggregate once. Every figure below renders from this object.
+
+    `root`/`dataset_label`/`judge` come from the lens spec (default: the live tau cohort),
+    so a second corpus renders through the SAME computation with its own provenance labels.
+    """
+    snapshots = all_arm_snapshots(root=root)
     present = {s.name for s in snapshots}
     from data import GRID_ARMS  # local: keeps the module-level import list honest
 
     dataset = CornersDataset(
         anchor_model=anchor_model,
+        dataset_label=dataset_label,
+        judge_label=judge,
         pending=[arm for arm in GRID_ARMS if arm not in present],
         status="; ".join(f"{s.name}: {s.status}" for s in snapshots)
         or "no grid data on disk yet",
@@ -338,7 +366,7 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
         return dataset
     anchor = Arm(
         name=f"{anchor_model} [anchor]",
-        condition=_condition(anchor_model, "none"),
+        condition=_condition(anchor_model, "none", dataset=dataset_label, judge=judge),
         rows=anchor_rows,
     )
     dataset.best_single = _best_single(identity)
@@ -346,9 +374,9 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
     if dataset.best_single is not None:
         best_anchor = Arm(
             name=f"{dataset.best_single} [best-single anchor]",
-            condition=_condition(dataset.best_single, "none").replace(
-                notes="best-single anchor"
-            ),
+            condition=_condition(
+                dataset.best_single, "none", dataset=dataset_label, judge=judge
+            ).replace(notes="best-single anchor"),
             rows=rows_for_model(identity.matrix, dataset.best_single),
         )
 
@@ -361,7 +389,7 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
                 dataset.notes.append(f"{key}: no scored rows yet, skipped")
                 continue
             try:
-                config = _config_arm(snapshot, model)
+                config = _config_arm(snapshot, model, dataset=dataset_label, judge=judge)
             except ValueError as exc:
                 # A mid-repair snapshot can hold a cell twice (original + retried row).
                 dataset.notes.append(f"{key}: rows not usable yet ({exc})")
@@ -404,7 +432,10 @@ def build_dataset(anchor_model: str = DEFAULT_ANCHOR) -> CornersDataset:
             dataset.records.append(record)
 
     for snapshot in snapshots:
-        _routed_records(snapshot, anchor, best_anchor, dataset)
+        _routed_records(
+            snapshot, anchor, best_anchor, dataset, root=root, dataset_label=dataset_label,
+            judge=judge,
+        )
 
     try:
         dataset.teacher = select_teacher(identity.matrix)
@@ -427,6 +458,10 @@ def _routed_records(
     anchor: Arm,
     best_anchor: Arm | None,
     dataset: CornersDataset,
+    *,
+    root: Path | None = None,
+    dataset_label: str = "tau-bench",
+    judge: str = GRID_JUDGE,
 ) -> None:
     """Replay this arm's fitted policy (when one exists) at the five dial detents.
 
@@ -438,7 +473,7 @@ def _routed_records(
     """
     from data import grid_dir  # matches all_arm_snapshots' default root
 
-    policy_path = grid_dir() / snapshot.name / "policy.json"
+    policy_path = (root or grid_dir()) / snapshot.name / "policy.json"
     if not policy_path.exists():
         dataset.pending.append(f"routed rung [{snapshot.name}]: no policy.json yet")
         return
@@ -484,6 +519,8 @@ def _routed_records(
                     "pool(routed)",
                     f"routing(knn dial={dial:g})"
                     + ("" if snapshot.name == IDENTITY_ARM else f"+compaction({snapshot.name})"),
+                    dataset=dataset_label,
+                    judge=judge,
                 ),
                 rows=rows,
                 overheads=overheads,
@@ -711,7 +748,8 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
     ax.set_ylabel(f"quality, points vs {dataset.anchor_model} (mean reward x 100)")
     footnote(
         fig,
-        f"measured · wm_simulated · judge {GRID_JUDGE} · anchor {dataset.anchor_model} "
+        f"measured · wm_simulated · {dataset.dataset_label} · judge {dataset.judge_label} "
+        f"· anchor {dataset.anchor_model} "
         f"(identity arm) · effective cost = cache-adjusted provider spend + compressor "
         f"inference, per COMPLETED task, unscored spend excluded and reported "
         f"(wmo.optimize.scorecard) · compaction rungs are a measured tradeoff, not a "
@@ -752,7 +790,8 @@ def fig_cost_per_task(dataset: CornersDataset, spec: FigureSpec, out: Path) -> N
     ax.set_xlabel("cache-adjusted effective $ per completed task")
     footnote(
         fig,
-        f"measured · wm_simulated · judge {GRID_JUDGE} · dots colored by arm: identity "
+        f"measured · wm_simulated · {dataset.dataset_label} · judge {dataset.judge_label} "
+        f"· dots colored by arm: identity "
         f"blue, truncate purple, llmlingua2-endpoint red · scorecard accounting (unscored "
         f"spend excluded, reported in numbers.json) · quality and latency per config are in "
         f"numbers.json and the frontier chart · snapshot: {dataset.status}",
@@ -827,6 +866,8 @@ def dump_numbers(dataset: CornersDataset, lens: LensSpec) -> Path:
     out = CORNERS / lens.corner_dir / "numbers.json"
     payload = {
         "status": dataset.status,
+        "dataset": dataset.dataset_label,
+        "judge": dataset.judge_label,
         "pending_arms": dataset.pending,
         "anchor": dataset.anchor_model,
         "best_single": dataset.best_single,
@@ -932,7 +973,12 @@ def main() -> None:
 
     apply_style()
     lens = load_lens(args.lens)
-    dataset = build_dataset(anchor_model=args.anchor)
+    dataset = build_dataset(
+        anchor_model=args.anchor,
+        root=Path(lens.dataset_root).expanduser() if lens.dataset_root else None,
+        dataset_label=lens.dataset_label,
+        judge=lens.judge_label or GRID_JUDGE,
+    )
     out = render_lens(lens, dataset, args.out_dir)
     numbers = dump_numbers(dataset, lens)
     lines = [
