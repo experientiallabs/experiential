@@ -312,6 +312,53 @@ def test_provider_picker_collects_azure_deployment_before_verification() -> None
     assert deployment_prompt == len(prompts) - 1
 
 
+def test_provider_picker_reuses_saved_deployment_and_retains_it_across_retry() -> None:
+    """A project rerun can accept its saved deployment, including after a failed ping."""
+    console = Console(force_terminal=False, no_color=True, width=100)
+    answers = iter(
+        [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    )
+    verified: list[ProviderConfig] = []
+
+    def verify(config: ProviderConfig) -> VerifyResult:
+        verified.append(config)
+        return VerifyResult(
+            ok=len(verified) == 2,
+            kind=config.kind,
+            model=config.model,
+            detail="temporary failure",
+        )
+
+    provider, model, region, deployment = select_provider_and_model(
+        console,
+        _scripted_reader(list(answers)),
+        _scripted_reader([]),
+        default_provider="azure",
+        default_model="kimi-k2.6",
+        default_region=None,
+        default_deployment="prod-kimi",
+        default_deployment_model="kimi-k2.6",
+        ask_azure_deployment=True,
+        interactive=False,
+        check=verify,
+    )
+
+    assert (provider, model, region, deployment) == (
+        "azure",
+        "kimi-k2.6",
+        None,
+        "prod-kimi",
+    )
+    assert [config.deployment for config in verified] == ["prod-kimi", "prod-kimi"]
+
+
 def test_build_wizard_select_by_number() -> None:
     console = Console(force_terminal=False, no_color=True, width=100)
     # Provider/model/embedder are numbered pickers; choosing by index must work. Pick anthropic (2),

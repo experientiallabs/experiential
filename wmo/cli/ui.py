@@ -239,6 +239,7 @@ def select_provider_and_model(
     default_model: str | None,
     default_region: str | None,
     default_deployment: str | None = None,
+    default_deployment_model: str | None = None,
     ask_azure_deployment: bool = False,
     interactive: bool,
     check: Callable[[ProviderConfig], VerifyResult],
@@ -257,6 +258,7 @@ def select_provider_and_model(
     # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
     notes = {p: creds_note(p) for p in with_creds}
     provider_default = default_provider or (with_creds[0] if with_creds else None)
+    retry_deployment: tuple[str, str] | None = None
     while True:
         provider = _select(
             console,
@@ -283,13 +285,22 @@ def select_provider_and_model(
             region = _prompt_text(console, ask, "AWS region", region_default) or None
         deployment = None
         if provider == "azure" and ask_azure_deployment:
+            deployment_default = (
+                retry_deployment[1]
+                if retry_deployment is not None and retry_deployment[0] == model
+                else (
+                    default_deployment
+                    if default_deployment_model is None or default_deployment_model == model
+                    else None
+                )
+            )
             while not deployment:
                 deployment = (
                     _prompt_text(
                         console,
                         ask,
                         f"Azure deployment serving {model}",
-                        default_deployment,
+                        deployment_default,
                     )
                     or None
                 )
@@ -317,6 +328,7 @@ def select_provider_and_model(
             f"  [red]✗ {provider} ({escape(model)}) failed[/red]: {escape(ping.detail or '')}"
         )
         console.print("  [yellow]fix the credentials or pick a different provider/model[/yellow]")
+        retry_deployment = (model, deployment) if deployment is not None else None
         provider_default = provider
 
 

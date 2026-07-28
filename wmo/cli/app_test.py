@@ -1085,6 +1085,47 @@ def test_providers_set_requires_an_operator_named_azure_deployment(
     assert load_settings(root).models.worker is None
 
 
+def test_providers_set_offers_the_saved_azure_deployment_on_interactive_rerun(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bare rerun carries the configured model's deployment into the picker."""
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(
+        provider="azure",
+        model="kimi-k2.6",
+        deployment="prod-kimi",
+    )
+    save_settings(settings, root)
+    offered: list[tuple[str | None, str | None]] = []
+
+    def select(*_args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        offered.append((kwargs["default_deployment"], kwargs["default_deployment_model"]))
+        return "azure", "kimi-k2.6", None, kwargs["default_deployment"]
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "_console",
+        SimpleNamespace(is_terminal=True, print=lambda *_: None),
+    )
+    monkeypatch.setattr(cli_app_module, "select_provider_and_model", select)
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: [
+            VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs
+        ],
+    )
+    monkeypatch.setattr(cli_app_module, "_register_pool_models", lambda **_kwargs: None)
+
+    result = runner.invoke(app, ["providers", "set", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert offered == [("prod-kimi", "kimi-k2.6")]
+    worker = load_settings(root).models.worker
+    assert worker is not None and worker.deployment == "prod-kimi"
+
+
 def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub both live pings so `providers set` reaches, and gets through, pool registration.
 

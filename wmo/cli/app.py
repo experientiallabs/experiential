@@ -337,6 +337,9 @@ def providers_set(
     existing = load_settings_or_abort(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:
+        existing_azure_deployment = (
+            existing.deployment if existing is not None and existing.provider == "azure" else None
+        )
         provider, model, region, deployment = select_provider_and_model(
             _console,
             lambda text: _console.input(text),
@@ -344,7 +347,10 @@ def providers_set(
             default_provider=provider or (existing.provider if existing else None),
             default_model=model or (existing.model if existing else None),
             default_region=region or (existing.region if existing else None),
-            default_deployment=deployment,
+            default_deployment=deployment or existing_azure_deployment,
+            default_deployment_model=(
+                existing.model if deployment is None and existing_azure_deployment else None
+            ),
             ask_azure_deployment=True,
             interactive=True,
             check=lambda cfg: verify_all(
