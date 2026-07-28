@@ -25,7 +25,6 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
 
 from wmo.core.types import Action, JsonObject, Observation
 from wmo.harness import e2b_sandbox as e2b_sandbox_module
@@ -60,6 +59,7 @@ from wmo.harness.runtime import (
 from wmo.harness.skills import Skill, SkillLibrary
 from wmo.harness.tools import SUBMIT, TOOL_REGISTRY, ToolSpec
 from wmo.providers.base import UNPARSED_TOOL_CALLS_KEY
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 _Event = tuple[str | None, str | None, str | None]
 _PID = 4242

@@ -28,8 +28,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
-from llm_waterfall import ChatRequest, ChatResponse
-
 from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
 from wmo.harness.environment import AgentEnvironment, is_env_action
 from wmo.harness.runtime import (
@@ -43,6 +41,7 @@ from wmo.harness.runtime import (
 from wmo.harness.skills import SkillLibrary
 from wmo.harness.tools import READ_SKILL, ToolSpec
 from wmo.providers.base import ContextWindowProvider, ToolCallingProvider
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 logger = logging.getLogger(__name__)
 

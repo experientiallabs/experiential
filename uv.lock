@@ -8,13 +8,6 @@ resolution-markers = [
     "python_full_version < '3.14' and sys_platform != 'win32'",
 ]
 
-[manifest]
-members = [
-    "environment-capture",
-    "llm-waterfall",
-    "world-model-optimizer",
-]
-
 [[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
@@ -775,8 +768,12 @@ wheels = [
 
 [[package]]
 name = "environment-capture"
-version = "0.1.1"
-source = { editable = "packages/environment-capture" }
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/8b/03df69f1aa8187066e9665374d5b377c87f06b2a2110ec6f6b950dfdc476/environment_capture-0.1.0.tar.gz", hash = "sha256:6eb638c7b20ff80af7062a305063baab204c6aa510e49e2de901529763fea094", size = 76165, upload-time = "2026-07-07T08:57:19.224Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/46/407618f5a6cf83d61cec57a3016aa308d63f3afecb9c6f2da01d9636d177/environment_capture-0.1.0-py3-none-any.whl", hash = "sha256:0f21614efd8c5a26eff29aebc5436e46a0463d42813252a93dca6b7dcb698516", size = 99215, upload-time = "2026-07-07T08:57:16.997Z" },
+]
 
 [package.optional-dependencies]
 bedrock = [
@@ -785,13 +782,6 @@ bedrock = [
 fetch = [
     { name = "huggingface-hub" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.34" },
-    { name = "huggingface-hub", marker = "extra == 'fetch'", specifier = ">=0.23" },
-]
-provides-extras = ["bedrock", "fetch"]
 
 [[package]]
 name = "fastapi"
@@ -1446,56 +1436,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0d/7f/b48d88cb32055b4ba7e51cd67e4ea13a589d4a568d33c3d0dc6994d13b83/litellm-1.93.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:1a476ebc340c070c982eab15b4673fa63a70f5936935f9f20e4d2acb5f35d23b", size = 20165502, upload-time = "2026-07-19T03:01:18.425Z" },
     { url = "https://files.pythonhosted.org/packages/45/6c/65a7f916326daa151131f1fce5e254d4834127a95d53a18f1c4d238dd5c3/litellm-1.93.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:cd70ccd4ba3ef1a395535c287bce72d30c7d937ecca4290c0db37a00738f7ada", size = 20159007, upload-time = "2026-07-19T03:01:21.704Z" },
 ]
-
-[[package]]
-name = "llm-waterfall"
-version = "0.1.4"
-source = { editable = "packages/llm-waterfall" }
-dependencies = [
-    { name = "pydantic" },
-]
-
-[package.optional-dependencies]
-all = [
-    { name = "anthropic" },
-    { name = "boto3" },
-    { name = "openai" },
-]
-anthropic = [
-    { name = "anthropic" },
-]
-azure = [
-    { name = "openai" },
-]
-bedrock = [
-    { name = "boto3" },
-]
-dev = [
-    { name = "anthropic" },
-    { name = "boto3" },
-    { name = "openai" },
-    { name = "pytest" },
-    { name = "ruff" },
-    { name = "ty" },
-]
-openai = [
-    { name = "openai" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.39" },
-    { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.34" },
-    { name = "llm-waterfall", extras = ["all"], marker = "extra == 'dev'", editable = "packages/llm-waterfall" },
-    { name = "llm-waterfall", extras = ["openai", "anthropic", "bedrock", "azure"], marker = "extra == 'all'", editable = "packages/llm-waterfall" },
-    { name = "openai", marker = "extra == 'azure'", specifier = ">=1.40" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40" },
-    { name = "pydantic", specifier = ">=2.6" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
-    { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.1a1" },
-]
-provides-extras = ["openai", "anthropic", "bedrock", "azure", "all", "dev"]
 
 [[package]]
 name = "lxml"
@@ -3981,7 +3921,6 @@ viz = [
 [package.dev-dependencies]
 dev = [
     { name = "environment-capture", extra = ["bedrock", "fetch"] },
-    { name = "llm-waterfall", extra = ["all"] },
 ]
 
 [package.metadata]
@@ -3990,7 +3929,7 @@ requires-dist = [
     { name = "boto3", specifier = ">=1.34" },
     { name = "click", specifier = ">=8.2" },
     { name = "e2b", marker = "extra == 'e2b'", specifier = "==2.31.0" },
-    { name = "environment-capture", editable = "packages/environment-capture" },
+    { name = "environment-capture" },
     { name = "fastapi", specifier = ">=0.128" },
     { name = "gepa", specifier = ">=0.1.1" },
     { name = "harbor", marker = "extra == 'harbor'", specifier = "==0.20.0" },
@@ -4022,10 +3961,7 @@ requires-dist = [
 provides-extras = ["otel", "viz", "e2b", "harbor", "connectors", "postgres", "distill", "dev"]
 
 [package.metadata.requires-dev]
-dev = [
-    { name = "environment-capture", extras = ["bedrock", "fetch"], editable = "packages/environment-capture" },
-    { name = "llm-waterfall", extras = ["all"], editable = "packages/llm-waterfall" },
-]
+dev = [{ name = "environment-capture", extras = ["bedrock", "fetch"] }]
 
 [[package]]
 name = "xxhash"

@@ -20,10 +20,9 @@ dependencies = [
     "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
-    # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
-    # read core behind `wmo download` (stdlib-only; pushing needs the member's fetch extra).
-    # RELEASE ORDER: environment-capture must be published to PyPI before any wmo release —
-    # outside the workspace this dependency resolves from PyPI, not [tool.uv.sources].
+    # The data-bundle read core behind `wmo download` (stdlib-only; pushing needs its own
+    # `fetch` extra). Published separately to PyPI and resolved from there — its benchmark
+    # adapters and capture tooling are not part of this repository.
     "environment-capture",
     "gepa>=0.1.1",
     "tomli-w>=1.0",  # writing .wmo/config.toml (stdlib tomllib reads); every `wmo build` needs it
@@ -78,13 +77,9 @@ dev = [
 ]
 
 [dependency-groups]
-# Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests. Both members have graduated to [project.dependencies] —
-# environment-capture when `wmo download` started consuming it, llm-waterfall when
-# wmo.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
-# members' heavy extras. The flagship wheel includes llm_waterfall's import package, while the
-# workspace dependency keeps its own metadata and extras available for development and testing.
-dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
+# environment-capture is a published PyPI dependency (`wmo download` reads its data bundles);
+# the dev group adds its heavy extras so the root gate can exercise the fetch/bedrock paths.
+dev = ["environment-capture[bedrock,fetch]"]
 
 [project.scripts]
 wmo = "wmo.cli:main"
@@ -94,82 +89,44 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["wmo", "packages/llm-waterfall/llm_waterfall"]
+packages = ["wmo"]
 # Test-only code is named for pytest discovery (`*_test.py`), and these two are the exceptions
 # that the glob therefore misses: `fake_tinker` is the deterministic Tinker double the distill
 # tests run the whole loop against, and `wmo/conftest.py` is a pytest fixture module. Both are
 # imported only by tests, so neither belongs in the published wheel. `fake_tinker` stays where
 # it is rather than moving under a test path: five test modules import it by that name.
 exclude = ["**/*_test.py", "wmo/distill/fake_tinker.py", "wmo/conftest.py"]
-force-include = { "packages/llm-waterfall/LICENSE" = "llm_waterfall/LICENSE" }
+# The vendored waterfall utility keeps its own MIT notice beside the code it covers.
+force-include = { "wmo/utils/waterfall/LICENSE" = "wmo/utils/waterfall/LICENSE" }
 
 [tool.hatch.build.targets.sdist]
-# Publish one flagship distribution. llm_waterfall is bundled because WMO imports it as a core
-# implementation module; the environment-capture dependency already resolves from PyPI.
+# One flagship distribution: everything importable lives under /wmo, and the
+# environment-capture dependency resolves from PyPI.
 include = [
     "/wmo",
-    "/packages/llm-waterfall/llm_waterfall",
-    "/packages/llm-waterfall/LICENSE",
     "/README.md",
     "/pyproject.toml",
     "/conftest.py",
 ]
 
-[tool.uv.workspace]
-# The monorepo (AGENTS.md § Monorepo): root stays the `wmo` flagship package; members live
-# under packages/, each independently published to PyPI. `uv sync` resolves the whole workspace.
-members = ["packages/*"]
-
-[tool.uv.sources]
-# Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
-llm-waterfall = { workspace = true }
-environment-capture = { workspace = true }
-
 [tool.pytest.ini_options]
 # Tests live inline next to the modules they cover (foo.py -> foo_test.py).
 python_files = ["*_test.py"]
-# One root gate covers the flagship and every Python member (same inline-test convention).
-# `deploy/` carries the operated services; their tests cover the deploy scripts themselves
-# (a deploy that deletes the box's generated trees rotates the pinned TLS certificate).
-testpaths = ["wmo", "packages", "deploy"]
-# tau2-bench is a local clone of the external real-environment runner (own test suite, own
-# deps) that lives beside the tau-bench member data; it is not part of this gate.
-norecursedirs = ["tau2-bench"]
+# One root gate over the single package.
+testpaths = ["wmo"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# `examples/` holds isolated, self-contained task launch/capture helpers that can depend on their
-# own benchmark environments. They are not part of the reusable `wmo` package.
-extend-exclude = ["examples/", ".agents/",
-    # Pre-contract benchmark dirs keep their examples-era exemption (legacy capture tooling).
-    "packages/environment-capture/tau-bench/",
-    "packages/environment-capture/terminal-tasks/",
-    "packages/environment-capture/swe-bench/",
-]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ANN", "BLE", "T20"]
 
 [tool.ruff.lint.per-file-ignores]
-# The environment-capture member's benchmark capture/smoke/fetch scripts are operator-run CLIs
-# that report progress on stdout/stderr — that is their product output, same class as the
-# legacy dirs excluded above. The never-print rule (AGENTS.md § Python) binds `wmo/` in full.
-# UP040: the member still publishes for Python >=3.11, where the `type` alias keyword (3.12+)
-# is unavailable; drop this ignore when the member's own floor moves to 3.12.
-"packages/environment-capture/**" = ["T20", "UP040"]
+# The waterfall utility's adapter tests stub provider SDK clients, whose kwargs are genuinely
+# arbitrary — the fakes have to accept whatever the SDK signature accepts. Scoped to that one
+# module tree so the rest of `wmo/` keeps ANN401 in full force.
+"wmo/utils/waterfall/**/*_test.py" = ["ANN401"]
 
 [tool.ty.environment]
 python-version = "3.12"
-
-[tool.ty.src]
-# `plot_trace_scaling.py` is a one-off research figure that imports matplotlib ephemerally
-# (`uv run --with matplotlib`), not a project dependency — exclude it from the type gate.
-# `deploy/` is box-side service code: it imports torch and transformers, which live in the
-# GPU box's venv and are deliberately not project dependencies. Ruff still lints it.
-exclude = ["examples/", ".agents/", "deploy/",
-    "packages/environment-capture/*/backend/",
-    "packages/environment-capture/tau-bench/",
-    "packages/environment-capture/terminal-tasks/",
-    "packages/environment-capture/swe-bench/",
-]

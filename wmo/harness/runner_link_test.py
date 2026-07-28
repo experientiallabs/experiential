@@ -12,7 +12,6 @@ import time
 from typing import Any, cast
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
 
 from wmo.core.types import Action, JsonObject, Observation
 from wmo.harness import runner_link as runner_link_module
@@ -20,6 +19,7 @@ from wmo.harness.runner_link import RunnerLink, SocketChannel, read_frame, write
 from wmo.harness.runtime import SCAFFOLD_LOSS_STOP_REASONS, RuntimeCancelled, StopReason
 from wmo.harness.skills import Skill, SkillLibrary
 from wmo.harness.tools import SUBMIT, TOOL_REGISTRY
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 class _Env:

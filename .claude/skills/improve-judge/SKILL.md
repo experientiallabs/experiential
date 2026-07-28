@@ -7,8 +7,7 @@ description: Iteratively improve the RubricJudge (or any LLM scorer) against a h
 
 An iterative calibration loop against a hand-labeled dataset. Never tweak the judge from
 intuition: every change starts from a disagreement you can point at and ends with a case that
-would catch its regression. Deep background and worked example, if it still exists (`.agents/`
-is prunable): `.agents/docs/reference/judge-meta-eval-playbook.md`.
+would catch its regression.
 
 The loop (repeat until a full pass produces no new disagreements you'd act on):
 
@@ -37,7 +36,7 @@ open("/tmp/judge-iter.json", "w").write(report.model_dump_json(indent=2))
 PY
 ```
 
-(`.agents/scripts/run_judge_quality.py` is a convenience driver for the same thing — use it if
+(an operator-local driver script does the same thing — use one if
 it's still around, but don't depend on it.)
 
 If the concern came from real eval runs, ALSO pull disagreements from the wild: read per-step
@@ -105,7 +104,7 @@ fail. Then run exactly one experiment matched to the layer:
   generate world-model predictions ONCE on a seeded step sample, cache them to a file, score the
   same cache with the old judge (snapshot its prompt/aggregation from git) and the new one, and
   report Spearman + shift sliced by factuality band; the shift must concentrate where the defect
-  was. (A ready-made driver may exist at `.agents/scripts/run_judge_regression.py`.)
+  was.
 - Commit the new cases with the fix and bump `JUDGE_VERSION` if semantics changed. Run outputs
   are working data: keep them out of git (`.wmo/`, `/tmp`); commit only the few small, stable
   result JSONs a finished writeup actually cites.

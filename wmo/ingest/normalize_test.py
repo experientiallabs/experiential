@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from wmo.core.types import ErrorClass, StepAttribution
 from wmo.ingest.normalize import (
     SpanRecord,
@@ -189,3 +191,47 @@ def test_step_attribution_captures_request_config() -> None:
     assert attribution.config == {"temperature": 0.2, "max_tokens": 512, "top_p": 0.9}
     # The model key is attribution.model, never duplicated into config.
     assert "model" not in attribution.config
+
+
+def test_legacy_wmh_trace_metadata_key_is_still_honored() -> None:
+    """Corpora emitted before the wmh -> wmo rename must not lose their trace metadata.
+
+    The published `environment-capture` still writes `wmh.trace.metadata`, so ignoring the
+    legacy key would silently strip benchmark/task_id/reward off every bundle it produced.
+    """
+    spans = [
+        SpanRecord(
+            trace_id="t1",
+            span_id="a",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.completion": "hi",
+                "wmh.trace.metadata": json.dumps({"benchmark": "financebench", "reward": 1.0}),
+            },
+        ),
+    ]
+
+    (trace,) = spans_to_traces(spans, source="test")
+
+    assert trace.metadata["benchmark"] == "financebench"
+    assert trace.metadata["reward"] == 1.0
+
+
+def test_current_wmo_trace_metadata_key_wins_over_the_legacy_one() -> None:
+    """A span carrying both keys is post-rename data; the legacy value must not shadow it."""
+    spans = [
+        SpanRecord(
+            trace_id="t1",
+            span_id="a",
+            attributes={
+                "gen_ai.operation.name": "chat",
+                "gen_ai.completion": "hi",
+                "wmo.trace.metadata": json.dumps({"benchmark": "current"}),
+                "wmh.trace.metadata": json.dumps({"benchmark": "legacy"}),
+            },
+        ),
+    ]
+
+    (trace,) = spans_to_traces(spans, source="test")
+
+    assert trace.metadata["benchmark"] == "current"

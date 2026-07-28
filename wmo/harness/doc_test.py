@@ -284,9 +284,8 @@ def _pi_doc() -> HarnessDoc:
 def _stub_provider():  # noqa: ANN202 - returns the casted Provider protocol below
     from typing import cast
 
-    from llm_waterfall import ChatRequest, ChatResponse
-
     from wmo.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
+    from wmo.utils.waterfall import ChatRequest, ChatResponse
 
     class _P:
         config = ProviderConfig(kind=ProviderKind.BEDROCK, model="m")

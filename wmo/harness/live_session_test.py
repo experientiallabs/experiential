@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
 
 from wmo.core.types import JsonObject
 from wmo.harness.live_session import LiveSession, SessionEvent, ToolOutcome
 from wmo.harness.tools import BASH, READ_SKILL, SUBMIT
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 class ScriptedChannel:

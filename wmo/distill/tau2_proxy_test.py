@@ -8,7 +8,9 @@ import urllib.request
 from collections.abc import Iterator
 
 import pytest
-from llm_waterfall.types import (
+
+from wmo.distill.tau2_proxy import EpisodeProxy, realign_tool_argument_types
+from wmo.utils.waterfall.types import (
     ChatChoice,
     ChatFunctionCall,
     ChatFunctionDefinition,
@@ -19,8 +21,6 @@ from llm_waterfall.types import (
     ChatToolCall,
     ChatUsage,
 )
-
-from wmo.distill.tau2_proxy import EpisodeProxy, realign_tool_argument_types
 
 
 class _FakeProvider:

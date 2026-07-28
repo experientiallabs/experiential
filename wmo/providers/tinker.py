@@ -50,7 +50,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
-from llm_waterfall.types import ChatChoice, ChatMessage, ChatTool, ChatUsage
 from pydantic import BaseModel, Field, model_validator
 
 from wmo.distill.deadlines import TinkerDeadlineError, call_with_deadline, wait_with_deadline
@@ -72,6 +71,7 @@ from wmo.providers.base import (
     VerifyResult,
     verify_via_ping,
 )
+from wmo.utils.waterfall.types import ChatChoice, ChatMessage, ChatTool, ChatUsage
 
 if TYPE_CHECKING:
     import tinker

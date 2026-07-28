@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from llm_waterfall import ChatMaxTokensField
 
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -15,6 +14,7 @@ from wmo.providers.base import (
     ProviderKind,
 )
 from wmo.providers.openai import OpenAIProvider
+from wmo.utils.waterfall import ChatMaxTokensField
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

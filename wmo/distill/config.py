@@ -163,7 +163,7 @@ class Tau2Config(BaseModel):
     spans (`wmo.distill.tau2`).
 
     tau2 needs Python 3.12+ and a heavy dependency tree, so it lives in its own venv
-    (see `packages/environment-capture/tau-bench/README.md`) and wmo never imports
+    (see the tau-bench data bundle's README) and wmo never imports
     it; `tau2_bin` points into that venv.
 
     Attempts per task are NOT configured here: training rollouts use

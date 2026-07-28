@@ -9,7 +9,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from llm_waterfall import ChatResponse
 
 from wmo.agents import project as project_module
 from wmo.agents.meta import meta_agent
@@ -23,6 +22,7 @@ from wmo.harness.live_session import SessionEvent
 from wmo.harness.runtime import HarnessSearchCancelled
 from wmo.harness.source_tree import HarnessSourceFile, HarnessSourceTree
 from wmo.providers.base import ProviderConfig, ProviderKind
+from wmo.utils.waterfall import ChatResponse
 
 
 class _Files:

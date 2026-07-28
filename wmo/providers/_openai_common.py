@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from openai import BadRequestError
 
 from wmo.providers.base import Completion, Message, StreamChunk, TokenUsage
+from wmo.utils.waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

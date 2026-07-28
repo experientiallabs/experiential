@@ -1,7 +1,8 @@
 """Named eval suites for repeatable reconstruction-fidelity runs.
 
-Suites live next to examples (`examples/<task>/evals/*.toml`) and point at trace files relative to
-the suite file. Generated run results are local artifacts, normally written under `.wmo/evals/`.
+Suites live next to the corpus they score (`<data root>/<task>/evals/*.toml`, where the data root
+is whatever `wmo download` wrote) and point at trace files relative to the suite file. Generated
+run results are local artifacts, normally written under `.wmo/evals/`.
 """
 
 from __future__ import annotations

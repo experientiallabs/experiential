@@ -21,7 +21,7 @@ as one six-PR train (#41, #72, #97, #55, #120, #98); the six layers map to five 
 ## Shared protocol (every layer, stated once)
 
 - **Corpora**: live-captured traces from the real benchmarks (capture tooling and provenance
-  under `packages/environment-capture/<suite>/`): tau-bench 1033 traces / 5289 steps,
+  under `environment-capture-data/<suite>/`): tau-bench 1033 traces / 5289 steps,
   terminal-tasks 280 / 685, swe-bench 255 / 1868 (swe scored on the healthy,
   degenerate-dropped corpus where noted).
 - **Split discipline**: deterministic by hash of `trace_id` into a fixed test band (the y-axis
@@ -465,7 +465,7 @@ machine; treat any number without that pinning as unfalsifiable.
 ## Reproduce
 
 All six layers are driven by the public `wmo` API; any thin driver reproduces them. Corpora:
-`packages/environment-capture/<suite>/traces.otel.jsonl` via `wmo.ingest` (adapter
+`environment-capture-data/<suite>/traces.otel.jsonl` via `wmo.ingest` (adapter
 `otel-genai`, degenerate traces dropped for swe-healthy). Splits via
 `wmo.research.partition_corpus(test_frac=0.2, valid_frac=0.15)`. Figures: matplotlib over the
 result JSONs, brand palette per AGENTS.md rule 15.

@@ -6,8 +6,9 @@ from collections.abc import Callable, Iterator
 from enum import StrEnum
 from typing import Literal, Protocol, runtime_checkable
 
-from llm_waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 from pydantic import BaseModel, Field
+
+from wmo.utils.waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 
 
 class ProviderKind(StrEnum):

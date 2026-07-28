@@ -11,7 +11,8 @@ is available, and reads a small summary for `wmo list`.
         retail-bench/    <- another
 
 "Filesystem as DB": loading a model is just reading its folder. The default root is the writable
-`.wmo/` directory used by `wmo build`; callers can pass another root such as `examples/<task>` to
+`.wmo/` directory used by `wmo build`; callers can pass another root such as a downloaded task
+dir to
 read intentional prebuilt example artifacts from that root's `models/` directory.
 """
 

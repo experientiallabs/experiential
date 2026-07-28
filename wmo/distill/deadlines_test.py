@@ -7,7 +7,6 @@ import time
 from typing import NoReturn
 
 import pytest
-from llm_waterfall import is_capacity_error
 
 from wmo.distill.deadlines import (
     DEFAULT_DEADLINES_S,
@@ -19,6 +18,7 @@ from wmo.distill.deadlines import (
     env_var_for,
     wait_with_deadline,
 )
+from wmo.utils.waterfall import is_capacity_error
 
 _SHORT_DEADLINE = "0.05"
 _GENEROUS_WAIT_S = 5.0
@@ -161,7 +161,7 @@ def test_invalid_override_raises_naming_the_env_var(
 
 def test_deadline_error_is_a_capacity_error_for_the_retry_stack() -> None:
     # Load-bearing pin: the provider retry wrapper (and the waterfall) only
-    # retries what llm_waterfall classifies as capacity. The error subclasses
+    # retries what wmo.utils.waterfall classifies as capacity. The error subclasses
     # TimeoutError and says "timed out" precisely so this holds.
     error = TinkerDeadlineError("sample", elapsed_s=120.4, deadline_s=120.0)
     assert isinstance(error, TimeoutError)

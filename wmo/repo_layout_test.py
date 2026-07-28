@@ -16,20 +16,17 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# AGENTS.md rule 5: tracked top-level directories must be within this set. The allowlist may
-# exceed the current tree (web/ and .github/ are decided-but-not-yet-landed surfaces): it bounds
-# what MAY exist, it does not require existence.
+# AGENTS.md rule 5: tracked top-level directories must be within this set, and the set is CLOSED.
+# An agent may never add to it. A new entry requires a human to name that exact directory and
+# grant permission for the name; the entry then lands in the same change that documents it in
+# AGENTS.md rule 5. If work does not fit a surface below, it goes under the closest one or stays
+# out of the repo — never into a new sibling.
 ALLOWED_TOP_DIRS = {
-    "wmo",
-    "examples",
-    "docs",
-    "assets",
-    "web",
-    ".agents",
-    ".claude",
-    ".github",
-    "packages",  # monorepo workspace members live here (AGENTS.md § Monorepo)
-    "deploy",  # service deployments we operate ourselves (AGENTS.md rule 5)
+    "wmo",  # the flagship package: all importable code
+    "docs",  # reviewed public documentation (see the docs/ layout tests below)
+    "assets",  # media referenced by README/docs
+    ".claude",  # checked-in agent skills
+    ".github",  # CI workflows
 }
 
 
@@ -57,8 +54,10 @@ def test_top_level_directories_are_allowlisted() -> None:
     unexpected = tracked_dirs - ALLOWED_TOP_DIRS
     assert not unexpected, (
         f"top-level directories {sorted(unexpected)} are not in the AGENTS.md rule 5 allowlist "
-        f"{sorted(ALLOWED_TOP_DIRS)}; put one-off work in .agents/, dataset tooling in "
-        "examples/<task>/, reusable code in wmo/, finished reports in docs/"
+        f"{sorted(ALLOWED_TOP_DIRS)}. The allowlist is closed and agents may not extend it: put "
+        "reusable code in wmo/ (self-contained building blocks in wmo/utils/), finished reports "
+        "in docs/, and one-off or scratch work OUTSIDE the repo. Adding a new top-level "
+        "directory requires a human to grant permission for that exact name."
     )
 
 
@@ -102,24 +101,29 @@ def test_docs_layout_is_exactly_readme_research_reference() -> None:
     )
 
 
-def test_docs_never_mention_the_agents_workspace() -> None:
-    """docs/ are finished products: the agents' workspace must be invisible from them.
+# Top-level directories this repo used to have. They are gone; a doc that still points at one is
+# sending the reader to a path that does not exist.
+RETIRED_TOP_DIRS = (".agents/", "deploy/", "examples/", "packages/", "web/")
 
-    Not even disclaimed pointers: a reader of docs/ should never learn the workspace exists.
-    Reproduction lives in the report itself (public wmo API or CLI), never behind a workspace
-    path.
+
+def test_docs_never_point_at_a_retired_directory() -> None:
+    """docs/ are finished products: every path they quote must still exist.
+
+    Reproduction lives in the report itself (public wmo API or CLI), never behind a path that
+    was deleted — and never behind a scratch workspace, which this repo no longer has.
     """
     offenders = [
-        p
+        (p, retired)
         for p in _tracked_files()
         if p.startswith("docs/")
         and p.endswith(".md")
         and (REPO_ROOT / p).is_file()  # tolerate uncommitted deletes/renames mid-edit
-        and ".agents" in (REPO_ROOT / p).read_text(encoding="utf-8")
+        for retired in RETIRED_TOP_DIRS
+        if retired in (REPO_ROOT / p).read_text(encoding="utf-8")
     ]
     assert not offenders, (
-        f"docs mentioning the agents workspace: {offenders}; quote reproduction as public "
-        "wmo API/CLI in the report itself and drop every workspace path (AGENTS.md rule 5)"
+        f"docs pointing at retired top-level directories: {offenders}; those paths no longer "
+        "exist. Quote reproduction as public wmo API/CLI in the report itself (AGENTS.md rule 5)"
     )
 
 
@@ -162,41 +166,34 @@ def test_no_tracked_file_is_matched_by_ignore_rules() -> None:
     )
 
 
-def _workspace_member_dirs() -> list[Path]:
-    """Existing member directories from [tool.uv.workspace].members (glob-aware)."""
+def test_there_is_no_uv_workspace() -> None:
+    """One distribution, no members (AGENTS.md § One package).
+
+    The workspace was retired when `packages/` was deleted: `environment-capture` resolves from
+    PyPI and `llm-waterfall` was vendored into `wmo/utils/waterfall/`. Reintroducing a member
+    means reintroducing a top-level `packages/` directory, which rule 5 forbids outright.
+    """
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
         root = tomllib.load(fh)
-    members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members", [])
-    assert members, "the workspace must declare its members (AGENTS.md § Monorepo)"
-    dirs: list[Path] = []
-    for member in members:
-        dirs.extend(p for p in REPO_ROOT.glob(member) if p.is_dir())
-    return dirs
+    uv_config = root.get("tool", {}).get("uv", {})
+    assert "workspace" not in uv_config, (
+        "[tool.uv.workspace] is back; this repo publishes one distribution whose importable code "
+        "is all of wmo/. Depend on PyPI or vendor under wmo/utils/ (AGENTS.md § One package)"
+    )
+    assert "sources" not in uv_config, (
+        "[tool.uv.sources] is back; with no workspace every dependency resolves from PyPI "
+        "(AGENTS.md § One package)"
+    )
 
 
-def test_workspace_members_are_real_packages() -> None:
-    """Every existing [tool.uv.workspace] member dir must carry its own pyproject.toml."""
-    for member_dir in _workspace_member_dirs():
-        assert (member_dir / "pyproject.toml").is_file(), (
-            f"workspace member {member_dir.name!r} has no pyproject.toml; every member is an "
-            "independently packaged, publishable unit (AGENTS.md § Monorepo)"
-        )
-
-
-def test_root_gate_covers_every_python_member() -> None:
-    """AGENTS.md § Monorepo promises one root gate: testpaths must include every member."""
+def test_root_gate_covers_the_whole_package() -> None:
+    """AGENTS.md § One package promises one root gate over the single package."""
     with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
         root = tomllib.load(fh)
-    testpaths = set(root["tool"]["pytest"]["ini_options"]["testpaths"])
-
-    def covered(member: Path) -> bool:
-        rel = member.relative_to(REPO_ROOT)
-        return any(rel == Path(tp) or Path(tp) in rel.parents for tp in testpaths)
-
-    missing = [str(d.relative_to(REPO_ROOT)) for d in _workspace_member_dirs() if not covered(d)]
-    assert not missing, (
-        f"workspace members {missing} are not in [tool.pytest.ini_options].testpaths; the root "
-        "gate must cover every Python member (AGENTS.md § Monorepo)"
+    testpaths = root["tool"]["pytest"]["ini_options"]["testpaths"]
+    assert testpaths == ["wmo"], (
+        f"testpaths is {testpaths}, not ['wmo']; the root gate covers the one package and every "
+        "test is inline beside the module it covers (AGENTS.md § One package)"
     )
 
 

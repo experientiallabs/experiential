@@ -1,6 +1,0 @@
-title = "Terminal tasks default replay"
-description = "Open-loop reconstruction fidelity over the bundled terminal task trace corpus."
-files = ["../traces.otel.jsonl"]
-sample_turns = "all"
-seed = 0
-

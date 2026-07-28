@@ -436,8 +436,8 @@ class CostQualityAnchor(BaseModel):
 
 
 # Every anchor was measured on routerbench-ours9 (1199 scenarios, 9 models, 70/30 stratified
-# splits, 5 seeds, text-embedding-3-large queries) THROUGH THIS CODE by
-# `.agents/scripts/validate_cost_quality.py`, which is also the gate that keeps them true.
+# splits, 5 seeds, text-embedding-3-large queries) THROUGH THIS CODE by an offline validation
+# script kept outside the repo. Nothing in CI regates them: re-measure before changing them.
 _MEASURED = (
     # dial, quality points vs best single, cost percent vs best single
     (0.0, 1.14, -13.9),  # matches R1's r1-knn-adapt-floor-q0.5 to the digit
@@ -498,8 +498,7 @@ def cost_quality_named_point(cost_quality: float) -> CostQualityPointName:
 
 # Built through the mapping, so the table an operator reads and the knobs the endpoint serves
 # can never be two different sliders, and sorted by dial position because a frontier read out of
-# order is a frontier nobody trusts. `.agents/scripts/validate_cost_quality.py` regates the
-# measured columns.
+# order is a frontier nobody trusts. The measured columns are re-derived offline, not in CI.
 COST_QUALITY_ANCHORS: tuple[CostQualityAnchor, ...] = tuple(
     CostQualityAnchor(
         cost_quality=dial,
@@ -544,8 +543,7 @@ def apply_cost_quality(policy: RoutingPolicy, cost_quality: float) -> RoutingPol
     through untouched, so no refit is involved and the slide is instant.
 
     Measured anchors: routerbench-ours9, 5 split seeds, held out, against the best single pool
-    model on the same split, all produced by this code
-    (`.agents/scripts/validate_cost_quality.py`, which regates them):
+    model on the same split, all produced by this code (re-measured offline, not in CI):
 
         dial   floor_q  lam    guard        quality     cost
         0.00   0.50     0.00   symmetric    +1.14 pt    -13.9%

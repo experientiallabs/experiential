@@ -17,14 +17,6 @@ from types import ModuleType
 from typing import TYPE_CHECKING, NoReturn, cast
 
 import pytest
-from llm_waterfall.types import (
-    ChatFunctionCall,
-    ChatFunctionDefinition,
-    ChatMessage,
-    ChatRequest,
-    ChatTool,
-    ChatToolCall,
-)
 from pydantic import JsonValue, ValidationError
 
 import wmo.distill.rendering as rendering_module
@@ -61,6 +53,14 @@ from wmo.providers.tinker import (
     TinkerSampler,
     TokenRecorder,
     TokenSpan,
+)
+from wmo.utils.waterfall.types import (
+    ChatFunctionCall,
+    ChatFunctionDefinition,
+    ChatMessage,
+    ChatRequest,
+    ChatTool,
+    ChatToolCall,
 )
 
 if TYPE_CHECKING:

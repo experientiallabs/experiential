@@ -223,7 +223,7 @@ def _collect_source(
             ask,
             f"Path to the {source} export to ingest",
             None,
-            example="packages/environment-capture/tau-bench/traces.otel.jsonl",
+            example="environment-capture-data/tau-bench/traces.otel.jsonl",
         )
         if not file:
             console.print("[red]a trace export path is required[/red]")

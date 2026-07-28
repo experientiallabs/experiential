@@ -927,7 +927,7 @@ def test_a_renderer_key_naming_a_model_the_run_never_samples_is_rejected(tmp_pat
 def _checked_in_config(name: str) -> DistillConfig:
     """Load one of the reference configs that ship beside this module.
 
-    They live in the package rather than in `.agents/` so they reach users of the
+    They live in the package rather than in operator scratch so they reach users of the
     wheel, which is the point of a reference config. No skip guard: these are
     shipped files, so an absent one is a packaging regression and should fail.
     """

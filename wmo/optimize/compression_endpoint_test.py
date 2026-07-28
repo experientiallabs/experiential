@@ -13,8 +13,8 @@ import os
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
+import certifi
 import httpx
 import pytest
 from pydantic import BaseModel
@@ -30,7 +30,6 @@ from wmo.optimize.compression import (
     servable_compressor,
 )
 from wmo.optimize.compression_endpoint import (
-    BUNDLED_CERT_PATH,
     CA_ENV,
     KEY_ENV,
     REQUIRED_SELECTION_RULE,
@@ -136,6 +135,19 @@ def endpoint() -> Iterator[tuple[LLMLingua2EndpointCompressor, FakeEndpointState
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture
+def pinned_cert() -> str:
+    """A real PEM on disk to point `WMO_COMPRESSOR_CA` at.
+
+    The repository ships no certificate (the box's is an operational secret), and
+    `ssl.create_default_context(cafile=...)` rejects anything that is not a parseable PEM, so
+    these tests borrow certifi's bundle. What is under test is that the client PINS whatever
+    file it is given — the fake endpoint is plain HTTP on loopback, so the pinned trust store
+    is built but never exercised on the wire.
+    """
+    return certifi.where()
 
 
 @pytest.fixture
@@ -323,20 +335,17 @@ def test_building_without_a_pinned_certificate_is_refused() -> None:
         LLMLingua2EndpointCompressor("https://40.80.93.150:8443", "x" * 64)
 
 
-def test_installed_wheel_without_the_bundled_cert_says_what_to_set(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The wheel case: `deploy/` is absent, so the error has to name the variable and the fix."""
+def test_unset_ca_says_what_to_set_and_where_to_get_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No certificate ships with the repo, so the error names the variable AND how to fetch it."""
     monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443")
     monkeypatch.setenv(KEY_ENV, "x" * 64)
     monkeypatch.delenv(CA_ENV, raising=False)
-    monkeypatch.setattr(compression_endpoint, "BUNDLED_CERT_PATH", tmp_path / "absent" / "cert.pem")
 
     with pytest.raises(CompressorEndpointError) as caught:
         LLMLingua2EndpointCompressor.from_env()
     message = str(caught.value)
     assert CA_ENV in message
-    assert "wheel" in message
+    assert compression_endpoint.CERT_FETCH_HINT in message
     assert "public CA" in message
 
 
@@ -350,12 +359,13 @@ def test_ca_pointing_at_a_missing_file_is_refused(monkeypatch: pytest.MonkeyPatc
         LLMLingua2EndpointCompressor.from_env()
 
 
-def test_from_env_pins_the_bundled_certificate(monkeypatch: pytest.MonkeyPatch) -> None:
-    """In a source checkout the committed cert is found without any configuration."""
+def test_from_env_pins_the_configured_certificate(
+    monkeypatch: pytest.MonkeyPatch, pinned_cert: str
+) -> None:
+    """`WMO_COMPRESSOR_CA` is the one and only source of the pin, and a real file satisfies it."""
     monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443")
     monkeypatch.setenv(KEY_ENV, "x" * 64)
-    monkeypatch.delenv(CA_ENV, raising=False)
-    assert BUNDLED_CERT_PATH.is_file()
+    monkeypatch.setenv(CA_ENV, pinned_cert)
     assert LLMLingua2EndpointCompressor.from_env().base_url == "https://40.80.93.150:8443"
 
 
@@ -371,10 +381,11 @@ def test_from_env_names_every_missing_variable(monkeypatch: pytest.MonkeyPatch) 
     assert "identity" in message
 
 
-def test_from_env_builds_a_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With both variables set, from_env yields a client pointed at the configured URL."""
+def test_from_env_builds_a_client(monkeypatch: pytest.MonkeyPatch, pinned_cert: str) -> None:
+    """With all three variables set, from_env yields a client pointed at the configured URL."""
     monkeypatch.setenv(URL_ENV, "https://40.80.93.150:8443/")
     monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.setenv(CA_ENV, pinned_cert)
     client = LLMLingua2EndpointCompressor.from_env()
     assert client.base_url == "https://40.80.93.150:8443"
 
@@ -408,13 +419,14 @@ def test_importing_registers_a_factory_and_builds_nothing() -> None:
 def test_first_resolution_builds_through_the_factory(
     endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
     monkeypatch: pytest.MonkeyPatch,
+    pinned_cert: str,
 ) -> None:
     """`route fit --compressor llmlingua2-endpoint` needs the id to resolve from env vars alone."""
     client, state = endpoint
     state.max_segments = 512
     monkeypatch.setenv(URL_ENV, client.base_url)
     monkeypatch.setenv(KEY_ENV, "x" * 64)
-    monkeypatch.setenv(CA_ENV, str(BUNDLED_CERT_PATH))
+    monkeypatch.setenv(CA_ENV, pinned_cert)
 
     built = get_compressor("llmlingua2-endpoint")
 
@@ -430,6 +442,7 @@ def test_first_resolution_builds_through_the_factory(
 def test_factory_failure_is_actionable_and_retryable(
     endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
     monkeypatch: pytest.MonkeyPatch,
+    pinned_cert: str,
 ) -> None:
     """A down endpoint must not poison the id for the life of the process.
 
@@ -449,6 +462,7 @@ def test_factory_failure_is_actionable_and_retryable(
 
     monkeypatch.setenv(URL_ENV, client.base_url)
     monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.setenv(CA_ENV, pinned_cert)
     assert get_compressor("llmlingua2-endpoint").id == "llmlingua2-endpoint"
 
 
@@ -456,12 +470,13 @@ def test_factory_failure_is_actionable_and_retryable(
 def test_registration_publishes_the_compressor_and_it_is_servable(
     endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
     monkeypatch: pytest.MonkeyPatch,
+    pinned_cert: str,
 ) -> None:
     """After registering, a policy can name the id and the v1 serving gate admits it."""
     client, _ = endpoint
     monkeypatch.setenv(URL_ENV, client.base_url)
     monkeypatch.setenv(KEY_ENV, "x" * 64)
-    monkeypatch.setenv(CA_ENV, str(BUNDLED_CERT_PATH))
+    monkeypatch.setenv(CA_ENV, pinned_cert)
 
     registered = register_endpoint_compressor()
 
@@ -474,6 +489,7 @@ def test_registration_publishes_the_compressor_and_it_is_servable(
 def test_registration_refuses_a_server_running_another_selection_rule(
     endpoint: tuple[LLMLingua2EndpointCompressor, FakeEndpointState],
     monkeypatch: pytest.MonkeyPatch,
+    pinned_cert: str,
 ) -> None:
     """append_stable is only true for absolute-threshold selection, so it is verified live.
 
@@ -484,6 +500,7 @@ def test_registration_refuses_a_server_running_another_selection_rule(
     state.selection_rule = "per-input-percentile"
     monkeypatch.setenv(URL_ENV, client.base_url)
     monkeypatch.setenv(KEY_ENV, "x" * 64)
+    monkeypatch.setenv(CA_ENV, pinned_cert)
 
     with pytest.raises(CompressorEndpointError) as caught:
         register_endpoint_compressor()

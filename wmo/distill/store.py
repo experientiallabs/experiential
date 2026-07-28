@@ -38,7 +38,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import tomli_w
-from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
@@ -49,6 +48,7 @@ from wmo.distill.tokens import TrialRecord
 from wmo.distill.tripwire import TripwireBaseline
 from wmo.providers.base import ProviderKind
 from wmo.providers.pool import PoolEntry
+from wmo.utils.waterfall import ChatMaxTokensField
 
 logger = logging.getLogger(__name__)
 

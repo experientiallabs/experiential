@@ -6,7 +6,7 @@ provider retry wrappers and trial/episode timeouts never engage (one live run
 hung 33 minutes this way while a fresh connection worked at the same moment).
 The `Sdk*` adapters therefore bound every SDK call with a per-call-kind
 deadline. Expiry raises `TinkerDeadlineError`, whose message deliberately
-reads as a timeout so llm-waterfall classifies it as a capacity (transient)
+reads as a timeout so waterfall classifies it as a capacity (transient)
 error: callers retry with a fresh session instead of hanging.
 
 Deadlines must scale with MODEL SIZE and TOKEN VOLUME, not just with call
@@ -129,7 +129,7 @@ class TinkerDeadlineError(TimeoutError):
     through a fresh session (the wmo adapters drop and rebuild their cached
     clients where they own them). Subclasses `TimeoutError` and keeps the
     phrase "timed out" in its message on purpose: that is what makes
-    llm-waterfall's `is_capacity_error` classify it as transient, so the
+    waterfall's `is_capacity_error` classify it as transient, so the
     provider retry wrapper re-attempts instead of propagating.
 
     Attributes:

@@ -46,7 +46,7 @@ Where episodes come from is config-selected: exactly one of `[harbor]` or `[tau2
 - **`[tau2]`**: Sierra's real tau2-bench, unmodified - tau2's own `llm_agent`, its LLM user
   simulator, its orchestrator, and its deterministic evaluator (`results.json`
   `reward_info.reward`). tau2 lives in its own Python 3.13 venv (`tau2_bin` points into it;
-  see `packages/environment-capture/tau-bench/README.md` for the one-time setup) and each
+  see `environment-capture-data/tau-bench/README.md` for the one-time setup) and each
   episode runs as its own `tau2 run` subprocess whose agent LLM calls a loopback
   OpenAI-compatible proxy inside the wmo process. A PER-EPISODE `TinkerChatProvider` behind
   that proxy samples the current weights and records the episode's exact token spans; its
@@ -81,7 +81,7 @@ the student-after eval and the gate run as usual); it is rejected unless `warmup
   benchmark dataset the trials run against, pointed at by the config's `[harbor] job_template`.
 - **The tau2 clone and its venv** (tau2 source only): `tau2_bin` points at the tau2 CLI inside
   its own Python 3.13 venv and `data_dir` at the clone's data directory (one-time setup in
-  `packages/environment-capture/tau-bench/README.md`), plus
+  `environment-capture-data/tau-bench/README.md`), plus
   `AZURE_API_KEY`/`AZURE_API_BASE`/`AZURE_API_VERSION` for the pinned azure/ user simulator.
 - **Task-id splits**: two JSON files, each a plain array of task-id strings. The train split
   feeds rollouts and interim evals; the holdout split (disjoint, enforced) is reserved for the

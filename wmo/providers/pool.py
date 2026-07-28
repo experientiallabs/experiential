@@ -35,7 +35,6 @@ from pathlib import Path
 from typing import Literal
 
 import tomli_w
-from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
@@ -50,6 +49,7 @@ from wmo.providers.base import (
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.registry import get_provider
 from wmo.tracking.pricing import ModelPrice, price_for
+from wmo.utils.waterfall import ChatMaxTokensField
 
 DEFAULT_POOL_PATH = Path(".wmo/pool.toml")
 

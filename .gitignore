@@ -24,10 +24,6 @@ logs/
 
 .wmo-fixed/
 
-# dev-run artifacts of the RL arms (official rows are committed deliberately under results/)
-examples/tau-bench/rl/*.results.jsonl
-examples/tau-bench/rl/icl_memory.jsonl
-
 # Local per-project settings (telemetry ids etc.) — never committed, wherever the root is.
 settings.toml
 
@@ -36,12 +32,9 @@ settings.toml
 .claude/scheduled_tasks.lock
 .claude/projects/
 
-# Raw experiment data artifacts of the distill/ablation program are NOT committed — they live
-# in the Notion experiments area (Research page) with a SHA-256 manifest. Analysis prose (.md)
-# stays in git, as do small result JSONs elsewhere under research/ (e.g. trace_scaling_results).
-.agents/docs/research/distill/*.json
-.agents/docs/research/distill/*.jsonl
-.agents/docs/research/distill/*.html
-
 # wandb run directories (local mirrors of what is already on the server)
 wandb/
+
+# External clones and downloaded data bundles land in the working directory, never in git.
+.tau2-bench/
+environment-capture-data/

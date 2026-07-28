@@ -546,7 +546,7 @@ def test_distill_names_the_install_command_when_the_distill_extra_is_missing(
 def test_a_missing_tau2_binary_names_a_setup_a_pip_installed_user_can_follow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The fix must not be a repo path: no wheel ships packages/environment-capture/."""
+    """The fix must not be a repo path: no wheel ships the benchmark data dirs."""
     _write_inputs(tmp_path)
     (tmp_path / "distill.toml").write_text(
         '[student]\nbase_model = "test/student"\n'

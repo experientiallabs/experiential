@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 import typer
-from llm_waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage
 from typer.testing import CliRunner
 
 import wmo.cli.agent_session as mod
@@ -26,6 +25,7 @@ from wmo.harness.workspace_patch import build_workspace_patch
 from wmo.platform.client import PlatformError
 from wmo.platform.credentials import PlatformCredentials
 from wmo.providers.base import ProviderKind
+from wmo.utils.waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage
 
 if TYPE_CHECKING:
     from collections.abc import Callable

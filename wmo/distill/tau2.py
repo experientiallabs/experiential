@@ -77,7 +77,7 @@ TASK_SPLIT_OVERRIDES = {"telecom": "full"}
 A property of the corpus, not a knob: the pinned telecom scenarios were
 captured from telecom's 2285-task "full" split, and tau2's default "base"
 split raises on the missing ids (see
-`packages/environment-capture/tau-bench/README.md`)."""
+the tau-bench data bundle's README)."""
 
 RESULTS_FILENAME = "results.json"
 SPANS_SINK_DIR = "spans"

@@ -33,9 +33,10 @@ format when `--source` is omitted (`wmo.ingest.detect`); an unrecognized or mixe
 with guidance instead of guessing. On an interactive terminal, `wmo build` with no source launches
 a wizard that lists the sources and prompts for file-or-pull.
 
-Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL - the same format the bundled
-`examples/*.otel.jsonl` use - so a source is interchangeable with any other corpus the harness
-reads: `wmo ingest`'s output feeds `wmo build --source otel-genai --file <out>` directly.
+Under the hood the chosen adapter normalizes to OTel-GenAI span JSONL - the same format the
+`traces.otel.jsonl` corpora `wmo download` fetches use - so a source is interchangeable with any
+other corpus the harness reads: `wmo ingest`'s output feeds
+`wmo build --source otel-genai --file <out>` directly.
 
 ### Progress events (the streaming contract)
 
@@ -64,8 +65,8 @@ as the terminal event.
 Per-provider export instructions, payload shapes, and caveats:
 [Phoenix](#ingesting-arize-phoenix-traces) · [Langfuse](#ingesting-langfuse-traces) ·
 [LangSmith](#ingesting-langsmith-runs) · [Braintrust](#ingesting-braintrust-traces) ·
-[PostHog](#ingesting-posthog-llm-traces) · [Mastra](#ingesting-mastra-traces). Runnable examples
-live in [`examples/ingest/`](../../examples/ingest/).
+[PostHog](#ingesting-posthog-llm-traces) · [Mastra](#ingesting-mastra-traces). Copy-pasteable
+end-to-end scripts for all six: [End-to-end scripts](#end-to-end-scripts).
 
 ### Already OTel-native? Use `otel-genai` (no dedicated adapter needed)
 
@@ -308,7 +309,7 @@ the Observation, mirroring an agent's `(action) -> observation` step.
 uv run wmo build --name phoenix-demo --source phoenix --file phoenix_export.json
 ```
 
-See `examples/ingest/phoenix_to_wmo.sh` for a runnable script.
+See [End-to-end scripts](#phoenix) for a runnable script.
 
 ### Caveats
 
@@ -388,7 +389,7 @@ framework traces where tool calls are separate child observations, Langfuse's na
 uv run wmo build --name langfuse-demo --source langfuse --file langfuse_export.json
 ```
 
-See `examples/ingest/langfuse_to_wmo.sh` for the end-to-end script.
+See [End-to-end scripts](#langfuse) for a runnable script.
 
 ### Caveats
 
@@ -475,7 +476,7 @@ JSONL (one run per line).
 uv run wmo build --name langsmith-demo --source langsmith --file langsmith_export.json
 ```
 
-See `examples/ingest/langsmith_to_wmo.sh` for the end-to-end script.
+See [End-to-end scripts](#langsmith) for a runnable script.
 
 ### Caveats
 
@@ -557,7 +558,7 @@ Accepted file shapes: a single span row, a JSON array of rows, an API page wrapp
 uv run wmo build --name braintrust-demo --source braintrust --file braintrust_export.json
 ```
 
-See `examples/ingest/braintrust_to_wmo.sh` for the end-to-end script.
+See [End-to-end scripts](#braintrust) for a runnable script.
 
 ### Caveats
 
@@ -618,7 +619,7 @@ uv run wmo build --name posthog-demo --source posthog --file events.json
 The pull runs `select event, properties, timestamp from events where event like '$ai_%'` via the
 HogQL query API and normalizes the rows.
 
-See `examples/ingest/posthog_to_wmo.sh` for a runnable script.
+See [End-to-end scripts](#posthog) for a runnable script.
 
 ## Ingesting Mastra traces
 
@@ -663,4 +664,196 @@ uv run wmo build --name mastra-demo --source mastra --file mastra_spans.json
   `http://localhost:4111`. `--api-key` is sent as a bearer token if your server requires auth.
 - **File export**: dump Mastra's stored AI spans (from its storage / the observability API) to JSON.
 
-See `examples/ingest/mastra_to_wmo.sh` for a runnable script.
+See [End-to-end scripts](#mastra) for a runnable script.
+
+## End-to-end scripts
+
+One copy-pasteable script per provider: export, then build. Each is self-contained — save it,
+`chmod +x`, run it. Arguments default to a demo export path and model name. The export step
+repeats the per-provider instructions above so each script stands alone.
+
+### Phoenix
+
+```bash
+#!/usr/bin/env bash
+# Ingest Arize Phoenix traces into a world model.
+#
+# Phoenix stores OpenInference spans. Export them to a file, then let the `phoenix` adapter
+# normalize them into the OTel-JSONL the rest of the pipeline consumes.
+set -euo pipefail
+
+# 1) Export spans from Phoenix to a JSON file. Phoenix has no stable file-export CLI, so dump the
+#    spans dataframe with the Phoenix client (run against your Phoenix instance):
+#
+#      python - <<'PY'
+#      import phoenix as px
+#      df = px.Client().get_spans_dataframe()           # all spans (optionally filter/limit)
+#      df.reset_index().to_json("phoenix_export.json", orient="records")
+#      PY
+#
+#    The Phoenix UI's per-trace "Export" also yields a JSON array of span objects. Either shape
+#    works: flat OpenInference span dicts (context.trace_id / start_time / attributes) OR an OTLP
+#    `resourceSpans` envelope.
+EXPORT="${1:-phoenix_export.json}"
+MODEL="${2:-phoenix-demo}"
+
+# 2) Build directly from the Phoenix export — `--source phoenix` ingests it as part of build.
+uv run wmo build --name "$MODEL" --source phoenix --file "${EXPORT}" --no-interactive
+
+echo "Built world model '$MODEL' from $EXPORT."
+```
+
+### Langfuse
+
+```bash
+#!/usr/bin/env bash
+# Ingest Langfuse traces into a world model, end to end.
+#
+# Langfuse exports a TRACE as an observation tree (not OTLP spans). Grab one (or a page) via the
+# public API or the SDK, then let the `langfuse` adapter normalize it into the OTel-GenAI JSONL that
+# `wmo build` consumes.
+set -euo pipefail
+
+EXPORT="${1:-langfuse_export.json}"
+MODEL="${2:-langfuse-demo}"
+
+# 1) Export from Langfuse (pick one). The adapter accepts a single trace object, a JSON array of
+#    traces, an API list page ({"data": [...]}), or JSONL (one trace per line).
+#
+#    Public API — a single trace by id (LANGFUSE_* keys are your project credentials):
+#      curl -s -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
+#        "$LANGFUSE_HOST/api/public/traces/$TRACE_ID" > "$EXPORT"
+#
+#    Public API — a page of recent traces (newest first):
+#      curl -s -u "$LANGFUSE_PUBLIC_KEY:$LANGFUSE_SECRET_KEY" \
+#        "$LANGFUSE_HOST/api/public/traces?limit=50" > "$EXPORT"
+#
+#    SDK (Python): langfuse.api.trace.get(trace_id).dict() -> dump to JSON.
+
+# 2) Build directly from the Langfuse export — `--source langfuse` ingests it as part of build.
+uv run wmo build --name "$MODEL" --source langfuse --file "$EXPORT" --no-interactive
+
+echo "Built world model '$MODEL' from $EXPORT."
+```
+
+### LangSmith
+
+```bash
+#!/usr/bin/env bash
+# Ingest LangSmith runs into a world model, end to end.
+#
+# LangSmith (LangChain) exports a trace as a tree of RUNS (not OTLP spans). Pull the runs for a
+# trace (or a project page) via the API or the SDK, then let the `langsmith` adapter normalize the
+# run tree into the OTel-GenAI JSONL that `wmo build` consumes.
+set -euo pipefail
+
+EXPORT="${1:-langsmith_export.json}"
+MODEL="${2:-langsmith-demo}"
+
+# 1) Export from LangSmith (pick one). The adapter accepts a single run, a JSON array of runs, a
+#    {"runs": [...]} wrapper, or JSONL (one run per line).
+#
+#    REST API — runs in a project (LANGCHAIN_API_KEY is your key; filter to one trace by id):
+#      curl -s -X POST "${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}/api/v1/runs/query" \
+#        -H "x-api-key: $LANGCHAIN_API_KEY" -H "Content-Type: application/json" \
+#        -d '{"session": ["<project-uuid>"], "limit": 100}' \
+#        | python -c 'import sys,json; print(json.dumps(json.load(sys.stdin)["runs"]))' > "$EXPORT"
+#
+#    SDK (Python): dump runs to a JSON array (one trace, or a whole project):
+#      uv run python - <<'PY' > "$EXPORT"
+#      import json
+#      from langsmith import Client
+#      runs = Client().list_runs(project_name="my-project")  # or trace_id=<uuid>
+#      json.dump([r.dict() for r in runs], sys.stdout, default=str)
+#      PY
+
+# 2) Build directly from the LangSmith export — `--source langsmith` ingests it as part of build.
+uv run wmo build --name "$MODEL" --source langsmith --file "$EXPORT" --no-interactive
+
+echo "Built world model '$MODEL' from $EXPORT."
+```
+
+### Braintrust
+
+```bash
+#!/usr/bin/env bash
+# Ingest Braintrust traces into a world model, end to end.
+#
+# Braintrust logs SPANS AS ROWS in an experiment/project log (not OTLP spans). A trace is the set of
+# rows sharing a `root_span_id`. Export the rows via the fetch API (or the SDK), then let the
+# `braintrust` adapter normalize them into the OTel-GenAI JSONL that `wmo build` consumes.
+set -euo pipefail
+
+EXPORT="${1:-braintrust_export.json}"
+MODEL="${2:-braintrust-demo}"
+
+# 1) Export from Braintrust (pick one). The adapter accepts a single span row, a JSON array of rows,
+#    an API page wrapper ({"events": [...]} or {"data": [...]}), or JSONL (one row per line).
+#
+#    Fetch API — project logs ({"events": [...]}); BRAINTRUST_API_KEY is your org key:
+#      curl -s -H "Authorization: Bearer $BRAINTRUST_API_KEY" \
+#        "https://api.braintrust.dev/v1/project_logs/$PROJECT_ID/fetch" > "$EXPORT"
+#
+#    Fetch API — an experiment's spans:
+#      curl -s -H "Authorization: Bearer $BRAINTRUST_API_KEY" \
+#        "https://api.braintrust.dev/v1/experiment/$EXPERIMENT_ID/fetch" > "$EXPORT"
+#
+#    SDK (Python): braintrust.api.* / dataset iteration -> dump each span row to JSON/JSONL.
+
+# 2) Build directly from the Braintrust export — `--source braintrust` ingests it as part of build.
+uv run wmo build --name "$MODEL" --source braintrust --file "$EXPORT" --no-interactive
+
+echo "Built world model '$MODEL' from $EXPORT."
+```
+
+### PostHog
+
+```bash
+#!/usr/bin/env bash
+# Build a world model from PostHog LLM-observability traces, end to end.
+#
+# PostHog captures LLM traces as `$ai_*` analytics events (not OTLP spans). Pull them live with the
+# `posthog` adapter (HogQL query over the events table), or ingest an exported events file.
+set -euo pipefail
+
+MODEL="${1:-posthog-demo}"
+
+# Credentials (a PostHog PERSONAL API key + your region host + numeric project id):
+#   export POSTHOG_API_KEY=phx_...           # Settings -> Personal API keys
+#   export POSTHOG_HOST=https://us.posthog.com   # or https://eu.posthog.com / self-hosted
+#   export POSTHOG_PROJECT_ID=12345
+
+# Option A — pull live from PostHog (build ingests via HogQL: event like '$ai_%'):
+uv run wmo build --name "$MODEL" --source posthog --pull \
+  --project "${POSTHOG_PROJECT_ID:?set POSTHOG_PROJECT_ID}" --no-interactive
+
+# Option B — build from an exported events file instead (single event / JSON array / JSONL /
+# a {"results": [...]} HogQL result):
+#   uv run wmo build --name "$MODEL" --source posthog --file events.json --no-interactive
+
+echo "Built world model '$MODEL' from PostHog LLM events."
+```
+
+### Mastra
+
+```bash
+#!/usr/bin/env bash
+# Build a world model from Mastra AI-tracing spans, end to end.
+#
+# Mastra records agent runs as AI-tracing spans typed by `type` (model_generation / tool_call / ...).
+# Pull them live from a running Mastra server, or ingest an exported spans file.
+set -euo pipefail
+
+MODEL="${1:-mastra-demo}"
+
+# Option A — pull live from a running Mastra server (fetches {base}/api/observability/traces).
+#   MASTRA_URL defaults to Mastra's dev server; --api-key is sent as a bearer token if needed.
+MASTRA_URL="${MASTRA_URL:-http://localhost:4111}"
+uv run wmo build --name "$MODEL" --source mastra --pull --project "$MASTRA_URL" --no-interactive
+
+# Option B — build from an exported spans file instead (single span / array / {"spans": [...]} /
+# {"traces": [...]} / JSONL):
+#   uv run wmo build --name "$MODEL" --source mastra --file mastra_spans.json --no-interactive
+
+echo "Built world model '$MODEL' from Mastra AI-tracing spans."
+```

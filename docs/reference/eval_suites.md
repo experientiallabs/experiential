@@ -2,19 +2,19 @@
 
 > **History:** this page originally described `wmo bench` + `benchmarks/<name>/benchmark.toml` + a leaderboard. That system was **removed in PR #38** ("consolidate bench into example eval suites") and replaced by the example-local eval suites described below.
 
-An **eval suite** is a committed, reproducible eval config living next to the example it scores: `examples/<task>/evals/<suite>.toml`. It names the trace files (relative to the suite file) and pins the scoring config. `wmo eval run <suite>` scores a prompt against it and persists the result locally.
+An **eval suite** is a versioned, reproducible eval config that ships in the benchmark's data bundle, living next to the corpus it scores: `environment-capture-data/<task>/evals/<suite>.toml`. It names the trace files (relative to the suite file) and pins the scoring config. `wmo eval run <suite>` scores a prompt against it and persists the result locally.
 
 This sits on top of the open-loop eval scorer (`wmo.engine.eval`): for each held-out step it feeds the recorded `(state, action)` teacher-forced, has the world model predict the observation, and scores it against the *real* recorded observation with the reference-grounded 5-dimension `RubricJudge`.
 
 ## The definition
 
-Each example task directory bundles everything: corpus, capture tooling, prebuilt models, and its eval suites:
+Each downloaded task directory bundles everything: corpus, prebuilt models, and its eval suites. `wmo download <benchmark>` writes them under the data root (`environment-capture-data/` in the working directory unless `$ENVCAP_DATA_ROOT` overrides it):
 
 ```
-examples/
+environment-capture-data/
   tau-bench/
-    traces.otel.jsonl     # the committed corpus (1033 traces)
-    evals/default.toml    # the suite definition (committed)
+    traces.otel.jsonl     # the corpus (1033 traces)
+    evals/default.toml    # the suite definition
     models/               # prebuilt example world models (tau-bench, tau-telecom)
 ```
 
@@ -42,7 +42,7 @@ skips the suite with that same message as a warning on stderr — if a suite is 
 ## Running
 
 ```bash
-wmo eval list                    # every suite under examples/*/evals/
+wmo eval list                    # every suite under environment-capture-data/*/evals/
 wmo eval run tau-bench           # run a suite, save a local JSON result
 wmo eval results                 # summarize local suite results (all suites)
 wmo eval results tau-bench       # ... or one suite

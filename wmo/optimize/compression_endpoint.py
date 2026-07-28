@@ -7,8 +7,8 @@ that, registered into the D-COMPRESS seam like any other compressor, so a policy
 without anything else in the harness knowing a network hop exists.
 
 Configuration is `WMO_COMPRESSOR_URL`, `WMO_COMPRESSOR_API_KEY`, and the pinned certificate
-(`WMO_COMPRESSOR_CA`, defaulted to the copy beside the deploy scripts in a source checkout).
-All three fail closed. If the endpoint is unreachable this raises: a compressor that silently
+(`WMO_COMPRESSOR_CA`, which the operator copies off the box). All three fail closed and none has
+a default. If the endpoint is unreachable this raises: a compressor that silently
 served uncompressed text on failure would make cost and accuracy results depend on the health
 of a box nobody was watching, and would quietly invalidate any grid that hit a bad minute. If
 the certificate is missing this also raises, rather than verifying a deliberately self-signed
@@ -52,16 +52,11 @@ URL_ENV = "WMO_COMPRESSOR_URL"
 KEY_ENV = "WMO_COMPRESSOR_API_KEY"
 CA_ENV = "WMO_COMPRESSOR_CA"
 
-# The pinned self-signed certificate shipped beside the deploy scripts, resolved from this file
-# rather than the working directory so a source checkout finds it from anywhere. It is NOT a
-# fallback: an installed wheel has no `deploy/` directory, and quietly dropping back to the
-# public CA store there would mean either a confusing TLS failure or, worse, trusting every
-# public CA against an endpoint that no public CA has ever vouched for. When this path is
-# missing, WMO_COMPRESSOR_CA must supply the certificate and the client refuses to build
-# without it.
-BUNDLED_CERT_PATH = (
-    Path(__file__).resolve().parents[2] / "deploy" / "compressor-endpoint" / "compressor-cert.pem"
-)
+# Where an operator fetches the pinned certificate from, quoted in every error that needs it.
+# The repository ships no copy: the endpoint is self-signed and its certificate is an operational
+# secret of the box, not source. The public CA store is never a fallback — trusting every public
+# CA against a box no public CA has vouched for is strictly worse than failing closed.
+CERT_FETCH_HINT = "scp h100-dev-box-6:/nvme/work/wmo-compressor/tls/cert.pem ."
 
 # The only selection rule whose output is append-stable. The server hard-codes it and publishes
 # it on /healthz; this client refuses to register against anything else (see `append_stable`).
@@ -87,7 +82,7 @@ class CompressorEndpointError(RuntimeError):
 class EndpointReply(BaseModel):
     """The endpoint's `/v1/compress` response.
 
-    Mirrors the server's `CompressResponse` (deploy/compressor-endpoint/server.py). Parsing it
+    Mirrors the server's `CompressResponse`. Parsing it
     into a model rather than reading a loose dict means a shape change on the box surfaces as
     one clear error here instead of a confusing failure deeper in the serving path.
     """
@@ -153,10 +148,10 @@ class LLMLingua2EndpointCompressor:
             # self-signed endpoint against the public CA store, which is not a weaker version
             # of pinning: it trusts every public CA and none of them has vouched for this box.
             raise CompressorEndpointError(
-                f"refusing to build a compressor client without the pinned certificate. Set "
-                f"{CA_ENV} to a copy of deploy/compressor-endpoint/compressor-cert.pem. The "
-                "endpoint is self-signed on purpose (it has no domain), so the public CA trust "
-                "store cannot verify it and must never be used as a fallback."
+                f"refusing to build a compressor client without the pinned certificate. Fetch it "
+                f"from the box (`{CERT_FETCH_HINT}`) and set {CA_ENV} to it. The endpoint is "
+                "self-signed on purpose (it has no domain), so the public CA trust store cannot "
+                "verify it and must never be used as a fallback."
             )
         else:
             # Pinning: the certificate becomes the client's ENTIRE trust store, so no public CA
@@ -169,10 +164,9 @@ class LLMLingua2EndpointCompressor:
     def from_env(cls, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> LLMLingua2EndpointCompressor:
         """Build from `WMO_COMPRESSOR_URL` / `WMO_COMPRESSOR_API_KEY` / `WMO_COMPRESSOR_CA`.
 
-        Fails closed on all three. The certificate resolves from `WMO_COMPRESSOR_CA` if set,
-        otherwise from the copy bundled beside the deploy scripts in a source checkout; if
-        neither exists (the installed-wheel case, where `deploy/` is absent) this raises rather
-        than falling back to the public CA store.
+        Fails closed on all three. The certificate comes from `WMO_COMPRESSOR_CA` and nowhere
+        else; unset or pointing at a missing file, this raises rather than falling back to the
+        public CA store.
         """
         base_url = os.environ.get(URL_ENV, "").strip()
         api_key = os.environ.get(KEY_ENV, "").strip()
@@ -182,8 +176,8 @@ class LLMLingua2EndpointCompressor:
                 f"compressor endpoint is not configured: {' and '.join(missing)} "
                 f"{'are' if len(missing) > 1 else 'is'} unset. Set {URL_ENV} to the endpoint "
                 f"(for example https://40.80.93.150:8443) and {KEY_ENV} to the bearer token "
-                "from the box (see deploy/compressor-endpoint/README.md), or select the "
-                "'identity' compressor to run without compression."
+                "issued by the box, or select the 'identity' compressor to run without "
+                "compression."
             )
         return cls(base_url, api_key, cert_path=cls._resolve_ca_path(), timeout_s=timeout_s)
 
@@ -194,19 +188,13 @@ class LLMLingua2EndpointCompressor:
         if configured:
             if not Path(configured).is_file():
                 raise CompressorEndpointError(
-                    f"{CA_ENV} points at '{configured}', which is not a file. It must be a copy "
-                    "of deploy/compressor-endpoint/compressor-cert.pem, the certificate the "
-                    "endpoint serves."
+                    f"{CA_ENV} points at '{configured}', which is not a file. It must be the "
+                    f"certificate the endpoint serves; fetch it with `{CERT_FETCH_HINT}`."
                 )
             return configured
-        if BUNDLED_CERT_PATH.is_file():
-            return str(BUNDLED_CERT_PATH)
         raise CompressorEndpointError(
-            f"the pinned certificate for the compressor endpoint was not found, so {CA_ENV} "
-            f"must be set. This build has no bundled copy at {BUNDLED_CERT_PATH} (expected when "
-            "WMO is installed from a wheel, which does not ship deploy/). Copy "
-            "deploy/compressor-endpoint/compressor-cert.pem from the repository, or fetch it "
-            f"with `scp h100-dev-box-6:/nvme/work/wmo-compressor/tls/cert.pem .`, and point "
+            f"the pinned certificate for the compressor endpoint is required, so {CA_ENV} must "
+            f"be set. The repository ships no copy: fetch it with `{CERT_FETCH_HINT}` and point "
             f"{CA_ENV} at it. The endpoint is self-signed by design, so the public CA trust "
             "store is not a fallback and is never used."
         )
@@ -230,7 +218,8 @@ class LLMLingua2EndpointCompressor:
                 f"'{REQUIRED_SELECTION_RULE}'. This client attests append stability, which only "
                 "holds for absolute-threshold selection; a percentile rule rewrites the "
                 "already-compressed prefix on every appended turn and must not be served. "
-                "Redeploy the box from deploy/compressor-endpoint/ before using this compressor."
+                "Reconfigure the box for absolute-threshold selection before using this "
+                "compressor."
             )
         self._max_segments = int(health.get("max_segments", self._max_segments))
         self._max_chars = int(health.get("max_chars", self._max_chars))
@@ -341,7 +330,7 @@ class LLMLingua2EndpointCompressor:
             if response.status_code == 401:
                 raise CompressorEndpointError(
                     f"compressor endpoint at {self.base_url} rejected the bearer token. Check "
-                    f"{KEY_ENV}; rotate it per deploy/compressor-endpoint/README.md if needed."
+                    f"{KEY_ENV}; the box's operator can rotate it."
                 )
             if response.status_code == 429:
                 raise CompressorEndpointError(
@@ -367,8 +356,7 @@ class LLMLingua2EndpointCompressor:
             except ValidationError as error:
                 raise CompressorEndpointError(
                     f"compressor endpoint at {self.base_url} returned a body this client does "
-                    f"not understand: {error}. Redeploy the box so its server.py matches this "
-                    "client (deploy/compressor-endpoint/deploy.sh)."
+                    f"not understand: {error}. Redeploy the box so its server matches this client."
                 ) from error
         raise CompressorEndpointError(
             f"compressor endpoint at {self.base_url} is unreachable ({last_error}). The "

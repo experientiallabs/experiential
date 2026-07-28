@@ -87,7 +87,7 @@ resume is how you raise `budget.max_usd` on a run that hit its cap.
 
 ## Before you spend
 
-Run the sub-cent gsm8k probe (`.agents/distill/tinker_probe_gsm8k.py`, operator scratch). It
+Run the sub-cent gsm8k probe (an operator scratch script, kept outside the repo). It
 exercises sample, score, `forward_backward` and `optim_step` end to end against Tinker for a
 fraction of a cent, and catches the failures that otherwise surface forty minutes into a paid run.
 

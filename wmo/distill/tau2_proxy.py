@@ -16,7 +16,7 @@ state. Within an episode tau2's orchestrator is sequential, which is the
 recorder's threading contract.
 
 The request/response mapping is deliberately thin: tau2 sends OpenAI
-chat-completion JSON, `ChatRequest`/`ChatResponse` (`llm_waterfall.types`)
+chat-completion JSON, `ChatRequest`/`ChatResponse` (`wmo.utils.waterfall.types`)
 ARE that wire shape, and `ToolCallingProvider.complete_chat` consumes and
 produces them directly. Tool schemas render into the prompt and sampled tool
 calls parse back through the provider's own renderer, the same path every
@@ -36,11 +36,11 @@ from dataclasses import dataclass, field
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from llm_waterfall.types import ChatRequest, ChatResponse, ChatTool
 from pydantic import JsonValue
 
 from wmo.core.types import JsonObject
 from wmo.providers.base import ToolCallingProvider
+from wmo.utils.waterfall.types import ChatRequest, ChatResponse, ChatTool
 
 logger = logging.getLogger(__name__)
 

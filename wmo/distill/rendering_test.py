@@ -12,19 +12,19 @@ import re
 import sys
 
 import pytest
-from llm_waterfall.types import (
-    ChatFunctionCall,
-    ChatFunctionDefinition,
-    ChatMessage,
-    ChatTool,
-    ChatToolCall,
-)
 
 from wmo.distill.rendering import (
     build_renderer,
     renderer_messages_from_chat,
     salvage_truncated_tool_call,
     tool_specs_from_chat,
+)
+from wmo.utils.waterfall.types import (
+    ChatFunctionCall,
+    ChatFunctionDefinition,
+    ChatMessage,
+    ChatTool,
+    ChatToolCall,
 )
 
 

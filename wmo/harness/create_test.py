@@ -15,7 +15,6 @@ from collections.abc import Callable
 from typing import ClassVar
 
 import pytest
-from llm_waterfall import ChatRequest, ChatResponse
 
 from wmo.core.types import JsonObject
 from wmo.engine.world_model import WorldModel
@@ -39,6 +38,7 @@ from wmo.harness.proposer import ProposalFailure, ProviderDeltaProposer
 from wmo.harness.runtime import Runtime
 from wmo.providers.base import Completion, Message, Provider, ProviderConfig, ProviderKind
 from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 _CAREFUL_PROMPT = "You are a careful agent. Verify the state of the system before submitting."
 

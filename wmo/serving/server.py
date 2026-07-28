@@ -1,7 +1,7 @@
 """Local FastAPI backend - the live environment agents call over HTTP.
 
 Routes are namespaced by world model name (`/world_models/{name}/...`) so one backend can serve
-several named models at once - from one or more store roots (`.wmo`, `examples/<task>`, ...).
+several named models at once - from one or more store roots (`.wmo`, a downloaded task dir, ...).
 Each route is a thin transport over an in-process `WorldModel`; the CLI and the API share the
 same code path. `GET /world_models` also returns each model's `card.json` (when present), and
 the `/world_models/builds` routes run new builds server-side so the website's build-your-own

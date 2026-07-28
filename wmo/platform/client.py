@@ -22,10 +22,10 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import BaseModel
 
 from wmo.core.types import Action, JsonObject, JsonValue, Observation
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 _TIMEOUT_SECONDS = 120.0
 _WORKSPACE_TIMEOUT_SECONDS = 300.0

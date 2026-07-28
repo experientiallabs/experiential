@@ -31,7 +31,6 @@ from environment_capture.hub import (
     fetch_corpus,
     published_corpora,
 )
-from llm_waterfall import is_capacity_error
 from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
@@ -140,6 +139,7 @@ from wmo.telemetry import (
     settings_root_from_results_root,
 )
 from wmo.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
+from wmo.utils.waterfall import is_capacity_error
 
 app = typer.Typer(
     help="Run agents, build world models from traces, and optimize agent harnesses.",
@@ -1121,7 +1121,8 @@ def download(
     """Download benchmark data bundles (trace corpus + task data) from the Hub.
 
     With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
-    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
+    picker. Bundles land in the `environment_capture.hub` data root (`environment-capture-data/`
+    under the working directory unless `$ENVCAP_DATA_ROOT` says otherwise); existing local files
     are kept unless `--force`.
     """
     selected = list(benchmarks or [])
@@ -1225,7 +1226,7 @@ def serve(
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
     Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root packages/environment-capture/tau-bench`). Two surfaces are
+    (e.g. `--root .wmo --root environment-capture-data/tau-bench`). Two surfaces are
     exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
     `.../step`; and, for every served model whose dir carries a `policy.json` (written by
     `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint
@@ -1371,8 +1372,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
         None,
-        help="Directory containing eval suites. Default: repo-local examples/ AND "
-        "packages/environment-capture/ (where the shipped suites live).",
+        help="Directory containing eval suites. Default: the downloaded benchmark data root "
+        "(environment-capture-data/, where the shipped suites live).",
     ),
     results_root: str = typer.Option(
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
@@ -1446,7 +1447,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
-    - `wmo eval list`: list named suites under `packages/environment-capture/<task>/evals/`.
+    - `wmo eval list`: list named suites under `environment-capture-data/<task>/evals/`.
     - `wmo eval run <suite>`: run a suite and save a local JSON result.
     - `wmo eval results optional-suite`: summarize local suite results.
     - `wmo eval grid <suite>`: run the model x condition grid for a suite and chart it (needs the
@@ -2767,8 +2768,8 @@ def _resolve_model_any(name: str | None, root: str) -> tuple[Path, str]:
     """Which artifact a read command should open, as `(store_root, resolved_name)`.
 
     A `--root` pointing somewhere other than the default project dir keeps single-root behavior.
-    Otherwise the search spans `<root>/models/*` plus the shipped `examples/*/models/*` and
-    `packages/environment-capture/*/models/*`, so `demo`, `play` and `knowledge` all agree on
+    Otherwise the search spans `<root>/models/*` plus the downloaded `<data root>/*/models/*`,
+    so `demo`, `play` and `knowledge` all agree on
     which models exist.
     """
     if not _is_default_project_dir(root):
@@ -2853,9 +2854,16 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
 
 
 def _benchmark_roots() -> tuple[Path, ...]:
-    """Every root holding self-contained task dirs: examples/ + the capture member's data dirs."""
-    repo = Path(__file__).resolve().parents[2]
-    return (repo / "examples", repo / "packages" / "environment-capture")
+    """Every root holding self-contained task dirs.
+
+    Benchmark data is not vendored in this repo: `wmo download` writes bundles through
+    `environment_capture.hub`, which owns where they land (`$ENVCAP_DATA_ROOT` if set, else
+    `environment-capture-data/` under the working directory). Deriving the root from
+    `corpus_path` instead of hardcoding one keeps discovery pointed wherever download wrote,
+    including when the override moves it.
+    """
+    # corpus_path is `<root>/<benchmark>/traces.otel.jsonl`, so its grandparent is the root.
+    return (corpus_path(next(iter(CORPORA))).parent.parent,)
 
 
 def _discover_examples() -> list[Path]:
@@ -3317,7 +3325,7 @@ def _exit_serve_provider_failure(
 
 
 # Top-level modules whose exceptions mean "the backend refused", not "wmo has a bug": the provider
-# SDKs plus the HTTP transports they raise through. llm-waterfall gates its capacity/client
+# SDKs plus the HTTP transports they raise through. waterfall gates its capacity/client
 # classification on the same set; this one answers a different question (is a credential hint the
 # right thing to print?), so it stays a local literal rather than importing a private name.
 _PROVIDER_SDK_MODULES = frozenset(

@@ -8,8 +8,6 @@ on:
       - "uv.lock"
       - "README.md"
       - "wmo/**"
-      - "packages/llm-waterfall/llm_waterfall/**"
-      - "packages/llm-waterfall/LICENSE"
   push:
     branches: [main]
     paths:
@@ -18,8 +16,6 @@ on:
       - "uv.lock"
       - "README.md"
       - "wmo/**"
-      - "packages/llm-waterfall/llm_waterfall/**"
-      - "packages/llm-waterfall/LICENSE"
   release:
     types: [published]
 

@@ -11,8 +11,9 @@ from __future__ import annotations
 import json
 from typing import Any, cast
 
-from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
+
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 
 def responses_request(

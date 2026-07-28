@@ -101,7 +101,7 @@ def test_build_env_prompt_defaults_are_byte_identical_to_v1() -> None:
     """Pin the default rendering: prebuilt models must keep serving unchanged.
 
     `knowledge`/`reasoning` are opt-in; with both off, the prompt must be byte-for-byte what it
-    was before they existed. If this test breaks, existing `examples/*/models/` artifacts (and
+    was before they existed. If this test breaks, existing `<task>/models/` artifacts (and
     GEPA-optimized prompts evolved against this shape) silently degrade — change with care and
     regenerate/version the shipped models.
     """

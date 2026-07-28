@@ -71,8 +71,6 @@ from typing import TYPE_CHECKING, Literal
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from llm_waterfall.types import ChatChoice, ChatRequest, ChatResponse, ChatTool, ChatToolCall
-from llm_waterfall.types import ChatMessage as ProviderChatMessage
 from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
 from starlette.background import BackgroundTask
 
@@ -110,6 +108,8 @@ from wmo.providers.pool import PoolEntry, pool_provider
 from wmo.serving.endpoint_config import EndpointConfig
 from wmo.serving.query_embeddings import QueryEmbeddingStore
 from wmo.serving.savings import EndpointSavings, SavingsWindow, compute_savings
+from wmo.utils.waterfall.types import ChatChoice, ChatRequest, ChatResponse, ChatTool, ChatToolCall
+from wmo.utils.waterfall.types import ChatMessage as ProviderChatMessage
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -145,7 +145,7 @@ class ChatMessage(BaseModel):
 
     The tool-calling half is the shape an agent replays: `tool_calls` on the assistant turn it
     got back, then one `role="tool"` message per result carrying the `tool_call_id` it answers.
-    Both reuse llm-waterfall's models (`ChatToolCall`), the same types `complete_chat` takes, so
+    Both reuse waterfall's models (`ChatToolCall`), the same types `complete_chat` takes, so
     a call survives the hop to the provider without a second parallel definition of the format.
     """
 

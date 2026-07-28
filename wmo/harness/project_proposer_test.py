@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from llm_waterfall import ChatResponse
 
 from wmo.agents.default import default_agent
 from wmo.agents.optimizer import optimizer_agent
@@ -24,6 +23,7 @@ from wmo.harness.runtime import TokenUsage
 from wmo.harness.scoring import ScoreCell, ScoreReport, ScoreRequest
 from wmo.harness.source_tree import HarnessSourceFile, HarnessSourceTree
 from wmo.providers.base import ProviderConfig, ProviderKind, ToolCallingProvider
+from wmo.utils.waterfall import ChatResponse
 
 
 @dataclass(frozen=True)

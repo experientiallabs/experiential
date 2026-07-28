@@ -67,7 +67,7 @@ are never committed.
 
 ## Reproducing a full grid
 
-The trace corpora are the ones under `packages/environment-capture/<suite>/` (e.g.
+The trace corpora are the ones under `environment-capture-data/<suite>/` (e.g.
 `kimi-gui-control`, `tau-bench`, `terminal-tasks`, `swe-bench`) - fetch a corpus with
 `wmo download <suite>`, evolve one prompt per (suite × model) with `wmo build`, collect them into a
 `--gepa-prompts` directory as `<label>.txt`, then run `wmo eval grid <suite>/default` per benchmark

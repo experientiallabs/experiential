@@ -623,14 +623,14 @@ def test_config_help_does_not_reuse_the_harness_group_name() -> None:
 
 
 def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
-    # The OpenAI-compatible surface is what README step 3 exists for, and examples/tau-bench
-    # moved to packages/environment-capture/ — the help must name both correctly.
+    # The OpenAI-compatible surface is what README step 3 exists for, and benchmark data now
+    # arrives via `wmo download` — the help must name the endpoint and the real data root.
     result = runner.invoke(app, ["serve", "--help"])
     assert result.exit_code == 0, result.output
     output = _flat(result.output)
     assert "/v1/chat/completions" in output
     assert "examples/tau-bench" not in output
-    assert "packages/environment-capture/tau-bench" in output
+    assert "environment-capture-data/tau-bench" in output
 
 
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1437,15 +1437,48 @@ def test_providers_set_does_not_save_a_failed_provider(monkeypatch, tmp_path) ->
     assert load_settings(root).models.worker is None
 
 
-def test_examples_list_shows_task_folders() -> None:
+def _fake_data_root(tmp_path: Path, *names: str) -> Path:
+    """A `wmo download` data root holding one self-contained task dir per name.
+
+    Benchmark data is not committed any more (it arrives via `wmo download`), so discovery is
+    exercised against a root built here rather than against whatever the checkout happens to
+    contain — which in CI is nothing.
+    """
+    root = tmp_path / "environment-capture-data"
+    for name in names:
+        task = root / name
+        task.mkdir(parents=True)
+        (task / "traces.otel.jsonl").write_text("", encoding="utf-8")
+        run_sh = task / "run.sh"
+        run_sh.write_text("#!/bin/sh\n", encoding="utf-8")
+        run_sh.chmod(0o755)  # `examples run` refuses a non-executable launcher
+    return root
+
+
+def test_examples_list_shows_task_folders(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    root = _fake_data_root(tmp_path, "tau-bench", "swe-bench", "terminal-tasks")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (root,))
+
     result = runner.invoke(app, ["examples", "list"])
+
     assert result.exit_code == 0, result.output
     assert "tau-bench" in result.output
     assert "swe-bench" in result.output
     assert "terminal-tasks" in result.output
 
 
-def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN001
+def test_examples_list_with_nothing_downloaded_says_so(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+    # The fresh-checkout case now that no benchmark data is committed: an empty list is the
+    # honest answer, not a crash.
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path / "absent",))
+
+    result = runner.invoke(app, ["examples", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "no examples found" in result.output
+
+
+def test_examples_run_invokes_task_launcher(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
     seen: dict[str, object] = {}
 
     def fake_run(command: list[str], *, cwd: object, check: bool) -> subprocess.CompletedProcess:
@@ -1454,15 +1487,17 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
         seen["check"] = check
         return subprocess.CompletedProcess(command, 0)
 
+    root = _fake_data_root(tmp_path, "tau-bench")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (root,))
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     result = runner.invoke(app, ["examples", "run", "tau-bench", "--", "--trace", "0"])
 
     assert result.exit_code == 0, result.output
     command = cast(list[str], seen["command"])
-    assert command[0].endswith("environment-capture/tau-bench/run.sh")
+    assert command[0] == str(root / "tau-bench" / "run.sh")
     assert command[1:] == ["--trace", "0"]
-    assert str(seen["cwd"]).endswith("environment-capture/tau-bench")
+    assert seen["cwd"] == root / "tau-bench"
     assert seen["check"] is False
 
 
@@ -1863,8 +1898,8 @@ def test_eval_help_lists_every_dispatched_flow() -> None:
     # The grid family owns six of this command's options, so its tokens must be discoverable.
     for token in ("grid <suite>", "grid-plot", "grid-heatmap", "agreement"):
         assert token in flat
-    # Suites moved out of examples/ long ago; the help must not send readers to the wrong dir.
-    assert "packages/environment-capture" in flat
+    # Suites live beside the downloaded corpus; the help must not send readers to a repo dir.
+    assert "environment-capture-data" in flat
 
 
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -3130,32 +3165,6 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
     assert fetched == ["a-bench", "z-bench"]  # kept going past the 404
     assert result.exit_code != 0  # ...but the failure is still reported at the end
     assert "broken" in result.output
-
-
-def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    # A fetch now tries more than one dataset repo name (the wmh -> wmo rename), so a bare
-    # "404" cannot be acted on: the report must say which ids were looked for. The CLI reads
-    # that off plain HTTPError attributes (no import of the newer member symbol), so this also
-    # covers the wheel, which resolves environment-capture from PyPI.
-    import urllib.error
-    from http.client import HTTPMessage
-
-    from environment_capture.hub import CorpusRepoUnavailable, candidate_repo_ids
-
-    attempts = [
-        (repo_id, urllib.error.HTTPError(f"https://hub/{repo_id}", 404, "nf", HTTPMessage(), None))
-        for repo_id in candidate_repo_ids("dabstep")
-    ]
-
-    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
-        raise CorpusRepoUnavailable(name, "main", attempts)
-
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
-    result = runner.invoke(app, ["download", "dabstep"])
-    assert result.exit_code != 0
-    for repo_id in candidate_repo_ids("dabstep"):
-        assert repo_id in result.output
 
 
 def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001

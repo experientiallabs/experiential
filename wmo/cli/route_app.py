@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import cast
 
 import typer
-from llm_waterfall import ChatMaxTokensField
 from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
@@ -90,6 +89,7 @@ from wmo.providers.pool import (
     load_pool,
     upsert_pool_entry,
 )
+from wmo.utils.waterfall import ChatMaxTokensField
 
 # The two output-budget parameter names any OpenAI-compatible backend accepts.
 _MAX_TOKENS_FIELDS: tuple[ChatMaxTokensField, ...] = ("max_tokens", "max_completion_tokens")

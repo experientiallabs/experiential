@@ -46,7 +46,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
-from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
 
 from wmo.core.types import JsonObject
@@ -54,6 +53,7 @@ from wmo.harness.runner_link import Channel, TokenUsage, WorkerFn, params_schema
 from wmo.harness.runtime import DEFAULT_MAX_OUTPUT_TOKENS
 from wmo.harness.tools import READ_SKILL, SUBMIT, ToolSpec
 from wmo.providers.base import ToolCallingProvider
+from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 # The action budget a single user turn may spend before the runner is told to stop — the live
 # analogue of `HostEpisode.max_env_actions`, so a champion optimized under that pressure behaves

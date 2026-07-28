@@ -3,7 +3,7 @@
 Interactive commands (`wmo demo` / `wmo play`) wrap the serve provider in this so a transient
 throttle or 5xx becomes "retry 1/3 in 1s..." instead of a traceback. Non-capacity errors (bad
 request, auth) propagate immediately — retrying those only hides real bugs. Classification is
-llm-waterfall's (the same contract the failover chain uses), so a wrapped WaterfallProvider whose
+waterfall's (the same contract the failover chain uses), so a wrapped WaterfallProvider whose
 whole chain exhausts still reads as capacity here and gets the narrated retry.
 """
 
@@ -12,8 +12,6 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from typing import TypeVar
-
-from llm_waterfall import is_capacity_error
 
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
@@ -27,6 +25,7 @@ from wmo.providers.base import (
     ToolCallingProvider,
     VerifyResult,
 )
+from wmo.utils.waterfall import is_capacity_error
 
 # attempt -> sleep before the next try
 _DELAYS = (1.0, 3.0, 9.0)

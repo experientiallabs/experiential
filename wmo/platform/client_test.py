@@ -9,7 +9,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from llm_waterfall.types import ChatMessage, ChatRequest
 
 from wmo.core.types import Action, ActionKind
 from wmo.platform.client import (
@@ -19,6 +18,7 @@ from wmo.platform.client import (
     RemoteAgentSession,
     fetch_cli_config,
 )
+from wmo.utils.waterfall.types import ChatMessage, ChatRequest
 
 API_URL = "https://api.test"
 

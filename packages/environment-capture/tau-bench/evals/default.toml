@@ -1,6 +1,0 @@
-title = "Tau Bench default replay"
-description = "Open-loop reconstruction fidelity over the bundled tau-bench trace corpus."
-files = ["../traces.otel.jsonl"]
-sample_turns = "all"
-seed = 0
-

@@ -1,18 +1,18 @@
-"""A Provider backed by llm-waterfall: fail over across a chain of backends on capacity errors.
+"""A Provider backed by the waterfall: fail over across a chain of backends on capacity errors.
 
-Wraps `llm_waterfall.Waterfall` (github.com/experientiallabs/llm-waterfall) behind the wmo
+Wraps `wmo.utils.waterfall.Waterfall` behind the wmo
 `Provider` protocol so long GEPA/eval runs degrade gracefully to the next backend instead of
 aborting when the preferred model throttles. Capacity errors (throttling / transient 5xx /
 timeouts) spill down the chain; real errors (bad request, auth) propagate immediately.
 
 `config` reports the *primary* config (the model we intend to use); per-call metering is still
 attributed to the model that actually served, via `Completion.model`. The full attempt trail and
-`provider_used` stay on the underlying package result — use `llm_waterfall.Waterfall` directly
+`provider_used` stay on the underlying package result — use `wmo.utils.waterfall.Waterfall` directly
 when a caller needs failover observability beyond cost attribution.
 
 Note on `embed`: the Provider protocol returns bare vectors, so embed usage/attribution is not
 carried through. Failover also assumes the chain shares one embedding space — keep `embed_model`
-consistent across rungs (see the llm-waterfall README).
+consistent across rungs (see `wmo.utils.waterfall`).
 """
 
 from __future__ import annotations
@@ -23,19 +23,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol
 
-from llm_waterfall import (
-    Backend,
-    ChatMaxTokensField,
-    ChatRequest,
-    ChatResponse,
-    ChatResult,
-    CompletionResult,
-    EmbeddingResult,
-    RetryPolicy,
-    Waterfall,
-)
-from llm_waterfall import Message as WfMessage
-from llm_waterfall import VerifyResult as WfVerifyResult
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from wmo.providers.base import (
@@ -50,8 +37,21 @@ from wmo.providers.base import (
 )
 from wmo.providers.bedrock import resolve_region
 from wmo.providers.registry import get_provider
+from wmo.utils.waterfall import (
+    Backend,
+    ChatMaxTokensField,
+    ChatRequest,
+    ChatResponse,
+    ChatResult,
+    CompletionResult,
+    EmbeddingResult,
+    RetryPolicy,
+    Waterfall,
+)
+from wmo.utils.waterfall import Message as WfMessage
+from wmo.utils.waterfall import VerifyResult as WfVerifyResult
 
-# ProviderKinds with a REAL llm-waterfall adapter, mapped to the package's provider names
+# ProviderKinds with a REAL waterfall adapter, mapped to the package's provider names
 # (wmo's azure value is "azure"; the package spells it "azure_openai"). OPENAI_RESPONSES has no
 # equivalent — the package speaks chat-completions; keep wmo's native provider for it.
 _KIND_TO_PROVIDER = {
@@ -64,7 +64,7 @@ _SUPPORTED_KINDS = frozenset(_KIND_TO_PROVIDER)
 
 
 def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend:
-    """Map a wmo ProviderConfig onto an llm-waterfall Backend.
+    """Map a wmo ProviderConfig onto a waterfall Backend.
 
     `profile` selects a named AWS profile (Bedrock), letting one chain span multiple accounts —
     wmo configs don't model that, so it's a separate argument (see `WaterfallProvider(profiles=)`).
@@ -78,7 +78,7 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
     provider = _KIND_TO_PROVIDER.get(config.kind)
     if provider is None:
         raise ValueError(
-            f"provider kind {config.kind.value!r} has no llm-waterfall backend; supported: "
+            f"provider kind {config.kind.value!r} has no waterfall backend; supported: "
             f"{', '.join(sorted(k.value for k in _SUPPORTED_KINDS))}"
         )
     region = config.region
@@ -99,7 +99,7 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
 
 
 class WaterfallLike(Protocol):
-    """The slice of `llm_waterfall.Waterfall` this provider uses (injectable in tests)."""
+    """The slice of `wmo.utils.waterfall.Waterfall` this provider uses (injectable in tests)."""
 
     def complete(
         self,
@@ -254,7 +254,7 @@ def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Cha
             raise ValueError(f"{where} is invalid (unknown key or bad value): {exc}") from None
         if rung.kind not in _SUPPORTED_KINDS:
             raise ValueError(
-                f"{where}: kind {rung.kind.value!r} has no llm-waterfall backend; "
+                f"{where}: kind {rung.kind.value!r} has no waterfall backend; "
                 f"supported: {sorted(k.value for k in _SUPPORTED_KINDS)}"
             )
         if rung.api_key is not None:

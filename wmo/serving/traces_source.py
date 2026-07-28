@@ -35,7 +35,7 @@ def local_traces_path(model_dir: Path) -> Path | None:
     downloaded = model_dir / TRACES_FILENAME
     if downloaded.is_file():
         return downloaded
-    # examples/<task>/traces.otel.jsonl sits two levels above examples/<task>/models/<name>/.
+    # <task>/traces.otel.jsonl sits two levels above <task>/models/<name>/.
     sibling = model_dir.parent.parent / TRACES_FILENAME
     if sibling.is_file():
         return sibling

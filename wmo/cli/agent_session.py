@@ -71,9 +71,8 @@ from wmo.providers.registry import get_provider
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from llm_waterfall import ChatRequest, ChatResponse
-
     from wmo.core.types import JsonObject
+    from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 _console = Console()
 

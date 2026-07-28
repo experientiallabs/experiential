@@ -1,4 +1,4 @@
-"""Tests for the llm-waterfall backed provider (fake waterfall — no SDKs, no network)."""
+"""Tests for the waterfall backed provider (fake waterfall — no SDKs, no network)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from llm_waterfall import (
+
+from wmo.providers.base import Message, ProviderConfig, ProviderKind
+from wmo.providers.bedrock import AWS_DEFAULT_REGION_ENV, AWS_REGION_ENV
+from wmo.providers.waterfall import WaterfallProvider, provider_or_chain, to_backend
+from wmo.utils.waterfall import (
     Backend,
     ChatRequest,
     ChatResponse,
@@ -15,13 +19,9 @@ from llm_waterfall import (
     EmbeddingResult,
     Waterfall,
 )
-from llm_waterfall import Message as WfMessage
-from llm_waterfall import TokenUsage as WfTokenUsage
-from llm_waterfall import VerifyResult as WfVerifyResult
-
-from wmo.providers.base import Message, ProviderConfig, ProviderKind
-from wmo.providers.bedrock import AWS_DEFAULT_REGION_ENV, AWS_REGION_ENV
-from wmo.providers.waterfall import WaterfallProvider, provider_or_chain, to_backend
+from wmo.utils.waterfall import Message as WfMessage
+from wmo.utils.waterfall import TokenUsage as WfTokenUsage
+from wmo.utils.waterfall import VerifyResult as WfVerifyResult
 
 
 class _FakeWaterfall:
@@ -129,7 +129,7 @@ def test_to_backend_resolves_model_chat_parameters() -> None:
 
 def test_to_backend_rejects_kinds_without_real_adapters() -> None:
     # openai_responses has no package equivalent (the package speaks chat-completions).
-    with pytest.raises(ValueError, match="no llm-waterfall backend"):
+    with pytest.raises(ValueError, match="no waterfall backend"):
         to_backend(ProviderConfig(kind=ProviderKind.OPENAI_RESPONSES, model="m"))
 
 
@@ -304,7 +304,7 @@ def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="is invalid"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
     path.write_text('[[chain.c]]\nkind = "openai_responses"\nmodel = "m"\n')
-    with pytest.raises(ValueError, match="no llm-waterfall backend"):
+    with pytest.raises(ValueError, match="no waterfall backend"):
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
     path.write_text('[[chain.c]]\nkind = "bedrock"\nmodel = "m"\napi_key = "sk-x"\n')
     with pytest.raises(ValueError, match="api_key only applies"):

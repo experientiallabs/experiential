@@ -72,12 +72,12 @@ Get the corpus, then build:
 ```bash
 uv run wmo download tau-bench
 uv run wmo build \
-  --file packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --file environment-capture-data/tau-bench/traces.otel.jsonl \
   --name tau-bench --fidelity low --embed-provider hashing
 ```
 
 `wmo download` fetches the published data bundle (trace corpus plus task data) into
-`packages/environment-capture/tau-bench/`; run it with no arguments for a picker over everything
+`environment-capture-data/tau-bench/`; run it with no arguments for a picker over everything
 published. `--source` defaults to `otel-genai`, which is what that corpus is. Traces from an
 observability stack (Phoenix, Langfuse, LangSmith, Braintrust, PostHog, Mastra) go through the
 same command with `--source <name>`, or through `wmo ingest` first.
@@ -145,7 +145,7 @@ Look at the thing before optimizing it:
 ```bash
 uv run wmo play --name tau-bench      # step in yourself
 uv run wmo demo --name tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl   # replay one, open loop
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl   # replay one, open loop
 ```
 
 `wmo demo` needs the corpus because a build keeps no copy of the traces it read, only the prompts,
@@ -211,7 +211,7 @@ This is the whole routing workflow, and it has one question in it.
 
 ```bash
 uv run wmo optimize model tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl \
   --scenarios 8
 ```
 
@@ -392,7 +392,7 @@ to any of them and the next `optimize model` run notices and resumes around it.
 ```bash
 # 1. buy the evidence (the only paid step)
 uv run wmo optimize route sweep tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl \
   --pool .wmo/pool.toml --scenarios 8 --out matrix.json
 
 # 2. fit the policy
@@ -486,7 +486,7 @@ Measure a compressed arm, then fit in the same geometry:
 
 ```bash
 uv run wmo optimize route sweep tau-bench \
-  --traces packages/environment-capture/tau-bench/traces.otel.jsonl \
+  --traces environment-capture-data/tau-bench/traces.otel.jsonl \
   --compressor llmlingua2-endpoint --aggressiveness 0.4 --out matrix-c04.json
 
 uv run wmo optimize route fit matrix-c04.json --kind knn \

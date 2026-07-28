@@ -85,14 +85,16 @@ rule. In particular verify:
 - Checks are clean, scoped to the diff: `uv run ruff check .` and `uv run ty check` (both fast)
   always; pytest targeted at the packages the PR touches (`uv run pytest wmo/<pkg>/ -q`) during
   fix iterations. Run the full `uv run pytest -q` only once, before the final hand-off, and only
-  when the PR touches `wmo/` code at all (docs/skills-only diffs skip it). If the PR touches
-  `web/`, also run `npm run lint` and `npx tsc --noEmit` from `web/`.
+  when the PR touches `wmo/` code at all (docs/skills-only diffs skip it).
 - Module docstrings and Google-style docstrings on significant classes/functions.
 - Tests live inline next to the code (`foo.py` → `foo_test.py`); new behavior has a test or eval
   that would catch its regression.
 - No `Any`, bare `dict`/`object`, or untyped `**kwargs` where a concrete type is practical.
-- No new top-level `benchmarks/`, `docs/`, `scripts/`, `tools/`, or `world-models/` surfaces;
-  dataset-specific logic stays under `examples/<task>/`.
+- NO new top-level directory or file, of any name, unless the PR description records that a
+  human granted permission for that exact name (AGENTS.md rule 5). The tracked top level is
+  closed: `wmo/`, `docs/`, `assets/`, `.claude/`, `.github/`. Reusable code goes in `wmo/`
+  (self-contained building blocks in `wmo/utils/`), finished reports in `docs/`, and scratch
+  work outside the repo entirely. Benchmark data is a dependency, never a directory.
 - Imports at module scope, fail-fast; no silent `ImportError` fallbacks.
 - End-to-end verification was actually done for anything with a runtime surface — drive it,
   don't just trust exit codes.

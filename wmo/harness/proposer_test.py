@@ -7,7 +7,6 @@ from collections.abc import Callable, Collection
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatResponse
 
 from wmo.agents.default import default_agent
 from wmo.agents.meta import meta_agent
@@ -25,6 +24,7 @@ from wmo.providers.base import (
     ToolCallingProvider,
     VerifyResult,
 )
+from wmo.utils.waterfall import ChatResponse
 
 
 def _trigger() -> FailureSignature:

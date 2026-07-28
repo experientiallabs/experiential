@@ -3,9 +3,9 @@
 from typing import cast
 
 import pytest
-from llm_waterfall import ChatRequest
 
 from wmo.providers._bedrock_chat import converse_request, converse_response
+from wmo.utils.waterfall import ChatRequest
 
 
 def test_converse_round_trip_preserves_tools_results_and_usage() -> None:

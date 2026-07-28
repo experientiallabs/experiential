@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict
 
 from wmo.providers.base import ProviderKind
+from wmo.utils.waterfall import ChatMaxTokensField
 
 
 class ProviderModel(BaseModel):
