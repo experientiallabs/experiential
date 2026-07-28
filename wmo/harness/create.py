@@ -386,17 +386,13 @@ def gate_delta(
 
 def _is_perfect(report: ClosedLoopReport) -> bool:
     """Return whether every task and every assertion passed."""
-    return (
-        report.success_rate >= 1.0 - _TIE_EPS
-        and report.mean_fraction >= 1.0 - _TIE_EPS
-    )
+    return report.success_rate >= 1.0 - _TIE_EPS and report.mean_fraction >= 1.0 - _TIE_EPS
 
 
 def _strictly_improves_full_objective(verdict: GateRecord) -> bool:
     """Require positive full-split evidence after non-regression gates pass."""
     return verdict.full_delta > _TIE_EPS or (
-        abs(verdict.full_delta) <= _TIE_EPS
-        and verdict.full_fraction_delta > _TIE_EPS
+        abs(verdict.full_delta) <= _TIE_EPS and verdict.full_fraction_delta > _TIE_EPS
     )
 
 
@@ -616,8 +612,7 @@ def create_harness(
             if _is_perfect(parent_report):
                 subject = "seed" if completed_iterations == 0 else "champion"
                 _note(
-                    f"{subject} already passes every task and assertion; "
-                    "stopping before proposals"
+                    f"{subject} already passes every task and assertion; stopping before proposals"
                 )
                 break
             # Eval runners from the previous iteration would otherwise sit idle through the

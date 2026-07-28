@@ -747,9 +747,7 @@ def test_exact_full_objective_tie_is_audited_but_not_promoted() -> None:
                 target = "target task" in user
                 results = []
                 for assertion in _gold_assertions(user):
-                    passed = (
-                        child and target and assertion == "a target improvement"
-                    ) or (
+                    passed = (child and target and assertion == "a target improvement") or (
                         not child and not target and assertion == "kept partial credit"
                     )
                     results.append({"assertion": assertion, "passed": passed, "why": "x"})
@@ -2168,9 +2166,7 @@ def test_next_iteration_uses_winner_then_stops_when_perfect() -> None:
     """Search advances through an improving parent and buys nothing after perfection."""
     seed = HarnessDoc.baseline("seed")
     provider = _RankedMetaProvider([])
-    proposer = _ParentRecordingProposer(
-        ["You are a weak agent.", "You are a strong agent."]
-    )
+    proposer = _ParentRecordingProposer(["You are a weak agent.", "You are a strong agent."])
     tasks = [
         TaskSpec(task_id="t1", instruction="task one", gold=["the work completed"]),
         TaskSpec(task_id="t2", instruction="task two", gold=["the work completed"]),
