@@ -200,8 +200,9 @@ confirmation before anything is spent; unpriced meters print as `unknown`, and a
 unpriced meters and no `budget.max_usd` refuses to start non-interactively.
 
 Consent is said, never inferred. There is nobody to ask on a non-interactive session (CI, cron,
-piped output), so the run refuses there with exit code 2 unless `--yes` was passed, printing what
-it would have spent and the flag that authorizes it. A bounded `budget.max_usd` caps the damage
+piped output, or a redirected stdin, which is not a person even when stdout is a terminal), so the
+run refuses there with exit code 2 unless `--yes` was passed, printing what it would have spent
+and the flag that authorizes it. A bounded `budget.max_usd` caps the damage
 but is not permission, so it does not change that.
 
 ## Running it

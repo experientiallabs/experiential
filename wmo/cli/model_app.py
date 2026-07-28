@@ -43,7 +43,7 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.agents.default import default_agent
-from wmo.cli.consent import require_spend_consent
+from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.model_roles import load_settings_or_abort
 from wmo.config import ARTIFACT_DIR
 from wmo.config.settings import ModelRole, save_settings, settings_path
@@ -168,7 +168,8 @@ def run(
         False,
         "--yes",
         help="Consent to the projected spend up front. Required in a non-interactive "
-        "session (CI, cron, piped output), where the run otherwise refuses to start.",
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
 ) -> None:
@@ -943,14 +944,20 @@ def _confirm_cost(
             "budget.max_usd is unset: the run's spend is unbounded and unaccounted, "
             "so --yes does not apply here"
         )
-        if not console.is_terminal:
+        # `can_prompt`, not `console.is_terminal`: the question below reads stdin, so a terminal
+        # stdout with a redirected stdin has nobody behind it to answer for unbounded spend.
+        if not can_prompt(console):
             raise typer.BadParameter(
                 f"cannot start with unbounded spend non-interactively: meter(s) "
                 f"{meters} are unpriced and budget.max_usd is unset; add [pricing] "
                 "entries for them or set [budget] max_usd in the distill config, "
-                "or run at a TTY to confirm explicitly"
+                "or run it interactively to confirm explicitly"
             )
-        if not Confirm.ask("Proceed with unbounded spend?", default=False):
+        try:
+            confirmed = Confirm.ask("Proceed with unbounded spend?", default=False)
+        except EOFError:
+            confirmed = False  # an ended input is not an answer, and never authorizes spend
+        if not confirmed:
             raise typer.Exit(0)
         return
     # Consent is said, never inferred: a bounded budget caps the damage but does not grant

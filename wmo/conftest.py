@@ -1,8 +1,9 @@
 """Suite-wide fixtures.
 
-Both fixtures here enforce the same rule: a test must behave identically on a machine that has
-developer state (a failover chain, a fetched OpenRouter price catalog) and one that does not,
-and no test may reach the network.
+The two autouse fixtures enforce the same rule: a test must behave identically on a machine
+that has developer state (a failover chain, a fetched OpenRouter price catalog) and one that
+does not, and no test may reach the network. `interactive_stdin` is opt-in and does the
+opposite job: it supplies the interactive session a prompt test needs.
 """
 
 from __future__ import annotations
@@ -44,3 +45,19 @@ def _offline_openrouter_catalog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 def _refuse_network() -> openrouter_pricing.PriceCatalog:
     """Stand-in for the live catalog fetch: tests never reach openrouter.ai."""
     raise RuntimeError("the test suite does not fetch the OpenRouter catalog")
+
+
+@pytest.fixture
+def interactive_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Present a terminal stdin, for a test that has to reach an interactive prompt.
+
+    `wmo.cli.consent.can_prompt` requires a TTY on BOTH streams, so forcing a terminal `Console`
+    (stdout) is not enough on its own: a spend gate refuses before any prompt is offered. This
+    is the input-side counterpart of rich's `force_terminal`, and it patches the seam rather
+    than `sys.stdin` because pytest's capture stub and `click.testing.CliRunner` both install a
+    non-terminal `sys.stdin` of their own. Tests that need to control what the prompt READS
+    replace `sys.stdin` directly instead.
+    """
+    from wmo.cli import consent
+
+    monkeypatch.setattr(consent, "_stdin_is_terminal", lambda: True)

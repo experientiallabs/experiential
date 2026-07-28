@@ -28,7 +28,7 @@ from rich.table import Table
 from wmo.agents.default import default_agent
 from wmo.agents.optimizer import optimizer_agent
 from wmo.agents.project import AgentProject
-from wmo.cli.consent import require_spend_consent
+from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.config.store import validate_name
@@ -232,7 +232,8 @@ def optimize(
         False,
         "--yes",
         help="Consent to the projected spend up front. Required in a non-interactive "
-        "session (CI, cron, piped output), where the run otherwise refuses to start.",
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
     ),
     harbor_config: str = typer.Option(
         None,
@@ -375,14 +376,17 @@ def optimize(
             "--iterations 0 (score-only) applies only to the harbor environment; "
             "world-model optimization needs at least one search iteration"
         )
-    interactive = _console.is_terminal
+    # The same both-streams test the spend gate below uses: a terminal stdout with a redirected
+    # stdin has nobody to answer the wizard, and asking anyway raised EOFError at the first
+    # `Prompt.ask` instead of the usage error that names the missing option.
+    interactive = can_prompt(_console)
     if name is None:
         if not interactive:
-            raise typer.BadParameter("provide a harness NAME (or run at a TTY for the wizard)")
+            raise typer.BadParameter("provide a harness NAME (or run interactively for the wizard)")
         name = Prompt.ask("Name for the created harness", default="evolved")
     if tasks_file is None:
         if not interactive:
-            raise typer.BadParameter("provide --tasks (or run at a TTY for the wizard)")
+            raise typer.BadParameter("provide --tasks (or run interactively for the wizard)")
         tasks_file = Prompt.ask("Task file (JSONL of task_id/instruction/gold)")
     if iterations is None:
         iterations = (

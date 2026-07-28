@@ -1703,7 +1703,7 @@ def test_route_sweep_hands_off_when_every_candidate_lost_the_same_scenario(
 
 
 def test_route_sweep_declining_the_confirmation_spends_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
@@ -1721,7 +1721,7 @@ def test_route_sweep_declining_the_confirmation_spends_nothing(
 
 
 def test_route_sweep_confirming_at_a_tty_runs_the_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())

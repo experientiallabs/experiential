@@ -253,7 +253,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         False,
         "--yes",
         help="Consent to the projected spend up front. Required in a non-interactive "
-        "session (CI, cron, piped output), where a spending run otherwise refuses to start.",
+        "session (CI, cron, piped output, redirected input), where a spending run "
+        "otherwise refuses to start.",
     ),
     dry_run: bool = typer.Option(
         False,
@@ -1089,7 +1090,8 @@ def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> b
     run of only those does not need permission to happen.
 
     A non-interactive session cannot answer, so a spending run REFUSES rather than proceeding:
-    consent must be said (`--yes`), never inferred from the absence of a terminal. Every spend
+    consent must be said (`--yes`), never inferred from the absence of an interactive session on
+    BOTH streams (a redirected stdin is not a person, even under a terminal stdout). Every spend
     surface (`route sweep`, `optimize distill`, both harness environments) shares the one
     implementation in `wmo.cli.consent`; all of them originally shipped
     proceed-silently-or-note, and the proceed branch here cost a scripted caller real money it

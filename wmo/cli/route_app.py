@@ -183,7 +183,8 @@ def sweep(
         False,
         "--yes",
         help="Consent to the projected spend up front. Required in a non-interactive "
-        "session (CI, cron, piped output), where the run otherwise refuses to start.",
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
     ),
     allow_uneven_coverage: bool = typer.Option(
         False,
@@ -242,9 +243,10 @@ def sweep(
     resumes at another.
 
     Spend is confirmed before the first episode runs, and consent is said, never inferred: at a
-    terminal the projected cost is a question, and with no terminal to ask at (CI, cron, piped
-    output, `| tee`) the run REFUSES with exit code 2 unless `--yes` was passed, naming what it
-    would have spent. What that estimate multiplies is ASSUMED tokens per policy call by the real
+    terminal the projected cost is a question, and with nobody to ask (CI, cron, piped output,
+    `| tee`, or a redirected stdin, which is not a person even when stdout is a terminal) the run
+    REFUSES with exit code 2 unless `--yes` was passed, naming what it would have spent.
+    What that estimate multiplies is ASSUMED tokens per policy call by the real
     cell and call counts, so it is a projection, never a measurement; the measured candidate spend
     is printed when the sweep finishes. Before that question is asked, every candidate's backend
     is resolved as far as it goes without a request: its kind's static
