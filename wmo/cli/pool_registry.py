@@ -39,12 +39,12 @@ from rich.table import Table
 from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION
 from wmo.cli.ui import PromptReader, creds_note, ensure_credentials, has_credentials, select_option
 from wmo.config import PROVIDER_ENV_VARS
+from wmo.core.files import FileLockTimeout
 from wmo.providers.base import ProviderKind, VerifyResult
 from wmo.providers.catalog import CatalogModel, CatalogSource, ProviderCatalog, list_provider_models
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.pool import (
     PoolEntry,
-    PoolLockTimeout,
     Tier,
     load_pool,
     pool_provider,
@@ -550,7 +550,7 @@ def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
         return False
     try:
         written = upsert_pool_entry(entry, pool_path)
-    except PoolLockTimeout as exc:
+    except FileLockTimeout as exc:
         # Another writer is in the way; nothing about the entry is wrong, so say to retry rather
         # than sending the user back through the prompts.
         console.print(f"  [red]pool busy[/red] {escape(str(exc))}")

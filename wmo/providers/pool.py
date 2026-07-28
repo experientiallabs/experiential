@@ -25,12 +25,8 @@ back to the same "declare the prices" error, with the catalog failure named.
 
 from __future__ import annotations
 
-import fcntl
 import os
-import time
 import tomllib
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -39,6 +35,7 @@ from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
+from wmo.core.files import DEFAULT_LOCK_TIMEOUT_S, file_write_lock, write_text_atomic
 from wmo.core.types import JsonObject
 from wmo.providers.base import (
     PreparableProvider,
@@ -53,11 +50,9 @@ from wmo.tracking.pricing import ModelPrice, price_for
 
 DEFAULT_POOL_PATH = Path(".wmo/pool.toml")
 
-# How long an upsert waits for another process to finish its write. A write is a few file
-# operations, so two racing `wmo optimize route student` runs never come close to this; the bound
-# exists so a hung holder is REPORTED instead of hanging the terminal forever.
-POOL_LOCK_TIMEOUT_S = 10.0
-_LOCK_POLL_S = 0.01
+# Kept as a module constant, rather than defaulted at the call, so a test can shorten the wait
+# for a CLI command that exposes no timeout flag (`wmo/cli/route_app_test.py`).
+POOL_LOCK_TIMEOUT_S = DEFAULT_LOCK_TIMEOUT_S
 
 # D-REPORT ModelRef vocabulary: "frontier" anchors the improvement report's comparison; "open"
 # models carry the run-10x-more-for-the-same-budget story.
@@ -338,10 +333,6 @@ def pool_api_key(entry: PoolEntry) -> str | None:
     return api_key
 
 
-class PoolLockTimeout(RuntimeError):
-    """Another writer held the roster's lock for longer than the bounded wait."""
-
-
 class PoolWrite(NamedTuple):
     """What one `upsert_pool_entry` did to the file, for a caller that has to report it.
 
@@ -393,7 +384,7 @@ def upsert_pool_entry(
     being added.
 
     The whole read-validate-write cycle runs under an exclusive cross-process lock (see
-    `_pool_write_lock`), so two registrations racing each other both land. Without it each reads
+    `wmo.core.files.file_write_lock`), so two racing registrations both land. Without it each reads
     the same roster and the later write erases the earlier entry, while both commands report
     success: a model an operator registered is simply not in the pool, and nothing says so.
 
@@ -409,62 +400,11 @@ def upsert_pool_entry(
     Raises:
         ValueError: If `path` exists but is not a readable pool file, if it is already an invalid
             roster before this entry is added, or if adding `entry` would make it one.
-        PoolLockTimeout: If another writer holds the roster's lock for the whole wait.
+        FileLockTimeout: If another writer holds the roster's lock for the whole wait.
     """
     timeout_s = POOL_LOCK_TIMEOUT_S if lock_timeout_s is None else lock_timeout_s
-    path.parent.mkdir(parents=True, exist_ok=True)  # the lock file lives beside the roster
-    with _pool_write_lock(path, timeout_s=timeout_s):
+    with file_write_lock(path, what="the model pool", timeout_s=timeout_s):
         return _upsert_locked(entry, path)
-
-
-@contextmanager
-def _pool_write_lock(path: Path, *, timeout_s: float) -> Iterator[None]:
-    """Hold the exclusive cross-process write lock for the roster at `path`.
-
-    The lock sits in a sibling `<pool>.lock` file, not in the roster: writing goes through an
-    atomic rename, which swaps the roster's inode, so a lock taken on the file itself would stop
-    protecting anything the moment the first writer landed.
-
-    `flock` belongs to the open file description, so the kernel drops it when the holder exits,
-    crashes, or is killed. A leftover `.lock` FILE is therefore never a held lock and can never
-    wedge a later run (which is also why it is left in place: unlinking it would let a waiter
-    block on an inode nobody else can reach). A live holder that hangs still could wedge us, so
-    the wait is bounded and reports what to do instead of blocking forever.
-
-    Args:
-        path: The pool TOML being written.
-        timeout_s: Seconds to keep retrying the lock before raising.
-
-    Yields:
-        None, with the lock held; it is released when the block exits, on any path.
-
-    Raises:
-        PoolLockTimeout: If the lock is still held after `timeout_s`.
-    """
-    lock_path = path.with_name(f"{path.name}.lock")
-    deadline = time.monotonic() + timeout_s
-    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
-    try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise PoolLockTimeout(
-                        f"another process has been writing the model pool at {path} for more "
-                        f"than {timeout_s:g}s (lock file {lock_path}); a registration takes "
-                        "milliseconds, so retry, and if it keeps failing look for a stuck "
-                        "process holding that lock (the lock is released automatically when "
-                        "that process exits, so the lock file itself is never the problem)"
-                    ) from None
-                time.sleep(_LOCK_POLL_S)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 def _upsert_locked(entry: PoolEntry, path: Path) -> PoolWrite:
@@ -512,17 +452,7 @@ def _upsert_locked(entry: PoolEntry, path: Path) -> PoolWrite:
             f"the {len(merged)} intended entries. This is a bug in wmo, not in your file, which "
             "is untouched; the likely cause is a pool field whose value is not a plain scalar"
         )
-    # The temp name carries this process's pid. The lock already keeps writers off each other, so
-    # this is defense in depth for anything that writes the roster without taking it: a shared
-    # fixed `.tmp` path would let each writer rename the other's half-written file into place,
-    # turning a lost update into a CORRUPT roster.
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp_path.write_text(body, encoding="utf-8")
-        tmp_path.replace(path)
-    except OSError:
-        tmp_path.unlink(missing_ok=True)  # never leave a stray temp beside the roster
-        raise
+    write_text_atomic(path, body)
     return PoolWrite(replaced=replaced, rewritten=rewritten)
 
 

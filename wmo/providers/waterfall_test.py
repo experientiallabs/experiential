@@ -311,6 +311,22 @@ def test_fallback_config_rejects_unknown_keys_and_kinds(tmp_path: Path) -> None:
         provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
 
 
+def test_fallback_config_names_the_file_when_it_is_not_valid_toml(tmp_path: Path) -> None:
+    """Every other failure here is prefixed with the path, and a decode error has to be too.
+
+    `.wmo/fallback.toml` is operator-edited and its errors render as `str(exc)` alone, so a bare
+    "Cannot overwrite a value (at line 4, column 1)" reads as a bad command argument rather than
+    as a broken file the user can go and fix.
+    """
+    path = tmp_path / "fallback.toml"
+    path.write_text('default = "a"\n\ndefault = "b"\n')
+
+    with pytest.raises(ValueError, match=r"is not valid TOML") as caught:
+        provider_or_chain(ProviderConfig(kind=ProviderKind.BEDROCK, model="m"), path=path)
+
+    assert str(path) in str(caught.value)
+
+
 def test_fallback_config_preserves_custom_token_field(tmp_path: Path) -> None:
     path = tmp_path / "fallback.toml"
     path.write_text(

@@ -43,6 +43,7 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from wmo.core.files import write_bytes_atomic
 from wmo.optimize.compression import (
     CompressionConfig,
     Compressor,
@@ -100,20 +101,11 @@ def write_artifact_atomically(path: Path, payload: bytes) -> None:
     a command that writes several artifacts promise that a failure leaves the old ones intact.
     `KnnBank.save` stages the same way for the sidecar it streams through numpy.
 
-    The staging name is unique PER CALL. `replace` is atomic, but a staging path shared between
-    two concurrent writers is not: they would interleave on one file, so one could publish the
-    other's bytes under its own name and the loser would fail on a file already renamed away.
-    It is also hidden and cleaned up on failure, so an interrupted write cannot leave litter in
-    an artifact directory that serving and the fitter both scan.
+    The per-call staging name, the cleanup on failure, and the durability are
+    `wmo.core.files.write_bytes_atomic`'s; this wrapper is the artifact layer's name for it, kept
+    because the reason above is the artifact directory's, not a property of writing files.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
-    try:
-        staging.write_bytes(payload)
-        staging.replace(path)
-    except BaseException:
-        staging.unlink(missing_ok=True)
-        raise
+    write_bytes_atomic(path, payload)
 
 
 def knn_bank_path_for(policy_path: Path) -> Path:

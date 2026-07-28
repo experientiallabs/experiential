@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
 import tomllib
 from pathlib import Path
 
@@ -485,6 +487,67 @@ def test_rollback_is_repointing_the_alias(tmp_path: Path) -> None:
     store.save_version("a", _card("tinker://fake/sampler/final/1"))
     store.set_alias("a", CHAMPION_ALIAS, 1)
     assert store.resolve("a").version == 1
+
+
+def test_concurrent_adapter_alias_moves_both_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two promotions of DIFFERENT aliases must not erase each other.
+
+    The write here was already atomic, which is the wrong half for this failure: neither write is
+    torn, the second simply overwrites a table the first had already added a key to, and both
+    calls return normally. The race is forced with a barrier on every read of `aliases.toml`, so
+    both writers provably hold the same snapshot; with the lock held the second cannot reach its
+    read until the first is done, the barrier times out, and the reads happen in sequence.
+    """
+    store = AdapterStore(tmp_path)
+    store.save_version("a", _card())
+    store.save_version("a", _card("tinker://fake/sampler/final/1"))
+    read_together = threading.Barrier(2, timeout=1.0)
+    real_read = Path.read_text
+
+    def _park_on_every_alias_read(self: Path, **kwargs: object) -> str:
+        text = real_read(self, **kwargs)  # ty: ignore[invalid-argument-type]
+        if self.name == "aliases.toml":
+            with contextlib.suppress(threading.BrokenBarrierError):
+                read_together.wait()
+        return text
+
+    monkeypatch.setattr(Path, "read_text", _park_on_every_alias_read)
+    failures: list[BaseException] = []
+
+    def _promote(alias: str, version: int) -> None:
+        try:
+            store.set_alias("a", alias, version)
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertions below
+            failures.append(exc)
+
+    writers = [
+        threading.Thread(target=_promote, args=args)
+        for args in ((CHAMPION_ALIAS, 2), ("staging", 1))
+    ]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=30)
+        assert not writer.is_alive(), "the alias lock wait is not bounded"
+    monkeypatch.undo()  # the assertion below reads the table without parking on the barrier
+
+    assert failures == []
+    assert store.aliases("a") == {CHAMPION_ALIAS: 2, "staging": 1}
+
+
+def test_a_corrupt_adapter_alias_file_names_itself(tmp_path: Path) -> None:
+    """The user never edited this file, so a bare `tomllib` message gives them nowhere to start."""
+    store = AdapterStore(tmp_path)
+    store.save_version("a", _card())
+    path = store.dir_for("a") / "aliases.toml"
+    path.write_text("[aliases]\nchampion = \n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"is not valid TOML") as caught:
+        store.aliases("a")
+
+    assert str(path) in str(caught.value)
 
 
 def test_unknown_adapter_ref_and_alias_are_friendly(tmp_path: Path) -> None:

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
+from wmo.core.files import write_text_atomic
 from wmo.optimize.compression import CompressionConfig
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
@@ -195,8 +196,8 @@ class OutcomeMatrix(BaseModel):
         return sum(rewards) / len(rewards)
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        """Write the matrix atomically: it is the measured output of a run that cost real money."""
+        write_text_atomic(path, self.model_dump_json(indent=2))
 
     @classmethod
     def load(cls, path: Path) -> OutcomeMatrix:

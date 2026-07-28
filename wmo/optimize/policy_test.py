@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Literal, cast
@@ -260,15 +261,20 @@ def test_openrouter_candidate_keeps_the_price_it_was_fitted_under(
 def test_a_failed_policy_save_leaves_the_previous_artifact_intact(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Serving reads the artifact dir while the optimizer writes it: no torn policy.json."""
+    """Serving reads the artifact dir while the optimizer writes it: no torn policy.json.
+
+    The failure is injected at the payload's fsync, which `wmo.core.files.write_bytes_atomic`
+    reaches with the bytes on the staging file and the rename not yet done. That is the moment an
+    in-place write would already have destroyed the served artifact.
+    """
     path = tmp_path / "policy.json"
     _rank_policy().save(path)
     served = RoutingPolicy.load(path)
 
-    def _die(self: Path, data: bytes) -> int:
+    def _die(fd: int) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr(Path, "write_bytes", _die)
+    monkeypatch.setattr(os, "fsync", _die)
     with pytest.raises(OSError, match="disk full"):
         _static().save(path)
     assert RoutingPolicy.load(path) == served  # the staged write never replaced it

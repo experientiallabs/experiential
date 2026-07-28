@@ -37,6 +37,7 @@ from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
 from wmo.config import ARTIFACT_DIR, WorldModelStore
+from wmo.core.files import FileLockTimeout
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
@@ -93,7 +94,6 @@ from wmo.optimize.sweep import (
 from wmo.providers.pool import (
     DEFAULT_POOL_PATH,
     PoolEntry,
-    PoolLockTimeout,
     load_pool,
     upsert_pool_entry,
 )
@@ -776,7 +776,7 @@ def student(
         raise typer.Exit(0)
     try:
         written = upsert_pool_entry(entry, pool_path)
-    except PoolLockTimeout as exc:
+    except FileLockTimeout as exc:
         # Nothing is wrong with the flags, so this is not a BadParameter: another writer is in the
         # way. Exit non-zero (and say to retry) so a script does not read it as a registration.
         _console.print(f"[red]pool busy[/red] {escape(str(exc))}")

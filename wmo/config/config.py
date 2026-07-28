@@ -13,6 +13,7 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel, Field, JsonValue, ValidationError
 
+from wmo.core.files import write_text_atomic
 from wmo.core.types import JsonObject
 from wmo.providers.base import EmbedderKind, ProviderConfig, ProviderKind
 from wmo.providers.models import resolve_provider_model
@@ -391,9 +392,5 @@ def save_config(config: HarnessConfig, root: str | Path = ARTIFACT_DIR) -> None:
     failed write never leaves a truncated `config.toml` behind.
     """
     paths = ArtifactPaths(root)
-    paths.root.mkdir(parents=True, exist_ok=True)
     data = _strip_none_object(config.model_dump(mode="json"))
-    tmp = paths.config.with_name(f"{paths.config.name}.tmp")
-    with tmp.open("wb") as fh:
-        tomli_w.dump(data, fh)
-    tmp.replace(paths.config)
+    write_text_atomic(paths.config, tomli_w.dumps(data))

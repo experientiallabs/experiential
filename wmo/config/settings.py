@@ -11,6 +11,7 @@ from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, Field, ValidationError
 
 from wmo.config.config import ARTIFACT_DIR
+from wmo.core.files import write_text_atomic
 
 SETTINGS_FILENAME = "settings.toml"
 
@@ -132,12 +133,8 @@ def load_settings(root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
 
 def save_settings(settings: ProjectSettings, root: str | Path = ARTIFACT_DIR) -> None:
     path = settings_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = settings.model_dump(mode="json", exclude_none=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    with tmp.open("wb") as fh:
-        tomli_w.dump(data, fh)
-    tmp.replace(path)
+    write_text_atomic(path, tomli_w.dumps(data))
 
 
 def set_telemetry_enabled(enabled: bool, root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
