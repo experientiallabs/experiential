@@ -10,15 +10,21 @@ from wmo.optimize.compression import (
     CompressingEmbedder,
     CompressionConfig,
     CompressionResult,
+    CompressionScope,
     Compressor,
     IdentityCompressor,
+    Segment,
     TruncateCompressor,
+    compress_conversation,
     compress_segments,
+    compressible_positions,
+    compression_signature,
     estimate_tokens,
     get_compressor,
     register_compressor,
     register_compressor_factory,
     registered_compressor_ids,
+    resolve_compression,
     same_compression,
     segment_batch_limit,
     servable_compressor,
@@ -183,6 +189,118 @@ def test_same_compression_compares_the_whole_triple() -> None:
     assert not same_compression(base, base.model_copy(update={"aggressiveness": 0.25}))
     # A version bump changes the emitted bytes exactly as a different id would.
     assert not same_compression(base, base.model_copy(update={"compressor_version": "2"}))
+
+
+# ---------------------------------------------------------------- scope, identity, and the task
+
+
+def test_two_configs_differing_only_in_scope_are_not_the_same_arm() -> None:
+    # Scope moves compression onto entirely different segments, so a bank fitted under one scope
+    # is not evidence for another. Identity has to see that, or the mount and fit gates wave it
+    # through and the artifact serves a representation it was never measured in.
+    conversation = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    observations = conversation.model_copy(update={"scope": "observations"})
+    assert not same_compression(conversation, observations)
+    assert not same_compression(observations, conversation)
+    assert compression_signature(conversation) != compression_signature(observations)
+    # bulk_min_chars is identity-bearing only where it can act, which is "bulk" scope alone.
+    assert same_compression(conversation, conversation.model_copy(update={"bulk_min_chars": 10}))
+    bulk = conversation.model_copy(update={"scope": "bulk"})
+    assert not same_compression(bulk, bulk.model_copy(update={"bulk_min_chars": 10}))
+
+
+def test_a_default_scope_signature_is_unchanged_so_recorded_fingerprints_still_match() -> None:
+    # The signature is persisted verbatim in sweep plans and `optimize model` stage fingerprints.
+    # Rendering the default scope would invalidate every one of them on disk for no new
+    # information, so scope shows up only when it departs from the default.
+    default = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    assert compression_signature(default) == "compressor 'truncate' version 1 at aggressiveness 0.5"
+    assert compression_signature(None) == "raw text (no compression)"
+    bulk = default.model_copy(update={"scope": "bulk", "bulk_min_chars": 4096})
+    assert compression_signature(bulk).endswith("scope bulk over 4096 chars")
+
+
+def test_resolve_compression_carries_scope_and_stamps_the_running_version() -> None:
+    config = resolve_compression("truncate", 0.5, scope="observations", bulk_min_chars=1234)
+    assert config.scope == "observations"
+    assert config.bulk_min_chars == 1234
+    assert config.compressor_version == TruncateCompressor.version
+
+
+_CONVERSATION = [
+    Segment(kind="system", text="a system prompt"),
+    Segment(kind="user", text="the task statement"),
+    Segment(kind="assistant", text="an earlier reply"),
+    Segment(kind="observation", text="a tool result"),
+    Segment(kind="user", text="a follow-up turn"),
+]
+
+
+def test_the_first_user_segment_is_protected_in_every_scope() -> None:
+    # The one deletion harm this track measured was a compressed task statement, so no scope and
+    # no dial can reach index 1 here.
+    scopes: tuple[CompressionScope, ...] = ("conversation", "observations", "bulk")
+    for scope in scopes:
+        config = CompressionConfig(
+            compressor_id="truncate", aggressiveness=1.0, scope=scope, bulk_min_chars=1
+        )
+        assert 1 not in compressible_positions(_CONVERSATION, config)
+
+
+def test_each_scope_selects_the_segments_it_names() -> None:
+    def positions(scope: CompressionScope, *, bulk_min_chars: int = 2000) -> tuple[int, ...]:
+        return compressible_positions(
+            _CONVERSATION,
+            CompressionConfig(compressor_id="truncate", scope=scope, bulk_min_chars=bulk_min_chars),
+        )
+
+    assert positions("conversation") == (4,)  # user turns, minus the task
+    assert positions("observations") == (3,)  # tool output only
+    # "bulk" is observations plus LARGE user content; the follow-up turn is short prose, so at the
+    # default threshold it is left alone and only the observation is selected.
+    assert positions("bulk") == (3,)
+    assert positions("bulk", bulk_min_chars=1) == (3, 4)
+
+
+def test_the_task_is_byte_identical_through_the_stage_at_full_aggressiveness() -> None:
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=1.0)
+    result = compress_conversation(get_compressor("truncate"), _CONVERSATION, config)
+    assert result.texts[1] == "the task statement"  # verbatim, at the top of the dial
+    assert result.texts[0] == "a system prompt"
+    assert result.texts[2] == "an earlier reply"
+    assert result.texts[3] == "a tool result"
+    assert result.texts[4] == ""  # a later turn, fully removed: the dial does work
+
+
+def test_mutable_from_leaves_the_reused_prefix_verbatim() -> None:
+    # Serving reuses an already-compressed prefix rather than recompressing it, which is what
+    # keeps the provider's prompt cache alive. Passing the WHOLE conversation is still required:
+    # scope selection is positional, so a caller that handed over only its window would shift the
+    # task segment and expose it.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    result = compress_conversation(
+        get_compressor("truncate"), _CONVERSATION, config, mutable_from=4
+    )
+    assert result.texts[:4] == [segment.text for segment in _CONVERSATION[:4]]
+    assert result.texts[4] == "a follow-up"
+
+
+def test_a_conversation_with_nothing_eligible_never_calls_the_compressor() -> None:
+    # Not just "no change": no round trip and no bill either, which is what makes a narrow scope
+    # free rather than merely harmless.
+    class _Refusing:
+        id = "refusing-for-tests"
+        version = "1"
+        append_stable = True
+
+        def compress(self, segments: list[str], config: CompressionConfig) -> CompressionResult:
+            raise AssertionError("the choke point handed over an ineligible segment")
+
+    config = CompressionConfig(compressor_id="refusing-for-tests", scope="observations")
+    only_the_task = [Segment(kind="user", text="the task statement")]
+    result = compress_conversation(cast("Compressor", _Refusing()), only_the_task, config)
+    assert result.texts == ["the task statement"]
+    assert result.cost_usd == 0.0
 
 
 def test_compressing_embedder_embeds_the_compressed_text() -> None:

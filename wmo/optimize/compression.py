@@ -8,6 +8,12 @@ conversation's cached prefix would forfeit ~0.9x discounts to save ~0.1x of toke
 that prefix out of the compressor's hands makes cache safety a property of the construction,
 not a convention each compressor must remember.
 
+WHICH segments are eligible is the config's `scope`, and it is decided in exactly one place:
+`compress_conversation` (via `compressible_positions`) is the only path from a caller's messages
+to a compressor, so scope selection and the unconditional task protection on top of it cannot be
+re-implemented per call site. The task or question segment (the first user segment of a
+conversation) is never compressed in any scope at any aggressiveness.
+
 This module ships the protocol plus the two reference implementations the seam is proven
 with: `identity` (today's behavior, bit-for-bit) and `truncate` (the trivial ratio-matched
 control every learned compressor must beat). Real compressors are chosen by the research
@@ -23,10 +29,10 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
-from typing import Protocol, runtime_checkable
+from collections.abc import Callable, Sequence
+from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.providers.base import Embedder
 
@@ -34,10 +40,41 @@ from wmo.providers.base import Embedder
 # provider-agnostic; used only for the compressor's own raw-vs-compressed accounting.
 _CHARS_PER_TOKEN = 4
 
+# Default `CompressionConfig.bulk_min_chars`: how large a user segment has to be before "bulk"
+# scope treats it as pasted document rather than dialogue. 2000 chars is roughly 500 proxy
+# tokens, well above any measured conversational turn and below every pasted-document segment
+# in the corpora the scope was ruled on.
+DEFAULT_BULK_MIN_CHARS = 2000
+
+CompressionScope = Literal["conversation", "observations", "bulk"]
+"""Which segments of a conversation a config may rewrite (see `CompressionConfig`)."""
+
+SegmentKind = Literal["system", "user", "assistant", "observation"]
+"""What one segment IS, in the seam's own vocabulary rather than any caller's role enum.
+
+Serving maps OpenAI roles onto this (`tool` results are observations); the eval threading maps
+provider roles onto it. Keeping the seam's vocabulary separate is what lets scope selection be
+one shared rule instead of one per caller.
+"""
+
 
 def estimate_tokens(text: str) -> int:
     """Deterministic proxy token count of `text` (ceil of chars/4; 0 only for empty text)."""
     return math.ceil(len(text) / _CHARS_PER_TOKEN)
+
+
+class Segment(BaseModel):
+    """One unit of conversation text as the compression seam sees it: what it is, and its bytes.
+
+    Frozen because the scope rules read it and the choke point maps results back onto it
+    positionally; a segment whose kind could be mutated between selection and rewrite would
+    let a caller compress something scope selection had already excluded.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: SegmentKind
+    text: str
 
 
 class CompressionConfig(BaseModel):
@@ -58,11 +95,35 @@ class CompressionConfig(BaseModel):
     Aggressiveness is risk-tiered per cluster and learned within bounds by the research track.
     `compressor_version` records the version the config was fitted against (provenance);
     serving logs the version that actually ran.
+
+    `scope` is WHICH segments the dial is allowed to touch, and it is identity-bearing: two
+    configs that differ only in scope are two different arms, not one (see `same_compression`).
+    The three values, each with the measurement behind it:
+
+    - "conversation" (the DEFAULT, and the only behavior that existed before this field):
+      user-role segments. Every artifact, matrix, and policy written without a scope loads with
+      its meaning unchanged.
+    - "observations": tool results and other environment output only. User and assistant
+      segments pass through verbatim. This is the scope the measurements favor: compressing
+      dialogue lost 6-17 accuracy points and INVERTED cost by 2.3x, while removing 40% of
+      document/observation bulk held accuracy inside the noise floor.
+    - "bulk": "observations" plus user segments of at least `bulk_min_chars`, i.e. pasted
+      documents rather than typed turns.
+
+    Scope is not a way to reach the task statement. The first user segment of a conversation is
+    never compressed in ANY scope, at any aggressiveness (`compressible_positions`): the one
+    genuine deletion harm this track ever measured was a compressed task statement, so the rule
+    is code, not configuration.
+
+    `bulk_min_chars` is inert outside "bulk" scope, and identity treats it that way: it is
+    compared only when the scope can act on it.
     """
 
     compressor_id: str = Field(min_length=1)
     compressor_version: str = "1"
     aggressiveness: float = Field(default=0.0, ge=0.0, le=1.0)
+    scope: CompressionScope = "conversation"
+    bulk_min_chars: int = Field(default=DEFAULT_BULK_MIN_CHARS, ge=1)
 
 
 class CompressionResult(BaseModel):
@@ -85,13 +146,19 @@ class CompressionStats(BaseModel):
     """Request-level accounting of one applied compression stage (D-SERVING-LOG / eval shape).
 
     `compressor_version` is the version that actually RAN (the config's copy is fit-time
-    provenance). Token counts are whole-request `estimate_tokens` totals: what the input would
-    have measured raw vs what was sent, so on-vs-off savings read straight off the record.
+    provenance).
     """
 
     compressor_id: str
     compressor_version: str
     aggressiveness: float
+    # ALL segments of the request, not just the ones the scope selected: what the whole input
+    # would have measured raw, and what was actually sent. The provider bills the whole prompt,
+    # so this is the pair that makes `1 - compressed/raw` the honest billed-input saving, which
+    # is the number the admin view quotes. The compressor's own achieved keep ratio is a
+    # DIFFERENT figure (compressed/raw over eligible segments only) and is not recorded here:
+    # under a narrow scope it can look excellent while the request barely shrank, so reporting
+    # it as the saving would overstate every scoped endpoint.
     tokens_in_raw: int
     tokens_in_compressed: int
     latency_s: float
@@ -307,6 +374,92 @@ def compress_segments(
     )
 
 
+def compressible_positions(
+    segments: Sequence[Segment], config: CompressionConfig
+) -> tuple[int, ...]:
+    """The indices of `segments` this config lets a compressor rewrite, in order.
+
+    TASK PROTECTION is enforced here and nowhere else, which is the point of routing every
+    caller through this function: the FIRST user segment of a conversation is the task or
+    question, and it is excluded in every scope at every aggressiveness. Compressing a task
+    statement is the one deletion this track measured real harm from, so it cannot be reachable
+    by a config value, a new scope, or a caller that forgets to check.
+
+    Everything else follows `config.scope`; see `CompressionConfig` for what the three values
+    mean and what was measured behind them.
+    """
+    protected = next((index for index, seg in enumerate(segments) if seg.kind == "user"), None)
+    selected: list[int] = []
+    for index, segment in enumerate(segments):
+        if index == protected:
+            continue
+        match config.scope:
+            case "conversation":
+                eligible = segment.kind == "user"
+            case "observations":
+                eligible = segment.kind == "observation"
+            case "bulk":
+                eligible = segment.kind == "observation" or (
+                    segment.kind == "user" and len(segment.text) >= config.bulk_min_chars
+                )
+        if eligible:
+            selected.append(index)
+    return tuple(selected)
+
+
+class ConversationCompression(BaseModel):
+    """What one `compress_conversation` call did: the segment texts to send, plus its own bill.
+
+    `texts` has one entry per input segment, in order, so a caller maps it back onto whatever
+    message objects it built the segments from. Segments the scope did not select (and every
+    segment before `mutable_from`) come back byte-identical.
+    """
+
+    texts: list[str]
+    cost_usd: float = 0.0
+
+
+def compress_conversation(
+    compressor: Compressor,
+    segments: Sequence[Segment],
+    config: CompressionConfig,
+    *,
+    mutable_from: int = 0,
+) -> ConversationCompression:
+    """Compress one conversation: the single path from a caller's messages to a compressor.
+
+    Both production callers (serving's compression stage and the eval threading in
+    `wmo.env.closed_loop`) come through here rather than selecting segments themselves, so
+    task protection and scope selection are one rule with one test surface instead of two
+    implementations that can drift.
+
+    `segments` is the WHOLE conversation, always, even when only its tail may be rewritten.
+    Scope selection is positional (the first user segment is the task), so a caller that handed
+    over only the window it wanted compressed would shift that position and hand the task
+    to the compressor on the very first turn a prefix was reused.
+
+    `mutable_from` is the index the rewritable window starts at: everything before it is
+    returned verbatim. Serving passes the length of the compressed prefix it is reusing, which
+    is what keeps the provider-visible prefix byte-identical across turns (and the prompt cache
+    alive). The default of 0 recompresses the whole conversation, which per-segment determinism
+    makes byte-identical anyway.
+
+    ONE compressor call carries every selected segment, so an endpoint-backed compressor pays
+    one round trip per conversation rather than one per message; `compress_segments` chunks that
+    to whatever cap the implementation declares.
+    """
+    texts = [segment.text for segment in segments]
+    positions = [
+        index for index in compressible_positions(segments, config) if index >= mutable_from
+    ]
+    if not positions:
+        return ConversationCompression(texts=texts)
+    result = compress_segments(compressor, [texts[index] for index in positions], config)
+    for index, rewritten in zip(positions, result.segments, strict=True):
+        texts[index] = rewritten
+    return ConversationCompression(texts=texts, cost_usd=result.cost_usd)
+
+
 class CompressingEmbedder:
     """Embeds the COMPRESSED form of each text, so a fit sees what serving will see.
 
@@ -318,6 +471,15 @@ class CompressingEmbedder:
 
     Serving does NOT wrap its embedder: the compression stage has already rewritten the request
     by the time the router embeds it, so wrapping there would compress twice.
+
+    OPEN under scoped compression, stated because a scoped fit can reach it: serving routes on
+    the last USER turn of the compressed transcript, and task protection plus the narrow scopes
+    mean that text is frequently raw (always, in "observations" scope, where no user turn is ever
+    a candidate; and on the first turn of every conversation in any scope, where the last user
+    turn IS the protected task). Wrapping the fit's embedder then puts the bank in a geometry
+    serving does not query it in, which is the mismatch this wrapper exists to prevent, pointing
+    the other way. Which config a scoped fit should stamp as `fit_compression`, and whether it
+    should wrap at all, is a fit-side decision this seam change does not make.
 
     As few compressor calls per `embed` batch as the compressor's cap allows, not one per text:
     fitting a bank means compressing every fit scenario, which would otherwise be a round trip
@@ -336,27 +498,49 @@ class CompressingEmbedder:
 
 
 def compression_signature(config: CompressionConfig | None) -> str:
-    """How a compression config reads in an error message; None is spelled out as raw text."""
+    """How a compression config reads in an error message; None is spelled out as raw text.
+
+    This string is also an ARM IDENTITY: sweep plans and the `optimize model` stage fingerprints
+    persist it and compare it verbatim, so two configs that emit different bytes must render
+    differently. Scope therefore appears here, but only when it departs from the default, and
+    `bulk_min_chars` only in the scope that reads it. The rendering stays injective either way,
+    and a fingerprint recorded before scope existed keeps matching the default-scope arm that
+    wrote it instead of invalidating every resume manifest on disk.
+    """
     if config is None:
         return "raw text (no compression)"
-    return (
+    rendered = (
         f"compressor '{config.compressor_id}' version {config.compressor_version} "
         f"at aggressiveness {config.aggressiveness:g}"
     )
+    if config.scope == "bulk":
+        return f"{rendered}, scope bulk over {config.bulk_min_chars} chars"
+    if config.scope != "conversation":
+        return f"{rendered}, scope {config.scope}"
+    return rendered
 
 
 def same_compression(left: CompressionConfig | None, right: CompressionConfig | None) -> bool:
-    """Whether two configs produce the same representation: same compressor, version, and level.
+    """Whether two configs produce the same representation: compressor, version, level, and scope.
 
-    None (raw) equals only None. Anything else is compared on the whole triple, because a
-    version bump changes the emitted bytes exactly as a different id would.
+    None (raw) equals only None. Anything else is compared field by field, because each one
+    changes the emitted bytes: a version bump changes them exactly as a different id would, and
+    a scope change moves compression onto entirely different segments (a conversation-scope arm
+    and an observations-scope arm at the same dial are two arms, and a routing bank fitted under
+    one is not evidence for the other).
+
+    `bulk_min_chars` is compared only in "bulk" scope, which is the only scope that reads it.
+    Comparing an inert field would refuse two arms that provably emit identical bytes.
     """
     if left is None or right is None:
         return left is None and right is None
+    if left.scope == "bulk" and left.bulk_min_chars != right.bulk_min_chars:
+        return False
     return (
         left.compressor_id == right.compressor_id
         and left.compressor_version == right.compressor_version
         and left.aggressiveness == right.aggressiveness
+        and left.scope == right.scope
     )
 
 
@@ -395,7 +579,13 @@ def servable_compressor(config: CompressionConfig | None) -> Compressor | None:
     return compressor
 
 
-def resolve_compression(compressor_id: str, aggressiveness: float) -> CompressionConfig:
+def resolve_compression(
+    compressor_id: str,
+    aggressiveness: float,
+    *,
+    scope: CompressionScope = "conversation",
+    bulk_min_chars: int = DEFAULT_BULK_MIN_CHARS,
+) -> CompressionConfig:
     """The config a `--compressor` flag names, stamped with the version that will actually RUN.
 
     Every command that turns a compressor id into a config comes through here (`route sweep`,
@@ -407,6 +597,10 @@ def resolve_compression(compressor_id: str, aggressiveness: float) -> Compressio
     against the v1 serving rule right here, so an arm that could never be mounted fails at the
     boundary instead of after a sweep has been paid for.
 
+    `scope` and `bulk_min_chars` default to today's behavior, so every existing caller resolves
+    the arm it always did. They are here rather than only on the model so that a scoped arm also
+    picks up the running version stamp and the servability check.
+
     Raises:
         ValueError: The id is unknown, or the implementation cannot be served, naming which.
     """
@@ -415,6 +609,8 @@ def resolve_compression(compressor_id: str, aggressiveness: float) -> Compressio
         compressor_id=compressor_id,
         compressor_version=resolved.version,
         aggressiveness=aggressiveness,
+        scope=scope,
+        bulk_min_chars=bulk_min_chars,
     )
     servable_compressor(config)
     return config
