@@ -549,7 +549,7 @@ def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
         console.print(f"  {_CHECK} {summary} [dim]already registered, unchanged[/dim]")
         return False
     try:
-        replaced = upsert_pool_entry(entry, pool_path)
+        written = upsert_pool_entry(entry, pool_path)
     except PoolLockTimeout as exc:
         # Another writer is in the way; nothing about the entry is wrong, so say to retry rather
         # than sending the user back through the prompts.
@@ -558,8 +558,14 @@ def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
     except ValueError as exc:
         console.print(f"  [red]skipped {escape(entry.name)}[/red]: {escape(str(exc))}")
         return False
-    note = " [dim](the roster was rewritten, so its comments are gone)[/dim]" if replaced else ""
-    console.print(f"  {_CHECK} {'replaced' if replaced else 'added'} {summary}{note}")
+    # `rewritten`, not `replaced`: normalizing a legacy inline-form roster drops the comments on
+    # an ADD too, and reporting that as a plain "added" would delete them silently.
+    note = (
+        " [dim](the roster was rewritten, so its comments are gone)[/dim]"
+        if written.rewritten
+        else ""
+    )
+    console.print(f"  {_CHECK} {'replaced' if written.replaced else 'added'} {summary}{note}")
     return True
 
 

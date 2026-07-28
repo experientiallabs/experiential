@@ -775,7 +775,7 @@ def student(
         )
         raise typer.Exit(0)
     try:
-        replaced = upsert_pool_entry(entry, pool_path)
+        written = upsert_pool_entry(entry, pool_path)
     except PoolLockTimeout as exc:
         # Nothing is wrong with the flags, so this is not a BadParameter: another writer is in the
         # way. Exit non-zero (and say to retry) so a script does not read it as a registration.
@@ -783,9 +783,12 @@ def student(
         raise typer.Exit(1) from exc
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    verb = "replaced" if replaced else "added"
+    verb = "replaced" if written.replaced else "added"
+    rewrite_note = (
+        "\n  the roster was rewritten, so its comments are gone" if written.rewritten else ""
+    )
     _console.print(
-        f"[green]✓[/green] {verb} pool candidate [bold]{name}[/bold] -> {pool_path}\n"
+        f"[green]✓[/green] {verb} pool candidate [bold]{name}[/bold]{rewrite_note} -> {pool_path}\n"
         f"  {card.base_model} adapter at {entry.model}\n"
         f"  ${input_per_mtok:g}/${output_per_mtok:g} per 1M in/out tokens, "
         f"{_credential_note(entry)}\n"
