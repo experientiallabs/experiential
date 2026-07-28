@@ -19,6 +19,7 @@ from wmo.cli.ui import (
     run_build_wizard,
     run_play_repl,
     select_model,
+    select_provider_and_model,
 )
 from wmo.config import PROVIDER_ENV_VARS, ModelInfo
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
@@ -270,6 +271,45 @@ def test_build_wizard_collects_all_inputs() -> None:
     assert params.fidelity == "high"
     assert params.embed_provider == "hashing"
     assert params.train_split == 0.5
+
+
+def test_provider_picker_collects_azure_deployment_before_verification() -> None:
+    """The providers-set TUI verifies the exact deployment the operator entered."""
+    console = Console(force_terminal=False, no_color=True, width=100)
+    prompts: list[str] = []
+    verified: list[ProviderConfig] = []
+    answers = iter(["", "", "prod-kimi"])
+
+    def read(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    def verify(config: ProviderConfig) -> VerifyResult:
+        verified.append(config)
+        return VerifyResult(ok=True, kind=config.kind, model=config.model)
+
+    provider, model, region, deployment = select_provider_and_model(
+        console,
+        read,
+        read,
+        default_provider="azure",
+        default_model="kimi-k2.6",
+        default_region=None,
+        default_deployment=None,
+        ask_azure_deployment=True,
+        interactive=False,
+        check=verify,
+    )
+
+    assert (provider, model, region, deployment) == (
+        "azure",
+        "kimi-k2.6",
+        None,
+        "prod-kimi",
+    )
+    assert verified[0].deployment == "prod-kimi"
+    deployment_prompt = next(i for i, prompt in enumerate(prompts) if "deployment" in prompt)
+    assert deployment_prompt == len(prompts) - 1
 
 
 def test_build_wizard_select_by_number() -> None:

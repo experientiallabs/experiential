@@ -73,6 +73,24 @@ def test_azure_models_declare_their_chat_token_parameter() -> None:
     assert actual == expected
 
 
+def test_azure_models_declare_their_api_surface() -> None:
+    """Azure API routing is model capability metadata, not a reasoning side effect."""
+    expected = {
+        "gpt-5.5": "api-versioned",
+        "gpt-5.4": "api-versioned",
+        "gpt-5.4-mini": "api-versioned",
+        "deepseek-v4-pro": "v1",
+        "kimi-k2.6": "v1",
+    }
+
+    actual = {
+        model_type: resolve_provider_model(ProviderKind.AZURE_OPENAI, model_type).azure_api_surface
+        for model_type in expected
+    }
+
+    assert actual == expected
+
+
 def test_unknown_custom_model_round_trips() -> None:
     resolved = resolve_provider_model(ProviderKind.OPENAI, "my-fine-tune")
     assert resolved.model_type == "my-fine-tune"
@@ -102,6 +120,19 @@ def test_provider_config_resolves_model_contract_before_custom_deployment() -> N
     assert config.chat_max_tokens_field == "max_completion_tokens"
     assert "chat_max_tokens_field" not in config.model_fields_set
     assert config.resolved_chat_max_tokens_field() == "max_completion_tokens"
+    assert config.resolved_azure_api_surface() == "api-versioned"
+
+
+def test_provider_config_allows_an_explicit_azure_api_surface_override() -> None:
+    """A custom Foundry deployment can opt into v1 without pretending to be a built-in model."""
+    config = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="my-foundry-model",
+        deployment="prod-model",
+        azure_api_surface="v1",
+    )
+
+    assert config.resolved_azure_api_surface() == "v1"
 
 
 def test_provider_config_allows_an_explicit_custom_endpoint_override() -> None:

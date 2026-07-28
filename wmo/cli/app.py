@@ -266,7 +266,7 @@ def _worker_provider_config(
     if config.kind is ProviderKind.AZURE_OPENAI:
         config = config.model_copy(
             update={
-                "deployment": deployment or config.model_type or config.model,
+                "deployment": deployment,
                 "api_version": api_version or "2024-05-01-preview",
             }
         )
@@ -337,13 +337,15 @@ def providers_set(
     existing = load_settings_or_abort(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:
-        provider, model, region = select_provider_and_model(
+        provider, model, region, deployment = select_provider_and_model(
             _console,
             lambda text: _console.input(text),
             lambda text: _console.input(text, password=True),
             default_provider=provider or (existing.provider if existing else None),
             default_model=model or (existing.model if existing else None),
             default_region=region or (existing.region if existing else None),
+            default_deployment=deployment,
+            ask_azure_deployment=True,
             interactive=True,
             check=lambda cfg: verify_all(
                 [
@@ -352,7 +354,7 @@ def providers_set(
                         cfg.model_type or cfg.model,
                         cfg.region,
                         endpoint=endpoint,
-                        deployment=deployment,
+                        deployment=cfg.deployment,
                         api_version=api_version,
                     )
                 ]
@@ -361,6 +363,11 @@ def providers_set(
     if provider is None or model is None:
         raise typer.BadParameter(
             "provide --provider and --model, or run `wmo providers set` in a terminal"
+        )
+    if _provider_kind(provider) is ProviderKind.AZURE_OPENAI and deployment is None:
+        raise typer.BadParameter(
+            "--deployment is required for Azure because deployment names are operator-created "
+            "and cannot be inferred from --model"
         )
     config = _worker_provider_config(
         provider,
@@ -398,9 +405,7 @@ def providers_set(
         options=pool_registry.EntryOptions(
             endpoint=config.endpoint,
             region=config.region,
-            # The RAW flags, not the worker config's: `_worker_provider_config` fills an Azure
-            # deployment in from the model id when none was given, and a pool entry must never
-            # inherit a guessed deployment name (nothing can derive an operator's own).
+            # The raw flags, not inferred worker fields. Azure deployment names are operator-owned.
             deployment=deployment,
             api_version=api_version,
             api_key_env=api_key_env,
@@ -2680,7 +2685,7 @@ def demo(
             # failed step — completed steps stay done.
             _console.print(f"\n[red]serve provider is still failing[/red]: {_short_error(exc)}")
             _console.print("[yellow]pick a different provider to continue the demo[/yellow]")
-            provider_name, model_type, region = select_provider_and_model(
+            provider_name, model_type, region, _deployment = select_provider_and_model(
                 _console,
                 lambda text: _console.input(text),
                 lambda text: _console.input(text, password=True),

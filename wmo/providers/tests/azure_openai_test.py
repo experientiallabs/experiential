@@ -160,6 +160,51 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
     assert chat.last_kwargs["max_completion_tokens"] == 16
 
 
+@pytest.mark.parametrize("model_type", ["kimi-k2.6", "deepseek-v4-pro"])
+def test_foundry_v1_chat_models_use_v1_without_reasoning_effort(
+    monkeypatch: pytest.MonkeyPatch, model_type: str
+) -> None:
+    """A model's Azure API surface, not reasoning configuration, selects its transport."""
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(3, 2)))
+    provider = AzureOpenAIProvider(
+        _config().model_copy(
+            update={
+                "model": model_type,
+                "model_type": model_type,
+                "deployment": f"prod-{model_type}",
+                "reasoning_effort": None,
+            }
+        )
+    )
+    monkeypatch.setattr(provider, "_get_v1_client", lambda: _FakeClient(chat))
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: (_ for _ in ()).throw(AssertionError("Foundry v1 must not use AzureOpenAI")),
+    )
+
+    completion = provider.complete("", [Message(role="user", content="ping")], max_tokens=8)
+
+    assert completion.text == "ok"
+    assert chat.last_kwargs["model"] == f"prod-{model_type}"
+    assert chat.last_kwargs["max_tokens"] == 8
+
+
+def test_api_versioned_chat_model_keeps_azure_openai_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(3, 2)))
+    provider = AzureOpenAIProvider(_config())
+    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+    monkeypatch.setattr(
+        provider,
+        "_get_v1_client",
+        lambda: (_ for _ in ()).throw(AssertionError("GPT legacy config must use AzureOpenAI")),
+    )
+
+    assert provider.complete("", [Message(role="user", content="ping")]).text == "ok"
+
+
 @pytest.mark.parametrize(
     ("model_type", "expects_temperature"),
     [("gpt-5.5", False), ("deepseek-v4-pro", True)],
@@ -172,7 +217,10 @@ def test_structured_chat_applies_model_temperature_capability(
     config = _config().model_copy(update={"model_type": model_type, "model": model_type})
     provider = AzureOpenAIProvider(config)
     chat = _FakeChatCompletions(_FakeChatResponse("ok", _FakeUsage(1, 1)))
-    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+    client_method = (
+        "_get_v1_client" if config.resolved_azure_api_surface() == "v1" else "_get_client"
+    )
+    monkeypatch.setattr(provider, client_method, lambda: _FakeClient(chat))
 
     provider.complete_chat(
         ChatRequest.model_validate(
@@ -442,6 +490,35 @@ def test_embed_uses_embed_model_as_deployment(monkeypatch: pytest.MonkeyPatch) -
     assert vectors == [[0.5, 0.6]]
     # embed_model is sent as the Azure deployment name (the `model` arg).
     assert embeddings.last_kwargs["model"] == "embed-deploy"
+
+
+def test_foundry_v1_chat_selection_does_not_change_embedding_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Azure embeddings remain on the API-versioned deployment route."""
+    embeddings = _FakeEmbeddings(_FakeEmbeddingResponse([[0.5, 0.6]]))
+    provider = AzureOpenAIProvider(
+        ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="kimi-k2.6",
+            deployment="prod-kimi",
+            api_version="2024-10-21",
+            embed_model="embed-prod",
+        )
+    )
+    legacy = _FakeClient(
+        _FakeChatCompletions(_FakeChatResponse("", _FakeUsage(0, 0))),
+        embeddings,
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: legacy)
+    monkeypatch.setattr(
+        provider,
+        "_get_v1_client",
+        lambda: (_ for _ in ()).throw(AssertionError("embed must not use the v1 chat client")),
+    )
+
+    assert provider.embed(["a"]) == [[0.5, 0.6]]
+    assert embeddings.last_kwargs["model"] == "embed-prod"
 
 
 def test_embed_requires_embed_model() -> None:

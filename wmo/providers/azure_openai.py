@@ -1,10 +1,10 @@
-"""Azure OpenAI provider (GPT 5.5).
+"""Azure provider for API-versioned Azure OpenAI and Azure Foundry v1 deployments.
 
 The real AZURE_OPENAI_API_KEY is only ever sent to the trusted, operator-supplied
 AZURE_OPENAI_ENDPOINT. A config-controlled endpoint (ProviderConfig.endpoint, which can arrive
 in an untrusted model bundle's config.toml) is treated as an untrusted host: auth for it comes
-from WMO_ENDPOINT_API_KEY, never the real key, mirroring OpenAIProvider. Deployment name and
-api_version come from ProviderConfig.deployment / ProviderConfig.api_version.
+from WMO_ENDPOINT_API_KEY, never the real key, mirroring OpenAIProvider. Deployment name and API
+surface come from ProviderConfig and the canonical model catalog.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class AzureOpenAIProvider:
         # does not apply. Multi-account pools (several Azure resources, one key each) need this.
         self._api_key = api_key
         self._client: AzureOpenAI | None = None
-        self._responses_client: OpenAI | None = None
+        self._v1_client: OpenAI | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
 
     def _resolved_endpoint(self) -> tuple[str, bool]:
@@ -117,9 +117,9 @@ class AzureOpenAIProvider:
                 )
         return self._client
 
-    def _get_responses_client(self) -> OpenAI:
-        """Create the Azure v1 client used by configured structured reasoning calls."""
-        if self._responses_client is None:
+    def _get_v1_client(self) -> OpenAI:
+        """Create the Azure v1 client used by chat and Responses API calls."""
+        if self._v1_client is None:
             endpoint, is_config_endpoint = self._resolved_endpoint()
             if self._api_key is not None:
                 # Same trusted explicit credential as _get_client.
@@ -130,12 +130,12 @@ class AzureOpenAIProvider:
                 api_key = os.environ.get("AZURE_OPENAI_API_KEY")
                 if not api_key:
                     raise ValueError(
-                        "AzureOpenAIProvider needs AZURE_OPENAI_API_KEY for the v1 Responses API."
+                        "AzureOpenAIProvider needs AZURE_OPENAI_API_KEY for the Azure v1 API."
                     )
 
             from openai import OpenAI
 
-            self._responses_client = OpenAI(
+            self._v1_client = OpenAI(
                 api_key=api_key,
                 base_url=_responses_base_url(endpoint),
                 timeout=240.0,
@@ -143,26 +143,32 @@ class AzureOpenAIProvider:
                 # one provider dispatch so usage and the operator's hard budget stay observable.
                 max_retries=0,
             )
-        return self._responses_client
+        return self._v1_client
+
+    def _get_responses_client(self) -> OpenAI:
+        """Return the v1 client used for structured reasoning calls."""
+        return self._get_v1_client()
 
     def prepare(self) -> None:
         """Resolve deployment, api_version, endpoint, and key by building this config's client.
 
-        Satisfies `wmo.providers.base.PreparableProvider`. Branches exactly like `verify`: a
-        `reasoning_effort` config dispatches through the Azure v1 Responses client, everything else
-        through the api-versioned chat client, so the thing that gets prepared is the thing the
-        request will use. All four failures are local, which is what makes this free: `_deployment`
-        rejects a config with no deployment name, `_get_client` rejects a missing api_version and a
-        missing endpoint before it reaches for the SDK, and `AzureOpenAI(...)` itself refuses to
-        construct without a resolvable key. No connection is opened.
+        Satisfies `wmo.providers.base.PreparableProvider`. The model's API-surface capability
+        selects the Azure v1 or API-versioned client independently from reasoning effort. All
+        failures are local, which is what makes this free: `_deployment` rejects a config with no
+        deployment name, each client validates its endpoint and credential before use, and no
+        connection is opened.
 
         Raises:
-            ValueError: The config is missing a deployment, an api_version, or an endpoint.
+            ValueError: The config is missing a deployment or endpoint, or an API-versioned
+                config is missing its api_version.
             openai.OpenAIError: No key resolved for this endpoint.
         """
         self._deployment()
-        if self.config.reasoning_effort is not None:
-            self._get_responses_client()
+        if (
+            self.config.reasoning_effort is not None
+            or self.config.resolved_azure_api_surface() == "v1"
+        ):
+            self._get_v1_client()
             return
         self._get_client()
 
@@ -207,8 +213,13 @@ class AzureOpenAIProvider:
                     input_tokens=usage.input_tokens, output_tokens=usage.output_tokens
                 ),
             )
+        client = (
+            self._get_v1_client()
+            if self.config.resolved_azure_api_surface() == "v1"
+            else self._get_client()
+        )
         return _openai_common.complete(
-            self._get_client().chat.completions,
+            client.chat.completions,
             self._deployment(),
             system,
             messages,
@@ -239,8 +250,13 @@ class AzureOpenAIProvider:
                 "streaming is not yet implemented for reasoning_effort Azure configs; "
                 "unset reasoning_effort or use complete()"
             )
+        client = (
+            self._get_v1_client()
+            if self.config.resolved_azure_api_surface() == "v1"
+            else self._get_client()
+        )
         return _openai_common.stream(
-            self._get_client().chat.completions,
+            client.chat.completions,
             self._deployment(),
             system,
             messages,
@@ -265,8 +281,13 @@ class AzureOpenAIProvider:
                 reasoning_effort=self.config.reasoning_effort,
                 allow_sampling=False,
             )
+        client = (
+            self._get_v1_client()
+            if self.config.resolved_azure_api_surface() == "v1"
+            else self._get_client()
+        )
         return _openai_common.complete_chat(
-            self._get_client().chat.completions,
+            client.chat.completions,
             self._deployment(),
             request,
             max_tokens_field=self.config.resolved_chat_max_tokens_field(),

@@ -5,7 +5,7 @@ from __future__ import annotations
 from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict
 
-from wmo.providers.base import ProviderKind
+from wmo.providers.base import AzureAPISurface, ProviderKind
 
 
 class ProviderModel(BaseModel):
@@ -27,6 +27,7 @@ class ProviderModel(BaseModel):
     model_id: str
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
     forward_temperature: bool = True
+    azure_api_surface: AzureAPISurface = "api-versioned"
 
 
 _MODELS: tuple[ProviderModel, ...] = (
@@ -158,12 +159,14 @@ _MODELS: tuple[ProviderModel, ...] = (
         model_type="deepseek-v4-pro",
         model_id="deepseek-v4-pro",
         chat_max_tokens_field="max_tokens",
+        azure_api_surface="v1",
     ),
     ProviderModel(
         provider=ProviderKind.AZURE_OPENAI,
         model_type="kimi-k2.6",
         model_id="kimi-k2.6",
         chat_max_tokens_field="max_tokens",
+        azure_api_surface="v1",
     ),
 )
 

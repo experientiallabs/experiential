@@ -41,6 +41,7 @@ class EmbedderKind(StrEnum):
 
 
 Role = Literal["user", "assistant"]
+AzureAPISurface = Literal["api-versioned", "v1"]
 
 
 class Message(BaseModel):
@@ -105,6 +106,9 @@ class ProviderConfig(BaseModel):
     region: str | None = None  # AWS Bedrock region
     deployment: str | None = None  # Azure OpenAI deployment name
     api_version: str | None = None  # Azure OpenAI API version
+    # Azure has two chat surfaces. Unset resolves through the canonical model catalog, keeping
+    # transport selection independent from optional reasoning configuration.
+    azure_api_surface: AzureAPISurface | None = None
     reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
     # The serialized default stays stable for persisted configs. When callers do not explicitly
     # set this field, built-in models resolve it from the canonical ProviderModel catalog.
@@ -133,6 +137,15 @@ class ProviderConfig(BaseModel):
             return True
         model = self.model_type or self.model
         return resolve_provider_model(self.kind, model).forward_temperature
+
+    def resolved_azure_api_surface(self) -> AzureAPISurface:
+        """Return the Azure chat API surface selected for this model."""
+        if self.azure_api_surface is not None:
+            return self.azure_api_surface
+        from wmo.providers.models import resolve_provider_model
+
+        model = self.model_type or self.model
+        return resolve_provider_model(self.kind, model).azure_api_surface
 
 
 def normalize_chat_temperature(

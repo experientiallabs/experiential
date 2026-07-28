@@ -1052,6 +1052,39 @@ def test_providers_set_verifies_and_saves_local_worker(monkeypatch, tmp_path) ->
     assert worker.endpoint == "https://models.example/v1"
 
 
+def test_providers_set_requires_an_operator_named_azure_deployment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A scripted Azure setup must fail before a guessed deployment is verified or saved."""
+    verified: list[ProviderConfig] = []
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: verified.extend(configs) or [],
+    )
+    root = tmp_path / ".wmo"
+
+    result = runner.invoke(
+        app,
+        [
+            "providers",
+            "set",
+            "--provider",
+            "azure",
+            "--model",
+            "kimi-k2.6",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--deployment" in result.output
+    assert "operator" in result.output
+    assert verified == []
+    assert load_settings(root).models.worker is None
+
+
 def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub both live pings so `providers set` reaches, and gets through, pool registration.
 
@@ -1250,9 +1283,7 @@ def test_providers_set_rejects_an_unknown_tier(
 def test_providers_set_never_guesses_an_azure_deployment_for_the_pool(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The worker config fills an Azure deployment in from the model id when none was given; a
-    # pool entry must not inherit that guess, because Azure sends the deployment as the request
-    # model and a guessed name addresses a route that does not exist.
+    # Neither the worker nor the pool may infer an operator-owned Azure deployment.
     _accept_every_provider(monkeypatch)
     root = tmp_path / ".wmo"
 
@@ -1273,11 +1304,9 @@ def test_providers_set_never_guesses_an_azure_deployment_for_the_pool(
     )
 
     assert result.exit_code != 0
-    assert "azure needs --deployment" in result.output
+    assert "--deployment" in result.output
     assert not (root / "pool.toml").exists()
-    # The worker role is still saved with its derived deployment: only the pool is strict.
-    worker = load_settings(root).models.worker
-    assert worker is not None and worker.deployment == "gpt-5.5"
+    assert load_settings(root).models.worker is None
 
 
 def test_providers_set_registers_a_named_azure_deployment(

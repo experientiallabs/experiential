@@ -81,7 +81,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "bedrock": ["claude-opus-4-8", "claude-opus-4-7", "claude-haiku-4-5"],
     # openai_responses (the Responses API) stays flag-only (`wmo build --provider
     # openai_responses`); the wizard list keeps to the four everyday backends.
-    "azure": ["gpt-5.5", "gpt-5.4"],
+    "azure": ["gpt-5.5", "gpt-5.4", "deepseek-v4-pro", "kimi-k2.6"],
 }
 _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
 
@@ -238,15 +238,18 @@ def select_provider_and_model(
     default_provider: str | None,
     default_model: str | None,
     default_region: str | None,
+    default_deployment: str | None = None,
+    ask_azure_deployment: bool = False,
     interactive: bool,
     check: Callable[[ProviderConfig], VerifyResult],
-) -> tuple[str, str, str | None]:
+) -> tuple[str, str, str | None, str | None]:
     """The wizard's serve-provider block: pick provider + model (+ region), creds, live verify.
 
     Providers with credentials present are annotated and the first becomes the suggested default
     (none otherwise); a failed live ping loops back to the picker with the failed pick as the
-    retry default. Also reused by `wmo demo`'s switch-provider flow. Returns
-    (provider, model, region).
+    retry default. A caller that owns persistent Azure setup may request the deployment prompt;
+    the exact operator-entered deployment is included in the config passed to `check`. Also reused
+    by `wmo demo`'s switch-provider flow. Returns (provider, model, region, deployment).
     """
     providers = list(_PROVIDER_MODELS)
     with_creds = [p for p in providers if has_credentials(p)]
@@ -278,6 +281,22 @@ def select_provider_and_model(
         if provider == "bedrock":
             region_default = default_region or _DEFAULT_REGIONS.get(provider)
             region = _prompt_text(console, ask, "AWS region", region_default) or None
+        deployment = None
+        if provider == "azure" and ask_azure_deployment:
+            while not deployment:
+                deployment = (
+                    _prompt_text(
+                        console,
+                        ask,
+                        f"Azure deployment serving {model}",
+                        default_deployment,
+                    )
+                    or None
+                )
+                if deployment is None:
+                    console.print(
+                        "[red]an operator-created Azure deployment name is required[/red]"
+                    )
         # Live ping now, not at the end: a bad key or model id loops straight back to the
         # picker (the failed pick becomes the suggested retry default).
         console.print(f"verifying {provider}…")
@@ -288,11 +307,12 @@ def select_provider_and_model(
                 model_type=model_spec.model_type,
                 model=model_spec.model_id,
                 region=region,
+                deployment=deployment,
             )
         )
         if ping.ok:
             console.print(f"  {_CHECK} {provider} ({escape(model)}) reachable")
-            return provider, model, region
+            return provider, model, region, deployment
         console.print(
             f"  [red]✗ {provider} ({escape(model)}) failed[/red]: {escape(ping.detail or '')}"
         )
@@ -372,7 +392,7 @@ def run_build_wizard(
         console, ask, ask_secret, defaults, interactive
     )
 
-    provider, model, region = select_provider_and_model(
+    provider, model, region, _deployment = select_provider_and_model(
         console,
         ask,
         ask_secret,
