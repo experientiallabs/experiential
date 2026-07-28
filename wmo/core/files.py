@@ -49,7 +49,7 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
       about 0.1 s across a 200-step distill run whose steps are minutes of paid rollouts.
     - **The destination's mode is carried over.** `replace` installs a NEW inode, so without this
       a file an operator or an installer had restricted comes back as 0644 on the first write.
-    - **A symlinked destination is written THROUGH, not replaced.** See `_resolve_destination`.
+    - **A symlinked destination is written THROUGH, not replaced.** See `resolve_write_target`.
 
     Cleanup is `BaseException`, not `OSError`: a Ctrl-C between the write and the rename would
     otherwise strand a staging file in an artifact directory that serving and the fitter scan.
@@ -65,7 +65,7 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
             rename, so a raised error always means the write did not land: see `_fsync_directory`
             for the one step that is deliberately best effort.
     """
-    path = _resolve_destination(path)
+    path = resolve_write_target(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
     try:
@@ -84,7 +84,7 @@ def write_bytes_atomic(path: Path, payload: bytes) -> None:
     _fsync_directory(path.parent)
 
 
-def _resolve_destination(path: Path) -> Path:
+def resolve_write_target(path: Path) -> Path:
     """The real file to write, following `path` if it is a symlink.
 
     An in-place `write_text` follows a symlink: an operator who points `.wmo/config.toml` at a
@@ -98,9 +98,12 @@ def _resolve_destination(path: Path) -> Path:
     the clobbering was longstanding rather than new. Following the link is what the operator asked
     for in every case; nothing wants a symlink quietly turned into a file.
 
-    Resolving is also what keeps the write atomic. The staging file has to sit beside the FINAL
-    target, because `replace` across filesystems fails with EXDEV, and a symlink into another mount
-    is exactly the case where staging beside the link would break.
+    Resolving is also what keeps the write atomic, and what keeps the LOCK correct.
+    `wmo.core.locks.file_write_lock` derives its lock file from this same answer, so two callers
+    reaching one target through different symlinks contend on one lock rather than taking a lock
+    each and both proceeding. And the staging file has to sit beside the FINAL target, because
+    `replace` across filesystems fails with EXDEV, and a symlink into another mount is exactly the
+    case where staging beside the link would break the rename.
 
     A broken symlink resolves to its missing target, which is then created: writing through a
     dangling link is what an in-place write would have done too.

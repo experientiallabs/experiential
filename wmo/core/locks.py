@@ -26,6 +26,8 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
+from wmo.core.files import resolve_write_target
+
 # How long a writer waits for another process to finish. These writes are a few file operations,
 # so real contention never comes close; the bound exists so a hung holder is REPORTED instead of
 # hanging the terminal forever.
@@ -51,6 +53,12 @@ def file_write_lock(
     atomic rename, which swaps the inode, so a lock taken on the file would stop protecting
     anything the moment the first writer landed.
 
+    The sibling is chosen beside the file the write will actually LAND on, via
+    `resolve_write_target`, not beside `path` as given. A symlinked roster is written through to its
+    target, so two callers reaching one target through different links (a shared pool symlinked from
+    two project directories) would otherwise take one lock each, both succeed, and lose an update
+    apiece: exactly what this exists to prevent.
+
     The lock is released by the OS when the holder exits, crashes, or is killed, so a leftover
     `.lock` FILE is never a held lock and can never wedge a later run. That is also why it is left
     in place: unlinking it would let a waiter block on an inode nobody else can reach. A live
@@ -74,7 +82,8 @@ def file_write_lock(
     Raises:
         FileLockTimeout: The lock was still held after `timeout_s`.
     """
-    lock_path = path.with_name(f"{path.name}.lock")
+    target = resolve_write_target(path)
+    lock_path = target.with_name(f"{target.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = FileLock(lock_path, timeout=timeout_s, mode=0o600)
     try:

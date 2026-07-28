@@ -102,3 +102,29 @@ def test_file_write_lock_is_not_reentrant_and_says_so_within_the_bound(tmp_path:
         with pytest.raises(FileLockTimeout):
             with file_write_lock(path, what="the roster", timeout_s=0.05):
                 pass  # pragma: no cover - the outer lock is held
+
+
+def test_two_symlinks_to_one_target_contend_on_a_single_lock(tmp_path: Path) -> None:
+    """A shared roster symlinked from two project directories is ONE file to be serialized.
+
+    The lock file is derived from the resolved write target, not from the path as given. Keyed off
+    the link instead, each caller takes its own lock, both proceed, and each loses the other's
+    update: precisely the failure the lock exists to prevent, and reachable only once writes follow
+    symlinks through to their target.
+    """
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    target = shared / "pool.toml"
+    target.write_text("roster", encoding="utf-8")
+    first = tmp_path / "project-a.toml"
+    first.symlink_to(target)
+    second = tmp_path / "project-b.toml"
+    second.symlink_to(target)
+
+    with file_write_lock(first, what="the model pool", timeout_s=0.05):
+        with pytest.raises(FileLockTimeout):
+            with file_write_lock(second, what="the model pool", timeout_s=0.05):
+                pass  # pragma: no cover - the first lock is held
+
+    assert [item.name for item in shared.glob("*.lock")] == ["pool.toml.lock"]
+    assert list(tmp_path.glob("*.lock")) == [], "a lock was keyed off the symlink, not the target"
