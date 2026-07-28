@@ -109,17 +109,24 @@ class CompressionConfig(BaseModel):
       document/observation bulk held accuracy inside the noise floor.
     - "bulk": "observations" plus user segments of at least `bulk_min_chars`, i.e. pasted
       documents rather than typed turns. The other safe scope for a stock scorer.
-    - "all": every segment, dialogue included. The target scope for a DOMAIN-ADAPTED scorer at a
-      calibrated threshold: at a fixed absolute threshold, a scorer that rates dialogue as
-      high-keep preserves conversation on its own, so excluding dialogue structurally is
-      redundant and costs the savings the adapted scorer could have made safely. Choosing it with
-      a stock scorer reintroduces exactly the measured dialogue harm above, which is why it is a
-      deliberate selection and never a default.
+    - "all": user turns (bar the first), assistant turns, and observations. Dialogue included, so
+      it is the target scope for a DOMAIN-ADAPTED scorer at a calibrated threshold: at a fixed
+      absolute threshold, a scorer that rates dialogue as high-keep preserves conversation on its
+      own, so excluding dialogue structurally is redundant and costs the savings the adapted
+      scorer could have made safely. Choosing it with a stock scorer reintroduces exactly the
+      measured dialogue harm above, which is why it is a deliberate selection and never a default.
 
-    Scope is not a way to reach the task statement. The first user segment of a conversation is
-    never compressed in ANY scope, at any aggressiveness (`compressible_positions`): the one
-    genuine deletion harm this track ever measured was a compressed task statement, so the rule
-    is code, not configuration.
+    Two exclusions are STAGE LAW rather than scope rules, so no scope reaches them at any
+    aggressiveness (`compressible_positions`):
+
+    1. The TASK: the first user segment of a conversation. The one genuine deletion harm this
+       track ever measured was a compressed task statement.
+    2. The SYSTEM PROMPT, for two measured reasons. Instructions are the single category with a
+       demonstrated deletion harm (the Block question-side failure), and a system prompt is the
+       endpoint owner's instruction surface (tool schemas, policies, format contracts) rather
+       than content to shorten. It is also the maximally cacheable prefix segment, so after the
+       ~0.1x cache-read discount compressing it buys almost nothing while risking all of that:
+       the track's caching-beats-compression rule at its strongest point.
 
     `bulk_min_chars` is inert outside "bulk" scope, and identity treats it that way: it is
     compared only when the scope can act on it.
@@ -385,21 +392,26 @@ def compressible_positions(
 ) -> tuple[int, ...]:
     """The indices of `segments` this config lets a compressor rewrite, in order.
 
-    TASK PROTECTION is enforced here and nowhere else, which is the point of routing every
-    caller through this function: the FIRST user segment of a conversation is the task or
-    question, and it is excluded in every scope at every aggressiveness. Compressing a task
-    statement is the one deletion this track measured real harm from, so it cannot be reachable
-    by a config value, a new scope, or a caller that forgets to check.
+    THE TWO PROTECTIONS are enforced here and nowhere else, which is the point of routing every
+    caller through this function. Neither is reachable by a config value, a new scope, or a
+    caller that forgets to check:
+
+    - the TASK, i.e. the first user segment of a conversation. Compressing a task statement is
+      the one deletion this track measured real harm from.
+    - the SYSTEM PROMPT, every one of them. It is the endpoint owner's instruction surface, and
+      instructions are the category with the demonstrated deletion harm; it is also the
+      maximally cacheable prefix segment, so compressing it trades a ~0.1x cache-read discount
+      for a fraction of its tokens.
 
     Everything else follows `config.scope`; see `CompressionConfig` for what the four values
-    mean and what was measured behind them. "all" means literally that, the protected task
-    aside: the system prompt and the model's own replies are candidates too, because the point of
-    that scope is to stop the SCOPE deciding what to keep and let a calibrated scorer decide.
+    mean and what was measured behind them. "all" therefore spans user turns after the first,
+    assistant turns, and observations: it stops the SCOPE deciding what dialogue is worth
+    keeping and hands that to a calibrated scorer, without reaching either protected kind.
     """
     protected = next((index for index, seg in enumerate(segments) if seg.kind == "user"), None)
     selected: list[int] = []
     for index, segment in enumerate(segments):
-        if index == protected:
+        if index == protected or segment.kind == "system":
             continue
         match config.scope:
             case "conversation":
@@ -482,14 +494,8 @@ class CompressingEmbedder:
     Serving does NOT wrap its embedder: the compression stage has already rewritten the request
     by the time the router embeds it, so wrapping there would compress twice.
 
-    OPEN under scoped compression, stated because a scoped fit can reach it: serving routes on
-    the last USER turn of the compressed transcript, and task protection plus the narrow scopes
-    mean that text is frequently raw (always, in "observations" scope, where no user turn is ever
-    a candidate; and on the first turn of every conversation in any scope, where the last user
-    turn IS the protected task). Wrapping the fit's embedder then puts the bank in a geometry
-    serving does not query it in, which is the mismatch this wrapper exists to prevent, pointing
-    the other way. Which config a scoped fit should stamp as `fit_compression`, and whether it
-    should wrap at all, is a fit-side decision this seam change does not make.
+    Whether a given arm should wrap at all is `routed_text_embedder`'s decision, not a call
+    site's; construct this directly only when you mean to compress unconditionally.
 
     As few compressor calls per `embed` batch as the compressor's cap allows, not one per text:
     fitting a bank means compressing every fit scenario, which would otherwise be a round trip
@@ -505,6 +511,49 @@ class CompressingEmbedder:
     def embed(self, texts: list[str]) -> list[list[float]]:
         compressed = compress_segments(self._compressor, list(texts), self._config)
         return self._inner.embed(compressed.segments)
+
+
+# The scopes that rewrite the text serving routes on. Serving embeds the last USER turn of the
+# compressed transcript, so only a scope that can compress a user turn changes the routed-on
+# representation. "observations" and "bulk" leave every routed-on query raw ("bulk" can compress a
+# pasted user document, but a segment that large is not what `_routable_text` hands the router in
+# any measured traffic, and treating it as one would put the bank in a geometry almost no query
+# lands in).
+_ROUTED_TEXT_SCOPES: frozenset[CompressionScope] = frozenset({"conversation", "all"})
+
+
+def routed_text_embedder(inner: Embedder, config: CompressionConfig | None) -> Embedder:
+    """The embedder a fit (or a report replay) must use for `config`'s arm.
+
+    Representation consistency has a direction, and scope decides which way it points. A routing
+    bank, its cluster centroids, and its novelty-floor quantile are geometry in the space of the
+    text the fit embedded, and serving queries that geometry with the text it routes on: the last
+    USER turn of the compressed transcript (`wmo.serving.chat._routable_text`). So the rule is
+    whether this arm's scope can rewrite that turn at all:
+
+    - "conversation" and "all" can, so the fit wraps and the bank lives in compressed geometry.
+      Not wrapping is the C2 Q2 failure: queries land farther from every bank row, the novelty
+      floor trips 10-13x more often, routing collapses to the expensive fallback, and cost rises
+      11-41% while accuracy sits flat to negative.
+    - "observations" and "bulk" cannot: no user turn is ever a candidate, so every routed-on query
+      arrives raw. Wrapping there would put the bank in a geometry serving NEVER queries, which is
+      the same failure mirrored, so these arms fit on raw text.
+
+    The wrap decision does not touch arm identity: `fit_compression` still stamps the whole config
+    either way, so the mount gates and the measured-arm gates behave exactly as they do now.
+
+    KNOWN RESIDUAL, interim: under "conversation" and "all" the routed-on text is compressed on
+    later turns but RAW on the first turn of every conversation, because the last user turn is
+    then the protected task. A wrapped bank is therefore right for most queries and slightly off
+    for first-turn ones, which is a mixture rather than the clean mismatch above. The uniform fix
+    is the route-on-raw serving contract (route on the raw last user turn, so the routed-on
+    representation is raw in every scope and no fit ever wraps), pending the routing lane's
+    co-sign; this rule converges to it, since adopting that contract just empties
+    `_ROUTED_TEXT_SCOPES`.
+    """
+    if config is None or config.scope not in _ROUTED_TEXT_SCOPES:
+        return inner
+    return CompressingEmbedder(inner, config)
 
 
 def compression_signature(config: CompressionConfig | None) -> str:

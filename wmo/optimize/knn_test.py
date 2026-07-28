@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from wmo.optimize.compression import CompressionConfig
 from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     COST_QUALITY_BALANCED,
@@ -16,6 +17,7 @@ from wmo.optimize.knn import (
     build_knn_bank,
     cost_quality_knobs,
     cost_quality_named_point,
+    fit_knn_artifact,
     fit_knn_policy,
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -545,3 +547,46 @@ def test_the_dial_records_the_coverage_quantile_it_applied(tmp_path: Path) -> No
         slid = apply_cost_quality(fitted, dial)
         assert slid.floor_q == pytest.approx(cost_quality_knobs(dial).floor_q)
         assert (slid.floor_sim is None) == (slid.floor_q == 0.0)
+
+
+def _bank_of(tmp_path: Path, config: CompressionConfig | None, tag: str) -> np.ndarray:
+    """The bank `fit_knn_artifact` writes for one compression arm, as raw embeddings."""
+    out_path = tmp_path / tag / POLICY_FILENAME
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fitted = fit_knn_artifact(
+        _matrix(),
+        out_path=out_path,
+        matrix_source="matrix.json",
+        embedder=EmbedderSpec(dim=256),
+        fallback="cheap",
+        rag_num=5,
+        min_pairs=0,
+        compression=config,
+    )
+    return fitted.policy.knn_bank().embeddings
+
+
+def test_the_fit_wraps_its_embedder_only_when_the_scope_rewrites_the_routed_on_turn(
+    tmp_path: Path,
+) -> None:
+    """Both directions at the real fit site (the ruling's interim representation rule).
+
+    Serving routes on the last USER turn of the compressed transcript, so only a scope that can
+    rewrite a user turn changes the routed-on representation. A "conversation" arm must therefore
+    fit its bank in compressed geometry, and an "observations" arm must fit on RAW text: wrapping
+    there would put the bank in a geometry serving never queries, which is the C2 Q2 mismatch
+    mirrored. Compared against the uncompressed bank rather than against types, so the assertion
+    is about the embeddings this fit actually wrote.
+    """
+    raw = _bank_of(tmp_path, None, "raw")
+    conversation = _bank_of(
+        tmp_path, CompressionConfig(compressor_id="truncate", aggressiveness=0.5), "conversation"
+    )
+    observations = _bank_of(
+        tmp_path,
+        CompressionConfig(compressor_id="truncate", aggressiveness=0.5, scope="observations"),
+        "observations",
+    )
+
+    assert not np.allclose(conversation, raw)  # compressed geometry: the router queries it that way
+    assert np.array_equal(observations, raw)  # raw geometry: every routed-on query arrives raw

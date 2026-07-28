@@ -42,10 +42,10 @@ from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.compression import (
-    CompressingEmbedder,
     compression_signature,
     registered_compressor_ids,
     resolve_compression,
+    routed_text_embedder,
     same_compression,
 )
 from wmo.optimize.knn import (
@@ -1081,12 +1081,11 @@ def fit(
             raise typer.BadParameter(str(exc)) from exc
         print_knn_fit(_console, fitted, out=out, z=z)
         return
-    built = spec.build()  # ONE embedder for fit and evaluation; azure would otherwise embed twice
-    if compression is not None:
-        # Representation consistency: the cluster centroids have to live in the geometry of the
-        # text serving will embed, which is the COMPRESSED text (see `fit_knn_artifact`, which
-        # applies the same rule to the bank on the knn path).
-        built = CompressingEmbedder(built, compression)
+    # ONE embedder for fit and evaluation; azure would otherwise embed twice. Representation
+    # consistency: the cluster centroids have to live in the geometry of the text serving routes
+    # on, which `routed_text_embedder` decides from the arm's scope (see `fit_knn_artifact`, which
+    # applies the same rule to the bank on the knn path).
+    built = routed_text_embedder(spec.build(), compression)
     try:
         policy = fit_rank_policy(
             matrix,

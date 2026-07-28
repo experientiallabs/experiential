@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
-from wmo.optimize.compression import CompressingEmbedder, CompressionConfig
+from wmo.optimize.compression import CompressionConfig, routed_text_embedder
 from wmo.optimize.policy import (
     DEFAULT_KNN_MIN_PAIRS,
     DEFAULT_KNN_Z,
@@ -319,15 +319,12 @@ def fit_knn_artifact(
         raise ValueError("rag_thres must be greater than 0")
     selected_ids = fit_ids if fit_ids is not None else matrix.scenario_ids()
     fit_digest = hashlib.sha256("\0".join(selected_ids).encode("utf-8")).hexdigest()[:16]
-    built = embedder.build()
-    if compression is not None:
-        # Representation consistency, the C2 rule that makes or breaks a compressed arm: the
-        # bank rows and the novelty-floor quantile have to live in the geometry of the text
-        # SERVING will embed, which is the compressed text. One wrapped embedder covers the fit
-        # and the replay below. Serving does not wrap, because its compression stage runs ahead
-        # of the router. Fitting the bank uncompressed while serving compresses is the failure
-        # this exists to prevent: the floor abstains, and routing silently stops happening.
-        built = CompressingEmbedder(built, compression)
+    # Representation consistency, the C2 rule that makes or breaks a compressed arm: the bank rows
+    # and the novelty-floor quantile have to live in the geometry of the text SERVING routes on.
+    # `routed_text_embedder` owns whether this arm's scope rewrites that text (so a scope that
+    # never touches a user turn fits on raw); one embedder covers the fit and the replay below.
+    # Serving does not wrap either way, because its compression stage runs ahead of the router.
+    built = routed_text_embedder(embedder.build(), compression)
     embed_tag = embedder_provenance(embedder)
     policy = fit_knn_policy(
         matrix,

@@ -27,7 +27,7 @@ from statistics import median, quantiles
 
 from pydantic import BaseModel, Field
 
-from wmo.optimize.compression import CompressingEmbedder
+from wmo.optimize.compression import routed_text_embedder
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import RoutingPolicy, select_model
 from wmo.providers.pool import Tier
@@ -196,15 +196,15 @@ def build_report(
     # One embedder for the whole report: an azure spec builds an HTTP client per `build()`, and
     # a report routes every held-out scenario.
     embedder = policy.embedder.build() if policy.kind != "static" else None
-    if embedder is not None and policy.compression is not None:
-        # Representation consistency, on the reporting side. A compressed endpoint's bank lives in
-        # the geometry of compressed text, and serving compresses each request before the router
-        # embeds it. Replaying the selection on RAW task text would therefore measure a policy
-        # nobody serves: every query lands farther from every bank row, the novelty floor trips,
-        # and the report would show routing collapsing to the fallback (C2 measured the floor
-        # tripping 10-13x more often under exactly this mismatch). So the replay embeds through the
-        # same compressor the fit did.
-        embedder = CompressingEmbedder(embedder, policy.compression)
+    if embedder is not None:
+        # Representation consistency, on the reporting side: the replay has to embed the way the
+        # FIT did, or it measures a policy nobody serves. On an arm whose scope rewrites the
+        # routed-on text, replaying on raw task text would land every query farther from every
+        # bank row and show routing collapsing to the fallback (C2 measured the floor tripping
+        # 10-13x more often under exactly that mismatch); on an arm whose scope does not, wrapping
+        # would invent the same error in reverse. `routed_text_embedder` is the one place that
+        # decides, so the report cannot disagree with the fit about it.
+        embedder = routed_text_embedder(embedder, policy.compression)
 
     routed_rows: dict[str, list[ScenarioOutcome]] = {}
     baseline_rows: dict[str, list[ScenarioOutcome]] = {}

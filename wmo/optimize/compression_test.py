@@ -25,6 +25,7 @@ from wmo.optimize.compression import (
     register_compressor_factory,
     registered_compressor_ids,
     resolve_compression,
+    routed_text_embedder,
     same_compression,
     segment_batch_limit,
     servable_compressor,
@@ -236,15 +237,30 @@ _CONVERSATION = [
 ]
 
 
-def test_the_first_user_segment_is_protected_in_every_scope() -> None:
-    # The one deletion harm this track measured was a compressed task statement, so no scope and
-    # no dial can reach index 1 here.
+def test_the_task_and_the_system_prompt_are_protected_in_every_scope() -> None:
+    # The two stage-law exclusions, at the top of the dial with the bulk threshold as low as it
+    # goes. Index 1 is the task (the measured deletion harm), index 0 is the system prompt (the
+    # endpoint owner's instruction surface, and the maximally cacheable prefix segment).
     scopes: tuple[CompressionScope, ...] = ("conversation", "observations", "bulk", "all")
     for scope in scopes:
         config = CompressionConfig(
             compressor_id="truncate", aggressiveness=1.0, scope=scope, bulk_min_chars=1
         )
-        assert 1 not in compressible_positions(_CONVERSATION, config)
+        positions = compressible_positions(_CONVERSATION, config)
+        assert 1 not in positions, scope
+        assert 0 not in positions, scope
+
+
+def test_a_second_system_segment_is_protected_too_not_just_the_first() -> None:
+    # The system rule is by KIND, not by position: a transcript carrying a second system turn
+    # (clients do send them mid-conversation) must not have that one compressed either.
+    segments = [
+        Segment(kind="user", text="the task statement"),
+        Segment(kind="system", text="a mid-conversation instruction update"),
+        Segment(kind="user", text="a follow-up turn"),
+    ]
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=1.0, scope="all")
+    assert compressible_positions(segments, config) == (2,)
 
 
 def test_each_scope_selects_the_segments_it_names() -> None:
@@ -260,10 +276,10 @@ def test_each_scope_selects_the_segments_it_names() -> None:
     # default threshold it is left alone and only the observation is selected.
     assert positions("bulk") == (3,)
     assert positions("bulk", bulk_min_chars=1) == (3, 4)
-    # "all" is literally all of it, the protected task at index 1 aside: the system prompt and the
-    # model's own reply are candidates too, because that scope exists to stop the SCOPE deciding
-    # what to keep and hand the decision to a calibrated scorer.
-    assert positions("all") == (0, 2, 3, 4)
+    # "all" spans user turns after the first, assistant turns, and observations: it stops the SCOPE
+    # deciding what dialogue is worth keeping and hands that to a calibrated scorer, while both
+    # stage-law exclusions (index 1 the task, index 0 the system prompt) still hold.
+    assert positions("all") == (2, 3, 4)
 
 
 def test_the_task_is_byte_identical_through_the_stage_at_full_aggressiveness() -> None:
@@ -305,6 +321,37 @@ def test_a_conversation_with_nothing_eligible_never_calls_the_compressor() -> No
     result = compress_conversation(cast("Compressor", _Refusing()), only_the_task, config)
     assert result.texts == ["the task statement"]
     assert result.cost_usd == 0.0
+
+
+def test_only_a_scope_that_rewrites_the_routed_on_turn_wraps_the_fit_embedder() -> None:
+    # Serving routes on the last USER turn of the compressed transcript, so representation
+    # consistency has a direction and scope decides which way it points. Wrapping under a scope
+    # that never touches a user turn would put the bank in a geometry serving never queries: the
+    # C2 Q2 failure mirrored.
+    inner = _CountingEmbedder()
+    base = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    assert isinstance(routed_text_embedder(inner, base), CompressingEmbedder)
+    assert isinstance(
+        routed_text_embedder(inner, base.model_copy(update={"scope": "all"})), CompressingEmbedder
+    )
+    for raw_routed in ("observations", "bulk"):
+        wrapped = routed_text_embedder(inner, base.model_copy(update={"scope": raw_routed}))
+        assert wrapped is inner, raw_routed
+    assert routed_text_embedder(inner, None) is inner  # an uncompressed arm never wraps
+
+
+def test_an_observations_scope_fit_embeds_raw_and_a_conversation_scope_fit_does_not() -> None:
+    # The same rule read off the BYTES the fit embedder hands its inner embedder, not off types.
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    conversation = _CountingEmbedder()
+    routed_text_embedder(conversation, config).embed(["one two three four"])
+    assert conversation.seen == [["one two"]]
+
+    observations = _CountingEmbedder()
+    routed_text_embedder(observations, config.model_copy(update={"scope": "observations"})).embed(
+        ["one two three four"]
+    )
+    assert observations.seen == [["one two three four"]]  # raw: serving routes on raw here
 
 
 def test_compressing_embedder_embeds_the_compressed_text() -> None:
