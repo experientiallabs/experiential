@@ -609,6 +609,136 @@ def test_a_completed_matrix_from_a_different_plan_is_not_overwritten(
     assert len(replaced.matrix.outcomes) == 6
 
 
+def test_completed_rows_are_not_reused_after_a_stable_scenario_id_changes_task(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    _run_plan(plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs")
+    first, *rest = plan.scenarios
+    changed = plan.model_copy(
+        update={
+            "scenarios": (
+                first.model_copy(update={"task": f"{first.task} with revised instructions"}),
+                *rest,
+            )
+        }
+    )
+
+    assert changed.identity.scenarios == plan.identity.scenarios
+    with pytest.raises(SweepError, match="scenario instructions or provenance changed"):
+        resumable_cells(changed)
+
+
+def test_completed_rows_are_not_reused_after_the_candidate_tool_hint_changes(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    _run_plan(plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs")
+    changed = plan.model_copy(update={"tools_hint": "search(query), fetch(url)"})
+
+    with pytest.raises(SweepError, match="candidate tool hint changed"):
+        resumable_cells(changed)
+
+
+def test_completed_rows_are_not_reused_after_the_trace_corpus_changes(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    _run_plan(plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs")
+    changed_traces = [
+        trace.model_copy(
+            update={
+                "steps": [
+                    step.model_copy(
+                        update={"observation": Observation(content="revised corpus observation")}
+                    )
+                    for step in trace.steps
+                ]
+            }
+        )
+        for trace in _traces()
+    ]
+    write_traces_jsonl(changed_traces, plan.model_dir / TRACES_FILENAME)
+    changed = plan_sweep(
+        model_dir=plan.model_dir,
+        config=resolve_config(plan.model_dir),
+        pool=plan.pool,
+        out_path=plan.out_path,
+        traces_file=None,
+        scenarios=len(plan.scenarios),
+        episodes=plan.episodes,
+        max_steps=plan.max_steps,
+        assume_input_tokens=plan.assume_input_tokens,
+        assume_output_tokens=plan.assume_output_tokens,
+    )
+
+    assert changed.identity.scenarios == plan.identity.scenarios
+    assert changed.identity.scenario_content == plan.identity.scenario_content
+    assert changed.identity.tools_hint == plan.identity.tools_hint
+    with pytest.raises(SweepError, match="trace corpus changed"):
+        resumable_cells(changed)
+
+
+@pytest.mark.parametrize("runtime_input", ["config", "prompt", "index", "knowledge"])
+def test_completed_rows_are_not_reused_after_the_frozen_world_model_changes(
+    tmp_path: Path,
+    runtime_input: str,
+) -> None:
+    model_dir = _model_dir(tmp_path)
+    if runtime_input == "prompt":
+        initial_file = model_dir / "prompts" / "optimized.txt"
+    elif runtime_input == "index":
+        initial_file = model_dir / "index" / "steps.jsonl"
+    elif runtime_input == "knowledge":
+        config = resolve_config(model_dir).model_copy(update={"knowledge": True})
+        save_config(config, model_dir)
+        initial_file = model_dir / "knowledge" / "rules.md"
+    else:
+        initial_file = None
+    if initial_file is not None:
+        initial_file.parent.mkdir(parents=True)
+        initial_file.write_text("initial frozen artifact content", encoding="utf-8")
+    plan = _plan(tmp_path, scenarios=3)
+    if runtime_input == "knowledge":
+        # `_plan` refreshes the default test config, so restore the enabled knowledge input.
+        config = resolve_config(model_dir).model_copy(update={"knowledge": True})
+        save_config(config, model_dir)
+        plan = plan_sweep(
+            model_dir=model_dir,
+            config=config,
+            pool=plan.pool,
+            out_path=plan.out_path,
+            traces_file=None,
+            scenarios=len(plan.scenarios),
+            episodes=plan.episodes,
+            max_steps=plan.max_steps,
+            assume_input_tokens=plan.assume_input_tokens,
+            assume_output_tokens=plan.assume_output_tokens,
+        )
+    _run_plan(plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs")
+    if runtime_input == "config":
+        config = resolve_config(plan.model_dir).model_copy(update={"top_k": 9})
+        save_config(config, plan.model_dir)
+    else:
+        assert initial_file is not None
+        initial_file.write_text("revised frozen artifact content", encoding="utf-8")
+    changed = plan_sweep(
+        model_dir=plan.model_dir,
+        config=resolve_config(plan.model_dir),
+        pool=plan.pool,
+        out_path=plan.out_path,
+        traces_file=None,
+        scenarios=len(plan.scenarios),
+        episodes=plan.episodes,
+        max_steps=plan.max_steps,
+        assume_input_tokens=plan.assume_input_tokens,
+        assume_output_tokens=plan.assume_output_tokens,
+    )
+
+    with pytest.raises(SweepError, match="frozen world-model artifact or config changed"):
+        resumable_cells(changed)
+
+
 def test_a_resumed_run_says_its_world_model_figure_is_this_attempt_only(
     tmp_path: Path, candidates: list[str]
 ) -> None:

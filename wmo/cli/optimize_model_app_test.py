@@ -34,6 +34,7 @@ from wmo.optimize.pipeline import (
     REPORT_FILENAME,
     RunManifest,
     Stage,
+    file_sha256,
 )
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DEPLOYMENT,
@@ -403,6 +404,56 @@ def test_a_second_run_skips_every_stage_and_says_why(
     assert "everystageiscurrent" in flat
     # A run with nothing to do asks nothing and spends nothing.
     assert "estimatedcandidatespend" not in flat
+
+
+def test_a_legacy_identityless_matrix_stays_usable_when_the_sweep_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upgrade must not turn a current, downstream-readable matrix into a paid rerun."""
+    world_model = _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
+    root = _project(tmp_path)
+    assert _run(tmp_path, root, "--yes").exit_code == 0
+    episodes_after_first = len(world_model.tasks)
+    matrix_path, _policy_path, _report_path, manifest_path = _paths(root)
+
+    matrix_payload = json.loads(matrix_path.read_text(encoding="utf-8"))
+    matrix_payload.pop("sweep_identity")
+    matrix_path.write_text(json.dumps(matrix_payload), encoding="utf-8")
+    manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+    sweep = manifest.record_for(Stage.SWEEP)
+    assert sweep is not None
+    legacy_sweep = sweep.model_copy(
+        update={
+            "fingerprint": {
+                key: value
+                for key, value in sweep.fingerprint.items()
+                if key
+                not in {
+                    "scenario_content",
+                    "tools_hint",
+                    "corpus",
+                    "world_model",
+                    "history_chars",
+                }
+            },
+            "artifact_identity": file_sha256(matrix_path),
+        }
+    )
+    manifest = manifest.model_copy(
+        update={
+            "stages": [
+                legacy_sweep if record.stage is Stage.SWEEP else record
+                for record in manifest.stages
+            ]
+        }
+    )
+    manifest.save(manifest_path)
+
+    again = _run(tmp_path, root, "--yes")
+    assert again.exit_code == 0, again.output
+    assert len(world_model.tasks) == episodes_after_first
+    assert _says(again.output, "matrix.json is current")
+    assert OutcomeMatrix.load(matrix_path).sweep_identity is None
 
 
 def test_force_from_sweep_redoes_the_sweep_and_everything_after_it(

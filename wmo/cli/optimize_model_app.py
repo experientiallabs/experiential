@@ -411,12 +411,12 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     )
     try:
         # A stage decision to run is explicit replacement authority for this pipeline's fixed
-        # matrix path. If the stage is current, the completed matrix instead participates in
-        # resume and is validated before the plan table or any spend question.
+        # matrix path. A skipped sweep does not resume anything: its manifest already established
+        # that the completed matrix is current, and older identity-less matrices must remain
+        # usable by downstream stages after an upgrade.
         replace_completed_sweep = _will_sweep(decisions)
-        already_measured = resumable_cells(
-            plan,
-            replace_completed=replace_completed_sweep,
+        already_measured = (
+            resumable_cells(plan, replace_completed=True) if replace_completed_sweep else 0
         )
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -774,17 +774,11 @@ def _live_inputs(
     match stage:
         case Stage.SWEEP:
             return _StageInputs(
-                fingerprint={
-                    "pool": file_sha256(pool_file),
-                    "scenarios": _scenario_identity(plan),
-                    "episodes": str(plan.episodes),
-                    "max_steps": str(plan.max_steps),
-                    # A matrix's rewards belong to ONE D-COMPRESS arm, so a changed compressor
-                    # means different evidence and the cells have to be bought again. This is the
-                    # fingerprint that makes `--compressor` re-measure rather than reuse cells
-                    # that ran under a different arm.
-                    "compression": compression_signature(plan.compression),
-                },
+                fingerprint=_sweep_fingerprint(
+                    plan,
+                    pool_file,
+                    complete_identity=_matrix_has_complete_sweep_identity(paths.matrix),
+                ),
                 artifact=paths.matrix,
                 artifact_identity=file_sha256(paths.matrix),
                 skip_summary="same pool, same scenarios, same episodes",
@@ -853,6 +847,57 @@ def _report_anchor(policy_path: Path, *, baseline: str | None, fallback: str | N
 def _scenario_identity(plan: SweepPlan) -> str:
     """The scenario SET the sweep will measure, as an id list a change is visible in."""
     return ",".join(scenario_id(scenario) for scenario in plan.scenarios)
+
+
+def _sweep_fingerprint(
+    plan: SweepPlan,
+    pool_file: Path,
+    *,
+    complete_identity: bool = True,
+) -> dict[str, str]:
+    """Inputs that decide whether `optimize model` must buy the sweep again.
+
+    The original keys stay unchanged for a legacy matrix with no complete sweep identity. Its
+    existing manifest can therefore keep skipping the paid stage while fit/report consume it.
+    Every newly written matrix adds the content identities, so changed instructions, tool hints,
+    corpus, config, runtime files, or history window rerun the sweep instead of silently reusing
+    stale evidence.
+    """
+    fingerprint = {
+        "pool": file_sha256(pool_file),
+        "scenarios": _scenario_identity(plan),
+        "episodes": str(plan.episodes),
+        "max_steps": str(plan.max_steps),
+        "compression": compression_signature(plan.compression),
+    }
+    if complete_identity:
+        identity = plan.identity
+        fingerprint.update(
+            {
+                "scenario_content": identity.scenario_content,
+                "tools_hint": identity.tools_hint,
+                "corpus": identity.corpus,
+                "world_model": identity.world_model,
+                "history_chars": str(identity.history_chars),
+            }
+        )
+    return fingerprint
+
+
+def _matrix_has_complete_sweep_identity(path: Path) -> bool:
+    """Whether a matrix can participate in the expanded optimizer fingerprint.
+
+    Missing and unreadable outputs are replacement cases, so they use the current fingerprint.
+    A readable legacy output keeps the old fingerprint shape solely to preserve downstream use;
+    active route-sweep resume still refuses it because unknown paid rows cannot be merged safely.
+    """
+    if not path.is_file():
+        return True
+    try:
+        identity = OutcomeMatrix.load(path).sweep_identity
+    except (OSError, ValueError):
+        return True
+    return identity is not None and identity.complete
 
 
 def _policy_fit_identity(policy_path: Path) -> str:
@@ -1253,13 +1298,7 @@ def _stage_sweep(
     print_world_model_spend(_console, run)
     record = StageRecord(
         stage=Stage.SWEEP,
-        fingerprint={
-            "pool": file_sha256(pool_file),
-            "scenarios": _scenario_identity(plan),
-            "episodes": str(plan.episodes),
-            "max_steps": str(plan.max_steps),
-            "compression": compression_signature(plan.compression),
-        },
+        fingerprint=_sweep_fingerprint(plan, pool_file),
         artifact_path=str(plan.out_path),
         artifact_identity=file_sha256(plan.out_path),
         completed_at=_now(),

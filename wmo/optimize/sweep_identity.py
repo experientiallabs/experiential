@@ -17,10 +17,22 @@ class PlanIdentity(BaseModel):
 
     pool: str
     scenarios: tuple[str, ...]
+    # Added with empty defaults so an older partial header or completed matrix remains readable.
+    # Empty means "unknown", never "unchanged": active resume refuses it because those rows
+    # cannot be proven to share the current measurement inputs.
+    scenario_content: str = ""
+    tools_hint: str = ""
+    corpus: str = ""
+    world_model: str = ""
     episodes: int
     max_steps: int
     history_chars: int
     compression: str
+
+    @property
+    def complete(self) -> bool:
+        """Whether every content-bearing measurement input was recorded."""
+        return all((self.scenario_content, self.tools_hint, self.corpus, self.world_model))
 
     @property
     def digest(self) -> str:
@@ -48,4 +60,17 @@ class PlanIdentity(BaseModel):
                 f"the observation window changed ({other.history_chars} chars then, "
                 f"{self.history_chars} now)"
             )
-        return f"the compression arm changed ({other.compression} then, {self.compression} now)"
+        if self.compression != other.compression:
+            return f"the compression arm changed ({other.compression} then, {self.compression} now)"
+        if not self.complete or not other.complete:
+            return (
+                "the earlier artifact predates complete scenario, corpus, and world-model "
+                "identity, so its rows cannot be proven reusable by this build"
+            )
+        if self.scenario_content != other.scenario_content:
+            return "the selected scenario instructions or provenance changed"
+        if self.tools_hint != other.tools_hint:
+            return "the candidate tool hint changed"
+        if self.corpus != other.corpus:
+            return "the trace corpus changed"
+        return "the frozen world-model artifact or config changed"

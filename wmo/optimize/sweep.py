@@ -18,6 +18,7 @@ constructed, and so tests can stub both at the CLI module they already patch.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -35,6 +36,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from wmo.config import ArtifactPaths, HarnessConfig, load_config
 from wmo.core.types import Action, EnvState, Observation
 from wmo.engine import split_holdout
+from wmo.engine.prompts import BASE_ENV_PROMPT
 from wmo.env.closed_loop import (
     CellKey,
     PoolCell,
@@ -150,6 +152,12 @@ class SweepPlan(BaseModel):
     # runs: it decides what the rewards MEAN, so two matrices swept under different compressors
     # are different evidence, and a resumed run whose compressor changed must re-measure.
     compression: CompressionConfig | None = None
+    # Content identities captured while the plan is built. The corpus is an input to scenario
+    # selection and tool hints; the artifact is what the frozen world model will actually load.
+    # Storing both keeps `identity` pure and prevents later filesystem edits from rewriting what
+    # an already-authorized plan says it measures.
+    corpus_identity: str
+    world_model_identity: str
     # How many cells run at once. NOT part of the plan's identity: it changes how long the
     # measurement takes, never what a cell measures, so a run resumed at a different value
     # continues the same cohort rather than re-buying it. 1 is the sequential default.
@@ -183,6 +191,12 @@ class SweepPlan(BaseModel):
         return PlanIdentity(
             pool=_pool_digest(self.pool),
             scenarios=tuple(scenario_id(scenario) for scenario in self.scenarios),
+            scenario_content=_content_digest(
+                [scenario.model_dump(mode="json") for scenario in self.scenarios]
+            ),
+            tools_hint=_content_digest(self.tools_hint),
+            corpus=self.corpus_identity,
+            world_model=self.world_model_identity,
             episodes=self.episodes,
             max_steps=self.max_steps,
             history_chars=self.history_chars,
@@ -320,6 +334,8 @@ def plan_sweep(
         tools_hint=tools_hint_from_traces(train) or None,
         history_chars=history_chars,
         compression=compression,
+        corpus_identity=_content_digest([trace.model_dump(mode="json") for trace in traces]),
+        world_model_identity=_world_model_identity(model_dir, config),
         max_concurrency=max_concurrency,
         trace_count=len(traces),
         tiny_corpus=tiny_corpus,
@@ -687,6 +703,94 @@ def _pool_digest(pool: ModelPool) -> str:
     """
     payload = "\n".join(entry.model_dump_json() for entry in pool.models)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _content_digest(value: object) -> str:
+    """SHA-256 of JSON content with mapping order removed from the identity."""
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _world_model_identity(model_dir: Path, config: HarnessConfig) -> str:
+    """Hash only files a normal frozen `WorldModel.load` consumes during a sweep.
+
+    Run records and optimizer outputs are deliberately absent: a sweep creates them, so including
+    them would make its own completed matrix stale. `auto_fidelity.json` is also absent because
+    route sweeps use the normal load, not `max_fidelity=True`.
+    """
+    paths = ArtifactPaths(model_dir)
+    digest = hashlib.sha256()
+    _hash_part(digest, "config.toml", _canonical_bytes(config.model_dump(mode="json")))
+    if paths.optimized_prompt.exists():
+        _hash_file(digest, paths.root, paths.optimized_prompt)
+    else:
+        _hash_part(
+            digest,
+            "prompts/optimized.txt:fallback",
+            BASE_ENV_PROMPT.encode("utf-8"),
+        )
+    _hash_tree(digest, paths.root, paths.index)
+    if config.knowledge:
+        _hash_tree(digest, paths.root, paths.knowledge)
+    else:
+        _hash_part(digest, "knowledge:disabled", b"")
+    return digest.hexdigest()
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _hash_tree(digest: hashlib._Hash, root: Path, directory: Path) -> None:
+    """Add a sorted tree to `digest`, including paths because loaders assign them meaning."""
+    relative = directory.relative_to(root).as_posix()
+    if not directory.exists():
+        _hash_part(digest, f"{relative}:missing", b"")
+        return
+    if not directory.is_dir():
+        _hash_file(digest, root, directory)
+        return
+    _hash_part(digest, f"{relative}:directory", b"")
+    try:
+        files = sorted(path for path in directory.rglob("*") if path.is_file())
+        for path in files:
+            _hash_file(digest, root, path)
+    except OSError as exc:
+        raise SweepError(
+            f"cannot fingerprint world-model artifact {directory}: {exc}. Fix its permissions "
+            "before sweeping so WMO can identify the frozen model being measured"
+        ) from exc
+
+
+def _hash_file(digest: hashlib._Hash, root: Path, path: Path) -> None:
+    relative = path.relative_to(root).as_posix()
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise SweepError(
+            f"cannot fingerprint world-model artifact {path}: {exc}. Fix its permissions before "
+            "sweeping so WMO can identify the frozen model being measured"
+        ) from exc
+    _hash_part(digest, relative, content)
+
+
+def _hash_part(digest: hashlib._Hash, label: str, content: bytes) -> None:
+    """Length-prefix a named blob so neither path nor content boundaries can collide."""
+    name = label.encode("utf-8")
+    digest.update(len(name).to_bytes(8, "big"))
+    digest.update(name)
+    digest.update(len(content).to_bytes(8, "big"))
+    digest.update(content)
 
 
 def _persist_harvest(harvest: _SessionHarvest, runs_dir: Path) -> tuple[RunRecord, Path | None]:
