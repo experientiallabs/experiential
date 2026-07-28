@@ -1,6 +1,6 @@
 [project]
 name = "world-model-optimizer"
-version = "0.2.1"
+version = "0.2.2"
 description = "Run agents, build world models from traces, and optimize agent harnesses."
 readme = "README.md"
 # harbor 0.20.0 requires Python >=3.12; the harbor evaluator is a first-class optimize
