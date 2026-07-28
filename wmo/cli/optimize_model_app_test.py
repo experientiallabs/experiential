@@ -406,10 +406,10 @@ def test_a_second_run_skips_every_stage_and_says_why(
     assert "estimatedcandidatespend" not in flat
 
 
-def test_a_legacy_identityless_matrix_stays_usable_when_the_sweep_is_skipped(
+def test_a_legacy_identityless_matrix_is_refreshed_once_with_explicit_consent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An upgrade must not turn a current, downstream-readable matrix into a paid rerun."""
+    """Unknown historical inputs are readable downstream, but never blessed as current."""
     world_model = _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
     root = _project(tmp_path)
     assert _run(tmp_path, root, "--yes").exit_code == 0
@@ -449,38 +449,26 @@ def test_a_legacy_identityless_matrix_stays_usable_when_the_sweep_is_skipped(
     )
     manifest.save(manifest_path)
 
-    again = _run(tmp_path, root, "--yes")
-    assert again.exit_code == 0, again.output
+    legacy_bytes = matrix_path.read_bytes()
+    unapproved = _run(tmp_path, root)
+    assert unapproved.exit_code == 2, unapproved.output
     assert len(world_model.tasks) == episodes_after_first
-    assert _says(again.output, "matrix.json is current")
+    assert matrix_path.read_bytes() == legacy_bytes
     assert OutcomeMatrix.load(matrix_path).sweep_identity is None
-    assert _says(again.output, "recorded current content identity for the legacy matrix")
-    migrated = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-    migrated_sweep = migrated.record_for(Stage.SWEEP)
-    assert migrated_sweep is not None
-    assert {
-        "scenario_content",
-        "tools_hint",
-        "corpus",
-        "world_model",
-        "history_chars",
-    } <= migrated_sweep.fingerprint.keys()
+    assert _says(unapproved.output, "has no complete sweep identity")
+    assert _says(unapproved.output, "one measured replacement is required")
 
-    changed_corpus = [
-        trace.model_copy(
-            update={
-                "steps": [
-                    step.model_copy(update={"task": f"{step.task} revised"}) for step in trace.steps
-                ]
-            }
-        )
-        for trace in _corpus()
-    ]
-    write_traces_jsonl(changed_corpus, root / "models" / "support" / TRACES_FILENAME)
-    changed = _run(tmp_path, root, "--yes")
-    assert changed.exit_code == 0, changed.output
-    assert len(world_model.tasks) > episodes_after_first
-    assert _says(changed.output, "scenario_content changed")
+    refreshed = _run(tmp_path, root, "--yes")
+    assert refreshed.exit_code == 0, refreshed.output
+    assert len(world_model.tasks) == episodes_after_first + 6
+    identity = OutcomeMatrix.load(matrix_path).sweep_identity
+    assert identity is not None and identity.complete
+
+    after_refresh = len(world_model.tasks)
+    exact = _run(tmp_path, root, "--yes")
+    assert exact.exit_code == 0, exact.output
+    assert len(world_model.tasks) == after_refresh
+    assert _says(exact.output, "matrix.json is current")
 
 
 def test_force_from_sweep_redoes_the_sweep_and_everything_after_it(

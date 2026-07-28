@@ -412,8 +412,9 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     try:
         # A stage decision to run is explicit replacement authority for this pipeline's fixed
         # matrix path. A skipped sweep does not resume anything: its manifest already established
-        # that the completed matrix is current, and older identity-less matrices must remain
-        # usable by downstream stages after an upgrade.
+        # that the completed matrix is current. A readable identity-less matrix is still valid
+        # downstream data, but this orchestrator plans one consented replacement because it
+        # cannot prove which historical measurement inputs produced those rows.
         replace_completed_sweep = _will_sweep(decisions)
         already_measured = (
             resumable_cells(plan, replace_completed=True) if replace_completed_sweep else 0
@@ -442,14 +443,6 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     if dry_run:
         _console.print("\ndry run: nothing was run and nothing was spent")
         raise typer.Exit(0)
-
-    manifest = _migrate_legacy_sweep_fingerprint(
-        manifest,
-        decisions=decisions,
-        paths=paths,
-        plan=plan,
-        pool_file=Path(pool_file),
-    )
 
     # One throwaway embedding before anything is bought, and only when a fit will actually happen:
     # `--embedder auto` turns the mere presence of AZURE_OPENAI_* into a network dependency, and
@@ -664,10 +657,7 @@ def _plan_stages(
     """
     decisions: list[StageDecision] = []
     running: Stage | None = None
-    sweep_record = manifest.record_for(Stage.SWEEP)
-    complete_sweep_identity = _matrix_has_complete_sweep_identity(
-        paths.matrix
-    ) or _sweep_record_has_content_identity(sweep_record)
+    matrix_has_complete_identity = _matrix_has_complete_sweep_identity(paths.matrix)
     for stage in stages:
         if stage is Stage.PREFLIGHT:
             continue
@@ -691,7 +681,6 @@ def _plan_stages(
             baseline=baseline,
             cost_quality=cost_quality,
             allow_uneven=allow_uneven,
-            complete_sweep_identity=complete_sweep_identity,
         )
         decision = decide_stage(
             stage,
@@ -702,6 +691,15 @@ def _plan_stages(
             artifact_identity=live.artifact_identity,
             skip_summary=live.skip_summary,
         )
+        if stage is Stage.SWEEP and not matrix_has_complete_identity and stage not in redo:
+            decision = StageDecision(
+                stage=stage,
+                status=StageStatus.RUN,
+                reason=(
+                    f"{paths.matrix.name} has no complete sweep identity; one measured "
+                    "replacement is required"
+                ),
+            )
         decisions.append(decision)
         if decision.will_run:
             running = stage
@@ -782,17 +780,12 @@ def _live_inputs(
     baseline: str | None,
     cost_quality: float,
     allow_uneven: bool,
-    complete_sweep_identity: bool,
 ) -> _StageInputs:
     """What `stage` would consume and produce right now, read off the filesystem."""
     match stage:
         case Stage.SWEEP:
             return _StageInputs(
-                fingerprint=_sweep_fingerprint(
-                    plan,
-                    pool_file,
-                    complete_identity=complete_sweep_identity,
-                ),
+                fingerprint=_sweep_fingerprint(plan, pool_file),
                 artifact=paths.matrix,
                 artifact_identity=file_sha256(paths.matrix),
                 skip_summary="same pool, same scenarios, same episodes",
@@ -866,102 +859,36 @@ def _scenario_identity(plan: SweepPlan) -> str:
 def _sweep_fingerprint(
     plan: SweepPlan,
     pool_file: Path,
-    *,
-    complete_identity: bool = True,
 ) -> dict[str, str]:
     """Inputs that decide whether `optimize model` must buy the sweep again.
 
-    The original keys stay unchanged for a legacy matrix with no complete sweep identity. Its
-    existing manifest can therefore keep skipping the paid stage while fit/report consume it.
-    Every newly written matrix adds the content identities, so changed instructions, tool hints,
-    corpus, config, runtime files, or history window rerun the sweep instead of silently reusing
-    stale evidence.
+    Content identities make changed instructions, tool hints, corpus, config, runtime files, or
+    history window rerun the sweep instead of silently reusing stale evidence. Legacy manifests
+    lack these keys and legacy matrices lack a complete identity, so they get one explicit,
+    consented replacement rather than having unknown historical inputs blessed as current.
     """
+    identity = plan.identity
     fingerprint = {
         "pool": file_sha256(pool_file),
         "scenarios": _scenario_identity(plan),
         "episodes": str(plan.episodes),
         "max_steps": str(plan.max_steps),
         "compression": compression_signature(plan.compression),
+        "scenario_content": identity.scenario_content,
+        "tools_hint": identity.tools_hint,
+        "corpus": identity.corpus,
+        "world_model": identity.world_model,
+        "history_chars": str(identity.history_chars),
     }
-    if complete_identity:
-        identity = plan.identity
-        fingerprint.update(
-            {
-                "scenario_content": identity.scenario_content,
-                "tools_hint": identity.tools_hint,
-                "corpus": identity.corpus,
-                "world_model": identity.world_model,
-                "history_chars": str(identity.history_chars),
-            }
-        )
     return fingerprint
 
 
-_SWEEP_CONTENT_IDENTITY_KEYS = frozenset(
-    {"scenario_content", "tools_hint", "corpus", "world_model", "history_chars"}
-)
-
-
-def _sweep_record_has_content_identity(record: StageRecord | None) -> bool:
-    """Whether a sweep record already pins the post-upgrade measurement inputs."""
-    return record is not None and _SWEEP_CONTENT_IDENTITY_KEYS <= record.fingerprint.keys()
-
-
-def _migrate_legacy_sweep_fingerprint(
-    manifest: RunManifest,
-    *,
-    decisions: list[StageDecision],
-    paths: _RunPaths,
-    plan: SweepPlan,
-    pool_file: Path,
-) -> RunManifest:
-    """Snapshot today's inputs after one free skip of a legacy completed matrix.
-
-    A pre-identity matrix remains valid input to fit/report, and its existing manifest proves the
-    paid sweep is current under the old fingerprint. That grants exactly one compatibility skip.
-    Recording the expanded fingerprint now means future instruction, tool, corpus, model, or
-    history changes rerun the sweep instead of trusting that legacy exception forever. The matrix
-    itself stays identity-less, so direct active resume still refuses to merge unknown paid rows.
-    """
-    sweep_decision = next(
-        (decision for decision in decisions if decision.stage is Stage.SWEEP),
-        None,
-    )
-    record = manifest.record_for(Stage.SWEEP)
-    if (
-        sweep_decision is None
-        or sweep_decision.will_run
-        or record is None
-        or _matrix_has_complete_sweep_identity(paths.matrix)
-        or _sweep_record_has_content_identity(record)
-    ):
-        return manifest
-    migrated = record.model_copy(
-        update={"fingerprint": _sweep_fingerprint(plan, pool_file, complete_identity=True)}
-    )
-    updated = manifest.model_copy(
-        update={
-            "stages": [
-                migrated if existing.stage is Stage.SWEEP else existing
-                for existing in manifest.stages
-            ]
-        }
-    )
-    updated.save(paths.manifest)
-    _console.print(
-        "  recorded current content identity for the legacy matrix; this invocation keeps the "
-        "sweep free, and later measurement-input changes will re-run it"
-    )
-    return updated
-
-
 def _matrix_has_complete_sweep_identity(path: Path) -> bool:
-    """Whether a matrix can participate in the expanded optimizer fingerprint.
+    """Whether a present readable matrix proves the complete measurement plan that produced it.
 
-    Missing and unreadable outputs are replacement cases, so they use the current fingerprint.
-    A readable legacy output keeps the old fingerprint shape solely to preserve downstream use;
-    active route-sweep resume still refuses it because unknown paid rows cannot be merged safely.
+    Missing and unreadable outputs are already replacement cases in stage planning, so they do
+    not need the legacy override. A readable identity-less matrix remains valid input to manual
+    downstream commands, but `optimize model` replaces it once with explicit spend consent.
     """
     if not path.is_file():
         return True
