@@ -130,6 +130,37 @@ def configured_role_configs(root: str) -> list[tuple[ModelRoleName, ProviderConf
     return resolved
 
 
+def inherit_provider_connection(
+    selected: ProviderConfig,
+    configured: ProviderConfig | None,
+) -> ProviderConfig:
+    """Carry the configured provider connection into a newly selected model.
+
+    Endpoints and API versions describe the provider connection, so they remain valid when the
+    wizard selects another model on the same provider. Deployment names and model-specific
+    request knobs only remain valid when the canonical model identity is unchanged.
+    """
+    if configured is None or selected.kind is not configured.kind:
+        return selected
+
+    updates = {
+        field: value
+        for field in ("endpoint", "api_version")
+        if (value := getattr(configured, field)) is not None
+    }
+    selected_model = selected.model_type or selected.model
+    configured_model = configured.model_type or configured.model
+    if selected_model == configured_model:
+        updates.update(
+            {
+                field: value
+                for field in ("deployment", "reasoning_effort", "chat_max_tokens_field")
+                if (value := getattr(configured, field)) is not None
+            }
+        )
+    return selected.model_copy(update=updates) if updates else selected
+
+
 def _model_config(configured: ModelRole, *, role: ModelRoleName) -> ProviderConfig:
     """Turn one configured role into provider-neutral config with the Azure default."""
     try:

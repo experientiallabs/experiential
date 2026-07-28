@@ -13,6 +13,7 @@ from wmo.cli.model_roles import (
     OptInModelRole,
     _model_config,
     configured_role_configs,
+    inherit_provider_connection,
     load_settings_or_abort,
     resolve_opt_in_model_provider,
 )
@@ -342,3 +343,58 @@ def test_configured_role_configs_names_the_role_with_the_bad_provider(tmp_path: 
         typer.BadParameter, match=r"settings \[models\.summary\] has unknown provider 'bogus'"
     ):
         configured_role_configs(str(root))
+
+
+def test_provider_connection_endpoint_applies_to_another_model() -> None:
+    selected = ProviderConfig(
+        kind=ProviderKind.OPENAI,
+        model="gpt-5.4-mini",
+        model_type="gpt-5.4-mini",
+    )
+    configured = ProviderConfig(
+        kind=ProviderKind.OPENAI,
+        model="gpt-5.5",
+        model_type="gpt-5.5",
+        endpoint="https://models.example/v1",
+        reasoning_effort="high",
+        chat_max_tokens_field="max_tokens",
+    )
+
+    resolved = inherit_provider_connection(selected, configured)
+
+    assert resolved.endpoint == "https://models.example/v1"
+    assert resolved.reasoning_effort is None
+    assert resolved.chat_max_tokens_field == "max_completion_tokens"
+
+
+def test_provider_connection_deployment_only_applies_to_the_same_model() -> None:
+    configured = ProviderConfig(
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        model_type="gpt-5.5",
+        endpoint="https://azure.example",
+        deployment="gpt-5-5-prod",
+        api_version="2026-01-01",
+    )
+
+    same_model = inherit_provider_connection(
+        ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.5",
+            model_type="gpt-5.5",
+        ),
+        configured,
+    )
+    another_model = inherit_provider_connection(
+        ProviderConfig(
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.4-mini",
+            model_type="gpt-5.4-mini",
+        ),
+        configured,
+    )
+
+    assert same_model.deployment == "gpt-5-5-prod"
+    assert another_model.deployment is None
+    assert another_model.endpoint == "https://azure.example"
+    assert another_model.api_version == "2026-01-01"

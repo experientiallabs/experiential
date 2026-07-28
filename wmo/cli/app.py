@@ -49,7 +49,11 @@ from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
 # mode-inapplicable flags exactly the way `wmo optimize harness` already does.
 from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
-from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
+from wmo.cli.model_roles import (
+    configured_role_configs,
+    inherit_provider_connection,
+    load_settings_or_abort,
+)
 from wmo.cli.platform_cmds import register as register_platform_commands
 from wmo.cli.ui import (
     BuildParams,
@@ -796,6 +800,10 @@ def build(
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
     configured_worker = load_settings_or_abort(root).models.resolve("worker")
+    configured_worker_config = next(
+        (config for role, config in configured_role_configs(root) if role == "worker"),
+        None,
+    )
     use_configured_worker = configured_worker is not None and (
         provider is None or provider == configured_worker.provider
     )
@@ -839,7 +847,11 @@ def build(
         embed_dim=embed_dim,
     )
     if use_wizard:
-        params = run_build_wizard(_console, params)
+        params = run_build_wizard(
+            _console,
+            params,
+            configured_provider=configured_worker_config if use_configured_worker else None,
+        )
     elif params.file is None and not params.pull:
         # This guard also required `name is None`, so `wmo build --name x` (verbatim the
         # empty-state hint `wmo list` prints) fell through to a raw ValueError from the ingest
@@ -917,13 +929,10 @@ def build(
         judge_model=params.judge_model or judge_model_default(params.provider, params.model),
         trace_adapter=params.source,
     )
-    if use_configured_worker and configured_worker is not None:
-        config.providers[0] = config.providers[0].model_copy(
-            update={
-                "endpoint": configured_worker.endpoint,
-                "deployment": configured_worker.deployment,
-                "api_version": configured_worker.api_version,
-            }
+    if use_configured_worker:
+        config.providers[0] = inherit_provider_connection(
+            config.providers[0],
+            configured_worker_config,
         )
     if grounder not in GROUNDER_KINDS:
         raise typer.BadParameter(

@@ -42,6 +42,7 @@ from rich.segment import ControlType
 from rich.table import Table
 from rich.text import Text
 
+from wmo.cli.model_roles import inherit_provider_connection
 from wmo.config import (
     PROVIDER_ENV_VARS,
     ModelInfo,
@@ -240,6 +241,7 @@ def select_provider_and_model(
     default_region: str | None,
     interactive: bool,
     check: Callable[[ProviderConfig], VerifyResult],
+    configured_provider: ProviderConfig | None = None,
 ) -> tuple[str, str, str | None]:
     """The wizard's serve-provider block: pick provider + model (+ region), creds, live verify.
 
@@ -249,10 +251,23 @@ def select_provider_and_model(
     (provider, model, region).
     """
     providers = list(_PROVIDER_MODELS)
-    with_creds = [p for p in providers if has_credentials(p)]
+
+    def configured_endpoint(provider: str) -> str | None:
+        if configured_provider is None or configured_provider.kind.value != provider:
+            return None
+        return configured_provider.endpoint
+
+    with_creds = [
+        provider
+        for provider in providers
+        if has_credentials(provider, endpoint=configured_endpoint(provider))
+    ]
     # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
     # is traceable — "api key exists" alone reads as a mystery when .env doesn't have it.
-    notes = {p: creds_note(p) for p in with_creds}
+    notes = {
+        provider: creds_note(provider, endpoint=configured_endpoint(provider))
+        for provider in with_creds
+    }
     provider_default = default_provider or (with_creds[0] if with_creds else None)
     while True:
         provider = _select(
@@ -264,7 +279,12 @@ def select_provider_and_model(
             interactive=interactive,
             notes=notes,
         )
-        ensure_credentials(console, ask_secret, provider)
+        ensure_credentials(
+            console,
+            ask_secret,
+            provider,
+            endpoint=configured_endpoint(provider),
+        )
         model = _select(
             console,
             ask,
@@ -283,11 +303,14 @@ def select_provider_and_model(
         console.print(f"verifying {provider}…")
         model_spec = resolve_provider_model(ProviderKind(provider), model)
         ping = check(
-            ProviderConfig(
-                kind=ProviderKind(provider),
-                model_type=model_spec.model_type,
-                model=model_spec.model_id,
-                region=region,
+            inherit_provider_connection(
+                ProviderConfig(
+                    kind=ProviderKind(provider),
+                    model_type=model_spec.model_type,
+                    model=model_spec.model_id,
+                    region=region,
+                ),
+                configured_provider,
             )
         )
         if ping.ok:
@@ -306,6 +329,7 @@ def run_build_wizard(
     reader: PromptReader | None = None,
     verify: Callable[[ProviderConfig], VerifyResult] | None = None,
     verify_embed: Callable[[ProviderConfig], VerifyResult] | None = None,
+    configured_provider: ProviderConfig | None = None,
 ) -> BuildParams:
     """Guided creation flow: prompt for each build input, pre-filled with `defaults`.
 
@@ -381,6 +405,7 @@ def run_build_wizard(
         default_region=defaults.region,
         interactive=interactive,
         check=check,
+        configured_provider=configured_provider,
     )
 
     # GEPA judge model: defaults to a cheap model of the same provider (haiku / gpt-5.4-mini);
@@ -404,11 +429,14 @@ def run_build_wizard(
         console.print(f"verifying {provider} (judge)…")
         judge_spec = resolve_provider_model(ProviderKind(provider), judge_model)
         ping = check(
-            ProviderConfig(
-                kind=ProviderKind(provider),
-                model_type=judge_spec.model_type,
-                model=judge_spec.model_id,
-                region=region,
+            inherit_provider_connection(
+                ProviderConfig(
+                    kind=ProviderKind(provider),
+                    model_type=judge_spec.model_type,
+                    model=judge_spec.model_id,
+                    region=region,
+                ),
+                configured_provider,
             )
         )
         if ping.ok:
@@ -695,33 +723,41 @@ def _select(
         console.print(f"[red]pick 1-{len(options)} or an option name[/red]")
 
 
-def _provider_env_vars(provider: str) -> list[str]:
+def _provider_env_vars(provider: str, *, endpoint: str | None = None) -> list[str]:
     """The env vars `provider` reads its credentials from ([] for unknown/offline kinds)."""
+    if provider == ProviderKind.OPENAI.value and endpoint is not None:
+        return ["WMO_ENDPOINT_API_KEY"]
     try:
         return PROVIDER_ENV_VARS[ProviderKind(provider)]
     except (ValueError, KeyError):
         return []
 
 
-def creds_note(provider: str) -> str:
+def creds_note(provider: str, *, endpoint: str | None = None) -> str:
     """Picker annotation for a provider whose credentials are present, naming what was found."""
-    env_vars = _provider_env_vars(provider)
+    env_vars = _provider_env_vars(provider, endpoint=endpoint)
     return f"{env_vars[0]} set" if len(env_vars) == 1 else "creds set"
 
 
-def has_credentials(provider: str) -> bool:
+def has_credentials(provider: str, *, endpoint: str | None = None) -> bool:
     """Offline presence check: every credential env var for `provider` is set (not validated)."""
-    env_vars = _provider_env_vars(provider)
+    env_vars = _provider_env_vars(provider, endpoint=endpoint)
     return bool(env_vars) and all(os.environ.get(var) for var in env_vars)
 
 
-def ensure_credentials(console: Console, ask_secret: PromptReader, provider: str) -> None:
+def ensure_credentials(
+    console: Console,
+    ask_secret: PromptReader,
+    provider: str,
+    *,
+    endpoint: str | None = None,
+) -> None:
     """Prompt for any missing credential env vars and persist entered values to `.env`.
 
     Presence only — the live ping that confirms the creds actually work happens once before
     the build (see `wmo build`). Enter skips a var, leaving it to the shell environment.
     """
-    for var in _provider_env_vars(provider):
+    for var in _provider_env_vars(provider, endpoint=endpoint):
         if os.environ.get(var):
             console.print(f"  {_CHECK} {var} is set")
             continue

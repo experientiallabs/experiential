@@ -56,6 +56,7 @@ from wmo.tracking.pricing import ModelPrice
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
 # plain `import wmo.cli.app as ...`; go through importlib to monkeypatch module globals.
 cli_app_module = importlib.import_module("wmo.cli.app")
+ui_module = importlib.import_module("wmo.cli.ui")
 
 runner = CliRunner()
 
@@ -274,7 +275,8 @@ def test_build_wizard_does_not_reuse_connection_for_changed_provider(
     )
     save_settings(settings, root)
 
-    def switch_provider(_console, params):  # noqa: ANN001, ANN202
+    def switch_provider(_console, params, *, configured_provider):  # noqa: ANN001, ANN202
+        assert configured_provider is not None
         return params.model_copy(
             update={
                 "name": "wizard-switch",
@@ -2008,6 +2010,56 @@ def test_build_interactive_wizard_creates_model(
     )
     assert result.exit_code == 0, result.output
     assert (root / "models" / "wizard-built" / "config.toml").exists()
+
+
+def test_build_wizard_verifies_the_configured_custom_endpoint(
+    patched_provider: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The wizard must ping the same endpoint it writes into the built model."""
+    root = tmp_path / ".wmo"
+    endpoint = "https://models.example/v1"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(
+        provider="openai",
+        model="gpt-5.5",
+        endpoint=endpoint,
+    )
+    save_settings(settings, root)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("WMO_ENDPOINT_API_KEY", "endpoint-key")
+    verified: list[ProviderConfig] = []
+
+    def verify(configs: list[ProviderConfig]) -> list[VerifyResult]:
+        verified.extend(configs)
+        return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
+
+    monkeypatch.setattr(ui_module, "verify_all", verify)
+    answers = "\n".join(
+        [
+            "wizard-custom",
+            "",
+            _traces_file(tmp_path),
+            "",
+            "",
+            "",
+            "1",
+            "1",
+        ]
+    )
+
+    result = runner.invoke(
+        app,
+        ["build", "--interactive", "--root", str(root)],
+        input=answers + "\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "OPENAI_API_KEY" not in result.output
+    assert len(verified) == 2
+    assert all(config.kind is ProviderKind.OPENAI for config in verified)
+    assert all(config.endpoint == endpoint for config in verified)
+    config = load_config(root / "models" / "wizard-custom")
+    assert config.serve_provider_config().endpoint == endpoint
 
 
 def test_build_non_interactive_without_source_errors(tmp_path) -> None:  # noqa: ANN001
