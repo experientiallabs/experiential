@@ -3224,3 +3224,37 @@ def test_fit_compaction_knn_writes_a_sidecar_overlay(tmp_path: Path) -> None:
         (tmp_path / COMPACTION_SIDECAR_FILENAME).read_text()
     )
     assert sum(1 for c in sidecar.clusters if c.compression is not None) == 1
+
+
+def test_fit_compaction_rejected_run_leaves_no_mountable_artifact(tmp_path: Path) -> None:
+    # The investigation gate must not leave a policy or sidecar behind (a rejected fit that
+    # still writes its outputs hands the rejected result to whatever consumes the directory
+    # next); only the evidence file, which IS the investigation record, may exist.
+    from wmo.optimize.compaction_fit import COMPACTION_SIDECAR_FILENAME
+
+    off_path, arm_path = _compaction_grid(tmp_path)
+    for kind in ("rank", "knn"):
+        out_dir = tmp_path / kind
+        out_dir.mkdir()
+        policy_file = out_dir / "policy.json"
+        result = runner.invoke(
+            app,
+            [
+                "optimize",
+                "route",
+                "fit-compaction",
+                str(off_path),
+                "--control",
+                str(arm_path),
+                "--kind",
+                kind,
+                "--clusters",
+                "2",
+                "--out",
+                str(policy_file),
+            ],
+        )
+        assert result.exit_code == 1
+        assert not policy_file.exists()
+        assert not (out_dir / COMPACTION_SIDECAR_FILENAME).exists()
+        assert policy_file.with_suffix(".compaction-evidence.json").exists()

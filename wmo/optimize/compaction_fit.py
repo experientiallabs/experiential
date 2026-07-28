@@ -268,10 +268,7 @@ def assign_to_clusters(
     centroids = np.asarray([c.centroid for c in clusters])
     cluster_ids = [c.cluster_id for c in clusters]
     sims = embeddings @ centroids.T
-    return {
-        sid: cluster_ids[int(np.argmax(sims[index]))]
-        for index, sid in enumerate(scenario_ids)
-    }
+    return {sid: cluster_ids[int(np.argmax(sims[index]))] for index, sid in enumerate(scenario_ids)}
 
 
 def fit_compaction(

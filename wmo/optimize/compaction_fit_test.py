@@ -8,6 +8,9 @@ genuine compression win, which is what the gates must find and the only thing th
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
 import pytest
 
 from wmo.optimize.compaction_fit import (
@@ -75,8 +78,8 @@ def _scenarios() -> list[tuple[str, str, str, int]]:
 
 
 def _matrix(
-    reward_fn,
-    cost_fn,
+    reward_fn: Callable[[str, int], float],
+    cost_fn: Callable[[str, int], float],
     config: CompressionConfig | None = None,
     episodes: int = 2,
 ) -> OutcomeMatrix:
@@ -140,7 +143,9 @@ def assignment(off: OutcomeMatrix) -> dict[str, int]:
     return assignment
 
 
-def test_win_cluster_gets_the_config_and_loss_cluster_stays_none(off, assignment) -> None:
+def test_win_cluster_gets_the_config_and_loss_cluster_stays_none(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     # The arm lifts fin (positive paired evidence) at lower cost, and wrecks code.
     arm = _winning_arm(config=TRUNCATE)
     fit = fit_compaction(assignment, off, [ArmMatrices(matrix=arm, config=TRUNCATE)])
@@ -150,7 +155,9 @@ def test_win_cluster_gets_the_config_and_loss_cluster_stays_none(off, assignment
     assert fit.per_cluster[code_cluster] is None
 
 
-def test_matching_quality_is_not_positive_evidence(off, assignment) -> None:
+def test_matching_quality_is_not_positive_evidence(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     # An arm identical to off on quality: mean paired delta is 0, and the floored SE makes
     # the registered gate (mean - z*SE >= 0) fail. Preserving quality is not evidence; this
     # is the strictness the A/A bar depends on.
@@ -160,7 +167,9 @@ def test_matching_quality_is_not_positive_evidence(off, assignment) -> None:
     assert all(not row.quality_pass for row in fit.evidence)
 
 
-def test_quality_pass_alone_is_not_enough_without_a_cost_win(off, assignment) -> None:
+def test_quality_pass_alone_is_not_enough_without_a_cost_win(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     # The arm lifts fin but costs MORE per completed task (the dumb-deletion failure the
     # grid measured): the cost gate must hold every cluster at None.
     arm = _winning_arm(cost=0.05, config=TRUNCATE)
@@ -170,32 +179,34 @@ def test_quality_pass_alone_is_not_enough_without_a_cost_win(off, assignment) ->
     assert all(row.quality_pass and not row.cost_pass for row in fin_rows)
 
 
-def test_thin_clusters_never_deviate(off, assignment) -> None:
+def test_thin_clusters_never_deviate(off: OutcomeMatrix, assignment: dict[str, int]) -> None:
     # min_pairs above the cluster size: no deviation regardless of how good the arm looks.
     arm = _winning_arm(config=TRUNCATE)
-    fit = fit_compaction(
-        assignment, off, [ArmMatrices(matrix=arm, config=TRUNCATE)], min_pairs=99
-    )
+    fit = fit_compaction(assignment, off, [ArmMatrices(matrix=arm, config=TRUNCATE)], min_pairs=99)
     assert fit.compressed_clusters() == 0
 
 
-def test_controls_are_reported_but_never_chosen(off, assignment) -> None:
+def test_controls_are_reported_but_never_chosen(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     arm = _winning_arm(config=TRUNCATE)
-    fit = fit_compaction(
-        assignment, off, [ArmMatrices(matrix=arm, config=TRUNCATE, control=True)]
-    )
+    fit = fit_compaction(assignment, off, [ArmMatrices(matrix=arm, config=TRUNCATE, control=True)])
     assert fit.compressed_clusters() == 0
     assert fit.controls_would_win  # it would have won, and that is loud, not silent
 
 
-def test_unservable_arm_is_evaluated_but_ineligible(off, assignment) -> None:
+def test_unservable_arm_is_evaluated_but_ineligible(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     arm = _winning_arm(config=UNKNOWN)
     fit = fit_compaction(assignment, off, [ArmMatrices(matrix=arm, config=UNKNOWN)])
     assert fit.compressed_clusters() == 0
     assert any(row.would_win and not row.eligible for row in fit.evidence)
 
 
-def test_uneven_coverage_is_refused_unless_opted_in(off, assignment) -> None:
+def test_uneven_coverage_is_refused_unless_opted_in(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     arm = _winning_arm(config=TRUNCATE)
     arm = OutcomeMatrix(pool=arm.pool, outcomes=arm.outcomes[: len(arm.outcomes) // 2])
     with pytest.raises(ValueError, match="cohort"):
@@ -206,13 +217,13 @@ def test_uneven_coverage_is_refused_unless_opted_in(off, assignment) -> None:
     assert fit.coverage  # the mismatch is printed, not swallowed
 
 
-def test_off_arm_must_be_uncompressed(assignment) -> None:
+def test_off_arm_must_be_uncompressed(assignment: dict[str, int]) -> None:
     compressed = _matrix(_off_rewards, lambda group, index: 0.01, config=TRUNCATE)
     with pytest.raises(ValueError, match="off arm"):
         fit_compaction(assignment, compressed, [])
 
 
-def test_aa_bar_passes_on_pure_noise(assignment) -> None:
+def test_aa_bar_passes_on_pure_noise(assignment: dict[str, int]) -> None:
     # Episode 1 rewards differ from episode 0 by symmetric noise; the A/A gates must not
     # deviate anywhere (the SE floor keeps even zero-variance clusters honest).
     import random
@@ -227,7 +238,9 @@ def test_aa_bar_passes_on_pure_noise(assignment) -> None:
     assert aa_report(assignment, off) == []
 
 
-def test_apply_compaction_stamps_and_enforces_exclusivity(off, assignment) -> None:
+def test_apply_compaction_stamps_and_enforces_exclusivity(
+    off: OutcomeMatrix, assignment: dict[str, int]
+) -> None:
     clusters, _ = overlay_clusters(
         off, embed_with=HashingEmbedder(dim=256), n_clusters=2, default_model="worker-a"
     )
@@ -251,7 +264,9 @@ def test_apply_compaction_stamps_and_enforces_exclusivity(off, assignment) -> No
         apply_compaction(endpoint_level, fit)
 
 
-def test_knn_map_ships_as_a_sidecar(off, assignment, tmp_path) -> None:
+def test_knn_map_ships_as_a_sidecar(
+    off: OutcomeMatrix, assignment: dict[str, int], tmp_path: Path
+) -> None:
     # The merged RoutingPolicy validator forbids clusters on a knn policy, so the overlay
     # cannot ride on the policy model until the co-signed contract delta lands; the map goes
     # beside the policy the way the knn bank does.
@@ -269,7 +284,7 @@ def test_knn_map_ships_as_a_sidecar(off, assignment, tmp_path) -> None:
     assert loaded.z == fit.z
 
 
-def test_assign_to_clusters_matches_overlay_assignment(off) -> None:
+def test_assign_to_clusters_matches_overlay_assignment(off: OutcomeMatrix) -> None:
     embedder = HashingEmbedder(dim=256)
     clusters, assignment = overlay_clusters(
         off, embed_with=embedder, n_clusters=2, default_model="worker-a"

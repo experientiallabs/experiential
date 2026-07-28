@@ -61,6 +61,7 @@ from wmo.optimize.knn import (
     COST_QUALITY_ANCHORS,
     DialResult,
     KnnFitOutcome,
+    best_single_on_fit,
     fit_knn_artifact,
     tune_policy_dial,
 )
@@ -1113,13 +1114,13 @@ def fit_compaction_cmd(
     off_matrix: str = typer.Argument(
         ..., help="The uncompressed OFF arm's OutcomeMatrix JSON (the grid's baseline)."
     ),
-    arm: list[str] = typer.Option(
+    arm: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
         [],
         "--arm",
         help="A compressed arm's OutcomeMatrix JSON, repeatable; the arm's compression config "
         "is read from the matrix itself (one matrix per arm, same scenario cohort as off).",
     ),
-    control: list[str] = typer.Option(
+    control: list[str] = typer.Option(  # noqa: B008 - typer reads option defaults at definition time
         [],
         "--control",
         help="Like --arm but a CONTROL (random removal, matched-ratio truncation): evaluated "
@@ -1222,23 +1223,20 @@ def fit_compaction_cmd(
     out_path = Path(out)
     built = spec.build()  # ONE embedder: base fit, overlay, and assignment share it
 
+    # EVERY gate runs before ANY artifact is written: a rejected fit must not leave a
+    # mountable policy or sidecar behind (a command that exits 1 and also produces the thing
+    # it rejected would hand the investigation result to whatever consumes the directory
+    # next). The knn base fit is therefore deferred until the gates pass; only the evidence
+    # file, which IS the investigation record, is written on the failure paths.
     if kind == "knn":
-        fitted = fit_knn_artifact(
-            off,
-            out_path=out_path,
-            matrix_source=off_source,
-            embedder=spec,
-            fallback=fallback,
-            floor_q=floor_q,
-            compression=None,  # per-cluster mode routes on raw text (exclusivity rule)
-        )
-        policy = fitted.policy
+        policy = None
+        default_model = fallback or best_single_on_fit(off, off.scenario_ids())
         policy_clusters, assignment = overlay_clusters(
             off,
             embed_with=built,
             n_clusters=clusters,
             seed=seed,
-            default_model=policy.default_model,
+            default_model=default_model,
         )
     else:
         policy = fit_rank_policy(
@@ -1276,15 +1274,6 @@ def fit_compaction_cmd(
     evidence_path = out_path.with_suffix(".compaction-evidence.json")
     evidence_path.write_text(fit.model_dump_json(indent=2))
 
-    if kind == "knn":
-        sidecar = out_path.parent / COMPACTION_SIDECAR_FILENAME
-        save_compaction_sidecar(policy_clusters, fit, sidecar, fitted_from=off_source)
-        target = f"sidecar {sidecar}"
-    else:
-        policy = apply_compaction(policy, fit)
-        policy.save(out_path)
-        target = out
-
     for note in fit.coverage:
         _console.print(f"[yellow]coverage[/yellow] {note}")
     for row in sorted(fit.evidence, key=lambda r: (r.cluster_id, r.signature)):
@@ -1295,18 +1284,39 @@ def fit_compaction_cmd(
             f"quality {'pass' if row.quality_pass else 'fail'} "
             f"cost {'pass' if row.cost_pass else 'fail'} {verdict}"
         )
+    if fit.controls_would_win:
+        _console.print(
+            f"[red]INVESTIGATION GATE[/red]: control arms would have won clusters: "
+            f"{fit.controls_would_win}. A control beating the learned arms through the full "
+            "gate is a finding to investigate, not a policy to ship. No policy or sidecar "
+            f"was written; the evidence is in {evidence_path}."
+        )
+        raise typer.Exit(1)
+
+    if kind == "knn":
+        fitted = fit_knn_artifact(
+            off,
+            out_path=out_path,
+            matrix_source=off_source,
+            embedder=spec,
+            fallback=fallback,
+            floor_q=floor_q,
+            compression=None,  # per-cluster mode routes on raw text (exclusivity rule)
+        )
+        del fitted
+        sidecar = out_path.parent / COMPACTION_SIDECAR_FILENAME
+        save_compaction_sidecar(policy_clusters, fit, sidecar, fitted_from=off_source)
+        target = f"sidecar {sidecar}"
+    else:
+        policy = apply_compaction(policy, fit)
+        policy.save(out_path)
+        target = out
+
     label = " [CANDIDATE: uneven coverage]" if fit.coverage else ""
     _console.print(
         f"[green]✓[/green] {fit.compressed_clusters()}/{len(fit.per_cluster)} clusters "
         f"compressed -> {target}{label}\n  evidence: {evidence_path}"
     )
-    if fit.controls_would_win:
-        _console.print(
-            f"[red]INVESTIGATION GATE[/red]: control arms would have won clusters: "
-            f"{fit.controls_would_win}. A control beating the learned arms through the full "
-            "gate is a finding to investigate, not a policy to ship."
-        )
-        raise typer.Exit(1)
 
 
 def print_knn_fit(console: Console, fitted: KnnFitOutcome, *, out: str, z: float) -> None:
