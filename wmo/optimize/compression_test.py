@@ -18,6 +18,7 @@ from wmo.optimize.compression import (
     get_compressor,
     register_compressor,
     register_compressor_factory,
+    registered_compressor_ids,
     same_compression,
     segment_batch_limit,
     servable_compressor,
@@ -87,6 +88,17 @@ def test_registry_rejects_unknown_id_with_guidance() -> None:
         get_compressor("llmzip")
     assert "identity" in str(caught.value)
     assert "truncate" in str(caught.value)
+
+
+def test_registered_ids_include_the_lazily_registered_endpoint_compressor() -> None:
+    """The list `--compressor`'s help renders, so a registered id cannot go undocumented.
+
+    `llmlingua2-endpoint` is registered as a FACTORY at import of `wmo.optimize`, which is why
+    the two hand-written help strings kept advertising only identity and truncate.
+    """
+    ids = registered_compressor_ids()
+    assert {"identity", "truncate", "llmlingua2-endpoint"} <= set(ids)
+    assert list(ids) == sorted(ids)
 
 
 def test_aggressiveness_is_bounded() -> None:

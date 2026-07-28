@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
 import typer
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from wmo.cli.app import app
 from wmo.cli.platform_cmds import _pull_harness, _resolve_kind
 from wmo.harness.doc import HarnessDoc, Surface, SurfaceKind
 from wmo.harness.store import HarnessStore
-from wmo.platform.client import HarnessVersionDoc, PlatformError, WhoAmI
+from wmo.platform.client import (
+    HarnessVersionDoc,
+    PlatformError,
+    PlatformUnreachable,
+    RemoteWorldModel,
+    WhoAmI,
+)
 from wmo.platform.credentials import ENV_HOME, PlatformCredentials, save_credentials
 
 if TYPE_CHECKING:
@@ -57,6 +64,28 @@ class _StubClient:
         return _WHOAMI
 
 
+def _unreachable() -> PlatformUnreachable:
+    return PlatformUnreachable(
+        "cannot reach https://api.test/api/whoami: [Errno 61] Connection refused; "
+        "check your connection, or re-run `wmo login --url <platform url>`"
+    )
+
+
+def _flatten(output: str) -> str:
+    """Rejoin a rich-wrapped message so assertions can match it as one string."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def _assert_clean_failure(result: Result) -> None:
+    """The command failed through the CLI instead of letting an exception escape.
+
+    A `PlatformError`/`ConnectError` reaching here is what a user sees as a
+    Python traceback, so the exception type is the assertion that matters.
+    """
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit), result.exception
+
+
 def test_platform_commands_are_registered() -> None:
     result = runner.invoke(app, ["--help"])
     for command in ("login", "logout", "status", "push", "pull"):
@@ -97,6 +126,37 @@ def test_status_surfaces_rejected_credentials(monkeypatch: pytest.MonkeyPatch) -
 
     assert result.exit_code == 1
     assert "Unauthorized" in result.output
+
+
+def test_status_reports_an_unreachable_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The command that answers "is my connection healthy?" must survive "no"."""
+    save_credentials(PlatformCredentials(api_url="http://127.0.0.1:9", token="xpl_x"))
+
+    class _UnreachableClient(_StubClient):
+        def whoami(self) -> WhoAmI:
+            raise _unreachable()
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _UnreachableClient)
+
+    result = runner.invoke(app, ["status"])
+
+    _assert_clean_failure(result)
+    assert "Connection check failed" in result.output
+    assert "cannot reach" in result.output
+
+
+def test_status_falls_back_to_the_api_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Env-var credentials carry no web_url; the host still has to be named."""
+    save_credentials(PlatformCredentials(api_url="https://api.test", token="xpl_x"))
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _StubClient)
+
+    result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0, result.output
+    # Equality on the host, not a substring: the bug printed "None" here, so
+    # what matters is exactly which host got named.
+    connected = next(line for line in result.output.splitlines() if "Connected to" in line)
+    assert connected.split("Connected to ", 1)[1].strip() == "https://api.test"
 
 
 def test_pull_rejects_unknown_kind() -> None:
@@ -222,10 +282,199 @@ def test_login_with_explicit_api_url_skips_web_discovery(
     assert saved.token == "xpl_new"
 
 
+def test_login_with_api_url_only_records_no_web_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--api-url alone cannot know the web app, so it must not claim the hosted one."""
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _StubClient)
+
+    result = runner.invoke(
+        app, ["login", "--api-url", "https://api-preview.test/", "--token", "xpl_new"]
+    )
+
+    assert result.exit_code == 0, result.output
+    from wmo.platform.credentials import load_credentials
+
+    saved = load_credentials()
+    assert saved.api_url == "https://api-preview.test"
+    assert saved.web_url is None
+
+
+def test_login_reports_an_unreachable_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(_url: str) -> str:
+        raise _unreachable()
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.fetch_cli_config", refuse)
+
+    result = runner.invoke(app, ["login", "--url", "http://127.0.0.1:9"])
+
+    _assert_clean_failure(result)
+    assert "cannot reach" in result.output
+    assert "wmo login --url" in result.output
+
+
+def test_login_reports_a_url_that_is_not_a_platform(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200 of HTML (login wall, SPA rewrite) is a verdict, not a decode crash."""
+
+    def not_json(_url: str) -> str:
+        raise PlatformError("answered HTTP 200 with text/html, not JSON", status_code=200)
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.fetch_cli_config", not_json)
+
+    result = runner.invoke(app, ["login", "--url", "https://preview.test"])
+
+    _assert_clean_failure(result)
+    assert "does not look like a platform" in result.output
+    assert "not JSON" in result.output
+
+
+def test_login_does_not_blame_the_key_for_an_unreachable_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnreachableClient(_StubClient):
+        def whoami(self) -> WhoAmI:
+            raise _unreachable()
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _UnreachableClient)
+
+    result = runner.invoke(app, ["login", "--api-url", "http://127.0.0.1:9", "--token", "xpl_new"])
+
+    _assert_clean_failure(result)
+    assert "Connection failed" in result.output
+    assert "rejected" not in result.output
+
+
 def test_push_requires_login_first(tmp_path: Path) -> None:
     result = runner.invoke(app, ["push", "anything", "--root", str(tmp_path)])
     assert result.exit_code != 0
     assert "no local world model or harness" in result.output
+
+
+def _connected() -> None:
+    save_credentials(
+        PlatformCredentials(
+            web_url="https://platform.test",
+            api_url="https://api.test",
+            token="xpl_x",
+            default_org="org-1",
+        )
+    )
+
+
+def _write_harness(root: str, name: str = "demo") -> None:
+    doc = HarnessDoc(
+        name=name, surfaces=[Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content="p")]
+    )
+    HarnessStore(root).save_version(doc)
+
+
+def test_push_reports_an_unreachable_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = str(tmp_path / ".wmo")
+    _write_harness(root)
+    _connected()
+
+    class _UnreachableClient(_StubClient):
+        def push_harness_version(self, *_args: object, **_kwargs: object) -> object:
+            raise _unreachable()
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _UnreachableClient)
+
+    result = runner.invoke(app, ["push", "demo", "--root", root])
+
+    _assert_clean_failure(result)
+    assert "Push failed" in result.output
+    assert "cannot reach" in result.output
+
+
+def test_push_reports_a_platform_http_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = str(tmp_path / ".wmo")
+    _write_harness(root)
+    _connected()
+
+    class _MissingOrgClient(_StubClient):
+        def push_harness_version(self, *_args: object, **_kwargs: object) -> object:
+            raise PlatformError("not found", status_code=404)
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _MissingOrgClient)
+
+    result = runner.invoke(app, ["push", "demo", "--root", root])
+
+    _assert_clean_failure(result)
+    assert "Push failed: not found" in _flatten(result.output)
+
+
+def test_pull_surfaces_the_hint_inside_a_platform_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A revoked key already carries the remedy; it must not be buried in a traceback."""
+    _connected()
+
+    class _RevokedKeyClient(_StubClient):
+        def list_world_models(self, _org_id: str) -> list[RemoteWorldModel]:
+            raise PlatformError(
+                "invalid API key — run `wmo login` (or check WMO_PLATFORM_TOKEN)", status_code=401
+            )
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _RevokedKeyClient)
+
+    result = runner.invoke(app, ["pull", "demo", "--root", str(tmp_path / ".wmo")])
+
+    _assert_clean_failure(result)
+    normalized = _flatten(result.output)
+    assert "Pull failed: invalid API key" in normalized
+    assert "run `wmo login`" in normalized
+
+
+def test_pull_reports_an_unreachable_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _connected()
+
+    class _UnreachableClient(_StubClient):
+        def list_world_models(self, _org_id: str) -> list[RemoteWorldModel]:
+            raise _unreachable()
+
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _UnreachableClient)
+
+    result = runner.invoke(app, ["pull", "demo", "--root", str(tmp_path / ".wmo")])
+
+    _assert_clean_failure(result)
+    assert "Pull failed" in result.output
+    assert "cannot reach" in result.output
+
+
+def test_push_rejects_an_unknown_ref(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo'd --ref is a usage error naming where the versions are listed."""
+    root = str(tmp_path / ".wmo")
+    _write_harness(root)
+    _connected()
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _StubClient)
+
+    result = runner.invoke(app, ["push", "demo", "--ref", "v99", "--root", root])
+
+    _assert_clean_failure(result)
+    normalized = _flatten(result.output)
+    assert "no version v99" in normalized
+    assert "wmo harness list" in normalized
+
+
+def test_push_unknown_name_names_the_root_and_the_next_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run against the default relative --root so the message's root is readable
+    # in the wrapped error box, exactly as a user in the wrong directory sees it.
+    monkeypatch.chdir(tmp_path)
+    _write_harness(".wmo")
+
+    result = runner.invoke(app, ["push", "nosuchmodel"])
+
+    _assert_clean_failure(result)
+    normalized = _flatten(result.output)
+    assert "no local world model or harness named 'nosuchmodel' under .wmo" in normalized
+    assert "have: demo" in normalized
+    assert "wmo list" in normalized
 
 
 def test_logout_when_not_logged_in() -> None:
@@ -234,18 +483,20 @@ def test_logout_when_not_logged_in() -> None:
     assert "nothing to remove" in result.output.lower()
 
 
-def test_resolve_kind_disambiguates() -> None:
-    assert _resolve_kind(None, model=True, harness=False) == "model"
-    assert _resolve_kind(None, model=False, harness=True) == "harness"
-    assert _resolve_kind("model", model=True, harness=True) == "model"
+def test_resolve_kind_disambiguates(tmp_path: Path) -> None:
+    root = str(tmp_path / ".wmo")
+    resolve = partial(_resolve_kind, name="x", root=root)
+    assert resolve(None, model=True, harness=False) == "model"
+    assert resolve(None, model=False, harness=True) == "harness"
+    assert resolve("model", model=True, harness=True) == "model"
     with pytest.raises(typer.BadParameter, match="pass --kind"):
-        _resolve_kind(None, model=True, harness=True)
+        resolve(None, model=True, harness=True)
     with pytest.raises(typer.BadParameter, match="no local world model or harness"):
-        _resolve_kind(None, model=False, harness=False)
+        resolve(None, model=False, harness=False)
     with pytest.raises(typer.BadParameter, match="no local world model"):
-        _resolve_kind("model", model=False, harness=True)
+        resolve("model", model=False, harness=True)
     with pytest.raises(typer.BadParameter, match="must be"):
-        _resolve_kind("bundle", model=True, harness=False)
+        resolve("bundle", model=True, harness=False)
 
 
 def test_bare_login_targets_the_hosted_platform(monkeypatch: pytest.MonkeyPatch) -> None:

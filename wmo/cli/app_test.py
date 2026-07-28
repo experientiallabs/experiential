@@ -3,28 +3,43 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import json
 import os
 import subprocess
 import time
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import typer
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from wmo.cli import app, pool_registry
 from wmo.cli.app import _CONCURRENCY_ISOLATION_FLAGS
 from wmo.cli.pool_registry import read_pool_entries
-from wmo.config import HarnessConfig, ModelRole, load_config, load_settings, save_settings
-from wmo.core.types import Trace
+from wmo.config import (
+    FIDELITY_TIERS,
+    FidelityTier,
+    HarnessConfig,
+    ModelInfo,
+    ModelRole,
+    WorldModelStore,
+    load_config,
+    load_settings,
+    save_settings,
+)
+from wmo.core.types import Action, ActionKind, Observation, Step, Trace
 from wmo.engine.build import DEFAULT_TRAIN_SPLIT, split_traces, split_traces_3way
 from wmo.engine.eval_suites import EvalSuiteConfig
+from wmo.ingest import VendorPull
 from wmo.providers.base import (
     Completion,
+    EmbedderKind,
     Message,
     ProviderConfig,
     ProviderKind,
@@ -32,6 +47,10 @@ from wmo.providers.base import (
     verify_via_ping,
 )
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
+
+# The exact text the tinker provider raises: the CLI hint has to recognise THAT
+# message, not a paraphrase of it.
+from wmo.providers.tinker import _MISSING_TINKER_EXTRA
 from wmo.tracking.pricing import ModelPrice
 
 # `wmo.cli`'s `app` attribute (the Typer object) shadows the `wmo.cli.app` submodule on
@@ -39,6 +58,11 @@ from wmo.tracking.pricing import ModelPrice
 cli_app_module = importlib.import_module("wmo.cli.app")
 
 runner = CliRunner()
+
+
+def _flat(text: str) -> str:
+    """Collapse rich wrapping (and typer's error-box borders) for substring asserts."""
+    return " ".join(text.replace("│", " ").split())
 
 
 class FakeProvider:
@@ -75,6 +99,16 @@ class FakeProvider:
         # The pre-build verify guard pings through this; delegate to the shared ping so the fake
         # reports ok without hitting a real backend.
         return verify_via_ping(self)
+
+
+def _squashed(text: str) -> str:
+    """Whitespace-free view of rich output, so a boxed+wrapped message still matches a substring.
+
+    Typer renders usage errors inside a panel that hard-wraps at the terminal width, which splits
+    long paths and command hints across lines; dropping whitespace and the box rules puts them
+    back together. Callers squash the expected string the same way.
+    """
+    return "".join(ch for ch in text if not ch.isspace() and ch not in "│┃")
 
 
 def _traces_file(tmp_path) -> str:  # noqa: ANN001 - pytest fixture path
@@ -326,7 +360,36 @@ def test_knowledge_command_prints_path_and_files(tmp_path) -> None:  # noqa: ANN
     assert "gate: auth required" in result.output
 
 
+def test_knowledge_command_prints_bracketed_markdown_verbatim(tmp_path) -> None:  # noqa: ANN001
+    """Knowledge is hand-edited markdown, so rich must not read its brackets as style tags.
+
+    Unescaped, `[/items]` raised MarkupError (the command died on ordinary content) and both
+    `list[str]` and the link text were silently deleted from the rendered output.
+    """
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmo"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file(
+        "schemas.md",
+        "Use the XML close marker [/items] to end a list.\n"
+        "reservations: list[str]\n"
+        "See [the docs](https://example.com) for details.",
+    )
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+    assert result.exit_code == 0, result.exception
+    assert "[/items]" in result.output
+    assert "list[str]" in result.output
+    assert "[the docs](https://example.com)" in result.output
+
+
 def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # noqa: ANN001
+    # The empty state used to print a directory that does not exist and say "drop *.md files in
+    # this folder" without naming the flag that seeds one, so this now pins both halves.
     from wmo.config import save_config
     from wmo.config.config import HarnessConfig
 
@@ -334,7 +397,92 @@ def test_knowledge_command_without_kb_says_how_to_enable(tmp_path) -> None:  # n
     save_config(HarnessConfig(), root=root / "models" / "airline")
     result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
     assert result.exit_code == 0, result.output
-    assert "empty" in result.output.lower()
+    flat = _squashed(result.output)
+    assert _squashed("does not exist yet") in flat  # the printed dir is absent, and it says so
+    assert "--knowledge" in flat  # the exact build flag that creates one
+
+
+def test_knowledge_command_flags_a_kb_the_model_ignores(tmp_path) -> None:  # noqa: ANN001
+    """Files under `knowledge/` are inert unless the model was built with `--knowledge`."""
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmo"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(), root=model_dir)  # knowledge=False, the build default
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    flat = _squashed(result.output)
+    assert "inert" in flat
+    assert "--knowledge" in flat  # names the flag that activates them
+    assert _squashed("gate: auth required") in flat  # the files are still shown
+
+
+def test_knowledge_command_stays_quiet_when_the_kb_is_live(tmp_path) -> None:  # noqa: ANN001
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    root = tmp_path / ".wmo"
+    model_dir = root / "models" / "airline"
+    save_config(HarnessConfig(knowledge=True), root=model_dir)
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert "inert" not in result.output
+
+
+def test_knowledge_resolves_a_shipped_example_like_demo_and_play(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """`wmo knowledge` must see the same models `wmo demo`/`wmo play` resolve, examples included."""
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+    from wmo.engine.knowledge import KnowledgeBase
+
+    example = tmp_path / "airline-bench"
+    model_dir = example / "models" / "airline"
+    save_config(HarnessConfig(knowledge=True), root=model_dir)
+    (example / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    KnowledgeBase(model_dir / "knowledge").write_file("rules.md", "- gate: auth required")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["knowledge", "--name", "airline"])
+
+    assert result.exit_code == 0, result.output
+    assert "gate: auth required" in result.output
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["build", "--help"], "[deprecated] alias for --source"),
+        (["eval", "--help"], "`[models.agent]` selects a distinct agent provider"),
+        (["providers", "set", "--help"], "settings.toml` as `[models.worker]`"),
+        (["providers", "verify", "--help"], "the `[models.<role>]` roles in"),
+        (["scenarios", "build", "--help"], "settings.toml [models.worker|judge|summary]."),
+    ],
+)
+def test_help_keeps_the_bracketed_pointer_it_exists_to_teach(
+    argv: list[str], expected: str
+) -> None:
+    """Typer renders help through rich markup, which swallows an unescaped `[...]` whole.
+
+    Each of these is the only pointer in that help text to where the setting lives (or, for
+    `--vendor`, the only sign that the option is deprecated), so a swallowed pair is silent
+    misinformation.
+    """
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    rendered = " ".join(result.output.replace("│", " ").split())
+    assert expected in rendered
 
 
 @pytest.mark.parametrize("args", [[], ["providers"], ["examples"], ["config"]])
@@ -398,6 +546,99 @@ def test_examples_discovery_skips_unresolvable_names(tmp_path, monkeypatch) -> N
     assert "available: good-example" in unknown.output
 
 
+def _flat(output: str) -> str:
+    """Rich wraps error panels; flatten box drawing and newlines before matching a message."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def test_examples_data_only_bundle_is_marked_and_points_at_wmo_build(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # What `wmo download` fetches: a corpus with no launcher. `list` must say so, and `run` must
+    # name what the bundle IS for instead of dead-ending on "no run.sh launcher".
+    bundle = tmp_path / "demo-corpus"
+    bundle.mkdir()
+    (bundle / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    listed = runner.invoke(app, ["examples", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "demo-corpus" in listed.output
+    assert "data only" in listed.output
+
+    result = runner.invoke(app, ["examples", "run", "demo-corpus"])
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "data-only bundle" in output
+    assert "wmo build --file" in output
+    assert "--name demo-corpus" in output
+
+
+def test_examples_run_rejects_a_non_executable_launcher(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A run.sh that lost its exec bit (archive, checkout) must be a usage error naming chmod,
+    # not a PermissionError traceback out of subprocess.
+    example = tmp_path / "noexec"
+    example.mkdir()
+    launcher = example / "run.sh"
+    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+    launcher.chmod(0o644)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    result = runner.invoke(app, ["examples", "run", "noexec"])
+
+    assert result.exit_code == 2, result.output  # usage error, not a traceback
+    assert "chmod +x" in _flat(result.output)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param("echo hi\n", id="no-shebang"),  # execve -> ENOEXEC
+        pytest.param("#!/nonexistent/interp\n", id="missing-interpreter"),  # execve -> ENOENT
+    ],
+)
+def test_examples_run_reports_a_launcher_that_cannot_be_started(
+    tmp_path,  # noqa: ANN001
+    monkeypatch,  # noqa: ANN001
+    script: str,
+) -> None:
+    # X_OK passes but the kernel still refuses to exec, so `subprocess.run` raises before there
+    # is any exit code to forward. That must not surface as an OSError traceback either.
+    example = tmp_path / "unstartable"
+    example.mkdir()
+    launcher = example / "run.sh"
+    launcher.write_text(script, encoding="utf-8")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+
+    result = runner.invoke(app, ["examples", "run", "unstartable"])
+
+    assert result.exit_code == 2, result.output  # usage error, not a traceback
+    assert not isinstance(result.exception, OSError), result.exception
+    output = _flat(result.output)
+    assert "could not start" in output
+    assert "head -1" in output
+
+
+def test_config_help_does_not_reuse_the_harness_group_name() -> None:
+    # `wmo harness` is a different group managing a different object; `wmo config` manages the
+    # project's own settings file.
+    result = runner.invoke(app, ["config", "--help"])
+    assert result.exit_code == 0, result.output
+    output = _flat(result.output)
+    assert "project-local wmo settings" in output
+    assert "harness" not in output
+
+
+def test_serve_help_names_the_openai_endpoint_and_a_real_example_root() -> None:
+    # The OpenAI-compatible surface is what README step 3 exists for, and examples/tau-bench
+    # moved to packages/environment-capture/ — the help must name both correctly.
+    result = runner.invoke(app, ["serve", "--help"])
+    assert result.exit_code == 0, result.output
+    output = _flat(result.output)
+    assert "/v1/chat/completions" in output
+    assert "examples/tau-bench" not in output
+    assert "packages/environment-capture/tau-bench" in output
+
+
 def test_main_entry_loads_dotenv_before_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     # The persistence half of the wizard's credential flow: keys saved to .env must be back in
     # os.environ on the next `wmo` invocation (main), and importing the module must NOT load.
@@ -433,6 +674,287 @@ def test_demo_replays_a_sampled_scenario_open_loop(patched_provider, tmp_path) -
     assert "predicted" in result.output
     assert "actual" in result.output
     assert "exact matches" in result.output
+
+
+@pytest.mark.parametrize("steps", ["0", "-1"])
+def test_demo_rejects_a_non_positive_step_budget(patched_provider, tmp_path, steps) -> None:  # noqa: ANN001
+    # `--steps 0` used to slice the trace to [] and index [-1] on it: an IndexError traceback.
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            steps,
+            "--no-prompt",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert not isinstance(result.exception, IndexError)
+    assert "--steps" in result.output
+
+
+def test_demo_missing_explicit_traces_names_the_path_given(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # The old message blamed the model's default location and told you to pass the flag you just
+    # passed; an explicit path that does not exist must name that path.
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    typo = tmp_path / "does-not-exist.jsonl"
+    result = runner.invoke(
+        app, ["demo", "--name", "demo-model", "--root", str(root), "--traces", str(typo)]
+    )
+    assert result.exit_code == 2, result.output
+    assert _squashed(str(typo)) in _squashed(result.output)
+
+
+def test_demo_without_a_corpus_names_the_file_to_pass(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    """A build keeps no copy of its corpus, so the default can never resolve after `wmo build`."""
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    result = runner.invoke(app, ["demo", "--name", "demo-model", "--root", str(root)])
+    assert result.exit_code == 2, result.output
+    flat = _squashed(result.output)
+    assert _squashed("keeps no copy of the corpus it read") in flat
+    assert _squashed("--traces <that file>") in flat
+    assert _squashed(str(root / "models" / "demo-model" / "traces.otel.jsonl")) in flat
+
+
+def test_demo_finds_a_corpus_stored_beside_the_artifact(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    """serve and `optimize route sweep` read <model_dir>/traces.otel.jsonl; demo must too."""
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    corpus = Path(_traces_file(tmp_path)).read_text(encoding="utf-8")
+    (root / "models" / "demo-model" / "traces.otel.jsonl").write_text(corpus, encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["demo", "--name", "demo-model", "--root", str(root), "--seed", "0", "--steps", "1"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "replaying scenario" in result.output
+
+
+def test_demo_provider_failure_is_a_clean_error_not_a_traceback(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The likeliest first-run failure: the serve provider has no credentials."""
+    import openai
+
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+
+    class _NoCredentials(FakeProvider):
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            raise openai.OpenAIError("Missing credentials. Please pass an `api_key`")
+
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _NoCredentials())
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, openai.OpenAIError)
+    flat = _squashed(result.output)
+    assert _squashed("Missing credentials") in flat
+    assert _squashed("wmo providers verify") in flat
+
+
+def test_demo_off_a_terminal_calls_an_outage_an_outage(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 429 that outlived the retries is not a credentials problem, and must not claim to be.
+
+    CliRunner is never a terminal, so this is exactly the CI/redirected path: the interactive
+    branch (offer a different provider) is unreachable and the capacity error falls through to
+    the setup-error renderer, which used to print `check ... your credentials`.
+    """
+    import httpx
+    import openai
+
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    request = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+    class _RateLimited(FakeProvider):
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            raise openai.RateLimitError(
+                "Rate limit reached for gpt-4o",
+                response=httpx.Response(429, request=request),
+                body=None,
+            )
+
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _RateLimited())
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, openai.RateLimitError)  # still no traceback
+    flat = _squashed(result.output)
+    assert _squashed("is out of capacity") in flat
+    assert _squashed("not a credentials problem") in flat
+    assert _squashed("re-run `wmo demo --name demo-model`") in flat  # the exact next command
+    assert "credentialsareset" not in flat  # the setup hint, squashed; wrong diagnosis here
+    assert "wmoprovidersverify" not in flat  # it would only re-report the same outage
+
+
+def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Only backend SDK failures are re-rendered; our own bugs must not be dressed up as setup."""
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+    monkeypatch.setattr(
+        cli_app_module,
+        "run_demo",
+        lambda *a, **kw: (_ for _ in ()).throw(KeyError("internal")),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "demo",
+            "--name",
+            "demo-model",
+            "--root",
+            str(root),
+            "--traces",
+            _traces_file(tmp_path),
+            "--steps",
+            "1",
+            "--no-prompt",
+        ],
+    )
+
+    assert isinstance(result.exception, KeyError)
+
+
+def test_play_refuses_a_serve_provider_it_cannot_prepare(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`prepare()` is free and offline, so a missing credential fails before the first step."""
+    import wmo.providers as providers_pkg
+
+    root = tmp_path / ".wmo"
+    _build(root, "demo-model", tmp_path)
+
+    class _Unpreparable(FakeProvider):
+        def prepare(self) -> None:
+            raise RuntimeError("Missing credentials. Set OPENAI_API_KEY")
+
+    monkeypatch.setattr(providers_pkg, "get_provider", lambda config: _Unpreparable())
+
+    result = runner.invoke(app, ["play", "--name", "demo-model", "--root", str(root)])
+
+    assert result.exit_code == 1, result.output
+    flat = _squashed(result.output)
+    assert _squashed("Missing credentials") in flat
+    assert _squashed("wmo providers verify") in flat
+
+
+def _example_model(root: Path, example: str, name: str) -> Path:
+    """A shipped-example artifact: <root>/<example>/models/<name>/ plus the example's corpus."""
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+
+    example_dir = root / example
+    (example_dir / "traces.otel.jsonl").parent.mkdir(parents=True, exist_ok=True)
+    (example_dir / "traces.otel.jsonl").write_text("", encoding="utf-8")
+    model_dir = example_dir / "models" / name
+    save_config(HarnessConfig(), root=model_dir)
+    return model_dir
+
+
+def test_demo_root_spelling_does_not_change_what_is_discovered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Discovery used to be gated on `root != ".wmo"` string equality, so `./.wmo` (or the `.wmo/`
+    # shell tab-completion types) silently searched a different set than the identical `.wmo`.
+    _example_model(tmp_path, "airline-bench", "airline")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+    monkeypatch.chdir(project)
+
+    outputs = [
+        _squashed(runner.invoke(app, ["demo", "--name", "ghost", "--root", spelling]).output)
+        for spelling in (".wmo", "./.wmo", ".wmo/")
+    ]
+
+    assert all(_squashed("airline (airline-bench example)") in out for out in outputs), outputs
+
+
+def test_demo_lists_a_shadowed_example_distinguishably(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A local build of the same name used to appear twice in the list, and --name could not say
+    # which one was meant.
+    from wmo.config import save_config
+    from wmo.config.config import HarnessConfig
+
+    _example_model(tmp_path, "airline-bench", "airline")
+    project = tmp_path / "project"
+    save_config(HarnessConfig(), root=project / ".wmo" / "models" / "airline")
+    _example_model(tmp_path, "retail-bench", "retail")
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (tmp_path,))
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["demo"])
+
+    assert result.exit_code == 2, result.output
+    flat = _squashed(result.output)
+    assert _squashed("airline (local)") in flat
+    assert _squashed("airline (airline-bench example)") in flat
+    assert _squashed(f"--root {tmp_path / 'airline-bench'}") in flat
+
+
+def test_demo_with_nothing_built_points_at_a_command_that_exists(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # The old hint named `examples/tau-bench`, a path that ships in neither the wheel nor the repo.
+    empty_root = tmp_path / "no-examples"
+    empty_root.mkdir()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(cli_app_module, "_benchmark_roots", lambda: (empty_root,))
+    monkeypatch.chdir(project)
+
+    result = runner.invoke(app, ["demo"])
+
+    assert result.exit_code == 2, result.output
+    flat = _squashed(result.output)
+    assert "examples/tau-bench" not in flat
+    assert "wmodownload" in flat
+    assert _squashed("wmo build --file <traces> --name <name>") in flat
 
 
 def test_retry_narrator_dedupes_identical_failures_and_counts_down(monkeypatch) -> None:  # noqa: ANN001
@@ -981,8 +1503,11 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
 
     monkeypatch.setattr(providers_pkg, "provider_or_chain", provider_or_chain)
     monkeypatch.setattr(providers_pkg, "get_provider", get_provider)
+    traces = _traces_file(tmp_path)
+    # No settings.toml here, so the asserted bedrock ids are the no-role-configured fallback.
+    monkeypatch.chdir(tmp_path)
 
-    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--no-rag"])
+    result = runner.invoke(app, ["eval", traces, "--no-rag"])
 
     assert result.exit_code == 0, result.output
     judge_systems_chain = [s for s in chain.systems if "grade a world model" in s]
@@ -996,6 +1521,101 @@ def test_eval_pins_the_judge_off_the_failover_chain(monkeypatch, tmp_path) -> No
         "us.anthropic.claude-opus-4-8",
     ]
     assert all(config.model_type == "claude-opus-4-8" for config in configs)
+
+
+def _record_eval_providers(monkeypatch: pytest.MonkeyPatch) -> list[ProviderConfig]:
+    """Capture every ProviderConfig `wmo eval` builds, and answer with the fake provider."""
+    seen: list[ProviderConfig] = []
+    fake = FakeProvider()
+
+    def record(config: ProviderConfig, **_kwargs: object) -> FakeProvider:
+        seen.append(config)
+        return fake
+
+    monkeypatch.setattr(cli_app_module.providers, "provider_or_chain", record)
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", record)
+    return seen
+
+
+def _write_worker_role(root: Path, provider: str, model: str) -> None:
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider=provider, model=model)
+    save_settings(settings, root)
+
+
+def test_eval_uses_configured_worker_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `wmo providers set` (step 1 of getting started) writes [models.worker]. eval used to score
+    # against a hardcoded bedrock/claude-opus-4-8 regardless, so an OpenAI-only project got a
+    # 0.000 fidelity at exit 0 from a provider it never configured.
+    traces = _traces_file(tmp_path)
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    seen = _record_eval_providers(monkeypatch)
+
+    result = runner.invoke(app, ["eval", traces, "--no-rag"])
+
+    assert result.exit_code == 0, result.output
+    assert {config.kind for config in seen} == {ProviderKind.OPENAI}
+    assert {config.model for config in seen} == {"gpt-5.4-mini"}
+    # The report is only comparable across runs on the same model, so eval names the backend.
+    assert "scoring with openai (gpt-5.4-mini)" in result.output
+
+
+def test_eval_provider_flag_overrides_the_configured_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    traces = _traces_file(tmp_path)
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    seen = _record_eval_providers(monkeypatch)
+
+    result = runner.invoke(app, ["eval", traces, "--no-rag", "--provider", "bedrock"])
+
+    assert result.exit_code == 0, result.output
+    assert {config.kind for config in seen} == {ProviderKind.BEDROCK}
+    # A --provider naming another backend drops the role's model: gpt-5.4-mini is not on bedrock.
+    assert {config.model for config in seen} == {"us.anthropic.claude-opus-4-8"}
+
+
+def test_eval_suite_run_records_the_resolved_worker_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The result JSON must name the model that produced the number, which with no flags is the
+    # configured role rather than anything on the command line.
+    examples_root = tmp_path / "examples"
+    evals_dir = examples_root / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
+        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text(
+        'files = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n', encoding="utf-8"
+    )
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    seen = _record_eval_providers(monkeypatch)
+    results_root = tmp_path / ".wmo" / "evals"
+
+    ran = runner.invoke(
+        app,
+        [
+            "eval",
+            "run",
+            "tiny-task",
+            "--examples-root",
+            str(examples_root),
+            "--results-root",
+            str(results_root),
+        ],
+    )
+
+    assert ran.exit_code == 0, ran.output
+    assert {config.kind for config in seen} == {ProviderKind.OPENAI}
+    payload = json.loads(next(iter(results_root.glob("tiny-task/default/*.json"))).read_text())
+    assert payload["config"]["provider"] == "openai"
+    assert payload["config"]["model"] == "gpt-5.4-mini"
 
 
 def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -1061,6 +1681,198 @@ def test_eval_suite_list_run_and_results(patched_provider, tmp_path) -> None:  #
     assert "0.500" in summarized.output
 
 
+def test_eval_out_parent_is_created_before_the_eval_runs(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # The report is written last; a missing parent used to blow up with FileNotFoundError AFTER
+    # the (paid) eval had finished, discarding it.
+    destination = tmp_path / "nodir" / "deeper" / "report.json"
+
+    result = runner.invoke(
+        app, ["eval", _traces_file(tmp_path), "--no-rag", "--out", str(destination)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert destination.exists()
+    assert "Traceback" not in result.output
+
+
+def test_eval_out_pointing_at_a_directory_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app, ["eval", _traces_file(tmp_path), "--no-rag", "--out", str(tmp_path)]
+    )
+
+    assert result.exit_code == 2  # usage error, not an IsADirectoryError traceback
+    assert "is a directory" in _flat(result.output)
+
+
+def test_eval_on_a_directory_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    corpus_dir = tmp_path / "benchmark"
+    corpus_dir.mkdir()
+
+    result = runner.invoke(app, ["eval", str(corpus_dir)])
+
+    assert result.exit_code == 2  # usage error, not an IsADirectoryError traceback
+    flat = _flat(result.output)
+    assert "is a directory" in flat
+    assert "traces.otel.jsonl" in flat  # names the file to pass instead
+
+
+def test_eval_file_with_no_traces_fails_instead_of_scoring_zero(tmp_path) -> None:  # noqa: ANN001
+    # A tasks.jsonl (or any non-OTel export) used to print a plausible
+    # "OVERALL fidelity=0.000 over 0 held-out steps" scorecard and exit 0.
+    tasks = tmp_path / "tasks.jsonl"
+    tasks.write_text('{"task_id": "t1", "instruction": "do it"}\n', encoding="utf-8")
+
+    result = runner.invoke(app, ["eval", str(tasks)])
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "no OTel GenAI traces" in flat
+    assert "--mode closed-loop" in flat
+    assert "OVERALL" not in flat
+
+
+def test_eval_run_suite_with_no_traces_fails_instead_of_persisting_zero(tmp_path) -> None:  # noqa: ANN001
+    # A suite result is durable: a zero-step run used to be saved and then resurface in
+    # `wmo eval results` as a real 0.000 measurement.
+    evals_dir = tmp_path / "examples" / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir.parent / "traces.otel.jsonl").write_text(
+        '{"task_id": "t1", "instruction": "do it"}\n', encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text('files = ["../traces.otel.jsonl"]\n', encoding="utf-8")
+    results_root = tmp_path / ".wmo" / "evals"
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "run",
+            "tiny-task",
+            "--examples-root",
+            str(tmp_path / "examples"),
+            "--results-root",
+            str(results_root),
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "no OTel GenAI traces" in flat
+    assert "OVERALL" not in flat
+    assert not list(results_root.rglob("*.json"))  # nothing persisted
+
+
+def test_eval_run_suite_listing_no_files_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    evals_dir = tmp_path / "examples" / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (evals_dir / "default.toml").write_text("files = []\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["eval", "run", "tiny-task", "--examples-root", str(tmp_path / "examples")]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "lists no trace files" in _flat(result.output)
+
+
+def test_eval_run_unknown_suite_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    examples_root = tmp_path / "examples"
+    examples_root.mkdir()
+
+    for tokens in (["run", "nosuite"], ["grid", "nosuite"]):
+        result = runner.invoke(app, ["eval", *tokens, "--examples-root", str(examples_root)])
+        assert result.exit_code == 2, result.output  # usage error, not a ValueError traceback
+        assert "unknown eval suite 'nosuite'" in _flat(result.output)
+
+
+def test_eval_unknown_chain_is_a_usage_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.chdir(tmp_path)  # no .wmo/fallback.toml here
+
+    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--chain", "nope"])
+
+    assert result.exit_code == 2  # usage error, not a ValueError traceback
+    assert "fallback.toml does not exist" in _flat(result.output)
+
+
+def test_eval_rejects_closed_loop_only_flags_in_open_loop(tmp_path) -> None:  # noqa: ANN001
+    # The README's closed-loop command minus `--mode closed-loop` used to silently drop every
+    # closed-loop flag and run a different (paid) evaluation.
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            _traces_file(tmp_path),
+            "--harness",
+            "nosuchharness",
+            "--k",
+            "7",
+            "--harness-backend",
+            "e2b",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result.output)
+    assert "--k, --harness, --harness-backend" in flat
+    assert "--mode closed-loop" in flat
+
+
+def test_eval_threshold_belongs_to_the_agreement_flow(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["eval", _traces_file(tmp_path), "--threshold", "0.9"])
+
+    assert result.exit_code == 2, result.output
+    assert "wmo eval agreement" in _flat(result.output)
+
+
+def _hide_viz_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make only matplotlib/seaborn look uninstalled, as on a core `pip install`."""
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name: str, package: str | None = None) -> ModuleSpec | None:
+        if name in cli_app_module._VIZ_MODULES:
+            return None
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(cli_app_module.importlib.util, "find_spec", find_spec)
+
+
+def test_eval_grid_flows_name_the_viz_extra_when_it_is_missing(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    # matplotlib/seaborn ship in the optional [viz] extra; the plotting import used to escape as a
+    # raw ModuleNotFoundError that never named it (for `eval grid`, after the whole paid grid).
+    _hide_viz_extra(monkeypatch)
+    result_json = tmp_path / "grid.json"
+    result_json.write_text("{}", encoding="utf-8")
+
+    for tokens in (["grid-plot", str(result_json)], ["grid-heatmap", str(result_json)]):
+        result = runner.invoke(app, ["eval", *tokens])
+        assert result.exit_code == 2, result.output
+        assert "uv sync --extra viz" in _flat(result.output)
+
+
+def test_research_plot_commands_name_the_viz_extra_when_it_is_missing(monkeypatch) -> None:  # noqa: ANN001
+    _hide_viz_extra(monkeypatch)
+
+    for argv in (
+        ["research", "plot-concurrency", "missing.json"],
+        ["research", "plot-concurrency-combined", "a.json", "b.json"],
+    ):
+        result = runner.invoke(app, argv)
+        assert result.exit_code == 2, result.output
+        assert "uv sync --extra viz" in _flat(result.output)
+
+
+def test_eval_help_lists_every_dispatched_flow() -> None:
+    result = runner.invoke(app, ["eval", "--help"])
+
+    assert result.exit_code == 0, result.output
+    flat = _flat(result.output)
+    # The grid family owns six of this command's options, so its tokens must be discoverable.
+    for token in ("grid <suite>", "grid-plot", "grid-heatmap", "agreement"):
+        assert token in flat
+    # Suites moved out of examples/ long ago; the help must not send readers to the wrong dir.
+    assert "packages/environment-capture" in flat
+
+
 def test_build_then_list_shows_named_model(patched_provider, tmp_path) -> None:  # noqa: ANN001
     root = tmp_path / ".wmo"
     _build(root, "tau2-airline", tmp_path)
@@ -1077,6 +1889,79 @@ def test_list_empty_project_is_friendly(tmp_path) -> None:  # noqa: ANN001
     result = runner.invoke(app, ["list", "--root", str(tmp_path / ".wmo")])
     assert result.exit_code == 0
     assert "no world models" in result.output
+    # --root defaults to a cwd-relative `.wmo`, so "nothing built" and "wrong directory" read
+    # the same unless the empty listing says where it looked. Asserted on the tail of the path
+    # only: rich wraps a long tmp_path across lines.
+    flat = _flat(result.output)
+    assert "no world models built under" in flat
+    assert str(Path(".wmo") / "models") in flat
+
+
+def test_list_rejects_a_file_as_root(tmp_path) -> None:  # noqa: ANN001
+    # `--root traces.jsonl` used to report a healthy empty project; a file can never hold models/.
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("{}\n", encoding="utf-8")
+    result = runner.invoke(app, ["list", "--root", str(corpus)])
+    assert result.exit_code == 2
+    assert "is a file, not a project dir" in _flat(result.output)
+
+
+def test_list_shows_an_unreadable_artifact_as_a_row(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # One artifact this CLI cannot parse (a bundle from a newer CLI, a hand edit) used to
+    # traceback the whole listing; the healthy models beside it must still be listed.
+    root = tmp_path / ".wmo"
+    _build(root, "alpha-healthy", tmp_path)
+    broken = root / "models" / "zz-broken"
+    broken.mkdir(parents=True)
+    (broken / "config.toml").write_text("this is not toml =", encoding="utf-8")
+
+    result = runner.invoke(app, ["list", "--root", str(root)])
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None  # a bad row, not an escaped TOMLDecodeError
+    assert "alpha-healthy" in result.output
+    assert "unreadable" in result.output
+    assert "zz-broken" in result.output
+    assert "is not valid TOML" in _flat(result.output)
+
+
+def _write_broken_model(root: Path, name: str) -> None:
+    (root / "models" / name).mkdir(parents=True)
+    (root / "models" / name / "config.toml").write_text("this is not toml =", encoding="utf-8")
+
+
+def test_the_model_picker_offers_only_readable_artifacts(
+    patched_provider: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `list_info` now hands back a row for an artifact it could not read, so the picker has to
+    # drop those rather than offer a choice that dead-ends the moment it is picked.
+    root = tmp_path / ".wmo"
+    _build(root, "alpha-healthy", tmp_path)
+    _build(root, "beta-healthy", tmp_path)
+    _write_broken_model(root, "zz-broken")
+    offered: list[str] = []
+
+    def fake_select_model(console: object, infos: list[ModelInfo]) -> str:
+        offered.extend(info.name for info in infos)
+        return infos[0].name
+
+    monkeypatch.setattr(cli_app_module, "_console", SimpleNamespace(is_terminal=True))
+    monkeypatch.setattr(cli_app_module, "select_model", fake_select_model)
+
+    assert cli_app_module._resolve_name(WorldModelStore(root), None) == "alpha-healthy"
+    assert offered == ["alpha-healthy", "beta-healthy"]
+
+
+def test_the_model_picker_reports_when_nothing_is_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".wmo"
+    for name in ("one-broken", "two-broken"):
+        _write_broken_model(root, name)
+    monkeypatch.setattr(cli_app_module, "_console", SimpleNamespace(is_terminal=True))
+
+    with pytest.raises(typer.BadParameter, match="no readable world model"):
+        cli_app_module._resolve_name(WorldModelStore(root), None)
 
 
 def test_play_repl_steps_and_quits(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -1129,6 +2014,379 @@ def test_build_non_interactive_without_source_errors(tmp_path) -> None:  # noqa:
     # No --file/--vendor and --no-interactive: should fail fast rather than hang on input.
     result = runner.invoke(app, ["build", "--no-interactive", "--root", str(tmp_path / ".wmo")])
     assert result.exit_code != 0
+
+
+def _flat(output: str) -> str:
+    """CliRunner output with rich's panel borders and line wrapping removed, for substrings."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def _pull_trace(trace_id: str, *, usable: bool) -> Trace:
+    """One single-step trace. `usable=False` makes it degenerate (empty observation)."""
+    return Trace(
+        trace_id=trace_id,
+        source="otel-genai:vendor",
+        steps=[
+            Step(
+                action=Action(kind=ActionKind.TOOL_CALL, name="get_user", arguments={"id": "u1"}),
+                observation=Observation(content="found u1" if usable else ""),
+            )
+        ],
+    )
+
+
+def _many_traces_file(tmp_path, count: int) -> str:  # noqa: ANN001 - pytest fixture path
+    """`count` copies of the single-trace export, each under its own trace id."""
+    base = Path(_traces_file(tmp_path)).read_text(encoding="utf-8").splitlines()
+    lines: list[str] = []
+    for i in range(count):
+        for line in base:
+            lines.append(json.dumps({**json.loads(line), "traceId": f"{i:032d}"}))
+    path = tmp_path / "many.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_build_with_a_name_but_no_trace_source_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    # `wmo list` prints `wmo build --name <name>` as its empty-state hint, and every non-TTY
+    # (CI, piped output) takes the scriptable path. It used to reach the ingest seam and raise
+    # a raw ValueError; the guard only fired when --name was ALSO omitted.
+    result = runner.invoke(
+        app, ["build", "--name", "x", "--root", str(tmp_path / ".wmo"), "--no-interactive"]
+    )
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "provide --file <export> or --pull" in _flat(result.output)
+
+
+def test_list_empty_state_names_a_trace_export(tmp_path) -> None:  # noqa: ANN001
+    # The hint must be a runnable command: --name alone is a usage error (test above).
+    result = runner.invoke(app, ["list", "--root", str(tmp_path / ".wmo")])
+    assert result.exit_code == 0
+    assert "--file" in result.output
+
+
+def test_build_missing_trace_file_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    # A typo'd --file used to die with a raw FileNotFoundError from the adapter, and only after
+    # the provider ping had already run.
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(tmp_path / "nope.jsonl"),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, FileNotFoundError)
+    assert "trace file not found" in _flat(result.output)
+    # Rejected at the argument boundary: no provider was pinged.
+    assert "verifying" not in result.output
+
+
+def test_build_rejects_a_directory_as_the_trace_file(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(tmp_path),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, IsADirectoryError)
+    assert "not a directory" in _flat(result.output)
+
+
+def test_build_rejects_the_postgres_source_and_names_wmo_ingest(tmp_path) -> None:  # noqa: ANN001
+    # `postgres` passes the adapter-name validator but can never work here: build has no
+    # --dsn/--table (those live on `wmo ingest`), so it must be rejected at the boundary.
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--source",
+            "postgres",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "wmo ingest --source postgres --dsn <dsn> --table <table>" in flat
+    assert "--dsn" not in _flat(runner.invoke(app, ["build", "--help"]).output)
+
+
+def test_build_wrong_source_names_the_detected_format(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # A chat-json export under the silent `--source otel-genai` default ingested nothing and
+    # raised ValueError('no traces ingested; nothing to build') as a traceback.
+    chat = tmp_path / "chat.json"
+    chat.write_text(json.dumps({"messages": [{"role": "user", "content": "hi"}]}), encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(chat),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "--source otel-genai" in flat
+    assert "it looks like chat-json" in flat
+    # The path itself is wrapped by rich, so assert on the command, not the rendered path.
+    assert "wmo ingest --file" in flat
+
+
+def test_build_empty_trace_file_names_source_and_ingest(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            str(empty),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "--source otel-genai" in flat
+    assert "wmo ingest --file" in flat
+
+
+def test_build_limit_caps_a_file_corpus(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # --limit was wired only into the VendorPull branch, so it was silently ignored for --file
+    # builds while `wmo ingest --limit` capped both transports.
+    from wmo.config.card import load_card
+
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "capped",
+            "--file",
+            _many_traces_file(tmp_path, 6),
+            "--limit",
+            "2",
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    card = load_card(root / "models" / "capped")
+    assert card is not None
+    assert card.corpus.traces == 2
+
+
+def test_build_pull_limit_is_a_fetch_cap_applied_once(
+    patched_provider,  # noqa: ANN001 - pytest fixture
+    monkeypatch,  # noqa: ANN001 - pytest fixture
+    tmp_path,  # noqa: ANN001 - pytest fixture path
+) -> None:
+    """A pull spends `--limit` vendor-side, so `--drop-degenerate` can leave fewer than N.
+
+    `wmo.ingest.base.from_vendor` slices to `pull.limit` before `build` ever sees the corpus,
+    so re-applying the same cap after the degenerate filter cannot restore the dropped traces —
+    it would only read as a promise of N usable traces that this transport cannot keep. Pinning
+    both halves: the adapter receives the cap, and `build` is not handed it a second time.
+    """
+    import sys
+
+    from wmo.config.card import load_card
+
+    seen: list[VendorPull] = []
+    passed_to_build: dict[str, object] = {}
+
+    class _CappingAdapter:
+        """Mimics `base.from_vendor`: alternating junk/usable traces, sliced at `pull.limit`."""
+
+        name = "otel-genai"
+
+        def from_vendor(self, pull: VendorPull) -> list[Trace]:
+            seen.append(pull)
+            traces = [_pull_trace(f"{i:032d}", usable=bool(i % 2)) for i in range(6)]
+            return traces if pull.limit is None else traces[: pull.limit]
+
+    real_run_build = cli_app_module.run_build
+
+    def _spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - passthrough spy
+        passed_to_build.update(kwargs)
+        return real_run_build(*args, **kwargs)
+
+    monkeypatch.setattr(
+        sys.modules["wmo.engine.build"], "get_adapter", lambda name: _CappingAdapter()
+    )
+    monkeypatch.setattr(cli_app_module, "run_build", _spy)
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "pulled",
+            "--pull",
+            "--limit",
+            "4",
+            "--drop-degenerate",
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert [p.limit for p in seen] == [4]  # spent at fetch…
+    assert passed_to_build["limit"] is None  # …and not a second time after the filter
+    card = load_card(root / "models" / "pulled")
+    assert card is not None
+    assert card.corpus.traces == 2  # 4 fetched, 2 of them degenerate; the cap cannot refill
+
+
+def test_build_rejects_a_limit_below_one(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--limit",
+            "0",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--limit must be at least 1" in _flat(result.output)
+
+
+def test_build_unknown_chain_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
+    """`--chain` with no `.wmo/fallback.toml` must say how to create the file, not traceback.
+
+    Deliberately no `patched_provider`: that fixture stubs `providers.provider_or_chain`, which
+    is the seam under test. Chain resolution runs before the provider ping, so nothing here
+    reaches the network (`wmo/conftest.py` points the chain path at an empty tmp dir).
+    """
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--chain",
+            "fast",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--provider",
+            "bedrock",
+            "--fidelity",
+            "low",
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "chain 'fast' requested but" in flat
+    assert "fallback.toml" in flat
+    assert "[[chain.<name>]] rung tables" in flat
+    assert "docs/reference/failover.md" in flat
+
+
+def test_build_model_default_follows_the_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    # --provider openai with no --model used to persist the Anthropic id `claude-opus-4-8`.
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "oa",
+            "--file",
+            _traces_file(tmp_path),
+            "--provider",
+            "openai",
+            "--fidelity",
+            "low",
+            "--root",
+            str(root),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    config = load_config(root / "models" / "oa")
+    assert config.serve_provider is ProviderKind.OPENAI
+    assert config.serve_provider_config().model_type == "gpt-5.5"
+
+
+def test_build_requires_a_model_for_a_provider_without_a_default(tmp_path) -> None:  # noqa: ANN001
+    # openrouter/tinker/openai_responses have no curated model list: ask rather than guess,
+    # matching `wmo providers set`'s scriptable contract.
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "x",
+            "--file",
+            _traces_file(tmp_path),
+            "--provider",
+            "openrouter",
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--no-interactive",
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--provider openrouter has no default serve model" in _flat(result.output)
 
 
 def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None:  # noqa: ANN001
@@ -1187,6 +2445,85 @@ def test_providers_verify_unknown_model_is_clean_error(tmp_path) -> None:  # noq
     )
     assert result.exit_code != 0
     assert not isinstance(result.exception, FileNotFoundError)
+
+
+# Hand-editing `.wmo/settings.toml` is documented (docs/reference/closed_loop.md), and a file
+# written by an older CLI outlives an upgrade, so every command that reads it has to fail as a
+# usage error naming the file, never as a tomllib/pydantic traceback.
+_BROKEN_SETTINGS = pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('[models.worker\nprovider = "openai"\n', "is not valid TOML"),
+        ('[models]\nworker = "openai"\n', "does not match the current settings schema"),
+    ],
+    ids=["malformed-toml", "schema-invalid"],
+)
+
+
+def _write_settings(tmp_path: Path, payload: str) -> Path:
+    root = tmp_path / ".wmo"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "settings.toml").write_text(payload, encoding="utf-8")
+    return root
+
+
+@_BROKEN_SETTINGS
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["providers", "verify"],
+        ["config", "telemetry", "status"],
+        ["config", "telemetry", "enable"],
+        ["providers", "set", "--provider", "openai", "--model", "gpt-5.4"],
+    ],
+    ids=["verify", "telemetry-status", "telemetry-enable", "providers-set"],
+)
+def test_broken_settings_is_a_usage_error_not_a_traceback(
+    tmp_path: Path, payload: str, expected: str, argv: list[str]
+) -> None:
+    root = _write_settings(tmp_path, payload)
+
+    result = runner.invoke(app, [*argv, "--root", str(root)])
+
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)  # BadParameter, not a leaked loader raise
+    flat = _flat(result.output)
+    assert expected in flat
+    assert "settings.toml" in flat
+    assert "delete it and re-run `wmo providers set`" in flat
+
+
+@_BROKEN_SETTINGS
+def test_providers_set_rejects_a_bad_provider_before_reading_settings(
+    tmp_path: Path, payload: str, expected: str
+) -> None:
+    # The caller's own argument is wrong too; the error must be about the argument they typed.
+    root = _write_settings(tmp_path, payload)
+
+    result = runner.invoke(
+        app, ["providers", "set", "--provider", "bogus", "--model", "x", "--root", str(root)]
+    )
+
+    assert result.exit_code == 2
+    assert "unknown provider 'bogus'" in _flat(result.output)
+    assert expected not in _flat(result.output)
+
+
+def test_providers_verify_unreadable_model_config_is_clean_error(tmp_path: Path) -> None:
+    # An artifact copied in by hand (or extracted from a bundle a newer CLI wrote) can hold a
+    # config.toml this CLI cannot parse; the command whose job is reporting configuration
+    # problems must report that one too.
+    broken = tmp_path / ".wmo" / "models" / "foo"
+    broken.mkdir(parents=True)
+    (broken / "config.toml").write_text("this is not toml [[[\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2
+    assert not isinstance(result.exception, ValueError)
+    flat = _flat(result.output)
+    assert "foo/config.toml is not valid TOML" in flat
+    assert "re-run `wmo build`" in flat
 
 
 def _record_verify_all(monkeypatch: pytest.MonkeyPatch, pinged: list[ProviderConfig]) -> None:
@@ -1265,6 +2602,34 @@ def test_providers_verify_reports_a_role_failure_with_its_credentials(
     assert "fail bedrock" in result.output
     assert "[foo]" in result.output
     assert "AWS_ACCESS_KEY_ID" in result.output
+
+
+def test_providers_verify_missing_optional_sdk_points_at_the_install(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # tinker's SDK is an optional extra, and its ImportError text replaces the "No module named"
+    # wording the hint used to key on, so the hint said "check your credentials" on a failure
+    # that has nothing to do with credentials.
+    root = tmp_path / ".wmo"
+    settings = load_settings(root)
+    settings.models.worker = ModelRole(provider="tinker", model="Qwen/Qwen3-8B")
+    save_settings(settings, root)
+    monkeypatch.setattr(
+        cli_app_module,
+        "verify_all",
+        lambda configs: [
+            VerifyResult(ok=False, kind=c.kind, model=c.model, detail=_MISSING_TINKER_EXTRA)
+            for c in configs
+        ],
+    )
+
+    result = runner.invoke(app, ["providers", "verify", "--root", str(root)])
+
+    flat = _flat(result.output)
+    # pip is the documented install path, so the extra must be reachable without a checkout,
+    # and the `[distill]` must survive rich markup rather than being read as a style tag.
+    assert "pip install 'world-model-optimizer[distill]'" in flat
+    assert "credentials are set" not in flat
 
 
 def test_providers_verify_reports_built_model_provider(patched_provider, tmp_path) -> None:  # noqa: ANN001
@@ -1442,6 +2807,58 @@ def test_providers_verify_name_scopes_the_report_to_one_world_model(
     assert "models.worker" not in result.output
 
 
+def test_research_concurrency_uses_the_configured_worker_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The environment LLM is the same worker-role call every other command makes; it used to be
+    # pinned to bedrock/claude-opus-4-8 whatever the project configured.
+    examples_root = tmp_path / "examples"
+    evals_dir = examples_root / "tiny-task" / "evals"
+    evals_dir.mkdir(parents=True)
+    (examples_root / "tiny-task" / "traces.otel.jsonl").write_text(
+        Path(_traces_file(tmp_path)).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    (evals_dir / "default.toml").write_text(
+        'files = ["../traces.otel.jsonl"]\ntrain_split = 0.5\n', encoding="utf-8"
+    )
+    _write_worker_role(tmp_path / ".wmo", "openai", "gpt-5.4-mini")
+    monkeypatch.chdir(tmp_path)
+    # get_provider is the identity here, so calling the runner's factory yields its config.
+    built: list[ProviderConfig] = []
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(
+        cli_app_module,
+        "build_world_runner",
+        lambda factory, prompt, demos, selected: built.append(factory()),
+    )
+    monkeypatch.setattr(
+        cli_app_module,
+        "run_concurrency_scaling",
+        lambda *a, **kw: SimpleNamespace(benchmark="", best_speedup=lambda: None),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "concurrency",
+            "tiny-task",
+            "--examples-root",
+            str(examples_root),
+            "--side",
+            "world",
+            "--scenarios",
+            "1",
+            "--levels",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert built[0].kind is ProviderKind.OPENAI
+    assert built[0].model == "gpt-5.4-mini"
+
+
 def test_research_concurrency_rejects_level_above_scenarios_fixed_n() -> None:
     # Fixed-N: a level above --scenarios would silently cap concurrency at N and duplicate the
     # N-worker point, so it must fail fast (guard fires before any suite/corpus resolution).
@@ -1500,6 +2917,148 @@ def test_research_concurrency_rejects_bad_select() -> None:
     assert "--select must be one of" in result.output
 
 
+def _framed(output: str) -> str:
+    """One flat line of a rich-framed message: the box wraps and pads what it renders."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def test_research_concurrency_unknown_suite_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # The suite argument must fail like every other argument on this command: a framed usage
+    # error naming the next command, not the raw ValueError traceback out of resolve_eval_suite.
+    result = runner.invoke(
+        app,
+        ["research", "concurrency", "nosuchsuite", "--examples-root", str(tmp_path)],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValueError)
+    flat = _framed(result.output)
+    assert "unknown eval suite 'nosuchsuite'" in flat
+    assert "`wmo eval list` prints the suites" in flat
+
+
+def test_scenarios_build_missing_file_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # A typo in --file is the likeliest first-run mistake; it must not be a FileNotFoundError.
+    result = runner.invoke(app, ["scenarios", "build", "--file", str(tmp_path / "nope.jsonl")])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, FileNotFoundError)
+    flat = _framed(result.output)
+    assert "does not exist" in flat
+    assert "`wmo download <benchmark>`" in flat
+
+
+def test_scenarios_build_directory_file_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    result = runner.invoke(app, ["scenarios", "build", "--file", str(tmp_path)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, IsADirectoryError)
+    assert "is a directory" in _framed(result.output)
+
+
+def test_scenarios_build_help_documents_the_accepted_embed_provider() -> None:
+    # The help must name values the command accepts: EmbedderKind spells Azure "azure".
+    result = runner.invoke(app, ["scenarios", "build", "--help"])
+    assert result.exit_code == 0
+    flat = _framed(result.output)
+    documented = flat[flat.index("Facet embedder") : flat.index("--embed-model")]
+    for kind in EmbedderKind:
+        assert kind.value in documented, kind
+    assert "azure_openai" not in documented
+
+
+def test_scenarios_verify_missing_scenario_set_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["scenarios", "verify", str(tmp_path / "nope.json"), "--file", str(corpus)],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, FileNotFoundError)
+    flat = _framed(result.output)
+    assert "does not exist" in flat
+    assert "`wmo scenarios build --file <traces.jsonl> --out" in flat
+
+
+def test_scenarios_verify_missing_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    scenarios_file = tmp_path / "scenarios.json"
+    scenarios_file.write_text('{"scenarios": []}', encoding="utf-8")
+    result = runner.invoke(
+        app,
+        ["scenarios", "verify", str(scenarios_file), "--file", str(tmp_path / "nope.jsonl")],
+    )
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, FileNotFoundError)
+    flat = _framed(result.output)
+    assert "--file" in flat and "does not exist" in flat
+
+
+def test_scenarios_verify_malformed_scenario_set_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Pydantic's ValidationError points at pydantic's docs; the user needs the command that
+    # writes this artifact instead.
+    scenarios_file = tmp_path / "scenarios.json"
+    scenarios_file.write_text("not json\n", encoding="utf-8")
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    result = runner.invoke(app, ["scenarios", "verify", str(scenarios_file), "--file", str(corpus)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValidationError)
+    flat = _framed(result.output)
+    assert "is not a scenario set written by `wmo scenarios build`" in flat
+    assert "errors.pydantic.dev" not in flat
+
+
+def test_scenarios_verify_non_utf8_scenario_set_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P1): `ScenarioSet.load` reads with encoding="utf-8", so binary bytes
+    # raise UnicodeDecodeError *before* pydantic and slipped past the ValidationError handler.
+    scenarios_file = tmp_path / "scenarios.json"
+    scenarios_file.write_bytes(b"\xff\xfe\x00binary")
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    result = runner.invoke(app, ["scenarios", "verify", str(scenarios_file), "--file", str(corpus)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, UnicodeDecodeError)
+    assert "is not UTF-8 text" in _framed(result.output)
+
+
+def test_scenarios_build_non_utf8_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P1): a path that exists still fails inside the adapter's read.
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_bytes(b"\xff\xfe\x00binary")
+    result = runner.invoke(app, ["scenarios", "build", "--file", str(corpus)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, UnicodeDecodeError)
+    flat = _framed(result.output)
+    assert "--file" in flat and "is not UTF-8 text" in flat
+
+
+def test_scenarios_build_unreadable_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P1): chmod-000 raised PermissionError out of Path.read_text.
+    corpus = tmp_path / "traces.jsonl"
+    corpus.write_text("", encoding="utf-8")
+    corpus.chmod(0)
+    try:
+        result = runner.invoke(app, ["scenarios", "build", "--file", str(corpus)])
+    finally:
+        corpus.chmod(0o644)
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, PermissionError)
+    flat = _framed(result.output)
+    assert "could not be read" in flat
+    assert "shows its owner and mode" in flat
+
+
+def test_research_concurrency_malformed_suite_file_omits_the_listing_hint(tmp_path) -> None:  # noqa: ANN001
+    # Regression (Greptile P2): a direct `.toml` selector that exists resolves past name lookup
+    # and fails on its own contents, so `wmo eval list` would point away from the broken file.
+    suite_file = tmp_path / "broken.toml"
+    suite_file.write_text("this is not = toml [[[\n", encoding="utf-8")
+    result = runner.invoke(app, ["research", "concurrency", str(suite_file)])
+    assert result.exit_code != 0
+    assert not isinstance(result.exception, ValueError)
+    flat = _framed(result.output)
+    assert "is not valid TOML" in flat
+    assert "wmo eval list" not in flat
+
+
 def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa: ANN001
     from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
@@ -1512,7 +3071,7 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
     monkeypatch.setattr(cli_app_module.providers, "get_provider", fake_get_provider)
     monkeypatch.setattr(
         cli_app_module,
-        "load_settings",
+        "load_settings_or_abort",
         lambda: ProjectSettings(
             models=ModelsSettings(
                 worker=ModelRole(provider="azure", model="gpt-5.4", endpoint="https://x/v1"),
@@ -1532,22 +3091,178 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
 
 
 def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
+    from wmo.config.settings import ProjectSettings
+
     monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
     assert summary is worker
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "some-model"
 
 
+def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch) -> None:  # noqa: ANN001
+    # Half a flag pair used to complete from bedrock, so `--model gpt-5.5` on an OpenAI project
+    # asked bedrock for an OpenAI model id.
+    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings_or_abort",
+        lambda: ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="openai", model="gpt-5.4-mini"))
+        ),
+    )
+    _summary, worker, _judge = cli_app_module._scenario_role_llms(None, "gpt-5.5", None)
+    assert cast(ProviderConfig, worker).kind is ProviderKind.OPENAI
+    assert cast(ProviderConfig, worker).model == "gpt-5.5"
+
+
 def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
     from wmo.config.settings import ProjectSettings
 
     monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
-    monkeypatch.setattr(cli_app_module, "load_settings", lambda: ProjectSettings())
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
     assert summary is worker
     assert worker is judge
     assert cast(ProviderConfig, worker).model == "us.anthropic.claude-opus-4-8"
+
+
+def test_worker_role_provider_config_falls_back_to_bedrock(monkeypatch) -> None:  # noqa: ANN001
+    from wmo.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
+    config = cli_app_module._worker_role_provider_config(None, None, None)
+    assert config.kind is ProviderKind.BEDROCK
+    assert config.model == "us.anthropic.claude-opus-4-8"
+
+
+def _azure_worker_settings(monkeypatch: pytest.MonkeyPatch, deployment: str | None) -> None:
+    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings_or_abort",
+        lambda: ProjectSettings(
+            models=ModelsSettings(
+                worker=ModelRole(
+                    provider="azure",
+                    model="gpt-5.4",
+                    endpoint="https://azure.example/v1",
+                    deployment=deployment,
+                )
+            )
+        ),
+    )
+
+
+def test_worker_role_provider_config_model_flag_keeps_the_role_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The endpoint describes the BACKEND, not the model, so swapping the model keeps it.
+    _azure_worker_settings(monkeypatch, "prod-54-canary")
+
+    config = cli_app_module._worker_role_provider_config(
+        None, "gpt-5.5", None, deployment="prod-55-canary"
+    )
+
+    assert config.kind is ProviderKind.AZURE_OPENAI
+    assert config.model == "gpt-5.5"
+    assert config.endpoint == "https://azure.example/v1"
+    assert config.deployment == "prod-55-canary"
+
+
+def test_worker_role_provider_config_refuses_an_azure_model_swap_without_a_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On Azure the wire `model` IS the deployment name, so the role's deployment names the model
+    # being replaced. Keeping it would call gpt-5.4 while reporting gpt-5.5; guessing `gpt-5.5`
+    # 404s on a resource that names deployments anything else, and `wmo eval` turns that into a
+    # silent fidelity=0.000 at exit 0. So refuse, naming the command that fixes it.
+    _azure_worker_settings(monkeypatch, "prod-54-canary")
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
+    message = str(excinfo.value)
+    assert "prod-54-canary" in message
+    assert "wmo providers set --provider azure --model gpt-5.5 --deployment <deployment>" in message
+
+
+def test_worker_role_provider_config_allows_an_azure_model_swap_the_deployment_already_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A resource whose deployments are named after their models has already answered the question.
+    _azure_worker_settings(monkeypatch, "gpt-5.5")
+
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
+    assert config.model == "gpt-5.5"
+    assert config.deployment == "gpt-5.5"
+
+
+def test_worker_role_provider_config_derives_a_deployment_the_role_never_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing configured to contradict, so fall back to the model type as
+    # `_worker_provider_config` does rather than refusing over a value that was never there.
+    _azure_worker_settings(monkeypatch, None)
+
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.5", None)
+
+    assert config.deployment == "gpt-5.5"
+
+
+def test_worker_role_provider_config_keeps_a_custom_deployment_for_the_same_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Re-stating the role's own model is not a model change: an operator's deployment name is not
+    # derivable from the model id, so re-deriving it here would break a working config.
+    _azure_worker_settings(monkeypatch, "prod-54-canary")
+
+    config = cli_app_module._worker_role_provider_config(None, "gpt-5.4", None)
+
+    assert config.deployment == "prod-54-canary"
+
+
+def test_worker_role_provider_config_provider_flag_uses_that_backends_flagship(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A --provider naming another backend must take its model from THAT backend's catalog:
+    # pairing --provider openai with bedrock's claude-opus-4-8 sends OpenAI a model it has never
+    # heard of, so the command fails instead of running on the backend the user selected.
+    from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
+
+    monkeypatch.setattr(
+        cli_app_module,
+        "load_settings_or_abort",
+        lambda: ProjectSettings(
+            models=ModelsSettings(worker=ModelRole(provider="bedrock", model="claude-sonnet-4-6"))
+        ),
+    )
+
+    config = cli_app_module._worker_role_provider_config("openai", None, None)
+
+    assert config.kind is ProviderKind.OPENAI
+    assert config.model == "gpt-5.5"
+
+
+def test_worker_role_provider_config_demands_a_model_for_a_catalog_less_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # openrouter/tinker publish no built-in rows — nothing can derive an operator's route or
+    # weights path — so the fix is to say which model, not to guess one.
+    from wmo.config.settings import ProjectSettings
+
+    monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        cli_app_module._worker_role_provider_config("openrouter", None, None)
+
+    assert "pass --model <model>" in str(excinfo.value)
+    assert "wmo providers set --provider openrouter --model <model>" in str(excinfo.value)
 
 
 def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
@@ -1748,3 +3463,38 @@ def test_default_eval_holdout_contains_no_build_training_trace() -> None:
     assert holdout, "sanity: the corpus must actually produce a holdout"
     leaked = {t.trace_id for t in gepa_train} & {t.trace_id for t in holdout}
     assert leaked == set(), f"{len(leaked)} GEPA training traces scored as held-out"
+
+
+def test_build_defaults_to_the_free_fidelity_tier(patched_provider, tmp_path) -> None:  # noqa: ANN001
+    """A plain `wmo build` must not spend on search.
+
+    The default was `medium`, which runs GEPA plus a cheap-lever config search; in one observed
+    build that was 73% of total spend. `low` is `estimate_only` with `gepa_budget=0` and no
+    config search, so the documented quickstart no longer bills a first-time user by default.
+    `auto_fidelity.json` records the difference: the low tier writes a signature estimate with
+    no `scores`, while every searching tier writes the scores it paid for.
+    """
+    spec = FIDELITY_TIERS[FidelityTier.LOW]
+    assert spec.gepa_budget == 0 and spec.config_search is False, "low is no longer the free tier"
+
+    root = tmp_path / ".wmo"
+    result = runner.invoke(
+        app,
+        [
+            "build",
+            "--name",
+            "defaulted",
+            "--file",
+            _traces_file(tmp_path),
+            "--root",
+            str(root),
+            "--provider",
+            "bedrock",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    auto = json.loads(
+        (root / "models" / "defaulted" / "auto_fidelity.json").read_text(encoding="utf-8")
+    )
+    assert not auto.get("scores"), f"default build paid for a config search: {auto['scores']}"

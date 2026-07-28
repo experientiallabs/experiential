@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.agents.default import default_agent
@@ -217,6 +219,11 @@ def _flat(result: Result) -> str:
     return " ".join(result.output.replace("│", " ").split())
 
 
+def _unwrapped(result: Result) -> str:
+    """Every space dropped, so an assert survives rich breaking a long command mid-token."""
+    return "".join(result.output.replace("│", " ").split())
+
+
 # -- routing and the happy path ---------------------------------------------------------------
 
 
@@ -352,6 +359,25 @@ def test_distill_runtime_error_exits_nonzero_with_the_message(
 # -- cost confirmation -------------------------------------------------------------------------
 
 
+def test_distill_non_interactive_without_yes_refuses_and_prices_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: exit 2, naming the projected spend and the flag that authorizes it."""
+    _write_inputs(tmp_path, extra_toml=_PRICING_TOML + _BUDGET_TOML)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result)
+    assert "cannot ask for spend consent" in flat
+    assert "wmo optimize distill run would spend ~$" in flat
+    assert "budget.max_usd cap" in flat
+    assert "--yes" in flat
+    assert recorder.calls == []  # no training started
+
+
 def test_distill_unpriced_meters_without_budget_reject_yes_non_interactively(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,6 +393,29 @@ def test_distill_unpriced_meters_without_budget_reject_yes_non_interactively(
     assert "unbounded" in flat
     assert "budget.max_usd" in flat
     assert recorder.calls == []
+
+
+def test_distill_unbounded_spend_refuses_a_terminal_stdout_with_redirected_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal stdout is not a human when stdin is a redirect.
+
+    This is the one branch `--yes` cannot answer, so it is also the one that most needs the
+    question to reach a person. Keying it on the console alone meant `wmo optimize distill run
+    --yes < /dev/null` at a terminal fell through to the prompt, where a redirect answered for
+    the absent human or the read died with an `EOFError` traceback.
+    """
+    _write_inputs(tmp_path, extra_toml="")  # no pricing, no budget cap
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    monkeypatch.setattr(model_app_module, "_console", Console(width=240, force_terminal=True))
+
+    result = _invoke(tmp_path, "--yes", input="y\n")
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result)
+    assert "cannot start with unbounded spend non-interactively" in flat
+    assert recorder.calls == []  # the piped "y" bought nothing
 
 
 def test_distill_unpriced_meters_with_a_budget_cap_honor_yes(
@@ -512,6 +561,52 @@ def test_distill_names_the_failing_config_field(
 
     assert result.exit_code == 2
     assert "harbor" in _flat(result)  # the missing required section is named
+
+
+def test_distill_names_the_install_command_when_the_distill_extra_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every shipped reference config has [rollout.renderers], which only VALIDATES with the extra.
+
+    pydantic re-raises a non-ValueError out of a field validator untouched, so a plain
+    `pip install world-model-optimizer` used to meet a traceback here instead of the install
+    command that fixes it.
+    """
+    _write_inputs(tmp_path, extra_toml='[rollout.renderers]\n"test/student" = "qwen3"\n')
+    # A deterministic stand-in for a no-extras install, whether or not this venv has the extra.
+    monkeypatch.setitem(sys.modules, "wmo.distill.renderers", None)
+    _patch_run(monkeypatch, _RunRecorder())
+
+    result = _invoke(tmp_path, "--yes")
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    unwrapped = _unwrapped(result)
+    assert "uvsync--extradistill" in unwrapped
+    assert "pipinstall'world-model-optimizer[distill]'" in unwrapped
+
+
+def test_a_missing_tau2_binary_names_a_setup_a_pip_installed_user_can_follow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fix must not be a repo path: no wheel ships packages/environment-capture/."""
+    _write_inputs(tmp_path)
+    (tmp_path / "distill.toml").write_text(
+        '[student]\nbase_model = "test/student"\n'
+        '[teacher]\nmodel = "test/teacher"\n'
+        f'[tau2]\ntau2_bin = "{tmp_path / "nope" / "tau2"}"\ndata_dir = "{tmp_path}"\n'
+        "[train]\nsteps = 2\ntasks_per_batch = 1\ngroup_size = 1\n",
+        encoding="utf-8",
+    )
+    _patch_run(monkeypatch, _RunRecorder())
+
+    result = _invoke(tmp_path, "--yes")
+
+    assert result.exit_code == 2
+    flat = _flat(result)
+    assert "does not exist" in flat
+    assert "packages/environment-capture" not in flat
+    assert "github.com/sierra-research/tau2-bench" in _unwrapped(result)
 
 
 def test_distill_rejects_overlapping_splits(
@@ -1166,6 +1261,66 @@ def test_report_on_a_run_that_never_gated_says_how_to_finish_it(tmp_path: Path) 
     flat = _flat(result)
     assert "has not reached its gate yet" in flat
     assert "wmo optimize distill run --run-dir <dir> --resume" in flat
+
+
+def test_report_survives_the_half_written_last_metrics_line_of_an_aborted_run(
+    tmp_path: Path,
+) -> None:
+    """`report` advertises itself as safe on an aborted run dir, so it must read one.
+
+    A run that died mid-append leaves a torn final line. That used to end the command in a
+    traceback, after the gate verdict and the solve-rate table had already printed.
+    """
+    run_dir = _finished_run(tmp_path)
+    store = DistillRunStore(run_dir)
+    store.append_metrics(0, _step_metrics())
+    with store.metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"step": 1, "reverse_')
+
+    result = _report(run_dir)
+
+    assert result.exit_code == 0, result.output
+    flat = _flat(result)
+    assert "ignoring a half-written last line" in flat
+    assert "reporting the 1 complete row(s)" in flat
+    assert "1 training step(s) recorded" in flat  # the complete row is still reported
+    assert "Traceback" not in result.output
+
+
+def test_report_on_metrics_damaged_above_the_last_line_is_a_usage_error(tmp_path: Path) -> None:
+    """Only the final line is excusable: a broken row above it means content was lost."""
+    run_dir = _finished_run(tmp_path)
+    store = DistillRunStore(run_dir)
+    store.metrics_path.write_text('{"step": 0}\n[1, 2, 3]\n{"step": 2}\n', encoding="utf-8")
+
+    result = _report(run_dir)
+
+    assert result.exit_code == 2
+    flat = _flat(result)
+    assert "corrupt metrics row on line 2" in flat
+    assert "Traceback" not in result.output
+
+
+def test_report_refuses_a_last_metrics_line_that_parses_into_a_non_object(tmp_path: Path) -> None:
+    """The tail excuse is for a line that fails to parse, which is all a torn append leaves.
+
+    A whole `[]`/`null` at the end was written intact, so skipping it would report the previous
+    step as the run's latest state while hiding that the file had been damaged.
+    """
+    run_dir = _finished_run(tmp_path)
+    store = DistillRunStore(run_dir)
+    store.append_metrics(0, _step_metrics())
+    with store.metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write("[]\n")
+
+    result = _report(run_dir)
+
+    assert result.exit_code == 2
+    flat = _flat(result)
+    assert "corrupt metrics row on line 2" in flat
+    assert "expected a JSON object" in flat
+    assert "ignoring a half-written last line" not in flat
+    assert "Traceback" not in result.output
 
 
 # -- `probe`: the teacher-search gate over a measured matrix ------------------------------------

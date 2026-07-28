@@ -28,6 +28,7 @@ Operators do not set those knobs. They set `cost_quality`, one number in [0, 1] 
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import re
@@ -252,6 +253,7 @@ def fit_knn_policy(
         # setting mean different things on different processes.
         cost_scale=bank_cost_scale(bank),
         fitted_from=fitted_from,
+        fit_scenario_ids=list(scenario_ids),
     )
     policy.attach_bank(bank)
     logger.info(
@@ -286,6 +288,7 @@ def fit_knn_artifact(
     out_path: Path,
     matrix_source: str,
     embedder: EmbedderSpec,
+    fit_ids: list[str] | None = None,
     fallback: str | None = None,
     z: float = DEFAULT_KNN_Z,
     rag_num: int = DEFAULT_RAG_NUM,
@@ -314,6 +317,8 @@ def fit_knn_artifact(
     """
     if rag_thres <= 0.0:
         raise ValueError("rag_thres must be greater than 0")
+    selected_ids = fit_ids if fit_ids is not None else matrix.scenario_ids()
+    fit_digest = hashlib.sha256("\0".join(selected_ids).encode("utf-8")).hexdigest()[:16]
     built = embedder.build()
     if compression is not None:
         # Representation consistency, the C2 rule that makes or breaks a compressed arm: the
@@ -327,6 +332,7 @@ def fit_knn_artifact(
     policy = fit_knn_policy(
         matrix,
         bank_path=knn_bank_path_for(out_path),
+        fit_ids=selected_ids,
         embedder=embedder,
         embed_with=built,
         guard_model=fallback,
@@ -337,7 +343,8 @@ def fit_knn_artifact(
         se_floor=se_floor,
         floor_q=floor_q,
         fitted_from=(
-            f"{matrix_source} knn fallback={fallback or 'auto'} z={z:g} k={rag_num} "
+            f"{matrix_source} fit_ids_sha256={fit_digest} "
+            f"knn fallback={fallback or 'auto'} z={z:g} k={rag_num} "
             f"thres={rag_thres:g} pairs={min_pairs} se_floor={se_floor} q={floor_q:g} "
             f"{embed_tag}"
         ),
@@ -353,7 +360,7 @@ def fit_knn_artifact(
             update={"compression": compression, "fit_compression": compression}
         )
     policy.save(out_path)
-    result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
+    result = evaluate_policy(policy, matrix, selected_ids, embedder=built)
     return KnnFitOutcome(
         policy=policy,
         bank_path=policy.bank_path(),
@@ -626,7 +633,14 @@ def tune_policy_dial(policy_path: Path, cost_quality: float) -> DialResult:
             superseded fit, or the policy has no dial (see `apply_cost_quality`).
     """
     if not policy_path.is_file():
-        raise ValueError(f"no policy file at {policy_path}")
+        # Name the producer, as the not-dialable branch of `apply_cost_quality` does: the default
+        # argument is a bare `policy.json`, so this is the first thing a new user hits.
+        raise ValueError(
+            f"no policy file at {policy_path}; fit one first with "
+            "`wmo optimize route fit <matrix.json> --kind knn`, or pass the path of an "
+            "installed policy (`wmo optimize route pin` and `wmo optimize model` write it to "
+            "<root>/models/<name>/policy.json)"
+        )
     policy = RoutingPolicy.load(policy_path)
     base_path = policy_path.with_name(f"{policy_path.stem}.base{policy_path.suffix}")
     as_fitted = RoutingPolicy.load(base_path) if base_path.is_file() else None

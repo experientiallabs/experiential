@@ -51,7 +51,7 @@ class HarnessStore:
         return self.root / HARNESSES_DIR
 
     def dir_for(self, name: str) -> Path:
-        return self.harnesses_dir / validate_name(name)
+        return self.harnesses_dir / validate_name(name, kind="harness")
 
     # -- enumeration -------------------------------------------------------------------------
 
@@ -131,7 +131,7 @@ class HarnessStore:
 
         Versions are append-only: this never touches an existing version directory.
         """
-        validate_name(doc.name)
+        validate_name(doc.name, kind="harness")
         version = (self.versions(doc.name)[-1] + 1) if self.exists(doc.name) else 1
         stamped = doc.model_copy(update={"version": version})
         directory = self.dir_for(doc.name) / f"v{version}"

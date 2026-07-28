@@ -456,6 +456,17 @@ def register_compressor_factory(compressor_id: str, factory: CompressorFactory) 
     _COMPRESSOR_FACTORIES[compressor_id] = factory
 
 
+def registered_compressor_ids() -> tuple[str, ...]:
+    """Every compressor id `--compressor` accepts, built and lazily-registered alike.
+
+    The one source of that list. `--compressor`'s help text renders it rather than spelling the
+    ids out, because a hand-written enumeration goes stale the moment a compressor is registered:
+    `llmlingua2-endpoint` shipped as a lazy factory and the help kept advertising two ids for
+    several releases while the flag accepted three.
+    """
+    return tuple(sorted({*_COMPRESSORS, *_COMPRESSOR_FACTORIES}))
+
+
 def get_compressor(compressor_id: str) -> Compressor:
     """Resolve a compressor by id, or raise naming the known ids (fail at mount, not mid-call)."""
     compressor = _COMPRESSORS.get(compressor_id)
@@ -481,7 +492,7 @@ def get_compressor(compressor_id: str) -> Compressor:
             )
         register_compressor(built)
         return built
-    known = ", ".join(sorted({*_COMPRESSORS, *_COMPRESSOR_FACTORIES}))
+    known = ", ".join(registered_compressor_ids())
     raise ValueError(
         f"unknown compressor '{compressor_id}'; known compressors: {known}. "
         "Register new compressors with wmo.optimize.compression.register_compressor "

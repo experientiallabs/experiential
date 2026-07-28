@@ -311,8 +311,20 @@ class DistillRunStore:
         with self.metrics_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
 
-    def read_metrics(self) -> list[JsonObject]:
+    def read_metrics(self, *, tolerate_partial_tail: bool = False) -> list[JsonObject]:
         """Read every metrics row back, in append order.
+
+        Args:
+            tolerate_partial_tail: Drop a half-written FINAL line instead of raising. A run
+                that died mid-append (ENOSPC, a run dir copied while it was live) leaves one,
+                and a read-only reader of an aborted run has to survive it. Off by default:
+                everything that writes or resumes a run wants the damage reported, and only
+                the last line is ever excusable (a broken row anywhere above it means the
+                file lost content, which no reader may quietly skip). Narrow on purpose: it
+                excuses only a line that fails to PARSE. `append_metrics` writes one JSON
+                object per line, and no truncation of one parses (every strict prefix of
+                `{...}` is invalid JSON), so a last line that parses into a non-object is
+                something a torn append cannot produce -- real corruption, and still an error.
 
         Returns:
             One JSON object per non-empty line; an empty list when no metrics
@@ -326,18 +338,25 @@ class DistillRunStore:
             text = self.metrics_path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return []
+        lines = text.splitlines()
         rows: list[JsonObject] = []
-        for line_number, line in enumerate(text.splitlines(), 1):
+        for line_number, line in enumerate(lines, 1):
             if not line.strip():
                 continue
+            is_tail = line_number == len(lines)
             try:
                 parsed = json.loads(line)
             except json.JSONDecodeError as exc:
+                if tolerate_partial_tail and is_tail:
+                    continue
                 raise ValueError(
                     f"corrupt metrics row on line {line_number} of {self.metrics_path}: {exc}; "
                     "remove the broken line (each line must be one JSON object) and retry"
                 ) from exc
             if not isinstance(parsed, dict):
+                # Not excused even at the tail, and even under tolerate_partial_tail: a line
+                # that parses is a line that was written whole, so this is content damage, not
+                # the torn append that flag exists for.
                 raise ValueError(
                     f"corrupt metrics row on line {line_number} of {self.metrics_path}: "
                     "expected a JSON object; remove the broken line and retry"

@@ -37,6 +37,7 @@ from typing import Literal
 import tomli_w
 from llm_waterfall import ChatMaxTokensField
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic_core import ErrorDetails
 
 from wmo.core.types import JsonObject
 from wmo.providers.base import (
@@ -238,15 +239,80 @@ class ModelPool(BaseModel):
 
 
 def load_pool(path: Path = DEFAULT_POOL_PATH) -> ModelPool:
-    """Load and validate the pool file at `path`."""
+    """Load and validate the pool file at `path`.
+
+    Every failure names the file and the command that writes it. Callers turn what this raises
+    straight into the user's error (`wmo optimize model`, `wmo optimize route sweep`), so a bare
+    `tomllib`/pydantic message would reach an operator as a schema dump with a pydantic.dev URL,
+    no path, and nothing to type next. The roster is an operator-edited file, and the whole
+    point of the message is to say which file and how to repair it. A file that exists but
+    declares no candidate is answered like a missing one: with the path and the commands that
+    write an entry.
+
+    Args:
+        path: The pool TOML to read.
+
+    Returns:
+        The validated roster.
+
+    Raises:
+        FileNotFoundError: No file at `path`.
+        ValueError: The file is not valid TOML, declares no `[[model]]` table, or has an entry
+            that fails validation; the message names the path and each failing field.
+    """
     if not path.is_file():
         raise FileNotFoundError(
-            f"no model pool file at {path}; create it with one [[model]] table per candidate "
-            "(fields: name, kind, model, and for non-built-in models input_per_mtok/"
-            "output_per_mtok; endpoint/deployment/api_version/api_key_env as the backend needs)"
+            f"no model pool file at {path}; register candidates with `wmo providers set` (or "
+            "write the file by hand: one [[model]] table per candidate, fields: name, kind, "
+            "model, and for non-built-in models input_per_mtok/output_per_mtok; "
+            "endpoint/deployment/api_version/api_key_env as the backend needs)"
         )
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    return ModelPool.model_validate({"models": data.get("model", [])})
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"pool file {path} is not valid TOML ({exc}); fix the file, or move it aside and "
+            "re-register the candidates with `wmo providers set`"
+        ) from exc
+    entries = data.get("model", [])
+    if not isinstance(entries, list):
+        # `[model]` declares ONE table; the roster is an array of tables, which needs the doubled
+        # brackets. Worth naming, since it is a typo on the very syntax the missing-file message
+        # above recommends.
+        raise ValueError(
+            f"{path} declares a single [model] table; the candidate pool is an array of tables, "
+            "so each candidate needs DOUBLED brackets: [[model]]"
+        )
+    if not entries:
+        raise ValueError(
+            f"no [[model]] tables in {path}, so the candidate pool is empty; register a hosted "
+            "model with `wmo providers set <provider>`, add a distilled student with "
+            "`wmo optimize route student <run-dir> --input-per-mtok <p> --output-per-mtok <p>`, "
+            "or write one [[model]] table per candidate by hand"
+        )
+    try:
+        return ModelPool.model_validate({"models": entries})
+    except ValidationError as exc:
+        # `loc` is ("models", <table index>, <field>); the leading "models" is this function's
+        # own wrapper key and means nothing to someone reading their TOML, so drop it and name
+        # the [[model]] table by the position they can count to in the file.
+        details = "; ".join(_entry_error(err) for err in exc.errors())
+        raise ValueError(
+            f"pool file {path} is not a valid model pool ({details}); fix the entry, or "
+            "re-register the candidate with `wmo providers set`"
+        ) from exc
+
+
+def _entry_error(error: ErrorDetails) -> str:
+    """One pydantic pool error as `[[model]] N field: message`, for a TOML-file reader."""
+    # A whole-pool failure (the duplicate-name rule) carries no entry position at all.
+    location = list(error["loc"][1:])
+    index = location[0] if location else None
+    if not isinstance(index, int):
+        return error["msg"]
+    field = ".".join(str(part) for part in location[1:])
+    table = f"[[model]] {index + 1}"
+    return f"{table} {field}: {error['msg']}" if field else f"{table}: {error['msg']}"
 
 
 def pool_api_key(entry: PoolEntry) -> str | None:

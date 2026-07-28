@@ -49,8 +49,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MISSING_TINKER_EXTRA = (
-    "the tinker SDK is not installed; run `uv sync --extra distill` to convert "
-    "training datums for a real Tinker training client"
+    "the tinker SDK is not installed; run `uv sync --extra distill` (or "
+    "`pip install 'world-model-optimizer[distill]'`) to convert training datums "
+    "for a real Tinker training client"
 )
 
 TopkCandidates = list[tuple[int, float]]

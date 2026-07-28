@@ -40,6 +40,15 @@ from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
 DEFAULT_TRAIN_SPLIT = 0.8
 
 
+class EmptyCorpusError(ValueError):
+    """Ingest produced no traces, so there is nothing to build.
+
+    A `ValueError` subclass so existing library callers keep working, but a distinct type so the
+    CLI can turn the most common cause (an export the pinned `--source` adapter cannot read) into
+    a usage error naming `--source` instead of letting a traceback escape.
+    """
+
+
 def _count_steps(traces: list[Trace]) -> int:
     return sum(len(trace.steps) for trace in traces)
 
@@ -151,6 +160,7 @@ def build(
     estimate_only: bool = False,
     drop_degenerate: bool = False,
     gepa_val_cap: int | None = None,
+    limit: int | None = None,
 ) -> OptimizeResult:
     """Ingest traces and run the full build, creating + persisting the artifact under `root`.
 
@@ -169,6 +179,15 @@ def build(
     artifact will serve, and the result lands in `auto_fidelity.json`. The search never changes
     the serve DEFAULTS (plain RAG unless flags were set explicitly): the winner activates at
     runtime via `--max-fidelity`.
+
+    `limit` caps the corpus at the first N normalized traces, so a first cheap build over a large
+    file export does not have to read the whole thing into GEPA. It is applied AFTER the
+    degenerate-trace filter, so `limit=N` with `drop_degenerate` yields N *usable* traces — which
+    is why it is not the same knob as `VendorPull.limit`. A pull is bounded vendor-side at fetch
+    time (`wmo.ingest.base.from_vendor` slices to `pull.limit`), before this function can see
+    which traces are degenerate; combining the two therefore yields *at most* N. Callers that
+    want exactly N usable traces from a pull must over-fetch: pass a larger `VendorPull.limit`
+    than `limit`.
     """
     report = reporter or NullReporter()
     paths = ArtifactPaths(root)
@@ -180,8 +199,10 @@ def build(
         # (run_trace_scaling / run_fidelity_tiers, via their own --drop-degenerate) apply.
         traces, dropped = drop_degenerate_traces(traces)
         report.activity(f"dropped {dropped} degenerate (all-empty-observation) traces")
+    if limit is not None:
+        traces = traces[:limit]
     if not traces:
-        raise ValueError("no traces ingested; nothing to build")
+        raise EmptyCorpusError("no traces ingested; nothing to build")
     report.ingest_done(len(traces), _count_steps(traces))
 
     # Three disjoint sets: train seeds GEPA's reflection minibatches, val (capped) selects
@@ -256,8 +277,28 @@ def build(
         # the whole valset, and steps (not traces) are what bound cost — a long-trace corpus once
         # turned a 4-iteration tier into $131. The default ceiling applies always; a fidelity
         # tier may widen it (`gepa_val_cap`, in steps).
-        gepa_val = _cap_gepa_valset(val or train, gepa_val_cap or _GEPA_VAL_STEP_CAP)
-        result = optimizer.optimize(train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget)
+        gepa_val_size = gepa_val_cap or _GEPA_VAL_STEP_CAP
+        gepa_val = _cap_gepa_valset(val or train, gepa_val_size)
+        # The acceptance re-check (inside `optimizer.optimize`) must not grade base-vs-winner on
+        # the very steps GEPA selected candidates against: that would test selection, not
+        # generalization, and is exactly what made `metrics.held_out_accuracy` unable to answer
+        # whether GEPA helps. `val` is the SAME validation split `gepa_val` was capped from
+        # (never test: the build's data boundary keeps test untouched for `wmo eval`), so its
+        # leftover traces past the cap are a genuinely disjoint, still leak-free sample. Capping
+        # that remainder at the same `gepa_val_size` keeps the re-check's cost the same order of
+        # magnitude as before in the common case: the two fresh eval passes already happened
+        # every GEPA build (`recheck_rollouts = 2 * len(recheck_steps)`), just against the
+        # selection data; this only repoints them. `allow_oversized_first=False`: unlike
+        # `gepa_val` (which must never come back empty - GEPA needs SOME valset), an empty
+        # `recheck` has a graceful, already-tested fallback inside `optimize()` (re-scores the
+        # selection valset itself), so a single oversized trace landing first in the leftover
+        # must not be let through alone - that would blow the re-check's cost past the selection
+        # pass it is supposed to match, for no benefit over falling back. `metrics.json` records
+        # which of the two happened via `fresh_recheck_disjoint` - never silently indistinguishable.
+        recheck = _cap_gepa_valset(val[len(gepa_val) :], gepa_val_size, allow_oversized_first=False)
+        result = optimizer.optimize(
+            train, gepa_val, BASE_ENV_PROMPT, config.gepa_budget, recheck=recheck
+        )
         # A GEPA candidate can be empty - a weak reflection LM (e.g. a self-reflecting open model)
         # sometimes proposes a blank env prompt that still scores acceptably on easy steps and
         # gets selected. An empty env prompt is never a valid artifact, so fall back to base.
@@ -347,16 +388,28 @@ def build(
 _GEPA_VAL_STEP_CAP = 16
 
 
-def _cap_gepa_valset(traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP) -> list[Trace]:
-    """A prefix of `traces` totalling at most `max_steps` steps (always at least one trace).
+def _cap_gepa_valset(
+    traces: list[Trace], max_steps: int = _GEPA_VAL_STEP_CAP, *, allow_oversized_first: bool = True
+) -> list[Trace]:
+    """A prefix of `traces` totalling at most `max_steps` steps.
 
     `split_traces` already shuffles deterministically, so the prefix is an unbiased, stable
     sample of the held-out split.
+
+    `allow_oversized_first` (default True, GEPA's own selection valset): a single trace bigger
+    than `max_steps` still passes through alone when it is the very first candidate, so GEPA is
+    never starved of a valset entirely. Pass False for a caller where an EMPTY result has an
+    acceptable fallback and the cost ceiling matters more than always returning something (e.g.
+    the acceptance re-check's disjoint sample in `wmo.engine.build.build`: if the leftover
+    validation traces happen to start with one unusually long trace, letting it through alone
+    would blow the re-check's cost past what the selection valset itself pays - `optimize()`
+    already falls back gracefully to the selection valset on an empty `recheck`, so returning
+    `[]` here is strictly safer than an oversized pass).
     """
     capped: list[Trace] = []
     steps = 0
     for trace in traces:
-        if capped and steps + len(trace.steps) > max_steps:
+        if (capped or not allow_oversized_first) and steps + len(trace.steps) > max_steps:
             break
         capped.append(trace)
         steps += len(trace.steps)

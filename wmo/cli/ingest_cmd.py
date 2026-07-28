@@ -18,6 +18,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, TextColumn
 
 from wmo.ingest import VendorPull, list_adapters
@@ -52,7 +53,9 @@ def _render_rich(stream: Iterator[IngestEvent]) -> bool:
         task_id = None
         for event in stream:
             if isinstance(event, DetectedEvent):
-                _console.print(f"detected [bold]{event.format}[/bold] · {event.traces} traces")
+                _console.print(
+                    f"detected [bold]{escape(event.format)}[/bold] · {event.traces} traces"
+                )
                 task_id = progress.add_task("normalizing", total=event.traces)
             elif isinstance(event, ProgressEvent) and task_id is not None:
                 progress.update(task_id, completed=event.normalized)
@@ -63,16 +66,18 @@ def _render_rich(stream: Iterator[IngestEvent]) -> bool:
                 progress.stop()
                 _console.print(
                     f"[green]done[/green] · {event.traces} traces / {event.steps} steps "
-                    f"→ [bold]{event.otel_object}[/bold]"
+                    f"→ [bold]{escape(event.otel_object)}[/bold]"
                 )
                 _console.print(
                     f"build from it: wmo build --name <name> --source otel-genai "
-                    f"--file {event.otel_object}"
+                    f"--file {escape(event.otel_object)}"
                 )
             elif isinstance(event, ErrorEvent):
                 progress.stop()
-                code = f" [{event.code}]" if event.code else ""
-                _console.print(f"[red]error{code}[/red] {event.message}")
+                # `\[` keeps rich from reading the code (and any bracket in the message, which
+                # comes from an adapter/driver exception or a user path) as a style tag.
+                code = f" \\[{escape(event.code)}]" if event.code else ""
+                _console.print(f"[red]error{code}[/red] {escape(event.message)}")
     return ok
 
 

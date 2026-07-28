@@ -122,6 +122,26 @@ def test_resolve_model_dirs_rejects_name_collision(tmp_path: Path) -> None:
         resolve_model_dirs([str(tmp_path / "a"), str(tmp_path / "b")], None)
 
 
+def test_resolve_model_dirs_unknown_name_lists_what_is_built_and_names_wmo_list(
+    tmp_path: Path,
+) -> None:
+    """The typo case must show the models that DO exist (they are filtered out of `resolved`,
+    so the enumeration cannot come from there) and name the command that shows them."""
+    _fake_artifact(tmp_path / "a", "airline")
+    with pytest.raises(FileNotFoundError) as excinfo:
+        resolve_model_dirs([str(tmp_path / "a")], ["nope"])
+    message = str(excinfo.value)
+    assert "have: airline" in message
+    assert "`wmo list`" in message
+
+
+def test_resolve_model_dirs_unknown_name_with_nothing_built_names_wmo_build(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FileNotFoundError, match=r"wmo build --name <name>"):
+        resolve_model_dirs([str(tmp_path / "a")], ["nope"])
+
+
 def test_resolve_model_dirs_ignores_collision_outside_requested_names(tmp_path: Path) -> None:
     _fake_artifact(tmp_path / "a", "dup")
     _fake_artifact(tmp_path / "b", "dup")

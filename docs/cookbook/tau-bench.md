@@ -60,9 +60,10 @@ a wrong key surfaces there rather than inside a paid sweep. Step 3's preflight t
 every candidate's backend as far as it can without making a request, before it asks you to confirm
 any spend.
 
-(`wmo providers verify` is worth knowing about from step 1 onward: it reads the providers a
-**built** world model recorded and pings them on both the completion and the embedding path. On a
-fresh project it has nothing to read, so run it after a build, not before one.)
+(`wmo providers verify` is worth running from step 0 onward: it pings the `[models.<role>]` roles
+in `.wmo/settings.toml` as well as the providers a **built** world model recorded. On a fresh
+project it still checks the roles and skips the embedding half with a note, so it is the cheapest
+credential preflight there is — run it before a build, not only after one.)
 
 ## Step 1: build the world model
 
@@ -83,10 +84,10 @@ same command with `--source <name>`, or through `wmo ingest` first.
 
 The two flags above are the free configuration: `--fidelity low` takes the estimated-best config
 with no search, and `--embed-provider hashing` indexes with an offline embedder. That is what
-produced the transcript below, at a measured `$0.0000`. The default is `--fidelity medium`, which
-adds light prompt optimization and a cheap-lever search and does cost money; `high` and `max`
-search harder. Every searching tier is floored at low's estimate, so more effort never ships a
-worse config than low.
+produced the transcript below, at a measured `$0.0000`. `low` is also the default, so a plain
+`wmo build` does not spend on search. Opt into `--fidelity medium` for light prompt optimization
+and a cheap-lever search, or `high`/`max` to search harder; those tiers cost real money. Every
+searching tier is floored at low's estimate, so more effort never ships a worse config than low.
 
 ```
 ✓ ingested 1033 traces → normalized 5289 steps
@@ -143,8 +144,12 @@ Look at the thing before optimizing it:
 
 ```bash
 uv run wmo play --name tau-bench      # step in yourself
-uv run wmo demo --name tau-bench      # replay a recorded scenario, open loop
+uv run wmo demo --name tau-bench \
+  --traces packages/environment-capture/tau-bench/traces.otel.jsonl   # replay one, open loop
 ```
+
+`wmo demo` needs the corpus because a build keeps no copy of the traces it read, only the prompts,
+the metrics and the retrieval index. Pass the same file step 1's `wmo build --file` was given.
 
 ## Step 2: register the routing candidates
 
@@ -257,9 +262,10 @@ episode, and written no artifact, not even resume state. It is the honest way to
 would cost, in a script or at a terminal, and it prints the table even when `--max-usd` would have
 refused the real run.
 
-**`--yes` consents.** Consent has to be said, never inferred from the absence of a terminal: a
-non-interactive session (a pipe, a CI job) that would buy a sweep and was not told `--yes` exits 2
-with `cannot ask for spend consent`, naming both honest ways forward. Nothing is bought. A run
+**`--yes` consents.** Consent has to be said, never inferred from the absence of someone to ask: a
+non-interactive session (a pipe, a CI job, or a redirected stdin, which is not a person even when
+stdout is a terminal) that would buy a sweep and was not told `--yes` exits 2 with `cannot ask for
+spend consent`, naming both honest ways forward. Nothing is bought. A run
 with no sweep left to buy needs no consent at all, so a resume down to fit, tune, and report
 proceeds unattended.
 
@@ -402,10 +408,10 @@ uv run wmo optimize route report matrix.json .wmo/models/tau-bench/policy.json \
   --baseline claude-opus-4-8 --endpoint tau-bench --out report.json
 ```
 
-One difference worth knowing before scripting these: `route sweep` does **not** share the staged
-command's consent refusal. On a non-interactive session it prints that it is proceeding without
-confirmation and buys the sweep. So pass `--yes` there because you mean it, and treat an unattended
-`route sweep` as spending by default; `--dry-run` is the staged command's flag, not this one's.
+One thing worth knowing before scripting these: `route sweep` shares the staged command's consent
+refusal. Consent is said, never inferred, so on a non-interactive session (CI, cron, piped output,
+`| tee`, a redirected stdin) it prints what it would have spent and exits 2 instead of buying the
+sweep. Pass `--yes` there because you mean it. `--dry-run` is the staged command's flag, not this one's.
 
 Reach for these when you want a knob the staged command does not expose: `--kind rank` for
 Avengers cluster ranks instead of kNN evidence, `--z` for a stricter or looser confidence bar,

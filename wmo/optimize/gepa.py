@@ -687,6 +687,12 @@ class GEPAOptimizer:
         held_out = float(result.val_aggregate_scores[result.best_idx])
         reverted = False
         recheck_rollouts = 0
+        # Populated only when the acceptance re-check below actually runs (`best != base_prompt`);
+        # stay `None` otherwise so `OptimizeMetrics.base_fresh`/`best_fresh` distinguish "no fresh
+        # comparison happened" from a real measured tie (see `OptimizeMetrics` docstring).
+        base_fresh: float | None = None
+        best_fresh: float | None = None
+        disjoint: bool | None = None
         if best != base_prompt:
             # Stagnant-or-improve acceptance re-check. GEPA promotes by argmax over SINGLE-sample
             # valset evaluations, and rollout+judge scores are noisy run-to-run even at T=0 (the
@@ -700,10 +706,13 @@ class GEPAOptimizer:
             # instead, which also catches winners whose valset win is real but biased (e.g. a
             # step-capped valset over-representing short traces). Always falls back to the FULL
             # valset - never the hard-filtered selection subset - and to the full valset again if
-            # the recheck traces carry no steps (0.0-vs-0.0 would silently keep any winner).
-            recheck_steps = _eval_steps(recheck, demos) if recheck else full_valset
-            if not recheck_steps:
-                recheck_steps = full_valset
+            # the recheck traces carry no steps (0.0-vs-0.0 would silently keep any winner). This
+            # fallback tests selection, not generalization, so `disjoint` records which one
+            # actually happened - a reader auditing `metrics.json` must not mistake a
+            # selection-sample fallback for a held-out measurement.
+            disjoint_steps = _eval_steps(recheck, demos) if recheck else []
+            disjoint = bool(disjoint_steps)
+            recheck_steps = disjoint_steps if disjoint else full_valset
             base_fresh = _mean_valset_score(adapter, recheck_steps, base_prompt)
             best_fresh = _mean_valset_score(adapter, recheck_steps, best)
             recheck_rollouts = 2 * len(recheck_steps)
@@ -717,6 +726,9 @@ class GEPAOptimizer:
                 frontier = [base_prompt] + [p for p in frontier if p != base_prompt]
             else:
                 held_out = best_fresh
+        fresh_delta = (
+            best_fresh - base_fresh if base_fresh is not None and best_fresh is not None else None
+        )
         return OptimizeResult(
             prompt=best,
             frontier=frontier,
@@ -726,6 +738,10 @@ class GEPAOptimizer:
                 held_out_accuracy=held_out,
                 rollouts_used=int(result.total_metric_calls or 0) + recheck_rollouts,
                 reverted_to_base=reverted,
+                base_fresh=base_fresh,
+                best_fresh=best_fresh,
+                fresh_delta=fresh_delta,
+                fresh_recheck_disjoint=disjoint,
             ),
         )
 

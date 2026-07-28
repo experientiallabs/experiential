@@ -8,7 +8,13 @@ import pytest
 
 from wmo.config import ArtifactPaths, HarnessConfig
 from wmo.core.types import Action, ActionKind, Observation, Step, Trace
-from wmo.engine.build import build, split_holdout, split_traces, split_traces_3way
+from wmo.engine.build import (
+    EmptyCorpusError,
+    build,
+    split_holdout,
+    split_traces,
+    split_traces_3way,
+)
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 from wmo.retrieval import HashingEmbedder
 
@@ -150,6 +156,28 @@ def test_cap_gepa_valset_bounds_steps_and_keeps_at_least_one_trace() -> None:
     # A single over-cap trace still passes through: never starve GEPA of a valset entirely.
     huge = trace_with_steps("huge", _GEPA_VAL_STEP_CAP + 10)
     assert _cap_gepa_valset([huge]) == [huge]
+
+
+def test_cap_gepa_valset_can_refuse_an_oversized_first_trace() -> None:
+    """`allow_oversized_first=False` (used for the acceptance re-check's disjoint sample, which
+    has a safe empty-result fallback) must return `[]` rather than let one oversized trace
+    through - letting it through would make that one re-check pass cost far more than the
+    selection valset it is supposed to match, for no benefit over falling back."""
+    from wmo.engine.build import _GEPA_VAL_STEP_CAP, _cap_gepa_valset
+
+    def trace_with_steps(tid: str, n: int) -> Trace:
+        step = Step(
+            action=Action(kind=ActionKind.TOOL_CALL, name="get", arguments={}),
+            observation=Observation(content="ok"),
+        )
+        return Trace(trace_id=tid, steps=[step.model_copy() for _ in range(n)])
+
+    huge = trace_with_steps("huge", _GEPA_VAL_STEP_CAP + 10)
+    small = trace_with_steps("small", 2)
+    assert _cap_gepa_valset([huge, small], allow_oversized_first=False) == []
+    # A normal-sized leading trace is unaffected: the strict mode only refuses an OVERSIZED
+    # first trace, it does not change behavior when nothing would overflow.
+    assert _cap_gepa_valset([small, small], allow_oversized_first=False) == [small, small]
 
 
 def _multi_trace_file(tmp_path, n: int) -> str:  # noqa: ANN001 - pytest fixture
@@ -591,3 +619,194 @@ def test_build_default_runs_no_search(tmp_path) -> None:  # noqa: ANN001
         embedder=HashingEmbedder(dim=64),
     )
     assert not (root / "auto_fidelity.json").exists()  # default stays plain RAG, no search
+
+
+def test_build_low_tier_records_no_gepa_sentinel_not_zero(tmp_path) -> None:  # noqa: ANN001
+    """`--fidelity low` (gepa_budget<=0) never runs the acceptance re-check, so `metrics.json`
+    must record base_fresh/best_fresh/fresh_delta as `null`, never a `0.0` a reader could mistake
+    for "GEPA ran and measured a tie". Without `OptimizeMetrics` carrying these fields at all,
+    this key lookup fails outright."""
+    root = tmp_path / ".wmo"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,  # the low fidelity tier: RAG only, GEPA never runs
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=_tiny_trace_file(tmp_path),
+        root=str(root),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    metrics = json.loads(ArtifactPaths(root).metrics.read_text(encoding="utf-8"))
+    assert metrics["base_fresh"] is None
+    assert metrics["best_fresh"] is None
+    assert metrics["fresh_delta"] is None
+    assert metrics["fresh_recheck_disjoint"] is None
+
+
+def test_build_gepa_recheck_is_disjoint_from_the_selection_valset(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The build must not re-check GEPA's winner on the same steps it was selected on: that
+    would test selection, not generalization, and is exactly why `held_out_accuracy` could not
+    answer whether GEPA helps. Regression for `optimize()` being called without `recheck=` at
+    all, which silently fell back to the selection valset itself."""
+    import sys
+
+    from wmo.optimize import OptimizeResult
+
+    build_mod = sys.modules["wmo.engine.build"]
+    # Plenty of one-step traces so the val split comfortably exceeds the GEPA valset step cap
+    # (16 by default), leaving a real disjoint remainder to recheck against.
+    traces_file = _multi_trace_file(tmp_path, 150)
+
+    captured: dict[str, list[Trace] | None] = {}
+
+    class _RecordingOptimizer:
+        def __init__(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def optimize(  # noqa: ANN202
+            self,
+            train,  # noqa: ANN001
+            test,  # noqa: ANN001
+            base_prompt,  # noqa: ANN001
+            budget,  # noqa: ANN001
+            *,
+            recheck=None,  # noqa: ANN001
+            **kwargs,  # noqa: ANN003
+        ):
+            captured["gepa_val"] = test
+            captured["recheck"] = recheck
+            return OptimizeResult(prompt=base_prompt, frontier=[base_prompt])
+
+    monkeypatch.setattr(build_mod, "GEPAOptimizer", _RecordingOptimizer)
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=2,
+        train_split=0.5,
+    )
+    build(
+        config,
+        file=traces_file,
+        root=str(tmp_path / ".wmo"),
+        serve_provider=FakeProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+
+    gepa_val = captured["gepa_val"]
+    recheck = captured["recheck"]
+    assert gepa_val  # the selection valset itself was non-empty
+    assert recheck  # a real disjoint sample was found, not an empty no-op fallback
+    gepa_val_ids = {t.trace_id for t in gepa_val}
+    recheck_ids = {t.trace_id for t in recheck}
+    assert not (gepa_val_ids & recheck_ids)
+
+
+def test_build_records_disjoint_false_when_recheck_falls_back_to_selection(tmp_path) -> None:  # noqa: ANN001
+    """When the validation split is too small to leave anything past the GEPA selection cap,
+    `recheck` comes back empty and the acceptance re-check falls back to re-scoring the
+    selection valset itself (pre-existing behavior). That fallback is NOT a held-out
+    measurement: `metrics.json` must say so via `fresh_recheck_disjoint: false`, not persist
+    `base_fresh`/`best_fresh` in the same shape as a genuinely disjoint comparison (Greptile
+    flagged this: a selection-biased delta would be indistinguishable from generalization
+    evidence in artifact audits)."""
+    MARKER = "Environment-specific notes"
+
+    class _PromptSensitiveBuildProvider(FakeProvider):
+        """Predicts (and is judged) differently depending on which candidate is serving, so the
+        real (unmocked) `gepa` engine has an actual signal to prefer the evolved candidate."""
+
+        def complete(self, system, messages, *, temperature=0.7, max_tokens=8192):  # noqa: ANN001, ANN202
+            self.systems.append(system)
+            if "improve the system prompt" in system:
+                return Completion(text=f"BASE ENV PROMPT\n\n{MARKER}:\n- always succeed")
+            if "grade a world model" in system:
+                good = '"predicted-good"' in "".join(m.content for m in messages)
+                score = 0.9 if good else 0.2
+                return Completion(
+                    text=(
+                        f'{{"format": {score}, "factuality": {score}, "consistency": {score}, '
+                        f'"realism": {score}, "quality": {score}, "critique": "ok"}}'
+                    )
+                )
+            if MARKER in system:
+                return Completion(text='{"output": "predicted-good", "is_error": false}')
+            return Completion(text='{"output": "predicted-bad", "is_error": false}')
+
+    root = tmp_path / ".wmo"
+    config = HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=3,
+        train_split=0.5,
+    )
+    # Few one-step traces: however the hash split lands, the validation split's total steps
+    # cannot exceed the default 16-step selection cap, so `gepa_val` consumes all of it and
+    # `recheck` is guaranteed empty - the exact corner case under test.
+    build(
+        config,
+        file=_multi_trace_file(tmp_path, 6),
+        root=str(root),
+        serve_provider=_PromptSensitiveBuildProvider(),
+        embedder=HashingEmbedder(dim=64),
+    )
+    metrics = json.loads(ArtifactPaths(root).metrics.read_text(encoding="utf-8"))
+    # The search found and kept a real winner over base (base_fresh/best_fresh are populated,
+    # not the "GEPA never ran"/"nothing to re-check" None), but on the selection sample - the
+    # artifact must label it as such.
+    assert metrics["base_fresh"] is not None
+    assert metrics["best_fresh"] is not None
+    assert metrics["fresh_recheck_disjoint"] is False
+
+
+def _low_tier_config() -> HarnessConfig:
+    return HarnessConfig(
+        providers=[ProviderConfig(kind=ProviderKind.BEDROCK, model="m")],
+        serve_provider=ProviderKind.BEDROCK,
+        embed_dim=64,
+        gepa_budget=0,
+        train_split=0.5,
+    )
+
+
+def test_build_limit_caps_a_file_corpus(tmp_path) -> None:  # noqa: ANN001
+    # `limit` is cost control for a first build over a large export, so it must cap a FILE
+    # ingest and not only a vendor pull (the same contract as `wmo ingest --limit`).
+    seen: dict[str, int] = {}
+
+    class _CountingEmbedder(HashingEmbedder):
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            seen["steps"] = seen.get("steps", 0) + len(texts)
+            return super().embed(texts)
+
+    build(
+        _low_tier_config(),
+        file=_multi_trace_file(tmp_path, 6),
+        root=str(tmp_path / ".wmo"),
+        serve_provider=FakeProvider(),
+        embedder=_CountingEmbedder(dim=64),
+        limit=2,
+    )
+    assert seen["steps"] == 2  # one step per trace, capped at 2 of 6
+
+
+def test_build_empty_corpus_raises_the_typed_error(tmp_path) -> None:  # noqa: ANN001
+    # `EmptyCorpusError` is the seam the CLI catches to turn "your --source does not match this
+    # export" into a usage error; it stays a ValueError for existing library callers.
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("", encoding="utf-8")
+    with pytest.raises(EmptyCorpusError) as excinfo:
+        build(
+            _low_tier_config(),
+            file=str(empty),
+            root=str(tmp_path / ".wmo"),
+            serve_provider=FakeProvider(),
+            embedder=HashingEmbedder(dim=64),
+        )
+    assert isinstance(excinfo.value, ValueError)

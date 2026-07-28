@@ -126,9 +126,11 @@ def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) ->
         for name in names:
             validate_name(name)  # friendly ValueError on an unsafe name, before any disk lookup
     wanted = set(names) if names is not None else None
+    built: set[str] = set()  # every name on disk, so a typo can be told what IS there
     for root in artifact_dirs:
         store = WorldModelStore(root)
         for name in store.list_names():
+            built.add(name)
             if wanted is not None and name not in wanted:
                 continue  # only names we'll actually serve can collide
             if name in resolved:
@@ -141,10 +143,11 @@ def resolve_model_dirs(artifact_dirs: Sequence[str], names: list[str] | None) ->
     if names is not None:
         missing = [name for name in names if name not in resolved]
         if missing:
-            available = ", ".join(sorted(resolved)) or "(none)"
+            available = ", ".join(sorted(built)) or "(none)"
+            remedy = "`wmo list` shows what is built" if built else "run `wmo build --name <name>`"
             raise FileNotFoundError(
                 f"no world model named {', '.join(missing)} under "
-                f"{', '.join(map(str, artifact_dirs))}; have: {available}"
+                f"{', '.join(map(str, artifact_dirs))}; have: {available}; {remedy}"
             )
         resolved = {name: resolved[name] for name in names}
     if not resolved:

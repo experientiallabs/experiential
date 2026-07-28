@@ -13,6 +13,7 @@ from wmo.cli.model_roles import (
     OptInModelRole,
     _model_config,
     configured_role_configs,
+    load_settings_or_abort,
     resolve_opt_in_model_provider,
 )
 from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
@@ -232,6 +233,24 @@ def test_model_role_names_covers_every_settings_role() -> None:
 
 def test_configured_role_configs_is_empty_for_a_project_with_no_settings(tmp_path: Path) -> None:
     assert configured_role_configs(str(tmp_path / ".wmo")) == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ['[models.worker\nprovider = "openai"\n', '[models]\nworker = "openai"\n'],
+    ids=["malformed-toml", "schema-invalid"],
+)
+def test_a_settings_file_this_cli_cannot_read_is_a_usage_error(
+    tmp_path: Path, payload: str
+) -> None:
+    # Every CLI read of settings.toml goes through this one loader, so a broken file has to come
+    # back as the same clean usage error an unknown provider inside the file already does.
+    root = tmp_path / ".wmo"
+    root.mkdir()
+    (root / "settings.toml").write_text(payload, encoding="utf-8")
+    for read in (load_settings_or_abort, configured_role_configs):
+        with pytest.raises(typer.BadParameter, match="settings.toml"):
+            read(str(root))
 
 
 def test_configured_role_configs_reports_only_roles_the_file_sets(tmp_path: Path) -> None:

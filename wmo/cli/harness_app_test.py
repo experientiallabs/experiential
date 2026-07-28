@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.cli import app
@@ -104,9 +105,103 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
             "2",
             "--root",
             str(tmp_path / ".wmo"),
+            # Consent is explicit on every spend surface: a non-TTY search without --yes
+            # refuses (exit 2), and CliRunner is never a TTY. Consent semantics have their own
+            # test below; every other world-model test consents up front.
+            "--yes",
             *extra,
         ],
     )
+
+
+def test_world_model_search_non_interactive_without_yes_refuses_to_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: the search refuses before `create_harness` is ever called.
+
+    The harbor mode of this same command grew the refusal first; this branch kept inferring
+    consent from `interactive`, so a piped or CI run started a paid propose-and-gate search
+    with no prompt and no notice.
+    """
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--iterations",
+            "2",
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+
+    flat = " ".join(result.output.split())  # rich wraps to the console width
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in flat
+    # The refusal quotes the size of what it declined to authorize and the flag that authorizes
+    # it, so a scripted caller can act on the message alone.
+    assert "up to ~9 rollout(s) + 2 proposal(s)" in flat
+    assert "--yes" in flat
+    assert recorder.calls == []  # no paid search started
+
+
+def test_world_model_search_at_a_terminal_with_redirected_stdin_refuses_to_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal stdout with a redirected stdin is not an interactive session either.
+
+    Same refusal as the fully non-interactive case: the console reports on stdout while the
+    prompt reads stdin, so keying the gate on the console alone let `wmo optimize harness ... <
+    /dev/null` at a terminal have its money question answered by the redirect.
+    """
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    monkeypatch.setattr(harness_app_module, "_console", Console(width=240, force_terminal=True))
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--iterations",
+            "2",
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+        input="y\n",  # what a heredoc or a `yes |` would supply
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in " ".join(result.output.split())
+    assert recorder.calls == []  # the piped "y" started nothing
+
+
+def test_the_wizard_needs_a_terminal_stdin_and_says_so_instead_of_raising_eoferror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wizard reads stdin, so a terminal stdout alone must not open it.
+
+    Opening it anyway meant the first `Prompt.ask` hit an exhausted stdin and the command died
+    with an `EOFError` traceback rather than the usage error that names the missing option.
+    """
+    monkeypatch.setattr(harness_app_module, "_console", Console(width=240, force_terminal=True))
+
+    result = runner.invoke(app, ["optimize", "harness", "made", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2, result.output
+    assert not isinstance(result.exception, EOFError)
+    assert "provide --tasks" in " ".join(result.output.replace("│", " ").split())
 
 
 def _patch_load(
@@ -246,6 +341,7 @@ def test_optimize_accepts_world_model_as_second_argument(
             "1",
             "--root",
             str(tmp_path / ".wmo"),
+            "--yes",
         ],
     )
 
@@ -920,6 +1016,92 @@ def test_harbor_scorer_receives_the_local_backend_episode_timeout(
     assert scorer.kwargs["episode_timeout_s"] == pytest.approx(1800.0)
 
 
+# -- what --help promises ----------------------------------------------------------------------
+
+
+def _help_text() -> str:
+    return " ".join(
+        runner.invoke(app, ["optimize", "harness", "--help"]).output.replace("│", " ").split()
+    )
+
+
+def test_backend_help_does_not_deny_that_harbor_moves_the_environment() -> None:
+    """On the harbor path --backend picks the TASK environment (docker vs E2B), and there is
+    no world model at all, so the option table must not claim otherwise: the same --help says
+    the opposite three paragraphs above."""
+    help_text = _help_text()
+    assert "The environment is always the world model." not in help_text
+    assert "the environment stays the world model" in help_text
+    assert "docker tasks" in help_text and "E2B tasks" in help_text
+
+
+def test_iterations_help_states_both_environment_defaults() -> None:
+    """Each iteration is a paid propose-and-gate step, and the fallback is not the same on both
+    paths, so --help states both numbers (Click can render no static default: the None sentinel
+    is what --resume's conflict check reads)."""
+    assert "Default: 5 for a world-model environment, 10 for harbor." in _help_text()
+
+
+def test_a_world_model_search_without_iterations_buys_the_documented_five(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--root",
+            str(tmp_path / ".wmo"),
+            # What the default buys is the question here, not consent: CliRunner is never a
+            # TTY, so without this the search refuses (exit 2) before it picks an iteration
+            # count. Same reason `_invoke` passes it.
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    [call] = recorder.calls
+    assert call["iterations"] == 5
+    assert "5 iteration(s)" in " ".join(result.output.split())
+
+
+def test_a_harbor_search_without_iterations_buys_the_documented_ten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _harbor_project(tmp_path, monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "pi",
+            "harbor",
+            "--harbor-config",
+            str(tmp_path / "job.yaml"),
+            "--task-ids",
+            str(tmp_path / "tasks.json"),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--root",
+            str(tmp_path / ".wmo"),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = captured["config"]
+    assert isinstance(config, _HarborRunConfig)
+    assert config.iterations == 10
+
+
 # -- the retired distill mode ------------------------------------------------------------------
 
 
@@ -984,3 +1166,121 @@ def test_model_identity_pins_model_type_and_endpoint() -> None:
     identity = _model_identity(config)
     assert identity["model_type"] == "Qwen/Qwen3-8B"
     assert identity["endpoint"] == "https://serve.example/v1"
+
+
+# -- `wmo harness init` / `wmo harness show`: unusable roots and errors that name a next step ---
+
+
+def _flat(output: str) -> str:
+    """Rich wraps error panels; flatten box drawing and newlines before matching a message."""
+    return " ".join(output.replace("│", " ").split())
+
+
+def test_harness_init_rejects_an_unusable_root_with_a_usage_error(tmp_path: Path) -> None:
+    """A --root that is a file (or otherwise unwritable) is a usage error naming --root, not a
+    NotADirectoryError traceback out of `mkdir(parents=True)`."""
+    not_a_dir = tmp_path / "root.txt"
+    not_a_dir.write_text("x", encoding="utf-8")
+
+    result = runner.invoke(app, ["harness", "init", "demo", "--root", str(not_a_dir)])
+
+    assert result.exit_code == 2, result.output  # usage error, not a traceback
+    output = _flat(result.output)
+    assert "cannot write the harness store" in output
+    assert "--root" in output
+
+
+def test_harness_init_twice_names_commands_that_exist(tmp_path: Path) -> None:
+    """`set_alias` is a HarnessStore method, not a CLI command; the error must not send a user
+    looking for it."""
+    root = str(tmp_path / ".wmo")
+    first = runner.invoke(app, ["harness", "init", "--root", root])
+    assert first.exit_code == 0, first.output
+
+    result = runner.invoke(app, ["harness", "init", "--root", root])
+
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "already exists" in output
+    assert "wmo optimize harness baseline" in output
+    assert "set_alias" not in output
+
+
+def test_harness_init_bad_name_names_the_object_it_creates(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["harness", "init", "bad/name", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "invalid harness name 'bad/name'" in output
+    assert "world model" not in output
+
+
+def test_harness_show_missing_harness_names_init(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["harness", "show", "baseline", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2, result.output
+    output = _flat(result.output)
+    assert "no harness named 'baseline'" in output
+    assert "wmo harness init baseline" in output
+
+
+@pytest.mark.parametrize("ref", ["baseline@v9", "baseline@prod"])
+def test_harness_show_unknown_ref_names_list(tmp_path: Path, ref: str) -> None:
+    root = str(tmp_path / ".wmo")
+    assert runner.invoke(app, ["harness", "init", "--root", root]).exit_code == 0
+
+    result = runner.invoke(app, ["harness", "show", ref, "--root", root])
+
+    assert result.exit_code == 2, result.output
+    assert "wmo harness list" in _flat(result.output)
+
+
+# --- rich markup: brackets in surface bodies and progress lines are content, not style tags ---
+
+
+def test_harness_list_keeps_the_bracketed_half_of_a_broken_dir_reason(tmp_path: Path) -> None:
+    """Pydantic puts its diagnosis in `[type=..., input_value=...]`, which rich ate whole."""
+    version_dir = tmp_path / ".wmo" / "harnesses" / "x" / "v1"
+    version_dir.mkdir(parents=True)
+    (version_dir / "doc.json").write_text("not json", encoding="utf-8")
+
+    result = runner.invoke(app, ["harness", "list", "--root", str(tmp_path / ".wmo")])
+    assert result.exit_code == 0, result.exception
+    assert "[type=json_invalid" in " ".join(result.output.split())
+
+
+def test_harness_show_prints_bracketed_surface_content_verbatim(tmp_path: Path) -> None:
+    """Surface bodies are prompts and code: rich must print their brackets, not parse them.
+
+    Unescaped, an unmatched `[/tool]` raised MarkupError and `list[str]` lost its type argument.
+    """
+    from wmo.harness.doc import Surface, SurfaceKind
+
+    body = "Close every block with [/tool].\nReturn list[str] from `plan`."
+    doc = HarnessDoc(
+        name="pi", surfaces=[Surface(id="prompt:core", kind=SurfaceKind.PROMPT, content=body)]
+    )
+    HarnessStore(str(tmp_path / ".wmo")).save_version(doc)
+
+    result = runner.invoke(app, ["harness", "show", "pi", "--root", str(tmp_path / ".wmo")])
+    assert result.exit_code == 0, result.exception
+    assert "[/tool]" in result.output
+    assert "list[str]" in result.output
+
+
+def test_harbor_progress_lines_show_which_slot_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`[seed]` / `[slot 1]` is the only thing identifying a progress line's candidate.
+
+    Rich reads a lowercase bracketed word as a style tag, so unescaped these rendered as an
+    empty string and every line started with a bare candidate id.
+    """
+    _harbor_project(tmp_path, monkeypatch)
+
+    result = _invoke_harbor(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    flat = " ".join(result.output.split())
+    assert "[seed] candidate-0000" in flat
+    assert "[slot 1] candidate-0001" in flat

@@ -81,8 +81,11 @@ logger = logging.getLogger(__name__)
 TINKER_API_KEY_ENV = "TINKER_API_KEY"
 
 _MISSING_TINKER_EXTRA = (
-    "the tinker SDK is not installed; run `uv sync --extra distill` to use the tinker provider"
+    "the tinker SDK is not installed; run `uv sync --extra distill` (or "
+    "`pip install 'world-model-optimizer[distill]'`) to use the tinker provider"
 )
+"""Both install forms, because `pip install world-model-optimizer` is the documented entry point
+and `uv sync` needs a checkout of this repo to have anything to sync."""
 
 # The tinker SamplingParams default; used when a structured request carries no
 # temperature (pi normally stamps one on every request).

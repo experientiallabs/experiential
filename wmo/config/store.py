@@ -19,13 +19,12 @@ from __future__ import annotations
 
 import json
 import re
-import tomllib
 from pathlib import Path
 
 from pydantic import BaseModel, JsonValue
 
 from wmo.config.card import ModelCard, load_card
-from wmo.config.config import ARTIFACT_DIR, ArtifactPaths, HarnessConfig
+from wmo.config.config import ARTIFACT_DIR, ArtifactPaths, load_config
 from wmo.providers.models import resolve_provider_model
 
 # The implicit model name used when the user does not pass `--name`.
@@ -35,11 +34,16 @@ DEFAULT_MODEL_NAME = "default"
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
-def validate_name(name: str) -> str:
-    """Return `name` if it is a safe single path segment, else raise a friendly ValueError."""
+def validate_name(name: str, *, kind: str = "world model") -> str:
+    """Return `name` if it is a safe single path segment, else raise a friendly ValueError.
+
+    `kind` names the object being named, because this validator guards several stores and the
+    error is read by a user who typed one command: a bad `wmo harness init` name must say
+    "harness", not "world model".
+    """
     if not _NAME_RE.match(name) or name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError(
-            f"invalid world model name {name!r}: use letters, digits, '.', '_', '-' "
+            f"invalid {kind} name {name!r}: use letters, digits, '.', '_', '-' "
             "(must start with a letter or digit, no path separators)"
         )
     return name
@@ -59,6 +63,13 @@ class ModelInfo(BaseModel):
     held_out_accuracy: float | None = None
     rollouts_used: int | None = None
     frontier_size: int | None = None
+    error: str | None = None
+    """Why this artifact could not be read, on a row where the summary fields are unknown."""
+
+    @classmethod
+    def unreadable(cls, name: str, error: str) -> ModelInfo:
+        """A `wmo list` row standing in for an artifact that could not be summarized."""
+        return cls(name=name, serve_provider="-", serve_model="-", error=error)
 
 
 class WorldModelStore:
@@ -135,24 +146,27 @@ class WorldModelStore:
         return load_card(model_dir)
 
     def info(self, name: str) -> ModelInfo:
-        """Read a model's config + metrics into a summary (for `wmo list`)."""
+        """Read a model's config + metrics into a summary (for `wmo list`).
+
+        Raises:
+            FileNotFoundError: No artifact named `name` under this root.
+            ValueError: One of the artifact's files could not be read or parsed. Goes through
+                `load_config` / `_read_json` so the message names the offending file.
+        """
         model_dir = self.dir_for(name)
         if model_dir is None:
             raise FileNotFoundError(f"no world model named {name!r}")
         paths = ArtifactPaths(model_dir)
-        with paths.config.open("rb") as fh:
-            config = HarnessConfig.model_validate(tomllib.load(fh))
+        config = load_config(model_dir)
         accuracy: float | None = None
         rollouts: int | None = None
         if paths.metrics.exists():
-            metrics = json.loads(paths.metrics.read_text(encoding="utf-8"))
+            metrics = _read_json(paths.metrics, dict)
             accuracy = _as_float(metrics.get("held_out_accuracy"))
             rollouts = _as_int(metrics.get("rollouts_used"))
         frontier_size: int | None = None
         if paths.frontier.exists():
-            frontier = json.loads(paths.frontier.read_text(encoding="utf-8"))
-            if isinstance(frontier, list):
-                frontier_size = len(frontier)
+            frontier_size = len(_read_json(paths.frontier, list))
         serve = config.serve_provider_config()
         model_type = serve.model_type or resolve_provider_model(serve.kind, serve.model).model_type
         return ModelInfo(
@@ -165,7 +179,42 @@ class WorldModelStore:
         )
 
     def list_info(self) -> list[ModelInfo]:
-        return [self.info(name) for name in self.list_names()]
+        """One row per built model; an artifact that cannot be read becomes a row, not a raise.
+
+        `wmo list` is how you find out what a project holds, so one hand-edited or half-copied
+        `models/<name>/config.toml` must not hide every healthy model beside it. The failure
+        rides along in `ModelInfo.error` for the caller to render next to the good rows.
+        """
+        infos: list[ModelInfo] = []
+        for name in self.list_names():
+            try:
+                infos.append(self.info(name))
+            except (OSError, ValueError) as exc:
+                infos.append(ModelInfo.unreadable(name, str(exc)))
+        return infos
+
+
+_JSON_SHAPE_NAMES: dict[type, str] = {dict: "object", list: "array"}
+
+
+def _read_json[T: dict | list](path: Path, shape: type[T]) -> T:
+    """Parse `path` as a JSON `shape`, naming it so a bad row can say which file is bad.
+
+    The shape is checked here rather than skipped past at the call site: an artifact whose
+    `metrics.json` holds an array is corrupt, and reading it as "this model has no metrics"
+    would print a row indistinguishable from a healthy model that was never evaluated.
+    """
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        # UnicodeDecodeError is a ValueError, not an OSError, so it needs naming here or a
+        # non-UTF-8 artifact reports a bare codec error with no path and no next step.
+        raise ValueError(f"{path} could not be read ({exc}); re-run `wmo build`") from exc
+    if not isinstance(value, shape):
+        raise ValueError(
+            f"{path} is not a JSON {_JSON_SHAPE_NAMES[shape]}; re-run `wmo build` to regenerate it"
+        )
+    return value
 
 
 def _as_float(value: JsonValue) -> float | None:

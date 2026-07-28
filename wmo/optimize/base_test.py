@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -27,6 +28,23 @@ def test_optimize_result_defaults_are_prompt_only() -> None:
     assert result.prompt == "serve this"
     assert result.artifacts == []
     assert result.metrics == OptimizeMetrics()
+
+
+def test_optimize_metrics_fresh_recheck_fields_default_to_none_not_zero() -> None:
+    # A "no fresh comparison happened" build (GEPA never ran, or its search-time winner was
+    # already base) must be distinguishable from a real measured tie: None, never a 0.0 that a
+    # reader could mistake for "GEPA ran and found no difference".
+    metrics = OptimizeMetrics()
+    assert metrics.base_fresh is None
+    assert metrics.best_fresh is None
+    assert metrics.fresh_delta is None
+    assert metrics.fresh_recheck_disjoint is None
+    # Round-trips through JSON as `null`, not omitted or coerced to 0.0.
+    dumped = json.loads(metrics.model_dump_json())
+    assert dumped["base_fresh"] is None
+    assert dumped["best_fresh"] is None
+    assert dumped["fresh_delta"] is None
+    assert dumped["fresh_recheck_disjoint"] is None
 
 
 def test_artifact_refs_cover_every_optimizer_family() -> None:

@@ -17,6 +17,7 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
@@ -29,6 +30,7 @@ from wmo.optimize.compression import (
     Compressor,
     TruncateCompressor,
     register_compressor,
+    registered_compressor_ids,
     same_compression,
 )
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -121,6 +123,8 @@ def test_route_fit_and_report(tmp_path: Path) -> None:
             "route",
             "fit",
             str(matrix_file),
+            "--kind",
+            "rank",
             "--out",
             str(policy_file),
             "--clusters",
@@ -152,7 +156,8 @@ def test_route_fit_and_report(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     report = json.loads(report_file.read_text())
     assert report["baseline"]["model_id"] == "a"
-    assert report["headline"]["baseline_accuracy"] == 0.5
+    assert set(policy.fit_scenario_ids).isdisjoint(report["scenario_ids"])
+    assert len(policy.fit_scenario_ids) + report["scenario_count"] == 4
     assert report["cost_assumptions"]
 
 
@@ -258,7 +263,8 @@ def test_route_fit_knn_writes_policy_and_sidecar(tmp_path: Path) -> None:
     assert policy.knn_bank_path == "policy.json.bank.npz"
     assert policy.bank_path() == tmp_path / "policy.json.bank.npz"
     assert policy.bank_path().is_file()  # sidecar beside the policy
-    assert len(policy.knn_bank().scenario_ids) == 12
+    assert len(policy.knn_bank().scenario_ids) == 8
+    assert policy.fit_scenario_ids == policy.knn_bank().scenario_ids
     assert "routed away from the fallback" in result.output
     # The prose neighborhoods carry unanimous evidence for b, so that traffic leaves the
     # fallback while the SQL half stays on it.
@@ -375,7 +381,16 @@ def test_route_tune_rejects_a_policy_kind_without_a_dial(tmp_path: Path) -> None
     policy_file = tmp_path / POLICY_FILENAME
     fit = runner.invoke(
         app,
-        ["optimize", "route", "fit", str(_matrix_file(tmp_path)), "--out", str(policy_file)],
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_matrix_file(tmp_path)),
+            "--kind",
+            "rank",
+            "--out",
+            str(policy_file),
+        ],
     )
     assert fit.exit_code == 0, fit.output
     result = runner.invoke(
@@ -559,7 +574,16 @@ def test_route_tune_that_fails_leaves_no_base_snapshot_behind(tmp_path: Path) ->
     policy_file = tmp_path / POLICY_FILENAME
     fit = runner.invoke(
         app,
-        ["optimize", "route", "fit", str(_matrix_file(tmp_path)), "--out", str(policy_file)],
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_matrix_file(tmp_path)),
+            "--kind",
+            "rank",
+            "--out",
+            str(policy_file),
+        ],
     )
     assert fit.exit_code == 0, fit.output
     rejected = runner.invoke(
@@ -1373,6 +1397,8 @@ def test_route_sweep_writes_a_matrix_fit_can_consume(
             "route",
             "fit",
             str(out),
+            "--kind",
+            "rank",
             "--out",
             str(policy_file),
             "--clusters",
@@ -1679,12 +1705,12 @@ def test_route_sweep_hands_off_when_every_candidate_lost_the_same_scenario(
 
 
 def test_route_sweep_declining_the_confirmation_spends_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     monkeypatch.setattr(route_module, "_console", Console(force_terminal=True))
-    monkeypatch.setattr(route_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(False))
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "3")
     assert result.exit_code == 0, result.output
     assert not out.exists()  # nothing written
@@ -1697,12 +1723,12 @@ def test_route_sweep_declining_the_confirmation_spends_nothing(
 
 
 def test_route_sweep_confirming_at_a_tty_runs_the_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     monkeypatch.setattr(route_module, "_console", Console(force_terminal=True))
-    monkeypatch.setattr(route_module, "Confirm", _Answer(True))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(True))
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "1")
     assert result.exit_code == 0, result.output
     assert len(OutcomeMatrix.load(out).outcomes) == 2
@@ -2646,3 +2672,405 @@ def test_route_fit_knn_leaves_the_stamp_null_without_the_flag(tmp_path: Path) ->
     assert result.exit_code == 0, result.output
     policy = RoutingPolicy.load(policy_file)
     assert policy.compression is None and policy.fit_compression is None
+
+
+# ------------------------------------------- input validation at the fit/report boundary
+# `fit` and `report` used to hand user-typed paths straight to the pydantic and pathlib loaders,
+# so a missing file, a swapped pair of positionals, or a matrix nothing scored came out as a
+# Python traceback. Every test below asserts the same two things the rest of this file asserts
+# for every other input: a clean usage error, and no exception escaping.
+
+
+def _no_traceback(result: Result) -> bool:
+    return result.exception is None or isinstance(result.exception, SystemExit)
+
+
+def _unscored_matrix_file(tmp_path: Path) -> Path:
+    """What a sweep writes when every episode errored: rows on disk, not one reward.
+
+    `sweep` still saves this matrix (the cells were paid for and their `error` fields are the
+    diagnosis) and exits 1 saying "fitting will fail", so it is a state a user reaches `fit`
+    from rather than an invented one.
+    """
+    matrix = OutcomeMatrix.load(_matrix_file(tmp_path))
+    path = tmp_path / "unscored.json"
+    OutcomeMatrix(
+        pool=matrix.pool,
+        outcomes=[o.model_copy(update={"reward": None, "success": False}) for o in matrix.outcomes],
+    ).save(path)
+    return path
+
+
+def test_route_fit_names_the_producer_when_the_matrix_is_missing(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(tmp_path / "nope.json"),
+            "--embedder",
+            "hashing",
+            "--out",
+            str(tmp_path / "policy.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "no outcome matrix at")
+    assert _says(result.output, "wmo optimize route sweep")
+
+
+def test_route_fit_rejects_a_matrix_that_is_not_readable(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(bad),
+            "--embedder",
+            "hashing",
+            "--out",
+            str(tmp_path / "policy.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "is not a readable OutcomeMatrix")
+
+
+@pytest.mark.parametrize("kind", ["knn", "rank"])
+def test_route_fit_refuses_a_matrix_with_no_scored_cell(tmp_path: Path, kind: str) -> None:
+    """Both kinds, and both used to traceback.
+
+    The rank fitter's own message ("no scored outcomes; cannot pick a default model") named no
+    remedy at all, so the answer belongs at the boundary where sweep's warning can be echoed.
+    """
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_unscored_matrix_file(tmp_path)),
+            "--kind",
+            kind,
+            "--embedder",
+            "hashing",
+            "--out",
+            str(tmp_path / "policy.json"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "carries a reward")
+    assert _says(result.output, "wmo optimize route sweep")
+    assert not (tmp_path / "policy.json").exists()
+
+
+def test_route_fit_defaults_to_the_knn_champion(tmp_path: Path) -> None:
+    """The default kind has to be the one every other surface steers to.
+
+    `fit --help` calls knn "the validated champion", sweep's handoff prints `--kind knn`, and
+    `tune` only dials a knn policy -- but the flag defaulted to rank, so a user who omitted it
+    silently fitted the non-champion and only found out at `tune`.
+    """
+    policy_file = tmp_path / POLICY_FILENAME
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_knn_matrix_file(tmp_path)),
+            "--fallback",
+            "a",
+            "--rag-num",
+            "3",
+            "--min-pairs",
+            "2",
+            "--out",
+            str(policy_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert RoutingPolicy.load(policy_file).kind == "knn"
+    # And therefore dialable without a refit, which is what the old default was not.
+    tuned = runner.invoke(
+        app, ["optimize", "route", "tune", str(policy_file), "--cost-quality", "0.5"]
+    )
+    assert tuned.exit_code == 0, tuned.output
+
+
+@pytest.mark.parametrize("command", ["fit", "sweep"])
+def test_route_compressor_help_lists_every_shipped_id(command: str) -> None:
+    """Rendered from the registry: `llmlingua2-endpoint` shipped while the help said two ids.
+
+    Asserted against the ids registered at import rather than the live registry, because that is
+    when typer builds a help string (this module itself registers fakes afterwards).
+    """
+    result = runner.invoke(app, ["optimize", "route", command, "--help"])
+    assert result.exit_code == 0, result.output
+    for compressor_id in ("identity", "truncate", "llmlingua2-endpoint"):
+        assert compressor_id in registered_compressor_ids()
+        assert _says(result.output, compressor_id)
+
+
+def _report(matrix_file: Path, policy_file: Path, out: Path, *, baseline: str = "a") -> Result:
+    """`route report`, always with an explicit --out so nothing lands in the working dir."""
+    return runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "report",
+            str(matrix_file),
+            str(policy_file),
+            "--baseline",
+            baseline,
+            "--out",
+            str(out),
+        ],
+    )
+
+
+def test_route_report_names_the_swap_when_the_positionals_are_reversed(tmp_path: Path) -> None:
+    # Two same-typed positionals in a fixed order is a swap waiting to happen, and a pydantic
+    # schema dump ("outcomes / Field required") is not a diagnosis.
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = _fitted_knn_policy(tmp_path)
+
+    swapped = _report(policy_file, matrix_file, tmp_path / "report.json")
+    assert swapped.exit_code != 0
+    assert _no_traceback(swapped)
+    assert _says(swapped.output, "holds a fitted policy, not an outcome matrix")
+    assert _says(swapped.output, "wmo optimize route report <matrix.json> <policy.json>")
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_route_report_rejects_a_policy_that_is_not_readable(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json", encoding="utf-8")
+    result = _report(_knn_matrix_file(tmp_path), bad, tmp_path / "report.json")
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "is not a readable routing policy")
+
+
+def test_route_report_rejects_a_policy_that_is_not_utf8_text(tmp_path: Path) -> None:
+    """`RoutingPolicy.load` decodes before pydantic runs, so this never reached the other clause.
+
+    UnicodeDecodeError is a ValueError but NOT a ValidationError, so undecodable bytes (a
+    truncated download, or the `.npz` evidence bank handed over as the policy) walked straight
+    past the boundary and tracebacked.
+    """
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b'{"kind": "\xff\xfeknn"}')
+    result = _report(_knn_matrix_file(tmp_path), bad, tmp_path / "report.json")
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "cannot read the policy at")
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_route_report_delivers_the_missing_sidecar_message_cleanly(tmp_path: Path) -> None:
+    """The message was already written; it arrived as the last line of a stack trace.
+
+    Copying a knn policy.json without its `.bank.npz` is the exact mistake `knn_bank` anticipates.
+    """
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = _fitted_knn_policy(tmp_path)
+    RoutingPolicy.load(policy_file).bank_path().unlink()
+
+    result = _report(matrix_file, policy_file, tmp_path / "report.json")
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "knn policy bank not found at")
+    assert _says(result.output, "Copy the sidecar next to the policy file")
+
+
+def test_route_report_says_baseline_is_a_pool_handle(tmp_path: Path) -> None:
+    # `--baseline` takes the [[model]] table's `name`, not the model id, and passing an id used
+    # to raise a bare KeyError.
+    result = _report(
+        _knn_matrix_file(tmp_path),
+        _fitted_knn_policy(tmp_path),
+        tmp_path / "report.json",
+        baseline="gpt-4o",
+    )
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "baseline 'gpt-4o' is not in the matrix pool")
+    assert _says(result.output, "pool entry handle")
+
+
+def test_route_report_refuses_a_matrix_with_nothing_scored_on_both_sides(tmp_path: Path) -> None:
+    matrix = OutcomeMatrix.load(_matrix_file(tmp_path))
+    half = tmp_path / "half.json"
+    OutcomeMatrix(
+        pool=matrix.pool,
+        outcomes=[
+            o.model_copy(update={"reward": None, "success": False}) if o.model == "a" else o
+            for o in matrix.outcomes
+        ],
+    ).save(half)
+    policy_file = tmp_path / "static.json"
+    RoutingPolicy(kind="static", default_model="a", pool=matrix.pool, fitted_from="handmade").save(
+        policy_file
+    )
+
+    result = _report(half, policy_file, tmp_path / "report.json", baseline="b")
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, "nothing to compare")
+    assert not (tmp_path / "report.json").exists()
+
+
+def test_route_report_creates_the_out_directory_like_fit_does(tmp_path: Path) -> None:
+    """`fit --out` mkdir -p's its parents; report tracebacked AFTER computing the whole report."""
+    out = tmp_path / "missing" / "sub" / "report.json"
+    result = _report(_knn_matrix_file(tmp_path), _fitted_knn_policy(tmp_path), out)
+    assert result.exit_code == 0, result.output
+    assert json.loads(out.read_text(encoding="utf-8"))["headline"]
+
+
+def test_route_report_notes_the_excluded_fit_split_on_the_fit_matrix(
+    tmp_path: Path,
+) -> None:
+    """Same matrix as the fit: since #308 the report excludes the fit split, so the surface says
+    "held-out with N fit scenarios excluded" rather than contradicting the report's own label.
+    The matrix digest in `fitted_from` is an identity, so a renamed copy has to trip it too.
+    """
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = _fitted_knn_policy(tmp_path)
+
+    result = _report(matrix_file, policy_file, tmp_path / "report.json")
+    assert result.exit_code == 0, result.output
+    assert _says(result.output, "fit scenario(s) were excluded")
+    assert "IN-SAMPLE" not in _flat(result.output)
+
+    renamed = tmp_path / "renamed.json"
+    renamed.write_bytes(matrix_file.read_bytes())
+    moved = _report(renamed, policy_file, tmp_path / "report_renamed.json")
+    assert moved.exit_code == 0, moved.output
+    assert _says(moved.output, "fit scenario(s) were excluded")
+
+    # The provenance marker is appended LAST, so a matrix stored under a content-addressed
+    # directory carries `sha256=` in its path too. Splitting from the left read THAT one and
+    # dropped the caveat on exactly the layout most likely to keep a fit matrix around.
+    addressed = tmp_path / "artifacts" / "sha256=deadbeef" / "matrix.json"
+    addressed.parent.mkdir(parents=True)
+    addressed.write_bytes(matrix_file.read_bytes())
+    content_addressed = _report(addressed, policy_file, tmp_path / "report_addressed.json")
+    assert content_addressed.exit_code == 0, content_addressed.output
+    assert _says(content_addressed.output, "fit scenario(s) were excluded")
+
+
+def test_route_report_stays_quiet_on_a_matrix_the_fit_never_saw(tmp_path: Path) -> None:
+    """The negative control: held-out numbers are what report is for, so no warning."""
+    policy_file = _fitted_knn_policy(tmp_path)
+    held_out = _knn_matrix_file(tmp_path, flip=True, name="held_out.json")
+    result = _report(held_out, policy_file, tmp_path / "report.json")
+    assert result.exit_code == 0, result.output
+    assert "IN-SAMPLE" not in _flat(result.output)
+
+
+def test_route_pin_names_the_positional_when_the_model_is_ambiguous(tmp_path: Path) -> None:
+    # `WorldModelStore.resolve` says "pass --name", which `pin` does not have: its world model is
+    # a positional and its --model is the POOL entry. Following the old advice failed outright.
+    pool_file = tmp_path / "pool.toml"
+    assert _add_student(tmp_path, pool_file).exit_code == 0
+    _built_model(tmp_path, "alpha")
+    _built_model(tmp_path, "beta")
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "--model",
+            "student",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    flat = _flat(result.output)
+    assert "WORLD_MODEL" in flat and "alpha,beta" in flat
+    assert "--name" not in flat
+    assert "wmooptimizeroutepinalpha--modelstudent" in flat  # a command that actually works
+
+    followed = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "alpha",
+            "--model",
+            "student",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert followed.exit_code == 0, followed.output
+
+
+def test_route_pin_names_the_pool_writers_when_the_pool_is_empty(tmp_path: Path) -> None:
+    pool_file = tmp_path / "pool.toml"
+    pool_file.write_text("# nothing yet\n", encoding="utf-8")
+    _built_model(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "support",
+            "--model",
+            "student",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert _no_traceback(result)
+    assert _says(result.output, str(pool_file))
+    assert _says(result.output, "wmo optimize route student")
+    assert "too_short" not in _flat(result.output)  # was a raw pydantic dump
+
+
+def test_route_tune_names_the_fit_when_there_is_no_policy(tmp_path: Path) -> None:
+    # The sibling not-dialable error names `wmo optimize route fit --kind knn`; this branch,
+    # which is the one a first-time user hits (the argument defaults to ./policy.json), did not.
+    result = runner.invoke(
+        app, ["optimize", "route", "tune", str(tmp_path / "nope.json"), "--cost-quality", "0.5"]
+    )
+    assert result.exit_code != 0
+    assert _says(result.output, "no policy file at")
+    assert _says(result.output, "wmo optimize route fit <matrix.json> --kind knn")
+
+
+# ------------------------------------------- rich markup in help text
+
+
+def test_route_student_help_keeps_the_pool_table_name() -> None:
+    """The paragraph exists to name the TOML table `student` writes, so it must survive rich.
+
+    Typer renders help through rich markup, which swallowed the unescaped `[[model]]` and left
+    an empty pair of backticks where the identifier should be.
+    """
+    result = runner.invoke(app, ["optimize", "route", "student", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "[[model]]" in _flat(result.output)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from rich.errors import MarkupError
 from typer.testing import CliRunner
 
 from wmo.cli.app import app
@@ -63,6 +64,28 @@ def test_ingest_error_exits_nonzero(tmp_path: Path) -> None:
     events = [json.loads(line) for line in result.output.strip().splitlines()]
     assert events[-1]["type"] == "error"
     assert events[-1]["code"] == "bad_format"
+
+
+def test_ingest_rich_error_shows_the_code_it_classified(tmp_path: Path) -> None:
+    """The human-readable mode must report the same code `--json` does.
+
+    Unescaped, rich read `[bad_format]` as a style tag and dropped it, so the only classification
+    a non-`--json` user ever sees vanished.
+    """
+    src = tmp_path / "junk.json"
+    src.write_text('{"nothing": true}', encoding="utf-8")
+    result = runner.invoke(app, ["ingest", "--file", str(src)])
+    assert result.exit_code == 1
+    assert "[bad_format]" in result.output
+
+
+def test_ingest_rich_error_survives_markup_in_the_failing_path(tmp_path: Path) -> None:
+    """A bracket in the path (or in an adapter's exception text) must not crash the renderer."""
+    missing = tmp_path / "[/bold]missing.jsonl"
+    result = runner.invoke(app, ["ingest", "--file", str(missing)])
+    assert result.exit_code == 1
+    assert not isinstance(result.exception, MarkupError), result.exception
+    assert "[bad_format]" in result.output
 
 
 def test_ingest_requires_a_transport() -> None:

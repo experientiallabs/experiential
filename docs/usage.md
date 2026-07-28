@@ -20,15 +20,15 @@ Three optimizers, named for the artifact each produces.
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. | `matrix.json` (an `OutcomeMatrix`) |
-| `wmo optimize route fit` | Fit a routing policy on a matrix: `--kind knn` guarded neighbor evidence, or `--kind rank` cluster ranks. | `policy.json` + its evidence bank |
+| `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. A non-interactive run needs `--yes`, or it prints the projected spend and exits 2. | `matrix.json` (an `OutcomeMatrix`) |
+| `wmo optimize route fit` | Fit a routing policy on a matrix: `--kind knn` guarded neighbor evidence (the default), or `--kind rank` cluster ranks. | `policy.json` + its evidence bank |
 | `wmo optimize route tune` | Set a fitted policy's cost/quality dial in place, no refit. | the policy, rewritten; `policy.base.json` snapshot |
 | `wmo optimize route report` | Build the three-objective improvement report for a policy over a matrix. | `report.json` (an `ImprovementReport`) |
 | `wmo optimize route pin` | Serve one pool model as an endpoint, with no matrix and no fit. | a `kind="static"` `policy.json` |
 | `wmo optimize route student` | Add a distilled student to the candidate pool as a priced entry. | a `[[model]]` entry in `pool.toml` |
-| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
+| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. A non-interactive run needs `--yes` in either environment. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
 | `wmo optimize distill probe` | Ask a measured outcome matrix whether this workload has a teacher gap worth distilling at all, and which model is the cheapest sufficient teacher. Free. Exits 0 (distill), 3 (no gap), 4 (too thin to say). | nothing (prints) |
-| `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
+| `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. A non-interactive run needs `--yes`. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
 | `wmo optimize distill report` | Read a finished or aborted run back: gate verdict and held-out before/after table. Free. | nothing (prints) |
 
 `wmo optimize model` is the staged path over the four `route` commands and calls the same library
@@ -39,9 +39,9 @@ functions they do, so you can drop to any stage and the next run resumes around 
 | Command | Purpose | Artifact |
 |---|---|---|
 | `wmo play` | Step into the environment yourself: type actions, get observations back. | nothing (a session) |
-| `wmo demo` | Replay a randomly sampled recorded scenario against the world model, open loop. | nothing (prints) |
+| `wmo demo` | Replay a randomly sampled recorded scenario against the world model, open loop. Needs the corpus (`--traces`) unless the model ships one, since a build keeps no copy of what it read. | nothing (prints) |
 | `wmo eval` | Score reconstruction fidelity (open-loop, teacher-forced) or run a live agent against the model (`--mode closed-loop`), or run a named example-local suite. | results under `.wmo/evals/` |
-| `wmo knowledge` | Print the model's knowledge base directory: editable markdown that is the env's canonical facts. | nothing (the directory it names is the editing interface) |
+| `wmo knowledge` | Print the model's knowledge base directory: editable markdown that is the env's canonical facts. Says so when the model was built without `--knowledge`, which makes those files inert. | nothing (the directory it names is the editing interface) |
 | `wmo list` | List every world model built under the project dir. | nothing (prints) |
 
 ## Traces and data
@@ -61,7 +61,7 @@ JSONL. The two formats are not interchangeable.
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo providers verify` | Ping the providers that **built** world models recorded, on the completion and embedding paths (deduped by kind and model). A project with nothing built has nothing to verify. | nothing (prints a row per provider) |
+| `wmo providers verify` | Ping every configured provider on the completion and embedding paths (deduped by kind and model): the `[models.<role>]` roles in `.wmo/settings.toml` **and** the providers each built world model recorded. Run it before `wmo build` — with nothing built yet it still checks the roles, and just skips the embed half. | nothing (prints a row per provider) |
 | `wmo harness list` / `show` / `init` | Inspect stored harness versions and aliases, or write the baseline as `v1` with `champion` pointed at it. | a `HarnessDoc` version in the store |
 | `wmo config telemetry` | View or change project-local usage telemetry settings. | `.wmo/settings.toml` |
 | `wmo e2b` | Inspect and reclaim E2B sandbox capacity. | nothing (prints, or reclaims) |

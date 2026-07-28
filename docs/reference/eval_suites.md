@@ -51,6 +51,8 @@ wmo eval <trace files...>        # ad hoc replay scoring, no suite needed
 
 Suite CLI flags (`--prompt`, `--train-split`, `--top-k`, …) override the suite's pinned config for one-off comparisons. Results are written under `.wmo/evals/` (local artifacts, not committed).
 
+Both flows score on the `[models.worker]` role that `wmo providers set` writes to `.wmo/settings.toml`, falling back to bedrock/`claude-opus-4-8` when the project configured no role; `--provider`/`--model` override it for one run. A `--provider` naming a different backend than the role takes its model from *that* backend's catalog, so `--provider openai` runs OpenAI's flagship rather than asking OpenAI for a Claude id. Every run prints the backend it used (`scoring with openai (gpt-5.4-mini)`) and each saved result records it, because a fidelity number is only comparable against runs on the same model.
+
 ## How it layers
 
 `wmo/engine/eval_suites.py` discovers suites (`examples_root/*/evals/*.toml`), resolves one by name, and lists persisted results. The `wmo eval` CLI command is a thin wrapper; scoring delegates to the same `wmo.engine.replay` path as ad hoc `wmo eval` and the research harness, so all fidelity numbers stay comparable.

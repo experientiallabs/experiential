@@ -8,8 +8,10 @@ models are named (`--name`), stored under `<root>/models/<name>/`, and listed wi
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
+import os
 import random
 import subprocess
 import time
@@ -18,7 +20,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import NoReturn, cast
 from uuid import uuid4
 
 import typer
@@ -30,6 +32,7 @@ from environment_capture.hub import (
     published_corpora,
 )
 from llm_waterfall import is_capacity_error
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
@@ -41,9 +44,12 @@ import wmo.providers as providers
 from wmo.cli.agent_session import register as register_agent_session_commands
 from wmo.cli.e2b_cmds import register as register_e2b_commands
 from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
-from wmo.cli.harness_app import harness_app, optimize_app
+
+# `_explicit` is package-private to wmo.cli, not module-private: `wmo eval` rejects
+# mode-inapplicable flags exactly the way `wmo optimize harness` already does.
+from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
-from wmo.cli.model_roles import configured_role_configs
+from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
 from wmo.cli.platform_cmds import register as register_platform_commands
 from wmo.cli.ui import (
     BuildParams,
@@ -56,6 +62,7 @@ from wmo.cli.ui import (
     select_model,
     select_option,
     select_provider_and_model,
+    serve_model_default,
 )
 from wmo.config import (
     ARTIFACT_DIR,
@@ -69,7 +76,6 @@ from wmo.config import (
     WorldModelStore,
     load_config,
     load_env_file,
-    load_settings,
     normalize_name,
     save_settings,
     set_telemetry_enabled,
@@ -77,11 +83,12 @@ from wmo.config import (
     validate_name,
 )
 from wmo.config.card import make_build_card, save_card
-from wmo.core.types import JsonObject
-from wmo.engine.build import DEFAULT_TRAIN_SPLIT, ingest, split_traces
+from wmo.core.types import JsonObject, Trace
+from wmo.engine.build import DEFAULT_TRAIN_SPLIT, EmptyCorpusError, ingest, split_traces
 from wmo.engine.build import build as run_build
 from wmo.engine.demo import run_demo
 from wmo.engine.eval_suites import (
+    EvalSuite,
     discover_eval_suites,
     list_eval_results,
     resolve_eval_suite,
@@ -96,12 +103,19 @@ from wmo.evals.grid import GridResult, ModelSpec, merge_results, run_grid
 from wmo.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmo.evals.open_loop import EvalReport, OpenLoopEval
 from wmo.ingest import VendorPull, get_adapter, list_adapters
+from wmo.ingest.base import load_payloads
+from wmo.ingest.detect import detect_format
 from wmo.optimize.judge import JUDGE_VERSION, RubricJudge
 from wmo.providers import ProviderConfig, ProviderKind, VerifyResult, verify_all, verify_embedder
-from wmo.providers.base import Embedder, EmbedderKind, Provider
-from wmo.providers.models import resolve_provider_model
+from wmo.providers.base import Embedder, EmbedderKind, PreparableProvider, Provider
+from wmo.providers.models import (
+    ProviderModel,
+    model_types_for_provider,
+    resolve_provider_model,
+)
 from wmo.providers.pool import Tier
 from wmo.providers.retry import wrap_provider_with_retries
+from wmo.providers.waterfall import FALLBACK_CONFIG_PATH
 from wmo.research import Side, run_concurrency_scaling
 from wmo.research.concurrency_run import build_real_runner, build_world_runner
 from wmo.research.concurrency_scaling import ConcurrencyPoint
@@ -116,6 +130,7 @@ from wmo.scenarios import (
     verify_scenarios,
 )
 from wmo.serving.server import create_app
+from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
 from wmo.telemetry import (
     BuildTelemetryStats,
     TelemetryBuildReporter,
@@ -135,7 +150,8 @@ providers_app = typer.Typer(help="Manage and verify LLM providers.", no_args_is_
 examples_app = typer.Typer(
     help="List and launch self-contained task examples.", no_args_is_help=True
 )
-config_app = typer.Typer(help="Manage local harness config.", no_args_is_help=True)
+# "harness" here would collide with the `wmo harness` group, which manages a different object.
+config_app = typer.Typer(help="Manage project-local wmo settings.", no_args_is_help=True)
 research_app = typer.Typer(
     help="Research experiments over the harness (scaling laws, ablations).", no_args_is_help=True
 )
@@ -158,9 +174,14 @@ _console = Console()
 _CHECK = "[green]✓[/green]"
 
 # Module-level singleton: a typer.Argument call can't be a default inline (ruff B008).
+# Every dispatched flow is listed: the `grid*` family owns six of this command's options
+# (--val-frac, --models, --gepa-prompts, --dataset-label, --limit-traces, --judge-model), so
+# leaving its tokens out of the help made those flags reference an undiscoverable subcommand.
 _EVAL_TOKENS = typer.Argument(
     None,
-    help="Trace files to score, or eval flow: list | run <suite> | results optional-suite.",
+    help="Trace files to score, or eval flow: list | run <suite> | results optional-suite | "
+    "grid <suite> | grid-plot <result.json>... | grid-heatmap <result.json>... | "
+    "agreement <a.json> <b.json>.",
 )
 # Repeatable option default hoisted out of the signature (ruff B008 forbids the call inline).
 _RESEARCH_REAL_ARG = typer.Option(
@@ -217,14 +238,14 @@ def config_telemetry(
 ) -> None:
     """View or change project-local usage telemetry settings."""
     normalized = action.lower()
-    if normalized == "status":
-        settings = load_settings(root)
-    elif normalized == "enable":
-        settings = set_telemetry_enabled(True, root)
-    elif normalized == "disable":
-        settings = set_telemetry_enabled(False, root)
-    else:
+    if normalized not in ("status", "enable", "disable"):
         raise typer.BadParameter("action must be one of: status, enable, disable")
+    # Read through the guarded loader first: `set_telemetry_enabled` reads the same file to
+    # preserve the rest of it, so a corrupt settings.toml must fail here as a usage error naming
+    # the file rather than as a tomllib traceback from inside the write.
+    settings = load_settings_or_abort(root)
+    if normalized != "status":
+        settings = set_telemetry_enabled(normalized == "enable", root)
     state = "enabled" if settings.telemetry.enabled else "disabled"
     _console.print(f"telemetry {state} ({settings_path(root)})")
 
@@ -289,7 +310,7 @@ def providers_set(
     """Choose the local worker's provider, and register the models the router can choose from.
 
     Two things a project needs, in one command. The worker provider lands in
-    `<root>/settings.toml` as `[models.worker]`, exactly as before. Then, on a terminal, this
+    `<root>/settings.toml` as `\\[models.worker]`, exactly as before. Then, on a terminal, this
     offers to register models as ROUTING CANDIDATES in `<root>/pool.toml`, the roster
     `wmo optimize route` selects over: pick a backend, search its catalog, and answer only what
     that backend needs (an Azure deployment; a price for a model with no published one, never
@@ -309,7 +330,11 @@ def providers_set(
             "set both --input-per-mtok and --output-per-mtok, or neither; a pool entry prices "
             "prompt and completion tokens together"
         )
-    existing = load_settings(root).models.worker
+    if provider is not None:
+        # Reject a bad --provider before reading the project's settings, so the argument the
+        # caller typed is what the error is about even in a project whose settings.toml is broken.
+        _provider_kind(provider)
+    existing = load_settings_or_abort(root).models.worker
     used_picker = _console.is_terminal and (provider is None or model is None)
     if used_picker:
         provider, model, region = select_provider_and_model(
@@ -352,7 +377,7 @@ def providers_set(
             _console.print(f"[red]provider verification failed[/red]: {detail}")
             raise typer.Exit(1)
 
-    settings = load_settings(root)
+    settings = load_settings_or_abort(root)
     settings.models.worker = ModelRole(
         provider=config.kind.value,
         model=config.model_type or model,
@@ -428,7 +453,7 @@ def providers_verify(
     """Ping every configured provider (completion + embed path) and report status.
 
     Two sources count as "configured", because checking that credentials work is what you do
-    BEFORE spending anything on `wmo build`: the `[models.<role>]` roles in
+    BEFORE spending anything on `wmo build`: the `\\[models.<role>]` roles in
     `<root>/settings.toml` (what `wmo providers set` writes), and the providers persisted inside
     every built world model. Completion providers are deduped by kind+model across both, so a
     role naming the same backend as a built model costs one ping, not two. The phi embed path
@@ -442,10 +467,11 @@ def providers_verify(
     configs: list[HarnessConfig] = []
     for model_name in names:
         try:
-            model_dir = str(store.resolve(model_name))
+            # Reading the artifact is inside the guard too: a model dir that exists but whose
+            # config.toml is corrupt or unreadable is a bad artifact, not an internal error.
+            configs.append(load_config(str(store.resolve(model_name))))
         except (FileNotFoundError, ValueError) as exc:
             raise typer.BadParameter(str(exc)) from exc
-        configs.append(load_config(model_dir))
 
     # Dedup identical completion calls across all selected models, then across the settings
     # roles. World models come FIRST so a config present in both is pinged with the built
@@ -519,16 +545,17 @@ def _print_verify_result(result: VerifyResult, sources: list[str], *, prefix: st
     """Print one `providers verify` line, plus the next step to take when the ping failed.
 
     `sources` names what asked for this provider (world model names, `models.<role>` settings
-    roles) so a failure points at the thing to fix. The detail is escaped: it carries raw
-    provider error text, and an unescaped `[...]` in it would be read as rich markup and crash
-    the report.
+    roles) so a failure points at the thing to fix. The detail and the hint are escaped: they
+    carry raw provider error text and pip extras (`...[distill]`), and an unescaped `[...]` in
+    either would be read as rich markup and silently dropped from the report.
     """
     mark = "[green]ok[/green]" if result.ok else "[red]fail[/red]"
     origin = f" [dim]({', '.join(sources)})[/dim]" if sources else ""
     detail = f" {escape(result.detail)}" if result.detail else ""
     _console.print(f"{mark} {prefix}{result.kind.value} ({result.model}){origin}{detail}")
     if not result.ok:
-        _console.print(f"  [yellow]{_credential_hint(result.kind, result.detail)}[/yellow]")
+        hint = escape(_credential_hint(result.kind, result.detail))
+        _console.print(f"  [yellow]{hint}[/yellow]")
 
 
 @examples_app.command("list")
@@ -539,7 +566,10 @@ def examples_list() -> None:
         _console.print("[yellow]no examples found[/yellow]")
         return
     for example in examples:
-        _console.print(example.name)
+        # Data-only bundles (what `wmo download` fetches) have no launcher, so say so here
+        # rather than letting `wmo examples run` be the only way to find out.
+        note = "" if (example / "run.sh").exists() else "  [dim](data only — no run.sh)[/dim]"
+        _console.print(f"{example.name}{note}")
 
 
 @examples_app.command(
@@ -554,9 +584,109 @@ def examples_run(
     example_dir = _resolve_example(name)
     runner = example_dir / "run.sh"
     if not runner.exists():
-        raise typer.BadParameter(f"example {name!r} has no run.sh launcher")
-    result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
+        # A data-only bundle (`wmo download`) is listed but not runnable; name what it IS for.
+        traces = example_dir / "traces.otel.jsonl"
+        hint = (
+            "; it is a data-only bundle — build a world model from it with "
+            f"`wmo build --file {traces} --name {name}`"
+            if traces.exists()
+            else ""
+        )
+        raise typer.BadParameter(f"example {name!r} has no run.sh launcher{hint}")
+    if not os.access(runner, os.X_OK):
+        raise typer.BadParameter(
+            f"example {name!r} has a run.sh that is not executable; run `chmod +x {runner}`"
+        )
+    try:
+        result = subprocess.run([str(runner), *ctx.args], cwd=example_dir, check=False)
+    except OSError as exc:
+        # The exec itself failed, so there is no exit code to forward: the launcher has no
+        # shebang (ENOEXEC), or names an interpreter that is not installed (ENOENT, whose
+        # "No such file or directory" reads as a lie about a run.sh we just stat'd). Say which
+        # line to look at instead of letting the errno out as a traceback.
+        raise typer.BadParameter(
+            f"example {name!r} could not start {runner} ({exc.strerror or exc}); "
+            f"check its interpreter line with `head -1 {runner}`"
+        ) from exc
     raise typer.Exit(result.returncode)
+
+
+# The serve provider `wmo build` falls back to when neither `--provider` nor a configured worker
+# role names one.
+_BUILD_PROVIDER = "bedrock"
+# Sources that read a live database rather than an export. `wmo build` has no transport flags for
+# them (`VendorPull.dsn/table` are only reachable from `wmo ingest`), so it rejects them up front
+# instead of failing inside the adapter with advice about flags it does not define.
+_DB_SOURCES = ("postgres",)
+
+
+def _check_build_source(source: str) -> None:
+    """Reject a `--source` that `wmo build` cannot drive, naming the `wmo ingest` two-step."""
+    if source not in list_adapters():
+        raise typer.BadParameter(
+            f"unknown --source {source!r}; choose one of: {', '.join(list_adapters())}"
+        )
+    if source in _DB_SOURCES:
+        raise typer.BadParameter(
+            f"--source {source} reads a live database, which `wmo build` has no connection flags "
+            f"for: normalize first with `wmo ingest --source {source} --dsn <dsn> --table <table> "
+            "--out traces.otel.jsonl`, then `wmo build --file traces.otel.jsonl`"
+        )
+
+
+def _check_build_file(file: str) -> None:
+    """Reject a missing/unreadable `--file` before the provider ping, not inside the adapter."""
+    path = Path(file)
+    if not path.exists():
+        raise typer.BadParameter(
+            f"trace file not found: {file} (export one with `wmo ingest --file <export> --out "
+            f"{file}`, or pass an existing path)"
+        )
+    if path.is_dir():
+        raise typer.BadParameter(f"--file must be a trace export, not a directory: {file}")
+
+
+def _empty_corpus_error(file: str | None, source: str) -> typer.BadParameter:
+    """Explain an empty ingest: usually `--source` does not match the export's real format."""
+    if file is None:
+        return typer.BadParameter(
+            f"the --source {source} pull returned no traces; widen --since/--limit or check the "
+            "--project"
+        )
+    detected: str | None = None
+    try:
+        detected = detect_format(load_payloads(Path(file).read_text(encoding="utf-8")))
+    except (ValueError, OSError):
+        detected = None
+    if detected is not None and detected != source:
+        return typer.BadParameter(
+            f"no traces ingested from {file} with --source {source}: it looks like {detected}. "
+            f"Retry with `--source {detected}`, or let `wmo ingest --file {file} --out "
+            "traces.otel.jsonl` auto-detect the format and build from its output."
+        )
+    return typer.BadParameter(
+        f"no traces ingested from {file} with --source {source} (build never auto-detects): "
+        f"check that the export carries agent steps and that --source names its format, or run "
+        f"`wmo ingest --file {file} --out traces.otel.jsonl` to auto-detect and normalize it "
+        "first"
+    )
+
+
+def _chain_bad_parameter(err: ValueError) -> typer.BadParameter:
+    """Render a failover-chain resolution failure as a usage error naming the file to write."""
+    return typer.BadParameter(
+        f"{err}. Write {FALLBACK_CONFIG_PATH} as [[chain.<name>]] rung tables (one table per "
+        "fallback rung, keys kind/model/profile/region; format in docs/reference/failover.md), "
+        "or drop --chain to serve from --provider alone"
+    )
+
+
+def _provider_or_chain_or_abort(config: ProviderConfig, chain: str | None) -> Provider:
+    """`providers.provider_or_chain`, with chain-resolution errors as clean usage errors."""
+    try:
+        return providers.provider_or_chain(config, chain=chain)
+    except ValueError as err:
+        raise _chain_bad_parameter(err) from None
 
 
 @app.command("build")
@@ -565,8 +695,9 @@ def build(
     source: str = typer.Option(
         "otel-genai",
         "--source",
-        help="Trace source adapter: otel-genai, chat-json, braintrust, phoenix, langfuse, "
-        "langsmith, posthog, mastra.",
+        help="Trace source adapter, pinned (build never auto-detects): otel-genai, chat-json, "
+        "braintrust, phoenix, langfuse, langsmith, posthog, mastra. To auto-detect an export's "
+        "format, normalize it first with `wmo ingest --file <export>`.",
     ),
     file: str = typer.Option(None, "--file", help="Path to an exported traces file for --source."),
     pull: bool = typer.Option(
@@ -575,25 +706,35 @@ def build(
     project: str = typer.Option(None, "--project", help="Vendor project/workspace id (--pull)."),
     api_key: str = typer.Option(None, "--api-key", help="Vendor API key (else env var)."),
     since: str = typer.Option(None, "--since", help="Only pull traces since this ISO timestamp."),
-    limit: int = typer.Option(None, "--limit", help="Max number of traces to pull."),
+    limit: int = typer.Option(
+        None,
+        "--limit",
+        help="Only use the first N traces (caps a --file export too, not just --pull); cost "
+        "control for a first build over a large corpus. A --pull is capped at fetch time, so "
+        "with --drop-degenerate it can yield fewer than N; a --file export yields N usable.",
+    ),
     vendor: str = typer.Option(
-        None, "--vendor", help="[deprecated] alias for --source <name> --pull."
+        None, "--vendor", help="\\[deprecated] alias for --source <name> --pull."
     ),
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir holding all world models."),
     provider: str = typer.Option(
-        None, "--provider", help="Provider that serves the model (default: bedrock)."
+        None, "--provider", help=f"Provider that serves the model (default: {_BUILD_PROVIDER})."
     ),
-    model: str = typer.Option(None, help="Canonical serve model type."),
+    model: str = typer.Option(
+        None, help="Canonical serve model type (default: the provider's suggested model)."
+    ),
     judge_model: str = typer.Option(
         None, "--judge-model", help="Canonical GEPA judge model type (default: cheap per provider)."
     ),
     region: str = typer.Option(None, help="AWS region (Bedrock)."),
     fidelity: str = typer.Option(
-        "medium",
+        "low",
         help="Build effort (all searching tiers are floored at low's estimate — more effort "
-        "never ships worse than low): low (free; the estimated-best config, no search) | "
-        "medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | max (deep "
-        "GEPA + full config search). The chosen config serves under `--max-fidelity`.",
+        "never ships worse than low): low (default; free — the estimated-best config, no "
+        "search) | medium (+light GEPA + cheap-lever search) | high (+GEPA + config search) | "
+        "max (deep GEPA + full config search). Searching tiers cost real money: one observed "
+        "medium build spent 73% of its total on GEPA. The chosen config serves under "
+        "`--max-fidelity`.",
     ),
     chain: str = typer.Option(
         None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."
@@ -654,10 +795,25 @@ def build(
     needs_input = name is None or (file is None and not pull)
     use_wizard = interactive if interactive is not None else (_console.is_terminal and needs_input)
 
-    configured_worker = load_settings(root).models.resolve("worker")
+    configured_worker = load_settings_or_abort(root).models.resolve("worker")
     use_configured_worker = configured_worker is not None and (
         provider is None or provider == configured_worker.provider
     )
+    # Settle the serve provider here so the model default can follow it. A single hard-coded
+    # Anthropic default wrote artifacts configured to call e.g. OpenAI with `claude-opus-4-8`.
+    resolved_provider = (
+        provider or (configured_worker.provider if configured_worker else None) or _BUILD_PROVIDER
+    )
+    resolved_model = (
+        model
+        or (configured_worker.model if use_configured_worker and configured_worker else None)
+        or serve_model_default(resolved_provider)
+    )
+    if resolved_model is None and not use_wizard:
+        raise typer.BadParameter(
+            f"--provider {resolved_provider} has no default serve model: pass `--model <id>` "
+            f"(`wmo build --provider {resolved_provider} --model <id> --file <export>`)"
+        )
     params = BuildParams(
         name=name or DEFAULT_MODEL_NAME,
         source=source,
@@ -668,11 +824,9 @@ def build(
         since=since,
         limit=limit,
         provider=provider or (configured_worker.provider if configured_worker else None),
-        model=(
-            model
-            or (configured_worker.model if use_configured_worker and configured_worker else None)
-            or "claude-opus-4-8"
-        ),
+        # A wizard run re-picks provider and model from its own per-provider lists, so an
+        # unresolved default here is only an unused suggestion; the flag path errored above.
+        model=resolved_model or "",
         region=(
             region
             or (configured_worker.region if use_configured_worker and configured_worker else None)
@@ -686,18 +840,22 @@ def build(
     )
     if use_wizard:
         params = run_build_wizard(_console, params)
-    elif name is None and file is None and not pull:
+    elif params.file is None and not params.pull:
+        # This guard also required `name is None`, so `wmo build --name x` (verbatim the
+        # empty-state hint `wmo list` prints) fell through to a raw ValueError from the ingest
+        # seam instead. A name is not a corpus: what is missing is the trace source.
         raise typer.BadParameter(
             "provide --file <export> or --pull (with --source), or run `wmo build` interactively"
         )
     if params.file and params.pull:
         raise typer.BadParameter("pass either --file or --pull, not both")
-    if params.source not in list_adapters():
-        raise typer.BadParameter(
-            f"unknown --source {params.source!r}; choose one of: {', '.join(list_adapters())}"
-        )
+    _check_build_source(params.source)
+    if params.file is not None:
+        _check_build_file(params.file)
+    if params.limit is not None and params.limit < 1:
+        raise typer.BadParameter(f"--limit must be at least 1, got {params.limit}")
     # The wizard always resolves a provider; the flag path keeps its historical default.
-    params.provider = params.provider or "bedrock"
+    params.provider = params.provider or _BUILD_PROVIDER
     # The wizard may replace the configured worker's provider. Re-evaluate the match before
     # carrying provider-specific connection fields into the build config.
     use_configured_worker = (
@@ -790,7 +948,7 @@ def build(
     # so cost/tokens still land in a single run record.
     tracker = RunTracker(run_id=uuid.uuid4().hex, kind="build")
     metered = MeteredProvider(
-        providers.provider_or_chain(config.serve_provider_config(), chain=chain),
+        _provider_or_chain_or_abort(config.serve_provider_config(), chain),
         tracker,
         classify=classify_build_call,
     )
@@ -802,32 +960,42 @@ def build(
         )
     build_stats = BuildTelemetryStats()
     with tracker.timed(), RichBuildReporter(_console, params.name) as reporter:
-        result = run_build(
-            config,
-            file=None if params.pull else params.file,
-            vendor=(
-                VendorPull(
-                    api_key=params.api_key,
-                    project=params.project,
-                    since=params.since,
-                    limit=params.limit,
-                )
-                if params.pull
-                else None
-            ),
-            root=model_dir,
-            serve_provider=metered,
-            judge_provider=metered_judge,
-            embedder=get_embedder(config),
-            reporter=TelemetryBuildReporter(reporter, build_stats),
-            max_fidelity=spec.config_search,
-            fidelity_budget=spec.search_budget,
-            full_search=spec.full_ladder,
-            cheap_search=spec.cheap_frontier_only,
-            estimate_only=spec.estimate_only,
-            drop_degenerate=drop_degenerate,
-            gepa_val_cap=spec.gepa_val_cap or None,
-        )
+        try:
+            result = run_build(
+                config,
+                file=None if params.pull else params.file,
+                vendor=(
+                    VendorPull(
+                        api_key=params.api_key,
+                        project=params.project,
+                        since=params.since,
+                        limit=params.limit,
+                    )
+                    if params.pull
+                    else None
+                ),
+                root=model_dir,
+                serve_provider=metered,
+                judge_provider=metered_judge,
+                embedder=get_embedder(config),
+                reporter=TelemetryBuildReporter(reporter, build_stats),
+                max_fidelity=spec.config_search,
+                fidelity_budget=spec.search_budget,
+                full_search=spec.full_ladder,
+                cheap_search=spec.cheap_frontier_only,
+                estimate_only=spec.estimate_only,
+                drop_degenerate=drop_degenerate,
+                gepa_val_cap=spec.gepa_val_cap or None,
+                # One cap per build, never both: a pull is already sliced to `--limit` inside
+                # `from_vendor`, so repeating it post-filter cannot restore what
+                # `--drop-degenerate` removed and would only read as a promise of N usable
+                # traces that the pull transport cannot keep.
+                limit=None if params.pull else params.limit,
+            )
+        except EmptyCorpusError:
+            # The one ingest outcome a user causes and can fix: the export does not parse under
+            # the pinned --source. Only this type is caught, so real build bugs still surface.
+            raise _empty_corpus_error(None if params.pull else params.file, params.source) from None
     record = tracker.record_summary()
     save_run(record, ArtifactPaths(model_dir).runs)
     # The card is additive metadata; a write failure (disk full, permissions) must not make an
@@ -900,7 +1068,7 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     failed = False
     for cfg, is_embed in checks:
         label = f"embed:{cfg.kind.value}" if is_embed else cfg.kind.value
-        serve_provider = None if is_embed else providers.provider_or_chain(cfg, chain=chain)
+        serve_provider = None if is_embed else _provider_or_chain_or_abort(cfg, chain)
         if is_embed:
             _console.print(f"verifying {label}…")
             result = verify_embedder(cfg)
@@ -918,9 +1086,28 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
             continue
         failed = True
         _console.print(f"  [red]✗ {label} ({result.model}) failed[/red]: {result.detail}")
-        _console.print(f"    [yellow]{_credential_hint(cfg.kind, result.detail)}[/yellow]")
+        hint = escape(_credential_hint(cfg.kind, result.detail))
+        _console.print(f"    [yellow]{hint}[/yellow]")
     if failed:
         raise typer.Exit(1)
+
+
+_PROVIDER_EXTRAS: dict[ProviderKind, str] = {ProviderKind.TINKER: "distill"}
+"""Providers whose SDK ships in an optional extra, keyed by kind so the hint can name the extra.
+
+Every other provider's SDK is a core dependency, so "the module is missing" means something
+different for them (a stale env) than it does here (an install step the user has not run yet).
+"""
+
+
+def _missing_sdk(detail: str) -> bool:
+    """Does a failed ping's detail mean "the SDK is absent" rather than "the creds are wrong"?
+
+    Two shapes reach here: the raw ImportError text of a core SDK ("No module named 'boto3'"), and
+    an optional extra's own message, which replaces that text with its install hint (see
+    `wmo.providers.tinker.check_tinker_prerequisites`) and so never contains the module wording.
+    """
+    return "No module named" in detail or "SDK is not installed" in detail
 
 
 def _credential_hint(kind: ProviderKind, detail: str) -> str:
@@ -928,8 +1115,14 @@ def _credential_hint(kind: ProviderKind, detail: str) -> str:
 
     Shared by the pre-build guard and `wmo providers verify` so both name the same env vars.
     """
-    if "No module named" in detail:
-        # SDKs are core deps; a missing module means the env is stale or hand-rolled.
+    if _missing_sdk(detail):
+        extra = _PROVIDER_EXTRAS.get(kind)
+        if extra is not None:
+            return (
+                f"run `pip install 'world-model-optimizer[{extra}]'` (or `uv sync --extra {extra}` "
+                "in a checkout), then re-run `wmo providers verify`"
+            )
+        # The rest are core deps; a missing module means the env is stale or hand-rolled.
         return "run `uv sync` to install the provider SDKs"
     envs = ", ".join(PROVIDER_ENV_VARS.get(kind, []))
     hint = f" ({envs})" if envs else ""
@@ -938,12 +1131,31 @@ def _credential_hint(kind: ProviderKind, detail: str) -> str:
 
 @app.command("list")
 def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list.")) -> None:
-    """List every world model built under the project dir."""
-    infos = WorldModelStore(root).list_info()
+    """List every world model built under the project dir.
+
+    An empty listing names the directory it searched, because `--root` defaults to a
+    cwd-relative `.wmo` and "nothing here" and "wrong directory" look identical otherwise.
+    An artifact that cannot be read is listed as `unreadable` with its reason, so one broken
+    `config.toml` costs you that one row instead of the whole listing.
+    """
+    if Path(root).is_file():
+        raise typer.BadParameter(
+            f"--root {root} is a file, not a project dir; pass the dir holding models/ "
+            f"(the default is `{ARTIFACT_DIR}`)"
+        )
+    store = WorldModelStore(root)
+    infos = store.list_info()
     if not infos:
-        _console.print("[yellow]no world models built yet[/yellow]; run `wmo build --name <name>`")
+        # Name the trace export too: `wmo build --name <name>` alone has no corpus to build from.
+        _console.print(
+            f"[yellow]no world models built under {store.models_dir}[/yellow]; run "
+            "`wmo build --name <name> --file <traces export>`"
+        )
         return
     _console.print(models_table(infos))
+    for info in infos:
+        if info.error is not None:
+            _console.print(f"  [red]✗ {info.name}[/red]: {escape(info.error)}")
 
 
 @app.command("download")
@@ -1058,8 +1270,11 @@ def serve(
     """Run the local FastAPI backend so agents can step against world models over HTTP.
 
     Serves every built model by default, or just the `--name` ones, from one or more roots
-    (e.g. `--root .wmo --root examples/tau-bench`). Routes are namespaced:
-    `/world_models/{name}/sessions` and `.../step`.
+    (e.g. `--root .wmo --root packages/environment-capture/tau-bench`). Two surfaces are
+    exposed: the world-model step API, namespaced `/world_models/{name}/sessions` and
+    `.../step`; and, for every served model whose dir carries a `policy.json` (written by
+    `wmo optimize route fit --out` or `wmo optimize model`), the OpenAI-compatible endpoint
+    `POST /v1/chat/completions` with `model="<name>"`, listed by `GET /v1/models`.
     """
     names = list(name) if name else None
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
@@ -1071,8 +1286,74 @@ def serve(
     uvicorn.run(server_app, host="127.0.0.1", port=port)
 
 
+# Charting deps ship in the optional `viz` extra, so `wmo.evals.grid_plot` /
+# `wmo.research.concurrency_plot` import them lazily. Every chart-writing flow probes for them
+# UP FRONT instead: `wmo eval grid` otherwise spent the whole (paid) grid and only then died on
+# `import matplotlib` with a raw traceback that never named the extra.
+_VIZ_MODULES = ("matplotlib", "seaborn")
+
+
+def _require_viz_extra() -> None:
+    """Usage error naming the `viz` extra when the charting deps are not installed."""
+    missing = [name for name in _VIZ_MODULES if importlib.util.find_spec(name) is None]
+    if missing:
+        raise typer.BadParameter(
+            f"charts need the `viz` extra ({', '.join(missing)} not installed); run "
+            "`uv sync --extra viz` (or `pip install 'world-model-optimizer[viz]'`) and retry"
+        )
+
+
+def _prepare_out_path(out: str | None) -> None:
+    """Validate `--out` and create its parent directory BEFORE any (paid) eval work runs.
+
+    Reports are written last, so a `--out` under a missing directory used to surface as a raw
+    FileNotFoundError that discarded a finished run. `_eval_run_suite`/`_eval_run_grid` already
+    created the parent at write time; doing it here makes every eval flow behave the same and
+    fail before it spends anything.
+    """
+    if out is None:
+        return
+    path = Path(out)
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"--out {path} is a directory; pass the file to write (e.g. `--out {path}/report.json`)"
+        )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as err:
+        raise typer.BadParameter(f"cannot create --out directory {path.parent}: {err}") from None
+
+
+def _resolve_eval_suite_or_usage(selector: str, examples_roots: list[str]) -> EvalSuite:
+    """Resolve a suite name, turning the unknown/ambiguous `ValueError` into a usage error.
+
+    Same contract as `_resolve_example`: a typo prints a clean box listing the available suites,
+    never a traceback.
+    """
+    try:
+        return resolve_eval_suite(selector, examples_roots)
+    except ValueError as err:
+        raise typer.BadParameter(str(err)) from None
+
+
+# Options only the closed-loop mode reads. In open-loop they used to be accepted and silently
+# dropped, so the README's closed-loop command minus `--mode closed-loop` quietly ran a different
+# (paid) evaluation. Same guard shape as `wmo optimize harness`'s world-model/harbor flag split.
+_CLOSED_LOOP_ONLY_FLAGS = (
+    ("name", "--name"),
+    ("root", "--root"),
+    ("k", "--k"),
+    ("max_turns", "--max-turns"),
+    ("harness", "--harness"),
+    ("harness_backend", "--harness-backend"),
+    ("eval_concurrency", "--eval-concurrency"),
+    ("e2b_template", "--e2b-template"),
+)
+
+
 @app.command("eval")
 def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin isn't used here
+    ctx: typer.Context,
     tokens: list[str] | None = _EVAL_TOKENS,
     mode: str = typer.Option(
         "open-loop",
@@ -1083,8 +1364,17 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     prompt_file: str | None = typer.Option(
         None, "--prompt", help="Prompt file; default=BASE_ENV_PROMPT."
     ),
-    provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
-    model: str = typer.Option("claude-opus-4-8", help="Canonical model type."),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Provider running the model. Default: the worker role `wmo providers set` wrote to "
+        "`.wmo/settings.toml`, else bedrock.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        help="Canonical model type. Default: the configured worker role's model, else the "
+        "flagship of whichever provider is in play (bedrock/claude-opus-4-8).",
+    ),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     chain: str | None = typer.Option(
         None, "--chain", help="Named failover chain from .wmo/fallback.toml (default: its default)."
@@ -1125,7 +1415,9 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     ),
     out: str | None = typer.Option(None, help="Optional path to write the full JSON report."),
     examples_root: str | None = typer.Option(
-        None, help="Directory containing example eval suites. Default: repo-local examples/."
+        None,
+        help="Directory containing eval suites. Default: repo-local examples/ AND "
+        "packages/environment-capture/ (where the shipped suites live).",
     ),
     results_root: str = typer.Option(
         f"{ARTIFACT_DIR}/evals", help="Local directory for named eval result JSON."
@@ -1195,15 +1487,24 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     - `wmo eval <trace files...>`: ad hoc replay scoring (open-loop, teacher-forced — the
       default mode).
     - `wmo eval <tasks.jsonl> --mode closed-loop`: a live agent runs tasks WITH the world model
-      as its environment. `[models.agent]` selects a distinct agent provider when configured;
+      as its environment. `\\[models.agent]` selects a distinct agent provider when configured;
       otherwise the agent shares the world model's provider. `--harness-backend e2b` moves the
       pi-node harness process into pooled E2B sandboxes while the environment stays the world
       model. Score task success against gold assertions (see docs/reference/closed_loop.md).
-    - `wmo eval list`: list named suites under `examples/<task>/evals/`.
+    - `wmo eval list`: list named suites under `packages/environment-capture/<task>/evals/`.
     - `wmo eval run <suite>`: run a suite and save a local JSON result.
     - `wmo eval results optional-suite`: summarize local suite results.
+    - `wmo eval grid <suite>`: run the model x condition grid for a suite and chart it (needs the
+      `viz` extra; consumes --models/--gepa-prompts/--dataset-label/--limit-traces/--judge-model
+      and --val-frac).
+    - `wmo eval grid-plot <result.json>...`: re-chart saved grid results, merged (`viz` extra).
+    - `wmo eval grid-heatmap <result.json>...`: chart saved grid results as one cross-benchmark
+      heatmap (`viz` extra).
     - `wmo eval agreement <a.json> <b.json>`: compare two closed-loop reports task-by-task
       (e.g. world-model vs real environment) — the outcome-agreement validity check.
+
+    Open-loop scoring runs on the worker role `wmo providers set` writes to `.wmo/settings.toml`
+    (bedrock/claude-opus-4-8 when no role is configured); `--provider`/`--model` override it.
     """
     args = tokens or []
     suite_roots = (
@@ -1211,6 +1512,21 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     )
     if mode not in ("open-loop", "closed-loop"):
         raise typer.BadParameter(f"unknown --mode {mode!r}; choose open-loop or closed-loop")
+    # Reject flags this flow will never read, before anything runs: a silently dropped
+    # --harness/--k means the user paid for an open-loop run they did not ask for.
+    if mode != "closed-loop":
+        inapplicable = [flag for param, flag in _CLOSED_LOOP_ONLY_FLAGS if _explicit(ctx, param)]
+        if inapplicable:
+            raise typer.BadParameter(
+                f"{', '.join(inapplicable)} apply only to `--mode closed-loop`; add that flag "
+                "or drop them"
+            )
+    if (not args or args[0] != "agreement") and _explicit(ctx, "threshold"):
+        raise typer.BadParameter(
+            "--threshold applies only to `wmo eval agreement <a.json> <b.json>`; drop it"
+        )
+    # --out is written last (after the paid work); make sure it is writable first.
+    _prepare_out_path(out)
     if mode == "closed-loop":
         if len(args) != 1 or args[0] in ("list", "run", "results", "agreement"):
             raise typer.BadParameter("usage: wmo eval <tasks.jsonl> --mode closed-loop")
@@ -1286,9 +1602,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
             examples_roots=suite_roots,
             results_root=results_root,
             prompt_file=prompt_file,
-            provider=provider,
-            model=model,
-            region=region,
+            provider_config=_worker_role_provider_config(provider, model, region),
             train_split=train_split,
             embed_dim=embed_dim,
             rag=rag,
@@ -1303,7 +1617,8 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     if not args:
         raise typer.BadParameter(
             "provide trace files, or use `wmo eval list`, `wmo eval run <suite>`, "
-            "or `wmo eval results`"
+            "`wmo eval results`, `wmo eval grid <suite>`, `wmo eval grid-plot <result.json>`, "
+            "`wmo eval grid-heatmap <result.json>`, or `wmo eval agreement <a.json> <b.json>`"
         )
 
     options = _eval_options(
@@ -1320,10 +1635,14 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     report = _run_eval_files(
         [Path(f) for f in args],
         options,
-        provider=provider,
-        model=model,
+        provider_config=_worker_role_provider_config(provider, model, region),
         chain=chain,
-        region=region,
+    )
+    _require_scorable_steps(
+        report,
+        args,
+        next_step=f"check the export with `wmo ingest --file {args[0]}`, or add "
+        "`--mode closed-loop` for a tasks file",
     )
     _print_eval_report(report)
     if out:
@@ -1471,7 +1790,9 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     out: str | None,
 ) -> None:
     """Run the model x condition grid for a suite, write result JSON + a fidelity bar chart PNG."""
-    suite = resolve_eval_suite(selector, examples_roots)
+    suite = _resolve_eval_suite_or_usage(selector, examples_roots)
+    # The chart is the last thing written, so probe its deps before the grid spends anything.
+    _require_viz_extra()
     specs = _parse_model_specs(models)
     prompt_dir = Path(gepa_prompts) if gepa_prompts else None
     prompt_map: dict[str, str] | None = None
@@ -1529,6 +1850,7 @@ def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | N
     process-global) be combined with the API-model grid into one chart - and re-plots any saved
     result without re-running the eval.
     """
+    _require_viz_extra()
     results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
     merged = merge_results(results)
     for cell in merged.cells:
@@ -1555,6 +1877,7 @@ def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
     Accepts any mix of API/Qwen result JSONs; same-suite results are merged into one 5-model row
     set, then all suites become the heatmap's columns (rows = model x condition).
     """
+    _require_viz_extra()
     by_suite: dict[str, list[GridResult]] = {}
     for p in paths:
         res = GridResult.model_validate_json(Path(p).read_text(encoding="utf-8"))
@@ -1571,9 +1894,7 @@ def _eval_run_suite(
     examples_roots: list[str],
     results_root: str,
     prompt_file: str | None,
-    provider: str,
-    model: str,
-    region: str | None,
+    provider_config: ProviderConfig,
     train_split: float | None,
     embed_dim: int | None,
     rag: bool | None,
@@ -1584,7 +1905,7 @@ def _eval_run_suite(
     reasoning: bool | None,
     out: str | None,
 ) -> None:
-    suite = resolve_eval_suite(selector, examples_roots)
+    suite = _resolve_eval_suite_or_usage(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
         prompt_file=prompt_file or (str(suite_prompt) if suite_prompt is not None else None),
@@ -1598,7 +1919,18 @@ def _eval_run_suite(
         reasoning=reasoning if reasoning is not None else suite.config.reasoning,
     )
     files = suite.resolve_files()
-    report = _run_eval_files(files, options, provider=provider, model=model, region=region)
+    if not files:
+        raise typer.BadParameter(
+            f"eval suite {suite.id} lists no trace files; set `files` in {suite.path}"
+        )
+    report = _run_eval_files(files, options, provider_config=provider_config)
+    # A suite run is saved under --results-root and resurfaces in `wmo eval results`, so a
+    # zero-step scorecard must fail here rather than persist as a real 0.000 measurement.
+    _require_scorable_steps(
+        report,
+        [str(path) for path in files],
+        next_step=f"check the corpus `files` in {suite.path} with `wmo ingest --file {files[0]}`",
+    )
     _print_eval_report(report)
 
     run_id = uuid4().hex
@@ -1611,10 +1943,13 @@ def _eval_run_suite(
         "suite": suite.id,
         "suite_path": str(suite.path),
         "suite_config": suite.config.model_dump(mode="json"),
+        # The RESOLVED backend, not the raw flags: with the flags omitted these come from the
+        # configured worker role, and a result JSON that recorded `null` could not say which
+        # model produced the fidelity number.
         "config": {
-            "provider": provider,
-            "model": model,
-            "region": region,
+            "provider": provider_config.kind.value,
+            "model": provider_config.model_type or provider_config.model,
+            "region": provider_config.region,
             "prompt": options.prompt_file,
             "files": [str(path) for path in files],
             "train_split": options.train_split,
@@ -1685,16 +2020,29 @@ def _run_eval_files(
     files: list[Path],
     options: _EvalOptions,
     *,
-    provider: str,
-    model: str,
-    region: str | None,
+    provider_config: ProviderConfig,
     chain: str | None = None,
 ) -> EvalReport:
     for path in files:
         if not path.exists():
             raise typer.BadParameter(f"trace file not found: {path}")
-    provider_config = _provider_config(provider, model, region)
-    llm = providers.provider_or_chain(provider_config, chain=chain)
+        if not path.is_file():
+            raise typer.BadParameter(
+                f"not a trace file: {path} is a directory; pass the export itself "
+                f"(e.g. `wmo eval {path}/traces.otel.jsonl`)"
+            )
+    # Name the backend: the number below is only comparable against runs on the same model, and
+    # with no flags the model comes from settings rather than the command line.
+    _console.print(
+        f"scoring with {provider_config.kind.value} "
+        f"({provider_config.model_type or provider_config.model})"
+    )
+    # A missing/unknown chain, or a multi-chain fallback.toml with no `default`, is a usage
+    # error: the message already names the file, so it must not arrive as a traceback.
+    try:
+        llm = providers.provider_or_chain(provider_config, chain=chain)
+    except (ValueError, FileNotFoundError) as err:
+        raise typer.BadParameter(str(err)) from None
     if isinstance(llm, providers.WaterfallProvider):
         _console.print("failover chain active (.wmo/fallback.toml) — world-model calls only")
     prompt = (
@@ -1721,6 +2069,29 @@ def _run_eval_files(
         reasoning=options.reasoning,
     )
     return evaluation.run()
+
+
+def _require_scorable_steps(report: EvalReport, paths: list[str], *, next_step: str) -> None:
+    """Refuse to print (or persist) a 0.000 scorecard for input that held nothing to score.
+
+    `evaluate_files` skips a file that yields no OTel GenAI traces, so a wrong file type, a
+    tasks.jsonl missing `--mode closed-loop`, or a train_split that leaves no holdout all used to
+    render as a plausible `OVERALL fidelity=0.000 over 0 held-out steps` at exit 0. `wmo eval run
+    <suite>` additionally saved that scorecard as a durable result, so it resurfaced later in
+    `wmo eval results`; both flows now stop here instead.
+
+    `next_step` is the caller's flow-specific remedy, since the ad-hoc path can suggest
+    `--mode closed-loop` for a tasks file and the suite path cannot.
+    """
+    if report.total_steps:
+        return
+    listed = ", ".join(paths)
+    if not report.per_file:
+        raise typer.BadParameter(f"no OTel GenAI traces in {listed}; {next_step}")
+    raise typer.BadParameter(
+        f"no held-out steps to score in {listed}; lower `--train-split` (currently reserving "
+        "every trace for training) or pass a larger corpus"
+    )
 
 
 def _print_eval_report(report: EvalReport) -> None:
@@ -1755,27 +2126,47 @@ def _eval_report_payload(report: EvalReport) -> JsonObject:
 @app.command("knowledge")
 def knowledge_(
     name: str = typer.Option(None, "--name", help="World model (default: the only one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
+    root: str = typer.Option(
+        ARTIFACT_DIR,
+        help="Project dir. Shipped example models are found too while this is the default "
+        "project dir; point it elsewhere to search that root alone.",
+    ),
 ) -> None:
     """Show a model's knowledge base: the env's canonical facts, a folder of editable markdown.
 
-    The printed directory IS the editing interface — open it in any editor. `rules.md`/
+    The printed directory IS the editing interface, open it in any editor. `rules.md`/
     `entities.md`/`schemas.md` are seeded at build (with knowledge enabled); `learned.md` collects
-    the env's own cross-session notes; `grounded.md` caches web-search groundings.
+    the env's own cross-session notes; `grounded.md` caches web-search groundings. Models are
+    resolved exactly as `wmo demo`/`wmo play` resolve them, so a shipped example needs no `--root`.
     """
-    store = WorldModelStore(root)
-    resolved = _resolve_name(store, name)
-    kb = KnowledgeBase(ArtifactPaths(store.resolve(resolved)).knowledge)
-    _console.print(f"[bold]{kb.directory}[/bold]")
+    store_root, resolved = _resolve_model_any(name, root)
+    model_dir = WorldModelStore(str(store_root)).resolve(resolved)
+    kb = KnowledgeBase(ArtifactPaths(model_dir).knowledge)
+    _console.print(f"[bold]{escape(str(kb.directory))}[/bold]")
+    build_with_knowledge = f"`wmo build --name {resolved} --file <traces> --knowledge`"
     if kb.is_empty:
+        state = "is empty" if kb.directory.is_dir() else "does not exist yet"
         _console.print(
-            "(empty — enable knowledge at build, drop *.md files in this folder, "
-            "or PUT files via the serving API)"
+            f"(that directory {state}) seed one with {build_with_knowledge}, which extracts "
+            "rules.md / entities.md / schemas.md from the train traces"
         )
         return
+    if not load_config(model_dir).knowledge:
+        # The files are on disk but `WorldModel.load` gates the KB on config.knowledge, so at the
+        # default fidelity nothing here reaches the env prompt. Say so instead of printing them
+        # back as if they were live.
+        _console.print(
+            f"[yellow]inert[/yellow]: {resolved!r} was built without a knowledge base, so "
+            "`wmo demo` / `wmo play` / `wmo serve` never render these files into the env "
+            f"prompt. Activate them by rebuilding with {build_with_knowledge}, or by setting "
+            f"`knowledge = true` in {escape(str(ArtifactPaths(model_dir).config))}."
+        )
+    # Knowledge is hand-edited markdown: `[/items]`, `list[str]` and `[text](url)` are ordinary
+    # content, so it is escaped rather than parsed as rich markup (which would crash on the
+    # first, and silently delete the other two).
     for file_name, content in kb.files().items():
-        _console.print(f"\n[bold]## {file_name}[/bold]")
-        _console.print(content.strip())
+        _console.print(f"\n[bold]## {escape(file_name)}[/bold]")
+        _console.print(escape(content.strip()))
 
 
 @scenarios_app.command("build")
@@ -1790,7 +2181,7 @@ def scenarios_build(
         "--provider",
         help=(
             "Pin ONE LLM for every role (facets/naming/synthesis/validation). When omitted, "
-            "roles resolve from .wmo/settings.toml [models.worker|judge|summary]."
+            "roles resolve from .wmo/settings.toml \\[models.worker|judge|summary]."
         ),
     ),
     model: str = typer.Option(None, help="Model id (pins all roles, like --provider)."),
@@ -1800,7 +2191,7 @@ def scenarios_build(
         help=(
             "Facet embedder: hashing (offline but lexical-only — clusters by wording, not "
             "meaning; prefer a semantic embedder for real corpora) | bedrock | openai | "
-            "azure_openai."
+            "azure."
         ),
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
@@ -1812,7 +2203,7 @@ def scenarios_build(
     Writes a `ScenarioSet` JSON: scenarios (task, seed state, checklist, weight, provenance),
     the named clusters they came from, and the corpus-coverage number that justifies them.
     """
-    traces = get_adapter("otel-genai").from_file(file)
+    traces = _ingest_scenario_corpus(file)
     if limit is not None:
         traces = traces[:limit]
     if not traces:
@@ -1861,12 +2252,12 @@ def scenarios_verify(
     baseline LLM agent on every scenario, and grades episodes against each scenario's checklist.
     With `--drop`, unverified scenarios are removed from the set in place.
     """
-    scenario_set = ScenarioSet.load(scenarios_file)
-    traces = get_adapter("otel-genai").from_file(file)
+    scenario_set = _load_scenario_set(scenarios_file)
+    traces = _ingest_scenario_corpus(file)
     if provider is not None or model is not None:
         store = WorldModelStore(root)
         model_dir = store.resolve(_resolve_name(store, name))
-        override = _provider_config(provider or "bedrock", model or "claude-opus-4-8", region)
+        override = _worker_role_provider_config(provider, model, region)
         llm = wrap_provider_with_retries(providers.get_provider(override))
         world_model = WorldModel.load(str(model_dir), llm)
     else:
@@ -1918,12 +2309,91 @@ def scenarios_verify(
         )
 
 
-def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+def _ingest_scenario_corpus(file: str) -> list[Trace]:
+    """Ingest a `--file` trace corpus for the scenarios commands as a validated CLI input.
+
+    `--file` is the only required option on `wmo scenarios build`, so a mistyped path is the
+    likeliest first-run mistake. Guard it here rather than letting `Path.read_text` raise, which
+    reaches the user as a stdlib FileNotFoundError/IsADirectoryError traceback.
+    """
+    path = Path(file)
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"--file {file} is a directory; point it at the trace file itself, "
+            f"e.g. `--file {Path(file) / 'traces.otel.jsonl'}`"
+        )
+    if not path.exists():
+        raise typer.BadParameter(
+            f"--file {file} does not exist; pass an exported OTel-GenAI corpus, or fetch a "
+            "benchmark one with `wmo download <benchmark>`"
+        )
     try:
-        kind = ProviderKind(provider)
+        return get_adapter("otel-genai").from_file(file)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _unreadable_input(f"--file {file}", path, exc) from exc
+
+
+def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
+    """Load a `ScenarioSet` argument, reporting a missing or malformed file as a usage error.
+
+    The raw failures are a stdlib FileNotFoundError/IsADirectoryError and a pydantic
+    ValidationError that sends the user to pydantic's docs; neither says the file is supposed to
+    be the output of `wmo scenarios build`.
+    """
+    path = Path(scenarios_file)
+    build_hint = (
+        f"build one with `wmo scenarios build --file <traces.jsonl> --out {scenarios_file}`"
+    )
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"scenario set {scenarios_file} is a directory; pass the JSON file written by "
+            "`wmo scenarios build --out <scenarios.json>`"
+        )
+    if not path.exists():
+        raise typer.BadParameter(f"scenario set {scenarios_file} does not exist; {build_hint}")
+    try:
+        return ScenarioSet.load(path)
+    except ValidationError as exc:
+        raise typer.BadParameter(
+            f"{scenarios_file} is not a scenario set written by `wmo scenarios build` "
+            f"({exc.error_count()} validation error(s), first: {exc.errors()[0]['msg']}); "
+            f"{build_hint}"
+        ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _unreadable_input(f"scenario set {scenarios_file}", path, exc) from exc
+
+
+def _unreadable_input(
+    label: str, path: Path, exc: OSError | UnicodeDecodeError
+) -> typer.BadParameter:
+    """Report the two read failures an exists/is-dir check cannot predict as a usage error.
+
+    A path that passes the shape checks can still fail inside the read: no permission on it, or
+    bytes that are not UTF-8 (a compressed or binary export). Both otherwise reach the user as a
+    stdlib traceback, which is the thing these guards exist to prevent.
+    """
+    if isinstance(exc, UnicodeDecodeError):
+        return typer.BadParameter(
+            f"{label} is not UTF-8 text; pass the decompressed JSON/JSONL export "
+            f"(`file {path}` says what it actually is)"
+        )
+    return typer.BadParameter(
+        f"{label} could not be read ({exc.strerror or exc}); "
+        f"`ls -l {path}` shows its owner and mode"
+    )
+
+
+def _provider_kind(provider: str) -> ProviderKind:
+    """The `ProviderKind` a `--provider` flag names, as a usage error when it names none."""
+    try:
+        return ProviderKind(provider)
     except ValueError:
         kinds = ", ".join(k.value for k in ProviderKind)
         raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+
+
+def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
+    kind = _provider_kind(provider)
     spec = resolve_provider_model(kind, model)
     return ProviderConfig(
         kind=kind,
@@ -1933,8 +2403,28 @@ def _provider_config(provider: str, model: str, region: str | None) -> ProviderC
     )
 
 
-_SCENARIO_DEFAULT_PROVIDER = "bedrock"
-_SCENARIO_DEFAULT_MODEL = "claude-opus-4-8"
+# The backend a worker-role command falls back to when the project configured no
+# `[models.worker]` role at all. Never a substitute for a configured role.
+_DEFAULT_WORKER_PROVIDER = "bedrock"
+_DEFAULT_WORKER_MODEL = "claude-opus-4-8"
+
+
+def _default_model_for_provider(kind: ProviderKind) -> str:
+    """`kind`'s flagship: the model to run when neither a flag nor a role named one.
+
+    A default model belongs to ONE backend — pairing `--provider openai` with bedrock's
+    `claude-opus-4-8` sends a model OpenAI has never heard of. `openrouter` and `tinker` publish
+    no built-in rows (nothing can derive an operator's route or weights path), so they must be
+    told which model to run.
+    """
+    catalog = model_types_for_provider(kind)
+    if not catalog:
+        raise typer.BadParameter(
+            f"provider {kind.value!r} has no default model; pass --model <model>, or run "
+            f"`wmo providers set --provider {kind.value} --model <model>` to configure the "
+            f"worker role"
+        )
+    return catalog[0]
 
 
 def _role_provider_config(role: str, region: str | None) -> ProviderConfig | None:
@@ -1945,7 +2435,7 @@ def _role_provider_config(role: str, region: str | None) -> ProviderConfig | Non
     generic `--region` flag — the flag also feeds the embedder, and e.g. a judge pinned to the
     one region where its model is enabled must not follow it.
     """
-    configured = load_settings().models.resolve(role)
+    configured = load_settings_or_abort().models.resolve(role)
     if configured is None:
         return None
     config = _provider_config(configured.provider, configured.model, configured.region or region)
@@ -1954,23 +2444,86 @@ def _role_provider_config(role: str, region: str | None) -> ProviderConfig | Non
     )
 
 
+def _azure_deployment_for_model(
+    configured: ProviderConfig, spec: ProviderModel, deployment: str | None
+) -> str:
+    """The Azure deployment to invoke after `--model` moved the role off its configured one.
+
+    On Azure the wire `model` IS the deployment name (`AzureOpenAIProvider._deployment`), so a
+    role's deployment names the model being replaced. Keeping it would call the old model and
+    report the new one. Guessing the new one is no better: an operator's deployment name is not
+    derivable from a model id, and a wrong guess 404s on every prediction, which `wmo eval`
+    reports as a silent `fidelity=0.000` at exit 0 — the defect this whole path exists to stop.
+    So a model swap on Azure has to be told which deployment serves it.
+    """
+    if deployment is not None:
+        return deployment
+    if configured.deployment is None:
+        # Nothing configured to contradict, so derive it from the model as
+        # `_worker_provider_config` does; the role could not have been called without one anyway.
+        return spec.model_type
+    if configured.deployment in (spec.model_type, spec.model_id):
+        return configured.deployment
+    raise typer.BadParameter(
+        f"the configured azure worker serves {configured.model} from deployment "
+        f"{configured.deployment!r}, and on Azure the deployment name is what is actually "
+        f"invoked, so --model {spec.model_type} needs the deployment that serves it. Run "
+        f"`wmo providers set --provider azure --model {spec.model_type} "
+        f"--deployment <deployment>` to point the worker role at it."
+    )
+
+
+def _worker_role_provider_config(
+    provider: str | None,
+    model: str | None,
+    region: str | None,
+    *,
+    deployment: str | None = None,
+) -> ProviderConfig:
+    """The backend for a worker-role call: explicit flags, then the worker role, then the default.
+
+    `wmo providers set` writes `[models.worker]` and is step 1 of the documented getting-started
+    path, so a command that ignored it would run against a provider the user never configured.
+    Each field falls back independently, and a `--provider` naming a DIFFERENT backend than the
+    configured role drops that role's model and connection fields, which belong to the backend it
+    replaced — the model then comes from the NEW backend's catalog, never from bedrock's.
+    """
+    configured = _role_provider_config("worker", region)
+    if configured is None or (provider is not None and provider != configured.kind.value):
+        kind = _provider_kind(provider or _DEFAULT_WORKER_PROVIDER)
+        config = _provider_config(kind.value, model or _default_model_for_provider(kind), region)
+    elif model is None:
+        config = configured
+    else:
+        spec = resolve_provider_model(configured.kind, model)
+        if spec.model_id == configured.model:
+            # Re-stating the role's own model is not a model change: leave its connection alone.
+            config = configured
+        else:
+            update: dict[str, object] = {"model_type": spec.model_type, "model": spec.model_id}
+            if configured.kind is ProviderKind.AZURE_OPENAI:
+                update["deployment"] = _azure_deployment_for_model(configured, spec, deployment)
+            config = configured.model_copy(update=update)
+    if deployment is not None:
+        config = config.model_copy(update={"deployment": deployment})
+    return config
+
+
 def _scenario_role_llms(
     provider: str | None, model: str | None, region: str | None
 ) -> tuple[Provider, Provider, Provider]:
     """(summary, worker, judge) providers for scenario construction.
 
     Explicit `--provider`/`--model` flags pin ALL roles to that one model (the pre-roles
-    behavior). Otherwise each role resolves from `.wmo/settings.toml`, falling back to worker,
-    then to the built-in default. Judging benefits from a different family than the worker —
-    a same-family judge carries self-preference bias toward the generator's outputs.
+    behavior); half a pair completes from the configured worker role rather than from bedrock.
+    Otherwise each role resolves from `.wmo/settings.toml`, falling back to worker, then to the
+    built-in default. Judging benefits from a different family than the worker: a same-family
+    judge carries self-preference bias toward the generator's outputs.
     """
     if provider is not None or model is not None:
-        config = _provider_config(
-            provider or _SCENARIO_DEFAULT_PROVIDER, model or _SCENARIO_DEFAULT_MODEL, region
-        )
-        llm = providers.get_provider(config)
+        llm = providers.get_provider(_worker_role_provider_config(provider, model, region))
         return llm, llm, llm
-    default = _provider_config(_SCENARIO_DEFAULT_PROVIDER, _SCENARIO_DEFAULT_MODEL, region)
+    default = _provider_config(_DEFAULT_WORKER_PROVIDER, _DEFAULT_WORKER_MODEL, region)
     cache: dict[str, Provider] = {}
     by_role: dict[str, Provider] = {}
     for role in ("summary", "worker", "judge"):
@@ -2013,10 +2566,18 @@ def _resolve_scenario_embedder(
 @app.command("demo")
 def demo(
     name: str = typer.Option(None, "--name", help="World model to demo (default: pick one)."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
-    steps: int = typer.Option(5, help="Max scenario steps to replay."),
+    root: str = typer.Option(
+        ARTIFACT_DIR,
+        help="Project dir. Shipped example models are found too while this is the default "
+        "project dir; point it elsewhere to search that root alone.",
+    ),
+    steps: int = typer.Option(5, min=1, help="Max scenario steps to replay."),
     traces: str = typer.Option(
-        None, "--traces", help="Trace file to sample the scenario from (default: the model's)."
+        None,
+        "--traces",
+        help="Trace file to sample the scenario from. Default: the model's own "
+        "traces.otel.jsonl, which only a Hub-downloaded model or a shipped example has, since a "
+        "build keeps no copy of the corpus it read.",
     ),
     seed: int = typer.Option(None, help="Seed for the scenario sample (default: random)."),
     show_prompt: bool = typer.Option(
@@ -2032,12 +2593,8 @@ def demo(
     wm, resolved_name, _provider, model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
     )
-    traces_file = Path(traces) if traces else _traces_for_root(model_root)
-    if traces_file is None or not traces_file.exists():
-        raise typer.BadParameter(
-            f"no trace file found for {resolved_name!r} under {model_root}; pass --traces"
-        )
     model_dir = WorldModelStore(str(model_root)).resolve(resolved_name)
+    traces_file = _demo_traces(model_dir, resolved_name, traces)
     config = load_config(model_dir)  # the model dir holds its own HarnessConfig
     candidates = [t for t in ingest(config, file=str(traces_file)) if t.steps]
     if not candidates:
@@ -2104,8 +2661,20 @@ def demo(
                     _NARRATOR.detach()
             break
         except Exception as exc:  # noqa: BLE001 - classified below
-            if not is_capacity_error(exc) or not _console.is_terminal:
-                raise
+            out_of_capacity = is_capacity_error(exc)
+            if not out_of_capacity or not _console.is_terminal:
+                # A backend that refused the request (missing/expired credentials, a model id it
+                # does not serve) is a user-fixable setup error, not a wmo bug: render it with the
+                # same hint `wmo providers verify` prints. Anything else keeps its traceback.
+                if not _is_provider_sdk_error(exc):
+                    raise
+                _exit_serve_provider_failure(
+                    resolved_name,
+                    config.serve_provider_config(),
+                    exc,
+                    out_of_capacity=out_of_capacity,
+                    retry=f"`wmo demo --name {resolved_name}`",
+                )
             # Retries are exhausted and the backend is still down: offer to re-point the model
             # at a different provider (same picker as the build wizard) and RESUME from the
             # failed step — completed steps stay done.
@@ -2147,7 +2716,11 @@ def _first_prompt(wm: WorldModel, trace) -> str:  # noqa: ANN001 - core Trace
 def play(
     name: str = typer.Option(None, "--name", help="World model to play (default: pick one)."),
     task: str = typer.Option(None, "--task", help="Task to seed the session with."),
-    root: str = typer.Option(ARTIFACT_DIR, help="Project dir (example models are found too)."),
+    root: str = typer.Option(
+        ARTIFACT_DIR,
+        help="Project dir. Shipped example models are found too while this is the default "
+        "project dir; point it elsewhere to search that root alone.",
+    ),
     max_fidelity: bool = typer.Option(
         False, "--max-fidelity", help="Run with the online extras on (default: pure RAG)."
     ),
@@ -2160,10 +2733,28 @@ def play(
     run_play_repl(_console, wm, resolved_name, task, suggestions=suggestions)
 
 
-def _traces_for_root(model_root: Path) -> Path | None:
-    """The trace corpus that built the models under `model_root`, when it ships alongside."""
-    candidate = model_root / "traces.otel.jsonl"
-    return candidate if candidate.exists() else None
+def _demo_traces(model_dir: Path, resolved_name: str, explicit: str | None) -> Path:
+    """The corpus `wmo demo` samples its scenario from: explicit `--traces`, else the model's own.
+
+    Default resolution is `local_traces_path`, the same one `wmo serve` and `wmo optimize route
+    sweep` use: a Hub-downloaded copy inside the artifact, else the sibling corpus of the shipped
+    example layout. A build keeps NO copy of the corpus it read, so a plain `wmo build` leaves
+    neither, and the failure has to name the file to pass rather than the directory it searched.
+    """
+    if explicit is not None:
+        path = Path(explicit)
+        if not path.is_file():
+            raise typer.BadParameter(f"no trace file at {path} (--traces)")
+        return path
+    found = local_traces_path(model_dir)
+    if found is not None:
+        return found
+    raise typer.BadParameter(
+        f"no trace corpus for world model {resolved_name!r}: looked for "
+        f"{model_dir / TRACES_FILENAME} and {model_dir.parent.parent / TRACES_FILENAME}. "
+        "A build keeps no copy of the corpus it read, so pass the file `wmo build --file` was "
+        f"given: `wmo demo --name {resolved_name} --traces <that file>`"
+    )
 
 
 def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
@@ -2186,48 +2777,90 @@ def _action_suggestions(wm: WorldModel, n: int = 3) -> list[str]:
 
 
 def _load_model_any(name: str | None, root: str, *, max_fidelity: bool = False):  # noqa: ANN202
-    """Resolve a model across the project dir AND shipped examples, then load it.
+    """Resolve a model across the project dir AND shipped examples, then load it."""
+    store_root, resolved = _resolve_model_any(name, root)
+    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
+    return wm, resolved, provider, store_root
 
-    An explicit non-default `--root` keeps the old single-root behavior. Otherwise the picker
-    spans `<root>/models/*` plus `examples/*/models/*`, labeling each with its source.
+
+def _model_candidates(root: str) -> list[tuple[str, Path, str]]:
+    """Every reachable artifact as `(label, store_root, name)`, local builds first.
+
+    The label disambiguates same-named artifacts (`tau-bench (local)` vs `tau-bench (tau-bench
+    example)`), so every message that enumerates choices must print labels, not bare names.
     """
-    if root != ARTIFACT_DIR:
-        wm, resolved, provider = _load_model(name, root, max_fidelity=max_fidelity)
-        return wm, resolved, provider, Path(root)
-
-    candidates: list[tuple[str, Path, str]] = []  # (label, store_root, name)
-    local = WorldModelStore(root)
-    candidates.extend((f"{n} (local)", Path(root), n) for n in local.list_names())
+    candidates: list[tuple[str, Path, str]] = []
+    candidates.extend((f"{n} (local)", Path(root), n) for n in WorldModelStore(root).list_names())
     for example_dir in _discover_examples():
         example_store = WorldModelStore(example_dir)
         candidates.extend(
             (f"{n} ({example_dir.name} example)", example_dir, n)
             for n in example_store.list_names()
         )
+    return candidates
 
+
+def _is_default_project_dir(root: str) -> bool:
+    """Whether `--root` still points at the default project dir, however it was spelled.
+
+    Comparing the raw string against `.wmo` made `--root ./.wmo` and `--root .wmo/` (what shell
+    tab-completion types) silently mean something different from `--root .wmo`, so resolve both.
+    """
+    return Path(root).resolve() == Path(ARTIFACT_DIR).resolve()
+
+
+def _resolve_model_any(name: str | None, root: str) -> tuple[Path, str]:
+    """Which artifact a read command should open, as `(store_root, resolved_name)`.
+
+    A `--root` pointing somewhere other than the default project dir keeps single-root behavior.
+    Otherwise the search spans `<root>/models/*` plus the shipped `examples/*/models/*` and
+    `packages/environment-capture/*/models/*`, so `demo`, `play` and `knowledge` all agree on
+    which models exist.
+    """
+    if not _is_default_project_dir(root):
+        return Path(root), _resolve_name(WorldModelStore(root), name)
+
+    candidates = _model_candidates(root)
     if name is not None:
         matched = [c for c in candidates if c[2] == name]
         if not matched:
-            have = ", ".join(c[2] for c in candidates) or "none built"
+            have = ", ".join(c[0] for c in candidates) or "none built"
             raise typer.BadParameter(f"no world model named {name!r} (have: {have})")
         # Prefer the local build over a same-named example artifact.
-        label, store_root, resolved = matched[0]
+        _label, store_root, resolved = matched[0]
     elif not candidates:
         raise typer.BadParameter(
-            "no world models found; run `wmo build` or try an example (examples/tau-bench)"
+            "no world models found; build one with `wmo build --file <traces> --name <name>`, "
+            "or fetch a published benchmark corpus first with `wmo download tau-bench`"
         )
     elif len(candidates) == 1:
-        label, store_root, resolved = candidates[0]
+        _label, store_root, resolved = candidates[0]
     elif _console.is_terminal:
         labels = [c[0] for c in candidates]
         chosen = _select_from(labels)
-        label, store_root, resolved = candidates[labels.index(chosen)]
+        _label, store_root, resolved = candidates[labels.index(chosen)]
     else:
-        have = ", ".join(c[2] for c in candidates)
-        raise typer.BadParameter(f"multiple world models ({have}); pass --name")
+        have = ", ".join(c[0] for c in candidates)
+        raise typer.BadParameter(
+            f"multiple world models ({have}); pass --name{_shadow_hint(candidates)}"
+        )
+    return store_root, resolved
 
-    wm, resolved, provider = _load_model(resolved, str(store_root), max_fidelity=max_fidelity)
-    return wm, resolved, provider, store_root
+
+def _shadow_hint(candidates: list[tuple[str, Path, str]]) -> str:
+    """Name the flag that reaches a shipped example a same-named local build shadows.
+
+    `--name` cannot separate the two (the local build always wins), so a listing that shows the
+    name twice has to say which flag can: `--root <the example dir>`.
+    """
+    names = [c[2] for c in candidates]
+    shadowed = [c for c in candidates if names.count(c[2]) > 1 and not c[0].endswith("(local)")]
+    if not shadowed:
+        return ""
+    label, store_root, shadowed_name = shadowed[0]
+    return (
+        f" (--name {shadowed_name} takes the local build; for '{label}' pass --root {store_root})"
+    )
 
 
 def _select_from(labels: list[str]) -> str:
@@ -2259,7 +2892,15 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
         # Only enumerate full model summaries when we actually need the picker (>1 model on a TTY).
         # `list_names` is cheap (a dir scan); `list_info` reads every config/metrics/frontier file.
         if _console.is_terminal and len(store.list_names()) > 1:
-            return select_model(_console, store.list_info())
+            # An artifact `list_info` reports as unreadable cannot be run, so keep it off the
+            # menu; `wmo list` is where its reason is printed.
+            readable = [info for info in store.list_info() if info.error is None]
+            if not readable:
+                raise ValueError(
+                    f"no readable world model under {store.models_dir}; "
+                    "run `wmo list` to see what is wrong with each one"
+                )
+            return select_model(_console, readable)
         return store.resolve(None).name
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -2335,8 +2976,17 @@ def research_concurrency(
     side: str = typer.Option(
         "both", "--side", help="both = differential | world = WM-only | real = sandbox-only."
     ),
-    provider: str = typer.Option("bedrock", "--provider", help="Provider running the model."),
-    model: str = typer.Option("us.anthropic.claude-opus-4-8", help="Model id (environment LLM)."),
+    provider: str | None = typer.Option(
+        None,
+        "--provider",
+        help="Provider running the model. Default: the worker role `wmo providers set` wrote to "
+        "`.wmo/settings.toml`, else bedrock.",
+    ),
+    model: str | None = typer.Option(
+        None,
+        help="Model id (environment LLM). Default: the configured worker role's model, else the "
+        "flagship of whichever provider is in play (bedrock/claude-opus-4-8).",
+    ),
     region: str | None = typer.Option(None, help="AWS region (Bedrock)."),
     deployment: str | None = typer.Option(None, help="Azure OpenAI deployment name."),
     api_version: str | None = typer.Option(None, help="Azure OpenAI API version."),
@@ -2362,12 +3012,18 @@ def research_concurrency(
     except ValueError:
         allowed = ", ".join(s.value for s in Side)
         raise typer.BadParameter(f"--side must be one of: {allowed}") from None
-    # Validate the provider up front, not lazily inside a worker thread mid-sweep.
-    try:
-        provider_kind = ProviderKind(provider)
-    except ValueError:
-        kinds = ", ".join(k.value for k in ProviderKind)
-        raise typer.BadParameter(f"unknown provider {provider!r}; choose one of: {kinds}") from None
+    # Resolve (and so validate) the environment LLM up front, not lazily inside a worker thread
+    # mid-sweep. Omitted flags come from the configured worker role.
+    # `--deployment` goes IN rather than on top: on Azure it is what a `--model` swap needs to
+    # know, and layering it afterwards would reject a run the user had already answered for.
+    env_config = _worker_role_provider_config(provider, model, region, deployment=deployment)
+    connection = {
+        field: value
+        for field, value in (("api_version", api_version), ("endpoint", endpoint))
+        if value is not None
+    }
+    if connection:
+        env_config = env_config.model_copy(update=connection)
     if select not in ("simplest", "longest", "random"):
         raise typer.BadParameter("--select must be one of: simplest, longest, random")
     try:
@@ -2392,7 +3048,17 @@ def research_concurrency(
     suite_roots = (
         [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
     )
-    resolved = resolve_eval_suite(suite, suite_roots)
+    # An unresolvable suite is a bad argument, like every other input validated above; the
+    # ValueError carries the available names, so only the next command has to be added. A direct
+    # `.toml` selector that exists resolves past name lookup and fails on its own contents, so
+    # listing the discoverable suites there would point away from the file that needs repairing.
+    try:
+        resolved = resolve_eval_suite(suite, suite_roots)
+    except ValueError as exc:
+        direct = Path(suite)
+        resolved_by_name = not (direct.suffix == ".toml" and direct.exists())
+        hint = "; `wmo eval list` prints the suites" if resolved_by_name else ""
+        raise typer.BadParameter(f"{exc}{hint}") from exc
     files = resolved.resolve_files()
     missing = [f for f in files if not f.exists()]
     if not files or missing:
@@ -2436,16 +3102,7 @@ def research_concurrency(
     )
 
     def provider_factory() -> Provider:
-        return providers.get_provider(
-            ProviderConfig(
-                kind=provider_kind,
-                model=model,
-                region=region,
-                deployment=deployment,
-                api_version=api_version,
-                endpoint=endpoint,
-            )
-        )
+        return providers.get_provider(env_config)
 
     world_runner = build_world_runner(provider_factory, prompt, demos, selected)
     real_runner = None
@@ -2517,9 +3174,12 @@ def research_plot_concurrency(
     ideal-linear, and the T_real/T_world differential when the report has both sides.
 
     `concurrency_plot` is imported here (not at module scope) because it pulls in matplotlib/pandas
-    from the optional `viz` extra — the harness runtime must not require them. A missing extra
-    raises a plain ImportError naming the module (`uv sync --extra viz`); it is not caught.
+    from the optional `viz` extra, and the harness runtime must not require them.
+    `_require_viz_extra`
+    turns a missing extra into a usage error naming `uv sync --extra viz`, so the import itself
+    never surfaces a raw ModuleNotFoundError traceback.
     """
+    _require_viz_extra()
     from wmo.research.concurrency_plot import render_report
 
     try:
@@ -2547,8 +3207,10 @@ def research_plot_concurrency_combined(
     explains it). Pass the per-benchmark report JSONs (`wmo research concurrency <suite> --out ...`)
     in the order you want them coloured.
 
-    Imported lazily for the same reason as `plot-concurrency` (the optional matplotlib viz extra).
+    Imported lazily for the same reason as `plot-concurrency` (the optional matplotlib viz extra),
+    and guarded by the same `_require_viz_extra` pre-flight.
     """
+    _require_viz_extra()
     from wmo.research.concurrency_plot import render_cost, render_speedup
 
     try:
@@ -2635,8 +3297,11 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
     resolved_name = _resolve_name(store, name)
     model_dir = store.resolve(resolved_name)
     config = load_config(model_dir)
+    serve_config = config.serve_provider_config()
+    backend = providers.get_provider(serve_config)
+    _prepare_serve_provider_or_exit(backend, serve_config)
     provider = wrap_provider_with_retries(
-        providers.get_provider(config.serve_provider_config()),
+        backend,
         on_retry=_NARRATOR.on_retry,
         sleep=_NARRATOR.sleep,
     )
@@ -2644,6 +3309,86 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
         str(model_dir), provider, telemetry_root=store.root, max_fidelity=max_fidelity
     )
     return world_model, resolved_name, provider
+
+
+def _prepare_serve_provider_or_exit(provider: Provider, config: ProviderConfig) -> None:
+    """Resolve the serve backend's local prerequisites before the first step, or exit cleanly.
+
+    Every backend builds its SDK client lazily, so a missing SDK or an unset credential otherwise
+    surfaces as the SDK's own exception mid-rollout, which Typer renders as a traceback.
+    `PreparableProvider.prepare` is the free, offline seam `wmo optimize route sweep` already
+    pre-flights with (no backend's `prepare` touches the network), so the interactive commands
+    fail here with the same hint `wmo providers verify` prints. Bedrock and tinker document a
+    residual gap they cannot close locally; those still fail on the first call.
+    """
+    if not isinstance(provider, PreparableProvider):
+        return
+    try:
+        provider.prepare()
+    except Exception as exc:  # noqa: BLE001 - every backend raises its own SDK's type here
+        _console.print(
+            f"[red]✗ {config.kind.value} ({config.model}) unusable[/red]: {escape(str(exc))}"
+        )
+        _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
+        _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
+        raise typer.Exit(1) from exc
+
+
+def _exit_serve_provider_failure(
+    resolved_name: str,
+    config: ProviderConfig,
+    exc: Exception,
+    *,
+    out_of_capacity: bool,
+    retry: str,
+) -> NoReturn:
+    """Render a serve-provider failure as the setup error or the outage it actually is, then exit.
+
+    The two need opposite next steps, and printing the wrong one costs the user the debugging
+    session: a 429/503/timeout has already survived `RetryingProvider`'s backoff, so the
+    credentials it took to get that far are demonstrably fine and `wmo providers verify` will
+    just report the same outage. Only a refusal (bad key, unserved model id) earns the
+    credential hint.
+    """
+    verb = "is out of capacity" if out_of_capacity else "failed"
+    _console.print(
+        f"\n[red]✗ the serve provider for {resolved_name!r} "
+        f"({config.kind.value}, {config.model}) {verb}[/red]: {escape(_short_error(exc))}"
+    )
+    if out_of_capacity:
+        _console.print(
+            "  [yellow]retries are exhausted and the backend is still refusing; this is an "
+            "outage or a rate limit, not a credentials problem[/yellow]"
+        )
+        _console.print(
+            f"  [yellow]re-run {retry} once it recovers, or run it on a terminal to switch "
+            "provider and resume from the failed step[/yellow]"
+        )
+    else:
+        _console.print(f"  [yellow]{escape(_credential_hint(config.kind, str(exc)))}[/yellow]")
+        _console.print("  [yellow]then re-check with `wmo providers verify`[/yellow]")
+    raise typer.Exit(1) from exc
+
+
+# Top-level modules whose exceptions mean "the backend refused", not "wmo has a bug": the provider
+# SDKs plus the HTTP transports they raise through. llm-waterfall gates its capacity/client
+# classification on the same set; this one answers a different question (is a credential hint the
+# right thing to print?), so it stays a local literal rather than importing a private name.
+_PROVIDER_SDK_MODULES = frozenset(
+    {"anthropic", "boto3", "botocore", "httpcore", "httpx", "openai", "tinker"}
+)
+
+
+def _is_provider_sdk_error(exc: Exception) -> bool:
+    """Whether `exc` was DEFINED by a provider SDK (bad creds, bad model id, refused request).
+
+    Deliberately narrow: wmo's own bugs must keep their traceback, so only exceptions whose class
+    (or a base of it) comes from a backend SDK are re-rendered as a setup error.
+    """
+    return any(
+        (getattr(klass, "__module__", "") or "").split(".")[0] in _PROVIDER_SDK_MODULES
+        for klass in type(exc).__mro__
+    )
 
 
 if __name__ == "__main__":

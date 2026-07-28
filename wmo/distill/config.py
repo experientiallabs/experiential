@@ -1083,6 +1083,9 @@ def load_distill_config(path: Path) -> DistillConfig:
         FileNotFoundError: If the file does not exist.
         ValueError: If the file is not valid TOML or fails validation; the
             message names the file and each failing field.
+        ImportError: If a section can only be validated with the distill extra
+            installed (`[rollout.renderers]` resolves names through
+            tinker-cookbook) and the extra is missing.
     """
     try:
         text = path.read_text(encoding="utf-8")

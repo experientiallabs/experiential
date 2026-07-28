@@ -31,9 +31,9 @@ import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Confirm
 from rich.table import Table
 
+from wmo.cli.consent import require_spend_consent
 from wmo.cli.route_app import (
     BIAS_ACCEPTED_NOTE,
     NO_EVIDENCE_WARNING,
@@ -64,7 +64,12 @@ from wmo.optimize.knn import (
     fit_provenance,
     tune_policy_dial,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, load_matrix_with_digest
+from wmo.optimize.outcomes import (
+    ROUTER_SPLIT_VERSION,
+    OutcomeMatrix,
+    load_matrix_with_digest,
+    split_router_scenarios,
+)
 from wmo.optimize.pipeline import (
     BUILT_STAGES,
     CONFIGURED_STAGES,
@@ -126,7 +131,7 @@ ASSUMED_OUTPUT_TOKENS = 250
 
 _KNN_KNOBS = (
     f"z={DEFAULT_KNN_Z:g} k={DEFAULT_RAG_NUM} thres={DEFAULT_RAG_THRES:g} "
-    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05"
+    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05 split={ROUTER_SPLIT_VERSION}"
 )
 """The knn fit this command performs. Fixed: the validated champion, dialed after the fact."""
 
@@ -249,7 +254,13 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         "biased; the coverage table prints either way.",
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir holding the built models."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the one spend confirmation."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where a spending run "
+        "otherwise refuses to start.",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -359,15 +370,24 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         already_measured = resumable_cells(plan)
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    try:
+        split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
-    if baseline is not None:
-        # Knowable from the pool the pre-flight already loaded, so it is a boundary error rather
-        # than a surprise after the sweep has been paid for and the fit written.
-        known = [entry.name for entry in preflight.pool.models]
-        if baseline not in known:
+    # Both flags name a pool candidate, and the pool is loaded by the pre-flight above, so a typo
+    # is knowable here for free: a boundary error rather than a surprise after the sweep has been
+    # paid for and the fit written. --fallback used to survive this far and then be printed in the
+    # plan table as if it were a real model, only failing inside the fit stage.
+    known = [entry.name for entry in preflight.pool.models]
+    for flag, value, why in (
+        ("--fallback", fallback, "the fit can only guard a candidate the sweep measures"),
+        ("--baseline", baseline, "the report can only anchor on a candidate the sweep measures"),
+    ):
+        if value is not None and value not in known:
             raise typer.BadParameter(
-                f"--baseline '{baseline}' is not a model in {pool_file}; the report can only "
-                f"anchor on a candidate the sweep measures. Available: {', '.join(known)}"
+                f"{flag} '{value}' is not a model in {pool_file}; {why}. "
+                f"Available: {', '.join(known)}"
             )
 
     # Printed before the plan table, the way `route fit` prints it before the fit: the embedder
@@ -437,7 +457,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except BudgetExceeded as exc:
         _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
-    if not _confirm(decisions, yes=yes):
+    if not _confirm(decisions, plan, yes=yes):
         _console.print("nothing was run and nothing was spent")
         raise typer.Exit(0)
 
@@ -856,6 +876,7 @@ def _stage_plan_text(
     already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
+    router_split = split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
     match stage:
         case Stage.PREFLIGHT:
             return f"resolve {len(plan.pool.models)} backend(s), check prices"
@@ -877,11 +898,17 @@ def _stage_plan_text(
             # Says what it IS rather than implying a step: the arm plus the two stages it sets up.
             return f"{escape(compression_signature(compression))}, configures sweep and fit"
         case Stage.FIT:
-            return f"knn (guarded, fallback {escape(fallback or 'best single on the sweep')})"
+            return (
+                f"knn over {len(router_split.fit_ids)} fit scenario(s) "
+                f"(guarded, fallback {escape(fallback or 'best single on the fit split')})"
+            )
         case Stage.TUNE:
             return f"cost_quality {cost_quality:g} ({cost_quality_named_point(cost_quality)})"
         case _:
-            return f"3-objective headline vs {escape(anchor)}"
+            return (
+                f"3-objective headline vs {escape(anchor)} over "
+                f"{len(router_split.report_ids)} router-held-out scenario(s)"
+            )
 
 
 def _report_estimate(policy_path: Path, fitting_with: EmbedderSpec) -> str:
@@ -1069,7 +1096,7 @@ def _status_text(decision: StageDecision) -> str:
     return f"will run [dim]({escape(decision.reason)})[/dim]"
 
 
-def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
+def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> bool:
     """The run's single spend confirmation. One question, before the first paid call.
 
     Asked whenever the SWEEP will run, rather than whenever the candidate projection is nonzero.
@@ -1079,10 +1106,12 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
     run of only those does not need permission to happen.
 
     A non-interactive session cannot answer, so a spending run REFUSES rather than proceeding:
-    consent must be said (`--yes`), never inferred from the absence of a terminal. Every spend
-    surface (`route sweep`, `optimize distill`, the harbor search) shares this rule; all of
-    them originally shipped proceed-silently-or-note, and the proceed branch here cost a
-    scripted caller real money it never agreed to.
+    consent must be said (`--yes`), never inferred from the absence of an interactive session on
+    BOTH streams (a redirected stdin is not a person, even under a terminal stdout). Every spend
+    surface (`route sweep`, `optimize distill`, both harness environments) shares the one
+    implementation in `wmo.cli.consent`; all of them originally shipped
+    proceed-silently-or-note, and the proceed branch here cost a scripted caller real money it
+    never agreed to.
 
     Raises:
         typer.Exit: code 2 when a spending run cannot ask and was not told `--yes`.
@@ -1091,13 +1120,13 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
         return False
     if yes or not _will_sweep(decisions):
         return True
-    if not _console.is_terminal:
-        _console.print(
-            "\nnon-interactive session: cannot ask for spend consent. Re-run with --yes to "
-            "consent explicitly, or --dry-run to see the plan without spending."
-        )
-        raise typer.Exit(2)
-    return Confirm.ask("\nProceed?", default=True)
+    return require_spend_consent(
+        _console,
+        yes=yes,
+        spend=f"~${_projected_total(decisions, plan):.2f} across {plan.cells} sweep cell(s)",
+        command="wmo optimize model",
+        alternative="--dry-run to see the plan without spending",
+    )
 
 
 # ------------------------------------------------------------------------------ stage execution
@@ -1308,11 +1337,17 @@ def _stage_fit(
     """
     matrix, source = load_matrix_with_digest(paths.matrix)
     try:
+        router_split = split_router_scenarios(matrix.scenario_ids())
+    except ValueError as exc:
+        _console.print(f"[red]fit failed[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    try:
         fitted = fit_knn_artifact(
             matrix,
             out_path=paths.policy,
             matrix_source=source,
             embedder=embedder,
+            fit_ids=list(router_split.fit_ids),
             fallback=fallback,
             compression=compression,
         )

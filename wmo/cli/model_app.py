@@ -43,8 +43,10 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.agents.default import default_agent
+from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.model_roles import load_settings_or_abort
 from wmo.config import ARTIFACT_DIR
-from wmo.config.settings import ModelRole, load_settings, save_settings, settings_path
+from wmo.config.settings import ModelRole, save_settings, settings_path
 from wmo.config.store import validate_name
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig, load_distill_config
@@ -162,7 +164,13 @@ def run(
         help="After an accepted gate, offer to point the models.agent role in settings.toml "
         "at the distilled adapter (always asks for confirmation).",
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
+    ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
 ) -> None:
     """Train (or resume) an agent model by distillation on real benchmark tasks.
@@ -424,8 +432,10 @@ def run_distill(
         backend: An explicit `--backend` override for the rollout source's
             backend (harbor or tau2), or None when the flag was not given.
         resume: Continue the run recorded in `run_dir`.
-        yes: Skip the cost confirmation (see `_confirm_cost` for the one
-            case where confirmation is forced anyway).
+        yes: Consent to the projected spend up front, and required on a
+            non-interactive session where there is nobody to ask (see
+            `_confirm_cost` for the one case where confirmation is forced
+            anyway).
         promote: After an accepted gate, offer to write `[models.agent]`
             pointing at the distilled adapter (explicit confirmation).
         root: The project dir (harness store, adapter store, settings).
@@ -646,10 +656,15 @@ def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
         )
     tau2_bin = Path(cfg.tau2.tau2_bin)
     if not tau2_bin.is_file():
+        # Self-contained on purpose: tau2-bench is an external clone no wheel can ship, so a
+        # pip-installed user has no repo file to be pointed at. The one-time setup is three
+        # commands, so the message carries them instead of a path that may not exist.
         raise typer.BadParameter(
-            f"tau2.tau2_bin {tau2_bin} does not exist; point it at the tau2 CLI inside "
-            "its own venv (see packages/environment-capture/tau-bench/README.md for the "
-            "one-time setup)"
+            f"tau2.tau2_bin {tau2_bin} does not exist; tau2-bench runs from its own Python 3.13 "
+            "venv, so set it up once (`git clone --depth 1 "
+            "https://github.com/sierra-research/tau2-bench && uv venv --python 3.13 .venv && "
+            "uv pip install --python .venv ./tau2-bench audioop-lts boto3`) and point "
+            "tau2.tau2_bin at that venv's CLI, <where-you-ran-it>/.venv/bin/tau2"
         )
     data_dir = Path(cfg.tau2.data_dir)
     if not data_dir.is_dir():
@@ -686,6 +701,13 @@ def _load_config(path: Path) -> DistillConfig:
         ) from exc
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    except ImportError as exc:
+        # Some sections can only be VALIDATED with the distill extra installed:
+        # `[rollout.renderers]` resolves its names through tinker-cookbook. pydantic re-raises a
+        # non-ValueError out of a field validator untouched, so without this a missing extra
+        # (the state every shipped reference config lands in on a plain `pip install`) escapes
+        # as a traceback instead of the install command the user needs.
+        raise typer.BadParameter(f"cannot load {path}: {exc}") from exc
 
 
 def _load_record(path: Path) -> DistillCliRunRecord:
@@ -907,9 +929,13 @@ def _confirm_cost(
     with `--yes`; a non-interactive invocation in that state is rejected with
     instructions (price the meters or set the cap).
 
+    Everything else goes through the shared spend boundary
+    (`wmo.cli.consent.require_spend_consent`), so consent is said, never inferred.
+
     Raises:
         typer.BadParameter: Unbounded spend in a non-interactive session.
-        typer.Exit: The user declined (exit code 0).
+        typer.Exit: The user declined (exit code 0), or a non-interactive session was not
+            told `--yes` (exit code 2).
     """
     if estimate.unpriced_meters and max_usd is None:
         meters = ", ".join(estimate.unpriced_meters)
@@ -918,27 +944,37 @@ def _confirm_cost(
             "budget.max_usd is unset: the run's spend is unbounded and unaccounted, "
             "so --yes does not apply here"
         )
-        if not console.is_terminal:
+        # `can_prompt`, not `console.is_terminal`: the question below reads stdin, so a terminal
+        # stdout with a redirected stdin has nobody behind it to answer for unbounded spend.
+        if not can_prompt(console):
             raise typer.BadParameter(
                 f"cannot start with unbounded spend non-interactively: meter(s) "
                 f"{meters} are unpriced and budget.max_usd is unset; add [pricing] "
                 "entries for them or set [budget] max_usd in the distill config, "
-                "or run at a TTY to confirm explicitly"
+                "or run it interactively to confirm explicitly"
             )
-        if not Confirm.ask("Proceed with unbounded spend?", default=False):
+        try:
+            confirmed = Confirm.ask("Proceed with unbounded spend?", default=False)
+        except EOFError:
+            confirmed = False  # an ended input is not an answer, and never authorizes spend
+        if not confirmed:
             raise typer.Exit(0)
         return
-    if yes:
-        return
-    if not console.is_terminal:
-        # Consent is said, never inferred: a bounded budget caps the damage but does not
-        # grant permission, and this used to start six-figure-token training runs silently.
-        console.print(
-            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-            "consent explicitly"
-        )
-        raise typer.Exit(2)
-    if not Confirm.ask("Proceed?", default=True):
+    # Consent is said, never inferred: a bounded budget caps the damage but does not grant
+    # permission, and this used to start six-figure-token training runs silently.
+    cap = f" under the ${max_usd:.2f} budget.max_usd cap" if max_usd is not None else ""
+    episodes = (
+        estimate.train_episodes
+        + estimate.warmup_episodes
+        + estimate.eval_episodes
+        + estimate.baseline_episodes
+    )
+    if not require_spend_consent(
+        console,
+        yes=yes,
+        spend=f"~${estimate.priced_usd:.2f} over {episodes} episode(s){cap}",
+        command="wmo optimize distill run",
+    ):
         raise typer.Exit(0)
 
 
@@ -1014,10 +1050,7 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
             f"skipped writing \\[models.agent]; paste the handoff snippet into {path} when ready"
         )
         return
-    try:
-        settings = load_settings(root)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    settings = load_settings_or_abort(root)
     settings.models.agent = ModelRole(
         provider="openai",
         model=result.final_sampler_path,
@@ -1157,6 +1190,43 @@ def _print_paired_delta(console: Console, store: DistillRunStore, gate: DistillG
     )
 
 
+def _read_metrics(console: Console, store: DistillRunStore) -> list[JsonObject]:
+    """Every metrics row, surviving the half-written last line an aborted run leaves.
+
+    `report` advertises itself as safe on a live or aborted run dir, so a torn final row (all a
+    run killed mid-append can leave behind) must not end the command: drop it, say so, and
+    report what is complete. Every other shape of damage -- a broken row above the last one, or
+    a last line that parses into something other than a JSON object, which no truncated append
+    can produce -- means the file lost or gained content, so it stays an error; it is just a
+    usage error now, the way `_load_gate` and `_load_eval_report` already treat the same class
+    of damage, rather than a traceback.
+
+    Args:
+        console: Where to print the note about a dropped final line.
+        store: The run store to read `metrics.jsonl` from.
+
+    Returns:
+        Every complete row, in append order.
+
+    Raises:
+        typer.BadParameter: If the damage is anything but a half-written last line.
+    """
+    try:
+        return store.read_metrics()
+    except ValueError:
+        pass  # the tolerant read below decides whether the damage is only the torn tail
+    try:
+        rows = store.read_metrics(tolerate_partial_tail=True)
+    except ValueError as fatal:
+        raise typer.BadParameter(str(fatal)) from fatal
+    console.print(
+        f"[yellow]note[/yellow] ignoring a half-written last line in "
+        f"{escape(str(store.metrics_path))} (a run killed mid-append leaves one); "
+        f"reporting the {len(rows)} complete row(s)"
+    )
+    return rows
+
+
 def _print_training_summary(console: Console, store: DistillRunStore) -> None:
     """Print the last training row's health metrics, or say the run trained nothing.
 
@@ -1164,7 +1234,7 @@ def _print_training_summary(console: Console, store: DistillRunStore) -> None:
     it. `mean_generation_tokens` is the per-episode series the loop does
     measure (sampled tokens, pooled over the batch's span-bearing episodes).
     """
-    rows = [row for row in store.read_metrics() if row.get("phase") is None]
+    rows = [row for row in _read_metrics(console, store) if row.get("phase") is None]
     if not rows:
         console.print("no training step recorded in metrics.jsonl")
         return

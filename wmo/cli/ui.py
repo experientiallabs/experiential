@@ -99,6 +99,17 @@ def judge_model_default(provider: str | None, serve_model: str) -> str:
     return _JUDGE_MODEL_DEFAULTS.get(provider or "", serve_model)
 
 
+def serve_model_default(provider: str | None) -> str | None:
+    """The serve model when none was chosen: the provider's suggested (first) model id.
+
+    Mirrors what the wizard offers, so the scriptable flag path and the interactive path agree.
+    Returns None for a provider with no curated list (openai_responses, openrouter, tinker):
+    there is no id worth guessing, so the caller must ask for `--model`.
+    """
+    models = _PROVIDER_MODELS.get(provider or "")
+    return models[0] if models else None
+
+
 # Embedders offered in the wizard, with the embeddings-model ids each provider-backed one supports
 # (None = the offline hashing embedder, no model). First entry is the suggested default.
 _EMBEDDERS: dict[str, list[str] | None] = {
@@ -979,7 +990,12 @@ def build_summary_panel(info: ModelInfo, root: str) -> Panel:
 
 
 def models_table(infos: list[ModelInfo]) -> Table:
-    """A table of every built world model (for `wmo list`)."""
+    """A table of every built world model (for `wmo list`).
+
+    An artifact the store could not read still gets a row, marked `unreadable`: it exists on
+    disk, so hiding it would be a lie, and dropping the whole table would hide the healthy models
+    beside it. `wmo list` prints the reason under the table.
+    """
     table = Table(title="world models")
     table.add_column("name", style="bold")
     table.add_column("serve provider")
@@ -989,7 +1005,9 @@ def models_table(infos: list[ModelInfo]) -> Table:
     for info in infos:
         table.add_row(
             info.name,
-            f"{info.serve_provider} ({info.serve_model})",
+            "[red]unreadable[/red]"
+            if info.error is not None
+            else f"{info.serve_provider} ({info.serve_model})",
             "-" if info.held_out_accuracy is None else f"{info.held_out_accuracy:.3f}",
             "-" if info.rollouts_used is None else str(info.rollouts_used),
             "-" if info.frontier_size is None else str(info.frontier_size),

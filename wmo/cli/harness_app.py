@@ -22,12 +22,13 @@ import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 
 from wmo.agents.default import default_agent
 from wmo.agents.optimizer import optimizer_agent
 from wmo.agents.project import AgentProject
+from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.config.store import validate_name
@@ -61,6 +62,9 @@ from wmo.providers.registry import get_provider
 # The default agent seed's literal CLI name: `wmo optimize harness pi harbor ...` starts from the
 # built-in pi agent and publishes new versions under the store name "pi".
 DEFAULT_SEED_AGENT = "pi"
+# The search budget each environment falls back to when --iterations is not given. They differ
+# (harbor buys more, cheaper, steps), which is exactly why --iterations' help states both.
+_DEFAULT_WORLD_MODEL_ITERATIONS = 5
 _DEFAULT_HARBOR_ITERATIONS = 10
 _HARBOR_ENVIRONMENT = "harbor"
 _HARBOR_EXTRA_HINT = (
@@ -105,7 +109,7 @@ def list_harnesses(root: str = typer.Option(ARTIFACT_DIR, help="Project dir.")) 
             broken.append((name, str(exc)))
     _console.print(table)
     for name, reason in broken:
-        _console.print(f"[red]broken[/red] {name}: {reason}")
+        _console.print(f"[red]broken[/red] {escape(name)}: {escape(reason)}")
 
 
 @harness_app.command("show")
@@ -116,17 +120,27 @@ def show_harness(
     """Print one harness version's surfaces."""
     base, _, ref = name.partition("@")
     try:
-        doc = HarnessStore(root).load(base, ref or None)
-    except (FileNotFoundError, ValueError) as exc:
+        validate_name(base, kind="harness")  # a bad name is a name error, not a missing ref
+    except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    _console.print(f"[bold]{doc.name}[/bold] v{doc.version}  doc_hash={doc.doc_hash[:12]}")
+    try:
+        doc = HarnessStore(root).load(base, ref or None)
+    except FileNotFoundError as exc:  # no such harness: nothing to list, so offer to create it
+        raise typer.BadParameter(f"{exc}; `wmo harness init {base}` creates the baseline") from exc
+    except ValueError as exc:  # the harness exists, the ref does not
+        raise typer.BadParameter(
+            f"{exc}; run `wmo harness list` to see its versions and aliases"
+        ) from exc
+    _console.print(f"[bold]{escape(doc.name)}[/bold] v{doc.version}  doc_hash={doc.doc_hash[:12]}")
+    # Surface bodies are prompts, skills and code: brackets are ordinary content, so they are
+    # escaped rather than read as rich markup (which crashes on an unmatched closing tag).
     for surface in doc.surfaces:
         budget = f"  budget={surface.budget}" if surface.budget is not None else ""
         _console.print(
-            f"\n[bold]{surface.id}[/bold]  ({surface.kind.value}, "
+            f"\n[bold]{escape(surface.id)}[/bold]  ({surface.kind.value}, "
             f"hash={surface.content_hash[:12]}{budget})"
         )
-        _console.print(surface.content)
+        _console.print(escape(surface.content))
 
 
 optimize_app = typer.Typer(
@@ -172,7 +186,9 @@ def optimize(
         "local",
         "--backend",
         help="Where the harness PROCESS runs: local (in/from this process) or e2b (the real "
-        "pi agent inside pooled E2B sandboxes). The environment is always the world model.",
+        "pi agent inside pooled E2B sandboxes). With a world-model ENVIRONMENT that is all it "
+        "moves: the environment stays the world model. With `harbor` it also selects the task "
+        "environment (local = docker tasks, e2b = E2B tasks).",
     ),
     eval_concurrency: int | None = typer.Option(
         None,
@@ -196,7 +212,9 @@ def optimize(
     iterations: int = typer.Option(
         None,
         min=0,
-        help="Propose-and-gate steps (the search budget). 0 scores the seed only (harbor env), "
+        help=f"Propose-and-gate steps (the search budget). Default: "
+        f"{_DEFAULT_WORLD_MODEL_ITERATIONS} for a world-model environment, "
+        f"{_DEFAULT_HARBOR_ITERATIONS} for harbor. 0 scores the seed only (harbor env), "
         "the way a baseline or a frozen champion is scored on a task set.",
     ),
     proposal_batch_size: int = typer.Option(
@@ -210,7 +228,13 @@ def optimize(
     archive_out: str = typer.Option(
         None, "--archive", help="Also write the full delta archive JSON here."
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
+    ),
     harbor_config: str = typer.Option(
         None,
         "--harbor-config",
@@ -352,27 +376,33 @@ def optimize(
             "--iterations 0 (score-only) applies only to the harbor environment; "
             "world-model optimization needs at least one search iteration"
         )
-    interactive = _console.is_terminal
+    # The same both-streams test the spend gate below uses: a terminal stdout with a redirected
+    # stdin has nobody to answer the wizard, and asking anyway raised EOFError at the first
+    # `Prompt.ask` instead of the usage error that names the missing option.
+    interactive = can_prompt(_console)
     if name is None:
         if not interactive:
-            raise typer.BadParameter("provide a harness NAME (or run at a TTY for the wizard)")
+            raise typer.BadParameter("provide a harness NAME (or run interactively for the wizard)")
         name = Prompt.ask("Name for the created harness", default="evolved")
     if tasks_file is None:
         if not interactive:
-            raise typer.BadParameter("provide --tasks (or run at a TTY for the wizard)")
+            raise typer.BadParameter("provide --tasks (or run interactively for the wizard)")
         tasks_file = Prompt.ask("Task file (JSONL of task_id/instruction/gold)")
     if iterations is None:
         iterations = (
-            IntPrompt.ask("Search iterations (each = 1 delta + 1 gated eval)", default=5)
+            IntPrompt.ask(
+                "Search iterations (each = 1 delta + 1 gated eval)",
+                default=_DEFAULT_WORLD_MODEL_ITERATIONS,
+            )
             if interactive
-            else 5
+            else _DEFAULT_WORLD_MODEL_ITERATIONS
         )
 
     if backend not in ("local", "e2b"):
         raise typer.BadParameter(f"unknown --backend {backend!r}; choose local or e2b")
     # Fail on a bad name NOW, not after the search has spent its eval budget on the save.
     try:
-        validate_name(name)
+        validate_name(name, kind="harness")
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     tasks = _load_task_file(tasks_file)
@@ -409,7 +439,15 @@ def optimize(
         f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
         f"{meta_note}{agent_note}{backend_note}"
     )
-    if interactive and not yes and not Confirm.ask("Proceed?", default=True):
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=(
+            f"up to ~{rollouts} rollout(s){holdout_note} + {candidate_count} proposal(s) "
+            f"against world model {model_name}"
+        ),
+        command="wmo optimize harness",
+    ):
         raise typer.Exit(0)
 
     def _progress(iteration: int, variant: str, score: float, changed: bool) -> None:
@@ -421,7 +459,7 @@ def optimize(
             if changed
             else "[yellow]unchanged[/yellow]"
         )
-        _console.print(f"  [{tag}] {variant}: success_rate={score:.3f} {state}")
+        _console.print(f"  \\[{tag}] {escape(variant)}: success_rate={score:.3f} {state}")
 
     def _note(message: str) -> None:
         # Dead proposals narrate here; scored proposals use the structured callback below.
@@ -439,8 +477,8 @@ def optimize(
             else "[yellow]rejected by gate[/yellow]"
         )
         _console.print(
-            f"  [iteration {record.iteration} proposal {record.proposal_index}] "
-            f"{record.candidate}: success_rate={record.score:.3f} {state}"
+            f"  \\[iteration {record.iteration} proposal {record.proposal_index}] "
+            f"{escape(record.candidate)}: success_rate={record.score:.3f} {state}"
         )
 
     result = create_harness(
@@ -689,16 +727,16 @@ def _optimize_harbor(
         f"{config.attempts} attempt(s), reward mode {config.reward_mode}, "
         f"worker backend {config.backend} (proposer project: E2B) -> {run_dir}"
     )
-    if not yes:
-        if not _console.is_terminal:
-            # Consent is said, never inferred (the shared spend-surface rule).
-            _console.print(
-                "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-                "consent explicitly"
-            )
-            raise typer.Exit(2)
-        if not Confirm.ask("Proceed?", default=True):
-            raise typer.Exit(0)
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=(
+            f"1 seed + {config.iterations} proposal slot(s) over {len(config.task_ids)} task(s) "
+            f"x {config.attempts} attempt(s) on backend {config.backend}"
+        ),
+        command="wmo optimize harness",
+    ):
+        raise typer.Exit(0)
 
     scorer, task_pins = _build_harbor_scorer(config, run_dir=run_dir, provider_config=agent_config)
     if resume:
@@ -721,12 +759,14 @@ def _optimize_harbor(
     def _on_boundary(outcome: SlotOutcome) -> None:
         if outcome.evaluated is None:
             _console.print(
-                f"  [slot {outcome.slot}] {outcome.candidate_id}: "
+                f"  \\[slot {outcome.slot}] {escape(outcome.candidate_id)}: "
                 f"[yellow]invalid[/yellow] ({escape(outcome.reason)})"
             )
         else:
             tag = "seed" if outcome.slot == 0 else f"slot {outcome.slot}"
-            _console.print(f"  [{tag}] {outcome.candidate_id}: score={outcome.evaluated.score:.3f}")
+            _console.print(
+                f"  \\[{tag}] {escape(outcome.candidate_id)}: score={outcome.evaluated.score:.3f}"
+            )
 
     result = optimize_population(
         seed_tree,
@@ -909,7 +949,7 @@ def _resolve_harbor_seed(root: str, agent_ref: str) -> tuple[str, HarnessSourceT
     """
     base, _, ref = agent_ref.partition("@")
     try:
-        validate_name(base)
+        validate_name(base, kind="harness")
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     if base == DEFAULT_SEED_AGENT and not ref:
@@ -1050,13 +1090,21 @@ def init_harness(
     store = HarnessStore(root)
     try:
         if store.exists(name):
+            # Only name commands that exist: there is no CLI surface for moving an alias by
+            # hand, so point at the command that appends a version and moves `champion` itself.
             raise typer.BadParameter(
-                f"harness {name!r} already exists; new versions are appended by "
-                "`wmo optimize harness`, and aliases move with `set_alias`"
+                f"harness {name!r} already exists; run `wmo harness show {name}` to inspect it, "
+                f"or `wmo optimize harness {name} <world-model>` to append a new version and "
+                "move `champion` to it"
             )
         doc = store.save_version(HarnessDoc.baseline(name), alias=CHAMPION_ALIAS)
     except ValueError as exc:  # invalid name -> usage error, not a traceback
         raise typer.BadParameter(str(exc)) from exc
+    except OSError as exc:  # unusable --root -> usage error, not a traceback
+        raise typer.BadParameter(
+            f"cannot write the harness store under {root!r} ({exc.strerror or exc}); "
+            "pass a writable project dir with --root"
+        ) from exc
     _console.print(
         f"[green]wrote[/green] {name} v{doc.version} (champion) -> {store.dir_for(name)}"
     )

@@ -188,6 +188,46 @@ def test_corrupt_metrics_line_names_the_line(tmp_path: Path) -> None:
         store.read_metrics()
 
 
+def test_a_tolerant_read_drops_only_a_half_written_last_line(tmp_path: Path) -> None:
+    """What a run killed mid-append leaves: a torn tail a read-only reader must survive."""
+    store = DistillRunStore(tmp_path / "run")
+    store.append_metrics(0, _MetricsRow(solve_rate=0.1, reverse_kl_per_token=2.0, usd=1.0))
+    with store.metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"step": 1, "solve_')
+
+    rows = store.read_metrics(tolerate_partial_tail=True)
+
+    assert [row["step"] for row in rows] == [0]
+    with pytest.raises(ValueError, match="line 2"):
+        store.read_metrics()  # strict is still the default, for everything that resumes a run
+
+
+def test_a_tolerant_read_still_refuses_damage_above_the_last_line(tmp_path: Path) -> None:
+    """A broken row with complete rows after it means content was lost, not a torn write."""
+    store = DistillRunStore(tmp_path / "run")
+    store.metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    store.metrics_path.write_text('{"step": 0}\n[1, 2, 3]\n{"step": 2}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="line 2"):
+        store.read_metrics(tolerate_partial_tail=True)
+
+
+@pytest.mark.parametrize("tail", ["[]", "null", '"step 1"', "[1, 2, 3]"])
+def test_a_tolerant_read_still_refuses_a_last_line_that_parses(tmp_path: Path, tail: str) -> None:
+    """A whole non-object value is not a torn append: every prefix of `{...}` fails to PARSE.
+
+    So a final line json.loads accepts was written whole, and dropping it would hide real
+    corruption while reporting an older step as the run's latest state.
+    """
+    store = DistillRunStore(tmp_path / "run")
+    store.append_metrics(0, _MetricsRow(solve_rate=0.1, reverse_kl_per_token=2.0, usd=1.0))
+    with store.metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{tail}\n")
+
+    with pytest.raises(ValueError, match="line 2.*expected a JSON object"):
+        store.read_metrics(tolerate_partial_tail=True)
+
+
 def test_spend_ledger_round_trips_and_updates(tmp_path: Path) -> None:
     store = DistillRunStore(tmp_path / "run")
     assert store.read_spend() is None  # fresh dir: no ledger yet
