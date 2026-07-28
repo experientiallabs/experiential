@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "name": "tau-telecom",
-  "title": "τ²-bench telecom (GEPA-optimized)",
-  "description": "The telecom slice of τ²-bench with a GEPA-evolved environment prompt (317 optimization rollouts). Same customer-service tool surface as tau-bench, tuned for the telecom domain's device and plan workflows.",
+  "title": "τ²-bench telecom",
+  "description": "The telecom slice of τ²-bench with an optimized environment prompt (317 optimization rollouts). Same customer-service tool surface as tau-bench, tuned for the telecom domain's device and plan workflows.",
   "task": "tau-bench",
   "corpus": {
     "traces": 29,
@@ -18,7 +18,6 @@
   "license": null,
   "tags": [
     "tool-calls",
-    "customer-service",
-    "gepa"
+    "customer-service"
   ]
 }
