@@ -1,32 +1,31 @@
 """Fetch and list trace-corpus data bundles from the Hugging Face Hub (stdlib-only).
 
 Every publishable benchmark's bundle — the trace corpus plus its task data / gold / evidence
-dirs — lives in a dataset repo under the org. This module is the READ core behind
-`python -m environment_capture.hub fetch` and the contract the website's serving
-trace-download endpoint adopts (PR #52). Plain-HTTP against the Hub's public REST API, so it
-needs no extra dependency and no token for public repos (pass ``token`` for private ones).
-Uploading lives in `environment_capture.hub_push` (the ``fetch`` extra).
-
-`wmo download` runs a VENDORED copy of the read half, `wmo/hub.py`: the flagship wheel must
-install with no dependency on anything under `packages/` (AGENTS.md § Monorepo). Registry,
-repo-id convention and data root are pinned across the two by
-`wmo/hub_test.py::test_the_two_copies_agree_on_the_registry_and_the_data_root`; the rest of the
-body is not, so mirror edits here into that copy by hand.
+dirs — lives in a dataset repo under the org. This is the READ core behind `wmo download`, plus
+the "is it local, and where" resolver (`corpus_path`) that decides whether to fetch or serve
+from disk. Plain HTTP against the Hub's public REST API, so it needs no extra dependency and no
+token for public repos (pass ``token`` for private ones).
 
 Bundles are local-first: capture writes into the benchmark dir, nothing here deletes local
 files, and fetching never overwrites an existing file unless forced. Downloads stream to a
 ``.part`` sibling and are atomically renamed, so a failed fetch never looks like a corpus.
 
-Usage (from the repo root):
-    uv run wmo download                                              # interactive picker
-    uv run python -m environment_capture.hub fetch dabstep           # skip if already present
-    uv run python -m environment_capture.hub fetch all --force       # overwrite local copies
-    uv run python -m environment_capture.hub_push bird-sql           # publish/update (write side)
+VENDORED, deliberately. This is a copy of the read half of `environment_capture.hub`, narrowed
+to what `wmo` consumes: the write side, its argparse CLI, and the canonical-repo-id helper the
+push path needs all stayed behind in the member. The flagship wheel must install with no
+dependency on anything under `packages/` (AGENTS.md § Monorepo) — a `Requires-Dist` on a member
+makes every `wmo` release wait on a member release, and it strands the member's unreleased
+fixes: the ``wmh-``/``wmo-`` dataset-name fallback below landed in the member's 0.1.1, which was
+never published, so no pip user has ever had it. `wmo/repo_layout_test.py` keeps the import from
+coming back.
+
+The two copies still share a registry and a data root, so a benchmark added on one side must be
+added on the other by hand. `test_the_two_copies_agree_on_the_registry_and_the_data_root` fails
+the build when that is forgotten; the rest of the body is not pinned, so keep edits mirrored.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import time
@@ -39,7 +38,7 @@ from http.client import HTTPMessage
 from pathlib import Path
 from typing import IO
 
-from environment_capture.trajectory import JsonValue
+from wmo.core.types import JsonValue
 
 _ORG = "experiential-labs"
 _CORPUS_FILE = "traces.otel.jsonl"
@@ -233,11 +232,6 @@ class CorpusRepoUnavailable(urllib.error.HTTPError):
             None,
         )
         self.attempted: tuple[str, ...] = tuple(repo_id for repo_id, _ in failures)
-
-
-def repo_id_for(benchmark: str) -> str:
-    """The canonical dataset repo backing one benchmark's corpus (the id we publish to)."""
-    return candidate_repo_ids(benchmark)[0]
 
 
 def candidate_repo_ids(benchmark: str) -> tuple[str, ...]:
@@ -447,17 +441,22 @@ def _resolve_repo(
 def _data_root() -> Path:
     """Where benchmark data dirs live (``<root>/<benchmark>/traces.otel.jsonl``).
 
-    Resolution order: the ``ENVCAP_DATA_ROOT`` env var; a repo checkout (the dir holding
-    this package — its sibling benchmark dirs); else, for an installed wheel,
-    ``environment-capture-data/`` under the current directory — a pip user's bundles land in
-    their project, never inside site-packages.
+    Resolution order: the ``ENVCAP_DATA_ROOT`` env var; the capture member's directory in a git
+    checkout (``packages/environment-capture/``, which holds the benchmark dirs local capture
+    writes into); else, for an installed wheel, ``environment-capture-data/`` under the current
+    directory — a pip user's bundles land in their project, never inside site-packages.
+
+    The env var keeps environment-capture's name on purpose: this is the SHARED data root, and
+    in a checkout this module and the member must resolve the same directory or a bundle written
+    by one is invisible to the other. The checkout branch is the one line that could not be
+    copied verbatim — the member finds that directory as its own parent, `wmo` has to name it.
     """
     override = os.environ.get("ENVCAP_DATA_ROOT")
     if override:
         return Path(override)
-    sibling = Path(__file__).resolve().parents[1]
-    if (sibling / "pyproject.toml").exists():  # repo checkout: the member dir itself
-        return sibling
+    checkout = Path(__file__).resolve().parents[1] / "packages" / "environment-capture"
+    if (checkout / "pyproject.toml").exists():  # repo checkout: the capture member dir
+        return checkout
     return Path.cwd() / "environment-capture-data"
 
 
@@ -503,7 +502,7 @@ _OPENER = urllib.request.build_opener(_AuthStrippingRedirectHandler)
 
 
 def _request(url: str, token: str | None) -> urllib.request.Request:
-    headers = {"User-Agent": "environment-capture/hub"}
+    headers = {"User-Agent": "world-model-optimizer/hub"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return urllib.request.Request(url, headers=headers)  # noqa: S310 - https-only constants
@@ -603,40 +602,3 @@ def _stream_to(
         raise
     os.replace(part, dest)
     return written
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    # Pushing lives in hub_push (needs the huggingface_hub extra); this stub keeps the old
-    # command discoverable without importing the write side here (imports stay module-scope).
-    push = sub.add_parser("push", help="Moved: use `python -m environment_capture.hub_push`.")
-    push.add_argument("benchmark", nargs="?")
-    push.add_argument("--private", action="store_true")
-
-    fetch = sub.add_parser("fetch", help="Download full data bundles into the benchmark dirs.")
-    fetch.add_argument(
-        "benchmark", help=f"Benchmark name, or 'all' ({', '.join(downloadable_benchmarks())})"
-    )
-    fetch.add_argument(
-        "--force", action="store_true", help="Overwrite existing local corpus/data files."
-    )
-
-    args = parser.parse_args()
-    if args.command == "push":
-        raise SystemExit(
-            "pushing moved to the write module: "
-            "`uv run python -m environment_capture.hub_push <benchmark>|all [--private]` "
-            "(needs the fetch extra + a write token)"
-        )
-    names = downloadable_benchmarks() if args.benchmark == "all" else [args.benchmark]
-    for name in names:
-        existing = corpus_path(name).exists()
-        path = fetch_corpus(name, force=args.force)
-        state = "kept local" if existing and not args.force else "fetched"
-        print(f"{state} {name} -> {path}")
-
-
-if __name__ == "__main__":
-    main()

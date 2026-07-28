@@ -11,6 +11,7 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -197,6 +198,57 @@ def test_root_gate_covers_every_python_member() -> None:
     assert not missing, (
         f"workspace members {missing} are not in [tool.pytest.ini_options].testpaths; the root "
         "gate must cover every Python member (AGENTS.md § Monorepo)"
+    )
+
+
+def _wheel_build_config() -> dict[str, object]:
+    """The `[tool.hatch.build.targets.wheel]` table that decides what the flagship ships."""
+    with (REPO_ROOT / "pyproject.toml").open("rb") as fh:
+        root = tomllib.load(fh)
+    return root["tool"]["hatch"]["build"]["targets"]["wheel"]
+
+
+def test_wmo_imports_no_workspace_member_the_wheel_does_not_bundle() -> None:
+    """Nothing under `wmo/` may import a workspace member. Tests included.
+
+    A member import in shipped code has to be paid for with a `Requires-Dist` line, and that
+    line couples every `wmo` release to a member release and strands the member's unreleased
+    fixes — the `wmh-`/`wmo-` dataset-name fallback sat in an unpublished 0.1.1 and reached no
+    pip user until `wmo/hub.py` vendored it. `llm_waterfall` is the one legal import because the
+    wheel physically BUNDLES its package, so importing it is importing our own shipped code.
+
+    The boundary is the DIRECTORY, not the wheel manifest. Excluding `*_test.py` from the wheel
+    would make a test import harmless to a pip user, and that is not the rule: `wmo/` is meant
+    to be readable, movable and extractable without `packages/` on the path at all, and a test
+    import is still a reason someone cannot run this tree standalone. A check that needs both
+    sides reads the other file off disk instead (skipping when it is absent), or does not exist.
+    """
+    bundled = {
+        Path(str(entry)).name for entry in cast("list[str]", _wheel_build_config()["packages"])
+    }
+    forbidden = sorted(
+        {
+            package.name
+            for member in _workspace_member_dirs()
+            for package in member.iterdir()
+            if package.is_dir() and (package / "__init__.py").is_file()
+        }
+        - bundled
+    )
+    assert forbidden, "this test is meaningless if every member is bundled into the wheel"
+    pattern = re.compile(rf"^\s*(?:from|import)\s+({'|'.join(forbidden)})\b", re.MULTILINE)
+    offenders = sorted(
+        f"{path}: {match.group(1)}"
+        for path in _tracked_files()
+        if path.startswith("wmo/")
+        and path.endswith(".py")
+        and (REPO_ROOT / path).is_file()  # tolerate uncommitted deletes/renames mid-edit
+        for match in pattern.finditer((REPO_ROOT / path).read_text(encoding="utf-8"))
+    )
+    assert not offenders, (
+        f"wmo/ imports workspace members the wheel does not bundle: {offenders}; vendor what "
+        "the flagship needs, and keep cross-tree checks to reading the other file off disk "
+        "(AGENTS.md § Monorepo)"
     )
 
 

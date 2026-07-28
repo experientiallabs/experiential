@@ -300,18 +300,26 @@ Rules of the road:
 - **Membership**: `[tool.uv.workspace].members = ["packages/*"]` in the root pyproject — a new dir under `packages/` with a pyproject IS a member; anything inside the
   workspace that depends on a member resolves it from source via `[tool.uv.sources]`
   (`{ workspace = true }`), never from PyPI.
-- **Dependency arrows**: members never import `wmo`, and members remain installable and usable
-  standalone. Published dependencies such as `environment-capture` need BOTH halves: declare them
-  in `[project.dependencies]` and use `[tool.uv.sources]` for in-workspace source resolution. The
-  intentional `llm-waterfall` exception is bundled into the flagship wheel, so it remains a
-  workspace development dependency but is not a `Requires-Dist` dependency of WMO. Do not add a
-  second runtime copy or a separate release requirement without revisiting the one-distribution
-  decision. Carve-out: the no-wmo-import rule binds the member's
-  PUBLISHED source tree (what `[tool.hatch.build]`/`include` ships in the wheel). Local research
-  and capture scripts inside per-benchmark data dirs (e.g.
-  `packages/environment-capture/tau-bench/rl/`) may import `wmo`: they are workspace tooling
-  that happens to live next to the data it operates on, they never ship, and the member must
-  stay installable without them.
+- **Dependency arrows**: the arrow between the trees is empty in BOTH directions. Members never
+  import `wmo`, and members remain installable and usable standalone. Shipped `wmo/` modules
+  import no workspace member either: a member import has to be paid for with a `Requires-Dist`
+  line, and that line makes every `wmo` release wait on a member release and strands the
+  member's unreleased fixes from pip users entirely (that is what happened to the dataset-name
+  fallback now vendored in `wmo/hub.py`). What the flagship needs from a member gets vendored,
+  with the origin named in the module docstring; `wmo/repo_layout_test.py` enforces the rule.
+  The intentional `llm-waterfall` exception is bundled into the flagship wheel, so importing it
+  is importing our own shipped code: it stays a workspace development dependency and is not a
+  `Requires-Dist` dependency of WMO. Do not add a second runtime copy or a separate release
+  requirement without revisiting the one-distribution decision. The no-member-import rule binds
+  the whole of `wmo/`, tests included — the boundary is the directory, not the wheel manifest,
+  so `wmo/` stays readable and extractable with `packages/` off the path entirely. A check that
+  needs both sides reads the other file off disk and skips when it is absent (that is how
+  `wmo/hub_test.py` pins the vendored hub copy against its origin), or it does not exist. One
+  carve-out, in the other direction: the no-wmo-import rule binds the member's PUBLISHED source
+  tree (what `[tool.hatch.build]`/`include` ships in the wheel), so local research and capture
+  scripts inside per-benchmark data dirs (e.g. `packages/environment-capture/tau-bench/rl/`)
+  may import `wmo` — they are workspace tooling that happens to live next to the data it
+  operates on, they never ship, and the member must stay installable without them.
 - **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
   `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
   `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in

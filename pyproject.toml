@@ -20,11 +20,6 @@ dependencies = [
     "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
-    # Workspace member (resolved from source via [tool.uv.sources]): the data-bundle
-    # read core behind `wmo download` (stdlib-only; pushing needs the member's fetch extra).
-    # RELEASE ORDER: environment-capture must be published to PyPI before any wmo release —
-    # outside the workspace this dependency resolves from PyPI, not [tool.uv.sources].
-    "environment-capture",
     "gepa>=0.1.1",
     "tomli-w>=1.0",  # writing .wmo/config.toml (stdlib tomllib reads); every `wmo build` needs it
     "posthog>=7.0",
@@ -79,11 +74,14 @@ dev = [
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests. Both members have graduated to [project.dependencies] —
-# environment-capture when `wmo download` started consuming it, llm-waterfall when
-# wmo.providers.waterfall did (see the RELEASE ORDER notes there). The dev group adds the
-# members' heavy extras. The flagship wheel includes llm_waterfall's import package, while the
-# workspace dependency keeps its own metadata and extras available for development and testing.
+# gate covers their tests, and the members' heavy extras come with them.
+#
+# A dependency GROUP is not published metadata, so nothing here reaches a `pip install
+# world-model-optimizer`. That is the whole point for environment-capture: it is a development
+# dependency only, and shipped `wmo/` imports nothing from it (`wmo/hub.py` vendors the
+# bundle-fetch read core `wmo download` needs, enforced by `wmo/repo_layout_test.py`).
+# llm-waterfall IS a runtime import of shipped `wmo` code, and is legal only because the
+# flagship wheel physically bundles its import package rather than requiring the distribution.
 dev = ["llm-waterfall[all]", "environment-capture[bedrock,fetch]"]
 
 [project.scripts]
@@ -105,7 +103,7 @@ force-include = { "packages/llm-waterfall/LICENSE" = "llm_waterfall/LICENSE" }
 
 [tool.hatch.build.targets.sdist]
 # Publish one flagship distribution. llm_waterfall is bundled because WMO imports it as a core
-# implementation module; the environment-capture dependency already resolves from PyPI.
+# implementation module; nothing else under packages/ is a dependency of the flagship.
 include = [
     "/wmo",
     "/packages/llm-waterfall/llm_waterfall",
@@ -122,6 +120,9 @@ members = ["packages/*"]
 
 [tool.uv.sources]
 # Inside the workspace, anything that depends on a member resolves it from source, not PyPI.
+# `environment-capture` now reaches the environment through the `dev` group alone, but the
+# mapping must stay: without it `uv sync` would resolve that group entry from PyPI, where the
+# newest release is 0.1.0 and predates everything the workspace develops against.
 llm-waterfall = { workspace = true }
 environment-capture = { workspace = true }
 

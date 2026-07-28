@@ -3318,15 +3318,106 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
     assert "broken" in result.output
 
 
+def test_download_all_offline_skips_the_unpublished_and_still_succeeds(  # noqa: ANN201
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+):
+    # Offline, `all` falls back to the local registry. That registry names bundles registered
+    # here so the write side knows how to publish them but never pushed, and the Hub can only
+    # answer 401 for those — which used to turn an otherwise complete `wmo download all` into a
+    # failed command over something the user cannot act on. The fallback is the published
+    # subset, and it says what it dropped.
+    import urllib.error
+
+    unpublished = sorted(n for n, spec in cli_app_module.CORPORA.items() if not spec.published)
+    assert unpublished, "this test is meaningless once every registered corpus is published"
+    fetched: list[str] = []
+
+    def no_catalogue(*_args: object, **_kwargs: object) -> None:
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(cli_app_module, "published_corpora", no_catalogue)
+    monkeypatch.setattr(
+        cli_app_module,
+        "fetch_corpus",
+        lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
+    )
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "all"])
+    assert result.exit_code == 0, result.output  # no failure over an unpushed registry entry
+    assert fetched == cli_app_module.downloadable_benchmarks()
+    for name in unpublished:
+        assert name not in fetched
+        assert name in result.output  # the narrowing is announced, never silent
+
+
+def test_download_multi_keeps_going_past_a_truncated_transfer(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
+    # A file still short after `fetch_corpus`'s own per-file retries raises OSError, which used
+    # to escape the loop's per-item handling and kill the command — so a bundle the Hub served
+    # badly stranded every benchmark queued behind it, exactly like the 404 above once did.
+    fetched: list[str] = []
+
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        if name == "short":
+            raise OSError("traces.otel.jsonl: downloaded 6 bytes but the Hub tree lists 4096")
+        fetched.append(name)
+        return tmp_path
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "a-bench", "short", "z-bench"])
+    assert fetched == ["a-bench", "z-bench"]  # kept going past the short transfer
+    assert result.exit_code != 0  # ...but the failure is still reported at the end
+    assert "short" in result.output
+
+
+def test_download_of_one_bundle_reports_a_truncated_transfer_as_a_failure(  # noqa: ANN201
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+):
+    # Alone it is a runtime failure, not a usage error: the name was fine, the transfer was not.
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        raise OSError("traces.otel.jsonl: 6 bytes, tree lists 4096 — truncated transfer")
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "dabstep"])
+    assert result.exit_code == 1
+    assert "truncated transfer" in result.output
+    assert "Invalid value" not in result.output
+
+
+def test_download_multi_reports_an_unknown_name_without_stranding_the_rest(  # noqa: ANN201
+    monkeypatch,  # noqa: ANN001
+    tmp_path: Path,
+):
+    # Same defect class, decided offline before the network is touched: one bad name in a
+    # hand-typed list used to abort the command before the good ones were attempted.
+    fetched: list[str] = []
+
+    def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
+        if name not in cli_app_module.CORPORA:
+            raise ValueError(f"{name!r} has no published corpus (available: dabstep)")
+        fetched.append(name)
+        return tmp_path
+
+    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
+    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    result = runner.invoke(app, ["download", "nope", "dabstep"])
+    assert fetched == ["dabstep"]
+    assert result.exit_code != 0
+    assert "nope" in result.output
+
+
 def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    # A fetch now tries more than one dataset repo name (the wmh -> wmo rename), so a bare
-    # "404" cannot be acted on: the report must say which ids were looked for. The CLI reads
-    # that off plain HTTPError attributes (no import of the newer member symbol), so this also
-    # covers the wheel, which resolves environment-capture from PyPI.
+    # A fetch tries more than one dataset repo name (the wmh -> wmo rename), so a bare "404"
+    # cannot be acted on: the report must say which ids were looked for. The CLI reads that off
+    # plain HTTPError attributes rather than the subclass, so the report survives any fetcher
+    # that raises a stock HTTPError.
     import urllib.error
     from http.client import HTTPMessage
 
-    from environment_capture.hub import CorpusRepoUnavailable, candidate_repo_ids
+    from wmo.hub import CorpusRepoUnavailable, candidate_repo_ids
 
     attempts = [
         (repo_id, urllib.error.HTTPError(f"https://hub/{repo_id}", 404, "nf", HTTPMessage(), None))
@@ -3355,7 +3446,7 @@ def test_download_picker_lists_published_and_fetches_choice(
     monkeypatch,  # noqa: ANN001
     tmp_path: Path,
 ) -> None:
-    from environment_capture.hub import PublishedCorpus
+    from wmo.hub import PublishedCorpus
 
     published = [
         PublishedCorpus(

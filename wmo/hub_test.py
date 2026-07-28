@@ -1,4 +1,11 @@
-"""Tests for the stdlib read core: listing, fetching, progress, atomicity (no network)."""
+"""Tests for the vendored Hub read core: listing, fetching, atomicity, drift (no network).
+
+This is the copy `pip install world-model-optimizer` actually runs, so it carries its own
+coverage rather than leaning on the member's. Two of these tests exist only because it IS a
+copy: `test_the_vendored_copy_has_not_drifted_from_its_origin` diffs the shared source regions
+against the member's file, and the data-root case pins the one line that could NOT be copied
+verbatim. Neither imports the member — nothing under `wmo/` does.
+"""
 
 from __future__ import annotations
 
@@ -11,15 +18,14 @@ from pathlib import Path
 
 import pytest
 
-from environment_capture import hub
-from environment_capture.hub import (
+from wmo import hub
+from wmo.hub import (
     CORPORA,
     CorpusRepoUnavailable,
     candidate_repo_ids,
     downloadable_benchmarks,
     fetch_corpus,
     published_corpora,
-    repo_id_for,
 )
 
 
@@ -43,6 +49,7 @@ def _fake_hub(
     *,
     live_repos: Container[str] | None = None,
     missing_code: int = 404,
+    claimed_sizes: dict[str, int] | None = None,
 ) -> _HubCalls:
     """Stand in for the Hub REST API: a tree listing plus resolve-URL streaming.
 
@@ -52,12 +59,15 @@ def _fake_hub(
         live_repos: Repo ids that resolve; every other id answers ``missing_code``. ``None``
             (the default) means every id resolves.
         missing_code: Status the Hub returns for a repo id outside ``live_repos``.
+        claimed_sizes: Repo path -> the size the TREE advertises, when it should disagree with
+            the bytes served (how a truncated transfer is detected).
 
     Returns:
         A live record of the repo ids requested, so a test can assert the request COUNT and
         not just the downloaded bytes.
     """
     calls = _HubCalls()
+    sizes = claimed_sizes or {}
 
     def http_json_page(url: str, *, token: str | None) -> tuple[object, None]:
         assert "/api/datasets/" in url and "/tree/main?recursive=true" in url
@@ -66,7 +76,8 @@ def _fake_hub(
         if live_repos is not None and repo_id not in live_repos:
             raise urllib.error.HTTPError(url, missing_code, "not found", HTTPMessage(), None)
         listing = [
-            {"type": "file", "path": path, "size": len(content)} for path, content in files.items()
+            {"type": "file", "path": path, "size": sizes.get(path, len(content))}
+            for path, content in files.items()
         ]
         return listing, None
 
@@ -144,6 +155,29 @@ def test_fetch_keeps_existing_local_files_unless_forced(
     assert (bench / "data" / "train.jsonl").read_text() == "tasks\n"
 
 
+def test_fetch_resumes_missing_files_inside_an_existing_dir(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted fetch that materialized only part of a data dir picks up the missing
+    files on re-run — dir presence alone must not mean 'complete'."""
+    _fake_hub(
+        monkeypatch,
+        {
+            "traces.otel.jsonl": b"spans\n",
+            "data/train.jsonl": b"tasks\n",
+            "data/test.jsonl": b"held-out\n",
+        },
+    )
+    bench = data_root / "gaia2"
+    (bench / "data").mkdir(parents=True)
+    (bench / "traces.otel.jsonl").write_text("local\n")
+    (bench / "data" / "train.jsonl").write_text("already-here\n")
+
+    fetch_corpus("gaia2")
+    assert (bench / "data" / "train.jsonl").read_text() == "already-here\n"  # kept
+    assert (bench / "data" / "test.jsonl").read_bytes() == b"held-out\n"  # resumed
+
+
 def test_fetch_with_dest_writes_only_the_corpus_file(
     data_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -159,7 +193,12 @@ def test_fetch_falls_back_to_the_legacy_repo_name(
 ) -> None:
     """The org's datasets are still published under the pre-rename ``wmh-`` name (the code
     renamed wmh -> wmo, the Hub repos did not), so the canonical id 404s and the whole bundle
-    must come from the legacy repo instead of failing the download."""
+    must come from the legacy repo instead of failing the download.
+
+    This is the fix vendoring exists to ship: it landed in the member's 0.1.1, which was never
+    published, so until `wmo` owned this code no pip user's `wmo download` could resolve a
+    single one of the org's datasets.
+    """
     canonical, legacy = candidate_repo_ids("gaia2")
     calls = _fake_hub(
         monkeypatch,
@@ -223,12 +262,70 @@ def test_fetch_does_not_try_another_name_on_a_non_missing_hub_error(
 
     assert not isinstance(caught.value, CorpusRepoUnavailable)
     assert caught.value.code == 429
-    assert calls.trees == [repo_id_for("gaia2")]
+    assert calls.trees == [candidate_repo_ids("gaia2")[0]]
+
+
+def test_fetch_names_a_repo_missing_its_corpus(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_hub(monkeypatch, {"data/train.jsonl": b"tasks\n"})
+    with pytest.raises(ValueError, match="never pushed"):
+        fetch_corpus("gaia2")
 
 
 def test_fetch_unknown_benchmark_names_the_available_ones(data_root: Path) -> None:
     with pytest.raises(ValueError, match="no published corpus"):
         fetch_corpus("nope")
+
+
+def test_fetch_rejects_a_transfer_the_tree_says_is_short(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A short read is a corrupt corpus, not a small one.
+
+    It must RAISE, with a type `wmo download` can tell apart from an outage (it catches
+    `OSError` to keep one bad bundle from stranding a batch), and it must leave nothing behind:
+    a fetch skips any path that exists, so a truncated file at the destination would make the
+    error's own "re-run the fetch" remedy answer `kept local` over a corpus missing most of its
+    spans, at exit 0.
+    """
+    _fake_hub(
+        monkeypatch,
+        {"traces.otel.jsonl": b"spans\n"},
+        claimed_sizes={"traces.otel.jsonl": 4096},
+    )
+    with pytest.raises(OSError, match="truncated transfer") as caught:
+        fetch_corpus("gaia2")
+    assert not isinstance(caught.value, urllib.error.URLError)  # not mistaken for an outage
+    assert "traces.otel.jsonl" in str(caught.value)  # a bundle is many files; name the one
+    corpus = data_root / "gaia2" / "traces.otel.jsonl"
+    assert not corpus.exists()  # nothing to make the next fetch think it is done
+    assert not corpus.with_name(corpus.name + ".part").exists()
+
+
+def test_a_truncated_forced_refresh_keeps_the_corpus_it_was_replacing(
+    data_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--force` over a good local corpus must not be able to destroy it.
+
+    The size is checked BEFORE the `.part` is renamed over the destination, so a short transfer
+    is a no-op. Checking after would already have clobbered a valid corpus with a truncated one
+    — and then deleting that to keep the re-run honest turns a failed refresh into data loss.
+    """
+    _fake_hub(
+        monkeypatch,
+        {"traces.otel.jsonl": b"spans\n"},
+        claimed_sizes={"traces.otel.jsonl": 4096},
+    )
+    corpus = data_root / "gaia2" / "traces.otel.jsonl"
+    corpus.parent.mkdir(parents=True)
+    corpus.write_text("the corpus that was already here\n")
+
+    with pytest.raises(OSError, match="truncated transfer"):
+        fetch_corpus("gaia2", force=True)
+
+    assert corpus.read_text() == "the corpus that was already here\n"
+    assert not corpus.with_name(corpus.name + ".part").exists()
 
 
 def test_unknown_benchmark_never_offers_an_unpublished_name(data_root: Path) -> None:
@@ -288,7 +385,7 @@ def test_published_corpora_maps_repos_to_benchmarks(monkeypatch: pytest.MonkeyPa
         ("gaia2", "2026-07-07"),
         ("bird-sql", "2026-07-05"),
     ]
-    assert published[0].repo_id == repo_id_for("gaia2")
+    assert published[0].repo_id == candidate_repo_ids("gaia2")[0]
 
 
 def test_published_corpora_accepts_the_legacy_repo_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,90 +421,8 @@ def test_published_corpora_lists_a_double_published_benchmark_once(
     monkeypatch.setattr(hub, "_http_json_page", lambda url, *, token: (listing, None))
 
     assert [(c.benchmark, c.repo_id) for c in published_corpora()] == [
-        ("gaia2", repo_id_for("gaia2"))
+        ("gaia2", candidate_repo_ids("gaia2")[0])
     ]
-
-
-def test_every_committed_corpus_is_publishable_or_documented_local_only() -> None:
-    """Manifest coverage: every benchmark dir with a local corpus must either be in the
-    publish manifest or be appworld (the documented local-only exception)."""
-    root = hub._data_root()
-    dirs = {p.parent.name for p in root.glob("*/traces.otel.jsonl")}
-    if not dirs:  # standalone package install: data dirs don't ship
-        pytest.skip("no sibling benchmark data dirs")
-    assert dirs - set(CORPORA) <= {"appworld"}
-
-
-def test_fetch_resumes_missing_files_inside_an_existing_dir(
-    data_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An interrupted fetch that materialized only part of a data dir picks up the missing
-    files on re-run — dir presence alone must not mean 'complete'."""
-    _fake_hub(
-        monkeypatch,
-        {
-            "traces.otel.jsonl": b"spans\n",
-            "data/train.jsonl": b"tasks\n",
-            "data/test.jsonl": b"held-out\n",
-        },
-    )
-    bench = data_root / "gaia2"
-    (bench / "data").mkdir(parents=True)
-    (bench / "traces.otel.jsonl").write_text("local\n")
-    (bench / "data" / "train.jsonl").write_text("already-here\n")
-
-    fetch_corpus("gaia2")
-    assert (bench / "data" / "train.jsonl").read_text() == "already-here\n"  # kept
-    assert (bench / "data" / "test.jsonl").read_bytes() == b"held-out\n"  # resumed
-
-
-def test_fetch_names_a_repo_missing_its_corpus(
-    data_root: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _fake_hub(monkeypatch, {"data/train.jsonl": b"tasks\n"})
-    with pytest.raises(ValueError, match="never pushed"):
-        fetch_corpus("gaia2")
-
-
-def test_gitignore_covers_every_declared_data_dir() -> None:
-    """The package .gitignore must shadow CORPORA's data_dirs: a spec dir with no matching
-    ignore pattern means `git add -A` can commit license-restricted payload."""
-    gitignore = hub._data_root() / ".gitignore"
-    if not gitignore.exists():  # standalone package install
-        pytest.skip("no package .gitignore shipped")
-    patterns = {
-        line.strip() for line in gitignore.read_text().splitlines() if line.strip().startswith("*/")
-    }
-    assert "*/traces.otel.jsonl" in patterns
-    declared = {d for spec in CORPORA.values() for d in spec.data_dirs}
-    missing = {d for d in declared if f"*/{d}/" not in patterns}
-    assert not missing, f"data dirs with no ignore pattern (license-leak risk): {missing}"
-
-
-def test_license_tags_match_the_provenance_readmes() -> None:
-    """CorpusSpec.license_id is what gets published on the dataset card; it must agree with the
-    license each benchmark README records (INTEGRATION.md non-negotiable #3)."""
-    human = {
-        "cc-by-nc-4.0": ("CC BY-NC",),
-        "cc-by-sa-4.0": ("CC BY-SA",),
-        "cc-by-4.0": ("CC BY 4.0", "CC-BY-4.0"),
-        "mit": ("MIT",),
-        "apache-2.0": ("Apache",),
-    }
-    root = hub._data_root()
-    checked = 0
-    for spec in CORPORA.values():
-        readme = root / spec.benchmark / "README.md"
-        if not readme.exists():
-            continue
-        text = readme.read_text(encoding="utf-8")
-        assert any(marker in text for marker in human[spec.license_id]), (
-            f"{spec.benchmark}: card would publish {spec.license_id} but its README never "
-            f"mentions {human[spec.license_id]} — fix whichever is wrong before pushing"
-        )
-        checked += 1
-    if not checked:  # standalone package install
-        pytest.skip("no benchmark READMEs shipped")
 
 
 def test_published_corpora_follows_pagination(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -437,16 +452,70 @@ def test_published_corpora_follows_pagination(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_data_root_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Env override wins; a repo checkout uses the package's sibling dirs; an installed wheel
-    (no sibling pyproject) lands bundles under the CWD, never inside site-packages."""
+    """Env override wins; a checkout resolves the CAPTURE MEMBER's dir; an installed wheel lands
+    bundles under the CWD, never inside site-packages.
+
+    The checkout branch is the line vendoring could not copy: the member finds that directory as
+    its own parent, `wmo/hub.py` is one level shallower and has to name it. Getting it wrong
+    would silently point the flagship at the repo root, where no benchmark dir exists.
+    """
     monkeypatch.setenv("ENVCAP_DATA_ROOT", str(tmp_path / "override"))
     assert hub._data_root() == tmp_path / "override"
 
     monkeypatch.delenv("ENVCAP_DATA_ROOT")
-    assert (hub._data_root() / "pyproject.toml").exists()  # repo checkout: the member dir
+    checkout = hub._data_root()
+    assert checkout == Path(hub.__file__).resolve().parents[1] / "packages" / "environment-capture"
+    assert (checkout / "pyproject.toml").exists()
 
-    site = tmp_path / "venv" / "site-packages" / "environment_capture"
+    site = tmp_path / "venv" / "site-packages" / "wmo"
     site.mkdir(parents=True)
     monkeypatch.setattr(hub, "__file__", str(site / "hub.py"))
     monkeypatch.chdir(tmp_path)
     assert hub._data_root() == tmp_path / "environment-capture-data"
+
+
+#: Source regions `wmo/hub.py` copied verbatim from the member and must keep copying verbatim,
+#: as (start marker, end marker) slices. Everything the two copies genuinely share lives here:
+#: the spec dataclass and the registry, the repo-name convention, and the prefix constants
+#: behind it. The rest of each file is allowed to differ — that is what "narrowed to what `wmo`
+#: consumes" means, and `_data_root` is deliberately not the same line in both.
+_SHARED_SOURCE_REGIONS = (
+    ("class CorpusSpec:", "class PublishedCorpus:"),
+    ("def candidate_repo_ids", "def _benchmark_from_repo_name"),
+    ("_REPO_PREFIXES", "_MISSING_REPO_CODES"),
+)
+
+
+def test_the_vendored_copy_has_not_drifted_from_its_origin() -> None:
+    """A vendored copy that drifts from its origin is worse than the import it replaced.
+
+    A benchmark registered on one side only makes `wmo download` and the member's capture
+    disagree about what exists; a repo-id rule that differs makes them look for the same bundle
+    under different dataset names. Both are silent until someone cannot find their data.
+
+    Compared as SOURCE TEXT, read off disk, rather than by importing the member: `wmo/` imports
+    nothing from `packages/`, tests included, and this test is not entitled to an exemption from
+    the rule the rest of the PR exists to establish. Text is also the stricter comparison — it
+    catches a comment or a docstring going stale, which a value check waves through.
+    """
+    copy_path = Path(hub.__file__).resolve()
+    member = (
+        copy_path.parents[1] / "packages" / "environment-capture" / "environment_capture/hub.py"
+    )
+    if not member.is_file():  # installed sdist, or the member is gone: nothing to compare
+        pytest.skip("the environment-capture member is not present in this tree")
+    origin = member.read_text(encoding="utf-8")
+    copy = copy_path.read_text(encoding="utf-8")
+    for start, end in _SHARED_SOURCE_REGIONS:
+        assert _region(copy, start, end) == _region(origin, start, end), (
+            f"wmo/hub.py drifted from the member's hub.py in the region {start!r}..{end!r}; "
+            "the two are hand-mirrored copies, so make the same edit in both (see the VENDORED "
+            "note at the top of wmo/hub.py)"
+        )
+
+
+def _region(source: str, start: str, end: str) -> str:
+    """The text of `source` from the line introducing `start` up to the one introducing `end`."""
+    assert start in source, f"marker {start!r} is gone; update _SHARED_SOURCE_REGIONS"
+    assert end in source, f"marker {end!r} is gone; update _SHARED_SOURCE_REGIONS"
+    return source[source.index(start) : source.index(end)]

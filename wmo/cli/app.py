@@ -25,12 +25,6 @@ from uuid import uuid4
 
 import typer
 import uvicorn
-from environment_capture.hub import (
-    CORPORA,
-    corpus_path,
-    fetch_corpus,
-    published_corpora,
-)
 from llm_waterfall import is_capacity_error
 from pydantic import ValidationError
 from rich.console import Console
@@ -102,6 +96,13 @@ from wmo.env.llm_agent import LLMAgent
 from wmo.evals.grid import GridResult, ModelSpec, merge_results, run_grid
 from wmo.evals.grid_plot import plot_grid, plot_grid_heatmap
 from wmo.evals.open_loop import EvalReport, OpenLoopEval
+from wmo.hub import (
+    CORPORA,
+    corpus_path,
+    downloadable_benchmarks,
+    fetch_corpus,
+    published_corpora,
+)
 from wmo.ingest import VendorPull, get_adapter, list_adapters
 from wmo.ingest.base import load_payloads
 from wmo.ingest.detect import detect_format
@@ -1166,17 +1167,14 @@ def download(
     """Download benchmark data bundles (trace corpus + task data) from the Hub.
 
     With no arguments, lists the org's published datasets (live, via the Hub API) and offers a
-    picker. Bundles land in `packages/environment-capture/<benchmark>/`; existing local files
-    are kept unless `--force`.
+    picker. Bundles land in `environment-capture-data/<benchmark>/` under the current directory
+    (in a git checkout, in `packages/environment-capture/<benchmark>/` instead); set
+    `ENVCAP_DATA_ROOT` to put them somewhere else. Existing local files are kept unless
+    `--force`.
     """
     selected = list(benchmarks or [])
     if selected == ["all"]:
-        # Prefer the Hub's live list: the static registry can name corpora that aren't
-        # published yet (a 404 mid-loop used to abort the remaining downloads).
-        try:
-            selected = sorted(corpus.benchmark for corpus in published_corpora())
-        except urllib.error.URLError:
-            selected = sorted(CORPORA)
+        selected = _all_downloadable()
     if not selected:
         try:
             published = published_corpora()
@@ -1206,30 +1204,80 @@ def download(
         existing = corpus_path(name).exists()
         try:
             path = _fetch_with_progress(name, force=force)
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
         except urllib.error.HTTPError as exc:
             # One unpublished/broken dataset must not abort the REST of a multi-download:
             # record it, keep fetching, and fail (with every name) at the end. The reason is
             # quoted rather than summarized here: a fetch tries more than one dataset repo id
-            # and only the error it raises knows which ones the Hub refused. Reading it off
-            # plain HTTPError attributes keeps this working against the PUBLISHED
-            # environment-capture, which the WMO wheel resolves from PyPI.
-            failures.append(f"{name}: the Hub answered {exc.code} for {exc.url} ({exc.reason})")
-            _console.print(f"[yellow]skipping {name}: Hub answered {exc.code}[/yellow]")
-            continue
+            # and only the error it raises knows which ones the Hub refused.
+            reason = f"the Hub answered {exc.code} for {exc.url} ({exc.reason})"
+            note = f"Hub answered {exc.code}"
         except urllib.error.URLError as exc:
+            # The connection itself is down, which is NOT a verdict on one bundle: everything
+            # queued behind it would fail identically, so stop instead of printing the same
+            # reason once per benchmark. (Checked before the OSError branch below, which it
+            # would otherwise be swallowed by — URLError is an OSError.)
             raise typer.BadParameter(
                 f"{name}: could not reach the Hub ({exc.reason}); check the connection and re-run"
                 " — fetches resume file-by-file"
             ) from exc
-        state = "kept local" if existing and not force else "fetched"
-        _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+        except ValueError as exc:
+            # An unknown name, decided offline before the network is touched. Asked for on its
+            # own it stays a plain usage error, because wrapping `wmo download nope` in "some
+            # datasets could not be downloaded" buries the answer to the common typo.
+            if len(selected) == 1:
+                raise typer.BadParameter(str(exc)) from exc
+            reason = note = str(exc)
+        except OSError as exc:
+            # A transfer still truncated after `fetch_corpus`'s own per-file retries. It says
+            # nothing about the bundles queued behind it, so in a list it joins the end-of-run
+            # report rather than stranding them; alone it is a runtime failure, not a usage
+            # error, so it exits 1 with the reason instead of `Invalid value:`.
+            if len(selected) == 1:
+                _console.print(f"[red]✗ could not download {name}[/red]: {escape(str(exc))}")
+                raise typer.Exit(1) from exc
+            reason = note = str(exc)
+        else:
+            state = "kept local" if existing and not force else "fetched"
+            _console.print(f"{_CHECK} {state} [bold]{name}[/bold] -> {path}")
+            continue
+        failures.append(f"{name}: {reason}")
+        _console.print(f"[yellow]skipping {name}: {escape(note)}[/yellow]")
     if failures:
+        # No cause is asserted here: the list now collects unknown names, Hub refusals and
+        # broken transfers alike, and each line carries the reason it actually failed for.
         raise typer.BadParameter(
-            "some datasets could not be downloaded (unpublished? `wmo download` with no "
-            "arguments lists what is):\n  " + "\n  ".join(failures)
+            "some datasets could not be downloaded (`wmo download` with no arguments lists "
+            "what the Hub publishes):\n  " + "\n  ".join(failures)
         )
+
+
+def _all_downloadable() -> list[str]:
+    """The bundles `wmo download all` should fetch, live Hub list preferred.
+
+    The Hub's own listing is authoritative, so it is tried first. Offline the local registry
+    answers instead — but only the entries it marks as published. The whole registry is the
+    wrong answer: it names bundles registered here so the write side knows how to publish them,
+    which the Hub can only answer 401 for, and one of those turns an otherwise complete
+    `wmo download all` into a failed command over something the user cannot act on.
+
+    Both narrowings are announced. A quiet substitution of a stale local list for the live one,
+    or a quiet drop of a registered benchmark, reads afterwards as "everything was fetched".
+    """
+    try:
+        return sorted(corpus.benchmark for corpus in published_corpora())
+    except urllib.error.URLError as exc:
+        selected = downloadable_benchmarks()
+        _console.print(
+            f"[yellow]could not list the Hub's published datasets ({exc.reason}); falling back "
+            "to the bundles this release knows about[/yellow]"
+        )
+        skipped = sorted(set(CORPORA) - set(selected))
+        if skipped:
+            _console.print(
+                f"[yellow]not downloading {', '.join(skipped)}: registered here but never "
+                "pushed to the Hub, so there is nothing to fetch[/yellow]"
+            )
+        return selected
 
 
 def _fetch_with_progress(name: str, *, force: bool) -> Path:
