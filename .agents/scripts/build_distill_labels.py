@@ -90,6 +90,12 @@ def main() -> None:
     ap.add_argument("--approved-cap-usd", type=float, default=None)
     ap.add_argument("--model", default=LABEL_MODEL)
     ap.add_argument("--instruction", choices=["strict", "aggressive"], default="strict")
+    ap.add_argument(
+        "--target-keep-pct",
+        type=int,
+        default=None,
+        help="calibrated teacher: explicit target keep percent appended to the instruction",
+    )
     ap.add_argument("--corpora", default=None, help="comma list; default all")
     ap.add_argument("--self-test", action="store_true", help="run align_labels assertions, no API")
     args = ap.parse_args()
@@ -107,6 +113,13 @@ def main() -> None:
         )
     cap = 0.60 if args.pilot else args.approved_cap_usd
     instruction = INSTRUCTIONS[args.instruction]
+    if args.target_keep_pct is not None:
+        instruction += (
+            f" CALIBRATION TARGET: delete words so that roughly {args.target_keep_pct}% of the "
+            f"input's words remain. If the text is so dense that {args.target_keep_pct}% cannot "
+            "be reached without deleting numbers, identifiers, or facts, get as close as you can "
+            "while still preserving them, and never pad to keep more."
+        )
 
     pool = load_pool()
     entry = pool.entry(args.model)
@@ -147,6 +160,7 @@ def main() -> None:
             ("-pilot" if args.pilot else "")
             + (f"-{args.instruction}" if args.instruction != "strict" else "")
             + (f"-{args.model}" if args.model != LABEL_MODEL else "")
+            + (f"-keep{args.target_keep_pct}" if args.target_keep_pct is not None else "")
         )
         out_path = OUT_DIR / f"labels-{corpus}{suffix}.jsonl"
         done: set[tuple[str, int, int]] = set()
@@ -266,6 +280,7 @@ def main() -> None:
                 "ts": __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat(),
                 "provider_model": args.model,
                 "instruction": args.instruction,
+                "target_keep_pct": args.target_keep_pct,
                 "corpus": corpus,
                 "pilot": bool(args.pilot),
                 "spend_usd": round(spent, 4),

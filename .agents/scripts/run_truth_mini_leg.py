@@ -61,7 +61,7 @@ METERING_PATH = DATA_ROOT / "cache/metering-c1.jsonl"
 
 MODELS = ["gpt-5.4-mini", "sonnet-5"]
 N_TRAIN_TASKS = 15
-EPISODES = 2
+EPISODES = 2  # default; --episodes overrides
 MAX_STEPS = 16
 SEED = 0
 
@@ -112,6 +112,9 @@ def gold_correct(reply: str, gold_numeric: float, tolerance: float = 0.02) -> bo
     return False
 
 
+ALL_TASKS = False
+
+
 def load_tasks() -> list[dict]:
     tasks = []
     for split in ("test", "train"):
@@ -139,7 +142,7 @@ def load_tasks() -> list[dict]:
     train = [t for t in tasks if t["stratum"] == "train"]
     rng = random.Random(SEED)
     rng.shuffle(train)
-    picked = test + train[:N_TRAIN_TASKS]
+    picked = test + (train if ALL_TASKS else train[:N_TRAIN_TASKS])
     log.info("tasks: %d test + %d train sampled (seed %d)", len(test), len(picked) - len(test), SEED)
     return picked
 
@@ -187,7 +190,7 @@ class AdaptedEndpointStyleCompressor:
     client. append_stable holds for the same reason (per-word local, fixed bar).
     """
 
-    id = "adapted-financebench-inprocess"
+    id = "adapted-financebench-inprocess"  # per-process registry; arm name distinguishes runs
     version = "r2-full-ft"
     append_stable = True
 
@@ -232,7 +235,7 @@ def build_compression(arm: str, aggressiveness: float, checkpoint: str | None) -
         return CompressionConfig(
             compressor_id="llmlingua2-endpoint", aggressiveness=aggressiveness
         )
-    if arm == "adapted":
+    if arm.startswith("adapted"):
         register_compressor(AdaptedEndpointStyleCompressor(checkpoint))
         return CompressionConfig(
             compressor_id="adapted-financebench-inprocess", aggressiveness=aggressiveness
@@ -249,14 +252,21 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     for noisy in ("httpx", "urllib3", "botocore", "anthropic", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    global ALL_TASKS, EPISODES
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--arm", required=True)
     ap.add_argument("--aggressiveness", type=float, default=0.0)
     ap.add_argument("--checkpoint", default=str(Path.home() / "Desktop/Projects/wmh-compression-data/cache/adapted-financebench-full"))
     ap.add_argument("--cap-usd", type=float, default=12.0, help="candidate+env metered stop per invocation")
     ap.add_argument("--models", default=",".join(MODELS))
+    ap.add_argument("--episodes", type=int, default=EPISODES)
+    ap.add_argument("--all-tasks", action="store_true", help="all scorable golds, not the 18-task mini set")
+    ap.add_argument("--capture-segments", action="store_true", help="dump raw live user segments per episode (off arm)")
+    ap.add_argument("--rows-prefix", default="truth-mini")
     args = ap.parse_args()
+    EPISODES = args.episodes
 
+    ALL_TASKS = args.all_tasks
     tasks = load_tasks()
     traces = get_adapter("otel-genai").from_file(str(BUNDLE / "traces.otel.jsonl"))
     tools_hint = tools_hint_from_traces(traces)
@@ -265,7 +275,8 @@ def main() -> None:
     pool = load_pool()
     config = load_config(str(MODEL_DIR))
     serve_config = config.serve_provider_config()
-    rows_path = OUT_DIR / f"truth-mini-{args.arm}_rows.jsonl"
+    rows_path = OUT_DIR / f"{args.rows_prefix}-{args.arm}_rows.jsonl"
+    capture_path = OUT_DIR / f"{args.rows_prefix}-{args.arm}_segments.jsonl"
     done: set[tuple[str, str, int]] = set()
     if rows_path.exists():
         done = {
@@ -318,6 +329,26 @@ def main() -> None:
                     "and answer from what they contain."
                 )
                 result = run_episode(env, agent, framed, max_steps=MAX_STEPS)
+                if args.capture_segments:
+                    observations = [
+                        s.observation.content
+                        for s in result.steps
+                        if s.observation is not None and s.observation.content
+                    ]
+                    with lock:
+                        with capture_path.open("a") as cf:
+                            cf.write(
+                                json.dumps(
+                                    {
+                                        "task_id": task["task_id"],
+                                        "model": model_name,
+                                        "episode": episode,
+                                        "segments": [framed] + [str(x) for x in observations],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
                 final = timed.replies[-1] if timed.replies else ""
                 correct = gold_correct(final, task["gold_numeric"])
                 answered = bool(extract_numbers(final))
