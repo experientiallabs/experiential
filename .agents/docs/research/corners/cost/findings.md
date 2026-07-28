@@ -214,3 +214,16 @@ fable-5 compressed} x +4 episodes ~ 240 cells ~ $120-160) to resolve the compres
 inversion and the delegation question on tau itself - needs a Silen cap + master cohort
 discipline. (4) The real-episode leg (planned, master's task) is the independent check,
 not a power fix (same n=20 pin).
+
+## The Pareto answer (Silen ask, 2026-07-28; n=20 basis, all 11 pool models)
+
+Single-model frontier: gpt-5.4-mini ($0.067, -34.1) -> haiku-4-5 ($0.098, -14.3) ->
+glm-5.2 ($0.187, -5.8) -> kimi-k2.6 ($0.353, -0.9) -> gpt-5.5 ($0.391, +2.8) -> opus-5
+($0.393, +10.9). fable-5 ($0.958, the anchor) is deep inside the frontier. The ROUTED
+endpoint ($0.411, +9.0, LOO n=20) sits a hair inside the frontier: weakly dominated by
+opus-5 on point estimates, with the gap (+4.7% cost, -1.9 pt) statistically
+indistinguishable from zero. That gap is the discovery tax, and it is the honest price of
+not knowing ex ante that opus-5 is the corner. On tau the dial does not trace the
+frontier (the LOO mix pins to opus-5 at every detent; small-bank law); the frontier's
+cheap end is reachable only as static mounts of the cheap models. RULING logged: compaction
+analysis skipped going forward (rungs stay as recorded evidence); routing is the focus.
