@@ -84,6 +84,23 @@ Savings behind an optimized endpoint can come from four places. Their current sh
 
 ## The two-anchor discipline (inherited from the routing lane)
 
+RULING (Silen, 2026-07-28, this chat): **fable-5 is the anchor for ALL baselines, routed
+configs included**; the dominated-anchor situation is understood and accepted. The
+best-single column stays on every artifact as the check, per the rest of this section.
+
+### The "is anything cheaper than opus-5" check (Silen ask, measured)
+
+Seven models are cheaper than opus-5 per completed task on this grid; every one pays
+quality for it. Five are RESOLVED worse (paired CI excludes zero): gpt-5.4-mini (-82.8%,
+-45.0 pt), haiku-4-5 (-75.0%, -25.2 pt), deepseek-v4-pro (-67.5%, -29.0 pt), glm-5.2
+(-52.4%, -16.6 pt), opus-4-8 (-8.6%, -15.0 pt). Two are UNRESOLVED at this sample size
+(CI spans zero): **kimi-k2.6** (-10.0%, mean -11.8 pt, CI -28.5..+4.5) and **gpt-5.5**
+(-0.5%, mean -8.1 pt, CI -18.1..+1.5). Neither is a measurable cheaper-at-parity win:
+gpt-5.5's saving is negligible, and kimi-k2.6's real 10% saving comes with p50 246s per
+task vs opus-5's 38s (6.5x slower) plus an unresolved but negative-leaning quality mean.
+Resolving kimi-k2.6 properly needs more episodes than the cohort pin allows; recorded as
+an open cell, not bought unprompted.
+
 Savings quoted against a weak anchor overstate. The headline anchor is **fable-5** (named,
 $5/$25 per Mtok class): the frontier reference a customer would otherwise be paying for.
 Alongside it, every config is also scored against the **best single pool model by mean
