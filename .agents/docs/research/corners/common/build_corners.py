@@ -669,6 +669,119 @@ def loo_routed_records(
         dataset.routed.append(record)
 
 
+REAL_PROBE_DIR = Path.home() / "Desktop/Projects/world-model-harness/.wmo/jt/real-probe"
+REAL_JUDGE = "tau2 reward (7/20 pinned tasks include tau2's NL-assertion judge)"
+
+
+def _real_rows(model: str) -> list:
+    """The probe's real-episode rows for one arm, as ScenarioOutcome (scorecard input).
+
+    tau2's reward is binary-ish in [0,1]; success = full reward. Cost is candidate-side
+    at OUR pool prices (cost_usd_pool); the user simulator is environment, identical for
+    both arms, and excluded from the candidate comparison.
+    """
+    from wmo.optimize.outcomes import ScenarioOutcome as Row
+
+    path = REAL_PROBE_DIR / "rows.jsonl"
+    if not path.exists():
+        return []
+    out: list[Row] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        raw = json.loads(line)
+        if raw.get("model") != model:
+            continue
+        out.append(
+            Row(
+                scenario_id=str(raw["scenario_id"]),
+                task=str(raw.get("scenario_id")),
+                model=model,
+                episode=int(raw.get("episode", 0)),
+                reward=raw.get("reward"),
+                success=raw.get("reward") == 1.0,
+                cost_usd=float(raw.get("cost_usd_pool") or 0.0),
+                call_seconds=[float(raw.get("duration_s") or 0.0)],
+                error=str(raw.get("error")) if raw.get("error") else None,
+            )
+        )
+    return out
+
+
+def real_probe_section(dataset: CornersDataset) -> dict[str, object] | None:
+    """The WM-vs-real probe verdict (pre-registered in the real-leg prompt).
+
+    Real side: routed-decision-direct (the balanced policy's decision executed direct,
+    endpoint tool-call gap filed) vs fable-5, real tau2 episodes, tau2's own reward.
+    Sim side: the identity matrix's opus-5 vs fable-5 rows. The verdict is per-scenario
+    PAIRED SIGN AGREEMENT (the binding sim-to-real convention) plus the two headline
+    checks: routed cost saving vs fable-5, and quality at-least-parity. Never pools the
+    provenances; the comparison is deltas-vs-deltas.
+    """
+    routed_rows = _real_rows("routed-decision-direct")
+    anchor_rows = _real_rows("fable-5")
+    if not routed_rows or not anchor_rows:
+        return None
+    routed = Arm(
+        name="routed-decision-direct [real]",
+        condition=ConditionLabel(
+            base_model="opus-5(routed decision)", optimizer="routing(balanced, direct-exec)",
+            dataset="tau2-real", split="pinned-eval-20", judge=REAL_JUDGE,
+            provenance="real_episode",
+        ),
+        rows=routed_rows,
+    )
+    anchor = Arm(
+        name="fable-5 [real]",
+        condition=ConditionLabel(
+            base_model="fable-5", optimizer="none", dataset="tau2-real",
+            split="pinned-eval-20", judge=REAL_JUDGE, provenance="real_episode",
+        ),
+        rows=anchor_rows,
+    )
+    card = build_scorecard(arm=routed, anchor=anchor)
+    real_delta = paired_delta(
+        _by_scenario_rewards(routed_rows), _by_scenario_rewards(anchor_rows)
+    )
+    cost_ci = cost_delta_ci(_scenario_cost(routed_rows, []), _scenario_cost(anchor_rows, []))
+
+    # Sign agreement: real per-scenario deltas vs the WM's (opus-5 minus fable-5), matched
+    # by position in the pinned split (the WM's scenario ids are trace hashes, the real
+    # ids are domain:task ids; both derive from the same pinned 20 in the same order, but
+    # a positional map would be fragile, so agreement is computed on the DELTA VECTORS'
+    # signs per shared count with the mapping stated).
+    wm_identity = next((s for s in all_arm_snapshots() if s.name == IDENTITY_ARM), None)
+    agreement = None
+    if wm_identity is not None and dataset.anchor_model in wm_identity.matrix.model_names():
+        wm_delta = paired_delta(
+            rewards_by_scenario(wm_identity.matrix.outcomes, model="opus-5"),
+            rewards_by_scenario(wm_identity.matrix.outcomes, model=dataset.anchor_model),
+        )
+        agreement = {
+            "note": (
+                "sign agreement requires a scenario-id bridge (wm ids are trace hashes, "
+                "real ids are domain:task); computed by the probe script via the pinned "
+                "split order and reported in findings"
+            ),
+            "wm_mean_delta_pt": round(wm_delta.mean_delta * 100, 2),
+            "real_mean_delta_pt": round(real_delta.mean_delta * 100, 2),
+            "wm_n_up_down_tied": [wm_delta.n_up, wm_delta.n_down, wm_delta.n_tied],
+            "real_n_up_down_tied": [real_delta.n_up, real_delta.n_down, real_delta.n_tied],
+        }
+    return {
+        "label": "measured",
+        "provenance": "real_episode",
+        "judge": REAL_JUDGE,
+        "deviation": (
+            "routed arm executed direct (served endpoint 501s tool calls on "
+            "anthropic-kind entries; finding filed); balanced policy routes 100% opus-5, "
+            "verified live + 20/20 LOO folds"
+        ),
+        "vs_anchor": _summary(card, real_delta, cost_ci),
+        "sim_vs_real": agreement,
+    }
+
+
 def fig_dial_curve(dataset: CornersDataset, spec: FigureSpec, out: Path) -> None:
     """The dial's measured cost curve: ours9 anchors AS MEASURED; tau panel pending fits.
 
@@ -1212,6 +1325,7 @@ def dump_numbers(dataset: CornersDataset, lens: LensSpec) -> Path:
             "est_usd_at_3large_list": round(dataset.embedding_replay_est_usd, 6),
             "label": "estimate; analysis spend allowed by Silen 2026-07-28 ruling",
         },
+        "real_probe": real_probe_section(dataset),
         "notes": dataset.notes,
     }
     out.write_text(json.dumps(payload, indent=2, default=str) + "\n")
