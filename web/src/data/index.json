@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-07-26T18:58:05.842Z",
+  "generated_at": "2026-07-28T02:55:41.908Z",
   "models": [
     {
       "card": {
@@ -6146,8 +6146,8 @@
       "card": {
         "schema_version": 1,
         "name": "tau-telecom",
-        "title": "τ²-bench telecom (GEPA-optimized)",
-        "description": "The telecom slice of τ²-bench with a GEPA-evolved environment prompt (317 optimization rollouts). Same customer-service tool surface as tau-bench, tuned for the telecom domain's device and plan workflows.",
+        "title": "τ²-bench telecom",
+        "description": "The telecom slice of τ²-bench with an optimized environment prompt (317 optimization rollouts). Same customer-service tool surface as tau-bench, tuned for the telecom domain's device and plan workflows.",
         "task": "tau-bench",
         "corpus": {
           "traces": 29,
@@ -6163,8 +6163,7 @@
         "license": null,
         "tags": [
           "tool-calls",
-          "customer-service",
-          "gepa"
+          "customer-service"
         ]
       },
       "dir": "packages/environment-capture/tau-bench/models/tau-telecom",
