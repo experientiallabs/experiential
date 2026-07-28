@@ -240,10 +240,11 @@ def sweep(
 
     Nothing measured is lost, and nothing measured is bought twice. Every cell lands in
     `<out>.partial.jsonl` the moment it completes, so a sweep killed at hour five keeps the cells
-    it paid for; re-running the same command measures only what is missing and then writes the
-    matrix and removes the sidecar. Changing what the sweep measures (the pool, the scenario cut,
-    episodes, the step budget, the observation window, the compressor) makes those rows a
-    different arm, and the command says so and stops rather than merging two arms into one matrix.
+    it paid for. The completed matrix records the same plan identity, so re-running the exact
+    command reuses every cell without asking for spend consent. Changing what the sweep measures
+    (the pool, the scenario cut, episodes, the step budget, the observation window, the compressor)
+    makes those rows a different arm, and the command stops rather than overwriting or merging
+    evidence. The partial log is removed only after the completed matrix is safely written.
     `--concurrency N` runs N cells at once, which is the difference between a six-hour grid and a
     one-hour grid; it is not part of what the sweep measures, so a run interrupted at one value
     resumes at another.
@@ -341,15 +342,15 @@ def sweep(
         raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
     try:
-        # Before the money question, not after it: a sidecar left by a run of a DIFFERENT plan is
-        # refused here, while refusing still costs nothing.
+        # Before the money question, not after it: a partial or completed artifact from a
+        # DIFFERENT plan is refused here, while refusing still costs nothing.
         already_measured = resumable_cells(plan)
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
     world_model, _serve_provider = load_world_model(model_dir)
 
     print_cost_estimate(_console, plan, already_measured=already_measured)
-    _confirm_cost(plan, yes=yes)
+    _confirm_cost(plan, yes=yes, already_measured=already_measured)
 
     _console.print(
         f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.scenarios)} held-out "
@@ -611,9 +612,9 @@ def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: 
     )
     if already_measured:
         console.print(
-            f"  RESUMING: {already_measured} of those cell(s) are already measured beside the "
-            f"matrix and are NOT bought again, so this run measures {plan.cells - already_measured}"
-            " and spends proportionally less than the total above."
+            f"  RESUMING: {already_measured} of those cell(s) are already measured in the "
+            "completed matrix or its crash log and are NOT bought again, so this run measures "
+            f"{plan.cells - already_measured} and spends proportionally less than the total above."
         )
     if plan.max_concurrency > 1:
         console.print(
@@ -633,7 +634,7 @@ def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: 
     )
 
 
-def _confirm_cost(plan: SweepPlan, *, yes: bool) -> None:
+def _confirm_cost(plan: SweepPlan, *, yes: bool, already_measured: int = 0) -> None:
     """Confirm the projected spend before any episode runs.
 
     Consent is said, never inferred: a non-interactive session cannot answer a prompt, so a
@@ -642,14 +643,21 @@ def _confirm_cost(plan: SweepPlan, *, yes: bool) -> None:
     real money it never agreed to; every spend surface now shares one refusal
     (`wmo.cli.consent.require_spend_consent`).
 
+    A completed exact rerun has no cells left to buy, so it needs no spend consent. A partial
+    resume asks only for the remaining cells and their proportional estimate.
+
     Raises:
         typer.Exit: The user declined (exit code 0), or a non-interactive session was not told
             `--yes` (exit code 2).
     """
+    remaining = plan.cells - already_measured
+    if remaining == 0:
+        return
+    remaining_usd = plan.total_usd * remaining / plan.cells
     if not require_spend_consent(
         _console,
         yes=yes,
-        spend=f"~${plan.total_usd:.2f} across {plan.cells} cell(s)",
+        spend=f"~${remaining_usd:.2f} across {remaining} remaining cell(s)",
         command="wmo optimize route sweep",
     ):
         raise typer.Exit(0)

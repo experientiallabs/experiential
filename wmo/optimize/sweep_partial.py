@@ -21,7 +21,6 @@ library: before this, nothing on disk recorded WHICH scenario cut a matrix came 
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from pathlib import Path
@@ -30,6 +29,7 @@ from typing import TYPE_CHECKING, Self
 from pydantic import BaseModel, ConfigDict
 
 from wmo.optimize.outcomes import ScenarioOutcome
+from wmo.optimize.sweep_identity import PlanIdentity
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -42,9 +42,6 @@ PARTIAL_SUFFIX = ".partial.jsonl"
 PARTIAL_FORMAT_VERSION = 1
 """Bumped only by a change that makes an older sidecar unreadable, so the refusal can say so."""
 
-IDENTITY_DIGEST_CHARS = 16
-"""64 bits, the same width `OutcomeMatrix`'s provenance digest uses."""
-
 
 class PartialSweepError(ValueError):
     """A sidecar cannot be used, for a reason the operator can fix.
@@ -53,58 +50,6 @@ class PartialSweepError(ValueError):
     mix its rows in) either throws away paid cells or fabricates a matrix whose rows were measured
     under two different plans. `wmo.optimize.sweep` re-raises these as `SweepError`.
     """
-
-
-class PlanIdentity(BaseModel):
-    """What a set of measured rows was measured UNDER: the cohort pins, as data.
-
-    Two matrices are comparable when these agree and are different evidence when they do not, so
-    this is exactly the resume check, and exactly what a sidecar records about itself. Fields are
-    the properties that change what a cell MEASURES; how fast the sweep ran (concurrency) is not
-    one of them, so raising concurrency mid-run resumes cleanly instead of re-buying the grid.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    pool: str  # digest of the candidate roster, prices included
-    scenarios: tuple[str, ...]  # the scenario cut, by id, in sweep order
-    episodes: int
-    max_steps: int
-    history_chars: int
-    compression: str  # `wmo.optimize.compression.compression_signature`
-
-    @property
-    def digest(self) -> str:
-        """A short stable hash of the whole identity, for stamping into artifacts and logs."""
-        canonical = self.model_dump_json()
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:IDENTITY_DIGEST_CHARS]
-
-    def mismatch(self, other: PlanIdentity) -> str | None:
-        """How `other` differs from this identity in operator terms, or None when it does not.
-
-        Names ONE difference, the first in declaration order: an operator who changed the pool and
-        the episode count fixes them one at a time anyway, and a wall of diffs buries the field
-        that actually explains the refusal.
-        """
-        if self == other:
-            return None
-        if self.pool != other.pool:
-            return "the candidate pool changed (different models, or different prices)"
-        if self.scenarios != other.scenarios:
-            return (
-                f"the scenario cut changed ({len(other.scenarios)} scenario(s) then, "
-                f"{len(self.scenarios)} now)"
-            )
-        if self.episodes != other.episodes:
-            return f"episodes per cell changed ({other.episodes} then, {self.episodes} now)"
-        if self.max_steps != other.max_steps:
-            return f"the step budget changed ({other.max_steps} then, {self.max_steps} now)"
-        if self.history_chars != other.history_chars:
-            return (
-                f"the observation window changed ({other.history_chars} chars then, "
-                f"{self.history_chars} now)"
-            )
-        return f"the compression arm changed ({other.compression} then, {self.compression} now)"
 
 
 class PartialHeader(BaseModel):

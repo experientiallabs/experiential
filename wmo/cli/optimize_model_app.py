@@ -365,9 +365,6 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             compression=compression,
             max_concurrency=concurrency,
         )
-        # Read before the plan table so the sweep row can say how much of the grid a previous
-        # attempt already bought, and so a sidecar from a different plan is refused for free.
-        already_measured = resumable_cells(plan)
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
     try:
@@ -412,6 +409,17 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         allow_uneven=allow_uneven_coverage,
         redo=redo,
     )
+    try:
+        # A stage decision to run is explicit replacement authority for this pipeline's fixed
+        # matrix path. If the stage is current, the completed matrix instead participates in
+        # resume and is validated before the plan table or any spend question.
+        replace_completed_sweep = _will_sweep(decisions)
+        already_measured = resumable_cells(
+            plan,
+            replace_completed=replace_completed_sweep,
+        )
+    except SweepError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     _print_plan(
         _console,
         model_dir.name,
@@ -478,6 +486,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             cost_quality=cost_quality,
             allow_uneven_coverage=allow_uneven_coverage,
             already_measured=already_measured,
+            replace_completed_sweep=replace_completed_sweep,
         )
     except BudgetExceeded as exc:
         _print_budget_stop(model_dir.name, exc)
@@ -1149,6 +1158,7 @@ def _run_stages(
     cost_quality: float,
     allow_uneven_coverage: bool,
     already_measured: int = 0,
+    replace_completed_sweep: bool = False,
 ) -> RunManifest:
     """Walk the plan, running what it said would run and recording each stage as it completes.
 
@@ -1175,6 +1185,7 @@ def _run_stages(
                     model_dir=model_dir,
                     pool_file=pool_file,
                     already_measured=already_measured,
+                    replace_completed=replace_completed_sweep,
                 )
                 ledger.record(record.total_spend_usd)
             case Stage.COMPACT:
@@ -1203,7 +1214,12 @@ def _now() -> str:
 
 
 def _stage_sweep(
-    plan: SweepPlan, *, model_dir: Path, pool_file: Path, already_measured: int = 0
+    plan: SweepPlan,
+    *,
+    model_dir: Path,
+    pool_file: Path,
+    already_measured: int = 0,
+    replace_completed: bool = False,
 ) -> StageRecord:
     """Measure every candidate closed-loop and record what it cost.
 
@@ -1223,6 +1239,7 @@ def _stage_sweep(
         world_model=world_model,
         env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
         on_outcome=cell_progress(_console, plan.cells - already_measured),
+        replace_completed=replace_completed,
     )
     matrix = run.matrix
     scored = sum(1 for outcome in matrix.outcomes if outcome.scored)

@@ -49,10 +49,10 @@ from wmo.ingest import get_adapter
 from wmo.optimize.compression import CompressionConfig, compression_signature
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.reward import EpisodeScore
+from wmo.optimize.sweep_identity import PlanIdentity
 from wmo.optimize.sweep_partial import (
     PartialSweepError,
     PartialWriter,
-    PlanIdentity,
     partial_path,
     read_partial,
 )
@@ -417,6 +417,7 @@ def execute_sweep(
     on_outcome: Callable[[ScenarioOutcome], None] | None = None,
     runs_dir: Path | None = None,
     remeasure: frozenset[CellKey] = frozenset(),
+    replace_completed: bool = False,
 ) -> SweepRun:
     """Run every cell of `plan` against a FROZEN world model, write the matrix, meter both sides.
 
@@ -433,9 +434,10 @@ def execute_sweep(
 
     NOTHING IS LOST TO A CRASH. Every cell is appended to `<out>.partial.jsonl` the moment it
     completes, and a later call with the same plan measures only the cells that file does not
-    already hold. A sidecar whose rows were measured under a different plan is refused rather
-    than merged (`SweepPlan.identity`). The sidecar is removed once the matrix is written, so a
-    finished sweep leaves exactly the artifact it always left.
+    already hold. The completed matrix records the same identity and participates in the same
+    resume, so an exact rerun buys no cells. A partial log or completed matrix measured under a
+    different plan is refused rather than merged or overwritten (`SweepPlan.identity`). The
+    partial log is removed once the matrix is written.
 
     The world model opens one metered session per episode and `WorldModelEnv.close` leaves that
     session's final `RunRecord` on the env. Those records used to die with the env: the sweep
@@ -457,11 +459,15 @@ def execute_sweep(
         remeasure: Cells to buy again even though the sidecar already holds them, for a retry
             pass over cells an earlier attempt lost to a transient fault. Their new rows carry
             `remeasured=True` and replace the earlier ones.
+        replace_completed: Ignore a readable completed matrix and start a new attempt. This is
+            explicit replacement authority for callers such as `--force-from sweep`; a matching
+            partial log still resumes so a forced attempt remains crash-safe.
 
     Raises:
-        SweepError: The sidecar beside `out_path` belongs to a different plan, or is damaged.
+        SweepError: A partial or completed artifact belongs to a different plan, has unknown
+            identity, or is damaged.
     """
-    resumed = _resume(plan, remeasure)
+    resumed = _resume(plan, remeasure, replace_completed=replace_completed)
     harvest = _SessionHarvest(env_factory)
     destination = runs_dir or ArtifactPaths(plan.model_dir).runs
     measured: list[ScenarioOutcome] = []
@@ -495,7 +501,11 @@ def execute_sweep(
         # candidate-side rows survive in the sidecar, which is what the next run resumes from.
         usage, usage_path = _persist_harvest(harvest, destination)
         resumed.writer.close()
-    matrix = OutcomeMatrix(pool=plan.pool.models, outcomes=_assemble(plan, resumed.rows, measured))
+    matrix = OutcomeMatrix(
+        pool=plan.pool.models,
+        outcomes=_assemble(plan, resumed.rows, measured),
+        sweep_identity=plan.identity,
+    )
     matrix.save(plan.out_path)
     # Only now: while the matrix was unwritten the sidecar was the only copy of these cells.
     resumed.writer.discard()
@@ -527,13 +537,18 @@ class _Resume:
     writer: PartialWriter
 
 
-def _resume(plan: SweepPlan, remeasure: frozenset[CellKey]) -> _Resume:
-    """Read the sidecar, decide which cells still need buying, and open the log for appending.
+def _resume(
+    plan: SweepPlan,
+    remeasure: frozenset[CellKey],
+    *,
+    replace_completed: bool = False,
+) -> _Resume:
+    """Read prior artifacts, decide which cells still need buying, and open the partial log.
 
-    A row is reused when the sidecar holds it AND the caller did not ask for that cell again.
-    Unscored rows are reused too: the cell ran, the episode was paid for, and its `error` is the
-    diagnosis. Re-running it is a decision the caller makes with `remeasure`, not one a resume
-    makes silently on their behalf and their budget.
+    A row is reused when the completed matrix or partial log holds it AND the caller did not ask
+    for that cell again. Unscored rows are reused too: the cell ran, the episode was paid for,
+    and its `error` is the diagnosis. Re-running it is a decision the caller makes with
+    `remeasure`, not one a resume makes silently on their behalf and their budget.
 
     Raises:
         SweepError: The sidecar belongs to a different plan, or cannot be read.
@@ -541,7 +556,10 @@ def _resume(plan: SweepPlan, remeasure: frozenset[CellKey]) -> _Resume:
     path = partial_path(plan.out_path)
     identity = plan.identity
     try:
-        rows = read_partial(path, identity)
+        rows = [
+            *_read_completed(plan, replace=replace_completed),
+            *read_partial(path, identity),
+        ]
         writer = PartialWriter(path, identity)
     except PartialSweepError as exc:
         raise SweepError(str(exc)) from exc
@@ -591,22 +609,73 @@ def _assemble(
     return ordered
 
 
-def resumable_cells(plan: SweepPlan) -> int:
-    """How many of `plan`'s cells a previous attempt already measured and left in the sidecar.
+def resumable_cells(plan: SweepPlan, *, replace_completed: bool = False) -> int:
+    """How many cells a previous attempt preserved in the completed matrix or partial log.
 
     Called BEFORE the spend confirmation, so a resumed run can say how much of the projected cost
     it is not going to pay again, and so a sidecar that belongs to a different plan is refused
     while refusing is still free. Zero when there is nothing to resume.
 
     Raises:
-        SweepError: The sidecar beside the plan's `out_path` belongs to a different plan, or is
-            damaged. Same message the run itself would raise, delivered before the money question.
+        SweepError: A prior artifact at `out_path` belongs to a different plan, has unknown
+            identity, or is damaged. The run itself would raise the same error, but this check
+            delivers it before the money question.
     """
     try:
-        rows = read_partial(partial_path(plan.out_path), plan.identity)
+        rows = [
+            *_read_completed(plan, replace=replace_completed),
+            *read_partial(partial_path(plan.out_path), plan.identity),
+        ]
     except PartialSweepError as exc:
         raise SweepError(str(exc)) from exc
     return len({CellKey.of(row).model_dump_json() for row in rows})
+
+
+def _read_completed(plan: SweepPlan, *, replace: bool = False) -> list[ScenarioOutcome]:
+    """Read reusable rows from a completed matrix, or honor explicit replacement authority."""
+    path = plan.out_path
+    if not path.is_file():
+        return []
+    try:
+        matrix = OutcomeMatrix.load(path)
+    except (OSError, ValueError) as exc:
+        raise SweepError(
+            f"{path} already exists but is not a readable completed outcome matrix: {exc}. "
+            "Choose a different --out, or move the existing file before re-running"
+        ) from exc
+    if replace:
+        return []
+    identity = matrix.sweep_identity
+    if identity is None:
+        raise SweepError(
+            f"{path} already holds an outcome matrix without a recorded sweep identity. WMO "
+            "cannot prove which plan produced it, so it will not overwrite or reuse it. Choose "
+            "a different --out, or move the existing file before re-running"
+        )
+    difference = plan.identity.mismatch(identity)
+    if difference is not None:
+        raise SweepError(
+            f"{path} holds a completed matrix measured under a DIFFERENT plan: {difference}. "
+            "Re-run with the previous settings to reuse it. To replace it, use the caller's "
+            "explicit replacement option if available, or preserve the matrix at another path "
+            "before re-running this plan"
+        )
+    expected = {
+        cell.key.model_dump_json()
+        for cell in pool_cells(
+            plan.pool,
+            list(plan.scenarios),
+            episodes_per_scenario=plan.episodes,
+        )
+    }
+    actual = [CellKey.of(row).model_dump_json() for row in matrix.outcomes]
+    if len(actual) != len(set(actual)) or set(actual) != expected:
+        raise SweepError(
+            f"{path} records sweep identity {identity.digest} but its cells do not match that "
+            "plan. WMO will not overwrite damaged or edited evidence. Choose a different --out, "
+            "or move the existing file before re-running"
+        )
+    return matrix.outcomes
 
 
 def _pool_digest(pool: ModelPool) -> str:

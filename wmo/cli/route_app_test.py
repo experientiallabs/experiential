@@ -1490,6 +1490,50 @@ def test_route_sweep_resumes_the_cells_an_interrupted_run_already_bought(
     assert not sidecar.exists()
 
 
+def test_route_sweep_reuses_a_completed_matrix_without_running_cells_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seams = _patch_seams(monkeypatch)
+    root = _project(tmp_path, traces=_corpus())
+    out, first = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
+    assert first.exit_code == 0, first.output
+    original = out.read_bytes()
+    scored_before = len(seams.world_model.scored)
+
+    _, second = _sweep(tmp_path, root, "support", "--scenarios", "3")
+    assert second.exit_code == 0, second.output
+    assert _says(second.output, "RESUMING: 6 of those cell(s) are already measured")
+    assert len(seams.world_model.scored) == scored_before
+    assert out.read_bytes() == original
+
+
+def test_route_sweep_refuses_to_overwrite_a_completed_matrix_from_another_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seams = _patch_seams(monkeypatch)
+    root = _project(tmp_path, traces=_corpus())
+    out, first = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
+    assert first.exit_code == 0, first.output
+    original = out.read_bytes()
+    scored_before = len(seams.world_model.scored)
+
+    _, blocked = _sweep(
+        tmp_path,
+        root,
+        "support",
+        "--scenarios",
+        "3",
+        "--episodes",
+        "2",
+        "--yes",
+    )
+    assert blocked.exit_code != 0
+    assert _says(blocked.output, "completed matrix")
+    assert _says(blocked.output, "episodes per cell changed")
+    assert len(seams.world_model.scored) == scored_before
+    assert out.read_bytes() == original
+
+
 def test_route_sweep_refuses_a_sidecar_that_belongs_to_a_different_plan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

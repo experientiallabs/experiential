@@ -562,6 +562,53 @@ def test_a_crash_keeps_its_paid_cells_and_the_resume_buys_only_the_rest(
     assert not partial_path(plan.out_path).exists()
 
 
+def test_a_completed_matrix_is_reused_without_buying_any_cell_again(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    first = _run_plan(plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs")
+    assert first.matrix.sweep_identity == plan.identity
+
+    built_before = len(candidates)
+    resumed = _run_plan(
+        _plan(tmp_path, scenarios=3),
+        [],
+        runs_dir=tmp_path / "runs",
+    )
+    assert len(candidates) == built_before
+    assert resumed.resumed_cells == 3
+    assert resumed.matrix == first.matrix
+
+
+def test_a_completed_matrix_from_a_different_plan_is_not_overwritten(
+    tmp_path: Path, candidates: list[str]
+) -> None:
+    plan = _plan(tmp_path, scenarios=3)
+    _run_plan(plan, [_StubEnv(0.10) for _ in range(3)], runs_dir=tmp_path / "runs")
+    original = plan.out_path.read_bytes()
+    changed = _plan(tmp_path, scenarios=3, episodes=2)
+
+    with pytest.raises(SweepError, match="episodes per cell changed"):
+        resumable_cells(changed)
+    with pytest.raises(SweepError, match="DIFFERENT plan"):
+        _run_plan(
+            changed,
+            [_StubEnv(0.10) for _ in range(6)],
+            runs_dir=tmp_path / "runs",
+        )
+    assert plan.out_path.read_bytes() == original
+
+    replaced = execute_sweep(
+        changed,
+        world_model=cast("WorldModel", _FrozenWorldModel()),
+        env_factory=_factory([_StubEnv(0.10) for _ in range(6)]),
+        runs_dir=tmp_path / "runs",
+        replace_completed=True,
+    )
+    assert replaced.matrix.sweep_identity == changed.identity
+    assert len(replaced.matrix.outcomes) == 6
+
+
 def test_a_resumed_run_says_its_world_model_figure_is_this_attempt_only(
     tmp_path: Path, candidates: list[str]
 ) -> None:

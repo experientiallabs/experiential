@@ -15,6 +15,7 @@ from pydantic import BaseModel, model_validator
 
 from wmo.core.files import write_text_atomic
 from wmo.optimize.compression import CompressionConfig
+from wmo.optimize.sweep_identity import PlanIdentity
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -118,10 +119,15 @@ class OutcomeMatrix(BaseModel):
 
     Carrying the pool snapshot makes the matrix self-describing: a policy fitted from it can
     record exactly which candidates (and at what prices) its assignments were chosen over.
+    Sweep-produced matrices also carry the complete plan identity, which lets an exact rerun
+    reuse the grid and keeps a changed plan from silently replacing different evidence.
     """
 
     pool: list[PoolEntry]
     outcomes: list[ScenarioOutcome]
+    # Present on matrices produced by a sweep. Older and manually assembled matrices remain valid
+    # downstream, but cannot safely be resumed because their complete measurement plan is unknown.
+    sweep_identity: PlanIdentity | None = None
 
     @model_validator(mode="after")
     def _outcomes_name_pool_models(self) -> OutcomeMatrix:
