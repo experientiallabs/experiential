@@ -34,7 +34,7 @@ wmo optimize route sweep my-model --traces traces.otel.jsonl
 
 # Turn those measurements into a routing policy
 wmo optimize route fit matrix.json --kind knn \
-  --out .wmo/models/my-endpoint/policy.json
+  --out .wmo/models/my-model/policy.json
 ```
 
 **3. Serve it.**
