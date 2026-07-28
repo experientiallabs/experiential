@@ -214,12 +214,6 @@ uv run pytest -q
    - `assets/` — media referenced by README/docs (demo GIFs, logos).
    - `.claude/` — checked-in agent skills (e.g. `/ready-for-merge`); local files
      (`settings.local.json`, locks) stay gitignored.
-   - `contracts/` — **cross-package contract tests**, and nothing else. A test that imports both
-     `wmo` and a workspace member can live in neither tree (`wmo/` imports no member the wheel
-     does not ship; members never import `wmo`), so it lives here, at the boundary it protects.
-     Inline `*_test.py` naming and the root pytest gate apply, via `testpaths`. Keep it small:
-     a file here means two packages share a wire format or an on-disk layout with no code
-     dependency to pin it, and it must say which contract and which two parties.
    - `packages/`: every workspace member lives here, one directory per package:
      `packages/llm-waterfall/` (stateless LLM failover, bundled into the flagship WMO wheel) and
      `packages/environment-capture/` (benchmark adapters + real-run trace capture emitting OTel
@@ -325,8 +319,8 @@ Rules of the road:
   per-benchmark data dirs (e.g. `packages/environment-capture/tau-bench/rl/`) may import `wmo`:
   they are workspace tooling that happens to live next to the data it operates on, they never
   ship, and the member must stay installable without them. Second, a vendored copy removes the
-  code dependency but not a shared wire format; a test that pins one imports both packages and
-  therefore belongs in neither, so it goes in `contracts/` (rule 5).
+  code dependency but not a shared wire format: nothing in-repo pins the two copies together, so
+  a change to one side must be mirrored by hand.
 - **Gate scoping**: the root gate (`uv run ruff check .`, `uv run ty check`,
   `uv run pytest -q`) covers the flagship and every Python member (member tests are inline
   `*_test.py`, discovered via root `testpaths`). A member may carry stricter/looser settings in

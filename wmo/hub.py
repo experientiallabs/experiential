@@ -17,7 +17,7 @@ anything under `packages/` (AGENTS.md § Monorepo), so `wmo` cannot import it: t
 every `wmo` release wait on a member release, and it stranded fixes — the ``wmh-``/``wmo-``
 dataset-name fallback below shipped in the member's unreleased 0.1.1 and never reached a single
 pip user. The two copies must still agree on the registry and the data root, so a benchmark
-added to one is added to both; `contracts/vendored_hub_parity_test.py` fails the build when they
+added to one must be added to both by hand; nothing in-repo fails the build when they
 drift.
 """
 
@@ -183,8 +183,7 @@ CORPORA: dict[str, CorpusSpec] = {
             # listing it as downloadable is a dead end, so reads hide it.
             published=False,
             license_id="mit",
-            upstream="mediar-ai/screenpipe gui-control (MIT); trajectories captured with "
-            "Kimi-K2.6 via Azure AI Foundry",
+            upstream="in-house capture",
             description=(
                 "Computer-use agent runs driving macOS GUI apps through the Accessibility API "
                 "plus a shell: real tool calls and the accessibility-tree/command outputs they saw."

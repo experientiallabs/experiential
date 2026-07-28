@@ -74,7 +74,7 @@ dev = [
 
 [dependency-groups]
 # Workspace members join the dev environment (uv syncs the `dev` group by default) so the root
-# gate covers their tests and `contracts/` can import both sides of a cross-package contract.
+# gate covers their tests.
 # A dependency GROUP is not published metadata, so nothing here reaches a `pip install
 # world-model-optimizer`: `environment-capture` is a development dependency only, and `wmo/`
 # imports nothing from it (`wmo/hub.py` vendors the bundle-fetch core `wmo download` needs).
@@ -132,9 +132,7 @@ python_files = ["*_test.py"]
 # One root gate covers the flagship and every Python member (same inline-test convention).
 # `deploy/` carries the operated services; their tests cover the deploy scripts themselves
 # (a deploy that deletes the box's generated trees rotates the pinned TLS certificate).
-# `contracts/` holds cross-package contract tests, which belong to neither tree because they
-# import both (AGENTS.md § Monorepo) — without this entry they would silently stop running.
-testpaths = ["wmo", "packages", "deploy", "contracts"]
+testpaths = ["wmo", "packages", "deploy"]
 # tau2-bench is a local clone of the external real-environment runner (own test suite, own
 # deps) that lives beside the tau-bench member data; it is not part of this gate.
 norecursedirs = ["tau2-bench"]

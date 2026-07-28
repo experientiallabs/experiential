@@ -178,9 +178,8 @@ def test_wmo_imports_no_workspace_member_it_does_not_ship() -> None:
     importing our own shipped code. Every other member is a separate distribution: importing one
     puts it back in `Requires-Dist`, which couples every `wmo` release to a member release and
     strands the member's unreleased fixes (that is exactly what happened to the `wmh-`/`wmo-`
-    dataset-name fallback, now vendored in `wmo/hub.py`). Tests count too — a test import is
-    still an import of the member, and cross-package contract tests belong in `contracts/`,
-    which is owned by neither tree.
+    dataset-name fallback, now vendored in `wmo/hub.py`). Tests count too: a test import is
+    still an import of the member, so a test needing both sides cannot live under `wmo/` either.
     """
     forbidden = sorted(
         {
@@ -203,7 +202,7 @@ def test_wmo_imports_no_workspace_member_it_does_not_ship() -> None:
     )
     assert not offenders, (
         f"wmo/ imports workspace members the wheel does not ship: {offenders}; vendor what the "
-        "flagship needs, or move a cross-package contract test into contracts/ "
+        "flagship needs, and keep tests that require both sides out of wmo/ "
         "(AGENTS.md § Monorepo)"
     )
 

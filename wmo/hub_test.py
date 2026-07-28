@@ -3,7 +3,7 @@
 Covers the behaviour `wmo download` and benchmark discovery depend on, against fake HTTP seams.
 `wmo/hub.py` is a narrowed copy of the `environment-capture` member's Hub client, and a copy
 that drifts from its origin is worse than the import it replaced; that half of the job is
-`contracts/vendored_hub_parity_test.py`, which lives outside `wmo/` because it must import both
+no automated parity check, because such a test would have to import both
 packages.
 """
 
