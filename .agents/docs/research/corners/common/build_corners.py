@@ -228,6 +228,10 @@ class LensSpec(BaseModel):
     judge_label: str | None = None  # default: GRID_JUDGE (the tau cohort's pin)
     provenance_label: str = WM_SIMULATED
     split_label: str = WM_TEST_BAND
+    # The arms this lens's dataset was DESIGNED to have. The pending footnote is computed against
+    # it, so a leg that never planned the compaction arms does not advertise them as data still to
+    # come: claiming absent data is its own dishonesty, in the opposite direction to hiding it.
+    arms: tuple[str, ...] | None = None  # default: the tau cohort's GRID_ARMS
 
 
 class ConfigRecord(BaseModel):
@@ -369,6 +373,7 @@ def build_dataset(
     judge: str = GRID_JUDGE,
     provenance: str = WM_SIMULATED,
     split: str = WM_TEST_BAND,
+    arms: tuple[str, ...] | None = None,
     loo: bool = False,
 ) -> CornersDataset:
     """Load once, aggregate once. Every figure below renders from this object.
@@ -386,7 +391,7 @@ def build_dataset(
         judge_label=judge,
         provenance_label=provenance,
         split_label=split,
-        pending=[arm for arm in GRID_ARMS if arm not in present],
+        pending=[arm for arm in (arms or GRID_ARMS) if arm not in present],
         status="; ".join(f"{s.name}: {s.status}" for s in snapshots)
         or "no grid data on disk yet",
     )
@@ -1467,6 +1472,7 @@ def main() -> None:
         judge=lens.judge_label or GRID_JUDGE,
         provenance=lens.provenance_label,
         split=lens.split_label,
+        arms=lens.arms,
         loo=args.loo,
     )
     out = render_lens(lens, dataset, args.out_dir)

@@ -32,6 +32,10 @@ LENS = LensSpec(
     judge_label="tau2 reward (7/20 pinned tasks include tau2's NL-assertion judge)",
     provenance_label=REAL_EPISODE,
     split_label="pinned-eval-20",
+    # One arm by design: this leg measures candidates on the real benchmark and has no compaction
+    # arms, so the default tau cohort's truncate/llmlingua2-endpoint must not be advertised as
+    # data still to come.
+    arms=("identity",),
     figures=(
         # Cost savings is the primary headline for this program, so the frontier leads.
         FigureSpec(kind="savings_frontier", filename="savings_vs_fable5.png"),
