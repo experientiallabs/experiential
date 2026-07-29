@@ -301,6 +301,8 @@ class Tau2Simulation(BaseModel):
     reward_info: Tau2RewardInfo | None = None
     messages: list[Tau2Message] = []
     info: Tau2SimulationInfo | None = None
+    start_time: str | None = None
+    end_time: str | None = None
 
     _null_is_zero = field_validator("duration", mode="before")(_zero_if_null)
 
@@ -368,6 +370,13 @@ class RealEpisodeRow(BaseModel):
     # were forwarded have no label and default to UNLABELED_COHORT rather than failing to load:
     # they are readable evidence of a different cohort, and consumers refuse to pair across them.
     cohort: str = UNLABELED_COHORT
+    # WHEN the episode ran, as tau2 clocked it. `wmo runs backfill` replays a run from its
+    # artifacts and refuses to infer anything they do not say, so without these the platform's run
+    # history could only carry the hour someone replayed it instead of the hour the work happened.
+    # Absent on rows bought before this field existed, which is why the converter reports how many
+    # it could not stamp rather than substituting a clock of its own.
+    started_at: str | None = None
+    ended_at: str | None = None
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -782,6 +791,8 @@ def rows_from_results(
                 termination_reason=sim.termination_reason,
                 error=error,
                 error_type=error_type,
+                started_at=sim.start_time,
+                ended_at=sim.end_time,
                 duration_s=sim.duration,
                 agent_input_tokens=agent_in,
                 agent_output_tokens=agent_out,

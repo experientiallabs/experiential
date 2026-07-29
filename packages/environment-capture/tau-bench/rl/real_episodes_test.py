@@ -526,6 +526,26 @@ def test_a_fully_evaluated_episode_reports_no_vacuous_components(tmp_path: Path)
     assert row.vacuous_components == []
 
 
+def test_row_carries_tau2s_own_clock(tmp_path: Path) -> None:
+    # `wmo runs backfill` stamps a replayed run with the timestamps its artifacts carry and
+    # infers nothing else, so an episode that does not record when it ran can only appear in the
+    # platform's history at the hour someone replayed it.
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].start_time = "2026-07-29T02:07:04.473281"
+    payload.simulations[0].end_time = "2026-07-29T02:07:47.001000"
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.started_at == "2026-07-29T02:07:04.473281"
+    assert row.ended_at == "2026-07-29T02:07:47.001000"
+
+
+def test_an_unclocked_episode_leaves_the_timestamps_absent(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.started_at is None
+    assert row.ended_at is None
+
+
 def test_matrix_carries_cost_and_latency(tmp_path: Path) -> None:
     index = _scenario_index(tmp_path)
     [row] = rows_from_results(_results_payload(0.5), _AZURE_AI, 0, index, _AZURE_OPENAI)
