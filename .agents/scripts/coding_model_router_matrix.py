@@ -60,7 +60,7 @@ RETRY_DELAYS_S = (15, 60)
 # including cache writes, and prevents concurrency from overshooting the operator's cap before
 # realized usage is persisted.
 CELL_SPEND_RESERVATION_USD = 500.0
-E2B_ACCOUNT_CAP = 100
+E2B_ACCOUNT_CAP = 1000
 SMOKE_TASKS = ("break-filter-js-from-html", "log-summary-date-ranges")
 SMOKE_ARMS = ("oai-luna-high", "ant-haiku45")
 INFRASTRUCTURE_STOPS = frozenset(

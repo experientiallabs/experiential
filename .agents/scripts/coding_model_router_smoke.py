@@ -46,7 +46,7 @@ ARMS = ("oai-luna-high", "ant-haiku45")
 MAX_LOGICAL_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
 SMOKE_MODEL_SPEND_CAP_USD = 10.0
-E2B_ACCOUNT_CAP = 100
+E2B_ACCOUNT_CAP = 1000
 INFRASTRUCTURE_STOPS = frozenset(
     {
         "error",

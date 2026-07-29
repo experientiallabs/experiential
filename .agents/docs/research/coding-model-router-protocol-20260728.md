@@ -201,7 +201,8 @@ cells, fit a guarded hashing-1024 kNN plumbing policy on the fit task, and repla
 The smoke has a hard USD 10 inference cap and is not headline evidence.
 
 The smoke and matrix runners fail before paid execution when the read-only E2B listing shows no
-slot under the configured 100-sandbox account cap.
+slot under the configured 1,000-sandbox account cap. The user confirmed the expanded account
+capacity on 2026-07-29 before the replacement smoke launch.
 
 The no-spend task and provider preflight passed for all four cells. Shared E2B capacity later
 opened to 82 active sandboxes, so the one authorized smoke was launched.

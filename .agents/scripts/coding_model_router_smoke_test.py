@@ -34,6 +34,11 @@ class _SandboxClient:
         return cls.page
 
 
+def test_expanded_e2b_account_cap_is_frozen_across_runners() -> None:
+    assert smoke_runner.E2B_ACCOUNT_CAP == 1000
+    assert matrix_runner.E2B_ACCOUNT_CAP == smoke_runner.E2B_ACCOUNT_CAP
+
+
 def _entry() -> PoolEntry:
     return PoolEntry(
         name="test-arm",
