@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import cast
 
 from llm_waterfall import ChatRequest
 
@@ -12,12 +13,49 @@ from wmo.providers._anthropic_chat import (
     messages_response,
 )
 
-_TOOL = {
+
+def _messages(payload: dict[str, object]) -> list[dict[str, object]]:
+    """The payload's messages, narrowed once so assertions can index them.
+
+    `messages_request` returns `dict[str, object]` because that is what the SDK takes; a test
+    that subscripts straight through it is only readable to a human, not to the type checker.
+    """
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    return cast("list[dict[str, object]]", messages)
+
+
+def _blocks(message: dict[str, object]) -> list[dict[str, object]]:
+    """One message's content blocks, narrowed."""
+    blocks = message["content"]
+    assert isinstance(blocks, list)
+    return cast("list[dict[str, object]]", blocks)
+
+
+def _tool_specs(payload: dict[str, object]) -> list[dict[str, object]]:
+    """The payload's tool schemas, narrowed."""
+    tools = payload["tools"]
+    assert isinstance(tools, list)
+    return cast("list[dict[str, object]]", tools)
+
+
+def _system_blocks(payload: dict[str, object]) -> list[dict[str, object]]:
+    """The system prompt as content blocks (the form it takes when it carries a breakpoint)."""
+    system = payload["system"]
+    assert isinstance(system, list)
+    return cast("list[dict[str, object]]", system)
+
+
+_TOOL_PARAMETERS: dict[str, object] = {
+    "type": "object",
+    "properties": {"command": {"type": "string"}},
+}
+_TOOL: dict[str, object] = {
     "type": "function",
     "function": {
         "name": "bash",
         "description": "run a shell command",
-        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}},
+        "parameters": _TOOL_PARAMETERS,
     },
 }
 
@@ -38,9 +76,7 @@ def test_system_lifts_out_of_messages() -> None:
     payload = messages_request(_request(), "claude-fable-5", default_max_tokens=1024)
 
     assert payload["system"] == "you are an agent"
-    messages = payload["messages"]
-    assert isinstance(messages, list)
-    assert [m["role"] for m in messages] == ["user"]
+    assert [m["role"] for m in _messages(payload)] == ["user"]
 
 
 def test_max_tokens_falls_back_to_the_default() -> None:
@@ -56,10 +92,9 @@ def test_tools_and_tool_choice_translate() -> None:
         _request(tool_choice="required"), "claude-fable-5", default_max_tokens=1024
     )
 
-    tools = payload["tools"]
-    assert isinstance(tools, list)
+    tools = _tool_specs(payload)
     assert tools[0]["name"] == "bash"
-    assert tools[0]["input_schema"] == _TOOL["function"]["parameters"]
+    assert tools[0]["input_schema"] == _TOOL_PARAMETERS
     assert payload["tool_choice"] == {"type": "any"}
 
 
@@ -103,19 +138,16 @@ def test_assistant_tool_call_and_result_round_trip() -> None:
     )
 
     payload = messages_request(request, "claude-fable-5", default_max_tokens=1024)
-    messages = payload["messages"]
-    assert isinstance(messages, list)
+    messages = _messages(payload)
     assert [m["role"] for m in messages] == ["user", "assistant", "user"]
 
-    assistant_blocks = messages[1]["content"]
-    assert isinstance(assistant_blocks, list)
+    assistant_blocks = _blocks(messages[1])
     assert assistant_blocks[0] == {"type": "text", "text": "looking"}
     assert assistant_blocks[1]["type"] == "tool_use"
     assert assistant_blocks[1]["id"] == "call_1"
     assert assistant_blocks[1]["input"] == {"command": "ls"}
 
-    result_blocks = messages[2]["content"]
-    assert isinstance(result_blocks, list)
+    result_blocks = _blocks(messages[2])
     assert result_blocks[0]["type"] == "tool_result"
     assert result_blocks[0]["tool_use_id"] == "call_1"
 
@@ -146,13 +178,9 @@ def test_consecutive_same_role_messages_merge() -> None:
         ]
     )
 
-    payload = messages_request(request, "claude-fable-5", default_max_tokens=1024)
-    messages = payload["messages"]
-    assert isinstance(messages, list)
+    messages = _messages(messages_request(request, "claude-fable-5", default_max_tokens=1024))
     assert [m["role"] for m in messages] == ["user", "assistant", "user"]
-    merged = messages[2]["content"]
-    assert isinstance(merged, list)
-    assert [block["tool_use_id"] for block in merged] == ["c1", "c2"]
+    assert [block["tool_use_id"] for block in _blocks(messages[2])] == ["c1", "c2"]
 
 
 def test_malformed_tool_arguments_keep_the_call() -> None:
@@ -173,11 +201,8 @@ def test_malformed_tool_arguments_keep_the_call() -> None:
         ]
     )
 
-    payload = messages_request(request, "claude-fable-5", default_max_tokens=1024)
-    messages = payload["messages"]
-    assert isinstance(messages, list)
-    blocks = messages[0]["content"]
-    assert isinstance(blocks, list)
+    messages = _messages(messages_request(request, "claude-fable-5", default_max_tokens=1024))
+    blocks = _blocks(messages[0])
     assert blocks[0]["type"] == "tool_use"
     assert blocks[0]["input"] == {}
 
@@ -190,13 +215,8 @@ def test_one_breakpoint_closes_the_whole_prefix() -> None:
     """
     payload = messages_request(_request(), "claude-fable-5", default_max_tokens=1024)
 
-    tools = payload["tools"]
-    assert isinstance(tools, list)
-    assert "cache_control" not in tools[-1]
-    messages = payload["messages"]
-    assert isinstance(messages, list)
-    blocks = messages[-1]["content"]
-    assert isinstance(blocks, list)
+    assert "cache_control" not in _tool_specs(payload)[-1]
+    blocks = _blocks(_messages(payload)[-1])
     assert blocks[-1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
     # The system prompt is inside the cached prefix, so it spends no breakpoint of its own.
     assert payload["system"] == "you are an agent"
@@ -210,9 +230,7 @@ def test_system_carries_the_breakpoint_when_there_are_no_messages() -> None:
         default_max_tokens=1024,
     )
 
-    system = payload["system"]
-    assert isinstance(system, list)
-    assert system[0]["cache_control"] == CACHE_CONTROL_EPHEMERAL
+    assert _system_blocks(payload)[0]["cache_control"] == CACHE_CONTROL_EPHEMERAL
 
 
 def test_caching_can_be_turned_off_to_measure_uncached_cost() -> None:
@@ -220,11 +238,7 @@ def test_caching_can_be_turned_off_to_measure_uncached_cost() -> None:
         _request(), "claude-fable-5", default_max_tokens=1024, cache_prompt=False
     )
 
-    messages = payload["messages"]
-    assert isinstance(messages, list)
-    blocks = messages[-1]["content"]
-    assert isinstance(blocks, list)
-    assert "cache_control" not in blocks[-1]
+    assert "cache_control" not in _blocks(_messages(payload)[-1])[-1]
     assert payload["system"] == "you are an agent"
 
 
