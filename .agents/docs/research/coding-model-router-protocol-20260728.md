@@ -207,6 +207,15 @@ Post-provider infrastructure attempts with missing counters now retain a labeled
 instead of incorrect exact zero usage. The migration repaired four historic rows, including the
 ungradeable Opus attempt at an estimated USD 0.650145.
 
+The first full-stage launch exposed a separate local concurrency defect before provider execution.
+Four independent Harbor scorers created local SSH Pi runtimes simultaneously, but each runtime
+defaulted to shim port 8891 and remote directory `ep-8891`. Three cells failed immediately with
+`Address already in use`; their exact-zero infrastructure attempts remain preserved and retryable.
+The fourth experiment-owned sandbox was terminated after the runner was interrupted. PiRuntime now
+binds an OS-assigned local port by default and derives a distinct remote episode directory from
+that port. A parallel regression test holds two default runtimes open concurrently and proves both
+ports and workdirs differ.
+
 ## Single smoke gate
 
 The only paid pre-sweep gate has exactly four cells:

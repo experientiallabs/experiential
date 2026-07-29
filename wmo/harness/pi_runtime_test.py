@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socket import socket
 from typing import cast
@@ -341,10 +342,10 @@ def test_run_maps_the_shim_done_reason_to_a_distinct_stop_reason(
         tools=[TOOL_REGISTRY["bash"], SUBMIT],
         port=8899,
     )
-    monkeypatch.setattr(PiRuntime, "_materialize", lambda self: None)
+    monkeypatch.setattr(PiRuntime, "_materialize", lambda self, workdir: None)
 
-    def fake_run_node(self: PiRuntime) -> tuple[int, str]:
-        del self
+    def fake_run_node(self: PiRuntime, port: int, workdir: str) -> tuple[int, str]:
+        del self, port, workdir
         # Stand in for entry.ts POSTing /done with its classified reason.
         episode.answer = "text"
         episode.done_reason = reason
@@ -407,7 +408,7 @@ def test_the_node_wall_budget_comes_from_the_configured_episode_timeout(
     )
     monkeypatch.setattr("wmo.harness.pi_runtime.subprocess.run", fake_run)
 
-    code, _note = runtime._run_node()  # noqa: SLF001 - the remote command is the contract
+    code, _note = runtime._run_node(8898, "~/pi-run/ep-8898")  # noqa: SLF001
 
     assert code == 0
     assert "StrictHostKeyChecking=accept-new" in commands[0]
@@ -449,12 +450,48 @@ def test_a_fractional_node_wall_budget_rounds_up_instead_of_truncating(
     )
     monkeypatch.setattr("wmo.harness.pi_runtime.subprocess.run", fake_run)
 
-    runtime._run_node()  # noqa: SLF001 - the remote command is the contract
+    runtime._run_node(8899, "~/pi-run/ep-8899")  # noqa: SLF001
 
     assert (
         f"timeout --kill-after=10 {expected} node --experimental-strip-types entry.ts"
         in commands[0][-1]
     )
+
+
+def test_default_runtime_ports_and_workdirs_are_isolated_across_parallel_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Independent local runtimes must not share the default shim port or runner directory."""
+    barrier = threading.Barrier(2)
+    endpoints: list[tuple[int, str]] = []
+    endpoint_lock = threading.Lock()
+
+    monkeypatch.setattr(PiRuntime, "_materialize", lambda self, workdir: None)
+
+    def fake_run_node(self: PiRuntime, port: int, workdir: str) -> tuple[int, str]:
+        del self
+        with endpoint_lock:
+            endpoints.append((port, workdir))
+        barrier.wait(timeout=5)
+        return 0, ""
+
+    monkeypatch.setattr(PiRuntime, "_run_node", fake_run_node)
+    runtimes = [
+        PiRuntime(
+            cast("Provider", _Provider()),
+            files={"src/agent.ts": "// a"},
+            tools=[SUBMIT],
+        )
+        for _ in range(2)
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda runtime: runtime.run("t1", "do it", _Env()), runtimes))
+
+    assert len(results) == 2
+    assert len({port for port, _workdir in endpoints}) == 2
+    assert len({workdir for _port, workdir in endpoints}) == 2
+    assert all(port > 0 and workdir.endswith(f"ep-{port}") for port, workdir in endpoints)
 
 
 def test_the_shared_termination_policy_is_materialized_next_to_entry_ts() -> None:
