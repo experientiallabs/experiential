@@ -1,7 +1,7 @@
 """The improvement report (D-REPORT): the endpoint's evidence artifact.
 
 Pure aggregation over an `OutcomeMatrix` given a `RoutingPolicy`: what the policy's routed mix
-scores on the held-out scenarios versus one frontier baseline model, at what cost and latency,
+scores on router-held-out scenarios versus one frontier baseline model, at what cost and latency,
 and which models the mix uses. No fitting happens here; any policy (hand-written, static, or a
 future fitted one) reports through the same function, so the artifact shape is stable before
 the optimizer exists.
@@ -87,6 +87,7 @@ class ImprovementReport(BaseModel):
     endpoint_id: str
     generated_at: str
     scenario_count: int
+    scenario_ids: list[str] = Field(default_factory=list)
     scenario_label: str  # e.g. "on 90 held-out scenarios reconstructed from your traces"
     baseline: ModelRef
     headline: Headline
@@ -155,22 +156,42 @@ def build_report(
 ) -> ImprovementReport:
     """Aggregate `matrix` into the endpoint's improvement report under `policy`.
 
-    The routed side replays the policy's serve-time selection over each held-out scenario's
+    The routed side replays the policy's serve-time selection over each router-held-out scenario's
     task text and takes THAT model's measured outcomes for the scenario; the baseline side is
     `baseline`'s own rows on the same scenarios. Both sides therefore quote real, per-scenario
     measurements from the identical matrix, over the identical scenarios (module docstring:
     the headline is a PAIRED comparison over commonly-scored scenarios).
 
-    Raises ValueError when no scenario was scored on both sides: a matrix that measured nothing
-    comparable has no honest report in it.
+    Fit scenarios recorded by the policy are excluded. An entirely separate evaluation matrix
+    has no overlapping ids, so all of its scenarios remain eligible. Raises ValueError when no
+    eligible scenario was scored on both sides: a matrix that measured nothing comparable has no
+    honest report in it.
     """
     names = {entry.name: entry for entry in matrix.pool}
     if baseline not in names:
         raise KeyError(f"baseline '{baseline}' is not in the matrix pool; have: {sorted(names)}")
 
-    scenario_tasks: dict[str, str] = {}
+    all_scenario_tasks: dict[str, str] = {}
     for outcome in matrix.outcomes:
-        scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
+        all_scenario_tasks.setdefault(outcome.scenario_id, outcome.task)
+
+    fit_ids = set(policy.fit_scenario_ids)
+    if not fit_ids and policy.kind == "knn":
+        # Legacy kNN artifacts did not serialize fit ids on the policy, but their evidence bank
+        # does. Recover the boundary rather than silently calling those rows held out.
+        fit_ids = set(policy.knn_bank().scenario_ids)
+    if policy.kind == "rank" and not fit_ids:
+        raise ValueError(
+            "the fitted rank policy does not record its fit scenario ids, so held-out reporting "
+            "cannot be proved; refit the policy with this version"
+        )
+    report_ids = [sid for sid in all_scenario_tasks if sid not in fit_ids]
+    if not report_ids:
+        raise ValueError(
+            "the report matrix contains no scenario outside the router fit set; use a matrix "
+            "with the reserved report partition or a separate evaluation matrix"
+        )
+    scenario_tasks = {sid: all_scenario_tasks[sid] for sid in report_ids}
 
     # One embedder for the whole report: an azure spec builds an HTTP client per `build()`, and
     # a report routes every held-out scenario.
@@ -221,7 +242,9 @@ def build_report(
 
     candidates: list[CandidateResult] = []
     for entry in matrix.pool:
-        rows = [o for o in matrix.outcomes if o.model == entry.name]
+        rows = [
+            o for o in matrix.outcomes if o.model == entry.name and o.scenario_id in scenario_tasks
+        ]
         accuracy, success, cost, p50, p95 = _aggregate(rows)
         candidates.append(
             CandidateResult(
@@ -241,6 +264,7 @@ def build_report(
         endpoint_id=endpoint,
         generated_at=generated_at,
         scenario_count=total,
+        scenario_ids=list(scenario_tasks),
         scenario_label=f"on {total} held-out scenarios reconstructed from your traces",
         baseline=_ref(baseline),
         headline=Headline(

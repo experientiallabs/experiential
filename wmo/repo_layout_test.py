@@ -105,22 +105,32 @@ def test_docs_layout_is_exactly_readme_research_reference() -> None:
 # sending the reader to a path that does not exist.
 RETIRED_TOP_DIRS = (".agents/", "deploy/", "examples/", "packages/", "web/")
 
+#: Each retired directory as a regex anchored at a path-token boundary. A bare substring test
+#: would fail the gate on ordinary prose: `web/` matches inside
+#: `https://api.search.brave.com/res/v1/web/search`, and `packages/` inside `site-packages/` or
+#: any `files.pythonhosted.org/packages/...` wheel URL.
+_RETIRED_PATTERNS = tuple(
+    (retired, re.compile(rf"(?<![\w./-]){re.escape(retired)}")) for retired in RETIRED_TOP_DIRS
+)
+
 
 def test_docs_never_point_at_a_retired_directory() -> None:
     """docs/ are finished products: every path they quote must still exist.
 
     Reproduction lives in the report itself (public wmo API or CLI), never behind a path that
-    was deleted — and never behind a scratch workspace, which this repo no longer has.
+    was deleted, and never behind a scratch workspace, which this repo no longer has.
     """
-    offenders = [
-        (p, retired)
-        for p in _tracked_files()
-        if p.startswith("docs/")
-        and p.endswith(".md")
-        and (REPO_ROOT / p).is_file()  # tolerate uncommitted deletes/renames mid-edit
-        for retired in RETIRED_TOP_DIRS
-        if retired in (REPO_ROOT / p).read_text(encoding="utf-8")
-    ]
+    offenders: list[tuple[str, str]] = []
+    for p in _tracked_files():
+        if not (p.startswith("docs/") and p.endswith(".md")):
+            continue
+        path = REPO_ROOT / p
+        if not path.is_file():  # tolerate uncommitted deletes/renames mid-edit
+            continue
+        text = path.read_text(encoding="utf-8")  # once per doc, not once per retired dir
+        offenders.extend(
+            (p, retired) for retired, pattern in _RETIRED_PATTERNS if pattern.search(text)
+        )
     assert not offenders, (
         f"docs pointing at retired top-level directories: {offenders}; those paths no longer "
         "exist. Quote reproduction as public wmo API/CLI in the report itself (AGENTS.md rule 5)"

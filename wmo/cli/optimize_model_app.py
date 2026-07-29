@@ -31,9 +31,9 @@ import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Confirm
 from rich.table import Table
 
+from wmo.cli.consent import require_spend_consent
 from wmo.cli.route_app import (
     BIAS_ACCEPTED_NOTE,
     NO_EVIDENCE_WARNING,
@@ -64,7 +64,13 @@ from wmo.optimize.knn import (
     fit_provenance,
     tune_policy_dial,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, load_matrix_with_digest
+from wmo.optimize.outcomes import (
+    ROUTER_SPLIT_VERSION,
+    OutcomeMatrix,
+    load_matrix_with_digest,
+    split_router_scenarios,
+)
+from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
 from wmo.optimize.pipeline import (
     BUILT_STAGES,
     CONFIGURED_STAGES,
@@ -112,6 +118,8 @@ from wmo.optimize.sweep import (
 from wmo.optimize.sweep import preflight_pool as run_preflight
 from wmo.optimize.teacher import TeacherSearchVerdict, select_teacher
 from wmo.providers.pool import DEFAULT_POOL_PATH
+from wmo.runs.hooks import PipelineEmitter
+from wmo.runs.schema import RunStatus
 
 _console = Console()
 
@@ -126,7 +134,7 @@ ASSUMED_OUTPUT_TOKENS = 250
 
 _KNN_KNOBS = (
     f"z={DEFAULT_KNN_Z:g} k={DEFAULT_RAG_NUM} thres={DEFAULT_RAG_THRES:g} "
-    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05"
+    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05 split={ROUTER_SPLIT_VERSION}"
 )
 """The knn fit this command performs. Fixed: the validated champion, dialed after the fact."""
 
@@ -249,12 +257,25 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         "biased; the coverage table prints either way.",
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir holding the built models."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the one spend confirmation."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where a spending run "
+        "otherwise refuses to start.",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
         help="Print the plan table (what would run, what it is projected to cost) and exit "
         "without spending anything or touching any artifact.",
+    ),
+    no_emit: bool = typer.Option(
+        False,
+        "--no-emit",
+        help="Do not report this run to the platform's runs panel. Reporting is on whenever a "
+        "platform credential with an organization resolves (`wmo login`); it is buffered, cannot "
+        "fail the run, and changes nothing about what the stages do.",
     ),
 ) -> None:
     """Measure, fit, tune, and report a routing policy for a world model, in one command.
@@ -359,6 +380,10 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         already_measured = resumable_cells(plan)
     except SweepError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    try:
+        split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     print_tiny_corpus_note(_console, plan)
     # Both flags name a pool candidate, and the pool is loaded by the pre-flight above, so a typo
     # is knowable here for free: a boundary error rather than a surprise after the sweep has been
@@ -442,10 +467,27 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except BudgetExceeded as exc:
         _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
-    if not _confirm(decisions, yes=yes):
+    if not _confirm(decisions, plan, yes=yes):
         _console.print("nothing was run and nothing was spent")
         raise typer.Exit(0)
 
+    # Created after consent, so a dry run and a declined cost question leave no platform run
+    # behind, and before the first stage, so the panel has the run before it has any spend.
+    emitter = PipelineEmitter.create(world_model=model_dir.name, requested=not no_emit)
+    emitter.start(
+        world_model=model_dir.name,
+        config={
+            "stages": [decision.stage.value for decision in decisions],
+            "scenarios": len(plan.scenarios),
+            "episodes": plan.episodes,
+            "cells": plan.cells,
+            "pool": [entry.name for entry in plan.pool.models],
+            "cost_quality": cost_quality,
+            "compressor": compression.compressor_id if compression is not None else None,
+            "embedder": embedder_spec.kind,
+            "max_usd": max_usd,
+        },
+    )
     try:
         manifest = _run_stages(
             decisions,
@@ -463,10 +505,24 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             cost_quality=cost_quality,
             allow_uneven_coverage=allow_uneven_coverage,
             already_measured=already_measured,
+            emitter=emitter,
         )
     except BudgetExceeded as exc:
+        # The cap is a clean stop, not a failure: every stage that completed is recorded and the
+        # next run resumes at the one that did not start.
+        emitter.finished(RunStatus.STOPPED, error=str(exc))
         _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
+    except typer.Exit as exc:
+        # A stage refused (the coverage gate, a failed fit): the command's own exit path, which is
+        # a failed optimization from the panel's point of view.
+        emitter.finished(RunStatus.FAILED if exc.exit_code else RunStatus.COMPLETED)
+        raise
+    except Exception as exc:
+        emitter.finished(RunStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
+        raise
+    emitter.finished(RunStatus.COMPLETED)
+    emitter.close()
     # No save here: `_run_stages` persists after every stage it runs, which is what keeps a run
     # that dies mid-flight resumable.
     _print_payoff(_console, model_dir.name, paths=paths, cost_quality=cost_quality)
@@ -861,6 +917,7 @@ def _stage_plan_text(
     already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
+    router_split = split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
     match stage:
         case Stage.PREFLIGHT:
             return f"resolve {len(plan.pool.models)} backend(s), check prices"
@@ -882,11 +939,17 @@ def _stage_plan_text(
             # Says what it IS rather than implying a step: the arm plus the two stages it sets up.
             return f"{escape(compression_signature(compression))}, configures sweep and fit"
         case Stage.FIT:
-            return f"knn (guarded, fallback {escape(fallback or 'best single on the sweep')})"
+            return (
+                f"knn over {len(router_split.fit_ids)} fit scenario(s) "
+                f"(guarded, fallback {escape(fallback or 'best single on the fit split')})"
+            )
         case Stage.TUNE:
             return f"cost_quality {cost_quality:g} ({cost_quality_named_point(cost_quality)})"
         case _:
-            return f"3-objective headline vs {escape(anchor)}"
+            return (
+                f"3-objective headline vs {escape(anchor)} over "
+                f"{len(router_split.report_ids)} router-held-out scenario(s)"
+            )
 
 
 def _report_estimate(policy_path: Path, fitting_with: EmbedderSpec) -> str:
@@ -1074,7 +1137,7 @@ def _status_text(decision: StageDecision) -> str:
     return f"will run [dim]({escape(decision.reason)})[/dim]"
 
 
-def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
+def _confirm(decisions: list[StageDecision], plan: SweepPlan, *, yes: bool) -> bool:
     """The run's single spend confirmation. One question, before the first paid call.
 
     Asked whenever the SWEEP will run, rather than whenever the candidate projection is nonzero.
@@ -1084,10 +1147,12 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
     run of only those does not need permission to happen.
 
     A non-interactive session cannot answer, so a spending run REFUSES rather than proceeding:
-    consent must be said (`--yes`), never inferred from the absence of a terminal. Every spend
-    surface (`route sweep`, `optimize distill`, the harbor search) shares this rule; all of
-    them originally shipped proceed-silently-or-note, and the proceed branch here cost a
-    scripted caller real money it never agreed to.
+    consent must be said (`--yes`), never inferred from the absence of an interactive session on
+    BOTH streams (a redirected stdin is not a person, even under a terminal stdout). Every spend
+    surface (`route sweep`, `optimize distill`, both harness environments) shares the one
+    implementation in `wmo.cli.consent`; all of them originally shipped
+    proceed-silently-or-note, and the proceed branch here cost a scripted caller real money it
+    never agreed to.
 
     Raises:
         typer.Exit: code 2 when a spending run cannot ask and was not told `--yes`.
@@ -1096,13 +1161,13 @@ def _confirm(decisions: list[StageDecision], *, yes: bool) -> bool:
         return False
     if yes or not _will_sweep(decisions):
         return True
-    if not _console.is_terminal:
-        _console.print(
-            "\nnon-interactive session: cannot ask for spend consent. Re-run with --yes to "
-            "consent explicitly, or --dry-run to see the plan without spending."
-        )
-        raise typer.Exit(2)
-    return Confirm.ask("\nProceed?", default=True)
+    return require_spend_consent(
+        _console,
+        yes=yes,
+        spend=f"~${_projected_total(decisions, plan):.2f} across {plan.cells} sweep cell(s)",
+        command="wmo optimize model",
+        alternative="--dry-run to see the plan without spending",
+    )
 
 
 # ------------------------------------------------------------------------------ stage execution
@@ -1124,12 +1189,17 @@ def _run_stages(
     baseline: str | None,
     cost_quality: float,
     allow_uneven_coverage: bool,
+    emitter: PipelineEmitter,
     already_measured: int = 0,
 ) -> RunManifest:
     """Walk the plan, running what it said would run and recording each stage as it completes.
 
     The manifest is saved after EVERY stage, not once at the end: a run that dies on the fit has
     still paid for its sweep, and the next run must know that.
+
+    `emitter` mirrors each verdict to the platform's runs panel. It is reported AFTER the manifest
+    is saved, so what the panel shows is a fact already on disk rather than a claim about a stage
+    whose record could still be lost.
     """
     # The loop saves after every stage, which is what makes a rejected sweep survive: the
     # coverage gate lives in the FIT iteration, so the SWEEP iteration's save has already run by
@@ -1139,10 +1209,12 @@ def _run_stages(
             _console.print(
                 f"\n[bold]{decision.stage.value}[/bold] [dim]SKIP: {escape(decision.reason)}[/dim]"
             )
+            emitter.stage_skipped(decision.stage, reason=decision.reason)
             continue
         _console.print(
             f"\n[bold]{decision.stage.value}[/bold] [dim]({escape(decision.reason)})[/dim]"
         )
+        emitter.stage_running(decision.stage)
         match decision.stage:
             case Stage.SWEEP:
                 ledger.check(Stage.SWEEP, projection.total_usd, basis=projection.basis)
@@ -1170,6 +1242,7 @@ def _run_stages(
                 record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
+        emitter.stage_completed(record, lifetime_spend_usd=manifest.lifetime_spend_usd)
     return manifest
 
 
@@ -1313,11 +1386,17 @@ def _stage_fit(
     """
     matrix, source = load_matrix_with_digest(paths.matrix)
     try:
+        router_split = split_router_scenarios(matrix.scenario_ids())
+    except ValueError as exc:
+        _console.print(f"[red]fit failed[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    try:
         fitted = fit_knn_artifact(
             matrix,
             out_path=paths.policy,
             matrix_source=source,
             embedder=embedder,
+            fit_ids=list(router_split.fit_ids),
             fallback=fallback,
             compression=compression,
         )
@@ -1427,6 +1506,24 @@ def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) ->
         f"scenario(s) -> {escape(str(paths.report))}",
         soft_wrap=True,
     )
+    # The measured cost/quality curve. It goes in MODEL_DIR (a serving artifact, mounted by
+    # GET /config beside policy.json), not the disposable optimize manifest dir, so the
+    # platform's Pareto graph renders this workload's real frontier (D-PARETO). Additive: a
+    # curve failure warns rather than failing a report that already succeeded.
+    try:
+        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        pareto_path = model_dir / PARETO_FILENAME
+        pareto_path.write_text(curve.model_dump_json(indent=2), encoding="utf-8")
+        _console.print(
+            f"  [green]✓[/green] pareto curve ({sum(1 for p in curve.points if p.on_frontier)} "
+            f"frontier point(s), recommended {curve.recommended}) -> "
+            f"{escape(str(pareto_path))}",
+            soft_wrap=True,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        _console.print(
+            f"  [yellow]![/yellow] pareto curve skipped: {escape(str(exc))}", soft_wrap=True
+        )
     return StageRecord(
         stage=Stage.REPORT,
         fingerprint={

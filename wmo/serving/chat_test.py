@@ -2928,3 +2928,54 @@ def test_a_compressor_that_returns_the_wrong_segment_count_is_named(tmp_path: Pa
 
     assert response.status_code == 502  # refused, not served with a corrupted transcript
     assert "splitter-for-tests" in _error_message(_rows(log_path)[-1])
+
+
+def test_config_carries_the_pareto_curve_when_the_runtime_has_one(tmp_path: Path) -> None:
+    from wmo.optimize.pareto import ParetoCurve, ParetoPoint
+
+    curve = ParetoCurve(
+        points=[
+            ParetoPoint(
+                id="cheap",
+                kind="model",
+                label="cheap",
+                cost_per_completed_task_usd=0.01,
+                mean_reward=0.5,
+                task_success_rate=0.5,
+                latency_p50_s=1.0,
+                n_scenarios=2,
+                n_scored=4,
+                n_excluded=0,
+                on_frontier=True,
+            )
+        ],
+        recommended="cheap",
+        complete=True,
+        n_scenarios=2,
+        provenance="wm_simulated",
+        judge="test-judge",
+    )
+    policy = _knn_policy(tmp_path)
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=policy,
+        provider_factory=_EchoProvider,
+        log=RequestLog(tmp_path / "requests.jsonl"),
+        pareto=curve,
+    )
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+    body = TestClient(app).get("/v1/endpoints/tau-bench/config").json()
+
+    assert body["pareto"]["recommended"] == "cheap"
+    assert body["pareto"]["complete"] is True
+    assert body["pareto"]["points"][0]["on_frontier"] is True
+    # The per-workload curve and the global ours9 anchors travel side by side, distinct.
+    assert [anchor["s"] for anchor in body["anchors"]] == [0.0, 0.25, 0.5, 0.75, 1.0]
+
+
+def test_config_omits_pareto_for_artifacts_that_predate_it(tmp_path: Path) -> None:
+    client, _ = _dial_client(tmp_path, _knn_policy(tmp_path))
+    body = client.get("/v1/endpoints/tau-bench/config").json()
+
+    assert body["pareto"] is None

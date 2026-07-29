@@ -21,7 +21,8 @@ def missing_sdk_error(package: str) -> ModuleNotFoundError:
     """
     return ModuleNotFoundError(
         f"the '{package}' package is required for this backend; it ships with the core wmo "
-        f"install, so reinstall the environment: uv sync (or pip install --upgrade wmo)"
+        f"install, so reinstall the environment: uv sync "
+        f"(or pip install --upgrade world-model-optimizer)"
     )
 
 

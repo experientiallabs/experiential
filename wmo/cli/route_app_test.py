@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import fcntl
 import importlib
 import itertools
 import json
-import os
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -14,9 +12,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from filelock import FileLock
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
@@ -155,7 +155,8 @@ def test_route_fit_and_report(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     report = json.loads(report_file.read_text())
     assert report["baseline"]["model_id"] == "a"
-    assert report["headline"]["baseline_accuracy"] == 0.5
+    assert set(policy.fit_scenario_ids).isdisjoint(report["scenario_ids"])
+    assert len(policy.fit_scenario_ids) + report["scenario_count"] == 4
     assert report["cost_assumptions"]
 
 
@@ -261,7 +262,8 @@ def test_route_fit_knn_writes_policy_and_sidecar(tmp_path: Path) -> None:
     assert policy.knn_bank_path == "policy.json.bank.npz"
     assert policy.bank_path() == tmp_path / "policy.json.bank.npz"
     assert policy.bank_path().is_file()  # sidecar beside the policy
-    assert len(policy.knn_bank().scenario_ids) == 12
+    assert len(policy.knn_bank().scenario_ids) == 8
+    assert policy.fit_scenario_ids == policy.knn_bank().scenario_ids
     assert "routed away from the fallback" in result.output
     # The prose neighborhoods carry unanimous evidence for b, so that traffic leaves the
     # fallback while the SQL half stays on it.
@@ -981,10 +983,9 @@ def test_route_student_reports_a_busy_pool_without_claiming_it_registered(
     """
     monkeypatch.setattr(pool_module, "POOL_LOCK_TIMEOUT_S", 0.05)
     pool_file = tmp_path / "pool.toml"
-    lock_path = pool_file.with_name(f"{pool_file.name}.lock")
     pool_file.parent.mkdir(parents=True, exist_ok=True)
-    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-    fcntl.flock(holder, fcntl.LOCK_EX)
+    holder = FileLock(pool_file.with_name(f"{pool_file.name}.lock"))
+    holder.acquire()
     try:
         result = runner.invoke(
             app,
@@ -1002,7 +1003,7 @@ def test_route_student_reports_a_busy_pool_without_claiming_it_registered(
             ],
         )
     finally:
-        os.close(holder)
+        holder.release()
 
     assert result.exit_code == 1, result.output
     assert "pool busy" in result.output
@@ -1702,12 +1703,12 @@ def test_route_sweep_hands_off_when_every_candidate_lost_the_same_scenario(
 
 
 def test_route_sweep_declining_the_confirmation_spends_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     monkeypatch.setattr(route_module, "_console", Console(force_terminal=True))
-    monkeypatch.setattr(route_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(False))
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "3")
     assert result.exit_code == 0, result.output
     assert not out.exists()  # nothing written
@@ -1720,12 +1721,12 @@ def test_route_sweep_declining_the_confirmation_spends_nothing(
 
 
 def test_route_sweep_confirming_at_a_tty_runs_the_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
     monkeypatch.setattr(route_module, "_console", Console(force_terminal=True))
-    monkeypatch.setattr(route_module, "Confirm", _Answer(True))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(True))
     out, result = _sweep(tmp_path, root, "support", "--scenarios", "1")
     assert result.exit_code == 0, result.output
     assert len(OutcomeMatrix.load(out).outcomes) == 2
@@ -2934,37 +2935,36 @@ def test_route_report_creates_the_out_directory_like_fit_does(tmp_path: Path) ->
     assert json.loads(out.read_text(encoding="utf-8"))["headline"]
 
 
-def test_route_report_warns_when_it_measures_the_matrix_the_policy_was_fitted_on(
+def test_route_report_notes_the_excluded_fit_split_on_the_fit_matrix(
     tmp_path: Path,
 ) -> None:
-    """`fit` sends the user here to escape its in-sample number; report never checked.
-
-    The report even labels its scenarios held-out, so this is the one case where both surfaces
-    say the opposite of what happened. The matrix digest in `fitted_from` is an identity, so a
-    renamed copy of the fit matrix has to trip it too.
+    """Same matrix as the fit: since #308 the report excludes the fit split, so the surface says
+    "held-out with N fit scenarios excluded" rather than contradicting the report's own label.
+    The matrix digest in `fitted_from` is an identity, so a renamed copy has to trip it too.
     """
     matrix_file = _knn_matrix_file(tmp_path)
     policy_file = _fitted_knn_policy(tmp_path)
 
     result = _report(matrix_file, policy_file, tmp_path / "report.json")
     assert result.exit_code == 0, result.output
-    assert _says(result.output, "IN-SAMPLE")
+    assert _says(result.output, "fit scenario(s) were excluded")
+    assert "IN-SAMPLE" not in _flat(result.output)
 
     renamed = tmp_path / "renamed.json"
     renamed.write_bytes(matrix_file.read_bytes())
     moved = _report(renamed, policy_file, tmp_path / "report_renamed.json")
     assert moved.exit_code == 0, moved.output
-    assert _says(moved.output, "IN-SAMPLE")
+    assert _says(moved.output, "fit scenario(s) were excluded")
 
     # The provenance marker is appended LAST, so a matrix stored under a content-addressed
     # directory carries `sha256=` in its path too. Splitting from the left read THAT one and
-    # dropped the warning on exactly the layout most likely to keep a fit matrix around.
+    # dropped the caveat on exactly the layout most likely to keep a fit matrix around.
     addressed = tmp_path / "artifacts" / "sha256=deadbeef" / "matrix.json"
     addressed.parent.mkdir(parents=True)
     addressed.write_bytes(matrix_file.read_bytes())
     content_addressed = _report(addressed, policy_file, tmp_path / "report_addressed.json")
     assert content_addressed.exit_code == 0, content_addressed.output
-    assert _says(content_addressed.output, "IN-SAMPLE")
+    assert _says(content_addressed.output, "fit scenario(s) were excluded")
 
 
 def test_route_report_stays_quiet_on_a_matrix_the_fit_never_saw(tmp_path: Path) -> None:

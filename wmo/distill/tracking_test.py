@@ -348,36 +348,28 @@ def test_a_torn_run_record_write_leaves_the_previous_record_intact(
 ) -> None:
     """The persisted run id is the resume anchor, so its write must be atomic.
 
-    A crash mid-write is modelled by a `write_text` that persists half its
-    payload and then raises. The record goes through the run dir's shared
-    temp-file-then-replace helper, so the half write lands on the temp file
-    and the record a resume reads back is still the complete previous one; an
-    in-place write would have truncated it and cost the dashboard run.
+    A crash mid-write is modelled by failing the payload's `fsync`, which is
+    reached with the bytes already written to the temp file and the rename not
+    yet done. The record goes through `wmo.core.files.write_text_atomic`, so
+    what a resume reads back is still the complete previous record; an in-place
+    write would have truncated it and cost the dashboard run.
     """
     run_dir = tmp_path / "run"
     _tracker(fake_wandb, run_dir)
     first_id = fake_wandb.run.id
-    intact = Path.write_text
 
-    def _torn(
-        self: Path,
-        data: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        intact(self, data[: len(data) // 2], encoding=encoding)
+    def _torn(fd: int) -> None:
         raise OSError("disk full halfway through the record")
 
-    monkeypatch.setattr(Path, "write_text", _torn)
+    monkeypatch.setattr(os, "fsync", _torn)
     with pytest.raises(OSError, match="disk full"):
         _tracker(fake_wandb, run_dir)
 
     assert json.loads((run_dir / WANDB_RUN_FILE).read_text(encoding="utf-8")) == {
         "run_id": first_id
     }
-    # The torn bytes went to the sibling temp file, never to the record.
-    assert (run_dir / f"{WANDB_RUN_FILE}.tmp").is_file()
+    # The partial bytes went to a sibling temp, which the failed write then cleaned up.
+    assert list(run_dir.glob(f"{WANDB_RUN_FILE}.*.tmp")) == []
 
 
 def test_missing_sdk_error_names_the_extra(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

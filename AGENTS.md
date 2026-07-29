@@ -208,7 +208,7 @@ uv run pytest -q
 
 6. **Benchmark data is a dependency, not a directory.** Benchmark launch/capture/conversion logic
    lives in the separately published `environment-capture` distribution, and its trace corpora and
-   task data are Hub-hosted bundles fetched with `wmo download` (`environment_capture.hub`). Do not
+   task data are Hub-hosted bundles fetched with `wmo download` (`wmo/hub.py`). Do not
    vendor a benchmark's data, gold dirs, or capture scripts back into this repo.
 
 7. **Give reusable workflows a clear owner.** Avoid parallel top-level scripts for harness actions.
@@ -277,7 +277,9 @@ This repo publishes **one distribution**: `world-model-optimizer`, whose importa
 - **Vendor or depend, decide once**: a shared building block goes to PyPI and is depended on
   (`environment-capture`), or it is vendored under `wmo/utils/` with its upstream `LICENSE`
   (`wmo/utils/waterfall/`). Vendoring is for code we alone consume and do not publish; keep it
-  free of imports back into `wmo` so it stays independently testable.
+  free of imports back into `wmo` so it stays independently testable. The data-bundle read core
+  behind `wmo download` is vendored the same way at `wmo/hub.py`, which names its origin in the
+  module docstring: a `wmo` release must never wait on an `environment-capture` release.
 - **Gate scoping**: the root gate is `uv run ruff check .`, `uv run ty check`, `uv run pytest -q`,
   all over the single `testpaths = ["wmo"]`. Tests are inline `*_test.py` beside the module they
   cover. There is exactly one ruff config and one ty config, at the root.

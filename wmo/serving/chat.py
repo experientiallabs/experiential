@@ -88,6 +88,7 @@ from wmo.optimize.knn import (
     apply_cost_quality,
     cost_quality_named_point,
 )
+from wmo.optimize.pareto import ParetoCurve
 from wmo.optimize.policy import (
     Embedder,
     GateOutcome,
@@ -637,9 +638,13 @@ class EndpointRuntime:
         config_path: Path | None = None,
         embeddings: QueryEmbeddingStore | None = None,
         log_query_embeddings: bool = True,
+        pareto: ParetoCurve | None = None,
     ) -> None:
         self.name = name
         self.policy = policy
+        # The measured curve written at optimize time (pareto.json); served verbatim on
+        # GET /config. None for artifacts that predate it: absence, never an empty curve.
+        self.pareto = pareto
         self.log = log
         self._embeddings = embeddings if log_query_embeddings else None
         self._base_policy = policy
@@ -771,12 +776,25 @@ class EndpointRuntime:
         exactly what the model will see.
         """
         incumbent = None
+        conversation_chars = 0
         remembered = _remembered_prefix(messages)
         if remembered is not None:
             with self._lock:
                 incumbent = self._affinity.get(_fingerprint(remembered))
+            if incumbent is not None:
+                # The transcript the fingerprint matched IS the shared prefix a warm cache
+                # would cover; its length feeds the cache-aware credit (chars/4 tokens,
+                # documented in `cache_credit_usd`). Content only: tool payloads are part of
+                # the prefix too, so this errs conservative, which is the designed direction.
+                conversation_chars = sum(len(m.content or "") for m in remembered)
         text = route_text if route_text is not None else _routable_text(messages)
-        return select_model(self.policy, text, incumbent=incumbent, embedder=self._embedder())
+        return select_model(
+            self.policy,
+            text,
+            incumbent=incumbent,
+            embedder=self._embedder(),
+            conversation_chars=conversation_chars,
+        )
 
     def record_query_embedding(self, record_id: str, decision: RoutingDecision) -> str | None:
         """Persist the vector `decision` was routed on, returning the log row's ref (or None).
@@ -1293,6 +1311,14 @@ class EndpointConfigResponse(BaseModel):
 
     `dialable` is false for policy kinds with no dial (static and rank endpoints), and then the
     dial fields are null and PUT returns 409.
+
+    `pareto` is the MEASURED cost/quality curve for THIS endpoint's workload
+    (`wmo.optimize.pareto`, written as `pareto.json` beside the report at optimize time):
+    every candidate and the routed dial detents on (effective cost per completed task,
+    reward), frontier-flagged, with a recommended point. None for endpoints optimized before
+    the artifact existed; a renderer shows nothing then, never an empty chart. Unlike
+    `anchors` (a global table measured on routerbench-ours9), the curve is per-workload; the
+    two must never be blended into one figure.
     """
 
     endpoint: str
@@ -1301,6 +1327,7 @@ class EndpointConfigResponse(BaseModel):
     named_point: str
     knobs: ServedKnobs | None
     anchors: list[CostQualityAnchor]
+    pareto: ParetoCurve | None = None
 
 
 class EndpointConfigUpdate(BaseModel):
@@ -1336,6 +1363,7 @@ def _config_response(runtime: EndpointRuntime) -> EndpointConfigResponse:
             else None
         ),
         anchors=list(COST_QUALITY_ANCHORS),
+        pareto=runtime.pareto,
     )
 
 

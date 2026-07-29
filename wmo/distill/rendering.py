@@ -94,6 +94,17 @@ class ChatRendering(Protocol):
         """Render chat messages (and optional tool schemas) into prompt token ids."""
         ...
 
+    def render_assistant_turn(
+        self, messages: list[ChatMessage], index: int, tools: list[ChatTool] | None = None
+    ) -> list[int]:
+        """Render an already-written assistant turn as its sampled-token equivalent.
+
+        The inverse of sampling, for turning recorded teacher TEXT into
+        training data under the student's own template; see the
+        implementation for the honest limits.
+        """
+        ...
+
     def render_suffix(
         self,
         messages: list[ChatMessage],
@@ -319,6 +330,78 @@ class CookbookChatRendering:
                 raise ValueError(
                     "the renderer produced a non-text chunk while rendering a prompt "
                     "suffix; the tinker provider is text-only"
+                )
+            tokens.extend(chunk_tokens)
+        return tokens
+
+    def render_assistant_turn(
+        self, messages: list[ChatMessage], index: int, tools: list[ChatTool] | None = None
+    ) -> list[int]:
+        """Render one already-written assistant turn as its SAMPLED-token equivalent.
+
+        The inverse of sampling: given a recorded transcript, produce the token
+        ids a model emitting `messages[index]` would have sampled after
+        `build_generation_prompt(messages[:index], tools)`. That is the turn's
+        rendered OUTPUT chunks without its header, because the header is
+        already the generation prompt's trailing suffix.
+
+        This is what lets a teacher's TEXT episode become training data under
+        the STUDENT's own template (`wmo.distill.text_episodes`):
+        prompt(index) + this turn's ids is exactly the prefix the next turn's
+        prompt extends, which is the property `build_datums` merges on.
+
+        The honest limit: these ids are re-encoded from text, so they are the
+        student's tokenization of the teacher's words, not ids any model
+        sampled. Hard-target cross-entropy is the only sound consumer, which
+        is why spans built this way carry `logprobs_are_placeholders`.
+
+        Args:
+            messages: The transcript, with `messages[index]` the assistant turn.
+            index: Index of the assistant turn to render.
+            tools: Tool schemas the episode ran with (rendered into the prefix).
+
+        Returns:
+            The turn's token ids, framed as the sampled continuation.
+
+        Raises:
+            ImportError: If tinker-cookbook is not installed (distill extra).
+            ValueError: If `index` is out of range, does not name an assistant
+                turn, or the turn renders to non-text chunks.
+        """
+        try:
+            from tinker_cookbook.renderers.base import RenderContext
+        except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
+            raise ImportError(MISSING_DISTILL_EXTRA) from exc
+
+        if not 0 <= index < len(messages):
+            raise ValueError(f"index {index} is out of range for {len(messages)} message(s)")
+        if messages[index].role != "assistant":
+            raise ValueError(
+                f"index {index} is a {messages[index].role!r} turn, not an assistant turn; "
+                "only assistant turns have sampled-token equivalents"
+            )
+        effective, shift = self._effective_messages(messages, tools)
+        idx = index + shift
+        last_user_index = max(
+            (i for i, msg in enumerate(effective) if msg["role"] == "user"),
+            default=-1,
+        )
+        ctx = RenderContext(
+            idx=idx,
+            is_last=(idx == len(effective) - 1),
+            prev_message=effective[idx - 1] if idx > 0 else None,
+            last_user_index=last_user_index,
+        )
+        # Output chunks ONLY: the header is already the prompt's generation
+        # suffix, so including it here would duplicate it in the token stream.
+        rendered = self._renderer.render_message(effective[idx], ctx)
+        tokens: list[int] = []
+        for chunk in rendered.output:
+            chunk_tokens = getattr(chunk, "tokens", None)
+            if chunk_tokens is None:
+                raise ValueError(
+                    f"assistant turn {index} rendered a non-text chunk; text-derived "
+                    "training data is text-only"
                 )
             tokens.extend(chunk_tokens)
         return tokens
@@ -607,3 +690,32 @@ def build_renderer(base_model: str, tokenizer: RendererTokenizer) -> CookbookCha
     # Any at runtime; RendererTokenizer is the slice it actually calls.
     renderer = get_renderer(renderer_name, cast("Tokenizer", tokenizer), model_name=base_model)
     return CookbookChatRendering(renderer)
+
+
+def build_offline_rendering(base_model: str) -> CookbookChatRendering:
+    """Build a base model's rendering without any Tinker client.
+
+    The rendering only needs a tokenizer, and the cookbook can load one from
+    Hugging Face directly, so text-to-datum work (`wmo.distill.text_episodes`)
+    runs with no training client, no sampler, and no network once the tokenizer
+    is cached. The two production call sites pass a live client's tokenizer
+    because they already hold one, not because a client is required.
+
+    Args:
+        base_model: Base model name in `org/model` form; the STUDENT's, when
+            re-encoding teacher text into training targets.
+
+    Returns:
+        The cookbook-backed `ChatRendering` for that model.
+
+    Raises:
+        ImportError: If tinker-cookbook is not installed (distill extra).
+        ValueError: If the cookbook has no renderer mapping for `base_model`.
+        OSError: If the tokenizer is neither cached nor downloadable.
+    """
+    try:
+        from tinker_cookbook.tokenizer_utils import get_tokenizer
+    except ImportError as exc:  # pragma: no cover - exercised via sys.modules patching
+        raise ImportError(MISSING_DISTILL_EXTRA) from exc
+
+    return build_renderer(base_model, cast("RendererTokenizer", get_tokenizer(base_model)))

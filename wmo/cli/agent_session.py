@@ -64,7 +64,12 @@ from wmo.harness.tools import READ_SKILL, resolve_tools
 from wmo.harness.workspace_patch import WorkspacePatchError
 from wmo.platform.client import PlatformClient, PlatformError, RemoteAgentSession
 from wmo.platform.credentials import PlatformCredentials, load_credentials
-from wmo.providers.base import ProviderConfig, ProviderKind, ToolCallingProvider
+from wmo.providers.base import (
+    PreparableProvider,
+    ProviderConfig,
+    ProviderKind,
+    ToolCallingProvider,
+)
 from wmo.providers.models import resolve_provider_model
 from wmo.providers.registry import get_provider
 
@@ -787,7 +792,22 @@ class RemoteWorldModelDriver:
 
 
 def _local_worker_provider(provider: str | None, model: str | None) -> ToolCallingProvider:
-    """Build the logged-out worker provider from local environment credentials."""
+    """Build the logged-out worker provider from local environment credentials, and pre-flight it.
+
+    The pre-flight is the point. Constructing a provider proves almost nothing (every backend
+    builds its SDK client lazily), so a bare `wmo run` with nothing configured used to say
+    nothing about the model it picked, download the ~130MB pi Node runtime, reach "session
+    ready", and only THEN fail mid-session on a Bedrock configuration the user never chose. The
+    chosen provider/model is now named up front and `PreparableProvider.prepare` runs before the
+    harness boots, the same free, request-free check `wmo optimize route sweep` does over its
+    roster (`wmo.providers.pool.prepare_pool_provider`). Backends keep their documented residual
+    gaps: bedrock's AWS credentials and tinker's reachability are not locally knowable and stay
+    first-call failures.
+
+    Raises:
+        typer.BadParameter: The provider name is unknown, the model cannot do tool calling, or
+            the backend cannot be prepared. Every message names `wmo providers set`.
+    """
     configured = load_settings().models.resolve("worker")
     provider_name = provider or (
         configured.provider if configured is not None else _DEFAULT_PROVIDER
@@ -813,8 +833,25 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         )
     )
     if not isinstance(built, ToolCallingProvider):
-        msg = f"provider {kind.value}/{spec.model_id} does not support structured tool calling"
+        msg = (
+            f"provider {kind.value}/{spec.model_id} does not support structured tool calling; "
+            "pick a tool-calling model with "
+            f"`wmo providers set --provider {kind.value} --model <model>`"
+        )
         raise typer.BadParameter(msg)
+    source = "settings models.worker" if configured is not None else "built-in default"
+    if provider is not None or model is not None:
+        source = "--provider/--model"
+    _console.print(f"[dim]worker: {kind.value}/{spec.model_id} ({source})[/dim]")
+    if isinstance(built, PreparableProvider):
+        try:
+            built.prepare()
+        except Exception as exc:  # noqa: BLE001 - every backend raises its own SDK's type here
+            raise typer.BadParameter(
+                f"worker provider {kind.value}/{spec.model_id} ({source}) cannot be used: {exc}\n"
+                f"Fix that, or choose another worker with "
+                f"`wmo providers set --provider <provider> --model <model>`"
+            ) from exc
     return built
 
 

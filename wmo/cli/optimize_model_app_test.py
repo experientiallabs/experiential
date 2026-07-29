@@ -10,7 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
@@ -19,9 +19,19 @@ import pytest
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
-from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
+from wmo.core.types import (
+    Action,
+    ActionKind,
+    EnvState,
+    JsonObject,
+    Observation,
+    Session,
+    Step,
+    Trace,
+)
 from wmo.engine.world_model import WorldModel
 from wmo.env.closed_loop import scenario_id
 from wmo.ingest.otel_writer import write_traces_jsonl
@@ -55,6 +65,8 @@ from wmo.providers.base import (
     VerifyResult,
 )
 from wmo.providers.pool import load_pool
+from wmo.runs import hooks as hooks_module
+from wmo.runs.client import RunsSink
 from wmo.serving.traces_source import TRACES_FILENAME
 from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
@@ -363,7 +375,9 @@ def test_one_command_lands_every_artifact_where_serving_reads_it(
     assert RoutingPolicy.load(policy_path.parent / "policy.base.json").cost_quality is None
     report = ImprovementReport.model_validate_json(report_path.read_text(encoding="utf-8"))
     assert report.endpoint_id == "support"
-    assert report.headline.scenarios_compared == 3
+    assert report.headline.scenarios_compared == 1
+    assert set(policy.fit_scenario_ids).isdisjoint(report.scenario_ids)
+    assert len(policy.fit_scenario_ids) + report.scenario_count == 3
 
     manifest = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
     assert [record.stage.value for record in manifest.stages] == ["sweep", "fit", "tune", "report"]
@@ -600,12 +614,12 @@ def test_a_cap_that_covers_the_run_lets_it_finish(
 
 
 def test_declining_the_confirmation_spends_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     world_model = _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root)
     assert result.exit_code == 0, result.output
@@ -616,12 +630,12 @@ def test_declining_the_confirmation_spends_nothing(
 
 
 def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root)
     flat = _flat(result.output)
@@ -631,20 +645,23 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     assert "2candidate(s)x3scenario(s)x1episode(s)" in flat
     # The free stages say free rather than showing a fabricated number, and the estimate names
     # itself a projection with its assumption spelled out.
-    assert _says(result.output, "knn (guarded, fallback best single on the sweep)")
+    # 3 scenarios split 70/30 for router fit vs report: 2 fit, 1 reserved (PR #308).
+    assert _says(
+        result.output, "knn over 2 fit scenario(s) (guarded, fallback best single on the fit split)"
+    )
     assert _says(result.output, "cost_quality 0.25 (Balanced (default))")
     assert "aprojection" in flat and "assumedoutputtoken" in flat
     assert _says(result.output, "are NOT in that figure")
 
 
 def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     """Two things an operator authorizing a run needs to see: how hard it will lean on the
     provider, and how much of the grid a previous attempt already paid for."""
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
-    monkeypatch.setattr(optimize_module, "Confirm", _Answer(False))
+    monkeypatch.setattr(consent_module, "Confirm", _Answer(False))
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     paced = _run(tmp_path, root, "--concurrency", "6")
     assert "2candidate(s)x3scenario(s)x1episode(s),6atatime" in _flat(paced.output)
@@ -1002,7 +1019,7 @@ def test_a_candidate_only_cap_would_have_let_that_second_sweep_through(
 
 
 def test_the_first_sweep_says_the_world_model_side_is_not_projectable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     """Before a model's first sweep there is nothing to forecast from, and silence would mislead.
 
@@ -1013,7 +1030,7 @@ def test_the_first_sweep_says_the_world_model_side_is_not_projectable(
     _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root)
     assert result.exit_code == 0, result.output
@@ -1168,13 +1185,13 @@ def test_accepting_biased_evidence_does_not_stick_silently(
 
 
 def test_the_cap_refuses_before_asking_rather_than_after(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     """Being asked to approve a run and then told it cannot start is the wrong order."""
     world_model = _patch_seams(monkeypatch)
     root = _project(tmp_path)
     answer = _Answer(True)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root, "--max-usd", "0.01")
     assert result.exit_code == 1, result.output
@@ -1184,7 +1201,7 @@ def test_the_cap_refuses_before_asking_rather_than_after(
 
 
 def test_a_zero_priced_pool_is_still_confirmed_because_the_simulator_is_not_free(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interactive_stdin: None
 ) -> None:
     """Keying the question on the candidate projection skips it exactly when it matters most.
 
@@ -1205,7 +1222,7 @@ def test_a_zero_priced_pool_is_still_confirmed_because_the_simulator_is_not_free
         encoding="utf-8",
     )
     answer = _Answer(False)
-    monkeypatch.setattr(optimize_module, "Confirm", answer)
+    monkeypatch.setattr(consent_module, "Confirm", answer)
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     result = _run(tmp_path, root, pool=free_pool)
     assert result.exit_code == 0, result.output
@@ -1553,3 +1570,99 @@ def test_the_fit_fingerprint_moves_with_the_embedder_and_with_the_arm(tmp_path: 
     assert fingerprint(embedder=EmbedderSpec(), compression=arm) != fingerprint(
         embedder=EmbedderSpec(), compression=keener
     )
+
+
+def test_the_run_reports_its_stages_to_the_platform(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a credential resolvable, the staged run tells the panel what it did, stage by stage.
+
+    Driven through the CLI rather than against `PipelineEmitter` directly, because the thing worth
+    protecting is the WIRING: which seams of the stage loop report, in which order, and that the
+    values handed over are the ones the manifest recorded.
+    """
+    pushed: list[JsonObject] = []
+
+    class Transport:
+        def push_run_events(
+            self,
+            org_id: str,
+            external_id: str,
+            *,
+            emitter_id: str,
+            events: Sequence[JsonObject],
+        ) -> JsonObject:
+            pushed.extend(dict(event) for event in events)
+            seqs = [int(str(event["seq"])) for event in events]
+            return {"accepted": len(events), "last_seq": max(seqs), "control": []}
+
+        def ack_run_control(
+            self,
+            org_id: str,
+            external_id: str,
+            control_id: str,
+            *,
+            status: str,
+            note: str | None = None,
+        ) -> JsonObject:
+            return {}
+
+        def close(self) -> None:
+            """No-op: this double owns no connection pool."""
+
+    monkeypatch.setattr(
+        hooks_module, "runs_sink", lambda: RunsSink(Transport(), org_id="org-1", emitter_id="test")
+    )
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
+    root = _project(tmp_path)
+
+    result = _run(tmp_path, root, "--yes")
+
+    assert result.exit_code == 0, result.output
+    meta = [event for event in pushed if event["type"] == "run.meta"]
+    assert len(meta) == 1
+    stages = [event for event in pushed if event["type"] == "stage.upsert"]
+    completed = [
+        str(_payload(event)["stage"])
+        for event in stages
+        if _payload(event)["status"] == "completed"
+    ]
+    assert completed == ["sweep", "fit", "tune", "report"]
+    assert [str(event["type"]) for event in pushed][-1] == "run.status"
+    assert _payload(pushed[-1])["status"] == "completed"
+    # The sweep is the only paid stage, and what the panel is told it cost is what the manifest
+    # recorded: no second accounting path.
+    manifest = RunManifest.model_validate_json(_paths(root)[3].read_text(encoding="utf-8"))
+    sweep_record = manifest.record_for(Stage.SWEEP)
+    assert sweep_record is not None
+    sweep_event = next(
+        event
+        for event in stages
+        if _payload(event)["stage"] == "sweep" and _payload(event)["status"] == "completed"
+    )
+    spend = _payload(sweep_event)["spend"]
+    assert isinstance(spend, dict)
+    assert spend["candidate_usd"] == sweep_record.spend_usd
+    assert spend["wm_usd"] == sweep_record.world_model_spend_usd
+
+
+def test_no_emit_reports_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--no-emit` never builds a transport, let alone reaches one."""
+
+    def refuse() -> RunsSink | None:
+        raise AssertionError("--no-emit must not resolve a platform sink")
+
+    monkeypatch.setattr(hooks_module, "runs_sink", refuse)
+    _patch_seams(monkeypatch, rewards={"cheap-1": 0.4, "pricey-1": 0.9})
+    root = _project(tmp_path)
+
+    result = _run(tmp_path, root, "--yes", "--no-emit")
+
+    assert result.exit_code == 0, result.output
+
+
+def _payload(event: JsonObject) -> JsonObject:
+    """One pushed event's payload, typed."""
+    payload = event["payload"]
+    assert isinstance(payload, dict)
+    return payload

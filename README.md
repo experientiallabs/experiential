@@ -32,9 +32,9 @@ wmo build --file traces.jsonl --name my-model
 # Score every registered model on held-out tasks from your traces
 wmo optimize route sweep my-model --traces traces.otel.jsonl
 
-# Turn those measurements into a routing policy
+# Deterministically reserve 30% for reporting and fit on the other 70%
 wmo optimize route fit matrix.json --kind knn \
-  --out .wmo/models/my-endpoint/policy.json
+  --out .wmo/models/my-model/policy.json
 ```
 
 **3. Serve it.**
@@ -43,7 +43,8 @@ wmo optimize route fit matrix.json --kind knn \
 wmo serve --name my-model
 ```
 
-See what it bought you against the model you were using before:
+See what it bought you against the model you were using before. The report automatically excludes
+the router-fit scenarios recorded in the policy:
 
 ```bash
 wmo optimize route report matrix.json .wmo/models/my-model/policy.json \

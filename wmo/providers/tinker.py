@@ -84,6 +84,8 @@ _MISSING_TINKER_EXTRA = (
     "the tinker SDK is not installed; run `uv sync --extra distill` (or "
     "`pip install 'world-model-optimizer[distill]'`) to use the tinker provider"
 )
+"""Both install forms, because `pip install world-model-optimizer` is the documented entry point
+and `uv sync` needs a checkout of this repo to have anything to sync."""
 
 # The tinker SamplingParams default; used when a structured request carries no
 # temperature (pi normally stamps one on every request).
@@ -323,6 +325,22 @@ class TokenSpan(BaseModel):
     sampled_token_ids: list[int]
     sampled_logprobs: list[float]
     """Sampler-assigned logprob for each sampled token, aligned one to one."""
+
+    logprobs_are_placeholders: bool = False
+    """True when `sampled_logprobs` are stand-ins, not sampler-issued values.
+
+    Set only by the text bridge (`wmo.distill.text_episodes`), which re-encodes
+    a teacher's recorded TEXT under the student's template: the token ids are
+    real training targets but no sampler ever scored them, so there are no
+    logprobs to record and the field carries zeros to satisfy alignment.
+
+    Hard-target cross_entropy is the only sound consumer (its wire format sends
+    target_tokens and weights, never logprobs). The advantage losses
+    (`importance_sampling`, `ppo`) compute a teacher-minus-student gap FROM
+    these values, so training on placeholders would optimize a fabricated
+    objective; `wmo.distill.data.attach_advantages` refuses such spans rather
+    than trusting callers to remember. Default False, so every recorded sink
+    and every previously written manifest loads unchanged."""
 
     delta_start: int | None = None
     """Index into this call's full message list at which `delta_messages`

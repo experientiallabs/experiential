@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.agents.default import default_agent
@@ -358,6 +359,25 @@ def test_distill_runtime_error_exits_nonzero_with_the_message(
 # -- cost confirmation -------------------------------------------------------------------------
 
 
+def test_distill_non_interactive_without_yes_refuses_and_prices_the_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: exit 2, naming the projected spend and the flag that authorizes it."""
+    _write_inputs(tmp_path, extra_toml=_PRICING_TOML + _BUDGET_TOML)
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result)
+    assert "cannot ask for spend consent" in flat
+    assert "wmo optimize distill run would spend ~$" in flat
+    assert "budget.max_usd cap" in flat
+    assert "--yes" in flat
+    assert recorder.calls == []  # no training started
+
+
 def test_distill_unpriced_meters_without_budget_reject_yes_non_interactively(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -373,6 +393,29 @@ def test_distill_unpriced_meters_without_budget_reject_yes_non_interactively(
     assert "unbounded" in flat
     assert "budget.max_usd" in flat
     assert recorder.calls == []
+
+
+def test_distill_unbounded_spend_refuses_a_terminal_stdout_with_redirected_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal stdout is not a human when stdin is a redirect.
+
+    This is the one branch `--yes` cannot answer, so it is also the one that most needs the
+    question to reach a person. Keying it on the console alone meant `wmo optimize distill run
+    --yes < /dev/null` at a terminal fell through to the prompt, where a redirect answered for
+    the absent human or the read died with an `EOFError` traceback.
+    """
+    _write_inputs(tmp_path, extra_toml="")  # no pricing, no budget cap
+    recorder = _RunRecorder()
+    _patch_run(monkeypatch, recorder)
+    monkeypatch.setattr(model_app_module, "_console", Console(width=240, force_terminal=True))
+
+    result = _invoke(tmp_path, "--yes", input="y\n")
+
+    assert result.exit_code == 2, result.output
+    flat = _flat(result)
+    assert "cannot start with unbounded spend non-interactively" in flat
+    assert recorder.calls == []  # the piped "y" bought nothing
 
 
 def test_distill_unpriced_meters_with_a_budget_cap_honor_yes(

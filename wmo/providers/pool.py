@@ -25,19 +25,17 @@ back to the same "declare the prices" error, with the catalog failure named.
 
 from __future__ import annotations
 
-import fcntl
 import os
-import time
 import tomllib
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_core import ErrorDetails
 
+from wmo.core.files import write_text_atomic
+from wmo.core.locks import DEFAULT_LOCK_TIMEOUT_S, file_write_lock
 from wmo.core.types import JsonObject
 from wmo.providers.base import (
     PreparableProvider,
@@ -53,11 +51,9 @@ from wmo.utils.waterfall import ChatMaxTokensField
 
 DEFAULT_POOL_PATH = Path(".wmo/pool.toml")
 
-# How long an upsert waits for another process to finish its write. A write is a few file
-# operations, so two racing `wmo optimize route student` runs never come close to this; the bound
-# exists so a hung holder is REPORTED instead of hanging the terminal forever.
-POOL_LOCK_TIMEOUT_S = 10.0
-_LOCK_POLL_S = 0.01
+# Kept as a module constant, rather than defaulted at the call, so a test can shorten the wait
+# for a CLI command that exposes no timeout flag (`wmo/cli/route_app_test.py`).
+POOL_LOCK_TIMEOUT_S = DEFAULT_LOCK_TIMEOUT_S
 
 # D-REPORT ModelRef vocabulary: "frontier" anchors the improvement report's comparison; "open"
 # models carry the run-10x-more-for-the-same-budget story.
@@ -338,8 +334,18 @@ def pool_api_key(entry: PoolEntry) -> str | None:
     return api_key
 
 
-class PoolLockTimeout(RuntimeError):
-    """Another writer held the roster's lock for longer than the bounded wait."""
+class PoolWrite(NamedTuple):
+    """What one `upsert_pool_entry` did to the file, for a caller that has to report it.
+
+    Two independent facts, because the CLI says a different thing for each and a bool cannot
+    carry both. `replaced` answers "was an entry of this name already there", which is the
+    question `wmo optimize route student` prompts about BEFORE writing. `rewritten` answers
+    "were the operator's comments dropped", which a replacement always does and an ADD can now
+    also do, when the roster had to be normalized out of the legacy inline form.
+    """
+
+    replaced: bool
+    rewritten: bool
 
 
 def upsert_pool_entry(
@@ -347,7 +353,7 @@ def upsert_pool_entry(
     path: Path = DEFAULT_POOL_PATH,
     *,
     lock_timeout_s: float | None = None,
-) -> bool:
+) -> PoolWrite:
     """Add `entry` to the pool roster at `path`, replacing any entry with the same name.
 
     The one write path for the roster, so a trained model becomes routable without hand-editing
@@ -355,11 +361,22 @@ def upsert_pool_entry(
     as: re-serializing them through `PoolEntry` would stamp every default (`tier`,
     `chat_max_tokens_field`) into a file an operator maintains by hand.
 
-    Adding a NEW entry appends its one table and touches nothing else, so comments, key order,
-    and spacing all survive byte for byte. REPLACING an entry has to remove the old table, which
-    means re-rendering the file through `tomllib` -> `tomli_w`: that keeps every entry's fields
-    but DROPS comments, because neither library round-trips them. Callers that can prompt should
-    say so before replacing (`wmo optimize route student` does).
+    Adding a NEW entry appends its one `[[model]]` section and touches nothing else, so comments,
+    key order, and spacing all survive byte for byte. REPLACING an entry has to remove the old
+    table, which means re-rendering the file through `tomllib` -> `tomli_w`: that keeps every
+    entry's fields but DROPS comments, because neither library round-trips them. Callers that can
+    prompt should say so before replacing (`wmo optimize route student` does).
+
+    One kind of ADD re-renders too, and so also drops comments: a roster written as the inline
+    array `model = [ {...} ]` rather than as `[[model]]` sections cannot be appended to (the
+    section header would be a second top-level `model` key), so it is normalized on the next
+    write. Releases up to 0.2.1 could write that form; a file this command has written since is
+    always in section form and always takes the append path. That case is why the return value
+    reports `rewritten` separately from `replaced`: an add that silently deleted the comments
+    recording which account each row bills to, while printing a plain "added", is not acceptable.
+
+    Whichever body is produced, it is parsed back and required to read as exactly the intended
+    roster before it is committed (`_parses_back`), so no write can leave the pool unloadable.
 
     The merged roster is validated as a whole `ModelPool` BEFORE anything is written, and the
     write itself goes through a temp file, so a rejected entry can never leave the pool
@@ -368,7 +385,7 @@ def upsert_pool_entry(
     being added.
 
     The whole read-validate-write cycle runs under an exclusive cross-process lock (see
-    `_pool_write_lock`), so two registrations racing each other both land. Without it each reads
+    `wmo.core.locks.file_write_lock`), so two racing registrations both land. Without it each reads
     the same roster and the later write erases the earlier entry, while both commands report
     success: a model an operator registered is simply not in the pool, and nothing says so.
 
@@ -379,70 +396,19 @@ def upsert_pool_entry(
             is `POOL_LOCK_TIMEOUT_S`.
 
     Returns:
-        True when an entry of the same name was replaced, False when `entry` was appended.
+        What the write did: see `PoolWrite`.
 
     Raises:
         ValueError: If `path` exists but is not a readable pool file, if it is already an invalid
             roster before this entry is added, or if adding `entry` would make it one.
-        PoolLockTimeout: If another writer holds the roster's lock for the whole wait.
+        FileLockTimeout: If another writer holds the roster's lock for the whole wait.
     """
     timeout_s = POOL_LOCK_TIMEOUT_S if lock_timeout_s is None else lock_timeout_s
-    path.parent.mkdir(parents=True, exist_ok=True)  # the lock file lives beside the roster
-    with _pool_write_lock(path, timeout_s=timeout_s):
+    with file_write_lock(path, what="the model pool", timeout_s=timeout_s):
         return _upsert_locked(entry, path)
 
 
-@contextmanager
-def _pool_write_lock(path: Path, *, timeout_s: float) -> Iterator[None]:
-    """Hold the exclusive cross-process write lock for the roster at `path`.
-
-    The lock sits in a sibling `<pool>.lock` file, not in the roster: writing goes through an
-    atomic rename, which swaps the roster's inode, so a lock taken on the file itself would stop
-    protecting anything the moment the first writer landed.
-
-    `flock` belongs to the open file description, so the kernel drops it when the holder exits,
-    crashes, or is killed. A leftover `.lock` FILE is therefore never a held lock and can never
-    wedge a later run (which is also why it is left in place: unlinking it would let a waiter
-    block on an inode nobody else can reach). A live holder that hangs still could wedge us, so
-    the wait is bounded and reports what to do instead of blocking forever.
-
-    Args:
-        path: The pool TOML being written.
-        timeout_s: Seconds to keep retrying the lock before raising.
-
-    Yields:
-        None, with the lock held; it is released when the block exits, on any path.
-
-    Raises:
-        PoolLockTimeout: If the lock is still held after `timeout_s`.
-    """
-    lock_path = path.with_name(f"{path.name}.lock")
-    deadline = time.monotonic() + timeout_s
-    fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
-    try:
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise PoolLockTimeout(
-                        f"another process has been writing the model pool at {path} for more "
-                        f"than {timeout_s:g}s (lock file {lock_path}); a registration takes "
-                        "milliseconds, so retry, and if it keeps failing look for a stuck "
-                        "process holding that lock (the lock is released automatically when "
-                        "that process exits, so the lock file itself is never the problem)"
-                    ) from None
-                time.sleep(_LOCK_POLL_S)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
-def _upsert_locked(entry: PoolEntry, path: Path) -> bool:
+def _upsert_locked(entry: PoolEntry, path: Path) -> PoolWrite:
     """The read-validate-write cycle of `upsert_pool_entry`, with the roster's lock held."""
     tables = _raw_tables(path)
     if tables:
@@ -467,33 +433,104 @@ def _upsert_locked(entry: PoolEntry, path: Path) -> bool:
         ModelPool.model_validate({"models": merged})
     except ValidationError as exc:
         raise ValueError(f"adding '{entry.name}' would make {path} an invalid pool: {exc}") from exc
-    rendered = tomli_w.dumps({"model": [table]})
-    if replaced or not path.is_file():
-        # A replacement has to remove the old table, which means re-rendering the whole file.
-        body = tomli_w.dumps({"model": merged})
-    else:
-        # The common case is a first registration, and appending the one new table byte-preserves
-        # everything already in the file: an operator's comments, key order, and spacing. Rewriting
-        # would silently destroy the comments that say which account a row bills to, and nothing
-        # would tell them it happened.
-        existing = path.read_text(encoding="utf-8")
-        if existing.endswith("\n\n"):
-            separator = ""
-        else:
-            separator = "\n" if existing.endswith("\n") else "\n\n"
-        body = f"{existing}{separator}{rendered}"
-    # The temp name carries this process's pid. The lock already keeps writers off each other, so
-    # this is defense in depth for anything that writes the roster without taking it: a shared
-    # fixed `.tmp` path would let each writer rename the other's half-written file into place,
-    # turning a lost update into a CORRUPT roster.
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    # The common case is a first registration, and appending the one new section byte-preserves
+    # everything already in the file: an operator's comments, key order, and spacing. Rewriting
+    # would silently destroy the comments that say which account a row bills to. A replacement
+    # cannot append (removing the old table means re-rendering), and neither can a file whose
+    # roster is not in section form, so both of those fall through to the re-render below.
+    existed = path.is_file()
+    body = None
+    if not replaced and existed:
+        body = _parses_back(_appended_body(path.read_text(encoding="utf-8"), table), merged)
+    # Creating the file is not a rewrite: there was nothing in it to lose, and reporting one
+    # would put "its comments are gone" on a first registration.
+    rewritten = body is None and existed
+    if body is None:
+        body = _parses_back(_render_sections(merged), merged)
+    if body is None:  # the re-render is what every other path falls back TO; it has no fallback
+        raise ValueError(
+            f"refusing to write {path}: the roster rendered to TOML that does not read back as "
+            f"the {len(merged)} intended entries. This is a bug in wmo, not in your file, which "
+            "is untouched; the likely cause is a pool field whose value is not a plain scalar"
+        )
+    write_text_atomic(path, body)
+    return PoolWrite(replaced=replaced, rewritten=rewritten)
+
+
+def _parses_back(body: str, merged: list[JsonObject]) -> str | None:
+    """`body` if it reads back as exactly the roster `merged`, else None.
+
+    The commit gate, checked on EVERY write rather than only on the append path, because the two
+    ways to render this file fail differently and both fail silently. Appending to a roster
+    written as the inline array `model = [ {...} ]` (the form releases up to 0.2.1 could produce)
+    is a duplicate top-level key, so the file stops loading. And `tomli_w.dumps` on a table with a
+    non-scalar value emits a `[key]` header, which under a hand-written `[[model]]` parses as a
+    SIBLING top-level table: the field silently vanishes from the entry with no error at all,
+    which is worse. `PoolEntry`'s all-scalar schema is what rules the second one out today, and
+    this is what keeps it ruled out if that ever changes.
+
+    Cheap enough to be unconditional: one `tomllib` parse of a file that holds a handful of
+    entries, once per registration, under a lock that is already held.
+    """
     try:
-        tmp_path.write_text(body, encoding="utf-8")
-        tmp_path.replace(path)
-    except OSError:
-        tmp_path.unlink(missing_ok=True)  # never leave a stray temp beside the roster
-        raise
-    return replaced
+        parsed = tomllib.loads(body)
+    except tomllib.TOMLDecodeError:
+        return None
+    return body if parsed.get("model") == merged else None
+
+
+def _render_sections(tables: list[JsonObject]) -> str:
+    """`tables` as one `[[model]]` section each, blank-line separated.
+
+    The section headers are written HERE rather than left to `tomli_w.dumps({"model": tables})`,
+    which does not reliably produce them. `tomli_w` picks the rendering per value: an array of
+    tables comes out as `[[model]]` sections only when at least one of them fails
+    `is_suitable_inline_table`, which is a LINE-LENGTH heuristic (100 characters). A roster of
+    short entries (`{name, kind, model}` for an OpenAI model) renders instead as the inline array
+    `model = [ {...} ]`. That form is valid TOML and still loads, but it cannot be APPENDED to:
+    adding a second `model = [...]` (or a `[[model]]` section) is a duplicate top-level key, so
+    every later `load_pool` fails with `Cannot overwrite a value` and the roster has to be
+    repaired by hand. Verbose entries (an Azure row carrying deployment/api_version/api_key_env)
+    cross 100 characters and come out as sections, which is what made the corruption look
+    intermittent rather than what it was: data-dependent, and reliably hit by the smallest entry
+    anyone registers.
+
+    Writing the header ourselves takes that heuristic out of the write path entirely, in both
+    directions: the file this command creates is one an append can extend, so the byte-preserving
+    add path in `_appended_body` stays reachable no matter how short the entries are.
+
+    Correct only while every table is a flat dict of scalars, which `PoolEntry` is: `tomli_w.dumps`
+    on a table holding a nested value emits a `[key]` header for it, and under a hand-written
+    `[[model]]` that header reads as a SIBLING top-level table, so the field leaves the entry with
+    no error raised. Nothing here enforces that; `_parses_back` is what catches it at the commit
+    point, for this and for the whole-roster render alike.
+    """
+    return "\n".join(f"[[model]]\n{tomli_w.dumps(table)}" for table in tables)
+
+
+def _appended_body(existing: str, table: JsonObject) -> str:
+    """`existing` plus one `[[model]]` section for `table`, separated by a blank line.
+
+    A pure string builder: whether the result is SAFE to write is `_parses_back`'s question, asked
+    at the commit point for every render rather than only for this one. Appending is what
+    byte-preserves an operator's comments, and it works against any roster already in section
+    form, which `_render_sections` guarantees for every file this command has written. A roster
+    still in the inline `model = [ {...} ]` form from 0.2.1 or earlier is the case that fails: a
+    section header appended to one is a duplicate top-level `model` key, the caller falls back to
+    a full re-render, and the file is normalized to section form so the next add can append again.
+
+    Args:
+        existing: The current file contents, already known to parse (`_raw_tables` read it).
+        table: The new entry's table, as rendered into the file.
+
+    Returns:
+        The full file contents to write, unverified.
+    """
+    if existing.endswith("\n\n"):
+        separator = ""
+    else:
+        separator = "\n" if existing.endswith("\n") else "\n\n"
+    return f"{existing}{separator}{_render_sections([table])}"
 
 
 def _raw_tables(path: Path) -> list[JsonObject]:

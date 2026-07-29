@@ -23,6 +23,8 @@ from pathlib import Path
 import tomli_w
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.core.files import write_text_atomic
+
 ENDPOINT_CONFIG_FILENAME = "endpoint.toml"
 
 
@@ -66,8 +68,4 @@ class EndpointConfig(BaseModel):
 
     def save(self, path: Path) -> None:
         """Write the config atomically (a half-written dial must not be loadable)."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staging = path.with_name(f"{path.name}.partial")
-        with staging.open("wb") as handle:
-            tomli_w.dump(self.model_dump(exclude_none=True), handle)
-        staging.replace(path)
+        write_text_atomic(path, tomli_w.dumps(self.model_dump(exclude_none=True)))

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, model_validator
 
+from wmo.core.files import write_text_atomic
 from wmo.optimize.compression import CompressionConfig
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
@@ -21,6 +22,47 @@ from wmo.providers.pool import PoolEntry
 # place under the same filename, and a fit is identified by the data it saw. 16 hex characters
 # is 64 bits, far past collision risk for the handful of matrices one artifact directory sees.
 MATRIX_DIGEST_CHARS = 16
+
+# Router fitting and reporting share one paid outcome matrix, but they must not share scenarios.
+# Hash ordering makes the partition stable across machines and independent of matrix row order.
+ROUTER_FIT_FRACTION = 0.7
+ROUTER_SPLIT_VERSION = "scenario-hash-70-30-v1"
+
+
+class RouterScenarioSplit(BaseModel):
+    """Disjoint scenario ids used to fit a router and report its generalization."""
+
+    fit_ids: tuple[str, ...]
+    report_ids: tuple[str, ...]
+
+
+def split_router_scenarios(scenario_ids: list[str]) -> RouterScenarioSplit:
+    """Deterministically reserve 30% of scenarios for router evaluation.
+
+    At least two scenarios are required because a router trained and evaluated on one scenario
+    cannot produce a held-out claim. Returned ids retain the matrix's original order; hashing is
+    used only to assign membership.
+    """
+    if len(scenario_ids) != len(set(scenario_ids)):
+        raise ValueError("router split requires unique scenario ids")
+    if len(scenario_ids) < 2:
+        raise ValueError(
+            "router fitting needs at least 2 scenarios so one can remain held out for reporting"
+        )
+    ranked = sorted(
+        scenario_ids,
+        key=lambda scenario_id: (
+            hashlib.sha256(scenario_id.encode("utf-8")).digest(),
+            scenario_id,
+        ),
+    )
+    fit_count = round(len(ranked) * ROUTER_FIT_FRACTION)
+    fit_count = min(len(ranked) - 1, max(1, fit_count))
+    fit_set = set(ranked[:fit_count])
+    return RouterScenarioSplit(
+        fit_ids=tuple(sid for sid in scenario_ids if sid in fit_set),
+        report_ids=tuple(sid for sid in scenario_ids if sid not in fit_set),
+    )
 
 
 class ScenarioOutcome(BaseModel):
@@ -154,8 +196,8 @@ class OutcomeMatrix(BaseModel):
         return sum(rewards) / len(rewards)
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2), encoding="utf-8")
+        """Write the matrix atomically: it is the measured output of a run that cost real money."""
+        write_text_atomic(path, self.model_dump_json(indent=2))
 
     @classmethod
     def load(cls, path: Path) -> OutcomeMatrix:

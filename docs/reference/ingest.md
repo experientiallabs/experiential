@@ -762,6 +762,7 @@ MODEL="${2:-langsmith-demo}"
 #    SDK (Python): dump runs to a JSON array (one trace, or a whole project):
 #      uv run python - <<'PY' > "$EXPORT"
 #      import json
+#      import sys
 #      from langsmith import Client
 #      runs = Client().list_runs(project_name="my-project")  # or trace_id=<uuid>
 #      json.dump([r.dict() for r in runs], sys.stdout, default=str)

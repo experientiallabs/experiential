@@ -1,12 +1,17 @@
 [project]
 name = "world-model-optimizer"
-version = "0.2.1"
+version = "0.2.2"
 description = "Run agents, build world models from traces, and optimize agent harnesses."
 readme = "README.md"
 # harbor 0.20.0 requires Python >=3.12; the harbor evaluator is a first-class optimize
 # environment, so the whole package moves to 3.12 (deliberate 3.11 drop, noted in the PR body).
 requires-python = ">=3.12"
 dependencies = [
+    # Cross-platform advisory file locking for the durable registries wmo edits in place (the
+    # candidate pool, the harness and adapter alias tables). Declared directly because
+    # `wmo.core.locks` imports it; it was already in the resolved graph via torch/datasets/
+    # huggingface-hub/harbor. It is what keeps a Unix-only `fcntl` off wmo's import path.
+    "filelock>=3.12",
     # typer/rich/fastapi/uvicorn floors match harbor 0.20.0's requirements so the harbor
     # extra resolves against the core install without downgrades.
     "typer>=0.16",
@@ -20,10 +25,6 @@ dependencies = [
     "scikit-learn>=1.4",
     "httpx>=0.27",
     "rich>=14.1",
-    # The data-bundle read core behind `wmo download` (stdlib-only; pushing needs its own
-    # `fetch` extra). Published separately to PyPI and resolved from there — its benchmark
-    # adapters and capture tooling are not part of this repository.
-    "environment-capture",
     "gepa>=0.1.1",
     "tomli-w>=1.0",  # writing .wmo/config.toml (stdlib tomllib reads); every `wmo build` needs it
     "posthog>=7.0",
@@ -73,12 +74,22 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.5",
     "ty>=0.0.1a1",
+    # The compressor-endpoint tests import certifi directly to borrow a real PEM for the
+    # certificate-pinning checks (the box's own cert is an operational secret). It arrives
+    # transitively via httpx, but a direct import gets a direct declaration.
+    "certifi",
     "world-model-optimizer[otel,viz,e2b,connectors,harbor,postgres,distill]",
 ]
 
 [dependency-groups]
-# environment-capture is a published PyPI dependency (`wmo download` reads its data bundles);
-# the dev group adds its heavy extras so the root gate can exercise the fetch/bedrock paths.
+# environment-capture joins the dev environment (uv syncs the `dev` group by default) with its
+# heavy extras, so the root gate can exercise the tests that import it directly.
+#
+# A dependency GROUP is not published metadata, so nothing here reaches a `pip install
+# world-model-optimizer`. That is the whole point for environment-capture: it is a development
+# dependency only, and shipped `wmo/` imports nothing from it (`wmo/hub.py` vendors the
+# bundle-fetch read core `wmo download` needs). llm-waterfall is no longer a dependency in any
+# form: its source is vendored under `wmo/utils/waterfall/` and ships inside the flagship wheel.
 dev = ["environment-capture[bedrock,fetch]"]
 
 [project.scripts]
@@ -96,12 +107,12 @@ packages = ["wmo"]
 # imported only by tests, so neither belongs in the published wheel. `fake_tinker` stays where
 # it is rather than moving under a test path: five test modules import it by that name.
 exclude = ["**/*_test.py", "wmo/distill/fake_tinker.py", "wmo/conftest.py"]
-# The vendored waterfall utility keeps its own MIT notice beside the code it covers.
-force-include = { "wmo/utils/waterfall/LICENSE" = "wmo/utils/waterfall/LICENSE" }
+# The vendored waterfall utility's MIT notice at wmo/utils/waterfall/LICENSE needs no
+# force-include: `packages = ["wmo"]` already ships every non-Python file under wmo/.
 
 [tool.hatch.build.targets.sdist]
-# One flagship distribution: everything importable lives under /wmo, and the
-# environment-capture dependency resolves from PyPI.
+# One flagship distribution: everything importable lives under /wmo, including the vendored
+# waterfall utility. environment-capture is a dev-only dependency, never a `Requires-Dist`.
 include = [
     "/wmo",
     "/README.md",

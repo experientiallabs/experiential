@@ -3,8 +3,8 @@
 Each iteration freezes the current champion, clusters its failures into mechanisms, and asks the
 proposer for a sibling batch of `HarnessDelta` objects against one size-weighted,
 expansion-discounted cluster. Every sibling is applied and evaluated against that same frozen
-champion. After the full batch resolves, at most one gate-eligible sibling becomes the next
-iteration's champion:
+champion. After the full batch resolves, at most one gate-eligible, strictly improving sibling
+becomes the next iteration's champion:
 
 - **Tier 1 — regression suite**: the child's score on the suite (tasks the search has already
   mastered) must not drop below the champion's. Newly-passing tasks promote into the suite on
@@ -14,10 +14,12 @@ iteration's champion:
   the champion on tasks the proposer never saw evidence from.
 
 Ties pass every gate tier: with k passes per task, scores are coarse, and "no worse" is the
-eligibility contract. When multiple siblings are eligible, full success wins, then assertion
-fraction, then lower proposal index. Every proposed delta, whether selected, rejected, or invalid
-before eval, is recorded in the archive with its verdict. The run as a whole is only as
-reproducible as its providers because proposals and rollouts sample real models at temperature.
+eligibility contract. Promotion still requires a strict gain in full success or, when success
+ties, full assertion fraction. When multiple improving siblings are eligible, full success wins,
+then assertion fraction, then lower proposal index. Every proposed delta, whether selected,
+rejected, or invalid before eval, is recorded in the archive with its verdict. The run as a whole
+is only as reproducible as its providers because proposals and rollouts sample real models at
+temperature.
 """
 
 from __future__ import annotations
@@ -95,7 +97,7 @@ class ProposalRecord(BaseModel):
 
     A dead proposal (every outcome but ``scored``) ends before a full-split evaluation. Scored
     proposals distinguish gate eligibility from final selection: several siblings may satisfy
-    the frozen non-regression gate, but only the best eligible sibling is selected. The
+    the frozen non-regression gate, but only the best strictly improving sibling is selected. The
     ``champion_score`` is always the frozen pre-iteration champion score, which is the comparison
     baseline and the honest plotting level for a dead proposal.
     """
@@ -148,7 +150,7 @@ class CreateResult(BaseModel):
     proposal_records: list[ProposalRecord] = Field(default_factory=list)
     screened: int = 0  # deltas rejected at the cheap trigger-cluster screen (no full eval spent)
     confirmations: int = 0  # narrow vetoes retried at higher k (see `narrow_failing_tiers`)
-    iterations: int = 0
+    iterations: int = 0  # proposal batches completed before budget exhaustion or a perfect score
     proposal_batch_size: int = 1
     # Spend meters over the WHOLE search (seed, screens, full splits, holdout, confirmations).
     # worker_usage: worker-LLM tokens from self-metering runtimes (the pi worker path; None on
@@ -382,6 +384,18 @@ def gate_delta(
     )
 
 
+def _is_perfect(report: ClosedLoopReport) -> bool:
+    """Return whether every task and every assertion passed."""
+    return report.success_rate >= 1.0 - _TIE_EPS and report.mean_fraction >= 1.0 - _TIE_EPS
+
+
+def _strictly_improves_full_objective(verdict: GateRecord) -> bool:
+    """Require positive full-split evidence after non-regression gates pass."""
+    return verdict.full_delta > _TIE_EPS or (
+        abs(verdict.full_delta) <= _TIE_EPS and verdict.full_fraction_delta > _TIE_EPS
+    )
+
+
 def create_harness(
     name: str,
     seed_doc: HarnessDoc,
@@ -415,9 +429,10 @@ def create_harness(
     (unusable, invalid, or screened out on its trigger cluster) ends early and cheaply. It is
     counted, recorded in ``proposal_records``, and narrated via ``on_note`` without aborting its
     siblings. ``on_proposal`` receives every final record in stable proposal order after
-    selection. ``on_progress`` receives the seed plus exactly one champion point per iteration,
-    including an unchanged point when no proposal wins. ``on_accept`` fires at most once per
-    iteration with the selected champion, its final delta verdict, and its full-suite score.
+    selection. ``on_progress`` receives the seed plus exactly one champion point per completed
+    iteration, including an unchanged point when no proposal wins. A perfect champion stops the
+    search before another proposal batch is bought. ``on_accept`` fires at most once per iteration
+    with the selected champion, its final delta verdict, and its full-suite score.
     ``on_note`` is an eager diagnostic stream, so dead-proposal and feedback-error notes may fire
     while siblings are still evaluating. ``on_proposal`` waits for batch selection and then fires
     in stable proposal order. The iteration's ``on_progress`` checkpoint follows those records.
@@ -576,6 +591,7 @@ def create_harness(
         )
 
         proposal_records: list[ProposalRecord] = []
+        completed_iterations = 0
 
         def _stage_dead(records: list[ProposalRecord], record: ProposalRecord) -> None:
             """Stage one dead proposal for ordered publication after batch selection."""
@@ -590,15 +606,21 @@ def create_harness(
 
         for iteration_index in range(1, iterations + 1):
             _check_cancelled()
+            frozen_champion_hash = champion_hash
+            parent = docs[frozen_champion_hash]
+            parent_report = reports[frozen_champion_hash]
+            if _is_perfect(parent_report):
+                subject = "seed" if completed_iterations == 0 else "champion"
+                _note(
+                    f"{subject} already passes every task and assertion; stopping before proposals"
+                )
+                break
             # Eval runners from the previous iteration would otherwise sit idle through the
             # potentially long proposer call. Sibling score waves still share the newly warmed
             # pool for this whole iteration.
             if sandbox_pool is not None:
                 sandbox_pool.retire_idle()
 
-            frozen_champion_hash = champion_hash
-            parent = docs[frozen_champion_hash]
-            parent_report = reports[frozen_champion_hash]
             frozen_champion_score = parent_report.success_rate
             frozen_best_full = best_full
             frozen_suite = list(suite)
@@ -987,16 +1009,21 @@ def create_harness(
 
             _check_cancelled()
             eligible = [candidate for candidate in scored_proposals if candidate.gate.accepted]
+            improving = [
+                candidate
+                for candidate in eligible
+                if _strictly_improves_full_objective(candidate.gate)
+            ]
             winner = (
                 max(
-                    eligible,
+                    improving,
                     key=lambda candidate: (
                         candidate.report.success_rate,
                         candidate.report.mean_fraction,
                         -candidate.proposal_index,
                     ),
                 )
-                if eligible
+                if improving
                 else None
             )
             for candidate in scored_proposals:
@@ -1004,15 +1031,22 @@ def create_harness(
                 if winner is candidate:
                     final_gate = candidate.gate
                 elif gate_eligible:
-                    assert winner is not None
+                    if not _strictly_improves_full_objective(candidate.gate):
+                        selection_reason = (
+                            "gate eligible but not selected: no measured improvement over "
+                            "the champion"
+                        )
+                    else:
+                        assert winner is not None
+                        selection_reason = (
+                            "gate eligible but not selected: "
+                            f"proposal {winner.proposal_index} ranked higher by full success, "
+                            "assertion fraction, then proposal order"
+                        )
                     final_gate = candidate.gate.model_copy(
                         update={
                             "accepted": False,
-                            "reason": (
-                                "gate eligible but not selected: "
-                                f"proposal {winner.proposal_index} ranked higher by full success, "
-                                "assertion fraction, then proposal order | " + candidate.gate.reason
-                            ),
+                            "reason": selection_reason + " | " + candidate.gate.reason,
                         }
                     )
                 else:
@@ -1070,6 +1104,7 @@ def create_harness(
                     reports[champion_hash].success_rate,
                     winner is not None,
                 )
+            completed_iterations = iteration_index
 
         _check_cancelled()
         best = docs[champion_hash].model_copy(update={"name": name, "version": 0})
@@ -1084,7 +1119,7 @@ def create_harness(
             proposal_records=proposal_records,
             screened=screened,
             confirmations=confirmations,
-            iterations=iterations,
+            iterations=completed_iterations,
             proposal_batch_size=proposal_batch_size,
             worker_usage=combine_usage(worker_usages),
         )

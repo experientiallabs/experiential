@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -40,6 +43,100 @@ def test_default_load_prefers_champion_alias_else_latest(tmp_path: Path) -> None
     # Rollback/promotion is just re-pointing.
     store.set_alias("h", CHAMPION_ALIAS, 2)
     assert store.load("h").version == 2
+
+
+def test_a_torn_alias_write_keeps_the_previous_champion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`aliases.toml` holds the champion pointer `resolve_version(None)` depends on.
+
+    Written in place, a crash or a full disk mid-write truncates it and the pointer is simply
+    gone, so `wmo` silently starts serving `latest` instead of the promoted version. The failure
+    is modelled at the payload's fsync, the point where an in-place write would already have
+    destroyed the old contents.
+    """
+    store = HarnessStore(tmp_path)
+    store.save_version(HarnessDoc.baseline("h"))
+    store.save_version(_variant("h", "v2 prompt"))
+    store.set_alias("h", CHAMPION_ALIAS, 1)
+
+    def _boom(fd: int) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fsync", _boom)
+    with pytest.raises(OSError, match="disk full"):
+        store.set_alias("h", CHAMPION_ALIAS, 2)
+    monkeypatch.undo()
+
+    assert store.aliases("h") == {CHAMPION_ALIAS: 1}
+    assert store.load("h").version == 1
+
+
+def test_concurrent_alias_moves_both_land(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two promotions of DIFFERENT aliases must not erase each other.
+
+    Unlocked, each reads the same table, adds its own key, and writes the whole thing back; the
+    later write drops the earlier alias and both calls return normally. Atomic replace does not
+    help here, because neither write is torn: the update is simply lost.
+
+    The race is forced, not hoped for: every read of `aliases.toml` parks on a barrier, so both
+    writers provably hold the SAME snapshot before either writes. With the lock held across the
+    whole cycle the second writer cannot reach its read until the first has finished, so the
+    barrier times out (its wait is far shorter than the lock's) and the reads happen in sequence.
+    """
+    store = HarnessStore(tmp_path)
+    store.save_version(HarnessDoc.baseline("h"))
+    store.save_version(_variant("h", "v2 prompt"))
+    # `save_version` defaults to alias=None, so aliases.toml does not exist yet and `aliases()`
+    # returns early from its `path.exists()` guard WITHOUT reading. The barrier below hooks
+    # `read_text`, so without this seeding write it is never armed and the two threads serialize
+    # by luck: measured 8 passes in 10 against the unlocked implementation.
+    store.set_alias("h", "seed", 1)
+    read_together = threading.Barrier(2, timeout=1.0)
+    real_read = Path.read_text
+
+    def _park_on_every_alias_read(self: Path, **kwargs: object) -> str:
+        text = real_read(self, **kwargs)  # ty: ignore[invalid-argument-type]
+        if self.name == "aliases.toml":
+            with contextlib.suppress(threading.BrokenBarrierError):
+                read_together.wait()
+        return text
+
+    monkeypatch.setattr(Path, "read_text", _park_on_every_alias_read)
+    failures: list[BaseException] = []
+
+    def _promote(alias: str, version: int) -> None:
+        try:
+            store.set_alias("h", alias, version)
+        except BaseException as exc:  # noqa: BLE001 - reported by the assertions below
+            failures.append(exc)
+
+    writers = [
+        threading.Thread(target=_promote, args=args)
+        for args in ((CHAMPION_ALIAS, 2), ("staging", 1))
+    ]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=30)
+        assert not writer.is_alive(), "the alias lock wait is not bounded"
+    monkeypatch.undo()  # the assertion below reads the table without parking on the barrier
+
+    assert failures == []
+    assert store.aliases("h") == {"seed": 1, CHAMPION_ALIAS: 2, "staging": 1}
+
+
+def test_a_corrupt_alias_file_names_itself(tmp_path: Path) -> None:
+    """The user never edited this file, so a bare `tomllib` message gives them nowhere to start."""
+    store = HarnessStore(tmp_path)
+    store.save_version(HarnessDoc.baseline("h"))
+    path = store.dir_for("h") / "aliases.toml"
+    path.write_text("[aliases]\nchampion = \n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"is not valid TOML") as caught:
+        store.aliases("h")
+
+    assert str(path) in str(caught.value)
 
 
 def test_alias_to_missing_version_rejected(tmp_path: Path) -> None:

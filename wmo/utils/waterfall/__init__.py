@@ -30,8 +30,6 @@ from wmo.utils.waterfall.types import (
 )
 from wmo.utils.waterfall.waterfall import Waterfall
 
-__version__ = "0.1.4"
-
 __all__ = [
     "Attempt",
     "Backend",

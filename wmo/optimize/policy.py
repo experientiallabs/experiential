@@ -1,6 +1,25 @@
 """The routing policy artifact: what the routing optimizer emits and the endpoint serves.
 
-An endpoint = {world model, policy, evidence, URL}; this module is the policy leg. Three kinds:
+An endpoint = {world model, policy, evidence, URL}; this module is the policy leg.
+
+WHICH KIND THE PRODUCT USES, because the three below are not peers:
+
+- `knn` is THE learned router. `wmo optimize model` fits nothing else (it pins
+  `kind="knn"`), so every optimized endpoint serves a knn policy.
+- `static` is not an algorithm, it is the pre-optimization state: an endpoint must serve from
+  the moment it exists, before any fit has run, and the improvement report needs an honest
+  "before" to measure against. Two producers choose its model differently: the hosted platform
+  seeds one over the strongest serving model available to the org, while `wmo optimize route
+  pin` installs one for whichever `--model` an operator names, which may deliberately be a
+  weaker one.
+- `rank` is a RESEARCH DIRECTION, retained deliberately: a faithful replication kept for
+  comparison, reachable only through the manual `wmo optimize route fit --kind rank`. The
+  staged pipeline never fits one, so nothing serves one today - but the runtime DOES dispatch a
+  manually installed rank artifact through `rank_decision`, so read this as unfitted by the
+  product rather than unservable. It is also the only kind with clusters, which is why a
+  request log's cluster columns are empty for everything the product serves.
+
+The three kinds:
 
 - `static`: every request goes to `default_model`. Valid without any optimizer run, so an
   endpoint serves from day one and the improvement report has an honest "before" state.
@@ -43,6 +62,7 @@ from uuid import uuid4
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
+from wmo.core.files import write_bytes_atomic
 from wmo.optimize.compression import (
     CompressionConfig,
     Compressor,
@@ -100,20 +120,11 @@ def write_artifact_atomically(path: Path, payload: bytes) -> None:
     a command that writes several artifacts promise that a failure leaves the old ones intact.
     `KnnBank.save` stages the same way for the sidecar it streams through numpy.
 
-    The staging name is unique PER CALL. `replace` is atomic, but a staging path shared between
-    two concurrent writers is not: they would interleave on one file, so one could publish the
-    other's bytes under its own name and the loser would fail on a file already renamed away.
-    It is also hidden and cleaned up on failure, so an interrupted write cannot leave litter in
-    an artifact directory that serving and the fitter both scan.
+    The per-call staging name, the cleanup on failure, and the durability are
+    `wmo.core.files.write_bytes_atomic`'s; this wrapper is the artifact layer's name for it, kept
+    because the reason above is the artifact directory's, not a property of writing files.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.with_name(f".{path.name}.{uuid4().hex}.partial")
-    try:
-        staging.write_bytes(payload)
-        staging.replace(path)
-    except BaseException:
-        staging.unlink(missing_ok=True)
-        raise
+    write_bytes_atomic(path, payload)
 
 
 def knn_bank_path_for(policy_path: Path) -> Path:
@@ -332,6 +343,10 @@ class RoutingEvidence(BaseModel):
     n_pairs: int | None = None  # neighbors scored on BOTH sides, the guard's sample size
     gate: GateOutcome | None = None  # None when no gate was reached
     propensity: Propensity
+    # The incumbent's cache credit that entered this decision's cost arithmetic, in USD
+    # (cache-aware policies only; None whenever no credit was applied). What lets the request
+    # log explain a cache-driven pick: "the incumbent was effectively cheaper by this much".
+    cache_credit_usd: float | None = None
 
 
 class RoutingDecision(BaseModel):
@@ -373,6 +388,22 @@ class RoutingPolicy(BaseModel):
     beta: float = Field(default=DEFAULT_BETA, gt=0.0)
     default_rank: int = Field(default=DEFAULT_RANK, ge=1)
     sticky: bool = True  # keep a conversation's incumbent model (see module docstring)
+    # Cache-aware decisions (Silen directive, 2026-07-28): when on, a knn policy with a
+    # conversation incumbent does NOT take the unconditional sticky return; the decision runs
+    # with the incumbent's cache credit inside its COST arithmetic (the pick_lam tilt and the
+    # guard's pricier test), so stickiness becomes a priced advantage the router can weigh
+    # against quality evidence instead of a blunt rule. The quality evidence test itself is
+    # unchanged: cache state never buys quality confidence. Off (the default) is bit-identical
+    # to today for every policy file, eval, and serving path.
+    #
+    # Safety outranks cache economics: the novelty abstain and the no-scored-candidates
+    # returns still serve the pinned fallback WITHOUT the switch gate. Consequence vs plain
+    # sticky mode (which never reaches the novelty check): a mid-conversation turn that looks
+    # unlike the fit data leaves a cache-warm incumbent for the fallback and pays full
+    # prefill. Ruled deliberate (routing master, 2026-07-28): on novel input the pinned-
+    # fallback contract wins. The switch gate governs evidence-backed decisions only; an
+    # incumbent absent from the fitted bank cannot be tested and sticks.
+    cache_aware: bool = False
     # ProxRouter-inspired support tilt (2510.09852, ADAPTED to clusters: their exponential
     # tilt reweights nonparametric scores by a prior; ours multiplies cluster probabilities
     # by support^gamma so thin outlier clusters lose routing weight). 0 = off (reference).
@@ -390,6 +421,10 @@ class RoutingPolicy(BaseModel):
     min_support: int | None = None  # scored episodes a challenger needs to lead its cluster
     guard_margin: float | None = None  # reward the challenger must beat the guard by
     fitted_from: str | None = None  # provenance: the outcome matrix the fitter used
+    # Scenario-level provenance for evaluation integrity. Reports exclude these ids when they
+    # appear in the supplied matrix; an entirely separate matrix has no overlap and is all held
+    # out. Empty is retained for static and legacy artifacts that learned no recorded split.
+    fit_scenario_ids: list[str] = Field(default_factory=list)
     # D-COMPRESS: the endpoint-level compression choice, applied by the serving compress stage
     # BEFORE routing (the router embeds what the model will see), so it cannot vary by cluster
     # at serve time; per-cluster overrides live on ClusterRanking for the joint fit and eval
@@ -642,12 +677,39 @@ class RoutingPolicy(BaseModel):
             )
 
 
+CHARS_PER_TOKEN = 4  # the documented, conservative prefix estimate (design: cacheaware.md)
+
+
+def cache_credit_usd(policy: RoutingPolicy, incumbent: str, prefix_chars: int) -> float:
+    """The incumbent's expected cache saving on this request, in USD.
+
+    credit = prefix_tokens x (input rate - cached read rate) at the INCUMBENT's pool prices,
+    with prefix_tokens estimated as prefix_chars / 4 (conservative; errs low). Every other
+    model's credit is zero by definition: a switch pays full prefill. A pool entry with no
+    cached_input_per_mtok earns no credit (its cache reads bill at the full input rate,
+    matching PoolEntry.cost_usd), and an unknown incumbent earns none either.
+
+    The estimate assumes a warm provider cache, which holds inside the provider prefix-cache
+    window (~minutes); the pre-registered replay gate measures under the same assumption.
+    """
+    if prefix_chars <= 0:
+        return 0.0
+    entry = next((e for e in policy.pool if e.name == incumbent), None)
+    if entry is None or entry.cached_input_per_mtok is None:
+        return 0.0
+    saving_per_mtok = entry.price().input_per_mtok - entry.cached_input_per_mtok
+    if saving_per_mtok <= 0.0:
+        return 0.0
+    return (prefix_chars / CHARS_PER_TOKEN) * saving_per_mtok / 1_000_000
+
+
 def select_model(
     policy: RoutingPolicy,
     text: str,
     *,
     incumbent: str | None = None,
     embedder: Embedder | None = None,
+    conversation_chars: int = 0,
 ) -> RoutingDecision:
     """Pick the pool model for one request.
 
@@ -660,15 +722,29 @@ def select_model(
     `policy.embedder` (an azure spec otherwise constructs a fresh HTTP client per call); it must
     be the function this policy's spec describes, or the fitted centroids (rank) and neighbor
     bank (knn) are meaningless. Default None builds it from the spec per call.
+
+    `conversation_chars` is the length of the transcript the affinity fingerprint matched (0
+    when there is none); a cache-aware knn policy turns it into the incumbent's cache credit
+    (`cache_credit_usd`). It is ignored everywhere else, so passing it is always safe.
     """
     names = {entry.name for entry in policy.pool}
-    if incumbent is not None and incumbent in names and policy.sticky:
+    cache_aware_knn = policy.cache_aware and policy.kind == "knn" and incumbent in names
+    if incumbent is not None and incumbent in names and policy.sticky and not cache_aware_knn:
         return RoutingDecision(model=incumbent, reason="sticky: conversation affinity")
     if policy.kind == "static":
         return RoutingDecision(model=policy.default_model, reason="static policy")
 
     query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
-    decision = knn_decision(policy, query) if policy.kind == "knn" else rank_decision(policy, query)
+    if policy.kind == "knn":
+        credit = cache_credit_usd(policy, incumbent, conversation_chars) if cache_aware_knn else 0.0
+        decision = knn_decision(
+            policy,
+            query,
+            incumbent=incumbent if cache_aware_knn else None,
+            cache_credit=credit,
+        )
+    else:
+        decision = rank_decision(policy, query)
     # Normalized separately rather than by normalizing `query` first: both decision functions do
     # their own normalization in their own precision, and pre-normalizing here would perturb the
     # champion's numerical path for the sake of a logging side effect.
@@ -729,7 +805,13 @@ def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     )
 
 
-def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
+def knn_decision(
+    policy: RoutingPolicy,
+    query: np.ndarray,
+    *,
+    incumbent: str | None = None,
+    cache_credit: float = 0.0,
+) -> RoutingDecision:
     """The kNN reward-profile core with its paired guard, on an already-embedded query.
 
     Shared by `select_model` (one live request) and batch evaluation, so the served path and the
@@ -753,6 +835,15 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     It runs on the UNTILTED evidence and after the cost knob, exactly as in the research code:
     the knob reorders candidates, and the guard then re-vetoes whatever it cannot support, so
     turning the knob up can never talk the router into a pick the evidence rejects.
+
+    Cache-aware calls (`incumbent` supplied by `select_model` when the policy has
+    `cache_aware` on) do two things. The `cache_credit` is subtracted from THE INCUMBENT's
+    mean cost in the two places cost enters the decision: the pick_lam tilt and the pricier
+    tests. And any decision that would ABANDON the incumbent must additionally clear the
+    switch gate (see `switch_gate` below): the same paired-evidence bar, anchored on the
+    incumbent, at effective prices. With NO incumbent this function is bit-identical to the
+    cache-blind path (the offline-eval invariant); quality evidence (profile, paired diffs,
+    z thresholds) never sees the credit.
     """
     if policy.kind != "knn":
         raise ValueError(f"knn_decision needs a knn policy, got kind='{policy.kind}'")
@@ -801,12 +892,90 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             evidence=RoutingEvidence(propensity="fallback-forced"),
         )
     mean_cost = bank.mean_costs()
+    # Cache-aware: the incumbent's expected cost on THIS request is its sticker price minus
+    # the cache credit (floored at zero); every other model pays full prefill. Effective
+    # costs feed the tilt and the guard's pricier test below; with credit 0 they ARE the
+    # mean costs and the whole path is bit-identical to the cache-blind decision.
+    effective_cost = mean_cost
+    credit_applied = 0.0
+    if cache_credit > 0.0 and incumbent is not None and incumbent in bank.models:
+        inc_index = bank.models.index(incumbent)
+        if not np.isnan(mean_cost[inc_index]):
+            effective_cost = mean_cost.copy()
+            effective_cost[inc_index] = max(mean_cost[inc_index] - cache_credit, 0.0)
+            credit_applied = cache_credit
+
+    def switch_gate(serve_index: int, serve: str) -> RoutingDecision | None:
+        """Cache-aware switch gate (design amendment 1, findings/cacheaware.md).
+
+        Serving `serve` would abandon the cache-warm incumbent, so the challenger must clear
+        the SAME paired-evidence bar against the incumbent that any pick clears against the
+        safety baseline, with the pricier flag on EFFECTIVE costs (incumbent credited,
+        challenger at full prefill). None = switch justified (or gate not applicable);
+        otherwise the decision that keeps the incumbent. Quality thresholds are identical to
+        the baseline guard: cache state raises the switch's price bar, never its confidence.
+        """
+        if incumbent is None or serve == incumbent:
+            return None
+        if incumbent not in bank.models:
+            # The bank predates this pool model, so the incumbent cannot be tested at all;
+            # the amendment's conservative rule applies: an untestable incumbent sticks.
+            return RoutingDecision(
+                model=incumbent,
+                reason=(
+                    f"cache-aware switch gate: kept incumbent {incumbent}, not in the fitted "
+                    f"bank so {serve} cannot be justified against it"
+                ),
+                evidence=RoutingEvidence(
+                    n_pairs=0,
+                    gate="reverted",
+                    propensity="fallback-forced",
+                    cache_credit_usd=credit_applied or None,
+                ),
+            )
+        inc_index = bank.models.index(incumbent)
+        inc_paired = scored[:, serve_index] & scored[:, inc_index]
+        inc_diffs = rewards[inc_paired, serve_index] - rewards[inc_paired, inc_index]
+        inc_pairs = int(inc_diffs.size)
+        inc_mean = float(inc_diffs.mean()) if inc_pairs else 0.0
+        inc_error = float(inc_diffs.std(ddof=1)) / inc_pairs**0.5 if inc_pairs > 1 else 0.0
+        if policy.se_floor and 0 < inc_pairs < SE_FLOOR_MAX_PAIRS:
+            inc_error = max(inc_error, (0.25 / inc_pairs) ** 0.5)
+        switch_pricier = bool(effective_cost[serve_index] > effective_cost[inc_index])
+        if policy.guard_mode == "asymmetric":
+            z_switch = policy.knn_z if switch_pricier else -policy.knn_z
+        else:
+            z_switch = 2 * policy.knn_z if switch_pricier else policy.knn_z
+        if inc_pairs >= policy.knn_min_pairs and inc_mean > z_switch * inc_error:
+            return None
+        detail = (
+            f"{inc_pairs} paired neighbors vs incumbent, delta={inc_mean:+.3f}, needs "
+            f"> {z_switch:g}xSE={z_switch * inc_error:.3f} at effective prices"
+        )
+        if inc_pairs < policy.knn_min_pairs:
+            detail = f"{inc_pairs} paired neighbors vs incumbent < {policy.knn_min_pairs}"
+        return RoutingDecision(
+            model=incumbent,
+            reason=(
+                f"cache-aware switch gate: kept incumbent {incumbent}, {serve} not "
+                f"justified against it ({detail})"
+            ),
+            evidence=RoutingEvidence(
+                mean_diff=inc_mean,
+                se=inc_error,
+                n_pairs=inc_pairs,
+                gate="reverted",
+                propensity="fallback-forced",
+                cache_credit_usd=credit_applied or None,
+            ),
+        )
+
     # The cost knob prices each candidate in average-call units before the argmax; at
     # pick_lam=0 the key is the bare profile, bit-identical to the validated champion. A model
     # the bank never priced pays exactly one unit, the reference's default.
     tilt = np.zeros(profile.shape)
     if policy.pick_lam > 0.0:
-        priced = np.where(np.isnan(mean_cost), policy.cost_scale, mean_cost)
+        priced = np.where(np.isnan(effective_cost), policy.cost_scale, effective_cost)
         tilt = policy.pick_lam * priced / policy.cost_scale
     pick_index, pick = max(
         candidates, key=lambda item: (profile[item[0]] - tilt[item[0]], -pool_order[item[1]])
@@ -820,6 +989,9 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             candidates, key=lambda item: (profile[item[0]], -pool_order[item[1]])
         )
         if leader != baseline:
+            gated = switch_gate(pick_index, baseline)
+            if gated is not None:
+                return gated
             return RoutingDecision(
                 model=baseline,
                 reason=(
@@ -829,13 +1001,18 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
                 ),
                 # Greedy: the baseline IS the argmax once the cost knob has priced the
                 # candidates, so nothing overrode the router's own preference.
-                evidence=RoutingEvidence(propensity="greedy"),
+                evidence=RoutingEvidence(
+                    propensity="greedy", cache_credit_usd=credit_applied or None
+                ),
             )
+        gated = switch_gate(pick_index, baseline)
+        if gated is not None:
+            return gated
         return RoutingDecision(
             model=baseline,
             reason=f"knn: baseline {baseline} leads {rows.size} neighbors "
             f"(profile {profile[pick_index]:.3f})",
-            evidence=RoutingEvidence(propensity="greedy"),
+            evidence=RoutingEvidence(propensity="greedy", cache_credit_usd=credit_applied or None),
         )
 
     base_index = bank.models.index(baseline)
@@ -846,7 +1023,7 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     error = float(diffs.std(ddof=1)) / pairs**0.5 if pairs > 1 else 0.0
     if policy.se_floor and 0 < pairs < SE_FLOOR_MAX_PAIRS:
         error = max(error, (0.25 / pairs) ** 0.5)
-    pricier = bool(mean_cost[pick_index] > mean_cost[base_index])
+    pricier = bool(effective_cost[pick_index] > effective_cost[base_index])
     if policy.guard_mode == "asymmetric":
         z_effective = policy.knn_z if pricier else -policy.knn_z
     else:
@@ -860,6 +1037,10 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
         )
         if pairs < policy.knn_min_pairs:
             detail = f"{pairs} paired neighbors < {policy.knn_min_pairs} required"
+        base_pool_index = bank.models.index(baseline)
+        gated = switch_gate(base_pool_index, baseline)
+        if gated is not None:
+            return gated
         return RoutingDecision(
             model=baseline,
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
@@ -869,8 +1050,13 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
                 n_pairs=pairs,
                 gate="reverted",
                 propensity="fallback-forced",
+                cache_credit_usd=credit_applied or None,
             ),
         )
+    gated = switch_gate(pick_index, pick)
+    if gated is not None:
+        return gated
+
     knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
     # Only the symmetric bar doubles z for a pricier pick; the asymmetric one holds it at z.
     price_note = ""
@@ -886,6 +1072,7 @@ def knn_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
             n_pairs=pairs,
             gate="passed",
             propensity="greedy",
+            cache_credit_usd=credit_applied or None,
         ),
     )
 

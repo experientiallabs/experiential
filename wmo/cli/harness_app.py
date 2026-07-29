@@ -22,12 +22,13 @@ import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
 from rich.console import Console
 from rich.markup import escape
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 
 from wmo.agents.default import default_agent
 from wmo.agents.optimizer import optimizer_agent
 from wmo.agents.project import AgentProject
+from wmo.cli.consent import can_prompt, require_spend_consent
 from wmo.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.config.store import validate_name
@@ -227,7 +228,13 @@ def optimize(
     archive_out: str = typer.Option(
         None, "--archive", help="Also write the full delta archive JSON here."
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
+    ),
     harbor_config: str = typer.Option(
         None,
         "--harbor-config",
@@ -369,14 +376,17 @@ def optimize(
             "--iterations 0 (score-only) applies only to the harbor environment; "
             "world-model optimization needs at least one search iteration"
         )
-    interactive = _console.is_terminal
+    # The same both-streams test the spend gate below uses: a terminal stdout with a redirected
+    # stdin has nobody to answer the wizard, and asking anyway raised EOFError at the first
+    # `Prompt.ask` instead of the usage error that names the missing option.
+    interactive = can_prompt(_console)
     if name is None:
         if not interactive:
-            raise typer.BadParameter("provide a harness NAME (or run at a TTY for the wizard)")
+            raise typer.BadParameter("provide a harness NAME (or run interactively for the wizard)")
         name = Prompt.ask("Name for the created harness", default="evolved")
     if tasks_file is None:
         if not interactive:
-            raise typer.BadParameter("provide --tasks (or run at a TTY for the wizard)")
+            raise typer.BadParameter("provide --tasks (or run interactively for the wizard)")
         tasks_file = Prompt.ask("Task file (JSONL of task_id/instruction/gold)")
     if iterations is None:
         iterations = (
@@ -429,7 +439,15 @@ def optimize(
         f"-> up to ~{rollouts} rollouts{holdout_note} + {candidate_count} proposals"
         f"{meta_note}{agent_note}{backend_note}"
     )
-    if interactive and not yes and not Confirm.ask("Proceed?", default=True):
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=(
+            f"up to ~{rollouts} rollout(s){holdout_note} + {candidate_count} proposal(s) "
+            f"against world model {model_name}"
+        ),
+        command="wmo optimize harness",
+    ):
         raise typer.Exit(0)
 
     def _progress(iteration: int, variant: str, score: float, changed: bool) -> None:
@@ -444,7 +462,8 @@ def optimize(
         _console.print(f"  \\[{tag}] {escape(variant)}: success_rate={score:.3f} {state}")
 
     def _note(message: str) -> None:
-        # Dead proposals narrate here; scored proposals use the structured callback below.
+        # Lightweight search notes narrate dead proposals and perfect-score early stops.
+        # Scored proposals use the structured callback below.
         _console.print(f"  [dim]{message}[/dim]")
 
     def _proposal(record: ProposalRecord) -> None:
@@ -482,10 +501,14 @@ def optimize(
         on_note=_note,
         on_proposal=_proposal,
     )
-    saved = store.save_version(result.best, alias=CHAMPION_ALIAS)
+    champion_version = store.aliases(name).get(CHAMPION_ALIAS)
+    current = store.load(name, str(champion_version)) if champion_version is not None else None
+    unchanged = current is not None and current.doc_hash == result.best.doc_hash
+    saved = current if unchanged else store.save_version(result.best, alias=CHAMPION_ALIAS)
     selected = len(result.archive.accepted())
+    publication = "unchanged" if unchanged else "created"
     _console.print(
-        f"[green]created[/green] [bold]{name}[/bold] v{saved.version} (champion) "
+        f"[green]{publication}[/green] [bold]{name}[/bold] v{saved.version} (champion) "
         f"success_rate={result.best_score:.3f}: {len(result.archive.deltas)} delta(s) audited, "
         f"{selected} selected, {result.skipped} skipped -> {store.dir_for(name)}"
     )
@@ -709,16 +732,16 @@ def _optimize_harbor(
         f"{config.attempts} attempt(s), reward mode {config.reward_mode}, "
         f"worker backend {config.backend} (proposer project: E2B) -> {run_dir}"
     )
-    if not yes:
-        if not _console.is_terminal:
-            # Consent is said, never inferred (the shared spend-surface rule).
-            _console.print(
-                "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-                "consent explicitly"
-            )
-            raise typer.Exit(2)
-        if not Confirm.ask("Proceed?", default=True):
-            raise typer.Exit(0)
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=(
+            f"1 seed + {config.iterations} proposal slot(s) over {len(config.task_ids)} task(s) "
+            f"x {config.attempts} attempt(s) on backend {config.backend}"
+        ),
+        command="wmo optimize harness",
+    ):
+        raise typer.Exit(0)
 
     scorer, task_pins = _build_harbor_scorer(config, run_dir=run_dir, provider_config=agent_config)
     if resume:

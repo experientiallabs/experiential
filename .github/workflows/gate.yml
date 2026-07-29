@@ -1,0 +1,32 @@
+name: gate
+
+# The whole-repo gate (AGENTS.md rule 1), run in CI so its promises are real.
+#
+# Deliberately NO `paths:` filter. This job carries the top-level allowlist check
+# (`wmo/repo_layout_test.py`, AGENTS.md rule 5), and that check exists to fail a change which
+# adds an unapproved top-level directory. A path filter would let exactly that change through
+# whenever it touched no Python: the allowlist is closed only if every pull request is checked.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install the project and its dev extras
+        run: uv sync --extra dev
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: ty check
+        run: uv run ty check
+      - name: pytest
+        run: uv run pytest -q

@@ -30,6 +30,8 @@ from pathlib import Path
 import tomli_w
 
 from wmo.config.store import validate_name
+from wmo.core.files import write_text_atomic
+from wmo.core.locks import file_write_lock
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.source_tree import SYSTEM_FILE, HarnessSourceFile, HarnessSourceTree
 
@@ -78,20 +80,43 @@ class HarnessStore:
     # -- aliases -----------------------------------------------------------------------------
 
     def aliases(self, name: str) -> dict[str, int]:
+        """The alias table for `name`, empty when it has none.
+
+        Names the file on a decode error: `resolve_version(None)` reads this to find the champion,
+        so a bare `tomllib` message would reach an operator as a parse error with no path, for a
+        file they never edited.
+        """
         path = self.dir_for(name) / _ALIASES_FILE
         if not path.exists():
             return {}
-        data = tomllib.loads(path.read_text(encoding="utf-8")).get("aliases", {})
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"harness alias file {path} is not valid TOML ({exc}); it maps alias names to "
+                f"version numbers under [aliases]. Repair it, or delete it to fall back to the "
+                f"latest version until the next `wmo optimize harness` promotion re-points "
+                f"{CHAMPION_ALIAS} (`wmo harness list` shows the versions this name has)"
+            ) from exc
+        data = parsed.get("aliases", {})
         return {k: v for k, v in data.items() if isinstance(v, int)}
 
     def set_alias(self, name: str, alias: str, version: int) -> None:
-        """Point `alias` at `version` (moving it if it exists). Rollback is re-pointing."""
+        """Point `alias` at `version` (moving it if it exists). Rollback is re-pointing.
+
+        Locked and atomic, because this is a read-modify-write of the file that holds the champion
+        pointer. Written in place, a crash or a full disk mid-write leaves a truncated
+        `aliases.toml` and the champion is gone; done unlocked, two promotions of DIFFERENT
+        aliases each read the same table and the later write drops the earlier one, with both
+        reporting success.
+        """
         if version not in self.versions(name):
             raise ValueError(f"harness {name!r} has no version v{version}")
-        current = self.aliases(name)
-        current[alias] = version
         path = self.dir_for(name) / _ALIASES_FILE
-        path.write_text(tomli_w.dumps({"aliases": current}), encoding="utf-8")
+        with file_write_lock(path, what="the harness alias table"):
+            current = self.aliases(name)
+            current[alias] = version
+            write_text_atomic(path, tomli_w.dumps({"aliases": current}))
 
     # -- load / save ---------------------------------------------------------------------------
 

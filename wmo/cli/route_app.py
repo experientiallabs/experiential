@@ -34,7 +34,9 @@ from rich.markup import escape
 from rich.prompt import Confirm
 from rich.table import Table
 
+from wmo.cli.consent import require_spend_consent
 from wmo.config import ARTIFACT_DIR, WorldModelStore
+from wmo.core.locks import FileLockTimeout
 from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
@@ -53,7 +55,14 @@ from wmo.optimize.knn import (
     fit_knn_artifact,
     tune_policy_dial,
 )
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, load_matrix_with_digest
+from wmo.optimize.outcomes import (
+    ROUTER_SPLIT_VERSION,
+    OutcomeMatrix,
+    ScenarioOutcome,
+    load_matrix_with_digest,
+    split_router_scenarios,
+)
+from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DIM,
     AZURE_EMBEDDER_ENV,
@@ -85,7 +94,6 @@ from wmo.optimize.sweep import (
 from wmo.providers.pool import (
     DEFAULT_POOL_PATH,
     PoolEntry,
-    PoolLockTimeout,
     load_pool,
     upsert_pool_entry,
 )
@@ -178,7 +186,13 @@ def sweep(
         DEFAULT_MATRIX_FILENAME, "--out", help="Where to write the OutcomeMatrix JSON."
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
+    ),
     allow_uneven_coverage: bool = typer.Option(
         False,
         "--allow-uneven-coverage",
@@ -235,11 +249,14 @@ def sweep(
     one-hour grid; it is not part of what the sweep measures, so a run interrupted at one value
     resumes at another.
 
-    Spend is confirmed before the first episode runs (`--yes` skips, as in
-    `wmo optimize harness --mode distill`). What that estimate multiplies is ASSUMED tokens per
-    policy call by the real cell and call counts, so it is a projection, never a measurement;
-    the measured candidate spend is printed when the sweep finishes. Before that question is asked,
-    every candidate's backend is resolved as far as it goes without a request: its kind's static
+    Spend is confirmed before the first episode runs, and consent is said, never inferred: at a
+    terminal the projected cost is a question, and with nobody to ask (CI, cron, piped output,
+    `| tee`, or a redirected stdin, which is not a person even when stdout is a terminal) the run
+    REFUSES with exit code 2 unless `--yes` was passed, naming what it would have spent.
+    What that estimate multiplies is ASSUMED tokens per policy call by the real
+    cell and call counts, so it is a projection, never a measurement; the measured candidate spend
+    is printed when the sweep finishes. Before that question is asked, every candidate's backend
+    is resolved as far as it goes without a request: its kind's static
     requirements from the entry alone, then its lazy SDK client forced to BUILD, which imports the
     SDK and resolves credentials locally. So a candidate that could never be called is a usage
     error at the boundary, not a mid-sweep abort with earlier candidates already paid for. Two
@@ -333,7 +350,7 @@ def sweep(
     world_model, _serve_provider = load_world_model(model_dir)
 
     print_cost_estimate(_console, plan, already_measured=already_measured)
-    _confirm_cost(yes=yes)
+    _confirm_cost(plan, yes=yes)
 
     _console.print(
         f"sweeping {len(plan.pool.models)} candidate(s) over {len(plan.scenarios)} held-out "
@@ -617,27 +634,25 @@ def print_cost_estimate(console: Console, plan: SweepPlan, *, already_measured: 
     )
 
 
-def _confirm_cost(*, yes: bool) -> None:
+def _confirm_cost(plan: SweepPlan, *, yes: bool) -> None:
     """Confirm the projected spend before any episode runs.
 
     Consent is said, never inferred: a non-interactive session cannot answer a prompt, so a
     spending run REFUSES unless `--yes` was passed. This command shipped proceed-and-note for
     its first day, and the equivalent branch in `wmo optimize model` spent a scripted caller's
-    real money it never agreed to; every spend surface now shares the refusal.
+    real money it never agreed to; every spend surface now shares one refusal
+    (`wmo.cli.consent.require_spend_consent`).
 
     Raises:
         typer.Exit: The user declined (exit code 0), or a non-interactive session was not told
             `--yes` (exit code 2).
     """
-    if yes:
-        return
-    if not _console.is_terminal:
-        _console.print(
-            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-            "consent explicitly"
-        )
-        raise typer.Exit(2)
-    if not Confirm.ask("Proceed?", default=True):
+    if not require_spend_consent(
+        _console,
+        yes=yes,
+        spend=f"~${plan.total_usd:.2f} across {plan.cells} cell(s)",
+        command="wmo optimize route sweep",
+    ):
         raise typer.Exit(0)
 
 
@@ -761,17 +776,20 @@ def student(
         )
         raise typer.Exit(0)
     try:
-        replaced = upsert_pool_entry(entry, pool_path)
-    except PoolLockTimeout as exc:
+        written = upsert_pool_entry(entry, pool_path)
+    except FileLockTimeout as exc:
         # Nothing is wrong with the flags, so this is not a BadParameter: another writer is in the
         # way. Exit non-zero (and say to retry) so a script does not read it as a registration.
         _console.print(f"[red]pool busy[/red] {escape(str(exc))}")
         raise typer.Exit(1) from exc
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    verb = "replaced" if replaced else "added"
+    verb = "replaced" if written.replaced else "added"
+    rewrite_note = (
+        "\n  the roster was rewritten, so its comments are gone" if written.rewritten else ""
+    )
     _console.print(
-        f"[green]✓[/green] {verb} pool candidate [bold]{name}[/bold] -> {pool_path}\n"
+        f"[green]✓[/green] {verb} pool candidate [bold]{name}[/bold]{rewrite_note} -> {pool_path}\n"
         f"  {card.base_model} adapter at {entry.model}\n"
         f"  ${input_per_mtok:g}/${output_per_mtok:g} per 1M in/out tokens, "
         f"{_credential_note(entry)}\n"
@@ -971,7 +989,13 @@ def fit(
         "call). Only meaningful with --compressor.",
     ),
 ) -> None:
-    """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
+    """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks).
+
+    `--kind knn` is the product router and what `wmo optimize model` fits. `--kind rank` is a
+    retained research direction (a faithful Avengers replication kept for comparison); the
+    staged pipeline never fits it and no served endpoint carries one, so choose it only to
+    measure against the champion.
+    """
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
     matrix, source = _load_matrix(matrix_file)
@@ -1030,6 +1054,11 @@ def fit(
             "`wmo optimize route sweep <model> --compressor <id> --aggressiveness <a>` writes a "
             "matrix whose episodes actually ran that way (one matrix per arm)."
         )
+    try:
+        router_split = split_router_scenarios(matrix.scenario_ids())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    fit_ids = list(router_split.fit_ids)
     if kind == "knn":
         if cost_weight > 0.0:
             raise typer.BadParameter(
@@ -1043,6 +1072,7 @@ def fit(
                 out_path=out_path,
                 matrix_source=source,
                 embedder=spec,
+                fit_ids=fit_ids,
                 fallback=fallback,
                 z=z,
                 rag_num=rag_num,
@@ -1067,13 +1097,15 @@ def fit(
     try:
         policy = fit_rank_policy(
             matrix,
+            fit_ids=fit_ids,
             embedder=spec,
             n_clusters=clusters,
             seed=seed,
             top_k_clusters=top_k_clusters,
             beta=beta,
             fitted_from=(
-                f"{source} rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
+                f"{source} split={ROUTER_SPLIT_VERSION} "
+                f"rank seed={seed} k={clusters} topk={top_k_clusters} beta={beta:g} "
                 f"cost_weight={cost_weight:g} {embedder_provenance(spec)}"
             ),
         )
@@ -1090,7 +1122,7 @@ def fit(
             update={"compression": compression, "fit_compression": compression}
         )
     policy.save(out_path)
-    result = evaluate_policy(policy, matrix, matrix.scenario_ids(), embedder=built)
+    result = evaluate_policy(policy, matrix, fit_ids, embedder=built)
     _console.print(
         f"[green]✓[/green] fitted {len(policy.clusters)} clusters over "
         f"{result.scenarios} scenarios -> {out}\n"
@@ -1303,6 +1335,15 @@ def report(
     # mkdir + atomic, exactly as `fit --out` and `pin --out` write their policies: a report whose
     # parent directory does not exist must not throw away the work that produced it.
     write_artifact_atomically(Path(out), improvement.model_dump_json(indent=2).encode("utf-8"))
+    # The measured cost/quality curve rides beside every report (D-PARETO): GET /config
+    # serves it from the model dir so the platform's graph renders this workload's frontier.
+    try:
+        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        pareto_out = Path(out).parent / PARETO_FILENAME
+        write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
+        _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")
+    except (ValueError, FileNotFoundError) as exc:
+        _console.print(f"[yellow]![/yellow] pareto curve skipped: {exc}")
     headline = improvement.headline
     _console.print(
         f"[green]✓[/green] report -> {out}\n"
@@ -1317,12 +1358,13 @@ def report(
 def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
     """The caveat for a report measured on the very matrix the policy was fitted on.
 
-    `fit` sends the user here precisely to escape its own in-sample number, and the report labels
-    its scenarios held-out, so a report over the fit matrix is the one case where both surfaces
-    say the opposite of what happened. The digest in `fitted_from` is an identity rather than a
-    label (`load_matrix_with_digest`), so the collision is detectable even when the matrix was
-    renamed or moved after the fit, and a matrix with the same path but different bytes does not
-    trip it.
+    Since the router split (#308), `build_report` excludes the policy's recorded fit scenarios,
+    so a report over the fit matrix IS held out whenever that split is recoverable - the note
+    says so, with the count. The in-sample WARNING remains only for a policy that records no
+    split and whose evidence cannot name one: those numbers retrieve their own rows. The digest
+    in `fitted_from` is an identity rather than a label (`load_matrix_with_digest`), so the
+    collision is detectable even when the matrix was renamed or moved after the fit, and a
+    matrix with the same path but different bytes does not trip it.
     """
     # `load_matrix_with_digest` appends the marker LAST, so split from the right: a matrix under a
     # content-addressed directory (`artifacts/sha256=.../matrix.json`) carries the marker in its
@@ -1331,9 +1373,26 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
     stamped = policy.fitted_from or ""
     if not mark or not digest or f"{_MATRIX_DIGEST_MARK}{digest}" not in stamped:
         return None
+    fit_ids = set(policy.fit_scenario_ids)
+    if not fit_ids and policy.kind == "knn":
+        # The same recovery `build_report` uses for legacy kNN artifacts: their evidence bank
+        # names the fit scenarios even when the policy predates recording them.
+        try:
+            fit_ids = set(policy.knn_bank().scenario_ids)
+        except (FileNotFoundError, ValueError):
+            fit_ids = set()
+    if fit_ids:
+        # Same matrix as the fit, but the report excluded the fit scenarios (the split is
+        # recorded on the policy), so the numbers above ARE held out. Say what happened instead
+        # of contradicting the report's own label.
+        return (
+            f"note: same matrix as the fit ({_MATRIX_DIGEST_MARK}{digest}); the "
+            f"{len(fit_ids)} fit scenario(s) were excluded, so the numbers above are over "
+            "held-out scenarios only."
+        )
     return (
         f"[yellow]warning[/yellow] this policy was FITTED on this matrix "
-        f"({_MATRIX_DIGEST_MARK}{digest}), so these numbers are IN-SAMPLE, not held out: every "
-        "request retrieves its own row. Sweep a second matrix over scenarios the fit never saw "
-        "and report against that one."
+        f"({_MATRIX_DIGEST_MARK}{digest}) and records no fit split, so these numbers are "
+        "IN-SAMPLE, not held out: every request retrieves its own row. Sweep a second matrix "
+        "over scenarios the fit never saw and report against that one."
     )

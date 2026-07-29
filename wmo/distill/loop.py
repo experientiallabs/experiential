@@ -396,6 +396,19 @@ class DistillEvalReport(BaseModel):
     measurement, not a score. See `RolloutStats.graded_solve_rate`. 0.0 on reports from before this
     field."""
 
+    health: PolicyHealth | None = None
+    """The sampling policy's pooled entropy and generation length over this batch.
+
+    Free degeneration evidence: the eval arms already sample a policy under a
+    fixed temperature and k, so the student-before and student-after arms are a
+    controlled reading of the SAME two statistics the training-step tripwire
+    bounds. That matters most for a warmup-only run (`train.steps = 0`), which
+    takes no training steps and therefore arms no per-step tripwire at all; the
+    warmup batch cannot substitute, because those spans are the TEACHER's and
+    say nothing about whether the student collapsed. Carries its own
+    denominators (episodes, sampled tokens), so a reader can tell a real
+    measurement from a thin one. None on reports written before this field."""
+
     graded_trials: int = Field(default=0, ge=0)
     """Gradeable trials that carried a readable test report: the `graded_solve_rate`
     denominator."""
@@ -1665,6 +1678,11 @@ def _teacher_rows(
     return rows, _batch_reverse_kl(datums, rows)
 
 
+def _ratio_phrase(ratio: float | None) -> str:
+    """A ratio rendered for a log line, or an honest 'unmeasured'."""
+    return "unmeasured" if ratio is None else f"{ratio:.2f}x"
+
+
 def _graded_phrase(graded_solve_rate: float, graded_trials: int) -> str:
     """One progress-line clause for the graded rate, saying so when there is none.
 
@@ -2268,9 +2286,14 @@ class _DistillRun:
                 "verifier.override_timeout_sec in the harbor job template. Writing 0.0% here "
                 "would put a null baseline behind gate.require_no_regression"
             )
+        # Free degeneration evidence: this batch already sampled a policy, so
+        # pool its spans now. For the student arms the before/after pair is the
+        # only collapse detector a warmup-only run has (see the report fields).
+        health = policy_health(records)
         report = DistillEvalReport(
             name=key,
             provider_model=provider.model,
+            health=health,
             base_model=provider.model_type,
             task_ids=list(task_ids),
             attempts=attempts,
@@ -3331,6 +3354,68 @@ class _DistillRun:
 
         return self._finalize(teacher_report, before_report)
 
+    def _check_trained_policy_health(
+        self, before_report: DistillEvalReport | None, after_report: DistillEvalReport
+    ) -> None:
+        """Compare the student's sampled health across the gate's own two arms.
+
+        The per-step tripwire never sees a warmup-only run: it arms on the
+        first TRAINING step, and `train.steps = 0` takes none. The warmup batch
+        cannot stand in either, because those spans are the TEACHER's, so their
+        entropy says nothing about whether the STUDENT collapsed. What does
+        exist, already paid for, is the gate's own before/after student arms:
+        same tasks, same k, same temperature, both sampled by the student. That
+        is a controlled reading of exactly the two statistics the tripwire
+        bounds, so it is checked here against the same configured fractions.
+
+        Post hoc by nature: the training is already done, so this reports
+        rather than aborts. It runs for every gated run (an OPD run gets it as
+        a second, independent check on top of its per-step tripwire), and stays
+        silent when either arm sampled nothing to measure.
+
+        Args:
+            before_report: The student-before arm, used as the baseline.
+            after_report: The student-after arm, the reading.
+        """
+        cfg = self._cfg
+        if before_report is None or before_report.health is None or after_report.health is None:
+            logger.info(
+                "no post-training health check: one of the student arms recorded no sampled "
+                "tokens to measure (a reused or imported baseline carries none)"
+            )
+            return
+        baseline = capture_baseline(0, before_report.health)
+        if baseline is None:
+            logger.info(
+                "no post-training health check: the student-before arm recorded no usable "
+                "entropy or length baseline"
+            )
+            return
+        after_health = after_report.health
+        entropy_ratio = metric_ratio(after_health.entropy_per_token, baseline.entropy_per_token)
+        length_ratio = metric_ratio(
+            after_health.mean_generation_tokens, baseline.mean_generation_tokens
+        )
+        breaches = evaluate_breaches(cfg.tripwire, baseline, after_health)
+        summary = (
+            f"post-training health (student-after vs student-before, the gate's own arms): "
+            f"entropy {_ratio_phrase(entropy_ratio)}, "
+            f"sampled tokens/episode {_ratio_phrase(length_ratio)}"
+        )
+        if breaches:
+            detail = "; ".join(breach.describe() for breach in breaches)
+            logger.warning(
+                "%s. DEGENERATION SIGNAL on the trained policy: %s. The training already "
+                "finished, so this is a report, not an abort: read the sampled episodes in "
+                "the student-after eval rollouts before promoting anything downstream",
+                summary,
+                detail,
+            )
+            self._emit("gate", f"{summary} -- degeneration signal: {detail}")
+        else:
+            logger.info("%s: within the configured tripwire bounds", summary)
+            self._emit("gate", summary)
+
     def _finalize(
         self,
         teacher_report: DistillEvalReport | None,
@@ -3376,6 +3461,7 @@ class _DistillRun:
             cfg.gate,
         )
         self._store.write_gate(record)
+        self._check_trained_policy_health(before_report, after_report)
         card = DistillModelCard(
             base_model=cfg.student.base_model,
             lora_rank=cfg.student.lora_rank,

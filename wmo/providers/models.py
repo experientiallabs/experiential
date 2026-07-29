@@ -99,6 +99,13 @@ _MODELS: tuple[ProviderModel, ...] = (
         model_id="claude-haiku-4-5",
     ),
     ProviderModel(
+        provider=ProviderKind.ANTHROPIC,
+        model_type="claude-opus-5",
+        model_id="claude-opus-5",
+        # Like Opus 4.8, Opus 5 rejects forwarded sampling parameters.
+        forward_temperature=False,
+    ),
+    ProviderModel(
         provider=ProviderKind.BEDROCK,
         model_type="claude-opus-4-8",
         model_id="us.anthropic.claude-opus-4-8",
@@ -120,6 +127,13 @@ _MODELS: tuple[ProviderModel, ...] = (
         provider=ProviderKind.BEDROCK,
         model_type="claude-haiku-4-5",
         model_id="us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    ),
+    ProviderModel(
+        provider=ProviderKind.BEDROCK,
+        model_type="claude-opus-5",
+        # Inference-profile id verified live on this account (converse OK, 2026-07-28).
+        model_id="us.anthropic.claude-opus-5",
+        forward_temperature=False,
     ),
     ProviderModel(provider=ProviderKind.BEDROCK, model_type="glm-5", model_id="zai.glm-5"),
     ProviderModel(

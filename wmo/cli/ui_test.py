@@ -266,7 +266,7 @@ def test_build_wizard_collects_all_inputs() -> None:
     assert params.file == "/tmp/traces.jsonl"
     assert params.provider == "bedrock"
     assert params.region == "us-east-1"
-    assert params.judge_model == "claude-haiku-4-5"
+    assert params.judge_model == "claude-opus-5"
     assert params.fidelity == "high"
     assert params.embed_provider == "hashing"
     assert params.train_split == 0.5
@@ -286,7 +286,7 @@ def test_build_wizard_select_by_number() -> None:
     )
     assert params.provider == "anthropic"
     assert params.model == "claude-opus-4-7"  # second anthropic model
-    assert params.judge_model == "claude-haiku-4-5"  # blank accepted the anthropic judge default
+    assert params.judge_model == "claude-opus-5"  # blank accepted the anthropic judge default
     assert params.region is None  # region only prompted for bedrock
     assert params.embed_provider == "hashing"
 

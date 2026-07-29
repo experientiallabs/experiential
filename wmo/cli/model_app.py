@@ -43,8 +43,10 @@ from rich.prompt import Confirm
 from rich.table import Table
 
 from wmo.agents.default import default_agent
+from wmo.cli.consent import can_prompt, require_spend_consent
+from wmo.cli.model_roles import load_settings_or_abort
 from wmo.config import ARTIFACT_DIR
-from wmo.config.settings import ModelRole, load_settings, save_settings, settings_path
+from wmo.config.settings import ModelRole, save_settings, settings_path
 from wmo.config.store import validate_name
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig, load_distill_config
@@ -162,7 +164,13 @@ def run(
         help="After an accepted gate, offer to point the models.agent role in settings.toml "
         "at the distilled adapter (always asks for confirmation).",
     ),
-    yes: bool = typer.Option(False, "--yes", help="Skip the cost confirmation prompt."),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Consent to the projected spend up front. Required in a non-interactive "
+        "session (CI, cron, piped output, redirected input), where the run otherwise "
+        "refuses to start.",
+    ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir."),
 ) -> None:
     """Train (or resume) an agent model by distillation on real benchmark tasks.
@@ -424,8 +432,10 @@ def run_distill(
         backend: An explicit `--backend` override for the rollout source's
             backend (harbor or tau2), or None when the flag was not given.
         resume: Continue the run recorded in `run_dir`.
-        yes: Skip the cost confirmation (see `_confirm_cost` for the one
-            case where confirmation is forced anyway).
+        yes: Consent to the projected spend up front, and required on a
+            non-interactive session where there is nobody to ask (see
+            `_confirm_cost` for the one case where confirmation is forced
+            anyway).
         promote: After an accepted gate, offer to write `[models.agent]`
             pointing at the distilled adapter (explicit confirmation).
         root: The project dir (harness store, adapter store, settings).
@@ -919,9 +929,13 @@ def _confirm_cost(
     with `--yes`; a non-interactive invocation in that state is rejected with
     instructions (price the meters or set the cap).
 
+    Everything else goes through the shared spend boundary
+    (`wmo.cli.consent.require_spend_consent`), so consent is said, never inferred.
+
     Raises:
         typer.BadParameter: Unbounded spend in a non-interactive session.
-        typer.Exit: The user declined (exit code 0).
+        typer.Exit: The user declined (exit code 0), or a non-interactive session was not
+            told `--yes` (exit code 2).
     """
     if estimate.unpriced_meters and max_usd is None:
         meters = ", ".join(estimate.unpriced_meters)
@@ -930,27 +944,37 @@ def _confirm_cost(
             "budget.max_usd is unset: the run's spend is unbounded and unaccounted, "
             "so --yes does not apply here"
         )
-        if not console.is_terminal:
+        # `can_prompt`, not `console.is_terminal`: the question below reads stdin, so a terminal
+        # stdout with a redirected stdin has nobody behind it to answer for unbounded spend.
+        if not can_prompt(console):
             raise typer.BadParameter(
                 f"cannot start with unbounded spend non-interactively: meter(s) "
                 f"{meters} are unpriced and budget.max_usd is unset; add [pricing] "
                 "entries for them or set [budget] max_usd in the distill config, "
-                "or run at a TTY to confirm explicitly"
+                "or run it interactively to confirm explicitly"
             )
-        if not Confirm.ask("Proceed with unbounded spend?", default=False):
+        try:
+            confirmed = Confirm.ask("Proceed with unbounded spend?", default=False)
+        except EOFError:
+            confirmed = False  # an ended input is not an answer, and never authorizes spend
+        if not confirmed:
             raise typer.Exit(0)
         return
-    if yes:
-        return
-    if not console.is_terminal:
-        # Consent is said, never inferred: a bounded budget caps the damage but does not
-        # grant permission, and this used to start six-figure-token training runs silently.
-        console.print(
-            "non-interactive session: cannot ask for spend consent; re-run with --yes to "
-            "consent explicitly"
-        )
-        raise typer.Exit(2)
-    if not Confirm.ask("Proceed?", default=True):
+    # Consent is said, never inferred: a bounded budget caps the damage but does not grant
+    # permission, and this used to start six-figure-token training runs silently.
+    cap = f" under the ${max_usd:.2f} budget.max_usd cap" if max_usd is not None else ""
+    episodes = (
+        estimate.train_episodes
+        + estimate.warmup_episodes
+        + estimate.eval_episodes
+        + estimate.baseline_episodes
+    )
+    if not require_spend_consent(
+        console,
+        yes=yes,
+        spend=f"~${estimate.priced_usd:.2f} over {episodes} episode(s){cap}",
+        command="wmo optimize distill run",
+    ):
         raise typer.Exit(0)
 
 
@@ -1026,10 +1050,7 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
             f"skipped writing \\[models.agent]; paste the handoff snippet into {path} when ready"
         )
         return
-    try:
-        settings = load_settings(root)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    settings = load_settings_or_abort(root)
     settings.models.agent = ModelRole(
         provider="openai",
         model=result.final_sampler_path,

@@ -32,7 +32,7 @@ from wmo.config import PROVIDER_ENV_VARS
 from wmo.providers.base import ProviderKind, VerifyResult
 from wmo.providers.catalog import list_provider_models
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
-from wmo.providers.pool import PoolEntry
+from wmo.providers.pool import PoolEntry, load_pool
 from wmo.tracking.pricing import ModelPrice
 
 _SONNET = "anthropic/claude-sonnet-4.5"
@@ -488,6 +488,33 @@ def test_register_model_ids_writes_without_prompting(tmp_path: Path) -> None:
     entries = read_pool_entries(pool)
     assert [entry.name for entry in entries] == ["claude-sonnet-4.5", "deepseek-v3.2"]
     assert all(entry.tier == "open" for entry in entries)
+
+
+def test_register_model_ids_writes_a_loadable_roster_for_two_built_in_priced_ids(
+    tmp_path: Path,
+) -> None:
+    """Two ids in one pass must leave a pool `load_pool` can read.
+
+    `--pool-model` writes one entry per id through `upsert_pool_entry`, so it is not a workaround
+    for the duplicate-key corruption: entry #2 takes the same append path. The ids here are
+    deliberately built-in priced ones, whose entries carry no price fields and so render short.
+    The OpenRouter batch above cannot catch this: its entries are stamped with resolved prices,
+    which pushes them past the length heuristic that decided the rendering.
+    """
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+
+    written = register_model_ids(
+        console,
+        pool_path=pool,
+        kind=ProviderKind.OPENAI,
+        model_ids=["gpt-5.5", "gpt-5.4-mini"],
+        options=EntryOptions(),
+        verify=_ok,
+    )
+
+    assert written == 2
+    assert [entry.name for entry in load_pool(pool).models] == ["gpt-5.5", "gpt-5.4-mini"]
 
 
 def test_register_model_ids_is_idempotent(tmp_path: Path) -> None:

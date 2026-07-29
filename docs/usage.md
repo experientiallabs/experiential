@@ -20,15 +20,15 @@ Three optimizers, named for the artifact each produces.
 
 | Command | Purpose | Artifact |
 |---|---|---|
-| `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. | `matrix.json` (an `OutcomeMatrix`) |
+| `wmo optimize route sweep` | Measure every pool candidate closed-loop against the world model. The only paid step of routing, and the only thing that produces a matrix. A non-interactive run needs `--yes`, or it prints the projected spend and exits 2. | `matrix.json` (an `OutcomeMatrix`) |
 | `wmo optimize route fit` | Fit a routing policy on a matrix: `--kind knn` guarded neighbor evidence (the default), or `--kind rank` cluster ranks. | `policy.json` + its evidence bank |
 | `wmo optimize route tune` | Set a fitted policy's cost/quality dial in place, no refit. | the policy, rewritten; `policy.base.json` snapshot |
 | `wmo optimize route report` | Build the three-objective improvement report for a policy over a matrix. | `report.json` (an `ImprovementReport`) |
 | `wmo optimize route pin` | Serve one pool model as an endpoint, with no matrix and no fit. | a `kind="static"` `policy.json` |
 | `wmo optimize route student` | Add a distilled student to the candidate pool as a priced entry. | a `[[model]]` entry in `pool.toml` |
-| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
+| `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. A non-interactive run needs `--yes` in either environment. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
 | `wmo optimize distill probe` | Ask a measured outcome matrix whether this workload has a teacher gap worth distilling at all, and which model is the cheapest sufficient teacher. Free. Exits 0 (distill), 3 (no gap), 4 (too thin to say). | nothing (prints) |
-| `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
+| `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. A non-interactive run needs `--yes`. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
 | `wmo optimize distill report` | Read a finished or aborted run back: gate verdict and held-out before/after table. Free. | nothing (prints) |
 
 `wmo optimize model` is the staged path over the four `route` commands and calls the same library
@@ -73,6 +73,17 @@ JSONL. The two formats are not interchangeable.
 | `wmo run` | Run a platform world model or agent by id, or the built-in local pi harness with no target. | a run record under `.wmo/runs/`; uploaded workspaces sync back |
 | `wmo login` / `logout` / `status` | Connect this machine to a platform account, disconnect, or show the current account and organizations. | a saved credential |
 | `wmo push` / `pull` | Publish a local world model or harness to the platform registry, or fetch one from it. | a registry entry, or a local artifact dir |
+| `wmo runs list` / `show` / `tail` | See the runs this organization is feeding: progress, spend, stages, per-candidate cells, and the live event log. `--json` on the first two; `--org` (id or slug) to read another organization the credential can see, which otherwise comes from the login or `WMO_PLATFORM_ORG`. | nothing (prints) |
+| `wmo runs stop` / `retry` | Ask the process feeding a run to stop at its next safe boundary, or to re-measure its unscored cells. Pull-based: it takes effect when that process next reports in, and a runner that owns its own retry policy may refuse with a reason. | a queued command |
+| `wmo runs backfill <path>` | Replay a finished or interrupted run from its own artifacts (a grid directory, or a world model's `optimize/`), so a run nobody watched still has its history. The run's name comes from where the artifacts live; `--name` supplies it for artifacts that have moved. `--dry-run` writes the events as JSONL instead. | run history on the platform |
+
+A long run reports itself while it works, and only when a platform credential with an organization
+resolves; `wmo optimize model --no-emit` turns it off. Reporting never changes what a run measures
+and can never fail it: every call is buffered and guarded, and none of them can raise. It is not
+free, though. Pushes ride the run's own callbacks rather than a background thread, so an unreachable
+platform costs at most a few bounded seconds at stage boundaries while its requests time out.
+Re-running a backfill is free: events are keyed by the emitter's sequence number, and the platform
+discards ones it already holds.
 
 `wmo run` is the primary execution surface. Bare runs execute harness code and bash on your
 machine behind an explicit consent boundary and a `--dir` file-tool jail; hosted ids run their

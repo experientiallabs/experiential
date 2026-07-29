@@ -10,6 +10,7 @@ import tomli_w
 from pydantic import BaseModel, Field, ValidationError
 
 from wmo.config.config import ARTIFACT_DIR
+from wmo.core.files import write_text_atomic
 from wmo.utils.waterfall import ChatMaxTokensField
 
 SETTINGS_FILENAME = "settings.toml"
@@ -94,29 +95,46 @@ def settings_path(root: str | Path = ARTIFACT_DIR) -> Path:
     return Path(root) / SETTINGS_FILENAME
 
 
+_SETTINGS_REPAIR = "fix the file, or delete it and re-run `wmo providers set` to write a fresh one"
+"""How to recover a settings file this loader refuses. Every raise below names it.
+
+`wmo providers set` reads the file before it rewrites it, so "just re-run it" is only true once
+the broken file is out of the way, hence "delete it and re-run", not "re-run".
+"""
+
+
 def load_settings(root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
+    """Read `<root>/settings.toml`, defaulting when it does not exist.
+
+    Raises:
+        ValueError: The file exists but cannot be read, is not valid TOML, or does not match the
+            current settings schema. The message names the path and the repair.
+    """
     path = settings_path(root)
     if not path.exists():
         return ProjectSettings()
     try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
-    except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"{path} is not valid TOML ({exc})") from exc
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # A TOML document is UTF-8 by definition, so bytes that do not decode are the same
+        # "not valid TOML" answer; `tomllib.load` decodes before it parses, and the raw
+        # UnicodeDecodeError names neither the file nor the way out.
+        raise ValueError(f"{path} is not valid TOML ({exc}); {_SETTINGS_REPAIR}") from exc
+    except OSError as exc:
+        raise ValueError(f"{path} could not be read ({exc}); {_SETTINGS_REPAIR}") from exc
     try:
         return ProjectSettings.model_validate(data)
     except ValidationError as exc:
-        raise ValueError(f"{path} does not match the current settings schema ({exc})") from exc
+        raise ValueError(
+            f"{path} does not match the current settings schema ({exc}); {_SETTINGS_REPAIR}"
+        ) from exc
 
 
 def save_settings(settings: ProjectSettings, root: str | Path = ARTIFACT_DIR) -> None:
     path = settings_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = settings.model_dump(mode="json", exclude_none=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    with tmp.open("wb") as fh:
-        tomli_w.dump(data, fh)
-    tmp.replace(path)
+    write_text_atomic(path, tomli_w.dumps(data))
 
 
 def set_telemetry_enabled(enabled: bool, root: str | Path = ARTIFACT_DIR) -> ProjectSettings:

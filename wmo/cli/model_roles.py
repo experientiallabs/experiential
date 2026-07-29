@@ -1,12 +1,14 @@
-"""Provider resolution for opt-in model roles shared by CLI workflows."""
+"""Reading project settings, and resolving the opt-in model roles, for CLI workflows."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 import typer
 
-from wmo.config.settings import ModelRole, load_settings
+from wmo.config.config import ARTIFACT_DIR
+from wmo.config.settings import ModelRole, ProjectSettings, load_settings
 from wmo.providers.base import Provider, ProviderConfig, ProviderKind
 from wmo.providers.models import resolve_provider_model
 from wmo.providers.registry import get_provider
@@ -21,6 +23,24 @@ MODEL_ROLE_NAMES: tuple[ModelRoleName, ...] = ("worker", "judge", "summary", "me
 # pool entry, or the local worker role) does not pin one, this shared default applies. Imported
 # by `wmo.cli.app` and `wmo.cli.pool_registry` so the three surfaces cannot drift apart.
 DEFAULT_AZURE_API_VERSION = "2024-05-01-preview"
+
+
+def load_settings_or_abort(root: str | Path = ARTIFACT_DIR) -> ProjectSettings:
+    """`load_settings`, with an unreadable settings file as a usage error, not a traceback.
+
+    The one path every CLI command uses to read `<root>/settings.toml`. Hand-editing that file is
+    a documented workflow, and a file written by an older CLI outlives an upgrade, so "the file is
+    broken" is an ordinary user state: it has to print as an error naming the file and the repair,
+    the way an unknown provider inside the file already does.
+
+    Raises:
+        typer.BadParameter: The settings file is unreadable, is not valid TOML, or does not match
+            the current schema.
+    """
+    try:
+        return load_settings(root)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def resolve_opt_in_model_provider(
@@ -39,9 +59,10 @@ def resolve_opt_in_model_provider(
         The resolved provider and configured model name, or the fallback and ``None``.
 
     Raises:
-        typer.BadParameter: The configured provider kind is unknown.
+        typer.BadParameter: The settings file is unreadable, or the configured provider kind is
+            unknown.
     """
-    configured = load_settings(root).models.resolve(role)
+    configured = load_settings_or_abort(root).models.resolve(role)
     if configured is None:
         return fallback, None
     config = _model_config(configured, role=role)
@@ -54,7 +75,7 @@ def resolve_required_model_config(root: str, role: OptInModelRole) -> ProviderCo
     The harbor optimize flow has no world model whose provider could stand in, so its
     ``agent`` (worker) and ``meta`` (proposer) roles must be configured explicitly.
     """
-    configured = load_settings(root).models.resolve(role)
+    configured = load_settings_or_abort(root).models.resolve(role)
     if configured is None:
         raise typer.BadParameter(
             f"settings [models.{role}] must be configured in <root>/settings.toml for this "
@@ -84,9 +105,10 @@ def configured_role_configs(root: str) -> list[tuple[ModelRoleName, ProviderConf
         One ``(role, config)`` pair per configured role; empty when nothing is configured.
 
     Raises:
-        typer.BadParameter: A configured role names an unknown provider kind.
+        typer.BadParameter: The settings file is unreadable, or a configured role names an
+            unknown provider kind.
     """
-    models = load_settings(root).models
+    models = load_settings_or_abort(root).models
     resolved: list[tuple[ModelRoleName, ProviderConfig]] = []
     for role in MODEL_ROLE_NAMES:
         configured: ModelRole | None = getattr(models, role)

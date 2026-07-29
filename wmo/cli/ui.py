@@ -75,22 +75,27 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-opus-4-7",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
+        "claude-opus-5",
     ],
     # Keep this picker curated to inference profiles verified by the normal interactive flow.
     # The full canonical registry remains available to flags and programmatic callers.
-    "bedrock": ["claude-opus-4-8", "claude-opus-4-7", "claude-haiku-4-5"],
+    "bedrock": ["claude-opus-4-8", "claude-opus-4-7", "claude-haiku-4-5", "claude-opus-5"],
     # openai_responses (the Responses API) stays flag-only (`wmo build --provider
     # openai_responses`); the wizard list keeps to the four everyday backends.
     "azure": ["gpt-5.5", "gpt-5.4"],
 }
 _DEFAULT_REGIONS: dict[str, str] = {"bedrock": "us-east-1"}
 
-# Default GEPA judge model per provider: a cheap, fast model of the same backend. Providers
-# without an entry judge on the serve model itself.
+# Default GEPA judge model per provider. Anthropic-backed providers default to the STRONGEST
+# judge, not the cheapest: the tau sim-to-real probe measured the haiku-4-5 default scoring
+# correct-inaction episodes as failures, which inverted the benchmark's model ranking against
+# reality (DECISIONS 2026-07-28); a judge that cannot follow the domain policy is expensive at
+# any price. Providers without an entry judge on the serve model itself. A judge change is a
+# new fidelity era: never compare rewards across judges.
 _JUDGE_MODEL_DEFAULTS: dict[str, str] = {
-    "anthropic": "claude-haiku-4-5",
+    "anthropic": "claude-opus-5",
     "openai": "gpt-5.4-mini",
-    "bedrock": "claude-haiku-4-5",
+    "bedrock": "claude-opus-5",
 }
 
 
@@ -990,7 +995,12 @@ def build_summary_panel(info: ModelInfo, root: str) -> Panel:
 
 
 def models_table(infos: list[ModelInfo]) -> Table:
-    """A table of every built world model (for `wmo list`)."""
+    """A table of every built world model (for `wmo list`).
+
+    An artifact the store could not read still gets a row, marked `unreadable`: it exists on
+    disk, so hiding it would be a lie, and dropping the whole table would hide the healthy models
+    beside it. `wmo list` prints the reason under the table.
+    """
     table = Table(title="world models")
     table.add_column("name", style="bold")
     table.add_column("serve provider")
@@ -1000,7 +1010,9 @@ def models_table(infos: list[ModelInfo]) -> Table:
     for info in infos:
         table.add_row(
             info.name,
-            f"{info.serve_provider} ({info.serve_model})",
+            "[red]unreadable[/red]"
+            if info.error is not None
+            else f"{info.serve_provider} ({info.serve_model})",
             "-" if info.held_out_accuracy is None else f"{info.held_out_accuracy:.3f}",
             "-" if info.rollouts_used is None else str(info.rollouts_used),
             "-" if info.frontier_size is None else str(info.frontier_size),

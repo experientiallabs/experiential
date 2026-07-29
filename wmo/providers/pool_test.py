@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import subprocess
 import sys
@@ -12,8 +11,11 @@ import time
 from pathlib import Path
 
 import pytest
+from filelock import FileLock
 from pydantic import ValidationError
 
+from wmo.core.locks import FileLockTimeout
+from wmo.providers import pool as pool_module
 from wmo.providers.azure_openai import AzureOpenAIProvider
 from wmo.providers.base import ProviderConfig, ProviderKind, TokenUsage
 from wmo.providers.openrouter import OPENROUTER_API_KEY_ENV, OpenRouterProvider
@@ -21,7 +23,6 @@ from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import (
     DEFAULT_POOL_PATH,
     PoolEntry,
-    PoolLockTimeout,
     load_pool,
     pool_api_key,
     pool_provider,
@@ -465,7 +466,7 @@ def test_pool_entry_defaults_keep_the_built_in_contract() -> None:
 def test_upsert_pool_entry_creates_the_file_and_appends(tmp_path: Path) -> None:
     path = tmp_path / "nested" / "pool.toml"
 
-    assert upsert_pool_entry(_student_entry(), path) is False
+    assert upsert_pool_entry(_student_entry(), path).replaced is False
 
     assert [m.name for m in load_pool(path).models] == ["student"]
     entry = load_pool(path).entry("student")
@@ -479,8 +480,8 @@ def test_upsert_pool_entry_replaces_by_name_and_keeps_the_others(tmp_path: Path)
     path.write_text(_POOL_TOML, encoding="utf-8")
     before = [m.name for m in load_pool(path).models]
 
-    assert upsert_pool_entry(_student_entry(), path) is False
-    assert upsert_pool_entry(_student_entry(), path) is True
+    assert upsert_pool_entry(_student_entry(), path).replaced is False
+    assert upsert_pool_entry(_student_entry(), path).replaced is True
 
     after = [m.name for m in load_pool(path).models]
     assert after == [*before, "student"]  # replaced in place, nothing duplicated or dropped
@@ -526,22 +527,27 @@ def test_upsert_pool_entry_uses_a_process_private_temp_file(
 ) -> None:
     """Two concurrent upserts must not be able to rename each other's half-written file.
 
-    A shared fixed `.tmp` path turns a lost update into a CORRUPT roster: writer A can rename
-    B's partially written file into place. Distinct temps bound the damage to last-writer-wins.
+    A shared fixed staging path turns a lost update into a CORRUPT roster: writer A can rename
+    B's partially written file into place. A name unique per call bounds the damage to
+    last-writer-wins. The property belongs to `wmo.core.files.write_bytes_atomic` and is covered
+    directly in `wmo/core/files_test.py`; this pins that the roster's write actually goes through
+    it, which is the reason it was documented on this function in the first place.
     """
-    seen: list[str] = []
-    real_write = Path.write_text
+    renamed: list[str] = []
+    real_replace = Path.replace
 
-    def _record(self: Path, data: str, **kwargs: object) -> int:
-        if self.suffix == ".tmp":
-            seen.append(self.name)
-        return real_write(self, data, **kwargs)  # ty: ignore[invalid-argument-type]
+    def _record(self: Path, target: object) -> Path:
+        renamed.append(self.name)
+        return real_replace(self, target)  # ty: ignore[invalid-argument-type]
 
-    monkeypatch.setattr(Path, "write_text", _record)
-    upsert_pool_entry(_student_entry(), tmp_path / "pool.toml")
+    monkeypatch.setattr(Path, "replace", _record)
+    path = tmp_path / "pool.toml"
+    upsert_pool_entry(_student_entry(), path)
+    upsert_pool_entry(_student_entry("other"), path)
 
-    assert seen == [f"pool.toml.{os.getpid()}.tmp"]
-    assert list(tmp_path.glob("*.tmp")) == []  # the temp is gone once renamed
+    assert len(set(renamed)) == 2, f"the staging name repeated across calls: {renamed}"
+    assert all(name.startswith(".pool.toml.") for name in renamed)
+    assert list(tmp_path.glob("*.partial")) == []  # the staging file is gone once renamed
 
 
 def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
@@ -552,7 +558,7 @@ def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
     real_replace = Path.replace
 
     def _boom(self: Path, target: object) -> Path:
-        if self.suffix == ".tmp":
+        if self.suffix == ".partial":
             raise OSError("disk full")
         return real_replace(self, target)  # ty: ignore[invalid-argument-type]
 
@@ -560,7 +566,7 @@ def test_upsert_pool_entry_leaves_no_temp_behind_when_the_write_fails(
     with pytest.raises(OSError, match="disk full"):
         upsert_pool_entry(_student_entry(), path)
 
-    assert list(tmp_path.glob("*.tmp")) == []
+    assert list(tmp_path.glob("*.partial")) == []
     assert load_pool(path).models  # the roster is untouched and still loadable
 
 
@@ -588,7 +594,7 @@ def test_upsert_pool_entry_appends_without_touching_a_byte_of_the_existing_file(
     path = tmp_path / "pool.toml"
     path.write_text(_COMMENTED_POOL, encoding="utf-8")
 
-    assert upsert_pool_entry(_student_entry(), path) is False
+    assert upsert_pool_entry(_student_entry(), path).replaced is False
 
     written = path.read_text(encoding="utf-8")
     assert written.startswith(_COMMENTED_POOL)  # byte-identical prefix, comments included
@@ -609,6 +615,197 @@ def test_upsert_pool_entry_append_round_trips_when_the_file_has_no_trailing_newl
     upsert_pool_entry(_student_entry(), path)
 
     assert [m.name for m in load_pool(path).models] == ["haiku", "student"]
+
+
+def _short_openai(name: str) -> PoolEntry:
+    """The smallest entry anyone registers: three fields, well under 100 rendered characters."""
+    return PoolEntry(name=name, kind=ProviderKind.OPENAI, model="gpt-5.5")
+
+
+def test_upsert_pool_entry_keeps_the_roster_loadable_across_two_short_registrations(
+    tmp_path: Path,
+) -> None:
+    """The direct regression: two minimal OpenAI rows used to write a duplicate top-level key.
+
+    `tomli_w` emits `[[model]]` sections only when a table is too long to inline (a 100-character
+    heuristic), so `model = [ {...} ]` came out for short entries and appending a second one
+    produced invalid TOML. Every later `load_pool` then failed, which takes serving and the
+    routing optimizer down, not just the candidate being added. This fixture must stay MINIMAL: a
+    verbose Azure row crosses the heuristic and passes with or without the fix.
+    """
+    path = tmp_path / "pool.toml"
+
+    assert upsert_pool_entry(_short_openai("gpt-5.5"), path).replaced is False
+    assert upsert_pool_entry(_short_openai("gpt-5.4-mini"), path).replaced is False
+
+    assert [m.name for m in load_pool(path).models] == ["gpt-5.5", "gpt-5.4-mini"]
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        pytest.param(_short_openai("gpt-5.4-mini"), id="short-openai"),
+        pytest.param(
+            PoolEntry(
+                name="azure-gpt",
+                kind=ProviderKind.AZURE_OPENAI,
+                model="gpt-5.5",
+                deployment="gpt-5.5",
+                endpoint="https://example.openai.azure.com",
+                api_version="2024-10-21",
+                api_key_env="AZURE_EXAMPLE_KEY",
+            ),
+            id="long-azure",
+        ),
+    ],
+)
+def test_upsert_pool_entry_round_trips_whatever_shape_the_entry_renders_to(
+    tmp_path: Path, second: PoolEntry
+) -> None:
+    """Parametrized over both sides of the length heuristic so it cannot silently come back."""
+    path = tmp_path / "pool.toml"
+
+    upsert_pool_entry(_short_openai("gpt-5.5"), path)
+    upsert_pool_entry(second, path)
+
+    assert [m.name for m in load_pool(path).models] == ["gpt-5.5", second.name]
+
+
+def test_upsert_pool_entry_appends_short_entries_indefinitely(tmp_path: Path) -> None:
+    """Three-plus sequential adds: the roster stays loadable and keeps every entry, in order."""
+    path = tmp_path / "pool.toml"
+    names = ["gpt-5.5", "gpt-5.4-mini", "haiku", "sonnet"]
+
+    for name in names:
+        assert upsert_pool_entry(_short_openai(name), path).replaced is False
+
+    assert [m.name for m in load_pool(path).models] == names
+
+
+def test_upsert_pool_entry_writes_a_file_a_later_append_can_preserve(tmp_path: Path) -> None:
+    """Creating the file must not cost the NEXT add its comment preservation.
+
+    The inline array form loads fine, so the corruption is only half the story: a file in that
+    form cannot be appended to at all, and every later add has to re-render it and drop the
+    operator's comments. Writing sections from the first entry on is what keeps the byte-preserving
+    path reachable for a roster of short entries.
+    """
+    path = tmp_path / "pool.toml"
+    upsert_pool_entry(_short_openai("gpt-5.5"), path)
+    annotated = path.read_text(encoding="utf-8") + "\n# billed to the research account\n"
+    path.write_text(annotated, encoding="utf-8")
+
+    upsert_pool_entry(_short_openai("gpt-5.4-mini"), path)
+
+    written = path.read_text(encoding="utf-8")
+    assert written.startswith(annotated)  # byte-identical prefix, comment included
+    assert [m.name for m in load_pool(path).models] == ["gpt-5.5", "gpt-5.4-mini"]
+
+
+_LEGACY_INLINE_POOL = """model = [
+    { name = "gpt-5.5", kind = "openai", model = "gpt-5.5" },
+]
+"""
+
+
+def test_upsert_pool_entry_normalizes_a_legacy_inline_pool_file(tmp_path: Path) -> None:
+    """Rosters written by releases up to 0.2.1 are one inline array, which cannot be appended to.
+
+    Adding a `[[model]]` section to one is the same duplicate-key corruption in the other
+    direction, so the upgrade path is a full re-render. It costs that file its comments once, and
+    leaves it in the section form every later add can extend.
+    """
+    path = tmp_path / "pool.toml"
+    path.write_text(_LEGACY_INLINE_POOL, encoding="utf-8")
+
+    assert upsert_pool_entry(_short_openai("haiku"), path).replaced is False
+
+    assert [m.name for m in load_pool(path).models] == ["gpt-5.5", "haiku"]
+    assert "[[model]]" in path.read_text(encoding="utf-8")  # normalized, so the next add appends
+
+
+def test_upsert_pool_entry_reports_the_rewrite_that_normalizing_a_legacy_pool_costs(
+    tmp_path: Path,
+) -> None:
+    """An ADD that drops the operator's comments must SAY so; the CLI prints the note from this.
+
+    Normalizing an inline-form roster is a re-render, so the comments recording which account
+    each row bills to are gone. Reporting that as a plain "added" (which is what keying the
+    note off `replaced` alone does) deletes them silently and unrecoverably.
+    """
+    path = tmp_path / "pool.toml"
+    path.write_text(f"# bills to research\n{_LEGACY_INLINE_POOL}", encoding="utf-8")
+
+    written = upsert_pool_entry(_short_openai("haiku"), path)
+
+    assert written.replaced is False  # nothing of that name was there
+    assert written.rewritten is True  # but the file was re-rendered anyway, so say so
+    assert "bills to research" not in path.read_text(encoding="utf-8")
+
+
+def test_upsert_pool_entry_reports_no_rewrite_for_a_plain_append(tmp_path: Path) -> None:
+    """The common case must not print the comment warning, or it stops meaning anything."""
+    path = tmp_path / "pool.toml"
+    upsert_pool_entry(_short_openai("gpt-5.5"), path)
+
+    written = upsert_pool_entry(_short_openai("gpt-5.4-mini"), path)
+
+    assert (written.replaced, written.rewritten) == (False, False)
+
+
+def test_upsert_pool_entry_does_not_call_creating_the_file_a_rewrite(tmp_path: Path) -> None:
+    """A first registration has no comments to lose, so it must not claim any were dropped."""
+    written = upsert_pool_entry(_short_openai("gpt-5.5"), tmp_path / "pool.toml")
+
+    assert (written.replaced, written.rewritten) == (False, False)
+
+
+def test_upsert_pool_entry_refuses_to_write_a_roster_that_does_not_read_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit gate, on the re-render path that has no fallback.
+
+    `_render_sections` hand-writes the `[[model]]` header, which is only correct while every
+    table is a flat dict of scalars. A nested value makes `tomli_w` emit a `[key]` header that
+    TOML reads as a SIBLING top-level table, so the field leaves the entry with no error raised:
+    silent data loss, not a parse failure.
+
+    `PoolEntry`'s `extra="forbid"` is the first line of defence and rejects such a field before
+    the renderer ever sees it, so the renderer is stubbed here to produce what tomli_w would
+    produce if that schema were ever relaxed. What is under test is the commit gate on the
+    RE-RENDER path, which is the one with no fallback: the append path could still fall back to
+    re-rendering, but a bad re-render used to be written straight out.
+    """
+    path = tmp_path / "pool.toml"
+
+    def _hoists_a_sub_table(tables: list[dict[str, object]]) -> str:
+        # Exactly what tomli_w does with a nested value today: the sub-table gets its own header,
+        # which under the [[model]] above it parses as a SIBLING, not as a field of the entry.
+        return "".join(
+            f"[[model]]\nname = {table['name']!r}\n\n[rate_limits]\nrpm = 60\n" for table in tables
+        )
+
+    monkeypatch.setattr(pool_module, "_render_sections", _hoists_a_sub_table)
+    with pytest.raises(ValueError, match="does not read back as"):
+        upsert_pool_entry(_short_openai("gpt-5.5"), path)
+
+    assert not path.exists()  # nothing was committed
+    assert list(tmp_path.glob("*.partial")) == []
+
+
+def test_load_pool_names_the_file_when_it_is_not_valid_toml(tmp_path: Path) -> None:
+    """A decode error reaches the user through `SweepError(str(exc))`, so it must carry the path.
+
+    Bare, `tomllib`'s "Cannot overwrite a value (at line 7, column 2)" surfaces under typer's
+    `Invalid value:`, which reads as a bad CLI argument rather than a corrupt pool file.
+    """
+    path = tmp_path / "pool.toml"
+    path.write_text('model = [ { name = "a" } ]\n\nmodel = [ { name = "b" } ]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"is not valid TOML") as caught:
+        load_pool(path)
+
+    assert str(path) in str(caught.value)
 
 
 def test_upsert_pool_entry_blames_a_pre_existing_bad_row_on_the_file_not_the_new_entry(
@@ -776,20 +973,19 @@ def test_upsert_pool_entry_reports_a_stuck_writer_instead_of_hanging(tmp_path: P
     """A held lock must fail with an actionable message inside the bound, never wedge the CLI."""
     path = tmp_path / "pool.toml"
     path.write_text(_COMMENTED_POOL, encoding="utf-8")
-    lock_path = path.with_name(f"{path.name}.lock")
-    holder = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-    fcntl.flock(holder, fcntl.LOCK_EX)
+    holder = FileLock(path.with_name(f"{path.name}.lock"))
+    holder.acquire()
     try:
-        with pytest.raises(PoolLockTimeout, match=r"writing the model pool at .*pool\.toml"):
+        with pytest.raises(FileLockTimeout, match=r"writing the model pool at .*pool\.toml"):
             upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05)
     finally:
-        os.close(holder)
+        holder.release()
 
     assert [entry.name for entry in load_pool(path).models] == ["gpt-5.5", "haiku"]  # untouched
     assert list(tmp_path.glob("*.tmp")) == []
-    # Once the holder is gone the lock is free again: the kernel owns that release, so a leftover
-    # lock FILE is never a held lock and cannot wedge the next run.
-    assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05) is False
+    # Once the holder is gone the lock is free again: the OS owns that release, so a leftover lock
+    # FILE is never a held lock and cannot wedge the next run.
+    assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05).replaced is False
 
 
 def test_upsert_pool_entry_releases_the_lock_when_it_rejects_the_roster(tmp_path: Path) -> None:
@@ -804,7 +1000,7 @@ def test_upsert_pool_entry_releases_the_lock_when_it_rejects_the_roster(tmp_path
         upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05)
 
     path.write_text(_COMMENTED_POOL, encoding="utf-8")  # the operator fixes the row
-    assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05) is False
+    assert upsert_pool_entry(_student_entry(), path, lock_timeout_s=0.05).replaced is False
 
 
 # --- OpenRouter entries: priced from the published catalog, not by hand -----------------------

@@ -609,8 +609,8 @@ def test_health_reports_the_endpoint_identity(
 
 
 @pytest.mark.skipif(
-    not (os.environ.get(URL_ENV) and os.environ.get(KEY_ENV)),
-    reason=f"live endpoint test: set {URL_ENV} and {KEY_ENV} to run it",
+    not (os.environ.get(URL_ENV) and os.environ.get(KEY_ENV) and os.environ.get(CA_ENV)),
+    reason=f"live endpoint test: set {URL_ENV}, {KEY_ENV} and {CA_ENV} to run it",
 )
 def test_live_endpoint_compresses_deterministically() -> None:
     """Opt-in: hit the real H100 endpoint and check it compresses and repeats itself exactly.

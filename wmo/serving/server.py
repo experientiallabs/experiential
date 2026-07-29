@@ -31,6 +31,7 @@ from wmo.config.card import ModelCard, load_card
 from wmo.core.types import Action, EnvState, Observation, Session
 from wmo.engine.loader import load_world_model
 from wmo.engine.world_model import WorldModel
+from wmo.optimize.pareto import PARETO_FILENAME, ParetoCurve
 from wmo.optimize.policy import POLICY_FILENAME, RoutingPolicy
 from wmo.optimize.reward import EpisodeScore
 from wmo.serving.builds import BuildManager, BuildRouteRequest, BuildSnapshot
@@ -189,6 +190,23 @@ def _load_models(
     return models, cards, dirs
 
 
+def _load_pareto_or_none(model_dir: Path | None) -> ParetoCurve | None:
+    """The measured curve written at optimize time, or None when it never was.
+
+    A malformed file fails the mount loudly (same posture as an invalid policy): serving a
+    stale or truncated curve as "the measured frontier" is worse than refusing to start.
+    """
+    if model_dir is None:
+        return None
+    path = model_dir / PARETO_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        return ParetoCurve.model_validate_json(path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"invalid pareto curve at {path}: {exc}") from exc
+
+
 def _endpoint_runtimes(
     policies: Mapping[str, RoutingPolicy],
     model_dirs: Mapping[str, Path],
@@ -227,6 +245,7 @@ def _endpoint_runtimes(
                 config_path=config_path,
                 embeddings=embeddings,
                 log_query_embeddings=settings.log_query_embeddings,
+                pareto=_load_pareto_or_none(model_dir),
             )
         except ValueError as exc:
             # Fail fast and name the file: a dial the policy cannot honor (a savings position on

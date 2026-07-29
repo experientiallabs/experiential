@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner, Result
 
 from wmo.cli import app
@@ -27,7 +28,7 @@ from wmo.harness.population import CandidateProposal, EvaluatedCandidate, candid
 from wmo.harness.proposer import ProviderDeltaProposer
 from wmo.harness.scoring import ScoreCell, ScoreReport, ScoreRequest
 from wmo.harness.source_tree import HarnessSourceFile, HarnessSourceTree
-from wmo.harness.store import HarnessStore
+from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
 from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind
 
 # The Typer object `harness_app` shadows the submodule name on plain attribute access; go
@@ -104,9 +105,103 @@ def _invoke(tmp_path: Path, *extra: str) -> Result:
             "2",
             "--root",
             str(tmp_path / ".wmo"),
+            # Consent is explicit on every spend surface: a non-TTY search without --yes
+            # refuses (exit 2), and CliRunner is never a TTY. Consent semantics have their own
+            # test below; every other world-model test consents up front.
+            "--yes",
             *extra,
         ],
     )
+
+
+def test_world_model_search_non_interactive_without_yes_refuses_to_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No TTY and no --yes: the search refuses before `create_harness` is ever called.
+
+    The harbor mode of this same command grew the refusal first; this branch kept inferring
+    consent from `interactive`, so a piped or CI run started a paid propose-and-gate search
+    with no prompt and no notice.
+    """
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--iterations",
+            "2",
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+    )
+
+    flat = " ".join(result.output.split())  # rich wraps to the console width
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in flat
+    # The refusal quotes the size of what it declined to authorize and the flag that authorizes
+    # it, so a scripted caller can act on the message alone.
+    assert "up to ~9 rollout(s) + 2 proposal(s)" in flat
+    assert "--yes" in flat
+    assert recorder.calls == []  # no paid search started
+
+
+def test_world_model_search_at_a_terminal_with_redirected_stdin_refuses_to_spend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A terminal stdout with a redirected stdin is not an interactive session either.
+
+    Same refusal as the fully non-interactive case: the console reports on stdout while the
+    prompt reads stdin, so keying the gate on the console alone let `wmo optimize harness ... <
+    /dev/null` at a terminal have its money question answered by the redirect.
+    """
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    monkeypatch.setattr(harness_app_module, "_console", Console(width=240, force_terminal=True))
+    _patch_load(monkeypatch, object(), _Provider())
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "harness",
+            "made",
+            "--tasks",
+            _tasks_file(tmp_path),
+            "--iterations",
+            "2",
+            "--root",
+            str(tmp_path / ".wmo"),
+        ],
+        input="y\n",  # what a heredoc or a `yes |` would supply
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "cannot ask for spend consent" in " ".join(result.output.split())
+    assert recorder.calls == []  # the piped "y" started nothing
+
+
+def test_the_wizard_needs_a_terminal_stdin_and_says_so_instead_of_raising_eoferror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wizard reads stdin, so a terminal stdout alone must not open it.
+
+    Opening it anyway meant the first `Prompt.ask` hit an exhausted stdin and the command died
+    with an `EOFError` traceback rather than the usage error that names the missing option.
+    """
+    monkeypatch.setattr(harness_app_module, "_console", Console(width=240, force_terminal=True))
+
+    result = runner.invoke(app, ["optimize", "harness", "made", "--root", str(tmp_path / ".wmo")])
+
+    assert result.exit_code == 2, result.output
+    assert not isinstance(result.exception, EOFError)
+    assert "provide --tasks" in " ".join(result.output.replace("│", " ").split())
 
 
 def _patch_load(
@@ -203,6 +298,8 @@ def test_create_default_local_loads_the_world_model(
     assert call["eval_concurrency"] is None  # backend default decided downstream (local -> 1)
     assert call["e2b_template"] is None
     flat = " ".join(result.output.split())
+    assert HarnessStore(project_root / ".wmo").versions("made") == [1]
+    assert "created made v1 (champion)" in flat
     assert "world model" in flat and "wm-alpha" in flat
     assert "sandbox" not in flat  # no sandbox note on the local path
     expected = shlex.join(
@@ -226,6 +323,44 @@ def test_create_default_local_loads_the_world_model(
     assert "--harness-backend" not in flat  # and the run-it hint stays plain
 
 
+def test_unchanged_search_reuses_the_destination_champion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A no-gain run must not append an identical immutable version."""
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+    store = HarnessStore(tmp_path / ".wmo")
+    original = store.save_version(HarnessDoc.baseline("made"), alias=CHAMPION_ALIAS)
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert store.versions("made") == [original.version]
+    assert store.aliases("made") == {CHAMPION_ALIAS: original.version}
+    flat = " ".join(result.output.split())
+    assert "unchanged made v1 (champion)" in flat
+    assert "created made" not in flat
+
+
+def test_unchanged_search_publishes_when_the_destination_has_no_champion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Latest is only a load fallback, not an existing champion publication."""
+    recorder = _CreateRecorder()
+    monkeypatch.setattr(harness_app_module, "create_harness", recorder)
+    _patch_load(monkeypatch, object(), _Provider())
+    store = HarnessStore(tmp_path / ".wmo")
+    store.save_version(HarnessDoc.baseline("made"))
+
+    result = _invoke(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert store.versions("made") == [1, 2]
+    assert store.aliases("made") == {CHAMPION_ALIAS: 2}
+    assert "created made v2 (champion)" in " ".join(result.output.split())
+
+
 def test_optimize_accepts_world_model_as_second_argument(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -246,6 +381,7 @@ def test_optimize_accepts_world_model_as_second_argument(
             "1",
             "--root",
             str(tmp_path / ".wmo"),
+            "--yes",
         ],
     )
 
@@ -963,6 +1099,10 @@ def test_a_world_model_search_without_iterations_buys_the_documented_five(
             _tasks_file(tmp_path),
             "--root",
             str(tmp_path / ".wmo"),
+            # What the default buys is the question here, not consent: CliRunner is never a
+            # TTY, so without this the search refuses (exit 2) before it picks an iteration
+            # count. Same reason `_invoke` passes it.
+            "--yes",
         ],
     )
 

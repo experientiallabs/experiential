@@ -15,6 +15,7 @@ from wmo.distill.tau2 import (
     _tau2_command,
     _wipe_stale_episode_dir,
     collect_tau2_rollouts,
+    episodes_from_tau2_results,
     parse_tau2_task_id,
 )
 from wmo.harness.doc import HarnessDoc
@@ -357,3 +358,106 @@ class TestEpisodeReuse:
         )
         assert launches == [1]
         assert records[0].passed is True
+
+
+class TestEpisodesFromResults:
+    """The reverse direction: recorded tau2 transcripts back out as text episodes."""
+
+    @staticmethod
+    def _write(
+        episode_dir: Path,
+        *,
+        reward: float | None = 1.0,
+        termination: str = "user_stop",
+        policy: str | None = "AIRLINE POLICY",
+        captured_prompt: str | None = None,
+    ) -> Path:
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        simulation: dict[str, object] = {
+            "id": "sim1",
+            "task_id": "7",
+            "termination_reason": termination,
+            "reward_info": ({"reward": reward} if reward is not None else {}),
+            "messages": [
+                {"role": "assistant", "content": "Hi! How can I help?", "turn_idx": 0},
+                {"role": "user", "content": "book it", "turn_idx": 1},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "turn_idx": 2,
+                    "tool_calls": [
+                        {"id": "call_0", "name": "book", "arguments": {"id": 7}},
+                    ],
+                },
+                {"role": "tool", "id": "call_0", "content": '{"ok": true}', "turn_idx": 3},
+                {"role": "assistant", "content": "Booked.", "turn_idx": 4},
+            ],
+        }
+        if policy is not None:
+            simulation["policy"] = policy
+        (episode_dir / "results.json").write_text(
+            json.dumps({"simulations": [simulation]}), encoding="utf-8"
+        )
+        if captured_prompt is not None:
+            (episode_dir / "system-prompt.txt").write_text(captured_prompt, encoding="utf-8")
+        return episode_dir / "results.json"
+
+    def test_converts_tau2_message_shape_and_prepends_the_captured_prompt(
+        self, tmp_path: Path
+    ) -> None:
+        results = self._write(tmp_path / "ep", captured_prompt="EXACT SYSTEM PROMPT")
+        [episode] = episodes_from_tau2_results(
+            results, teacher_model="kimi-k3", task_id="airline/7"
+        )
+        assert episode.messages[0].role == "system"
+        assert episode.messages[0].content == "EXACT SYSTEM PROMPT"
+        assert episode.passed is True
+        assert episode.stop_reason == "submitted"
+        assert episode.source == "tau2:results.json"
+        # tau2 records flat tool calls with OBJECT arguments; the chat format
+        # needs them nested with a JSON string.
+        call = next(m for m in episode.messages if m.tool_calls).tool_calls
+        assert call is not None
+        assert call[0].function.name == "book"
+        assert json.loads(call[0].function.arguments) == {"id": 7}
+        # tau2 keys a tool result by the call's own id
+        tool_msg = next(m for m in episode.messages if m.role == "tool")
+        assert tool_msg.tool_call_id == "call_0"
+
+    def test_falls_back_to_the_recorded_policy(self, tmp_path: Path) -> None:
+        results = self._write(tmp_path / "ep")
+        [episode] = episodes_from_tau2_results(
+            results, teacher_model="kimi-k3", task_id="airline/7"
+        )
+        assert episode.messages[0].content == "<policy>\nAIRLINE POLICY\n</policy>"
+
+    def test_an_explicit_prompt_wins(self, tmp_path: Path) -> None:
+        results = self._write(tmp_path / "ep", captured_prompt="CAPTURED")
+        [episode] = episodes_from_tau2_results(
+            results, teacher_model="k", task_id="airline/7", system_prompt="EXPLICIT"
+        )
+        assert episode.messages[0].content == "EXPLICIT"
+
+    def test_no_resolvable_prompt_skips_the_episode(self, tmp_path: Path) -> None:
+        # Training on prompts missing the agent's policy would teach a task the
+        # student never faces at serving time, so the episode is dropped.
+        results = self._write(tmp_path / "ep", policy=None)
+        assert episodes_from_tau2_results(results, teacher_model="k", task_id="airline/7") == []
+
+    def test_ungraded_simulations_are_not_training_material(self, tmp_path: Path) -> None:
+        infra = self._write(
+            tmp_path / "a", reward=None, termination="infrastructure_error", captured_prompt="P"
+        )
+        assert episodes_from_tau2_results(infra, teacher_model="k", task_id="airline/7") == []
+
+    def test_a_failed_episode_is_kept_but_marked(self, tmp_path: Path) -> None:
+        results = self._write(tmp_path / "ep", reward=0.0, captured_prompt="P")
+        [episode] = episodes_from_tau2_results(results, teacher_model="k", task_id="airline/7")
+        assert episode.passed is False
+        assert episode.reward == 0.0
+
+    def test_unreadable_results_are_actionable(self, tmp_path: Path) -> None:
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with pytest.raises(ValueError, match="cannot read tau2 results"):
+            episodes_from_tau2_results(bad, teacher_model="k", task_id="airline/7")

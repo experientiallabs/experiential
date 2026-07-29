@@ -71,6 +71,9 @@ def _cluster_policy() -> RoutingPolicy:
         kind="rank",
         default_model="cheap",
         pool=_entries(),
+        # This policy represents one fitted on a separate matrix. None of these report rows
+        # overlap its recorded fit evidence, so all are legitimately held out.
+        fit_scenario_ids=["external-fit-scenario"],
         embedder=EmbedderSpec(dim=64),
         top_k_clusters=1,
         clusters=[
@@ -118,6 +121,36 @@ def test_report_model_mix_and_candidates() -> None:
     assert by_name["cheap"].cost_per_run_usd == pytest.approx(0.001)
     assert by_name["cheap"].model.tier == "open"
     assert by_name["fable-5"].latency_p50_ms == pytest.approx(300.0)
+
+
+def test_report_excludes_rows_recorded_as_router_fit_evidence() -> None:
+    policy = _cluster_policy().model_copy(update={"fit_scenario_ids": ["s1"]})
+
+    report = build_report(
+        _matrix(),
+        policy,
+        baseline="fable-5",
+        endpoint="tau-bench",
+        generated_at="2026-07-24T00:00:00Z",
+    )
+
+    assert report.scenario_ids == ["s2"]
+    assert report.scenario_count == report.headline.scenarios_compared == 1
+    assert report.headline.accuracy == pytest.approx(0.8)
+    assert all(candidate.scored_episodes == 1 for candidate in report.candidates)
+
+
+def test_report_refuses_when_every_scenario_was_used_for_router_fit() -> None:
+    policy = _cluster_policy().model_copy(update={"fit_scenario_ids": ["s1", "s2"]})
+
+    with pytest.raises(ValueError, match="no scenario outside the router fit set"):
+        build_report(
+            _matrix(),
+            policy,
+            baseline="fable-5",
+            endpoint="tau-bench",
+            generated_at="2026-07-24T00:00:00Z",
+        )
 
 
 def test_report_static_policy_and_unscored_rows() -> None:

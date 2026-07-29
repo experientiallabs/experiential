@@ -91,6 +91,13 @@ class _MiniRendering:
         lines.append("assistant:")
         return self._tok.encode("\n".join(lines))
 
+    def render_assistant_turn(
+        self, messages: list[ChatMessage], index: int, tools: list[ChatTool] | None = None
+    ) -> list[int]:
+        del tools
+        content = messages[index].content
+        return self._tok.encode(content if isinstance(content, str) else "")
+
     def render_suffix(
         self,
         messages: list[ChatMessage],
@@ -367,6 +374,14 @@ class _FramedRendering(_MiniRendering):
             prefix = "<tools>" + ",".join(tool.function.name for tool in tools) + "</>"
         body = "".join(self._segment(message) for message in messages)
         return self._tok.encode(prefix + body + "<assistant>")
+
+    def render_assistant_turn(
+        self, messages: list[ChatMessage], index: int, tools: list[ChatTool] | None = None
+    ) -> list[int]:
+        del tools
+        content = messages[index].content
+        text = content if isinstance(content, str) else ""
+        return self._tok.encode(f"{text}</>")
 
     def render_suffix(
         self,

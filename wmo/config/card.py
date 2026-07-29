@@ -13,6 +13,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError
 
+from wmo.core.files import write_text_atomic
+
 CARD_FILENAME = "card.json"
 
 
@@ -110,7 +112,7 @@ def save_card(card: ModelCard, model_dir: str | Path) -> Path:
     """Write `card.json` into `model_dir`, returning the path written."""
     path = card_path(model_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(card.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(path, card.model_dump_json(indent=2) + "\n")
     return path
 
 

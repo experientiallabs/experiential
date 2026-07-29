@@ -283,8 +283,20 @@ def _parse_rungs(path: Path, name: str, entries: list[dict[str, object]]) -> Cha
 
 
 def _parse_fallback_config(path: Path) -> tuple[dict[str, Chain], str | None]:
-    """Parse the named chains and the optional `default` selector."""
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    """Parse the named chains and the optional `default` selector.
+
+    Every other failure here is prefixed with `path`, and a decode error has to be too: it reaches
+    the user through a CLI error that renders `str(exc)` alone, so a bare "Cannot overwrite a
+    value (at line 7, column 2)" reads as a bad command argument rather than as a broken file.
+    """
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(
+            f"{path} is not valid TOML ({exc}); it holds the provider fallback chains as "
+            '[[chain.<name>]] rung entries plus an optional `default = "<name>"`, so fix the '
+            "file or move it aside to fall back to the configured provider"
+        ) from exc
     unknown_top = set(data) - {"chain", "default"}
     if unknown_top:
         raise ValueError(

@@ -262,9 +262,10 @@ episode, and written no artifact, not even resume state. It is the honest way to
 would cost, in a script or at a terminal, and it prints the table even when `--max-usd` would have
 refused the real run.
 
-**`--yes` consents.** Consent has to be said, never inferred from the absence of a terminal: a
-non-interactive session (a pipe, a CI job) that would buy a sweep and was not told `--yes` exits 2
-with `cannot ask for spend consent`, naming both honest ways forward. Nothing is bought. A run
+**`--yes` consents.** Consent has to be said, never inferred from the absence of someone to ask: a
+non-interactive session (a pipe, a CI job, or a redirected stdin, which is not a person even when
+stdout is a terminal) that would buy a sweep and was not told `--yes` exits 2 with `cannot ask for
+spend consent`, naming both honest ways forward. Nothing is bought. A run
 with no sweep left to buy needs no consent at all, so a resume down to fit, tune, and report
 proceeds unattended.
 
@@ -407,10 +408,10 @@ uv run wmo optimize route report matrix.json .wmo/models/tau-bench/policy.json \
   --baseline claude-opus-4-8 --endpoint tau-bench --out report.json
 ```
 
-One difference worth knowing before scripting these: `route sweep` does **not** share the staged
-command's consent refusal. On a non-interactive session it prints that it is proceeding without
-confirmation and buys the sweep. So pass `--yes` there because you mean it, and treat an unattended
-`route sweep` as spending by default; `--dry-run` is the staged command's flag, not this one's.
+One thing worth knowing before scripting these: `route sweep` shares the staged command's consent
+refusal. Consent is said, never inferred, so on a non-interactive session (CI, cron, piped output,
+`| tee`, a redirected stdin) it prints what it would have spent and exits 2 instead of buying the
+sweep. Pass `--yes` there because you mean it. `--dry-run` is the staged command's flag, not this one's.
 
 Reach for these when you want a knob the staged command does not expose: `--kind rank` for
 Avengers cluster ranks instead of kNN evidence, `--z` for a stricter or looser confidence bar,

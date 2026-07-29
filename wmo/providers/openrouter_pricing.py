@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.core.files import write_text_atomic
 from wmo.core.types import JsonValue
 from wmo.platform.credentials import wmo_home
 from wmo.providers.openrouter import OPENROUTER_MODELS_URL
@@ -202,10 +203,7 @@ def _read_cache(path: Path) -> PriceCatalog | None:
 def _write_cache(path: Path, catalog: PriceCatalog) -> None:
     """Persist the table atomically. A cache that cannot be written is a warning, not an error."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staging = path.with_name(f"{path.name}.partial")
-        staging.write_text(json.dumps(catalog.model_dump(mode="json")), encoding="utf-8")
-        staging.replace(path)
+        write_text_atomic(path, json.dumps(catalog.model_dump(mode="json")))
     except OSError as exc:
         logger.warning("could not cache the OpenRouter price table at %s: %s", path, exc)
 

@@ -41,6 +41,8 @@ import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.config.store import validate_name
+from wmo.core.files import write_text_atomic
+from wmo.core.locks import file_write_lock
 from wmo.core.types import JsonObject
 from wmo.distill.config import DistillConfig, load_distill_config, snapshot_toml
 from wmo.distill.gate import DistillGateRecord
@@ -51,24 +53,6 @@ from wmo.providers.pool import PoolEntry
 from wmo.utils.waterfall import ChatMaxTokensField
 
 logger = logging.getLogger(__name__)
-
-
-def write_text_atomic(path: Path, text: str) -> None:
-    """Write `text` to `path` via a same-directory tmp file plus atomic replace.
-
-    Every durable file in the run dir goes through this, including the ones
-    other modules own (`wmo.distill.tracking`'s wandb run record): a torn
-    write to checkpoints.json (or the config snapshot, warmup record, gate
-    verdict, wandb run id) would otherwise corrupt the resume path exactly
-    when a crash made resume necessary.
-
-    Args:
-        path: The destination file; its parent directory must exist.
-        text: The complete file contents, written as UTF-8.
-    """
-    tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(text, encoding="utf-8")
-    tmp_path.replace(path)
 
 
 ADAPTERS_DIR = "adapters"
@@ -708,20 +692,41 @@ class AdapterStore:
     # -- aliases ---------------------------------------------------------------------------------
 
     def aliases(self, name: str) -> dict[str, int]:
+        """The alias table for `name`, empty when it has none.
+
+        Names the file on a decode error: `resolve_version(None)` reads this to find the champion,
+        so a bare `tomllib` message would reach an operator as a parse error with no path, for a
+        file they never edited.
+        """
         path = self.dir_for(name) / _ALIASES_FILE
         if not path.exists():
             return {}
-        data = tomllib.loads(path.read_text(encoding="utf-8")).get("aliases", {})
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(
+                f"adapter alias file {path} is not valid TOML ({exc}); it maps alias names to "
+                f"version numbers under [aliases]. Repair it, or delete it to fall back to the "
+                f"latest version until the next `wmo optimize distill run` promotion re-points "
+                f"{CHAMPION_ALIAS}"
+            ) from exc
+        data = parsed.get("aliases", {})
         return {k: v for k, v in data.items() if isinstance(v, int)}
 
     def set_alias(self, name: str, alias: str, version: int) -> None:
-        """Point `alias` at `version` (moving it if it exists). Rollback is re-pointing."""
+        """Point `alias` at `version` (moving it if it exists). Rollback is re-pointing.
+
+        The write was already atomic; the lock covers the rest of the read-modify-write. Two
+        promotions of DIFFERENT aliases each read the same table and the later write drops the
+        earlier one, with both reporting success.
+        """
         if version not in self.versions(name):
             raise ValueError(f"adapter {name!r} has no version v{version}")
-        current = self.aliases(name)
-        current[alias] = version
         path = self.dir_for(name) / _ALIASES_FILE
-        write_text_atomic(path, tomli_w.dumps({"aliases": current}))
+        with file_write_lock(path, what="the adapter alias table"):
+            current = self.aliases(name)
+            current[alias] = version
+            write_text_atomic(path, tomli_w.dumps({"aliases": current}))
 
     # -- load / save -----------------------------------------------------------------------------
 

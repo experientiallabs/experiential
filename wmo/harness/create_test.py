@@ -213,26 +213,36 @@ def test_archive_reconstructs_children_by_folding_deltas() -> None:
         result.archive.reconstruct("0" * 32)
 
 
-def test_create_rejects_regressing_delta_and_keeps_champion() -> None:
-    # The seed already passes; the proposed prompt makes the agent submit a broken answer.
+def test_create_stops_before_proposing_when_seed_is_perfect() -> None:
+    """A perfect seed needs no candidate spend and must remain the champion."""
     seed = HarnessDoc.baseline("seed")
     provider = RoleProvider(
         meta_reply=_meta_reply(seed, "You are a broken agent."),
         judge_fn=lambda user: "done-broken" not in user,
     )
-    result = _run(provider)
+    progress: list[tuple[int, str, float, bool]] = []
+    crowned: list[str] = []
+    notes: list[str] = []
+    result = _run(
+        provider,
+        iterations=3,
+        on_progress=lambda i, n, r, a: progress.append((i, n, r, a)),
+        on_accept=lambda doc, delta, score: crowned.append(doc.doc_hash),
+        on_note=notes.append,
+    )
 
     assert result.skipped == 0
-    [delta] = result.archive.deltas
-    assert delta.verdict is not None and not delta.verdict.accepted
-    assert "full split" in delta.verdict.reason
+    assert provider.meta_users == []
+    assert result.archive.deltas == []
     assert result.archive.accepted() == []
-    # The champion never moved: the winner is the (renamed) seed at its original score.
     assert result.best_score == 1.0
     assert result.best.system_prompt() == seed.system_prompt()
-    assert result.suite == ["t1"]  # and the suite kept the seed's win
-    # An all-pass parent gets the generalization trigger, not a fabricated failure.
-    assert delta.trigger.mechanism == "none: all tasks pass"
+    assert result.suite == ["t1"]
+    assert result.iterations == 0
+    assert len(result.reports) == 1
+    assert crowned == []
+    assert progress == [(0, "seed", 1.0, True)]
+    assert notes == ["seed already passes every task and assertion; stopping before proposals"]
 
 
 def test_create_skips_unusable_proposals() -> None:
@@ -715,6 +725,83 @@ def test_gate_accepts_binary_tie_with_nonregressing_global_partial_progress() ->
 
     assert verdict.accepted is True
     assert verdict.full_fraction_delta == pytest.approx(0.25)
+
+
+def test_exact_full_objective_tie_is_audited_but_not_promoted() -> None:
+    """Trigger progress cannot crown a child with zero net measured improvement."""
+
+    class ExactTieProvider(RoleProvider):
+        """Trade equal assertion credit between two still-failing tasks."""
+
+        def complete(
+            self,
+            system: str,
+            messages: list[Message],
+            *,
+            temperature: float = 0.7,
+            max_tokens: int = 2048,
+        ) -> Completion:
+            user = messages[-1].content
+            if "grade whether an agent completed a task" in system:
+                child = "done-verified" in user
+                target = "target task" in user
+                results = []
+                for assertion in _gold_assertions(user):
+                    passed = (child and target and assertion == "a target improvement") or (
+                        not child and not target and assertion == "kept partial credit"
+                    )
+                    results.append({"assertion": assertion, "passed": passed, "why": "x"})
+                return Completion(text=json.dumps({"assertions": results, "passed": False}))
+            return super().complete(
+                system,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+    seed = HarnessDoc.baseline("seed")
+    provider = ExactTieProvider(meta_reply=_meta_reply(seed, _CAREFUL_PROMPT))
+    tasks = [
+        TaskSpec(
+            task_id="target",
+            instruction="target task",
+            gold=["a target improvement", "still incomplete"],
+        ),
+        TaskSpec(
+            task_id="other",
+            instruction="other task",
+            gold=["kept partial credit", "z still incomplete"],
+        ),
+    ]
+    crowned: list[str] = []
+
+    result = create_harness(
+        "winner",
+        seed,
+        tasks,
+        _wm(provider),
+        provider,
+        ProviderDeltaProposer(provider),
+        GoldJudge(provider),
+        iterations=1,
+        k=1,
+        on_accept=lambda doc, delta, score: crowned.append(doc.doc_hash),
+    )
+
+    [delta] = result.archive.deltas
+    [record] = result.proposal_records
+    assert record.outcome == "scored"
+    assert record.gate_eligible is True
+    assert record.selected is False
+    assert record.screen_child_fraction == pytest.approx(0.5)
+    assert record.screen_parent_fraction == 0.0
+    assert delta.verdict is not None and delta.verdict.accepted is False
+    assert delta.verdict.full_delta == 0.0
+    assert delta.verdict.full_fraction_delta == 0.0
+    assert "no measured improvement over the champion" in delta.verdict.reason
+    assert result.archive.accepted() == []
+    assert result.best.system_prompt() == seed.system_prompt()
+    assert crowned == []
 
 
 def test_search_records_screen_and_full_trace_feedback_for_project_proposers() -> None:
@@ -1729,8 +1816,9 @@ class _RankedMetaProvider(_SequencedMetaProvider):
 class _ParentRecordingProposer:
     """Propose against the live parent and remember each iteration's parent hash."""
 
-    def __init__(self) -> None:
+    def __init__(self, prompts: list[str]) -> None:
         self.parent_hashes: list[str] = []
+        self.prompts = prompts
 
     def propose_batch(
         self,
@@ -1744,7 +1832,7 @@ class _ParentRecordingProposer:
     ) -> list[HarnessDelta | ProposalFailure | None]:
         del evidence, history, should_cancel
         self.parent_hashes.append(parent.doc_hash)
-        prompt = f"{_CAREFUL_PROMPT} Iteration {len(self.parent_hashes)}."
+        prompt = self.prompts[len(self.parent_hashes) - 1]
         proposal = parse_delta(parent, trigger, _meta_reply(parent, prompt))
         assert proposal is not None and count == 1
         return [proposal]
@@ -2074,28 +2162,34 @@ def test_sibling_holdout_gates_use_frozen_iteration_champion(
     assert [record.selected for record in result.proposal_records] == [True, False]
 
 
-def test_next_iteration_proposes_from_previous_iteration_winner() -> None:
-    """The selected winner is the next parent, with no stepping-stone parent pool."""
+def test_next_iteration_uses_winner_then_stops_when_perfect() -> None:
+    """Search advances through an improving parent and buys nothing after perfection."""
     seed = HarnessDoc.baseline("seed")
-    provider = RoleProvider()
-    proposer = _ParentRecordingProposer()
+    provider = _RankedMetaProvider([])
+    proposer = _ParentRecordingProposer(["You are a weak agent.", "You are a strong agent."])
+    tasks = [
+        TaskSpec(task_id="t1", instruction="task one", gold=["the work completed"]),
+        TaskSpec(task_id="t2", instruction="task two", gold=["the work completed"]),
+    ]
 
     result = create_harness(
         "winner",
         seed,
-        _tasks(),
+        tasks,
         _wm(provider),
         provider,
         proposer,
         GoldJudge(provider),
-        iterations=2,
+        iterations=3,
         proposal_batch_size=1,
     )
 
     assert len(result.archive.accepted()) == 2
     first_winner_hash = result.proposal_records[0].candidate_doc_hash
+    assert first_winner_hash is not None
     assert proposer.parent_hashes == [seed.doc_hash, first_winner_hash]
     assert [record.selected for record in result.proposal_records] == [True, True]
+    assert result.iterations == 2
 
 
 def test_on_accept_delivers_the_new_champion_the_moment_it_is_crowned() -> None:

@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from wmo.distill.config import (
+    DEFAULT_WARMUP_LEARNING_RATE,
     PROBE_BASELINE_ENTROPY_NATS,
     PROBE_BASELINE_EPISODE_TOKENS,
     DistillConfig,
@@ -86,7 +87,11 @@ def test_load_minimal_applies_defaults(tmp_path: Path) -> None:
     assert cfg.warmup.steps == 0
     assert cfg.warmup.rollouts_per_task == 1
     assert cfg.warmup.keep == "passed"
-    assert cfg.warmup.learning_rate is None
+    # The supervised phase owns its LR: inheriting the OPD default silently
+    # trained an entire kept corpus at 1e-4 where the reference anchor config
+    # deliberately pins 5e-5 for warmup (cycle 1, 918,869 loss tokens x2).
+    assert cfg.warmup.learning_rate == pytest.approx(DEFAULT_WARMUP_LEARNING_RATE)
+    assert DEFAULT_WARMUP_LEARNING_RATE == pytest.approx(5e-5)
     # Interim evals default OFF: the holdout gate is the run's measurement.
     assert cfg.eval.every == 0
     assert cfg.eval.tasks == 12
@@ -1000,3 +1005,14 @@ def test_snapshot_round_trips_the_tau2_source(tmp_path: Path) -> None:
     snap_path = tmp_path / "snapshot.toml"
     snap_path.write_text(snapshot_toml(cfg), encoding="utf-8")
     assert load_distill_config(snap_path) == cfg
+
+
+def test_warmup_can_still_opt_into_the_training_learning_rate(tmp_path: Path) -> None:
+    """Explicit None restores the old coupling for a run that wants it."""
+    text = MINIMAL_TOML + "\n[train]\nlearning_rate = 2e-4\n\n[warmup]\nsteps = 1\n"
+    cfg = load_distill_config(_write(tmp_path, text))
+    assert cfg.warmup.learning_rate == pytest.approx(DEFAULT_WARMUP_LEARNING_RATE)
+    explicit = load_distill_config(
+        _write(tmp_path, MINIMAL_TOML + "\n[warmup]\nsteps = 1\nlearning_rate = 3e-5\n")
+    )
+    assert explicit.warmup.learning_rate == pytest.approx(3e-5)
