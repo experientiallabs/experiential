@@ -109,6 +109,9 @@ The run itself is real-only (no world-model leg), but the product object the mat
 model's endpoint, and `wmo runs backfill` names the run after this directory.
 """
 
+ENDPOINT_NAME = "swe-bench"
+"""The platform endpoint whose evidence this grid is."""
+
 DATASET = "princeton-nlp/SWE-Bench_Verified"
 SPLIT = "test"
 
@@ -993,6 +996,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 # cohort.model_dir); the rest of this file is this lane's own provenance.
                 "created": datetime.now(UTC).isoformat(),
                 "model_dir": str(SWE_MODEL_DIR),
+                # Names the product object this grid is evidence FOR, so `wmo runs backfill`
+                # attaches the run to that endpoint and its page carries the run history.
+                "endpoint": ENDPOINT_NAME,
                 "tip": tip,
                 "runner_tip": _runner_sha(),
                 "pool_file": str(pool_path),
