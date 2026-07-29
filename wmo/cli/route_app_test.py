@@ -3133,3 +3133,42 @@ enabled = false
     assert pinned.exit_code == 0, pinned.output
     policy = RoutingPolicy.load(model_dir / POLICY_FILENAME)
     assert [entry.name for entry in policy.pool] == ["student"]
+
+
+def test_route_student_replacement_keeps_a_disabled_entry_disabled(tmp_path: Path) -> None:
+    """Retraining and re-registering a student must not undo an operator's enabled = false.
+
+    Same rule as the registry writer, pinned separately because the student command
+    reaches upsert_pool_entry through its own path (_pool_disabled at route_app.py).
+    """
+    pool_file = tmp_path / "pool.toml"
+    assert _add_student(tmp_path, pool_file).exit_code == 0
+    pool_file.write_text(
+        pool_file.read_text(encoding="utf-8").replace(
+            'name = "student"', 'name = "student"\nenabled = false'
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "student",
+            str(_run_dir(tmp_path)),
+            "--input-per-mtok",
+            "0.2",
+            "--output-per-mtok",
+            "0.8",
+            "--pool",
+            str(pool_file),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "keeping it disabled" in result.output
+    entries = load_pool(pool_file).models
+    assert len(entries) == 1
+    assert entries[0].enabled is False
