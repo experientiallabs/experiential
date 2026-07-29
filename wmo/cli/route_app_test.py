@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import cast
+from typing import NamedTuple, cast
 
 import pytest
 from rich.console import Console
@@ -19,6 +19,7 @@ from typer.testing import CliRunner, Result
 
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
+from wmo.cli.route_app import no_removal_warning
 from wmo.config import HarnessConfig, save_config
 from wmo.core.types import Action, ActionKind, EnvState, Observation, Session, Step, Trace
 from wmo.distill.store import DistillModelCard
@@ -26,7 +27,9 @@ from wmo.engine.world_model import WorldModel
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.ingest.otel_writer import write_traces_jsonl
 from wmo.optimize.compression import (
+    DEFAULT_BULK_MIN_CHARS,
     CompressionConfig,
+    CompressionScope,
     Compressor,
     TruncateCompressor,
     register_compressor,
@@ -57,19 +60,32 @@ from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 runner = CliRunner()
 
 
-def _arm(compression: CompressionConfig | None) -> tuple[str, str, float]:
-    """The D-COMPRESS fields an episode measured under `compression` would carry.
+class _Arm(NamedTuple):
+    """The D-COMPRESS fields an episode measured under one compression config would carry.
 
     A matrix records the arm its rewards were produced under, and `fit` refuses to stamp a
     policy whose compression config disagrees, so a fixture fitting `--compressor` has to look
-    like episodes that actually ran that way.
+    like episodes that actually ran that way. SCOPE is part of that: it is identity-bearing, so a
+    fixture that omitted it would be refused as a different arm from any scoped fit.
     """
+
+    compressor_id: str
+    compressor_version: str
+    aggressiveness: float
+    scope: CompressionScope
+    bulk_min_chars: int
+
+
+def _arm(compression: CompressionConfig | None) -> _Arm:
+    """The row fields for `compression`, or the uncompressed defaults when there is none."""
     if compression is None:
-        return "", "", 0.0
-    return (
+        return _Arm("", "", 0.0, "conversation", DEFAULT_BULK_MIN_CHARS)
+    return _Arm(
         compression.compressor_id,
         compression.compressor_version,
         compression.aggressiveness,
+        compression.scope,
+        compression.bulk_min_chars,
     )
 
 
@@ -83,7 +99,7 @@ def _matrix_file(tmp_path: Path, *, compression: CompressionConfig | None = None
             name="b", kind=ProviderKind.OPENAI, model="b", input_per_mtok=1.0, output_per_mtok=1.0
         ),
     ]
-    arm_id, arm_version, arm_aggressiveness = _arm(compression)
+    arm = _arm(compression)
     outcomes = []
     tasks = {
         "s1": "SELECT count(*) FROM t",
@@ -103,9 +119,11 @@ def _matrix_file(tmp_path: Path, *, compression: CompressionConfig | None = None
                     reward=1.0 if wins else 0.0,
                     success=wins,
                     cost_usd=0.001,
-                    compressor_id=arm_id,
-                    compressor_version=arm_version,
-                    aggressiveness=arm_aggressiveness,
+                    compressor_id=arm.compressor_id,
+                    compressor_version=arm.compressor_version,
+                    aggressiveness=arm.aggressiveness,
+                    compressor_scope=arm.scope,
+                    compressor_bulk_min_chars=arm.bulk_min_chars,
                 )
             )
     path = tmp_path / "matrix.json"
@@ -207,7 +225,7 @@ def _knn_matrix_file(
         "write a gentle reminder about the expense deadline",
         "write a farewell note for a departing teammate",
     ]
-    arm_id, arm_version, arm_aggressiveness = _arm(compression)
+    arm = _arm(compression)
     outcomes = []
     for group, tasks in (("sql", sql), ("prose", prose)):
         for index, task in enumerate(tasks):
@@ -221,9 +239,11 @@ def _knn_matrix_file(
                         reward=1.0 if wins else 0.0,
                         success=wins,
                         cost_usd=0.001,
-                        compressor_id=arm_id,
-                        compressor_version=arm_version,
-                        aggressiveness=arm_aggressiveness,
+                        compressor_id=arm.compressor_id,
+                        compressor_version=arm.compressor_version,
+                        aggressiveness=arm.aggressiveness,
+                        compressor_scope=arm.scope,
+                        compressor_bulk_min_chars=arm.bulk_min_chars,
                     )
                 )
     path = tmp_path / name
@@ -2663,6 +2683,113 @@ def test_route_fit_knn_stamps_the_compression_it_was_fitted_under(tmp_path: Path
     # Both halves, so the mount gate has an identity to check rather than a null.
     assert policy.fit_compression is not None
     assert same_compression(policy.compression, policy.fit_compression)
+
+
+def test_route_fit_carries_scope_and_bulk_min_chars_onto_the_policy(tmp_path: Path) -> None:
+    # The scopes the measurements favor have to be reachable end to end, not just constructible in
+    # Python: a flag the CLI does not expose is a scope nobody can run.
+    config = CompressionConfig(
+        compressor_id="truncate", aggressiveness=0.5, scope="bulk", bulk_min_chars=1500
+    )
+    matrix_file = _knn_matrix_file(tmp_path, compression=config)
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--kind",
+            "knn",
+            "--out",
+            str(policy_file),
+            "--fallback",
+            "a",
+            "--min-pairs",
+            "0",
+            "--compressor",
+            "truncate",
+            "--aggressiveness",
+            "0.5",
+            "--scope",
+            "bulk",
+            "--bulk-min-chars",
+            "1500",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    policy = RoutingPolicy.load(policy_file)
+    assert policy.compression is not None
+    assert policy.compression.scope == "bulk"
+    assert policy.compression.bulk_min_chars == 1500
+    # And the arm gate accepted it, which is the whole point of threading identity through.
+    assert same_compression(policy.compression, policy.fit_compression)
+
+
+def test_an_unknown_scope_is_refused_naming_the_scopes_that_exist(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(_knn_matrix_file(tmp_path)),
+            "--kind",
+            "knn",
+            "--out",
+            str(tmp_path / "policy.json"),
+            "--fallback",
+            "a",
+            "--compressor",
+            "truncate",
+            "--scope",
+            "dialogue",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "unknown compression scope" in result.output
+    assert "observations" in result.output
+
+
+def test_the_no_removal_warning_fires_only_when_nothing_was_removed() -> None:
+    """F4: a compression arm that removed nothing must say so; spend happened either way.
+
+    A pure function so it can be asserted at this altitude: driving a whole sweep would need a
+    world model and live providers to prove a string.
+    """
+    arm = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    pool = [
+        PoolEntry(
+            name="a", kind=ProviderKind.OPENAI, model="a", input_per_mtok=1.0, output_per_mtok=1.0
+        )
+    ]
+
+    def _matrix(compressed: int) -> OutcomeMatrix:
+        return OutcomeMatrix(
+            pool=pool,
+            outcomes=[
+                ScenarioOutcome(
+                    scenario_id="s1",
+                    task="t",
+                    model="a",
+                    reward=1.0,
+                    tokens_in_raw=100,
+                    tokens_in_compressed=compressed,
+                    compressor_id="truncate",
+                    compressor_version="1",
+                    aggressiveness=0.5,
+                )
+            ],
+        )
+
+    dead = no_removal_warning(_matrix(100), arm)
+    assert dead is not None
+    assert "removed NOTHING" in dead
+    assert "keep 1.00" in dead
+    assert "one user message opening with the task" in dead  # names the cause
+    assert no_removal_warning(_matrix(60), arm) is None  # it removed something: silence
+    assert no_removal_warning(_matrix(100), None) is None  # no arm requested: silence
 
 
 def test_route_fit_knn_leaves_the_stamp_null_without_the_flag(tmp_path: Path) -> None:

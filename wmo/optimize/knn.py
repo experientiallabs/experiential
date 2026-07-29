@@ -320,10 +320,9 @@ def fit_knn_artifact(
     selected_ids = fit_ids if fit_ids is not None else matrix.scenario_ids()
     fit_digest = hashlib.sha256("\0".join(selected_ids).encode("utf-8")).hexdigest()[:16]
     # Representation consistency, the C2 rule that makes or breaks a compressed arm: the bank rows
-    # and the novelty-floor quantile have to live in the geometry of the text SERVING routes on.
-    # `routed_text_embedder` owns whether this arm's scope rewrites that text (so a scope that
-    # never touches a user turn fits on raw); one embedder covers the fit and the replay below.
-    # Serving does not wrap either way, because its compression stage runs ahead of the router.
+    # and the novelty-floor quantile have to live in the geometry of the query that DECIDES, which
+    # is the raw task statement in every scope (`routed_text_embedder` carries the reasoning and is
+    # the one place that could ever change it). One embedder covers the fit and the replay below.
     built = routed_text_embedder(embedder.build(), compression)
     embed_tag = embedder_provenance(embedder)
     policy = fit_knn_policy(

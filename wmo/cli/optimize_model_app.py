@@ -36,7 +36,9 @@ from rich.table import Table
 from wmo.cli.consent import require_spend_consent
 from wmo.cli.route_app import (
     BIAS_ACCEPTED_NOTE,
+    BULK_MIN_CHARS_HELP,
     NO_EVIDENCE_WARNING,
+    SCOPE_HELP,
     _compressor_note,
     cell_progress,
     print_coverage,
@@ -50,8 +52,10 @@ from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.closed_loop import scenario_id
 from wmo.optimize.compression import (
+    DEFAULT_BULK_MIN_CHARS,
     CompressionConfig,
     compression_signature,
+    parse_compression_scope,
     resolve_compression,
 )
 from wmo.optimize.knn import (
@@ -203,9 +207,8 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         None,
         "--compressor",
         help="Compress every request through this compressor before routing it (identity | "
-        "truncate | llmlingua2-endpoint). The sweep then measures that arm and the fit embeds "
-        "its bank through the same compressor, so the endpoint serves what was measured. "
-        "Default: no compression.",
+        "truncate | llmlingua2-endpoint). The sweep then measures that arm and the fit stamps it, "
+        "so the endpoint serves the arm that was measured. Default: no compression.",
     ),
     aggressiveness: float = typer.Option(
         0.0,
@@ -215,6 +218,10 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         help="Compressor-defined dial in [0, 1] for --compressor: 0.0 is a no-op and higher never "
         "removes less, but it is not an exact removal fraction (the achieved ratio is measured per "
         "episode).",
+    ),
+    scope: str = typer.Option("conversation", "--scope", help=SCOPE_HELP),
+    bulk_min_chars: int = typer.Option(
+        DEFAULT_BULK_MIN_CHARS, "--bulk-min-chars", min=1, help=BULK_MIN_CHARS_HELP
     ),
     embedder: str = typer.Option(
         "auto",
@@ -311,7 +318,12 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
             # Resolved at PLAN time, before the table: an unknown id, or an implementation that
             # could never be mounted, is a usage error. Discovering it after the sweep this arm
             # configured has been paid for would be discovering it too late to matter.
-            compression = resolve_compression(compressor, aggressiveness)
+            compression = resolve_compression(
+                compressor,
+                aggressiveness,
+                scope=parse_compression_scope(scope),
+                bulk_min_chars=bulk_min_chars,
+            )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     try:

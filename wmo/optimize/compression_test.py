@@ -7,6 +7,7 @@ from typing import cast
 import pytest
 
 from wmo.optimize.compression import (
+    DEFAULT_BULK_MIN_CHARS,
     CompressingEmbedder,
     CompressionConfig,
     CompressionResult,
@@ -282,6 +283,24 @@ def test_each_scope_selects_the_segments_it_names() -> None:
     assert positions("all") == (2, 3, 4)
 
 
+@pytest.mark.parametrize(
+    ("length", "eligible"),
+    [(DEFAULT_BULK_MIN_CHARS - 1, False), (DEFAULT_BULK_MIN_CHARS, True), (2001, True)],
+)
+def test_the_bulk_threshold_is_inclusive_at_exactly_its_default(
+    length: int, eligible: bool
+) -> None:
+    # Pinned at the boundary because "at least bulk_min_chars" is a decision, not an accident: a
+    # segment of exactly 2000 chars IS bulk. An off-by-one here silently moves which user content a
+    # bulk arm compresses, and no accuracy measurement would attribute the change to this.
+    segments = [
+        Segment(kind="user", text="the task statement"),
+        Segment(kind="user", text="x" * length),
+    ]
+    config = CompressionConfig(compressor_id="truncate", scope="bulk")
+    assert compressible_positions(segments, config) == ((1,) if eligible else ())
+
+
 def test_the_task_is_byte_identical_through_the_stage_at_full_aggressiveness() -> None:
     config = CompressionConfig(compressor_id="truncate", aggressiveness=1.0)
     result = compress_conversation(get_compressor("truncate"), _CONVERSATION, config)
@@ -323,35 +342,39 @@ def test_a_conversation_with_nothing_eligible_never_calls_the_compressor() -> No
     assert result.cost_usd == 0.0
 
 
-def test_only_a_scope_that_rewrites_the_routed_on_turn_wraps_the_fit_embedder() -> None:
-    # Serving routes on the last USER turn of the compressed transcript, so representation
-    # consistency has a direction and scope decides which way it points. Wrapping under a scope
-    # that never touches a user turn would put the bank in a geometry serving never queries: the
-    # C2 Q2 failure mirrored.
+def test_no_scope_wraps_the_fit_embedder_because_the_deciding_query_is_raw() -> None:
+    # The bank embeds bare task statements; serving routes on the last user turn, which on turn 1
+    # IS the task (stage law never compresses it); and sticky affinity means turns 2+ never consult
+    # the bank. So the deciding query is raw in EVERY scope, and a wrapped bank would be queried
+    # with raw text essentially always: the C2 Q2 failure caused by wrapping, not prevented by it.
     inner = _CountingEmbedder()
     base = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
-    assert isinstance(routed_text_embedder(inner, base), CompressingEmbedder)
-    assert isinstance(
-        routed_text_embedder(inner, base.model_copy(update={"scope": "all"})), CompressingEmbedder
-    )
-    for raw_routed in ("observations", "bulk"):
-        wrapped = routed_text_embedder(inner, base.model_copy(update={"scope": raw_routed}))
-        assert wrapped is inner, raw_routed
-    assert routed_text_embedder(inner, None) is inner  # an uncompressed arm never wraps
+    scopes: tuple[CompressionScope, ...] = ("conversation", "observations", "bulk", "all")
+    for scope in scopes:
+        assert routed_text_embedder(inner, base.model_copy(update={"scope": scope})) is inner, scope
+    assert routed_text_embedder(inner, None) is inner  # an uncompressed arm, unchanged as ever
 
 
-def test_an_observations_scope_fit_embeds_raw_and_a_conversation_scope_fit_does_not() -> None:
-    # The same rule read off the BYTES the fit embedder hands its inner embedder, not off types.
+def test_every_scope_fit_embeds_raw_bytes() -> None:
+    # The same rule read off the BYTES handed to the inner embedder, not off types, so a future
+    # wrap rule cannot pass this by returning a wrapper that happens to be a no-op.
     config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
-    conversation = _CountingEmbedder()
-    routed_text_embedder(conversation, config).embed(["one two three four"])
-    assert conversation.seen == [["one two"]]
+    scopes: tuple[CompressionScope, ...] = ("conversation", "observations", "bulk", "all")
+    for scope in scopes:
+        inner = _CountingEmbedder()
+        routed_text_embedder(inner, config.model_copy(update={"scope": scope})).embed(
+            ["one two three four"]
+        )
+        assert inner.seen == [["one two three four"]], scope
 
-    observations = _CountingEmbedder()
-    routed_text_embedder(observations, config.model_copy(update={"scope": "observations"})).embed(
-        ["one two three four"]
-    )
-    assert observations.seen == [["one two three four"]]  # raw: serving routes on raw here
+
+def test_compressing_embedder_is_still_available_for_deliberate_research_use() -> None:
+    # Demoted to explicit-use-only, not deleted: research code that wants a compressed-geometry
+    # bank constructs it directly and owns the reason.
+    inner = _CountingEmbedder()
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    CompressingEmbedder(inner, config).embed(["one two three four"])
+    assert inner.seen == [["one two"]]
 
 
 def test_compressing_embedder_embeds_the_compressed_text() -> None:

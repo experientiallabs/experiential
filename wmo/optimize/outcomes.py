@@ -17,6 +17,7 @@ from wmo.optimize.compression import (
     DEFAULT_BULK_MIN_CHARS,
     CompressionConfig,
     CompressionScope,
+    compression_signature,
 )
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
@@ -161,21 +162,35 @@ class OutcomeMatrix(BaseModel):
         Reads the scored rows only: an unscored row never produced a reward, so whatever it ran
         under cannot bias a fit.
         """
+        # The key mirrors `same_compression` exactly, `bulk_min_chars`'s scope-conditional
+        # inertness included: outside "bulk" scope that field cannot change a single emitted byte,
+        # so keying on it would split one arm in two and refuse the matrix while printing the same
+        # readable string twice, naming a difference the reader cannot see.
         configs = {
             (
                 o.compressor_id,
                 o.compressor_version,
                 o.aggressiveness,
                 o.compressor_scope,
-                o.compressor_bulk_min_chars,
+                o.compressor_bulk_min_chars if o.compressor_scope == "bulk" else None,
             )
             for o in self.outcomes
             if o.scored
         }
         if len(configs) > 1:
             readable = sorted(
-                f"{cid or 'uncompressed'}/{ver}/{agg:g}/{scope}"
-                for cid, ver, agg, scope, _chars in configs
+                compression_signature(
+                    CompressionConfig(
+                        compressor_id=cid,
+                        compressor_version=ver,
+                        aggressiveness=agg,
+                        scope=scope,
+                        bulk_min_chars=chars if chars is not None else DEFAULT_BULK_MIN_CHARS,
+                    )
+                )
+                if cid
+                else "uncompressed"
+                for cid, ver, agg, scope, chars in configs
             )
             raise ValueError(
                 "this matrix mixes compression configs across its scored rows "
@@ -184,7 +199,8 @@ class OutcomeMatrix(BaseModel):
             )
         if not configs:
             return None
-        compressor_id, compressor_version, aggressiveness, scope, bulk_min_chars = configs.pop()
+        compressor_id, compressor_version, aggressiveness, scope, bulk_chars = configs.pop()
+        bulk_min_chars = bulk_chars if bulk_chars is not None else DEFAULT_BULK_MIN_CHARS
         if not compressor_id:
             return None
         return CompressionConfig(

@@ -172,6 +172,61 @@ def test_a_matrix_that_mixes_arms_refuses_to_name_one() -> None:
         matrix.measured_compression()
 
 
+def _one_pool() -> list[PoolEntry]:
+    return [
+        PoolEntry(
+            name="a", kind=ProviderKind.OPENAI, model="a", input_per_mtok=1.0, output_per_mtok=1.0
+        )
+    ]
+
+
+def _row(scenario: str, **compression: object) -> ScenarioOutcome:
+    return ScenarioOutcome.model_validate(
+        {
+            "scenario_id": scenario,
+            "task": "t",
+            "model": "a",
+            "reward": 1.0,
+            "compressor_id": "truncate",
+            "compressor_version": "1",
+            "aggressiveness": 0.5,
+            **compression,
+        }
+    )
+
+
+def test_an_inert_bulk_threshold_does_not_split_one_arm_in_two() -> None:
+    # Outside "bulk" scope `bulk_min_chars` cannot change a single emitted byte, so rows that
+    # differ only in it are ONE arm. Keying the mixing check on it refused the matrix while
+    # printing the same string twice, naming a difference the reader could not see.
+    matrix = OutcomeMatrix(
+        pool=_one_pool(),
+        outcomes=[
+            _row("s1", compressor_bulk_min_chars=2000),
+            _row("s2", compressor_bulk_min_chars=4096),
+        ],
+    )
+    measured = matrix.measured_compression()
+    assert measured is not None
+    assert measured.scope == "conversation"
+
+
+def test_a_live_bulk_threshold_does_split_two_arms_and_the_message_shows_it() -> None:
+    # In "bulk" scope the same field decides which user content gets compressed, so now the rows
+    # really are two arms, and the refusal has to render the difference it is refusing over.
+    matrix = OutcomeMatrix(
+        pool=_one_pool(),
+        outcomes=[
+            _row("s1", compressor_scope="bulk", compressor_bulk_min_chars=2000),
+            _row("s2", compressor_scope="bulk", compressor_bulk_min_chars=4096),
+        ],
+    )
+    with pytest.raises(ValueError, match="mixes compression configs") as caught:
+        matrix.measured_compression()
+    assert "over 2000 chars" in str(caught.value)
+    assert "over 4096 chars" in str(caught.value)
+
+
 def test_an_unscored_row_does_not_decide_the_arm() -> None:
     # An unscored episode produced no reward, so whatever it ran under cannot bias a fit.
     matrix = OutcomeMatrix(

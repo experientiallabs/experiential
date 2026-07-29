@@ -566,27 +566,19 @@ def _bank_of(tmp_path: Path, config: CompressionConfig | None, tag: str) -> np.n
     return fitted.policy.knn_bank().embeddings
 
 
-def test_the_fit_wraps_its_embedder_only_when_the_scope_rewrites_the_routed_on_turn(
-    tmp_path: Path,
-) -> None:
-    """Both directions at the real fit site (the ruling's interim representation rule).
+def test_every_compression_arm_fits_its_bank_on_raw_text(tmp_path: Path) -> None:
+    """The route-on-raw representation rule, at the real fit site.
 
-    Serving routes on the last USER turn of the compressed transcript, so only a scope that can
-    rewrite a user turn changes the routed-on representation. A "conversation" arm must therefore
-    fit its bank in compressed geometry, and an "observations" arm must fit on RAW text: wrapping
-    there would put the bank in a geometry serving never queries, which is the C2 Q2 mismatch
-    mirrored. Compared against the uncompressed bank rather than against types, so the assertion
-    is about the embeddings this fit actually wrote.
+    The bank embeds bare task statements, serving routes on the last user turn (which on turn 1 is
+    the task that stage law never compresses), and sticky affinity means turns 2+ never consult the
+    bank. So the deciding query is raw whatever the scope, and a bank fitted through the compressor
+    would be queried with raw text essentially always: the C2 Q2 failure caused BY the wrap.
+
+    Asserted on the embeddings the fit actually wrote rather than on embedder types, so a
+    reintroduced wrap cannot slip past this.
     """
     raw = _bank_of(tmp_path, None, "raw")
-    conversation = _bank_of(
-        tmp_path, CompressionConfig(compressor_id="truncate", aggressiveness=0.5), "conversation"
-    )
-    observations = _bank_of(
-        tmp_path,
-        CompressionConfig(compressor_id="truncate", aggressiveness=0.5, scope="observations"),
-        "observations",
-    )
-
-    assert not np.allclose(conversation, raw)  # compressed geometry: the router queries it that way
-    assert np.array_equal(observations, raw)  # raw geometry: every routed-on query arrives raw
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    for scope in ("conversation", "observations", "bulk", "all"):
+        banked = _bank_of(tmp_path, config.model_copy(update={"scope": scope}), f"scope-{scope}")
+        assert np.array_equal(banked, raw), scope

@@ -114,7 +114,7 @@ from wmo.providers.base import (
     ToolCallingProvider,
 )
 from wmo.providers.pool import PoolEntry, pool_provider
-from wmo.serving.endpoint_config import EndpointConfig
+from wmo.serving.endpoint_config import ENDPOINT_CONFIG_FILENAME, EndpointConfig
 from wmo.serving.query_embeddings import QueryEmbeddingStore
 from wmo.serving.savings import EndpointSavings, SavingsWindow, compute_savings
 
@@ -745,11 +745,24 @@ class EndpointRuntime:
             # collapses to the expensive fallback while accuracy sits flat (C2 Q2). Disabling
             # compaction on such an endpoint would produce exactly that, silently, so it does
             # not mount.
+            #
+            # Server-wide, deliberately, matching the house pattern for a broken serving artifact
+            # (`wmo.serving.server`: a policy.json that will not load and an endpoint.toml the
+            # policy cannot honor both fail `create_app` outright; only additive metadata like
+            # card.json degrades to None). An endpoint that answers every request with routing
+            # silently collapsed is the failure nothing downstream notices, which is exactly what
+            # fail-fast is for.
+            #
+            # The remedy names both entry points because there are two: a disk-loaded endpoint
+            # sets the file key, and an in-process caller passes the argument.
             raise ValueError(
                 f"this {policy.kind} policy's routing evidence was fitted on "
-                f"{compression_signature(policy.fit_compression)}, so it can only be served "
-                "with compaction enabled: set `compaction_enabled = true` in this endpoint's "
-                "endpoint.toml, or serve a policy fitted on raw text."
+                f"{compression_signature(policy.fit_compression)}, so it can only be served with "
+                "compaction enabled. Set `compaction_enabled = true` in this endpoint's "
+                f"{ENDPOINT_CONFIG_FILENAME} and restart the server (the flag is read at mount, "
+                "so it is not a live setting like cost_quality), pass "
+                "compaction_enabled=True if you are constructing EndpointRuntime directly, or "
+                "serve a policy fitted on raw text."
             )
         return None
 
@@ -928,6 +941,44 @@ class EndpointRuntime:
                 embedder = self._policy_embedder
         return embedder
 
+    def _stored_reply(
+        self, compressed: list[ChatMessage], reply: ChatMessage, stats: CompressionStats | None
+    ) -> ChatMessage:
+        """The assistant reply as it must be STORED: compressed, if this scope compresses replies.
+
+        Storing the RAW reply is an append-only violation the moment a scope makes assistant turns
+        eligible ("all"). The next turn would serve the stored prefix verbatim on an affinity HIT
+        (raw reply) but recompress the whole transcript on a MISS (compressed reply), so the
+        provider-visible prefix would depend on cache state and the prompt cache would be forfeited
+        exactly when it was warmest. Compressing before storing makes the two paths agree: the miss
+        path runs the same compressor over the same segment, and per-segment determinism means it
+        reproduces these bytes.
+
+        Runs the reply through the choke point with `mutable_from` at the reply's own index, so
+        scope selection sees the whole conversation (the task stays protected) while only the reply
+        can be rewritten. Under every scope but "all" the reply is not eligible, nothing is handed
+        to the compressor, and this is free.
+
+        `stats` is the request's compression accounting; the compressor's bill and wall clock for
+        this call are folded in, because the client waits for it and it is real money.
+        """
+        with self._lock:
+            policy = self.policy
+            compressor = self._compressor
+        config = policy.compression
+        if config is None or compressor is None:
+            return reply
+        started = time.monotonic()
+        staged = [*compressed, reply]
+        rewritten = compress_conversation(
+            compressor, _segments(staged), config, mutable_from=len(compressed)
+        )
+        if stats is not None:
+            stats.cost_usd += rewritten.cost_usd
+            stats.latency_s += time.monotonic() - started
+        text = rewritten.texts[-1]
+        return reply if text == reply.content else reply.model_copy(update={"content": text})
+
     def remember(
         self,
         messages: list[ChatMessage],
@@ -935,6 +986,7 @@ class EndpointRuntime:
         model: str,
         *,
         compressed: list[ChatMessage] | None = None,
+        stats: CompressionStats | None = None,
     ) -> None:
         """Record the finished exchange so the conversation's next request finds its incumbent.
 
@@ -946,7 +998,9 @@ class EndpointRuntime:
         `messages` must be the RAW request messages (the client resends that transcript, so the
         fingerprint must match it). `compressed` is the provider-visible transcript when
         compression ran; stored under the same key so the next turn reuses the exact bytes the
-        provider's prompt cache was written with.
+        provider's prompt cache was written with. The reply is stored COMPRESSED (see
+        `_stored_reply`), which is what keeps the stored prefix identical to what the miss path
+        would recompute under a scope that makes assistant turns eligible.
 
         The two caches are bounded independently (entries for affinity, bytes for transcripts),
         so they can disagree about which conversations they remember. Both directions of
@@ -955,6 +1009,11 @@ class EndpointRuntime:
         and an affinity entry evicted while its prefix survives simply re-routes while still
         reusing the exact bytes that fingerprint was stored with.
         """
+        # The reply is compressed OUTSIDE the lock: it can be a compressor round trip, and holding
+        # the lock across it would head-of-line-block every other conversation's affinity lookup.
+        stored_reply = (
+            self._stored_reply(compressed, reply, stats) if compressed is not None else reply
+        )
         transcript = [*messages, reply]
         key = _fingerprint(transcript)
         with self._lock:
@@ -963,7 +1022,7 @@ class EndpointRuntime:
             while len(self._affinity) > _AFFINITY_CAPACITY:
                 self._affinity.popitem(last=False)
             if compressed is not None:
-                transcript = [*compressed, reply]
+                transcript = [*compressed, stored_reply]
                 previous = self._compressed.pop(key, None)
                 if previous is not None:
                     self._compressed_bytes -= previous[1]
@@ -1650,6 +1709,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 reply,
                 decision.model,
                 compressed=provider_messages if compression else None,
+                stats=compression,
             )
             if not request.stream:
                 _record(usage, ttfb_ms=None)
@@ -1741,6 +1801,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 ChatMessage(role="assistant", content=completion.text),
                 decision.model,
                 compressed=provider_messages if compression else None,
+                stats=compression,
             )
             _record(completion.usage, ttfb_ms=None)
             return Response(
@@ -1849,6 +1910,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 ChatMessage(role="assistant", content="".join(parts)),
                 decision.model,
                 compressed=provider_messages if compression else None,
+                stats=compression,
             )
             stream_state["recorded"] = True
             _record(usage, ttfb_ms=ttfb_ms)

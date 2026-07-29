@@ -313,10 +313,16 @@ register_compressor(_RECORDER)
 def test_a_compressed_policys_report_replays_in_the_geometry_it_was_fitted_in() -> None:
     """The reporting half of representation consistency (C2's Q2 rule).
 
-    A compressed endpoint's bank lives in the geometry of compressed text, and serving compresses
-    each request before the router embeds it. A report that embedded RAW task text against that
-    bank would measure a policy nobody serves: the queries land farther from every row, the novelty
-    floor trips, and routing reads as collapsed to the fallback.
+    The rule is that the replay must embed the way the FIT did, or the report measures a policy
+    nobody serves. Since the deciding query is the RAW task statement in every scope
+    (`wmo.optimize.compression.routed_text_embedder` carries the reasoning: the bank holds task
+    statements, serving routes on the last user turn, turn 1's last user turn is the
+    never-compressed task, and sticky affinity keeps turns 2+ off the bank), a compressed arm's
+    bank is fitted raw and its report replays raw. The compressor is not consulted at all.
+
+    This assertion used to run the other way. It was inverted with the wrap rule itself when the
+    gate review found that wrapping CAUSED the C2 Q2 mismatch on the only queries that decide
+    anything, rather than preventing it.
     """
     _RECORDER.seen.clear()
     arm = CompressionConfig(compressor_id=_RecordingCompressor.id, aggressiveness=0.5)
@@ -329,8 +335,8 @@ def test_a_compressed_policys_report_replays_in_the_geometry_it_was_fitted_in() 
         generated_at="2026-07-24T00:00:00Z",
     )
     assert report.scenario_count == 2
-    # Every routed scenario's task text went through the compressor on its way to the embedder.
-    assert sorted(_RECORDER.seen) == sorted([_SQL_TASK, _PROSE_TASK])
+    # Raw, exactly as the bank was fitted: the replay never reached for the compressor.
+    assert _RECORDER.seen == []
 
 
 def test_an_uncompressed_policys_report_embeds_the_task_text_as_it_is() -> None:

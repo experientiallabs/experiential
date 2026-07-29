@@ -198,12 +198,9 @@ def build_report(
     embedder = policy.embedder.build() if policy.kind != "static" else None
     if embedder is not None:
         # Representation consistency, on the reporting side: the replay has to embed the way the
-        # FIT did, or it measures a policy nobody serves. On an arm whose scope rewrites the
-        # routed-on text, replaying on raw task text would land every query farther from every
-        # bank row and show routing collapsing to the fallback (C2 measured the floor tripping
-        # 10-13x more often under exactly that mismatch); on an arm whose scope does not, wrapping
-        # would invent the same error in reverse. `routed_text_embedder` is the one place that
-        # decides, so the report cannot disagree with the fit about it.
+        # FIT did, or it measures a policy nobody serves. Routing it through the same
+        # `routed_text_embedder` the fit used is what guarantees they cannot disagree, whichever
+        # way that function's rule goes.
         embedder = routed_text_embedder(embedder, policy.compression)
 
     routed_rows: dict[str, list[ScenarioOutcome]] = {}

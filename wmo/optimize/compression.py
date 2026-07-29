@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable, Sequence
-from typing import Literal, Protocol, runtime_checkable
+from typing import Literal, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -48,6 +48,28 @@ DEFAULT_BULK_MIN_CHARS = 2000
 
 CompressionScope = Literal["conversation", "observations", "bulk", "all"]
 """Which segments of a conversation a config may rewrite (see `CompressionConfig`)."""
+
+COMPRESSION_SCOPES: tuple[CompressionScope, ...] = (
+    "conversation",
+    "observations",
+    "bulk",
+    "all",
+)
+"""Every accepted scope, in escalating order. The one source `--scope`'s help renders from."""
+
+
+def parse_compression_scope(value: str) -> CompressionScope:
+    """Narrow a `--scope` string to the literal, naming the choices when it is not one of them.
+
+    Raises:
+        ValueError: `value` is not a scope, listing the ones that are.
+    """
+    if value not in COMPRESSION_SCOPES:
+        raise ValueError(
+            f"unknown compression scope {value!r}; choose one of {' | '.join(COMPRESSION_SCOPES)}"
+        )
+    return cast("CompressionScope", value)
+
 
 SegmentKind = Literal["system", "user", "assistant", "observation"]
 """What one segment IS, in the seam's own vocabulary rather than any caller's role enum.
@@ -483,19 +505,17 @@ def compress_conversation(
 
 
 class CompressingEmbedder:
-    """Embeds the COMPRESSED form of each text, so a fit sees what serving will see.
+    """Embeds the COMPRESSED form of each text. EXPLICIT USE ONLY: no fit reaches for this.
 
-    The fit-side half of representation consistency (C2's Q2 result). A routing bank and its
-    novelty floor are geometry: fit them on raw task text and then query them with compressed
-    text and the queries land farther from every bank row, the floor trips 10-13x more often,
-    and the router abstains to the expensive fallback on 20-30% more requests. Wrapping the fit's
-    embedder is all it takes to move the bank and the floor onto the served representation.
+    Kept as a tool, not a policy. It was the fit-side half of representation consistency until
+    the decision-bearing query turned out to be raw (see `routed_text_embedder`, which is what
+    every fit and report goes through and which no longer wraps anything). Research code that
+    deliberately wants a compressed-geometry bank constructs this directly and owns the reason;
+    production fits must not, because a bank in a geometry serving does not query is the C2 Q2
+    failure whichever direction it points in.
 
-    Serving does NOT wrap its embedder: the compression stage has already rewritten the request
-    by the time the router embeds it, so wrapping there would compress twice.
-
-    Whether a given arm should wrap at all is `routed_text_embedder`'s decision, not a call
-    site's; construct this directly only when you mean to compress unconditionally.
+    Serving does not wrap its embedder either: the compression stage has already rewritten the
+    request by the time the router embeds it, so wrapping there would compress twice.
 
     As few compressor calls per `embed` batch as the compressor's cap allows, not one per text:
     fitting a bank means compressing every fit scenario, which would otherwise be a round trip
@@ -513,43 +533,41 @@ class CompressingEmbedder:
         return self._inner.embed(compressed.segments)
 
 
-# The scopes that rewrite the text serving routes on. Serving embeds the last USER turn of the
-# compressed transcript, so only a scope that can compress a user turn changes the routed-on
-# representation. "observations" and "bulk" leave every routed-on query raw ("bulk" can compress a
-# pasted user document, but a segment that large is not what `_routable_text` hands the router in
-# any measured traffic, and treating it as one would put the bank in a geometry almost no query
-# lands in).
-_ROUTED_TEXT_SCOPES: frozenset[CompressionScope] = frozenset({"conversation", "all"})
+# The scopes under which a fit embeds COMPRESSED text. Deliberately empty: see
+# `routed_text_embedder` for why the decision-bearing query is raw in every scope. Kept as the one
+# named place the rule lives, so adopting a different serving contract is an edit here rather than
+# a hunt through the fit sites.
+_ROUTED_TEXT_SCOPES: frozenset[CompressionScope] = frozenset()
 
 
 def routed_text_embedder(inner: Embedder, config: CompressionConfig | None) -> Embedder:
-    """The embedder a fit (or a report replay) must use for `config`'s arm.
+    """The embedder a fit (or a report replay) must use for `config`'s arm: always the raw one.
 
-    Representation consistency has a direction, and scope decides which way it points. A routing
-    bank, its cluster centroids, and its novelty-floor quantile are geometry in the space of the
-    text the fit embedded, and serving queries that geometry with the text it routes on: the last
-    USER turn of the compressed transcript (`wmo.serving.chat._routable_text`). So the rule is
-    whether this arm's scope can rewrite that turn at all:
+    Representation consistency is about the query that DECIDES something, and for a knn endpoint
+    that query is raw whatever the scope, for three reasons that compound:
 
-    - "conversation" and "all" can, so the fit wraps and the bank lives in compressed geometry.
-      Not wrapping is the C2 Q2 failure: queries land farther from every bank row, the novelty
-      floor trips 10-13x more often, routing collapses to the expensive fallback, and cost rises
-      11-41% while accuracy sits flat to negative.
-    - "observations" and "bulk" cannot: no user turn is ever a candidate, so every routed-on query
-      arrives raw. Wrapping there would put the bank in a geometry serving NEVER queries, which is
-      the same failure mirrored, so these arms fit on raw text.
+    - the bank embeds bare TASK STATEMENTS, one row per fit scenario;
+    - serving routes on the last user turn (`wmo.serving.chat._routable_text`), and on turn 1 of
+      every conversation that turn IS the task, which stage law never compresses;
+    - conversation affinity is sticky by default, so turns 2+ reuse the incumbent and never
+      consult the bank at all.
 
-    The wrap decision does not touch arm identity: `fit_compression` still stamps the whole config
-    either way, so the mount gates and the measured-arm gates behave exactly as they do now.
+    So the decision-bearing query is the raw task, and a bank fitted through the compressor would
+    be queried with raw text essentially always: the C2 Q2 failure (queries land farther from every
+    bank row, the novelty floor trips 10-13x more often, routing collapses to the expensive
+    fallback, cost up 11-41% while accuracy sits flat to negative) CAUSED by wrapping rather than
+    prevented by it. Hence banks are fitted raw, in every scope. This adopts the co-signed
+    route-on-raw direction early and matches what serving actually embeds when it decides.
 
-    KNOWN RESIDUAL, interim: under "conversation" and "all" the routed-on text is compressed on
-    later turns but RAW on the first turn of every conversation, because the last user turn is
-    then the protected task. A wrapped bank is therefore right for most queries and slightly off
-    for first-turn ones, which is a mixture rather than the clean mismatch above. The uniform fix
-    is the route-on-raw serving contract (route on the raw last user turn, so the routed-on
-    representation is raw in every scope and no fit ever wraps), pending the routing lane's
-    co-sign; this rule converges to it, since adopting that contract just empties
-    `_ROUTED_TEXT_SCOPES`.
+    Arm identity is untouched: `fit_compression` still stamps the whole config, so both mount gates
+    and the measured-arm gate behave exactly as before. The wrap decision was never part of
+    identity.
+
+    DOCUMENTED RESIDUAL: an endpoint with stickiness OFF, under "conversation" or "all" scope,
+    embeds compressed text on turns 2+ against this raw bank. That is the narrow remaining
+    mismatch, it needs a non-default serving configuration to reach, and the uniform fix is the
+    serving-side route-on-raw change (route on the RAW last user turn, so the routed-on
+    representation is raw on every turn) which belongs to the routing co-sign round.
     """
     if config is None or config.scope not in _ROUTED_TEXT_SCOPES:
         return inner

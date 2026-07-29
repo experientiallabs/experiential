@@ -232,9 +232,15 @@ def _endpoint_runtimes(
         except ValueError as exc:
             # Fail fast and name the file: a dial the policy cannot honor (a savings position on
             # a policy fitted without costs) must not degrade silently to the fitted knobs.
-            raise ValueError(
-                f"{config_path} for endpoint {name!r} cannot be served: {exc}"
-            ) from exc
+            # An endpoint with no config file has no path to name, and printing "None ... cannot be
+            # served" sent operators looking for a file that was never there; say which endpoint
+            # instead, and that its settings are defaults.
+            where = (
+                f"{config_path} for endpoint {name!r}"
+                if config_path is not None
+                else f"endpoint {name!r} (no {ENDPOINT_CONFIG_FILENAME}, serving defaults)"
+            )
+            raise ValueError(f"{where} cannot be served: {exc}") from exc
     return runtimes
 
 

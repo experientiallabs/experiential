@@ -2742,6 +2742,50 @@ def test_all_scope_reaches_dialogue_but_neither_the_task_nor_the_system_prompt(
     assert _rows(log_path)[-1]["compressor_id"] == "truncate"
 
 
+def test_all_scope_serves_identical_bytes_on_an_affinity_hit_and_a_miss(tmp_path: Path) -> None:
+    """The append-only property under a scope that makes the assistant reply eligible.
+
+    The reply used to be stored RAW while the miss path recompressed it, so the provider-visible
+    prefix depended on cache state: a hit served a raw reply, an eviction served a compressed one,
+    and the prompt cache was forfeited exactly when it was warmest. Storing the reply already
+    compressed makes both paths produce the same bytes, which is what append-only means here.
+    """
+    config = CompressionConfig(compressor_id="truncate", aggressiveness=0.5, scope="all")
+    turn_one = [{"role": "user", "content": "the task"}]
+
+    def _second_turn(runtime: EndpointRuntime, client: TestClient, evict: bool) -> list[str]:
+        first = client.post(
+            "/v1/chat/completions", json={"model": "tau-bench", "messages": turn_one}
+        )
+        reply = first.json()["choices"][0]["message"]["content"]
+        assert len(reply.split()) > 1, "the reply must be long enough for compression to show"
+        if evict:
+            with runtime._lock:
+                runtime._affinity.clear()
+                runtime._clear_compressed()
+        second = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tau-bench",
+                "messages": [
+                    *turn_one,
+                    {"role": "assistant", "content": reply},
+                    {"role": "user", "content": "five six seven eight"},
+                ],
+            },
+        )
+        assert second.status_code == 200
+        return [m.content for m in providers["haiku-4-5"].seen[-1][1]]
+
+    client, _, runtime, providers = _compressed_runtime(tmp_path / "hit", config)
+    on_hit = _second_turn(runtime, client, evict=False)
+    client, _, runtime, providers = _compressed_runtime(tmp_path / "miss", config)
+    on_miss = _second_turn(runtime, client, evict=True)
+
+    assert on_hit == on_miss  # cache state cannot change what the provider sees
+    assert on_hit[0] == "the task"  # still the protected task, on both paths
+
+
 def test_the_first_user_turn_survives_the_top_of_the_dial(tmp_path: Path) -> None:
     # Aggressiveness 1.0 removes every word truncate is handed. The task statement still arrives
     # byte-identical, because protection is a property of the stage and not of the dial.
@@ -2809,13 +2853,21 @@ def test_disabling_compaction_on_a_compressed_fit_refuses_to_mount(tmp_path: Pat
     policy = _knn_policy(tmp_path).model_copy(
         update={"compression": config, "fit_compression": config}
     )
-    with pytest.raises(ValueError, match="compaction_enabled = true"):
+    with pytest.raises(ValueError, match="compaction_enabled = true") as caught:
         EndpointRuntime(
             name="tau-bench",
             policy=policy,
             provider_factory=_EchoProvider,
             log=RequestLog(tmp_path / "requests.jsonl"),
         )
+    message = str(caught.value)
+    # The flag is read at mount, so the remedy has to say the server must come back up; an
+    # operator who set it and watched nothing change was the failure here.
+    assert "restart" in message
+    # And it names the in-process entry point too, because this runtime is constructible directly
+    # (injected policies) where there is no file to edit at all.
+    assert "compaction_enabled=True" in message
+    assert "endpoint.toml" in message
 
 
 def test_mounting_a_mismatched_compression_artifact_fails_loudly(tmp_path: Path) -> None:

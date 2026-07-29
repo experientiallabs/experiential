@@ -542,6 +542,25 @@ def test_endpoint_toml_is_where_compaction_gets_turned_on(tmp_path: Path) -> Non
     assert runtimes["support"]._compressor is None
 
 
+def test_a_mount_failure_without_a_config_file_names_the_endpoint_not_none(tmp_path: Path) -> None:
+    # An endpoint with no endpoint.toml has no path to name. The message used to interpolate the
+    # missing path and read "None ... cannot be served", which sent operators looking for a file
+    # that was never there. The blast radius is deliberately server-wide, matching how a
+    # policy.json that will not load is handled: an endpoint serving with routing silently
+    # collapsed is the failure nothing downstream notices.
+    model_dir, policy = _knn_policy_dir(tmp_path)
+    arm = CompressionConfig(compressor_id="truncate", aggressiveness=0.5)
+    needs_compaction = policy.model_copy(update={"compression": arm, "fit_compression": arm})
+    assert not (model_dir / ENDPOINT_CONFIG_FILENAME).exists()
+
+    with pytest.raises(ValueError) as error:
+        _endpoint_runtimes({"support": needs_compaction}, {"support": model_dir}, RequestLog(None))
+    message = str(error.value)
+    assert "None" not in message
+    assert "support" in message
+    assert ENDPOINT_CONFIG_FILENAME in message
+
+
 def test_endpoint_toml_can_switch_the_query_embedding_store_off(tmp_path: Path) -> None:
     # "Default on and undisableable" is not a choice an operator should be denied: an embedding
     # is request content at rest, and whether to keep it is a tenancy decision.

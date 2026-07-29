@@ -42,7 +42,11 @@ from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
 from wmo.optimize.compression import (
+    COMPRESSION_SCOPES,
+    DEFAULT_BULK_MIN_CHARS,
+    CompressionConfig,
     compression_signature,
+    parse_compression_scope,
     registered_compressor_ids,
     resolve_compression,
     routed_text_embedder,
@@ -113,6 +117,23 @@ DEFAULT_MATRIX_FILENAME = "matrix.json"
 
 COMPRESSOR_IDS_HELP = " | ".join(registered_compressor_ids())
 """What `--compressor` accepts, rendered from the registry so the help cannot go stale."""
+
+SCOPE_HELP = (
+    f"Which segments --compressor may rewrite ({' | '.join(COMPRESSION_SCOPES)}). "
+    "`conversation` (default) is user turns; `observations` is tool/environment output only and "
+    "is the safe choice for a stock scorer (compressing dialogue measured 6-17 accuracy points "
+    "worse at 2.3x the cost, while removing 40% of observation bulk held accuracy inside the "
+    "noise floor); `bulk` adds pasted user documents over --bulk-min-chars; `all` adds dialogue "
+    "and is for a domain-adapted scorer at a calibrated threshold. The task statement and the "
+    "system prompt are never compressed in any scope."
+)
+"""Shared by `route sweep`, `route fit`, and `optimize model`, so the three cannot describe the
+same flag differently."""
+
+BULK_MIN_CHARS_HELP = (
+    "How large a user segment must be for `--scope bulk` to treat it as a pasted document "
+    "rather than a typed turn. Inert in every other scope."
+)
 
 _MATRIX_DIGEST_MARK = "sha256="
 """How `load_matrix_with_digest` spells the digest inside a policy's `fitted_from`."""
@@ -216,6 +237,10 @@ def sweep(
         "never removes less, but it is not an exact removal fraction (the achieved ratio is "
         "recorded per episode).",
     ),
+    scope: str = typer.Option("conversation", "--scope", help=SCOPE_HELP),
+    bulk_min_chars: int = typer.Option(
+        DEFAULT_BULK_MIN_CHARS, "--bulk-min-chars", min=1, help=BULK_MIN_CHARS_HELP
+    ),
 ) -> None:
     """Measure every pool candidate closed-loop and write the outcome matrix `fit` consumes.
 
@@ -296,7 +321,12 @@ def sweep(
         try:
             # Checked before a single episode is paid for, and against the SERVING rule: there
             # is no point measuring an arm whose compressor could never be mounted.
-            sweep_compression = resolve_compression(compressor, aggressiveness)
+            sweep_compression = resolve_compression(
+                compressor,
+                aggressiveness,
+                scope=parse_compression_scope(scope),
+                bulk_min_chars=bulk_min_chars,
+            )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     store = WorldModelStore(root)
@@ -374,6 +404,11 @@ def sweep(
     print_world_model_spend(_console, run)
     rows = coverage(matrix)
     print_coverage(_console, rows)
+    dead_arm = no_removal_warning(matrix, sweep_compression)
+    if dead_arm is not None:
+        # Before the coverage gates below, which can exit: an operator who just paid for a
+        # compressor that never ran must hear it whichever way this command ends.
+        _console.print(dead_arm)
     if scored == 0:
         # Exit non-zero: a matrix with no verified reward is not evidence, so `sweep && fit` in a
         # script must stop here rather than fit on it. The rows are on disk for their `error`s.
@@ -492,6 +527,41 @@ def cell_progress(console: Console, cells: int) -> Callable[[ScenarioOutcome], N
         )
 
     return _on_outcome
+
+
+def no_removal_warning(matrix: OutcomeMatrix, compression: CompressionConfig | None) -> str | None:
+    """The warning for a compression arm that removed NOTHING, or None when it removed something.
+
+    The spend was real and the matrix is honest: every row records what it measured. The problem is
+    that what it measured is the UNCOMPRESSED arm, and nothing else in the pipeline can tell,
+    because a fit stamps the arm the flags name rather than the arm the rows achieved. An operator
+    who paid for a sweep deserves to hear that before they read a comparison into it.
+
+    The near-certain cause on the built-in agent is worth naming rather than leaving to be
+    rediscovered: `LLMAgent` renders each turn as ONE user message that opens with the task, and
+    the task is stage-law protected, so no segment is ever eligible whatever the scope. The
+    observation-bearing scopes need tool-role segments, which that agent's transcript does not
+    produce at all.
+
+    Reads only scored rows with nonzero accounting, so an all-unscored sweep (which has its own
+    louder warning) does not also claim the compressor achieved nothing.
+    """
+    if compression is None:
+        return None
+    measured = [o for o in matrix.outcomes if o.scored and o.tokens_in_raw > 0]
+    if not measured or any(o.tokens_in_compressed < o.tokens_in_raw for o in measured):
+        return None
+    return (
+        "[yellow]warning[/yellow] this arm removed NOTHING: all "
+        f"{len(measured)} scored row(s) achieved keep 1.00 under "
+        f"{escape(compression_signature(compression))}, so the sweep measured the UNCOMPRESSED "
+        "arm and paid for a compressor that never had an eligible segment.\n"
+        "  With the built-in agent that is expected, not a bug: it renders each turn as one user "
+        "message opening with the task, the task is never compressed, and the "
+        "observation-bearing scopes need tool-role segments it does not emit.\n"
+        "  The rows are honest, but `fit` will stamp the arm you NAMED, not the arm this "
+        "measured: do not read a compression result off this matrix."
+    )
 
 
 def uneven_warning(rows: list[CandidateCoverage]) -> str | None:
@@ -987,6 +1057,10 @@ def fit(
         "less, but it is not an exact removal fraction (the achieved ratio is reported per "
         "call). Only meaningful with --compressor.",
     ),
+    scope: str = typer.Option("conversation", "--scope", help=SCOPE_HELP),
+    bulk_min_chars: int = typer.Option(
+        DEFAULT_BULK_MIN_CHARS, "--bulk-min-chars", min=1, help=BULK_MIN_CHARS_HELP
+    ),
 ) -> None:
     """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
     if kind not in ("rank", "knn"):
@@ -1029,7 +1103,12 @@ def fit(
         try:
             # Fail before the fit spends anything: model_copy below skips validators, and an
             # unservable compressor would otherwise only surface when serving mounts the result.
-            compression = resolve_compression(compressor, aggressiveness)
+            compression = resolve_compression(
+                compressor,
+                aggressiveness,
+                scope=parse_compression_scope(scope),
+                bulk_min_chars=bulk_min_chars,
+            )
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
     # The rewards in this matrix were produced under SOME compression config, and a joint fit is
@@ -1082,9 +1161,9 @@ def fit(
         print_knn_fit(_console, fitted, out=out, z=z)
         return
     # ONE embedder for fit and evaluation; azure would otherwise embed twice. Representation
-    # consistency: the cluster centroids have to live in the geometry of the text serving routes
-    # on, which `routed_text_embedder` decides from the arm's scope (see `fit_knn_artifact`, which
-    # applies the same rule to the bank on the knn path).
+    # consistency: the cluster centroids have to live in the geometry of the query that decides,
+    # which `routed_text_embedder` owns (see `fit_knn_artifact`, which applies the same rule to the
+    # bank on the knn path).
     built = routed_text_embedder(spec.build(), compression)
     try:
         policy = fit_rank_policy(
