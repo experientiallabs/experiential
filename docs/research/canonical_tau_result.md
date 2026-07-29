@@ -18,10 +18,12 @@ negative result kept.
 ## Why this is credible (the method, before the numbers)
 
 1. Simulated and real are never blurred. The world model built from tau-bench traces supplies
-   the closed-loop evidence for FITTING policies (its rank agreement with reality was measured
-   before it was trusted: the sim picks the real winner, and errs pessimistic). Every headline
-   quality/cost claim is then checked on REAL tau2 episodes through the same serving path a
-   customer uses. Numbers below carry [wm] or [real] tags.
+   the closed-loop evidence for FITTING policies; every headline quality/cost claim is then
+   checked on REAL tau2 episodes through the same serving path a customer uses, under a
+   pre-registered pass/fail rule. Numbers below carry [wm] or [real] tags. This check has
+   TEETH: the earlier sim-to-real result (the sim picks the real winner, errs pessimistic)
+   did NOT survive at the top of this pool - the real-episode section below reports the WM's
+   quality ranking inverting against reality, and the claims re-scoped accordingly.
 2. Cost means cache-adjusted effective cost per completed task. Not per-token price: a model
    that is cheap per token and fails tasks, or one that forfeits the provider prompt cache, is
    expensive in the only sense that matters. The metric folds the compressor's own inference
@@ -54,6 +56,10 @@ functions they wrap.
 | tau-bench (multi-turn tool agent) | 100% opus-5, discovered by 20/20 LOO fold-fits; guard refuses to degrade | +9.0 pt vs fable-5 (CI -0.9..+19.8: at-least-parity, leaning better) [wm] | **-57.1%** ($0.411 vs $0.958; CI -72.7..-37.3, RESOLVED) [wm] | LOO-CV n=20, judge rubric-v2 (opus-4-8) |
 | terminal-tasks (one-shot bash agent) | 100% sonnet-5 (constant policy; kimi-k3 ties 0.949 vs 0.948, broken on price) | -0.4 pt vs fable-5, within noise (paired CI touches 0) [wm] | **-69.4%** ($0.011 vs $0.035; CI -77..-61) [wm] | held-out 6, full pipeline via public commands |
 | routerbench-ours9 (1,199 QA prompts, 9 models) | frontier-pinned mix (37% gpt-5.5 / 33% sonnet-5 / 23% fable-5) | +0.84 pt over best single (0.978 vs 0.969) | -35.0% ($0.0023 vs $0.0035) | 360 held-out; measured on ours9, never blended with tau |
+
+**Read the tau row with the real-episode section below**: its quality cell is [wm] and the
+real probe INVERTED it (-25.0 pt real vs the WM's +9.0..+10.9); its cost direction held at
+-25% real (not -57%). The terminal and ours9 rows have no real leg yet.
 
 The three-stage figures behind this table (model-selection stage, compression stage,
 distillation stage per benchmark): `corners/cost/figures/three_stage_tau.png`,
@@ -104,14 +110,35 @@ appearing twice is the same computation. Every chart still reports all three obj
 The latency limitation stands: no online latency-aware routing rule exists yet; latency
 corners are offline mount choices.
 
-### Real-episode validation [PENDING: probe in flight]
+### Real-episode validation: THE QUALITY HEADLINE BREAKS, AND THIS DOCUMENT SAYS SO
 
-The routed config and the anchor, run on real tau2 through the served endpoint (the user
-path: tau2 -> OpenAI-compatible endpoint -> compress -> route -> provider), pinned
-balanced-20 scenarios, canonical pins, tau2's own reward. Pre-registered decision rule: if
-the routed-vs-anchor per-scenario sign agreement and both headline directions (cost saving,
-quality at-least-parity) hold, the WM carries the corner analysis and the real leg is the
-independent check; if either breaks, the claims re-scope. [PENDING: probe verdict + rows.]
+The probe ran (pinned 20 scenarios x 2 episodes per arm, canonical pins, tau2's own reward,
+40/40 scored per arm) and its pre-registered rule FIRED [real]:
+
+- **Quality inverts in sign at the top of the pool.** Real routed-vs-fable-5 is **-25.0 pt
+  (CI -42.5..-5.0, sign test p=0.012)** where the WM said +10.9 (CI excludes zero). On real
+  tau2, fable-5 is the quality king (0.775) and opus-5 collapses (0.525).
+- **The cost direction holds, the magnitude does not**: -25.0% real per completed task
+  where the WM said -57.1% (a ~2.3x overstatement, partly because the quality collapse
+  shrinks the completion denominator).
+- Consequence, applied throughout this document: every wm_simulated tau number is a
+  SIMULATION claim and is never quoted as a real one. The measured real tau statement
+  today: routing-to-opus-5 saves 25% per completed task at a 25-point quality loss vs
+  fable-5. Candidate mechanisms under investigation (not adjudicated): judge affinity
+  (rubric-v2 on opus-4-8 scoring same-family opus-5), the WM's 20-step cap vs real
+  100-turn episodes, WM fidelity on long-horizon tool use.
+- The live lead: qwen3.5-9b scored mid-pack in the WM yet solved 71.7% of real tau2 in
+  cycle-1's cohort - if near-parity replicates on this probe cohort (~$3-6 check,
+  authorized), the real Pareto winner is a ~50x-cheaper model and the product story
+  becomes cheap-parity discovery. [PENDING: qwen real probe + judge-affinity check.]
+- Deviation labeled on every row: the endpoint 501s tool calls on anthropic-kind entries
+  (serving-lane finding), so the routed arm executed its verified decision (100% opus-5)
+  direct.
+
+This section is the reason the method section says what it says: the probe rule was fixed
+before the run, it fired, spending stopped, and the inversion is reported at the same
+prominence as the savings. A reader who trusts anything here should trust it BECAUSE this
+section exists.
 
 ### The compound loop: reported as designed, not as achieved
 
