@@ -47,6 +47,7 @@ MAX_LOGICAL_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
 SMOKE_MODEL_SPEND_CAP_USD = 10.0
 E2B_ACCOUNT_CAP = 1000
+E2B_LIST_PAGE_SIZE = 100
 INFRASTRUCTURE_STOPS = frozenset(
     {
         "error",
@@ -77,11 +78,15 @@ def _scenario_id(task_id: str) -> str:
 
 def _require_e2b_capacity() -> None:
     """Fail before paid work when the configured account cap has no slot."""
-    paginator = Sandbox.list(limit=E2B_ACCOUNT_CAP)
-    active = paginator.next_items()
-    if len(active) >= E2B_ACCOUNT_CAP or paginator.has_next:
+    paginator = Sandbox.list(limit=E2B_LIST_PAGE_SIZE)
+    active_count = 0
+    while True:
+        active_count += len(paginator.next_items())
+        if active_count >= E2B_ACCOUNT_CAP or not paginator.has_next:
+            break
+    if active_count >= E2B_ACCOUNT_CAP:
         raise RuntimeError(
-            f"E2B has at least {len(active)} active sandboxes against the frozen "
+            f"E2B has at least {active_count} active sandboxes against the frozen "
             f"{E2B_ACCOUNT_CAP}-sandbox account cap"
         )
 

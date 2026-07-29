@@ -17,26 +17,34 @@ from wmo.providers.pool import ModelPool, PoolEntry
 
 
 class _SandboxPage:
-    def __init__(self, active: int, *, has_next: bool = False) -> None:
-        self.active = active
-        self.has_next = has_next
+    def __init__(self, active_pages: list[int]) -> None:
+        self.active_pages = active_pages
+        self.index = 0
+
+    @property
+    def has_next(self) -> bool:
+        return self.index < len(self.active_pages)
 
     def next_items(self) -> list[object]:
-        return [object()] * self.active
+        active = self.active_pages[self.index]
+        self.index += 1
+        return [object()] * active
 
 
 class _SandboxClient:
-    page = _SandboxPage(0)
+    page = _SandboxPage([0])
 
     @classmethod
     def list(cls, *, limit: int) -> _SandboxPage:
-        assert limit == smoke_runner.E2B_ACCOUNT_CAP
+        assert limit == smoke_runner.E2B_LIST_PAGE_SIZE
         return cls.page
 
 
 def test_expanded_e2b_account_cap_is_frozen_across_runners() -> None:
     assert smoke_runner.E2B_ACCOUNT_CAP == 1000
     assert matrix_runner.E2B_ACCOUNT_CAP == smoke_runner.E2B_ACCOUNT_CAP
+    assert smoke_runner.E2B_LIST_PAGE_SIZE == 100
+    assert matrix_runner.E2B_LIST_PAGE_SIZE == smoke_runner.E2B_LIST_PAGE_SIZE
 
 
 def _entry() -> PoolEntry:
@@ -52,25 +60,24 @@ def _entry() -> PoolEntry:
 def test_smoke_capacity_gate_accepts_a_legitimate_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _SandboxClient.page = _SandboxPage(smoke_runner.E2B_ACCOUNT_CAP - 1)
+    _SandboxClient.page = _SandboxPage([100] * 9 + [99])
     monkeypatch.setattr(smoke_runner, "Sandbox", _SandboxClient)
 
     smoke_runner._require_e2b_capacity()
 
 
 @pytest.mark.parametrize(
-    ("active", "has_next"),
+    "active_pages",
     [
-        (smoke_runner.E2B_ACCOUNT_CAP, False),
-        (smoke_runner.E2B_ACCOUNT_CAP - 1, True),
+        [100] * 10,
+        [100] * 10 + [1],
     ],
 )
-def test_smoke_capacity_gate_rejects_full_or_paginated_account(
+def test_smoke_capacity_gate_rejects_full_account(
     monkeypatch: pytest.MonkeyPatch,
-    active: int,
-    has_next: bool,
+    active_pages: list[int],
 ) -> None:
-    _SandboxClient.page = _SandboxPage(active, has_next=has_next)
+    _SandboxClient.page = _SandboxPage(active_pages)
     monkeypatch.setattr(smoke_runner, "Sandbox", _SandboxClient)
 
     with pytest.raises(RuntimeError, match="account cap"):

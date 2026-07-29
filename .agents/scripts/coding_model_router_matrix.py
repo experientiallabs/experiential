@@ -61,6 +61,7 @@ RETRY_DELAYS_S = (15, 60)
 # realized usage is persisted.
 CELL_SPEND_RESERVATION_USD = 500.0
 E2B_ACCOUNT_CAP = 1000
+E2B_LIST_PAGE_SIZE = 100
 SMOKE_TASKS = ("break-filter-js-from-html", "log-summary-date-ranges")
 SMOKE_ARMS = ("oai-luna-high", "ant-haiku45")
 INFRASTRUCTURE_STOPS = frozenset(
@@ -788,11 +789,15 @@ def _run(
             raise ValueError(f"{variable} is required for the paid matrix")
     full_root = root / "full"
     full_root.mkdir(parents=True, exist_ok=True)
-    paginator = Sandbox.list(limit=E2B_ACCOUNT_CAP)
-    running = paginator.next_items()
-    if len(running) >= E2B_ACCOUNT_CAP or paginator.has_next:
+    paginator = Sandbox.list(limit=E2B_LIST_PAGE_SIZE)
+    active_count = 0
+    while True:
+        active_count += len(paginator.next_items())
+        if active_count >= E2B_ACCOUNT_CAP or not paginator.has_next:
+            break
+    if active_count >= E2B_ACCOUNT_CAP:
         raise RuntimeError(
-            f"E2B has at least {len(running)} active sandboxes against the frozen "
+            f"E2B has at least {active_count} active sandboxes against the frozen "
             f"{E2B_ACCOUNT_CAP}-sandbox account cap"
         )
     state = RunState(root=full_root, pool=pool, ceiling_usd=ceiling_usd)
