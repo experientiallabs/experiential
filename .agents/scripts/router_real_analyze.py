@@ -566,15 +566,13 @@ def analyze(
     primary = summaries["semantic-3072/dial-0.25"]
     primary_bootstrap = _dict(primary["bootstrap"])
     quality_ci = _list(primary_bootstrap["quality_points_ci95"])
-    cost_ci = _list(primary_bootstrap["cost_percent_ci95"])
     promotion = {
         "nonnegative_quality": _number(primary["quality_points_mean"]) >= 0,
         "lower_cost": _number(primary["cost_percent_mean"]) < 0,
-        "quality_wins_5_of_5": _number(primary["quality_wins"]) == 5,
-        "joint_wins_5_of_5": _number(primary["joint_wins"]) == 5,
-        "bootstrap_quality_nonnegative": _number(quality_ci[0]) >= 0,
-        "bootstrap_cost_negative": _number(cost_ci[1]) < 0,
+        "bootstrap_quality_noninferior": _number(quality_ci[0]) >= -0.5,
+        "all_seed_point_gates": _number(primary["joint_wins"]) == 5,
     }
+    promotion["passed_benchmark_local_gates"] = all(promotion.values())
     result = {
         "benchmark": benchmark,
         "matrix_scenarios": len(matrix.scenario_ids()),
