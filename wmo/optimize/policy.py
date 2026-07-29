@@ -809,11 +809,14 @@ def knn_decision(
     the knob reorders candidates, and the guard then re-vetoes whatever it cannot support, so
     turning the knob up can never talk the router into a pick the evidence rejects.
 
-    Cache-aware calls (`incumbent` + `cache_credit` > 0, supplied by `select_model` when the
-    policy has `cache_aware` on) subtract the credit from THE INCUMBENT's mean cost in the two
-    places cost enters the decision: the pick_lam tilt and the guard's pricier test. With
-    credit 0 or no incumbent this function is bit-identical to the cache-blind path; quality
-    evidence (profile, paired diffs, z) never sees the credit.
+    Cache-aware calls (`incumbent` supplied by `select_model` when the policy has
+    `cache_aware` on) do two things. The `cache_credit` is subtracted from THE INCUMBENT's
+    mean cost in the two places cost enters the decision: the pick_lam tilt and the pricier
+    tests. And any decision that would ABANDON the incumbent must additionally clear the
+    switch gate (see `switch_gate` below): the same paired-evidence bar, anchored on the
+    incumbent, at effective prices. With NO incumbent this function is bit-identical to the
+    cache-blind path (the offline-eval invariant); quality evidence (profile, paired diffs,
+    z thresholds) never sees the credit.
     """
     if policy.kind != "knn":
         raise ValueError(f"knn_decision needs a knn policy, got kind='{policy.kind}'")
@@ -874,6 +877,56 @@ def knn_decision(
             effective_cost = mean_cost.copy()
             effective_cost[inc_index] = max(mean_cost[inc_index] - cache_credit, 0.0)
             credit_applied = cache_credit
+
+    def switch_gate(serve_index: int, serve: str) -> RoutingDecision | None:
+        """Cache-aware switch gate (design amendment 1, findings/cacheaware.md).
+
+        Serving `serve` would abandon the cache-warm incumbent, so the challenger must clear
+        the SAME paired-evidence bar against the incumbent that any pick clears against the
+        safety baseline, with the pricier flag on EFFECTIVE costs (incumbent credited,
+        challenger at full prefill). None = switch justified (or gate not applicable);
+        otherwise the decision that keeps the incumbent. Quality thresholds are identical to
+        the baseline guard: cache state raises the switch's price bar, never its confidence.
+        """
+        if incumbent is None or serve == incumbent or incumbent not in bank.models:
+            return None
+        inc_index = bank.models.index(incumbent)
+        inc_paired = scored[:, serve_index] & scored[:, inc_index]
+        inc_diffs = rewards[inc_paired, serve_index] - rewards[inc_paired, inc_index]
+        inc_pairs = int(inc_diffs.size)
+        inc_mean = float(inc_diffs.mean()) if inc_pairs else 0.0
+        inc_error = float(inc_diffs.std(ddof=1)) / inc_pairs**0.5 if inc_pairs > 1 else 0.0
+        if policy.se_floor and 0 < inc_pairs < SE_FLOOR_MAX_PAIRS:
+            inc_error = max(inc_error, (0.25 / inc_pairs) ** 0.5)
+        switch_pricier = bool(effective_cost[serve_index] > effective_cost[inc_index])
+        if policy.guard_mode == "asymmetric":
+            z_switch = policy.knn_z if switch_pricier else -policy.knn_z
+        else:
+            z_switch = 2 * policy.knn_z if switch_pricier else policy.knn_z
+        if inc_pairs >= policy.knn_min_pairs and inc_mean > z_switch * inc_error:
+            return None
+        detail = (
+            f"{inc_pairs} paired neighbors vs incumbent, delta={inc_mean:+.3f}, needs "
+            f"> {z_switch:g}xSE={z_switch * inc_error:.3f} at effective prices"
+        )
+        if inc_pairs < policy.knn_min_pairs:
+            detail = f"{inc_pairs} paired neighbors vs incumbent < {policy.knn_min_pairs}"
+        return RoutingDecision(
+            model=incumbent,
+            reason=(
+                f"cache-aware switch gate: kept incumbent {incumbent}, {serve} not "
+                f"justified against it ({detail})"
+            ),
+            evidence=RoutingEvidence(
+                mean_diff=inc_mean,
+                se=inc_error,
+                n_pairs=inc_pairs,
+                gate="reverted",
+                propensity="fallback-forced",
+                cache_credit_usd=credit_applied or None,
+            ),
+        )
+
     # The cost knob prices each candidate in average-call units before the argmax; at
     # pick_lam=0 the key is the bare profile, bit-identical to the validated champion. A model
     # the bank never priced pays exactly one unit, the reference's default.
@@ -893,6 +946,9 @@ def knn_decision(
             candidates, key=lambda item: (profile[item[0]], -pool_order[item[1]])
         )
         if leader != baseline:
+            gated = switch_gate(pick_index, baseline)
+            if gated is not None:
+                return gated
             return RoutingDecision(
                 model=baseline,
                 reason=(
@@ -906,6 +962,9 @@ def knn_decision(
                     propensity="greedy", cache_credit_usd=credit_applied or None
                 ),
             )
+        gated = switch_gate(pick_index, baseline)
+        if gated is not None:
+            return gated
         return RoutingDecision(
             model=baseline,
             reason=f"knn: baseline {baseline} leads {rows.size} neighbors "
@@ -935,6 +994,10 @@ def knn_decision(
         )
         if pairs < policy.knn_min_pairs:
             detail = f"{pairs} paired neighbors < {policy.knn_min_pairs} required"
+        base_pool_index = bank.models.index(baseline)
+        gated = switch_gate(base_pool_index, baseline)
+        if gated is not None:
+            return gated
         return RoutingDecision(
             model=baseline,
             reason=f"knn guard: reverted to {baseline}, evidence insufficient ({detail})",
@@ -947,6 +1010,10 @@ def knn_decision(
                 cache_credit_usd=credit_applied or None,
             ),
         )
+    gated = switch_gate(pick_index, pick)
+    if gated is not None:
+        return gated
+
     knob = f", cost knob lam={policy.pick_lam:g}" if policy.pick_lam > 0.0 else ""
     # Only the symmetric bar doubles z for a pricier pick; the asymmetric one holds it at z.
     price_note = ""

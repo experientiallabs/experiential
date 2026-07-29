@@ -1379,3 +1379,29 @@ def test_select_model_cache_aware_prices_the_incumbent_instead_of_sticking() -> 
     fresh_aware = select_model(aware, "anything", embedder=_UnitEmbedder())
     fresh_sticky = select_model(sticky, "anything", embedder=_UnitEmbedder())
     assert fresh_aware.model_dump() == fresh_sticky.model_dump()
+
+
+def test_cache_aware_switch_gate_blocks_unjustified_switches() -> None:
+    """7/5 mixed evidence clears the baseline guard for haiku but NOT the switch gate when
+    the incumbent is haiku itself... exercised the other way: incumbent haiku, evidence says
+    baseline fable leads -> switching back to fable must be justified AGAINST haiku."""
+    # Fable wins 7, haiku wins 5: fable leads the profile, blind decision serves fable.
+    rewards = [[1.0, 0.0]] * 7 + [[0.0, 1.0]] * 5
+    policy = _knn_policy(_knn_bank(rewards), knn_z=0.5, knn_min_pairs=8)
+    blind = knn_decision(policy, _QUERY)
+    assert blind.model == "fable-5"
+    # Cache-aware with incumbent haiku: fable's edge over haiku (delta +0.167) does not clear
+    # the doubled bar (fable is pricier, effectively too: no credit can rescue a switch TO a
+    # pricier model), so the conversation stays on haiku.
+    kept = knn_decision(policy, _QUERY, incumbent="haiku-4-5", cache_credit=0.001)
+    assert kept.model == "haiku-4-5"
+    assert "switch gate" in kept.reason
+    assert kept.evidence is not None and kept.evidence.gate == "reverted"
+
+
+def test_cache_aware_switch_gate_allows_justified_switches() -> None:
+    """Unanimous evidence against the incumbent clears the switch gate."""
+    rewards = [[1.0, 0.0]] * 12  # fable always wins, haiku always loses
+    policy = _knn_policy(_knn_bank(rewards), knn_z=0.5, knn_min_pairs=8)
+    switched = knn_decision(policy, _QUERY, incumbent="haiku-4-5", cache_credit=0.001)
+    assert switched.model == "fable-5"
