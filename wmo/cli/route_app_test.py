@@ -160,6 +160,64 @@ def test_route_fit_and_report(tmp_path: Path) -> None:
     assert report["cost_assumptions"]
 
 
+def _fit_then_report(tmp_path: Path, *extra: str) -> tuple[Result, Path]:
+    """Fit a knn policy, then report over the same matrix with `extra` report flags.
+
+    knn because only a dialable policy produces routed detents, and so a curve at all.
+    """
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = tmp_path / "policy.json"
+    fit = runner.invoke(
+        app,
+        [
+            *("optimize", "route", "fit", str(matrix_file)),
+            *("--kind", "knn", "--fallback", "a", "--out", str(policy_file)),
+            *("--z", "0.5", "--rag-num", "3", "--min-pairs", "2"),
+        ],
+    )
+    assert fit.exit_code == 0, fit.output
+    report_file = tmp_path / "report.json"
+    result = runner.invoke(
+        app,
+        [
+            *("optimize", "route", "report", str(matrix_file), str(policy_file)),
+            *("--baseline", "a", "--out", str(report_file)),
+            *extra,
+        ],
+    )
+    return result, report_file.parent / "pareto.json"
+
+
+def test_the_curve_defaults_to_the_world_model_labels(tmp_path: Path) -> None:
+    # Unchanged behavior for every existing caller: a sweep's matrix was scored by the world
+    # model's own verifier.
+    result, pareto = _fit_then_report(tmp_path)
+    assert result.exit_code == 0, result.output
+    curve = json.loads(pareto.read_text())
+    assert curve["provenance"] == "wm_simulated"
+    assert curve["judge"] == "world-model verifier"
+
+
+def test_a_real_benchmark_matrix_can_label_its_own_curve(tmp_path: Path) -> None:
+    # The bench-defaults case: the rewards are real tau2 episodes, and a curve claiming they came
+    # out of a world model would present a measurement as a simulation. ParetoCurve.provenance
+    # exists to stop exactly that, and until now the CLI hardcoded it.
+    result, pareto = _fit_then_report(
+        tmp_path, "--provenance", "real_episode", "--judge", "tau2 reward"
+    )
+    assert result.exit_code == 0, result.output
+    curve = json.loads(pareto.read_text())
+    assert curve["provenance"] == "real_episode"
+    assert curve["judge"] == "tau2 reward"
+
+
+def test_a_misspelled_provenance_is_refused_not_written(tmp_path: Path) -> None:
+    result, pareto = _fit_then_report(tmp_path, "--provenance", "real")
+    assert result.exit_code != 0
+    assert "real_episode" in result.output
+    assert not pareto.exists()
+
+
 def test_route_fit_rejects_unknown_embedder(tmp_path: Path) -> None:
     result = runner.invoke(
         app,

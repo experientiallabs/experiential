@@ -63,7 +63,13 @@ from wmo.optimize.outcomes import (
     load_matrix_with_digest,
     split_router_scenarios,
 )
-from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
+from wmo.optimize.pareto import (
+    DEFAULT_WM_JUDGE,
+    PARETO_FILENAME,
+    REAL_EPISODE,
+    WM_SIMULATED,
+    held_out_curve,
+)
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DIM,
     AZURE_EMBEDDER_ENV,
@@ -1333,8 +1339,27 @@ def report(
     ),
     endpoint: str = typer.Option("endpoint", "--endpoint", help="Endpoint id for the report."),
     out: str = typer.Option("report.json", "--out", help="Where to write the report JSON."),
+    provenance: str = typer.Option(
+        WM_SIMULATED,
+        "--provenance",
+        help=f"How this matrix's rewards were produced: {WM_SIMULATED} (closed-loop against a "
+        f"world model, the default) or {REAL_EPISODE} (episodes of the real benchmark). It rides "
+        "on the pareto curve and must never be wrong: consumers refuse to blend the two.",
+    ),
+    judge: str = typer.Option(
+        DEFAULT_WM_JUDGE,
+        "--judge",
+        help="What scored the episodes, printed beside every rendering of the curve. Pass the "
+        "real scorer for a real-benchmark matrix (for example \\[tau2 reward]).",
+    ),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
+    if provenance not in {WM_SIMULATED, REAL_EPISODE}:
+        # A typo here would silently label real measurements as simulated, which is the one
+        # mistake the curve's provenance field exists to prevent.
+        raise typer.BadParameter(
+            f"--provenance must be {WM_SIMULATED} or {REAL_EPISODE}, not {provenance!r}"
+        )
     matrix, matrix_source = _load_matrix(matrix_file)
     policy = _load_policy(policy_file)
     try:
@@ -1364,7 +1389,7 @@ def report(
     # The measured cost/quality curve rides beside every report (D-PARETO): GET /config
     # serves it from the model dir so the platform's graph renders this workload's frontier.
     try:
-        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        curve = held_out_curve(matrix, policy, judge=judge, provenance=provenance)
         pareto_out = Path(out).parent / PARETO_FILENAME
         write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
         _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")

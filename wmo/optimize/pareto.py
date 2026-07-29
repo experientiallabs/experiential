@@ -50,6 +50,16 @@ PointKind = Literal["model", "routed"]
 # from the model directory at serving mount (GET /config carries it to the platform).
 PARETO_FILENAME = "pareto.json"
 
+# The two ways a curve's rewards can have been produced. Consumers refuse to blend them, which
+# is exactly why they are named constants rather than literals repeated at each call site: a
+# curve mislabelled here presents real measurements as a simulation, or the reverse.
+WM_SIMULATED = "wm_simulated"
+REAL_EPISODE = "real_episode"
+
+# What scores a world-model sweep: the model's own verifier. A real-benchmark matrix was scored
+# by the benchmark instead and has to say which one.
+DEFAULT_WM_JUDGE = "world-model verifier"
+
 
 class ParetoPoint(BaseModel):
     """One measured way to serve the workload, on all three objectives."""
@@ -91,7 +101,7 @@ def pareto_curve(
     matrix: OutcomeMatrix,
     *,
     judge: str,
-    provenance: str = "wm_simulated",
+    provenance: str = WM_SIMULATED,
     policy: RoutingPolicy | None = None,
     dials: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
     scenario_ids: Sequence[str] | None = None,
@@ -178,7 +188,7 @@ def held_out_curve(
     policy: RoutingPolicy,
     *,
     judge: str,
-    provenance: str = "wm_simulated",
+    provenance: str = WM_SIMULATED,
     embedder: Embedder | None = None,
 ) -> ParetoCurve:
     """The curve a report ships: routed points on the fit's held-out band only.
