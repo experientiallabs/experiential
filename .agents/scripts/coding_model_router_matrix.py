@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from coding_model_router_usage import exact_cost_usd, usage_from_trace
+from coding_model_router_usage import exact_cost_usd, usage_from_trace, usage_metering_error
 from e2b import Sandbox
 from harbor.models.job.config import JobConfig
 from harbor.models.trial.result import TrialResult
@@ -194,6 +195,27 @@ def _failure_class(cell: ScoreCell, stop_reason: str) -> str:
     return "" if cell.reward == 1.0 else "task_failure"
 
 
+def _trace_error(trace: dict[str, object]) -> str:
+    steps = trace.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        observation = step.get("observation")
+        if not isinstance(observation, dict) or observation.get("is_error") is not True:
+            continue
+        content = observation.get("content")
+        if isinstance(content, str):
+            return content[-2_000:]
+    return ""
+
+
+def _known_pre_worker_failure(trace: dict[str, object]) -> bool:
+    """Whether trace evidence proves no provider request could have started."""
+    return _trace_error(trace).startswith("remote materialize failed")
+
+
 def _outcome(
     cell: ScoreCell,
     *,
@@ -208,6 +230,13 @@ def _outcome(
     instruction = trace.get("instruction")
     stop = trace.get("stop_reason")
     stop_reason = stop if isinstance(stop, str) else ""
+    failure_class = _failure_class(cell, stop_reason)
+    metering_error = (
+        "" if cell.infra_failed or _known_pre_worker_failure(trace) else usage_metering_error(usage)
+    )
+    if metering_error:
+        failure_class = "metering"
+    ungradeable = cell.infra_failed or failure_class in {"scaffold", "metering"}
     return ScenarioOutcome(
         scenario_id=f"{benchmark}:{cell.task_id}",
         task=instruction if isinstance(instruction, str) else cell.task_id,
@@ -215,14 +244,14 @@ def _outcome(
         benchmark=benchmark,
         episode=attempt - 1,
         attempt_number=attempt,
-        reward=None if cell.infra_failed else cell.reward,
-        success=cell.passed and not cell.infra_failed,
+        reward=None if ungradeable else cell.reward,
+        success=cell.passed and not ungradeable,
         critique=cell.note,
         steps=len(steps) if isinstance(steps, list) else 0,
         tool_calls=_tool_calls(trace),
         stop_reason=stop_reason,
         usage=usage.total,
-        cost_usd=exact_cost_usd(entry, usage),
+        cost_usd=0.0 if metering_error else exact_cost_usd(entry, usage),
         call_seconds=usage.call_seconds,
         call_input_tokens=usage.call_input_tokens,
         call_output_tokens=usage.call_output_tokens,
@@ -232,13 +261,17 @@ def _outcome(
         completion_status=(
             "infrastructure_failure"
             if cell.infra_failed
+            else "scaffold_failure"
+            if failure_class == "scaffold"
+            else "metering_failure"
+            if failure_class == "metering"
             else "scored_pass"
             if cell.passed
             else "scored_failure"
         ),
-        failure_class=_failure_class(cell, stop_reason),
+        failure_class=failure_class,
         artifact_dir=str(artifact_dir.resolve()),
-        error=(cell.note or None) if cell.infra_failed else None,
+        error=(metering_error or _trace_error(trace) or cell.note or None) if ungradeable else None,
         remeasured=attempt > 1,
     )
 
@@ -299,6 +332,11 @@ class RunState:
             if status == "reserved":
                 reserved += _float(row.get("reserved_usd"))
             elif status == "completed" or status is None:
+                if row.get("model_cost_accounting_status") == "missing_provider_usage":
+                    raise BudgetExhausted(
+                        f"{row.get('event_id')} has unknown paid model cost; "
+                        "no further reservations are safe"
+                    )
                 spent += _float(row.get("model_cost_usd"))
         return spent, reserved
 
@@ -373,7 +411,14 @@ class RunState:
                     "usage": outcome.usage.model_dump(mode="json"),
                     "model_call_seconds": outcome.call_seconds,
                     "task_environment_wall_seconds": outcome.wall_seconds,
-                    "model_cost_usd": outcome.cost_usd,
+                    "model_cost_usd": (
+                        None if outcome.failure_class == "metering" else outcome.cost_usd
+                    ),
+                    "model_cost_accounting_status": (
+                        "missing_provider_usage"
+                        if outcome.failure_class == "metering"
+                        else "exact_from_provider_usage"
+                    ),
                     "task_environment_cost_usd": None,
                     "task_environment_cost_note": (
                         "E2B invoice rate is absent from Harbor artifacts"
@@ -396,10 +441,25 @@ def _archive_infra(
 ) -> Path:
     target = root / "infra-attempts" / benchmark / arm / task_id / f"attempt-{attempt}"
     if target.exists():
-        return target
+        source_digest = _artifact_digest(artifact_dir)
+        if _artifact_digest(target) == source_digest:
+            return target
+        target = target.with_name(f"{target.name}-{source_digest[:12]}")
+        if target.exists():
+            if _artifact_digest(target) == source_digest:
+                return target
+            raise RuntimeError(f"archive digest collision at {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(artifact_dir, target)
     return target
+
+
+def _artifact_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        digest.update(str(item.relative_to(root)).encode())
+        digest.update(item.read_bytes())
+    return digest.hexdigest()
 
 
 def _run_cell(
@@ -419,7 +479,9 @@ def _run_cell(
         scorer = asyncio.run(
             _scorer(
                 benchmark=benchmark,
-                jobs_dir=state.root / "harbor" / benchmark / entry.name / task_id,
+                jobs_dir=(
+                    state.root / "harbor" / benchmark / entry.name / task_id / f"attempt-{attempt}"
+                ),
                 task_ids=[task_id],
                 entry=entry,
                 timeout_s=timeout_s,
@@ -443,6 +505,16 @@ def _run_cell(
             attempt=attempt,
             artifact_dir=artifact_dir,
         )
+        if outcome.reward is None and not cell.infra_failed:
+            artifact_dir = _archive_infra(
+                state.root,
+                artifact_dir,
+                benchmark=benchmark,
+                task_id=task_id,
+                arm=entry.name,
+                attempt=attempt,
+            )
+            outcome.artifact_dir = str(artifact_dir.resolve())
         state.persist(event_id, outcome)
         logger.info(
             "persisted %s x %s x %s attempt %d reward=%s cost=$%.6f",
@@ -453,7 +525,7 @@ def _run_cell(
             outcome.reward,
             outcome.cost_usd,
         )
-        if not cell.infra_failed:
+        if outcome.reward is not None:
             return outcome
         if attempt >= MAX_LOGICAL_ATTEMPTS:
             return outcome

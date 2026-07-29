@@ -502,6 +502,7 @@ def _simulated_outcome(
         cell.entry,
         DetailedUsage(
             total=outcome.usage,
+            calls=len(outcome.call_seconds),
             call_seconds=outcome.call_seconds,
             call_input_tokens=outcome.call_input_tokens,
             call_output_tokens=outcome.call_output_tokens,

@@ -44,6 +44,7 @@ class DetailedUsage:
     """Episode totals plus request-level counters needed for tiered pricing."""
 
     total: TokenUsage
+    calls: int
     call_seconds: list[float]
     call_input_tokens: list[int]
     call_output_tokens: list[int]
@@ -55,7 +56,7 @@ def usage_from_trace(trace: dict[str, object]) -> DetailedUsage:
     """Read a Harbor worker trace, accepting legacy traces with aggregate counters only."""
     raw = trace.get("worker_usage")
     if not isinstance(raw, dict):
-        return DetailedUsage(TokenUsage(), [], [], [], [], [])
+        return DetailedUsage(TokenUsage(), 0, [], [], [], [], [])
     return DetailedUsage(
         total=TokenUsage(
             input_tokens=_nonnegative_int(raw.get("input_tokens")),
@@ -64,12 +65,33 @@ def usage_from_trace(trace: dict[str, object]) -> DetailedUsage:
             cache_write_input_tokens=_nonnegative_int(raw.get("cache_write_input_tokens")),
             reasoning_tokens=_nonnegative_int(raw.get("reasoning_tokens")),
         ),
+        calls=_nonnegative_int(raw.get("calls")),
         call_seconds=_seconds_list(raw.get("call_seconds")),
         call_input_tokens=_int_list(raw.get("call_input_tokens")),
         call_output_tokens=_int_list(raw.get("call_output_tokens")),
         call_cached_input_tokens=_int_list(raw.get("call_cached_input_tokens")),
         call_cache_write_input_tokens=_int_list(raw.get("call_cache_write_input_tokens")),
     )
+
+
+def usage_metering_error(usage: DetailedUsage) -> str:
+    """Return why an episode cannot be priced exactly, or an empty string when complete."""
+    if usage.calls < 1:
+        return "worker usage is missing a completed provider call"
+    counters = {
+        "call_seconds": len(usage.call_seconds),
+        "call_input_tokens": len(usage.call_input_tokens),
+        "call_output_tokens": len(usage.call_output_tokens),
+        "call_cached_input_tokens": len(usage.call_cached_input_tokens),
+        "call_cache_write_input_tokens": len(usage.call_cache_write_input_tokens),
+    }
+    incomplete = {name: count for name, count in counters.items() if count != usage.calls}
+    if incomplete:
+        return (
+            f"worker usage reports {usage.calls} calls but carries incomplete request counters: "
+            f"{incomplete}"
+        )
+    return ""
 
 
 def exact_cost_usd(entry: PoolEntry, usage: DetailedUsage) -> float:

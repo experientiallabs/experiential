@@ -120,6 +120,57 @@ def test_worker_request_uses_document_temperature() -> None:
     assert request.temperature == 0.35
 
 
+def test_worker_completion_usage_keeps_exact_per_call_counters() -> None:
+    ep = _episode(_Env())
+    completion = ChatResponse.model_validate(
+        {
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {
+                    "cached_tokens": 40,
+                    "cache_write_tokens": 10,
+                },
+                "completion_tokens_details": {"reasoning_tokens": 7},
+            },
+        }
+    )
+
+    ep.record_worker_completion(completion, 0.25)
+
+    assert ep.worker_usage.model_dump(mode="json") == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cached_input_tokens": 40,
+        "cache_write_input_tokens": 10,
+        "reasoning_tokens": 7,
+        "calls": 1,
+        "call_seconds": [0.25],
+        "call_input_tokens": [100],
+        "call_output_tokens": [20],
+        "call_cached_input_tokens": [40],
+        "call_cache_write_input_tokens": [10],
+    }
+
+
+def test_error_result_keeps_partial_worker_usage() -> None:
+    ep = _episode(_Env())
+    ep.record_worker_failure(0.5)
+
+    result = PiRuntime._error_result(  # noqa: SLF001 - partial spend is the contract
+        "task",
+        ep,
+        "do it",
+        "provider failed",
+        StopReason.PROVIDER_ERROR,
+    )
+
+    assert result.worker_usage is not None
+    assert result.worker_usage.calls == 1
+    assert result.worker_usage.call_seconds == [0.5]
+
+
 def test_read_skill_is_runtime_local_and_does_not_consume_environment_budget() -> None:
     env = _Env()
     skills = SkillLibrary(
@@ -355,6 +406,7 @@ def test_the_node_wall_budget_comes_from_the_configured_episode_timeout(
     code, _note = runtime._run_node()  # noqa: SLF001 - the remote command is the contract
 
     assert code == 0
+    assert "StrictHostKeyChecking=accept-new" in commands[0]
     assert "timeout 1800 node --experimental-strip-types entry.ts" in commands[0][-1]
 
 

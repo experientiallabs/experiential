@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
-from coding_model_router_usage import exact_cost_usd, usage_from_trace
+from coding_model_router_usage import exact_cost_usd, usage_from_trace, usage_metering_error
 from harbor.models.job.config import JobConfig
 from harbor.models.trial.result import TrialResult
 
@@ -114,6 +114,27 @@ def _failure_class(cell: ScoreCell, stop_reason: str) -> str:
     return "" if cell.reward == 1.0 else "task_failure"
 
 
+def _trace_error(trace: dict[str, object]) -> str:
+    steps = trace.get("steps")
+    if not isinstance(steps, list):
+        return ""
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        observation = step.get("observation")
+        if not isinstance(observation, dict) or observation.get("is_error") is not True:
+            continue
+        content = observation.get("content")
+        if isinstance(content, str):
+            return content[-2_000:]
+    return ""
+
+
+def _known_pre_worker_failure(trace: dict[str, object]) -> bool:
+    """Whether trace evidence proves no provider request could have started."""
+    return _trace_error(trace).startswith("remote materialize failed")
+
+
 def _outcome(
     cell: ScoreCell,
     *,
@@ -127,6 +148,13 @@ def _outcome(
     instruction = trace.get("instruction")
     stop = trace.get("stop_reason")
     stop_reason = stop if isinstance(stop, str) else ""
+    failure_class = _failure_class(cell, stop_reason)
+    metering_error = (
+        "" if cell.infra_failed or _known_pre_worker_failure(trace) else usage_metering_error(usage)
+    )
+    if metering_error:
+        failure_class = "metering"
+    ungradeable = cell.infra_failed or failure_class in {"scaffold", "metering"}
     return ScenarioOutcome(
         scenario_id=_scenario_id(cell.task_id),
         task=instruction if isinstance(instruction, str) else cell.task_id,
@@ -134,14 +162,14 @@ def _outcome(
         benchmark=BENCHMARK,
         episode=logical_attempt - 1,
         attempt_number=logical_attempt,
-        reward=None if cell.infra_failed else cell.reward,
-        success=cell.passed and not cell.infra_failed,
+        reward=None if ungradeable else cell.reward,
+        success=cell.passed and not ungradeable,
         critique=cell.note,
         steps=len(steps) if isinstance(steps, list) else 0,
         tool_calls=_tool_calls(trace),
         stop_reason=stop_reason,
         usage=usage.total,
-        cost_usd=exact_cost_usd(entry, usage),
+        cost_usd=0.0 if metering_error else exact_cost_usd(entry, usage),
         call_seconds=usage.call_seconds,
         call_input_tokens=usage.call_input_tokens,
         call_output_tokens=usage.call_output_tokens,
@@ -151,13 +179,17 @@ def _outcome(
         completion_status=(
             "infrastructure_failure"
             if cell.infra_failed
+            else "scaffold_failure"
+            if failure_class == "scaffold"
+            else "metering_failure"
+            if failure_class == "metering"
             else "scored_pass"
             if cell.passed
             else "scored_failure"
         ),
-        failure_class=_failure_class(cell, stop_reason),
+        failure_class=failure_class,
         artifact_dir=str(artifact_dir.resolve()),
-        error=(cell.note or None) if cell.infra_failed else None,
+        error=(metering_error or _trace_error(trace) or cell.note or None) if ungradeable else None,
         remeasured=logical_attempt > 1,
     )
 
@@ -210,7 +242,12 @@ def _upsert_ledger(path: Path, outcome: ScenarioOutcome) -> None:
         "usage": outcome.usage.model_dump(mode="json"),
         "model_call_seconds": outcome.call_seconds,
         "task_environment_wall_seconds": outcome.wall_seconds,
-        "model_cost_usd": outcome.cost_usd,
+        "model_cost_usd": None if outcome.failure_class == "metering" else outcome.cost_usd,
+        "model_cost_accounting_status": (
+            "missing_provider_usage"
+            if outcome.failure_class == "metering"
+            else "exact_from_provider_usage"
+        ),
         "task_environment_cost_usd": None,
         "task_environment_cost_note": "E2B invoice rate is absent from Harbor artifacts",
         "completion_status": outcome.completion_status,
@@ -281,7 +318,14 @@ def _archive_infra(
 ) -> Path:
     target = root / "infra-attempts" / arm / task_id / f"attempt-{attempt}"
     if target.exists():
-        return target
+        source_digest = _artifact_digest(str(artifact_dir))
+        if _artifact_digest(str(target)) == source_digest:
+            return target
+        target = target.with_name(f"{target.name}-{source_digest[:12]}")
+        if target.exists():
+            if _artifact_digest(str(target)) == source_digest:
+                return target
+            raise RuntimeError(f"archive digest collision at {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(artifact_dir, target)
     return target
@@ -298,6 +342,11 @@ def _run_cell(
     pool: ModelPool,
 ) -> None:
     matrix = _load_matrix(matrix_path, pool)
+    if any(outcome.failure_class == "metering" for outcome in matrix.outcomes):
+        raise RuntimeError(
+            "smoke has a paid attempt with missing provider usage; exact spend and the $10 cap "
+            "cannot be proven, so paid execution is stopped"
+        )
     if _completed(matrix, task_id, entry.name):
         logger.info("resume: keeping completed %s x %s", task_id, entry.name)
         return
@@ -308,7 +357,7 @@ def _run_cell(
         scorer = asyncio.run(
             _scorer(
                 template_path,
-                root / "harbor" / entry.name / task_id,
+                root / "harbor" / entry.name / task_id / f"attempt-{logical_attempt}",
                 task_id,
                 entry,
             )
@@ -329,6 +378,15 @@ def _run_cell(
             logical_attempt=logical_attempt,
             artifact_dir=artifact_dir,
         )
+        if outcome.reward is None and not cell.infra_failed:
+            artifact_dir = _archive_infra(
+                root,
+                artifact_dir,
+                task_id=task_id,
+                arm=entry.name,
+                attempt=logical_attempt,
+            )
+            outcome.artifact_dir = str(artifact_dir.resolve())
         _upsert_outcome(matrix_path, matrix, outcome)
         _upsert_ledger(ledger_path, outcome)
         logger.info(
@@ -339,7 +397,7 @@ def _run_cell(
             outcome.reward,
             outcome.cost_usd,
         )
-        if not cell.infra_failed:
+        if outcome.reward is not None:
             return
         if logical_attempt >= MAX_LOGICAL_ATTEMPTS:
             raise RuntimeError(f"{task_id} x {entry.name} remained ungradeable after 3 attempts")
@@ -350,6 +408,71 @@ def _run_cell(
         logical_attempt += 1
 
 
+def _normalize_existing_ungradeable_attempts(
+    root: Path,
+    matrix_path: Path,
+    ledger_path: Path,
+    matrix: OutcomeMatrix,
+) -> OutcomeMatrix:
+    """Correct pre-fix scaffold and unmetered scored rows before resume."""
+    changed = False
+    for outcome in matrix.outcomes:
+        task_id = outcome.scenario_id.split(":", 1)[1]
+        attempt_root = (
+            root / "harbor" / outcome.model / task_id / f"attempt-{outcome.attempt_number}"
+        )
+        source_traces = list(attempt_root.rglob("agent/wmo-run.json"))
+        artifact_dir = (
+            source_traces[0].parent.parent
+            if len(source_traces) == 1
+            else Path(outcome.artifact_dir)
+        )
+        trace = _read_object(_trace_path(artifact_dir))
+        stop = trace.get("stop_reason")
+        stop_reason = stop if isinstance(stop, str) else ""
+        usage = usage_from_trace(trace)
+        metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
+        if metering_error:
+            failure_class = "metering"
+            completion_status = "metering_failure"
+            error = metering_error
+        elif (
+            outcome.failure_class == "scaffold"
+            or stop_reason in SCAFFOLD_STOPS
+            or stop_reason.startswith("agent-exception:")
+        ):
+            failure_class = "scaffold"
+            completion_status = "scaffold_failure"
+            error = _trace_error(trace) or "scaffold stopped before grading"
+        else:
+            continue
+        if (
+            outcome.reward is None
+            and outcome.failure_class == failure_class
+            and outcome.completion_status == completion_status
+            and outcome.error == error
+        ):
+            continue
+        archived = _archive_infra(
+            root,
+            artifact_dir,
+            task_id=task_id,
+            arm=outcome.model,
+            attempt=outcome.attempt_number,
+        )
+        outcome.reward = None
+        outcome.success = False
+        outcome.completion_status = completion_status
+        outcome.failure_class = failure_class
+        outcome.error = error
+        outcome.artifact_dir = str(archived.resolve())
+        _upsert_ledger(ledger_path, outcome)
+        changed = True
+    if changed:
+        matrix.save(matrix_path)
+    return matrix
+
+
 def _artifact_digest(path: str) -> str:
     root = Path(path)
     digest = hashlib.sha256()
@@ -357,6 +480,73 @@ def _artifact_digest(path: str) -> str:
         digest.update(str(item.relative_to(root)).encode())
         digest.update(item.read_bytes())
     return digest.hexdigest()
+
+
+def _drop_duplicate_retry_noops(
+    root: Path,
+    matrix_path: Path,
+    ledger_path: Path,
+    matrix: OutcomeMatrix,
+) -> OutcomeMatrix:
+    """Exclude deterministic Harbor resumes that made no new execution attempt."""
+    seen: dict[tuple[str, str], set[str]] = {}
+    kept: list[ScenarioOutcome] = []
+    duplicates: list[dict[str, object]] = []
+    duplicate_event_ids: set[str] = set()
+    for outcome in sorted(
+        matrix.outcomes,
+        key=lambda row: (row.scenario_id, row.model, row.attempt_number),
+    ):
+        cell = (outcome.scenario_id, outcome.model)
+        digest = _artifact_digest(outcome.artifact_dir)
+        cell_digests = seen.setdefault(cell, set())
+        if digest not in cell_digests:
+            cell_digests.add(digest)
+            kept.append(outcome)
+            continue
+        duplicates.append(
+            {
+                "scenario_id": outcome.scenario_id,
+                "model": outcome.model,
+                "attempt_number": outcome.attempt_number,
+                "artifact_dir": outcome.artifact_dir,
+                "artifact_digest": digest,
+                "reason": (
+                    "Harbor resumed an identical deterministic trial directory; no new "
+                    "sandbox or provider call occurred"
+                ),
+            }
+        )
+        duplicate_event_ids.add(
+            f"smoke:{outcome.benchmark}:{outcome.scenario_id}:"
+            f"{outcome.model}:{outcome.attempt_number}"
+        )
+    if not duplicates:
+        return matrix
+    existing_path = root / "retry-noops.json"
+    existing = _read_object(existing_path).get("rows") if existing_path.is_file() else []
+    existing_rows = existing if isinstance(existing, list) else []
+    by_key: dict[tuple[object, object, object], object] = {}
+    for row in [*existing_rows, *duplicates]:
+        if isinstance(row, dict):
+            by_key[(row.get("scenario_id"), row.get("model"), row.get("attempt_number"))] = row
+    _write_json(
+        existing_path,
+        {
+            "protocol": "coding-router-smoke-retry-noops-v1",
+            "rows": list(by_key.values()),
+        },
+    )
+    matrix.outcomes = kept
+    matrix.save(matrix_path)
+    ledger_rows = [
+        row for row in _ledger_rows(ledger_path) if row.get("event_id") not in duplicate_event_ids
+    ]
+    write_text_atomic(
+        ledger_path,
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in ledger_rows),
+    )
+    return matrix
 
 
 def _fit(root: Path, matrix: OutcomeMatrix) -> None:
@@ -465,6 +655,8 @@ def run(root: Path, template_path: Path, *, interrupt_after_cells: int | None) -
     ledger_path = root.parent / "spend-ledger.jsonl"
     root.mkdir(parents=True, exist_ok=True)
     matrix = _load_matrix(matrix_path, pool)
+    matrix = _drop_duplicate_retry_noops(root, matrix_path, ledger_path, matrix)
+    matrix = _normalize_existing_ungradeable_attempts(root, matrix_path, ledger_path, matrix)
     prior = [
         {
             "scenario_id": outcome.scenario_id,

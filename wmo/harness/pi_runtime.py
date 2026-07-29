@@ -29,9 +29,10 @@ import os
 import re
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from llm_waterfall import ChatRequest
+from llm_waterfall import ChatRequest, ChatResponse
 from pydantic import JsonValue
 
 from wmo.core.types import Action, ActionKind, EnvState, JsonObject, Observation, Step
@@ -43,11 +44,17 @@ from wmo.harness.runtime import (
     DEFAULT_MAX_TURNS,
     RunResult,
     StopReason,
+    TokenUsage,
     validate_episode_timeout_s,
 )
 from wmo.harness.skills import SkillLibrary
 from wmo.harness.tools import READ_SKILL, ToolSpec
-from wmo.providers.base import UNPARSED_TOOL_CALLS_KEY, Provider, ToolCallingProvider
+from wmo.providers.base import (
+    UNPARSED_TOOL_CALLS_KEY,
+    Provider,
+    ToolCallingProvider,
+    structured_token_usage,
+)
 
 # The runner: node runs here, reached over SSH. The checkout keeps pi's node_modules; per-episode
 # source is overwritten from the harness surfaces.
@@ -60,6 +67,17 @@ _ENTRY_TS = os.path.join(_PI_ENTRY_DIR, "entry.ts")
 _TERMINATION_TS = os.path.join(_PI_ENTRY_DIR, "runner_termination.ts")
 # Cleanup headroom past the node wall budget: one SSH round trip plus process teardown.
 _NODE_TEARDOWN_GRACE_S = 60.0
+# A newly provisioned control host often has no known_hosts entry for the operator-configured
+# runner. `accept-new` permits that first connection but still rejects a changed key, unlike
+# `StrictHostKeyChecking=no`. Keep the same policy on materialization and the tunneled node run.
+_SSH_OPTIONS = (
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=accept-new",
+)
 # Runner paths are interpolated into remote shell commands, so restrict them to characters that
 # cannot break out of the command (allows `~` expansion; rejects spaces, quotes, `;`, `$`, etc.).
 _SAFE_REMOTE_PATH = re.compile(r"^[A-Za-z0-9_./~-]+$")
@@ -107,6 +125,7 @@ class _Episode:
         self.finish_reason: str = ""
         self.unparsed_tool_calls: list[str] = []
         self.tool_call_turns: int = 0
+        self.worker_usage = TokenUsage()
         self.done = threading.Event()
         self._env_calls = 0
 
@@ -161,6 +180,27 @@ class _Episode:
         request_body = dict(body)
         request_body["temperature"] = self.temperature
         return ChatRequest.model_validate(request_body)
+
+    def record_worker_completion(self, completion: ChatResponse, elapsed_s: float) -> None:
+        """Meter one successful provider call at its request-level pricing boundary."""
+        reported = structured_token_usage(completion)
+        usage = self.worker_usage
+        usage.calls += 1
+        usage.input_tokens += reported.input_tokens
+        usage.output_tokens += reported.output_tokens
+        usage.cached_input_tokens += reported.cached_input_tokens
+        usage.cache_write_input_tokens += reported.cache_write_input_tokens
+        usage.reasoning_tokens += reported.reasoning_tokens
+        usage.call_seconds.append(elapsed_s)
+        usage.call_input_tokens.append(reported.input_tokens)
+        usage.call_output_tokens.append(reported.output_tokens)
+        usage.call_cached_input_tokens.append(reported.cached_input_tokens)
+        usage.call_cache_write_input_tokens.append(reported.cache_write_input_tokens)
+
+    def record_worker_failure(self, elapsed_s: float) -> None:
+        """Record a failed provider attempt without inventing token counters."""
+        self.worker_usage.calls += 1
+        self.worker_usage.call_seconds.append(elapsed_s)
 
 
 # The tool `parameters` schema builder lives in runner_link (shared with the frame transport);
@@ -249,8 +289,12 @@ class _ShimHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+        started = time.perf_counter()
+        usage_recorded = False
         try:
             completion = self._ep.provider.complete_chat(self._ep.worker_request(body))
+            self._ep.record_worker_completion(completion, time.perf_counter() - started)
+            usage_recorded = True
             choice = completion.choices[0]
             message = choice.message
             # Record the host's view of this turn BEFORE streaming it: entry.ts reads it back to
@@ -283,6 +327,8 @@ class _ShimHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"data: {json.dumps(last)}\n\n".encode())
             self.wfile.write(b"data: [DONE]\n\n")
         except Exception as exc:  # noqa: BLE001 - never crash the shim
+            if not usage_recorded:
+                self._ep.record_worker_failure(time.perf_counter() - started)
             self._ep.proxy_error = str(exc)
             err = json.dumps({"error": {"message": f"agent provider failed: {exc}"}})
             self.wfile.write(f"data: {err}\n\ndata: [DONE]\n\n".encode())
@@ -394,6 +440,7 @@ class PiRuntime:
             stop_reason=stop_reason,
             answer=episode.answer,
             turns=len(episode.steps),
+            worker_usage=episode.worker_usage if episode.worker_usage.calls else None,
         )
 
     @staticmethod
@@ -414,6 +461,7 @@ class PiRuntime:
             stop_reason=stop,
             answer="",
             turns=len(episode.steps),
+            worker_usage=episode.worker_usage if episode.worker_usage.calls else None,
         )
 
     def _materialize(self) -> None:
@@ -466,10 +514,7 @@ class PiRuntime:
         proc = subprocess.run(
             [
                 "ssh",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "BatchMode=yes",
+                *_SSH_OPTIONS,
                 "-R",
                 f"{self._port}:127.0.0.1:{self._port}",
                 PI_RUNNER_HOST,
@@ -484,7 +529,7 @@ class PiRuntime:
 
 def _ssh(remote_cmd: str, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", PI_RUNNER_HOST, remote_cmd],
+        ["ssh", *_SSH_OPTIONS, PI_RUNNER_HOST, remote_cmd],
         input=input_bytes,
         capture_output=True,
         timeout=120,
