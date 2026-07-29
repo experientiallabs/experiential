@@ -138,6 +138,11 @@ class ToolRoleScoped:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         self.calls += 1
+        if self._model_id.startswith("us.anthropic."):
+            # Bedrock Converse rejects `temperature` for sonnet-5 ("deprecated for this
+            # model"); stripped uniformly for this model across ALL arms, so the arms stay
+            # comparable within the model.
+            request = request.model_copy(update={"temperature": None})
         if self._compressor is not None:
             tool_indices = [
                 i
@@ -180,8 +185,14 @@ async def run_episode(
     episode_dir = OUT / arm / entry.name / f"{task_id.replace(':', '_')}-e{episode}"
     results_copy = episode_dir / "results.json"
     if results_copy.exists():
-        log.info("resume: %s already has results", alias)
-        return
+        payload = json.loads(results_copy.read_text())
+        sims = payload.get("simulations") or []
+        prior = (sims[0].get("reward_info") or {}).get("reward") if sims else None
+        if prior is not None:
+            log.info("resume: %s already has verifier evidence", alias)
+            return
+        # A results file without a reward is an errored simulation, not evidence: re-run.
+        shutil.rmtree(episode_dir)
     async with semaphore:
         if state["spend"] >= BUDGET_GUARD_USD:
             state["skipped"] += 1
