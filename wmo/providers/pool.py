@@ -107,6 +107,20 @@ class PoolEntry(BaseModel):
         catalog_note = ""
         if self.input_per_mtok is None and self.kind is ProviderKind.OPENROUTER:
             catalog_note = self._resolve_openrouter_price()
+        if (
+            self.input_per_mtok is None
+            and self.kind is ProviderKind.OPENAI
+            and self.endpoint is not None
+        ):
+            # A self-hosted server (openai kind + explicit endpoint) always takes an explicit
+            # price: the built-in table describes OpenAI's HOSTED rates, and an entry whose
+            # model id shadows a hosted one (someone serving "gpt-4o" locally) would otherwise
+            # silently bill sweeps, routing, and metering at the wrong server's price.
+            raise ValueError(
+                f"pool model '{self.name}': '{self.model}' is served by a custom endpoint "
+                f"({self.endpoint}), so built-in prices do not apply; add input_per_mtok and "
+                "output_per_mtok to its entry (0 and 0 for free local inference)"
+            )
         if self.input_per_mtok is None and price_for(self.model) is None:
             raise ValueError(
                 f"pool model '{self.name}': '{self.model}' has no built-in price;{catalog_note} "
@@ -259,10 +273,18 @@ _LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.
 
 
 def is_local_endpoint(endpoint: str | None) -> bool:
-    """Whether `endpoint` points at this machine (see `_LOCAL_HOSTNAMES`; `*.local` counts too)."""
+    """Whether `endpoint` points at this machine (see `_LOCAL_HOSTNAMES`; `*.local` counts too).
+
+    Never raises: this feeds display copy and price defaulting, and `urlsplit` raises
+    `ValueError` on malformed bracket URLs (`http://[::1:8000`), which must read as "not
+    local", not crash the roster table or the endpoint prompt.
+    """
     if not endpoint:
         return False
-    host = urlsplit(endpoint).hostname
+    try:
+        host = urlsplit(endpoint).hostname
+    except ValueError:
+        return False
     if host is None:
         return False
     return host.lower() in _LOCAL_HOSTNAMES or host.lower().endswith(".local")

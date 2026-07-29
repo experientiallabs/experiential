@@ -31,10 +31,11 @@ vendor's lineup moves faster than any release of this package.
 
 from __future__ import annotations
 
+import os
 from enum import StrEnum
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
 from wmo.providers.base import ProviderKind
 from wmo.providers.models import model_types_for_provider, resolve_provider_model
@@ -208,10 +209,15 @@ def endpoint_catalog(endpoint: str) -> ProviderCatalog:
 
     The self-hosted counterpart of `list_provider_models`, keyed on the URL instead of the kind
     (the entries it feeds are plain `ProviderKind.OPENAI` rows with `endpoint` set). Rows carry
-    no price: a self-hosted candidate is priced by the operator, default 0. Like every other
-    catalog it never raises and is only ever a set of suggestions; an unreachable or
-    non-conforming server comes back as an empty catalog whose `detail` says what happened, and
-    the caller falls back to a typed id.
+    no price: a self-hosted candidate is priced by the operator, default 0 when local. Like
+    every other catalog it never raises (`Exception`, not just `httpx.HTTPError`: a malformed
+    typed URL raises `httpx.InvalidURL`, which subclasses neither) and is only ever a set of
+    suggestions; an unreachable or non-conforming server comes back as an empty catalog whose
+    `detail` says what happened, and the caller falls back to a typed id.
+
+    The probe authenticates exactly like the serving path (`wmo.providers.openai`): when
+    `WMO_ENDPOINT_API_KEY` is set it rides as a bearer token, so a vLLM started with
+    `--api-key` lists its models here the same way it will serve them.
 
     Args:
         endpoint: The server's base URL as a pool entry would carry it (".../v1").
@@ -220,15 +226,22 @@ def endpoint_catalog(endpoint: str) -> ProviderCatalog:
         The catalog, with `detail` naming the URL it asked.
     """
     url = f"{endpoint.rstrip('/')}/models"
+    api_key = os.environ.get("WMO_ENDPOINT_API_KEY")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        response = httpx.get(url, timeout=ENDPOINT_CATALOG_TIMEOUT_S)
+        response = httpx.get(url, timeout=ENDPOINT_CATALOG_TIMEOUT_S, headers=headers)
         response.raise_for_status()
         listing = _EndpointModelList.model_validate(response.json())
-    except (httpx.HTTPError, ValidationError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - the never-raises contract IS this catalog's API
+        hint = "type the model id the server serves"
+        if not endpoint.rstrip("/").endswith("/v1"):
+            # The single most common misspelling: Ollama prints its bare origin, but the
+            # OpenAI-compatible surface (models AND chat) lives under /v1.
+            hint = f"most servers serve under /v1, try {endpoint.rstrip('/')}/v1; else {hint}"
         return ProviderCatalog(
             kind=ProviderKind.OPENAI,
             source=CatalogSource.NONE,
-            detail=f"could not list models from {url} ({exc}); type the model id the server serves",
+            detail=f"could not list models from {url} ({exc}); {hint}",
         )
     models = [CatalogModel(id=row.id) for row in listing.data]
     return ProviderCatalog(

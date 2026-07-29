@@ -9,7 +9,9 @@ against an explicit endpoint, never a real OpenAI key).
 
 Interactive: run `wmo providers set`, pick `openai`, and answer the endpoint prompt with
 your server's URL. The picker then lists what that server actually serves (its own
-`GET /v1/models`), and prices default to $0 per Mtok, stamped explicitly.
+`GET /v1/models`), and prices default to $0 per Mtok, stamped explicitly. The endpoint
+prompt covers ROUTING CANDIDATES; to also point the local WORKER agent at your server,
+pass `--endpoint` on the command line (the scripted example below does both at once).
 
 Scripted:
 
@@ -33,8 +35,12 @@ output_per_mtok = 0.0
 ```
 
 Prices are always explicit for endpoint-backed entries, even when the model id shadows a
-built-in one: the price a candidate bills at is a property of the server, and yours is
-free unless you declare an amortized rate (`--input-per-mtok`/`--output-per-mtok`).
+built-in one: the price a candidate bills at is a property of the server. The $0 default
+applies only to LOCALLY hosted servers (localhost, 127.0.0.1, `host.docker.internal`,
+`*.local`); a remote OpenAI-compatible endpoint (Together, Groq, a LiteLLM proxy) bills
+real money, so registration demands `--input-per-mtok`/`--output-per-mtok` for it.
+Servers started with an API key (vLLM `--api-key`) are probed and served with
+`WMO_ENDPOINT_API_KEY` as the bearer token.
 
 ## Serve it
 

@@ -778,7 +778,7 @@ def test_half_a_price_pair_still_prompts_for_both(tmp_path: Path) -> None:
     pool = tmp_path / "pool.toml"
     written, _, _ = _drive(
         pool,
-        ["y", "openai", "self-hosted", "y", "", "open", "", "0.2", "0.8", "", "n"],
+        ["y", "openai", "", "self-hosted", "y", "", "open", "", "0.2", "0.8", "", "n"],
         options=EntryOptions(input_per_mtok=0.1),
     )
 
@@ -993,3 +993,135 @@ def test_the_same_model_on_two_endpoints_is_two_entries(
         "http://localhost:11434/v1",
         "http://silens-mac.local:8001/v1",
     }
+
+
+def test_re_registration_keeps_a_disabled_entry_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `enabled = false` is an explicit operator edit; a registration re-run must not silently
+    # put the candidate back into selection.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    options = EntryOptions(endpoint="http://localhost:11434/v1")
+    register_model_ids(
+        console,
+        pool_path=pool,
+        kind=ProviderKind.OPENAI,
+        model_ids=["qwen3:4b"],
+        options=options,
+        verify=_ok,
+    )
+    pool.write_text(
+        pool.read_text(encoding="utf-8").replace(
+            'name = "qwen3-4b"', 'name = "qwen3-4b"\nenabled = false'
+        ),
+        encoding="utf-8",
+    )
+
+    register_model_ids(
+        console,
+        pool_path=pool,
+        kind=ProviderKind.OPENAI,
+        model_ids=["qwen3:4b"],
+        options=options,
+        verify=_ok,
+    )
+
+    entries = read_pool_entries(pool)
+    assert [entry.name for entry in entries] == ["qwen3-4b"]
+    assert entries[0].enabled is False
+    assert isinstance(console.file, StringIO)
+    assert "keeping it disabled" in console.file.getvalue()
+
+
+def test_equivalent_endpoint_spellings_are_one_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Scheme/host case and a default port are the same route; a sweep must not pay for the
+    # same backend twice under two handles.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    for endpoint in ("http://localhost:80/v1", "HTTP://LocalHost/v1"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.OPENAI,
+            model_ids=["qwen3:4b"],
+            options=EntryOptions(endpoint=endpoint),
+            verify=_ok,
+        )
+
+    assert [entry.name for entry in read_pool_entries(pool)] == ["qwen3-4b"]
+
+
+def test_a_seeded_endpoint_can_be_cleared_back_to_openais_own_api(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A session started with --endpoint must still be able to register hosted candidates:
+    # '-' clears the seed, and the prompt says so instead of promising a blank that cannot work.
+    monkeypatch.setattr(
+        pool_registry,
+        "endpoint_catalog",
+        lambda endpoint: (_ for _ in ()).throw(AssertionError("hosted pass must not probe")),
+    )
+    pool = tmp_path / "pool.toml"
+    written, output, script = _drive(
+        pool,
+        ["y", "openai", "-", "gpt-5.4", "", "frontier", "", "", "n"],
+        kind=ProviderKind.OPENAI,
+        options=EntryOptions(endpoint="http://localhost:11434/v1"),
+    )
+
+    assert written == 1
+    entry = read_pool_entries(pool)[0]
+    assert entry.endpoint is None
+    assert entry.input_per_mtok is None  # hosted gpt-5.4 keeps its built-in price
+    assert any("'-' = OpenAI's own API" in prompt for prompt in script.prompts)
+
+
+def test_a_remote_paid_endpoint_is_never_defaulted_to_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Together/Groq/a proxy bill real money: the scripted path demands the price loudly,
+    # exactly as main did for any unpriced candidate.
+    monkeypatch.setattr(
+        pool_registry,
+        "endpoint_catalog",
+        lambda endpoint: ProviderCatalog(
+            kind=ProviderKind.OPENAI,
+            source=CatalogSource.PUBLISHED,
+            models=[CatalogModel(id="llama-3.3-70b")],
+        ),
+    )
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    with pytest.raises(typer.BadParameter, match="cannot be assumed"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.OPENAI,
+            model_ids=["llama-3.3-70b"],
+            options=EntryOptions(endpoint="https://api.together.xyz/v1"),
+            verify=_ok,
+        )
+    assert not pool.exists()
+
+
+def test_a_half_supplied_price_pair_is_refused_not_zero_filled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only output_per_mtok given: zero-filling the pair would silently discard the declared
+    # rate; the loud both-or-neither rule the CLI flags already have applies here too.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    console = Console(file=StringIO(), width=120, no_color=True)
+    with pytest.raises(typer.BadParameter, match="both"):
+        register_model_ids(
+            console,
+            pool_path=tmp_path / "pool.toml",
+            kind=ProviderKind.OPENAI,
+            model_ids=["qwen3:4b"],
+            options=EntryOptions(endpoint="http://localhost:11434/v1", output_per_mtok=12.0),
+            verify=_ok,
+        )

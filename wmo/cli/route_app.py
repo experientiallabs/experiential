@@ -775,6 +775,13 @@ def student(
             "are not preserved by a replacement), or --name <other> to keep both"
         )
         raise typer.Exit(0)
+    if _pool_disabled(pool_path, name):
+        # Same rule as the registry writer: `enabled = false` is an explicit operator edit,
+        # and replacing the entry must not silently put the candidate back into selection.
+        entry = entry.model_copy(update={"enabled": False})
+        _console.print(
+            f"[dim]'{name}' is disabled in the roster (enabled = false); keeping it disabled[/dim]"
+        )
     try:
         written = upsert_pool_entry(entry, pool_path)
     except FileLockTimeout as exc:
@@ -814,6 +821,16 @@ def _pool_has(path: Path, name: str) -> bool:
     except (ValueError, FileNotFoundError):
         # An unreadable pool is upsert_pool_entry's error to raise, with its own message; do not
         # pre-empt it here with a confirmation prompt about an entry we cannot see.
+        return False
+
+
+def _pool_disabled(path: Path, name: str) -> bool:
+    """Whether `path` carries an entry called `name` with `enabled = false` (else False)."""
+    if not path.is_file():
+        return False
+    try:
+        return any(entry.name == name and not entry.enabled for entry in load_pool(path).models)
+    except (ValueError, FileNotFoundError):
         return False
 
 

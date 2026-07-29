@@ -628,8 +628,14 @@ def _pool_digest(pool: ModelPool) -> str:
     The whole entry, not just the name: a matrix's rows are priced by their pool entry, so an
     edited price makes an old row's `cost_usd` a different number than the same cell would get
     today, and resuming across that edit would mix two price regimes into one comparison.
+
+    `enabled` is excluded from the digest: the pool digested here is already filtered to the
+    enabled entries, so the field carries no information, and hashing it would break every
+    pre-0.2.3 partial sidecar for an otherwise UNCHANGED roster the day the field was added
+    (a serialization-shape change, not a roster change). Turning an entry off still re-plans,
+    because the entry leaves the filtered pool entirely.
     """
-    payload = "\n".join(entry.model_dump_json() for entry in pool.models)
+    payload = "\n".join(entry.model_dump_json(exclude={"enabled"}) for entry in pool.models)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 

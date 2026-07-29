@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -253,19 +254,24 @@ def register_from_provider(
 
 
 def _ask_endpoint(console: Console, ask: PromptReader, options: EntryOptions) -> EntryOptions:
-    """Ask which server the OpenAI pass talks to: blank is OpenAI's own API.
+    """Ask which server the OpenAI pass talks to: OpenAI's own API when nothing is set.
 
     Answered once per pass, because every model registered against a server shares its URL. The
     stored value is exactly what was typed (a platform serving inside a container translates
     known-local hostnames at ITS boundary; the pool file never carries the translated form).
+
+    The blank answer keeps whatever is in effect, so its meaning is stated per case: with no
+    seeded endpoint blank means OpenAI's own API, and with one (`--endpoint`) blank keeps it,
+    with `-` as the explicit way back to the hosted API. Without that escape a session started
+    with `--endpoint` could never register a hosted candidate at all.
     """
-    raw = _read(
-        ask,
-        "[bold]OpenAI-compatible endpoint URL[/bold] "
-        "[dim](blank = OpenAI's own API; e.g. http://localhost:11434/v1 for Ollama)[/dim]"
-        + (f" [dim]\\[{escape(options.endpoint)}][/dim]" if options.endpoint else "")
-        + ": ",
-    )
+    if options.endpoint:
+        hint = f"blank = keep {escape(options.endpoint)}; '-' = OpenAI's own API"
+    else:
+        hint = "blank = OpenAI's own API; e.g. http://localhost:11434/v1 for Ollama"
+    raw = _read(ask, f"[bold]OpenAI-compatible endpoint URL[/bold] [dim]({hint})[/dim]: ")
+    if raw == "-":
+        return options.model_copy(update={"endpoint": None})
     endpoint = raw or options.endpoint
     if not endpoint:
         return options.model_copy(update={"endpoint": None})
@@ -353,12 +359,31 @@ def register_model_ids(
             than writing a candidate that does not work.
     """
     _check_azure_deployment(kind, model_ids, options)
+    if _self_hosted(kind, options) and (options.input_per_mtok is None) != (
+        options.output_per_mtok is None
+    ):
+        # Both or neither, exactly like the CLI flag guard (`wmo providers set` enforces it for
+        # flags; this covers direct library callers): silently zero-filling the missing half
+        # would discard a declared rate.
+        raise typer.BadParameter(
+            "set both input and output prices, or neither; a half-supplied pair would silently "
+            "zero the declared half"
+        )
     if _self_hosted(kind, options) and options.input_per_mtok is None:
-        # The scripted twin of the interactive default: a self-hosted candidate is priced by
-        # the operator or it is explicitly free, never priced off a shadowed built-in id.
+        if not is_local_endpoint(options.endpoint):
+            # A REMOTE OpenAI-compatible server (Together, Groq, a LiteLLM proxy) bills real
+            # money; only a locally hosted one defaults to free. Demanding the price here keeps
+            # the loud behavior main had for unpriced candidates.
+            raise typer.BadParameter(
+                f"'{options.endpoint}' is not a locally hosted server, so its price cannot be "
+                "assumed to be $0; pass --input-per-mtok and --output-per-mtok (USD per 1M "
+                "tokens) for the candidates it serves"
+            )
+        # The scripted twin of the interactive default: a LOCAL candidate is priced by the
+        # operator or it is explicitly free, never priced off a shadowed built-in id.
         console.print(
-            f"  [dim]self-hosted endpoint {escape(options.endpoint or '')}: pricing at $0/Mtok "
-            "(override with --input-per-mtok/--output-per-mtok)[/dim]"
+            f"  [dim]locally hosted endpoint {escape(options.endpoint or '')}: pricing at "
+            "$0/Mtok (override with --input-per-mtok/--output-per-mtok)[/dim]"
         )
         options = options.model_copy(update={"input_per_mtok": 0.0, "output_per_mtok": 0.0})
     if _self_hosted(kind, options):
@@ -603,6 +628,16 @@ def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
     Returns:
         True when the roster changed, False when it was already right or the write was refused.
     """
+    existing = {row.name: row for row in read_pool_entries(pool_path)}.get(entry.name)
+    if existing is not None and not existing.enabled:
+        # `enabled = false` is an explicit operator edit; a re-run of a registration script
+        # must not silently put the candidate back into selection. Re-enabling is the same
+        # one-line file edit that disabled it.
+        entry = entry.model_copy(update={"enabled": False})
+        console.print(
+            f"  [dim]{escape(entry.name)} is disabled in the roster (enabled = false); "
+            "keeping it disabled[/dim]"
+        )
     price = entry.price()
     summary = (
         f"[bold]{escape(entry.name)}[/bold] ({entry.kind.value} "
@@ -756,19 +791,26 @@ def _ask_per_model_options(
     if not priced_by_flags and _self_hosted(kind, options):
         # A self-hosted server ALWAYS takes an explicit price, even when the id shadows a
         # built-in one (someone serving `gpt-4o` locally must not inherit OpenAI's hosted
-        # rate). Default 0: local inference has no marginal per-token bill, and the stamped
-        # explicit zero says the $0 downstream is declared, not an accident.
+        # rate). The blank-answer default is 0 ONLY for a locally hosted server (no marginal
+        # per-token bill); a remote OpenAI-compatible endpoint (Together, Groq, a proxy) bills
+        # real money, so its prompt insists on a typed number.
+        local = is_local_endpoint(options.endpoint)
         console.print(
             f"  [dim]{escape(model.id)} is served by "
-            f"{escape(options.endpoint or 'a custom endpoint')}; built-in prices do not apply. "
-            "0 = free (local inference); declare an amortized rate to make cost-aware routing "
-            "weigh it[/dim]"
+            f"{escape(options.endpoint or 'a custom endpoint')}; built-in prices do not apply."
+            + (
+                " 0 = free (local inference); declare an amortized rate to make cost-aware "
+                "routing weigh it[/dim]"
+                if local
+                else " Enter what this server bills you (0 only if it is genuinely free)[/dim]"
+            )
         )
+        default = 0.0 if local else None
         updates["input_per_mtok"] = _ask_price(
-            console, ask, "Input price, USD per 1M tokens", default=0.0
+            console, ask, "Input price, USD per 1M tokens", default=default
         )
         updates["output_per_mtok"] = _ask_price(
-            console, ask, "Output price, USD per 1M tokens", default=0.0
+            console, ask, "Output price, USD per 1M tokens", default=default
         )
     elif not priced_by_flags and needs_price(kind, model):
         console.print(
@@ -801,7 +843,25 @@ def _target(
     a teammate's vLLM box are two different candidates, and collapsing them would silently
     delete one server's entry, exactly like the multi-account case `_existing_handle` guards.
     """
-    return (kind.value, model.lower(), (deployment or model).lower(), (endpoint or "").rstrip("/"))
+    return (kind.value, model.lower(), (deployment or model).lower(), _endpoint_key(endpoint))
+
+
+def _endpoint_key(endpoint: str | None) -> str:
+    """One endpoint URL as an identity key: equivalent spellings compare equal.
+
+    Scheme and host are case-insensitive on the wire and a default port is the same route as
+    no port, so `HTTP://LocalHost:80/v1` and `http://localhost/v1` must not become two
+    candidates a sweep pays for twice. The path keeps its case (paths are case-sensitive).
+    """
+    if not endpoint:
+        return ""
+    parts = urlsplit(endpoint.rstrip("/"))
+    if parts.hostname is None:
+        return endpoint.rstrip("/").lower()
+    scheme = parts.scheme.lower()
+    default_port = {"http": 80, "https": 443}.get(scheme)
+    port = "" if parts.port in (None, default_port) else f":{parts.port}"
+    return f"{scheme}://{parts.hostname.lower()}{port}{parts.path}"
 
 
 def _existing_handle(

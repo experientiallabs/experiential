@@ -146,8 +146,9 @@ class _FakeResponse:
 def test_endpoint_catalog_lists_what_the_server_serves(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[str] = []
 
-    def fake_get(url: str, timeout: float) -> _FakeResponse:
+    def fake_get(url: str, timeout: float, headers: dict[str, str]) -> _FakeResponse:
         seen.append(url)
+        assert headers == {}  # no key in the environment, no Authorization header
         return _FakeResponse(
             {"object": "list", "data": [{"id": "qwen3:4b", "owned_by": "library"}]}
         )
@@ -166,7 +167,7 @@ def test_endpoint_catalog_lists_what_the_server_serves(monkeypatch: pytest.Monke
 def test_endpoint_catalog_answers_an_unreachable_server_as_an_empty_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_get(url: str, timeout: float) -> _FakeResponse:
+    def fake_get(url: str, timeout: float, headers: dict[str, str]) -> _FakeResponse:
         raise httpx.ConnectError("connection refused")
 
     monkeypatch.setattr("wmo.providers.catalog.httpx.get", fake_get)
@@ -183,9 +184,53 @@ def test_endpoint_catalog_answers_a_nonconforming_body_as_an_empty_catalog(
 ) -> None:
     monkeypatch.setattr(
         "wmo.providers.catalog.httpx.get",
-        lambda url, timeout: _FakeResponse({"unexpected": "shape"}),
+        lambda url, timeout, headers: _FakeResponse({"unexpected": "shape"}),
     )
     catalog = endpoint_catalog("http://localhost:11434/v1")
 
     assert catalog.source is CatalogSource.NONE
     assert catalog.models == []
+
+
+def test_endpoint_catalog_survives_a_malformed_typed_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    # httpx.InvalidURL subclasses Exception directly (not HTTPError): the never-raises
+    # contract must hold for a URL a user mistyped at the prompt.
+    monkeypatch.delenv("WMO_ENDPOINT_API_KEY", raising=False)
+    catalog = endpoint_catalog("http://localhost:port/v1")
+    assert catalog.source is CatalogSource.NONE
+    assert catalog.models == []
+
+
+def test_endpoint_catalog_sends_the_endpoint_scoped_key_like_serving_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A vLLM started with --api-key protects /v1/models too; the probe authenticates the
+    # same way the serving path will, or a correctly configured server always lists empty.
+    seen_headers: list[dict[str, str]] = []
+
+    def fake_get(url: str, timeout: float, headers: dict[str, str]) -> _FakeResponse:
+        seen_headers.append(headers)
+        return _FakeResponse({"object": "list", "data": [{"id": "m"}]})
+
+    monkeypatch.setenv("WMO_ENDPOINT_API_KEY", "sekret")
+    monkeypatch.setattr("wmo.providers.catalog.httpx.get", fake_get)
+    endpoint_catalog("http://localhost:8001/v1")
+
+    assert seen_headers == [{"Authorization": "Bearer sekret"}]
+
+
+def test_endpoint_catalog_hints_at_v1_when_a_bare_origin_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Ollama prints its bare origin; the OpenAI-compatible surface lives under /v1.
+    def fake_get(url: str, timeout: float, headers: dict[str, str]) -> _FakeResponse:
+        request = httpx.Request("GET", url)
+        raise httpx.HTTPStatusError(
+            "404", request=request, response=httpx.Response(404, request=request)
+        )
+
+    monkeypatch.delenv("WMO_ENDPOINT_API_KEY", raising=False)
+    monkeypatch.setattr("wmo.providers.catalog.httpx.get", fake_get)
+    catalog = endpoint_catalog("http://localhost:11434")
+
+    assert "try http://localhost:11434/v1" in catalog.detail

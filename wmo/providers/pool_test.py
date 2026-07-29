@@ -1225,3 +1225,21 @@ def test_disabled_entry_still_validates_loudly(tmp_path: Path) -> None:
 )
 def test_is_local_endpoint(endpoint: str | None, local: bool) -> None:
     assert pool_module.is_local_endpoint(endpoint) is local
+
+
+def test_an_endpoint_backed_entry_never_inherits_a_hosted_price() -> None:
+    # "gpt-5.4" has a built-in (hosted) price, but this entry is served by a custom endpoint:
+    # the hosted rate is the wrong server's price, so the entry must demand its own.
+    with pytest.raises(ValidationError, match="custom endpoint"):
+        PoolEntry(
+            name="gpt-at-home",
+            kind=ProviderKind.OPENAI,
+            model="gpt-5.4",
+            endpoint="http://localhost:8001/v1",
+        )
+
+
+def test_is_local_endpoint_never_raises_on_a_malformed_bracket_url() -> None:
+    # urlsplit raises ValueError on `http://[::1:8000`; display copy must read it as
+    # "not local", not crash the roster table.
+    assert pool_module.is_local_endpoint("http://[::1:8000/v1") is False

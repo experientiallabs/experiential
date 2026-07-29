@@ -720,3 +720,19 @@ def test_a_plan_identity_changes_with_what_it_measures_and_not_with_how_fast(
 def test_a_concurrency_below_one_is_refused_at_plan_time(tmp_path: Path) -> None:
     with pytest.raises(SweepError, match="at least 1"):
         _plan(tmp_path, max_concurrency=0)
+
+
+def test_pool_digest_ignores_the_enabled_field() -> None:
+    """The digest predates `enabled`; hashing it would orphan every pre-upgrade sidecar.
+
+    The digested pool is already filtered to enabled entries, so the field carries no
+    information there, and an unchanged roster must keep its recorded digest across the
+    upgrade that added the field.
+    """
+    from wmo.optimize.sweep import _pool_digest
+    from wmo.providers.pool import ModelPool, PoolEntry
+
+    entry = PoolEntry(name="on", kind=ProviderKind.OPENAI, model="gpt-5.4")
+    explicit = entry.model_copy(update={"enabled": True})
+    assert _pool_digest(ModelPool(models=[entry])) == _pool_digest(ModelPool(models=[explicit]))
+    assert '"enabled"' not in entry.model_dump_json(exclude={"enabled"})
