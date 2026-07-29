@@ -117,6 +117,10 @@ BATCH_KILL_MARGIN_S = 300.0
 # means something is failing every time, and silently piling up directories would hide it.
 MAX_ATTEMPTS_PER_CELL = 100
 
+# Cap on the failure message carried by an unscored row. A provider can answer with a whole HTML
+# error page, so the message is trimmed to enough text to classify the failure.
+MAX_ERROR_CHARS = 600
+
 # A realistic agent-side episode mix, used only to order the pool cheapest-first. Ordering by
 # input price alone would let a model with a cheap input rate and an expensive output rate look
 # cheaper than it is.
@@ -228,6 +232,13 @@ class Tau2RewardInfo(BaseModel):
     reward: float | None = None
 
 
+class Tau2SimulationInfo(BaseModel):
+    """tau2's per-episode failure record. Present only on an episode it could not finish."""
+
+    error: str | None = None
+    error_type: str | None = None
+
+
 class Tau2Simulation(BaseModel):
     """One tau2 episode. Lenient by design: tau2 owns this schema and may extend it."""
 
@@ -238,6 +249,7 @@ class Tau2Simulation(BaseModel):
     user_cost: float | None = None
     reward_info: Tau2RewardInfo | None = None
     messages: list[Tau2Message] = []
+    info: Tau2SimulationInfo | None = None
 
     _null_is_zero = field_validator("duration", mode="before")(_zero_if_null)
 
@@ -273,6 +285,15 @@ class RealEpisodeRow(BaseModel):
     reward: float | None  # None = unscored (infrastructure failure), never treated as 0
     nl_assertion_reward: bool
     termination_reason: str
+    # WHY an unscored episode has no reward. tau2 collapses every failure into the single
+    # termination_reason "infrastructure_error", which merges two cases analysis must keep
+    # apart: a candidate that replied with neither content nor a tool call (its own output, a
+    # benchmark failure that belongs in the denominator) and a 429, auth fault, or timeout
+    # (genuinely ours, excluded-and-reported). The distinction decides whether a cell counts as
+    # a zero or a hole, and reading it back out of tau2's save directories is not possible once
+    # they are cleaned, so the signature travels on the row.
+    error: str | None = None
+    error_type: str | None = None
     duration_s: float
     agent_input_tokens: int
     agent_output_tokens: int
@@ -632,6 +653,23 @@ def _stream_tokens(messages: Sequence[Tau2Message], role: str) -> tuple[int, int
     return prompt, completion
 
 
+def _error_fields(sim: Tau2Simulation) -> tuple[str | None, str | None]:
+    """tau2's failure signature for one episode, or `(None, None)` when it finished.
+
+    Args:
+        sim: The parsed tau2 simulation.
+
+    Returns:
+        The capped error message and tau2's exception class name.
+    """
+    if sim.info is None:
+        return None, None
+    message = (sim.info.error or "").strip()
+    if len(message) > MAX_ERROR_CHARS:
+        message = message[:MAX_ERROR_CHARS] + "... [truncated]"
+    return message or None, sim.info.error_type
+
+
 def rows_from_results(
     results: Tau2Results,
     entry: PoolEntry,
@@ -665,6 +703,7 @@ def rows_from_results(
         agent_in, agent_out = _stream_tokens(sim.messages, "assistant")
         user_in, user_out = _stream_tokens(sim.messages, "user")
         assistant = [m for m in sim.messages if m.role == "assistant"]
+        error, error_type = _error_fields(sim)
         rows.append(
             RealEpisodeRow(
                 scenario_id=scenario.scenario_id,
@@ -678,6 +717,8 @@ def rows_from_results(
                 reward=sim.reward_info.reward if sim.reward_info is not None else None,
                 nl_assertion_reward=scenario.nl_assertion_reward,
                 termination_reason=sim.termination_reason,
+                error=error,
+                error_type=error_type,
                 duration_s=sim.duration,
                 agent_input_tokens=agent_in,
                 agent_output_tokens=agent_out,
@@ -769,9 +810,7 @@ def resume_keys(rows: Sequence[RealEpisodeRow], retry_failed: bool) -> set[tuple
     pass, one retry: a cell that fails again simply stays unscored, and the operator decides
     whether to run the flag again.
     """
-    return {
-        row.key for row in latest_per_cell(rows) if not (retry_failed and row.reward is None)
-    }
+    return {row.key for row in latest_per_cell(rows) if not (retry_failed and row.reward is None)}
 
 
 def to_matrix(rows: Sequence[RealEpisodeRow], pool: Sequence[PoolEntry]) -> OutcomeMatrix:

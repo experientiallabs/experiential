@@ -21,6 +21,7 @@ from real_episodes import (
     ProtocolPins,
     RealEpisodeRow,
     Tau2Results,
+    Tau2SimulationInfo,
     agent_llm_args,
     append_rows,
     batch_command,
@@ -406,6 +407,67 @@ def test_unscored_episode_is_never_zeroed(tmp_path: Path) -> None:
     assert outcome.reward is None
     assert outcome.scored is False
     assert outcome.success is False
+
+
+def test_finished_episode_carries_no_error_signature(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.error is None
+    assert row.error_type is None
+
+
+def test_unscored_episode_carries_tau2s_failure_signature(tmp_path: Path) -> None:
+    # The signature observed on the real grid: the candidate answered with neither content nor a
+    # tool call, so tau2 refused the message and lost the episode. termination_reason alone cannot
+    # tell that apart from a 429, and the two are graded differently.
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(None)
+    payload.simulations[0].termination_reason = "infrastructure_error"
+    payload.simulations[0].info = Tau2SimulationInfo(
+        error="AssistantMessage must have either content or tool_calls. Got AssistantMessage",
+        error_type="ValueError",
+    )
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.reward is None
+    assert row.error_type == "ValueError"
+    assert row.error is not None
+    assert "must have either content or tool_calls" in row.error
+
+
+def test_a_giant_error_message_is_capped(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(None)
+    payload.simulations[0].info = Tau2SimulationInfo(error="x" * 5000, error_type="APIError")
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.error is not None
+    assert row.error.endswith("... [truncated]")
+    assert len(row.error) < 5000
+
+
+def test_error_signature_survives_the_rows_round_trip(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(None)
+    payload.simulations[0].info = Tau2SimulationInfo(error="boom", error_type="ValueError")
+    append_rows(
+        tmp_path / "rows.jsonl", rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    )
+    [reloaded] = load_rows(tmp_path / "rows.jsonl")
+    assert (reloaded.error, reloaded.error_type) == ("boom", "ValueError")
+
+
+def test_rows_written_before_the_error_field_still_load(tmp_path: Path) -> None:
+    # Rows already bought on this cohort have no error keys; refusing them would strand paid
+    # episodes.
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    legacy = row.model_dump()
+    del legacy["error"]
+    del legacy["error_type"]
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    [reloaded] = load_rows(path)
+    assert reloaded.error is None
+    assert reloaded.reward == 1.0
 
 
 def test_matrix_carries_cost_and_latency(tmp_path: Path) -> None:
