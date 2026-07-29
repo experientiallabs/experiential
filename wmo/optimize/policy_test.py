@@ -533,6 +533,22 @@ def test_azure_embedder_spec_missing_key_env_fails_loudly(
         spec.build()
 
 
+def test_openai_embedder_spec_builds_a_batched_provider_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_EMBED_KEY", "sk-test")
+    spec = EmbedderSpec(
+        kind="openai",
+        dim=3072,
+        deployment="text-embedding-3-large",
+        api_key_env="OPENAI_EMBED_KEY",
+        batch=128,
+    )
+    from wmo.retrieval.embedders import BatchedEmbedder
+
+    assert isinstance(spec.build(), BatchedEmbedder)
+
+
 def test_support_tilt_shifts_weight_to_supported_clusters() -> None:
     # Two near-equidistant clusters with opposite rankings; the tiny cluster (total=1) wins
     # untilted (slightly closer), the big one (total=400) wins under tilt.
@@ -985,6 +1001,35 @@ def test_embedder_provenance_separates_two_azure_resources() -> None:
     assert embedder_provenance(EmbedderSpec(dim=512)) == "hashing-512"
 
 
+def test_openai_embedder_provenance_and_resolution_are_provider_specific() -> None:
+    spec, line = resolve_embedder(
+        "openai",
+        dim=None,
+        deployment="text-embedding-3-large",
+        endpoint=None,
+        api_key_env=None,
+    )
+    assert spec == EmbedderSpec(
+        kind="openai",
+        dim=3072,
+        deployment="text-embedding-3-large",
+        api_key_env="OPENAI_API_KEY",
+    )
+    assert embedder_provenance(spec) == "openai-3072/text-embedding-3-large"
+    assert "billed to that account" in line
+
+
+def test_openai_embedder_rejects_an_azure_endpoint() -> None:
+    with pytest.raises(ValueError, match="drop --endpoint"):
+        resolve_embedder(
+            "openai",
+            dim=None,
+            deployment="text-embedding-3-large",
+            endpoint="https://example.openai.azure.com",
+            api_key_env=None,
+        )
+
+
 def test_evidence_records_the_guards_numbers_when_a_pick_is_routed() -> None:
     # The same decision the reason string describes in prose, in a shape something can aggregate.
     decision = knn_decision(_knn_policy(_knn_bank([[0.0, 1.0]] * 12)), _QUERY)
@@ -1189,7 +1234,7 @@ def test_explicit_azure_without_a_deployment_says_which_flag_is_missing() -> Non
 def test_an_unknown_embedder_is_a_usage_error() -> None:
     with pytest.raises(ValueError) as caught:
         resolve_embedder("word2vec", dim=None, deployment=None, endpoint=None, api_key_env=None)
-    assert "auto, hashing or azure" in str(caught.value)
+    assert "auto, hashing, openai or azure" in str(caught.value)
 
 
 def test_the_azure_resolution_line_says_it_bills_an_api(

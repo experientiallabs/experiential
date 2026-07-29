@@ -563,7 +563,6 @@ def test_dry_run_resolves_the_split_and_spends_nothing(
     # The cohort the operator is about to buy is stated before anything is bought.
     assert f"protocol pins: cohort '{ProtocolPins().label}' (canonical)" in printed
     assert "--max-steps 100 --timeout 1800 --max-retries 0" in printed
-    # The user simulator is environment, so it is never also run as a candidate.
     assert "--agent-llm azure/gpt-5.4-mini" not in printed
 
 
@@ -611,24 +610,29 @@ def test_scenario_flag_rejects_ids_outside_the_split(tmp_path: Path) -> None:
     )
 
 
-def test_only_selecting_just_the_user_simulator_is_refused(tmp_path: Path) -> None:
+def test_user_simulator_model_can_also_be_scored_as_candidate(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     _fake_capture_from_pinned_split(tmp_path)
-    assert (
-        main(
-            [
-                "--capture-dir",
-                str(tmp_path),
-                "--pool",
-                str(_pool_file(tmp_path / "pool.toml")),
-                "--out-dir",
-                str(tmp_path / "out"),
-                "--only",
-                "gpt-5.4-mini",
-                "--dry-run",
-            ]
+    with caplog.at_level("INFO", logger="tau-real"):
+        assert (
+            main(
+                [
+                    "--capture-dir",
+                    str(tmp_path),
+                    "--pool",
+                    str(_pool_file(tmp_path / "pool.toml")),
+                    "--out-dir",
+                    str(tmp_path / "out"),
+                    "--only",
+                    "gpt-5.4-mini",
+                    "--dry-run",
+                ]
+            )
+            == 0
         )
-        == 2
-    )
+    assert "--agent-llm azure/gpt-5.4-mini" in caplog.text
+    assert "--user-llm azure/gpt-5.4-mini" in caplog.text
 
 
 def test_write_matrix_only_rebuilds_from_rows(tmp_path: Path) -> None:

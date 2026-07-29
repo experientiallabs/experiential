@@ -38,6 +38,21 @@ def test_gpt_5_5_output_is_30_per_mtok() -> None:
     assert (price.input_per_mtok, price.output_per_mtok) == (5.0, 30.0)
 
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gpt-5.6-sol", (5.0, 30.0)),
+        ("gpt-5.6-terra", (2.5, 15.0)),
+        ("gpt-5.6-luna", (1.0, 6.0)),
+        ("claude-opus-5", (5.0, 25.0)),
+    ],
+)
+def test_current_frontier_prices(model: str, expected: tuple[float, float]) -> None:
+    price = price_for(model)
+    assert price is not None
+    assert (price.input_per_mtok, price.output_per_mtok) == expected
+
+
 def test_fable_5_is_10_in_50_out() -> None:
     price = price_for("claude-fable-5")
     assert price is not None

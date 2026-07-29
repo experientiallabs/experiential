@@ -81,8 +81,11 @@ class PoolEntry(BaseModel):
     # (Tinker's serving endpoint does) declares it here, because the catalog has never heard of it.
     chat_max_tokens_field: ChatMaxTokensField = "max_completion_tokens"
     endpoint: str | None = None
+    endpoint_env: str | None = None
     deployment: str | None = None  # Azure deployment name
+    deployment_env: str | None = None
     api_version: str | None = None  # Azure api-version
+    reasoning_effort: str | None = None
     region: str | None = None  # AWS Bedrock region (bedrock entries only)
     api_key_env: str | None = None  # env var holding this entry's API key (multi-account pools)
     tier: Tier = "frontier"
@@ -105,12 +108,24 @@ class PoolEntry(BaseModel):
                 f"pool model '{self.name}': '{self.model}' has no built-in price;{catalog_note} "
                 "add input_per_mtok and output_per_mtok (USD per 1M tokens) to its pool entry"
             )
-        if self.kind is ProviderKind.AZURE_OPENAI and self.deployment is None:
+        if self.endpoint is not None and self.endpoint_env is not None:
+            raise ValueError(
+                f"pool model '{self.name}': set endpoint or endpoint_env, not both"
+            )
+        if self.deployment is not None and self.deployment_env is not None:
+            raise ValueError(
+                f"pool model '{self.name}': set deployment or deployment_env, not both"
+            )
+        if (
+            self.kind is ProviderKind.AZURE_OPENAI
+            and self.deployment is None
+            and self.deployment_env is None
+        ):
             # Without this the entry loads fine and the first request routed to it 500s
             # from AzureOpenAIProvider._deployment(); load is the validation boundary.
             raise ValueError(
                 f"pool model '{self.name}': azure entries need `deployment` (the Azure "
-                "deployment name to call)"
+                "deployment name to call), or `deployment_env` naming the variable that holds it"
             )
         if self.kind is ProviderKind.BEDROCK and self.api_key_env is not None:
             # Same boundary: `BedrockProvider.__init__` refuses an explicit key, and a sweep
@@ -205,11 +220,40 @@ class PoolEntry(BaseModel):
             model=self.model,
             model_type=self.model_type,
             chat_max_tokens_field=self.chat_max_tokens_field,
-            endpoint=self.endpoint,
-            deployment=self.deployment,
+            endpoint=self._env_backed_value(
+                literal=self.endpoint,
+                env_name=self.endpoint_env,
+                field="endpoint",
+            ),
+            deployment=self._env_backed_value(
+                literal=self.deployment,
+                env_name=self.deployment_env,
+                field="deployment",
+            ),
             api_version=self.api_version,
+            reasoning_effort=self.reasoning_effort,
             region=self.region,
         )
+
+    def _env_backed_value(
+        self,
+        *,
+        literal: str | None,
+        env_name: str | None,
+        field: str,
+    ) -> str | None:
+        """Resolve a non-secret pool reference without serializing its value."""
+        if literal is not None:
+            return literal
+        if env_name is None:
+            return None
+        value = os.environ.get(env_name)
+        if not value:
+            raise ValueError(
+                f"pool model '{self.name}': environment variable {env_name} for {field} "
+                "is unset or empty"
+            )
+        return value
 
 
 class ModelPool(BaseModel):

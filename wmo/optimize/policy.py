@@ -142,12 +142,12 @@ class EmbedderSpec(BaseModel):
     """How to reproduce the policy's embedding function at serve time.
 
     `hashing` is deterministic, offline, and credential-free, so a policy file is fully
-    self-contained. `azure` uses an Azure embedding deployment (per-entry credential
-    conventions matching the model pool: `api_key_env` names the env var); the fitter records
-    whichever the fit actually used, and serving reconstructs the identical function.
+    self-contained. `openai` uses a direct OpenAI embedding model, and `azure` uses an Azure
+    embedding deployment. Both use the model-pool credential convention where `api_key_env`
+    names the key variable. The fitter records the exact backend and serving reconstructs it.
     """
 
-    kind: Literal["hashing", "azure"] = "hashing"
+    kind: Literal["hashing", "openai", "azure"] = "hashing"
     # gt=0 because a zero-width embedding is not a smaller embedding, it is no embedding: it
     # would reach the provider as `dimensions=0` and build a bank of empty rows.
     dim: int = Field(default=512, gt=0)
@@ -160,6 +160,8 @@ class EmbedderSpec(BaseModel):
     def _validate_backend(self) -> EmbedderSpec:
         if self.kind == "azure" and not (self.deployment and self.endpoint):
             raise ValueError("an azure embedder spec needs deployment and endpoint")
+        if self.kind == "openai" and not self.deployment:
+            raise ValueError("an openai embedder spec needs an embedding model")
         return self
 
     def build(self) -> Embedder:
@@ -175,12 +177,12 @@ class EmbedderSpec(BaseModel):
                 )
         provider = get_provider(
             ProviderConfig(
-                kind=ProviderKind.AZURE_OPENAI,
+                kind=(ProviderKind.OPENAI if self.kind == "openai" else ProviderKind.AZURE_OPENAI),
                 model=self.deployment or "",
                 embed_model=self.deployment,
                 embed_dim=self.dim,
-                endpoint=self.endpoint,
-                api_version="2024-10-21",
+                endpoint=self.endpoint if self.kind == "azure" else None,
+                api_version="2024-10-21" if self.kind == "azure" else None,
             ),
             api_key=api_key,
         )
@@ -198,7 +200,11 @@ def embedder_provenance(spec: EmbedderSpec) -> str:
     left out on purpose: renaming it does not move a single vector.
     """
     tag = f"{spec.kind}-{spec.dim}"
-    return tag if spec.kind == "hashing" else f"{tag}/{spec.deployment}@{spec.endpoint}"
+    if spec.kind == "hashing":
+        return tag
+    if spec.kind == "openai":
+        return f"{tag}/{spec.deployment}"
+    return f"{tag}/{spec.deployment}@{spec.endpoint}"
 
 
 @dataclass(frozen=True)
@@ -1159,8 +1165,8 @@ def resolve_embedder(
         ValueError: An unknown `--embedder`, or an explicit azure spec missing a flag.
             `route fit` re-raises these as `typer.BadParameter`.
     """
-    if choice not in ("auto", "hashing", "azure"):
-        raise ValueError(f"unknown embedder '{choice}'; use auto, hashing or azure")
+    if choice not in ("auto", "hashing", "openai", "azure"):
+        raise ValueError(f"unknown embedder '{choice}'; use auto, hashing, openai or azure")
 
     if choice == "auto":
         present = all(os.environ.get(name) for name in AZURE_EMBEDDER_ENV)
@@ -1185,6 +1191,36 @@ def resolve_embedder(
     if choice == "hashing":
         spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
         return spec, f"embedder: hashing-{spec.dim} (explicit). {HASHING_DOWNGRADE_NOTICE}"
+
+    if choice == "openai":
+        if not deployment:
+            raise ValueError(
+                "--embedder openai needs --deployment naming the embedding model "
+                "(for example text-embedding-3-large)"
+            )
+        if endpoint:
+            raise ValueError(
+                "--embedder openai uses the direct OpenAI endpoint; drop --endpoint or use "
+                "--embedder azure"
+            )
+        native, recognized = _native_dim(deployment)
+        spec = EmbedderSpec(
+            kind="openai",
+            dim=native if dim is None else dim,
+            deployment=deployment,
+            api_key_env=api_key_env or "OPENAI_API_KEY",
+        )
+        width = (
+            f"{spec.dim}d as asked"
+            if dim is not None
+            else f"{spec.dim}d native"
+            if recognized
+            else f"{spec.dim}d assumed"
+        )
+        return spec, (
+            f"embedder: openai {deployment} ({width}) (explicit). "
+            "This calls the OpenAI embedding API and is billed to that account."
+        )
 
     if not (deployment and endpoint):
         # EmbedderSpec would reject this too, but only after the matrix has been read; say which
@@ -1266,6 +1302,12 @@ def _probe_failure(spec: EmbedderSpec, detail: str) -> str:
     """What to tell an operator whose embedder does not work, in the vocabulary they typed."""
     if spec.kind == "hashing":
         return f"the hashing embedder failed to embed a probe text: {detail}"
+    if spec.kind == "openai":
+        return (
+            f"OpenAI embedding model '{spec.deployment}' could not embed a probe text: "
+            f"{detail}. Check {spec.api_key_env or 'OPENAI_API_KEY'}, use a current embedding "
+            "model, or fit with --embedder hashing."
+        )
     return (
         f"embedding deployment '{spec.deployment}' at {spec.endpoint} could not embed a probe "
         f"text: {detail}. That resource may serve chat models without hosting an embedding "

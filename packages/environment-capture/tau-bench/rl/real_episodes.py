@@ -413,8 +413,9 @@ def litellm_route(entry: PoolEntry) -> str:
     if entry.kind is ProviderKind.BEDROCK:
         return f"bedrock/{entry.model}"
     if entry.kind is ProviderKind.AZURE_OPENAI:
-        deployment = entry.deployment or entry.model
-        endpoint = entry.endpoint or ""
+        config = entry.provider_config()
+        deployment = config.deployment or entry.model
+        endpoint = config.endpoint or ""
         if _AZURE_AI_HOST in endpoint:
             return f"azure_ai/{deployment}"
         if _AZURE_OPENAI_HOST in endpoint:
@@ -449,18 +450,19 @@ def _credentials(entry: PoolEntry, environ: dict[str, str]) -> dict[str, str]:
             )
         return {"ANTHROPIC_API_KEY": key}
     if family in ("azure", "azure_ai"):
+        config = entry.provider_config()
         variable = entry.api_key_env or (
             "AZURE_API_KEY" if family == "azure" else "AZURE_AI_API_KEY"
         )
         key = environ.get(variable)
         if not key:
             raise SystemExit(f"pool model '{entry.name}' needs {variable} in the environment")
-        endpoint = entry.endpoint or ""
+        endpoint = config.endpoint or ""
         if family == "azure":
             return {
                 "AZURE_API_KEY": key,
                 "AZURE_API_BASE": endpoint,
-                "AZURE_API_VERSION": entry.api_version or "2024-10-21",
+                "AZURE_API_VERSION": config.api_version or "2024-10-21",
             }
         # The Azure AI inference endpoint litellm calls is the account URL plus /models; pool
         # entries record the account URL because that is what the wmo provider wants.
@@ -474,12 +476,13 @@ def _credentials(entry: PoolEntry, environ: dict[str, str]) -> dict[str, str]:
                 "in the environment"
             )
         credentials = {"OPENAI_API_KEY": key}
-        if entry.endpoint:
+        config = entry.provider_config()
+        if config.endpoint:
             # A self-hosted OpenAI-compatible server (a Tinker-served student, a local vLLM).
             # Dropping its endpoint would send this candidate's episodes to api.openai.com
             # under the wrong key and quietly measure a different model.
-            credentials["OPENAI_API_BASE"] = entry.endpoint
-            credentials["OPENAI_BASE_URL"] = entry.endpoint
+            credentials["OPENAI_API_BASE"] = config.endpoint
+            credentials["OPENAI_BASE_URL"] = config.endpoint
         return credentials
     if family == "openrouter":
         key = environ.get(entry.api_key_env or "OPENROUTER_API_KEY")
@@ -1063,19 +1066,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             len(latest_per_cell(rows)) - len(done),
         )
 
-    # The user simulator is the environment, so it is never also measured as a candidate.
+    # The user simulator is part of the fixed environment, but the same underlying model may
+    # independently be measured in the candidate role. This is required for a dense pool matrix.
     candidates = [
         entry
         for entry in price_order(pool)
-        if entry.name != user_sim.name and (not args.only or entry.name in args.only)
+        if not args.only or entry.name in args.only
     ]
     if not candidates:
         logger.error(
-            "no candidates left to run: --only %s selects nothing outside the pinned user "
-            "simulator '%s'. Pool models are %s.",
+            "no candidates left to run: --only %s selects none of the pool models %s "
+            "(pinned user simulator '%s').",
             args.only,
-            user_sim.name,
             sorted(by_name),
+            user_sim.name,
         )
         return 2
 
