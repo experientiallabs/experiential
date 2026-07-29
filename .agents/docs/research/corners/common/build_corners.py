@@ -97,6 +97,14 @@ ARM_COLORS = {IDENTITY_ARM: BLUE, "truncate": PURPLE, "llmlingua2-endpoint": RED
 
 NOISE_FLOOR_POINTS = NOISE_FLOOR_REWARD * 100
 
+# The provenance and split a lens describes when it does not say otherwise: the tau world-model
+# grid this runner was written for. A real-benchmark lens overrides both, and must, because the
+# labeling rules forbid a computed delta from crossing provenance and a reader cannot check that
+# rule against a label that is wrong.
+WM_SIMULATED = "wm_simulated"
+REAL_EPISODE = "real_episode"
+WM_TEST_BAND = "wm-test-band"
+
 # Dial positions replayed for the tau dial curve: the same five measured detents the ours9
 # anchors use, so the two panels are comparable in shape (never in numbers).
 ROUTED_DIALS = (0.0, 0.25, 0.5, 0.75, 1.0)
@@ -218,6 +226,10 @@ class LensSpec(BaseModel):
     dataset_root: str | None = None  # default: the live tau grid cohort (data.grid_dir)
     dataset_label: str = "tau-bench"
     judge_label: str | None = None  # default: GRID_JUDGE (the tau cohort's pin)
+    # A real-benchmark lens sets these. They are not cosmetic: every label rule in
+    # common/README.md is enforced by a reader comparing them, so a wrong one is worse than none.
+    provenance_label: str = WM_SIMULATED
+    split_label: str = WM_TEST_BAND
 
 
 class ConfigRecord(BaseModel):
@@ -269,6 +281,8 @@ class CornersDataset(BaseModel):
     anchor_model: str
     dataset_label: str = "tau-bench"
     judge_label: str = GRID_JUDGE
+    provenance_label: str = WM_SIMULATED
+    split_label: str = WM_TEST_BAND
     best_single: str | None = None
     records: list[ConfigRecord] = []
     routed: list[RoutedRecord] = []
@@ -282,15 +296,21 @@ class CornersDataset(BaseModel):
 
 
 def _condition(
-    model: str, optimizer: str, *, dataset: str = "tau-bench", judge: str = GRID_JUDGE
+    model: str,
+    optimizer: str,
+    *,
+    dataset: str = "tau-bench",
+    judge: str = GRID_JUDGE,
+    provenance: str = WM_SIMULATED,
+    split: str = WM_TEST_BAND,
 ) -> ConditionLabel:
     return ConditionLabel(
         base_model=model,
         optimizer=optimizer,
         dataset=dataset,
-        split="wm-test-band",
+        split=split,
         judge=judge,
-        provenance="wm_simulated",
+        provenance=provenance,
     )
 
 
@@ -311,13 +331,21 @@ def _compressor_overheads(rows: list) -> list[RowOverhead]:
 
 
 def _config_arm(
-    snapshot: ArmSnapshot, model: str, *, dataset: str = "tau-bench", judge: str = GRID_JUDGE
+    snapshot: ArmSnapshot,
+    model: str,
+    *,
+    dataset: str = "tau-bench",
+    judge: str = GRID_JUDGE,
+    provenance: str = WM_SIMULATED,
+    split: str = WM_TEST_BAND,
 ) -> Arm:
     rows = rows_for_model(snapshot.matrix, model)
     optimizer = "none" if snapshot.name == IDENTITY_ARM else f"compaction({snapshot.name})"
     return Arm(
         name=f"{model} [{snapshot.name}]",
-        condition=_condition(model, optimizer, dataset=dataset, judge=judge),
+        condition=_condition(
+            model, optimizer, dataset=dataset, judge=judge, provenance=provenance, split=split
+        ),
         rows=rows,
         overheads=_compressor_overheads(rows),
     )
@@ -327,9 +355,7 @@ def _best_single(snapshot: ArmSnapshot) -> str | None:
     """The strongest pool model by mean reward over its scored identity rows."""
     means: dict[str, float] = {}
     for model in snapshot.matrix.model_names():
-        rewards = [
-            o.reward for o in rows_for_model(snapshot.matrix, model) if o.reward is not None
-        ]
+        rewards = [o.reward for o in rows_for_model(snapshot.matrix, model) if o.reward is not None]
         if rewards:
             means[model] = sum(rewards) / len(rewards)
     return max(means, key=lambda m: means[m]) if means else None
@@ -341,6 +367,8 @@ def build_dataset(
     root: Path | None = None,
     dataset_label: str = "tau-bench",
     judge: str = GRID_JUDGE,
+    provenance: str = WM_SIMULATED,
+    split: str = WM_TEST_BAND,
     loo: bool = False,
 ) -> CornersDataset:
     """Load once, aggregate once. Every figure below renders from this object.
@@ -356,9 +384,10 @@ def build_dataset(
         anchor_model=anchor_model,
         dataset_label=dataset_label,
         judge_label=judge,
+        provenance_label=provenance,
+        split_label=split,
         pending=[arm for arm in GRID_ARMS if arm not in present],
-        status="; ".join(f"{s.name}: {s.status}" for s in snapshots)
-        or "no grid data on disk yet",
+        status="; ".join(f"{s.name}: {s.status}" for s in snapshots) or "no grid data on disk yet",
     )
     identity = next((s for s in snapshots if s.name == IDENTITY_ARM), None)
     if identity is None or anchor_model not in identity.matrix.model_names():
@@ -371,7 +400,14 @@ def build_dataset(
         return dataset
     anchor = Arm(
         name=f"{anchor_model} [anchor]",
-        condition=_condition(anchor_model, "none", dataset=dataset_label, judge=judge),
+        condition=_condition(
+            anchor_model,
+            "none",
+            dataset=dataset_label,
+            judge=judge,
+            provenance=provenance,
+            split=split,
+        ),
         rows=anchor_rows,
     )
     dataset.best_single = _best_single(identity)
@@ -380,7 +416,12 @@ def build_dataset(
         best_anchor = Arm(
             name=f"{dataset.best_single} [best-single anchor]",
             condition=_condition(
-                dataset.best_single, "none", dataset=dataset_label, judge=judge
+                dataset.best_single,
+                "none",
+                dataset=dataset_label,
+                judge=judge,
+                provenance=provenance,
+                split=split,
             ).replace(notes="best-single anchor"),
             rows=rows_for_model(identity.matrix, dataset.best_single),
         )
@@ -388,13 +429,18 @@ def build_dataset(
     for snapshot in snapshots:
         for model in snapshot.matrix.model_names():
             key = f"{snapshot.name}/{model}"
-            if not any(
-                row.reward is not None for row in rows_for_model(snapshot.matrix, model)
-            ):
+            if not any(row.reward is not None for row in rows_for_model(snapshot.matrix, model)):
                 dataset.notes.append(f"{key}: no scored rows yet, skipped")
                 continue
             try:
-                config = _config_arm(snapshot, model, dataset=dataset_label, judge=judge)
+                config = _config_arm(
+                    snapshot,
+                    model,
+                    dataset=dataset_label,
+                    judge=judge,
+                    provenance=provenance,
+                    split=split,
+                )
             except ValueError as exc:
                 # A mid-repair snapshot can hold a cell twice (original + retried row).
                 dataset.notes.append(f"{key}: rows not usable yet ({exc})")
@@ -416,9 +462,7 @@ def build_dataset(
                 vs_anchor_evidence=paired_delta(
                     config_rewards, rewards_by_scenario(anchor.rows, model=anchor_model)
                 ),
-                vs_anchor_cost_ci=cost_delta_ci(
-                    config_cost, _scenario_cost(anchor.rows, [])
-                ),
+                vs_anchor_cost_ci=cost_delta_ci(config_cost, _scenario_cost(anchor.rows, [])),
             )
             if best_anchor is not None and config.condition.key() != best_anchor.condition.key():
                 try:
@@ -438,7 +482,12 @@ def build_dataset(
 
     for snapshot in snapshots:
         _routed_records(
-            snapshot, anchor, best_anchor, dataset, root=root, dataset_label=dataset_label,
+            snapshot,
+            anchor,
+            best_anchor,
+            dataset,
+            root=root,
+            dataset_label=dataset_label,
             judge=judge,
         )
 
@@ -503,22 +552,20 @@ def _routed_records(
             # which is the measured floor-tripping failure, so the replay compresses too.
             embedder = CompressingEmbedder(embedder, policy.fit_compression)
         eval_ids = [
-            sid
-            for sid in snapshot.matrix.scenario_ids()
-            if sid not in set(policy.fit_scenario_ids)
+            sid for sid in snapshot.matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)
         ]
         if not eval_ids:
             dataset.notes.append(f"routed rung [{snapshot.name}]: no held-out scenarios")
             return
         for dial in ROUTED_DIALS:
             dialed = apply_cost_quality(policy, dial)
-            rows = rows_for_policy(
-                snapshot.matrix, dialed, ids=eval_ids, embedder=embedder
-            )
+            rows = rows_for_policy(snapshot.matrix, dialed, ids=eval_ids, embedder=embedder)
             dataset.embedding_replay_calls += len(eval_ids)
-            dataset.embedding_replay_est_usd += sum(
-                len(snapshot.matrix.for_scenario(sid)[0].task) // 4 for sid in eval_ids
-            ) / 1e6 * EMBED_LIST_USD_PER_MTOK
+            dataset.embedding_replay_est_usd += (
+                sum(len(snapshot.matrix.for_scenario(sid)[0].task) // 4 for sid in eval_ids)
+                / 1e6
+                * EMBED_LIST_USD_PER_MTOK
+            )
             overheads = [
                 RowOverhead(
                     scenario_id=row.scenario_id,
@@ -537,6 +584,8 @@ def _routed_records(
                     + ("" if snapshot.name == IDENTITY_ARM else f"+compaction({snapshot.name})"),
                     dataset=dataset_label,
                     judge=judge,
+                    provenance=dataset.provenance_label,
+                    split=dataset.split_label,
                 ),
                 rows=rows,
                 overheads=overheads,
@@ -564,9 +613,7 @@ def _routed_records(
                 record.vs_best = build_scorecard(arm=arm, anchor=best_anchor)
                 record.vs_best_evidence = paired_delta(
                     routed_rewards,
-                    rewards_by_scenario(
-                        best_anchor.rows, model=best_anchor.condition.base_model
-                    ),
+                    rewards_by_scenario(best_anchor.rows, model=best_anchor.condition.base_model),
                 )
                 record.vs_best_cost_ci = cost_delta_ci(
                     routed_cost, _scenario_cost(best_anchor.rows, [])
@@ -638,6 +685,8 @@ def loo_routed_records(
                 f"routing(knn loo dial={dial:g})",
                 dataset=dataset.dataset_label,
                 judge=dataset.judge_label,
+                provenance=dataset.provenance_label,
+                split=dataset.split_label,
             ),
             rows=rows,
             overheads=overheads,
@@ -728,8 +777,11 @@ def real_probe_section(dataset: CornersDataset) -> dict[str, object] | None:
     routed = Arm(
         name="routed-decision-direct [real]",
         condition=ConditionLabel(
-            base_model="opus-5(routed decision)", optimizer="routing(balanced, direct-exec)",
-            dataset="tau2-real", split="pinned-eval-20", judge=REAL_JUDGE,
+            base_model="opus-5(routed decision)",
+            optimizer="routing(balanced, direct-exec)",
+            dataset="tau2-real",
+            split="pinned-eval-20",
+            judge=REAL_JUDGE,
             provenance="real_episode",
         ),
         rows=routed_rows,
@@ -737,15 +789,17 @@ def real_probe_section(dataset: CornersDataset) -> dict[str, object] | None:
     anchor = Arm(
         name="fable-5 [real]",
         condition=ConditionLabel(
-            base_model="fable-5", optimizer="none", dataset="tau2-real",
-            split="pinned-eval-20", judge=REAL_JUDGE, provenance="real_episode",
+            base_model="fable-5",
+            optimizer="none",
+            dataset="tau2-real",
+            split="pinned-eval-20",
+            judge=REAL_JUDGE,
+            provenance="real_episode",
         ),
         rows=anchor_rows,
     )
     card = build_scorecard(arm=routed, anchor=anchor)
-    real_delta = paired_delta(
-        _by_scenario_rewards(routed_rows), _by_scenario_rewards(anchor_rows)
-    )
+    real_delta = paired_delta(_by_scenario_rewards(routed_rows), _by_scenario_rewards(anchor_rows))
     cost_ci = cost_delta_ci(_scenario_cost(routed_rows, []), _scenario_cost(anchor_rows, []))
 
     # Sign agreement: real per-scenario deltas vs the WM's (opus-5 minus fable-5), matched
@@ -840,8 +894,7 @@ def fig_dial_curve(dataset: CornersDataset, spec: FigureSpec, out: Path) -> None
             )
         n = tau_points[0].n_eval_scenarios
         right.set_title(
-            f"Dial cost curve: tau grid, routed replay vs {dataset.anchor_model} "
-            f"(n={n} held-out)"
+            f"Dial cost curve: tau grid, routed replay vs {dataset.anchor_model} (n={n} held-out)"
         )
     else:
         right.set_title("Dial cost curve: tau grid (pending per-arm fits)")
@@ -890,6 +943,7 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
         color=MUTED,
     )
     plotted = [r for r in dataset.records if r.vs_anchor.cost_delta_percent is not None]
+
     # Selective direct labels (never a label on every point): the cost/quality Pareto
     # frontier, the cost-inversion outliers (compression made it dearer than the anchor),
     # and the within-noise-floor triangles. Everything else is in numbers.json.
@@ -898,9 +952,7 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
         return any(
             o.vs_anchor.cost_delta_percent <= c
             and o.vs_anchor.quality_delta_points >= q
-            and (
-                o.vs_anchor.cost_delta_percent < c or o.vs_anchor.quality_delta_points > q
-            )
+            and (o.vs_anchor.cost_delta_percent < c or o.vs_anchor.quality_delta_points > q)
             for o in plotted
             if o is not r and o.vs_anchor.cost_delta_percent is not None
         )
@@ -974,7 +1026,8 @@ def fig_savings_frontier(dataset: CornersDataset, spec: FigureSpec, out: Path) -
     ax.set_ylabel(f"quality, points vs {dataset.anchor_model} (mean reward x 100)")
     footnote(
         fig,
-        f"measured · wm_simulated · {dataset.dataset_label} · judge {dataset.judge_label} "
+        f"measured · {dataset.provenance_label} · {dataset.dataset_label} · "
+        f"judge {dataset.judge_label} "
         f"· anchor {dataset.anchor_model} "
         f"(identity arm) · effective cost = cache-adjusted provider spend + compressor "
         f"inference, per COMPLETED task, unscored spend excluded and reported "
@@ -1016,7 +1069,8 @@ def fig_cost_per_task(dataset: CornersDataset, spec: FigureSpec, out: Path) -> N
     ax.set_xlabel("cache-adjusted effective $ per completed task")
     footnote(
         fig,
-        f"measured · wm_simulated · {dataset.dataset_label} · judge {dataset.judge_label} "
+        f"measured · {dataset.provenance_label} · {dataset.dataset_label} · "
+        f"judge {dataset.judge_label} "
         f"· dots colored by arm: identity "
         f"blue, truncate purple, llmlingua2-endpoint red · scorecard accounting (unscored "
         f"spend excluded, reported in numbers.json) · quality and latency per config are in "
@@ -1049,8 +1103,12 @@ def _bar(
         return
     ax.bar(x, cost, width=0.62, color=color, zorder=3)
     ax.annotate(
-        detail, xy=(x, cost), xytext=(0, dy), textcoords="offset points",
-        ha="center", fontsize=7.2,
+        detail,
+        xy=(x, cost),
+        xytext=(0, dy),
+        textcoords="offset points",
+        ha="center",
+        fontsize=7.2,
     )
 
 
@@ -1091,26 +1149,55 @@ def fig_three_stage(dataset: CornersDataset, spec: FigureSpec, out: Path) -> Non
     x = 0
     if routed_by_dial:
         rec = routed_by_dial[0.25]
-        _bar(ax1, 0, rec.vs_anchor.anchor_cost.cost_per_completed_task_usd, MUTED, anchor,
-             detail(rec.vs_anchor.anchor_cost.cost_per_completed_task_usd or 0.0, 0.0,
-                    rec.vs_anchor.anchor_latency.p50_model_s, rec.vs_anchor.scenarios_compared))
+        _bar(
+            ax1,
+            0,
+            rec.vs_anchor.anchor_cost.cost_per_completed_task_usd,
+            MUTED,
+            anchor,
+            detail(
+                rec.vs_anchor.anchor_cost.cost_per_completed_task_usd or 0.0,
+                0.0,
+                rec.vs_anchor.anchor_latency.p50_model_s,
+                rec.vs_anchor.scenarios_compared,
+            ),
+        )
         best_cost = (
             None if rec.vs_best is None else rec.vs_best.anchor_cost.cost_per_completed_task_usd
         )
         if rec.vs_best is not None and best_cost is not None:
-            _bar(ax1, 1, best_cost, BLUE, best,
-                 detail(best_cost, -rec.vs_best.quality_delta_points,
-                        rec.vs_best.anchor_latency.p50_model_s, rec.vs_best.scenarios_compared))
+            _bar(
+                ax1,
+                1,
+                best_cost,
+                BLUE,
+                best,
+                detail(
+                    best_cost,
+                    -rec.vs_best.quality_delta_points,
+                    rec.vs_best.anchor_latency.p50_model_s,
+                    rec.vs_best.scenarios_compared,
+                ),
+            )
         for i, dial in enumerate((0.25, 1.0)):
             r = routed_by_dial.get(dial)
             if r is None or r.vs_anchor.cost.cost_per_completed_task_usd is None:
                 continue
-            _bar(ax1, 2 + i, r.vs_anchor.cost.cost_per_completed_task_usd, PURPLE,
-                 f"routed@{dial:g}",
-                 detail(r.vs_anchor.cost.cost_per_completed_task_usd,
-                        r.vs_anchor.quality_delta_points, r.vs_anchor.latency.p50_model_s,
-                        r.vs_anchor.scenarios_compared, mix_text(r.routed_mix)),
-                 dy=4 if i == 0 else 44)
+            _bar(
+                ax1,
+                2 + i,
+                r.vs_anchor.cost.cost_per_completed_task_usd,
+                PURPLE,
+                f"routed@{dial:g}",
+                detail(
+                    r.vs_anchor.cost.cost_per_completed_task_usd,
+                    r.vs_anchor.quality_delta_points,
+                    r.vs_anchor.latency.p50_model_s,
+                    r.vs_anchor.scenarios_compared,
+                    mix_text(r.routed_mix),
+                ),
+                dy=4 if i == 0 else 44,
+            )
         labels = [anchor, best, "routed@0.25", "routed@1.0"]
         ax1.set_xticks(range(len(labels)), labels, fontsize=8)
         _bar_ylim_headroom(ax1)
@@ -1119,19 +1206,48 @@ def fig_three_stage(dataset: CornersDataset, spec: FigureSpec, out: Path) -> Non
         best_rec = by_key.get(f"{IDENTITY_ARM}/{best}")
         if best_rec is not None:
             card = best_rec.vs_anchor
-            _bar(ax1, 0, card.anchor_cost.cost_per_completed_task_usd, MUTED, anchor,
-                 detail(card.anchor_cost.cost_per_completed_task_usd or 0.0, 0.0,
-                        card.anchor_latency.p50_model_s, card.scenarios_compared))
-            _bar(ax1, 1, card.cost.cost_per_completed_task_usd, BLUE, best,
-                 detail(card.cost.cost_per_completed_task_usd or 0.0,
-                        card.quality_delta_points, card.latency.p50_model_s,
-                        card.scenarios_compared))
+            _bar(
+                ax1,
+                0,
+                card.anchor_cost.cost_per_completed_task_usd,
+                MUTED,
+                anchor,
+                detail(
+                    card.anchor_cost.cost_per_completed_task_usd or 0.0,
+                    0.0,
+                    card.anchor_latency.p50_model_s,
+                    card.scenarios_compared,
+                ),
+            )
+            _bar(
+                ax1,
+                1,
+                card.cost.cost_per_completed_task_usd,
+                BLUE,
+                best,
+                detail(
+                    card.cost.cost_per_completed_task_usd or 0.0,
+                    card.quality_delta_points,
+                    card.latency.p50_model_s,
+                    card.scenarios_compared,
+                ),
+            )
             constant = str(spec.params.get("constant_routed", ""))
             if constant and card.cost.cost_per_completed_task_usd is not None:
-                _bar(ax1, 2, card.cost.cost_per_completed_task_usd, PURPLE, "routed",
-                     detail(card.cost.cost_per_completed_task_usd,
-                            card.quality_delta_points, card.latency.p50_model_s,
-                            card.scenarios_compared, constant))
+                _bar(
+                    ax1,
+                    2,
+                    card.cost.cost_per_completed_task_usd,
+                    PURPLE,
+                    "routed",
+                    detail(
+                        card.cost.cost_per_completed_task_usd,
+                        card.quality_delta_points,
+                        card.latency.p50_model_s,
+                        card.scenarios_compared,
+                        constant,
+                    ),
+                )
             ax1.set_xticks(range(3), [anchor, best, "routed"], fontsize=8)
     ax1.set_title("Stage 1: routing")
     ax1.set_ylabel("effective $ per completed task")
@@ -1155,10 +1271,19 @@ def fig_three_stage(dataset: CornersDataset, spec: FigureSpec, out: Path) -> Non
                     x += 1
                 continue
             card = rec.vs_anchor
-            _bar(ax2, x, card.cost.cost_per_completed_task_usd, ARM_COLORS[arm_name], "",
-                 detail(card.cost.cost_per_completed_task_usd or 0.0,
-                        card.quality_delta_points, card.latency.p50_model_s,
-                        card.scenarios_compared))
+            _bar(
+                ax2,
+                x,
+                card.cost.cost_per_completed_task_usd,
+                ARM_COLORS[arm_name],
+                "",
+                detail(
+                    card.cost.cost_per_completed_task_usd or 0.0,
+                    card.quality_delta_points,
+                    card.latency.p50_model_s,
+                    card.scenarios_compared,
+                ),
+            )
             positions.append(x)
             ticks.append(f"{model}\n{arm_short[arm_name]}")
             x += 1
@@ -1177,16 +1302,18 @@ def fig_three_stage(dataset: CornersDataset, spec: FigureSpec, out: Path) -> Non
     )
     note = str(spec.params.get("distill_note", ""))
     ax3.text(
-        0.0, 0.95,
+        0.0,
+        0.95,
         (note + "\n\n" if note else "")
         + "Teacher gate (descriptive only, per the\nno-distillation ruling):\n"
         + "\n".join(textwrap.wrap(verdict, width=46)),
-        va="top", fontsize=8,
+        va="top",
+        fontsize=8,
     )
 
     footnote(
         fig,
-        f"measured · wm_simulated · dataset {dataset.dataset_label} · judge "
+        f"measured · {dataset.provenance_label} · dataset {dataset.dataset_label} · judge "
         f"{dataset.judge_label} · anchor {anchor}, best-single {best} · effective cost per "
         f"COMPLETED task (wmo.optimize.scorecard; compressor + router overhead folded in) · "
         f"stage-1 routed bars on the fit's held-out band · compaction rungs are a measured "
@@ -1210,8 +1337,11 @@ def fig_three_stage_ours9(dataset: CornersDataset, spec: FigureSpec, out: Path) 
         ax.bar(i, a.cost_delta_percent, width=0.62, color=PURPLE, zorder=3)
         ax.annotate(
             f"{a.cost_delta_percent:+.1f}%\n{a.quality_delta_points:+.2f} pt",
-            xy=(i, a.cost_delta_percent), xytext=(0, -16), textcoords="offset points",
-            ha="center", fontsize=7.5,
+            xy=(i, a.cost_delta_percent),
+            xytext=(0, -16),
+            textcoords="offset points",
+            ha="center",
+            fontsize=7.5,
         )
     ax.set_xticks(range(4), [detents[d].named_point for d in (0.0, 0.25, 0.5, 1.0)], fontsize=8)
     ax.axhline(0.0, color=MUTED, linewidth=0.8)
@@ -1219,8 +1349,14 @@ def fig_three_stage_ours9(dataset: CornersDataset, spec: FigureSpec, out: Path) 
     ax.set_title("Stage 1 (routing-only benchmark): routerbench-ours9 dial anchors")
     mix = str(spec.params.get("mix", ""))
     if mix:
-        ax.text(0.02, 0.04, "\n".join(textwrap.wrap(f"frontier-pinned routed mix: {mix}", 60)),
-                transform=ax.transAxes, fontsize=7.5, color=MUTED)
+        ax.text(
+            0.02,
+            0.04,
+            "\n".join(textwrap.wrap(f"frontier-pinned routed mix: {mix}", 60)),
+            transform=ax.transAxes,
+            fontsize=7.5,
+            color=MUTED,
+        )
     footnote(
         fig,
         "measured on routerbench-ours9 (1199 scenarios, 9 models, 5 seeds) vs ITS best "
@@ -1410,6 +1546,8 @@ def main() -> None:
         root=Path(lens.dataset_root).expanduser() if lens.dataset_root else None,
         dataset_label=lens.dataset_label,
         judge=lens.judge_label or GRID_JUDGE,
+        provenance=lens.provenance_label,
+        split=lens.split_label,
         loo=args.loo,
     )
     out = render_lens(lens, dataset, args.out_dir)
