@@ -358,6 +358,28 @@ def _ledger_append(ledger_path: Path, line: LedgerLine) -> None:
         handle.write(line.model_dump_json() + "\n")
 
 
+def _assert_no_duplicate_cells(rows: Sequence[ScenarioOutcome]) -> None:
+    """Fail loudly on a repeated (scenario, model, episode) key.
+
+    Episode indices come from enumerating each task's trial directories, so a task left holding
+    more trial dirs than `--episodes` (a retry that banked an extra, a prune that did not remove
+    what it should) would quietly add a row and double-count that cell's spend.
+    `scorecard.Arm` rejects duplicates too, but only much later and with the analysis half
+    built; catching it here names the offender while the fix is still cheap.
+    """
+    seen: dict[tuple[str, str, int], int] = defaultdict(int)
+    for row in rows:
+        seen[(row.scenario_id, row.model, row.episode)] += 1
+    dupes = sorted(key for key, count in seen.items() if count > 1)
+    if dupes:
+        shown = ", ".join(f"{s}/{m}/ep{e}" for s, m, e in dupes[:5])
+        raise ValueError(
+            f"{len(dupes)} duplicated cell key(s) in the chunk files: {shown}. "
+            "Inspect the offending model's harbor job dir for extra trial directories; "
+            "consolidating would double-count their spend."
+        )
+
+
 def _tip_sha() -> str:
     """The repo tip this cohort was measured at; every ledger line carries it."""
     result = subprocess.run(
@@ -451,6 +473,7 @@ def _consolidate(
         payload = json.loads(chunk_file.read_text(encoding="utf-8"))
         for raw in payload.get("outcomes", []):
             rows.append(ScenarioOutcome.model_validate(raw))
+    _assert_no_duplicate_cells(rows)
     _write_rows(rows_path, rows)
     matrix = OutcomeMatrix(pool=list(pool.models), outcomes=rows)
     matrix_path.write_text(matrix.model_dump_json(indent=2), encoding="utf-8")
