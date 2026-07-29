@@ -21,6 +21,7 @@ customer copy never says router.
 from __future__ import annotations
 
 import itertools
+import json
 from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -1435,7 +1436,7 @@ def push(
     org: str | None = typer.Option(
         None,
         "--org",
-        help="Organization id or slug (default: the login's, or $WMO_PLATFORM_ORG).",
+        help="Organization id (default: the login's, or $WMO_PLATFORM_ORG).",
     ),
     report_file: str | None = typer.Option(
         None,
@@ -1466,7 +1467,7 @@ def push(
         )
     try:
         policy = RoutingPolicy.load(policy_path)
-    except (ValidationError, ValueError) as exc:
+    except (OSError, ValidationError, ValueError) as exc:
         raise typer.BadParameter(f"{policy_path} is not a routing policy: {exc}") from exc
 
     bank_path: Path | None = None
@@ -1482,21 +1483,31 @@ def push(
                 "copy it beside the policy or refit with `wmo optimize route fit --kind knn`"
             )
     report_path = Path(report_file) if report_file is not None else None
-    if report_path is not None and not report_path.is_file():
-        raise typer.BadParameter(
-            f"no report at {report_path} (`wmo optimize route report` writes one)"
-        )
+    if report_path is not None:
+        if not report_path.is_file():
+            raise typer.BadParameter(
+                f"no report at {report_path} (`wmo optimize route report` writes one)"
+            )
+        try:
+            json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # Same rule as the sidecar check: a broken local artifact fails here,
+            # not as a server refusal after the upload already happened.
+            raise typer.BadParameter(f"{report_path} is not readable JSON: {exc}") from exc
 
     # Imported here, not at module scope: `platform_cmds` builds its own command
     # surface at import time, and pulling that in for one command changed behavior
     # in unrelated `route` commands (15 of this module's tests went red).
     from wmo.cli.platform_cmds import _connected, _require_connection
 
+    # Sized before the install: a stat after a SUCCESSFUL install would make the
+    # whole command read as failed if anything removed the local file meanwhile.
+    size = f", bank {bank_path.stat().st_size / 1024:.0f}KiB" if bank_path is not None else ""
+
     credentials, org_id = _require_connection(org)
     with _connected(credentials, "Could not install the policy") as client:
         client.install_endpoint_policy(org_id, endpoint, policy_path, bank_path, report_path)
 
-    size = f", bank {bank_path.stat().st_size / 1024:.0f}KiB" if bank_path is not None else ""
     _console.print(
         f"[green]✓[/green] installed {policy.kind} policy on [bold]{endpoint}[/bold]{size}\n"
         f"  from: {policy_path}\n"

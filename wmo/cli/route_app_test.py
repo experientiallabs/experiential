@@ -3315,3 +3315,27 @@ def test_route_push_sends_no_bank_for_a_static_policy(tmp_path: Path) -> None:
         )
     assert result.exit_code == 0, result.output
     assert client.calls[0][3] is None
+
+
+def test_route_push_sends_the_report_when_given_one(tmp_path: Path) -> None:
+    """--report rides through to the install, so the endpoint gains its evidence."""
+    policy_file = _fitted_knn_policy(tmp_path)
+    report_file = tmp_path / "report.json"
+    report_file.write_text('{"headline": {}}', encoding="utf-8")
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app,
+            [
+                "optimize",
+                "route",
+                "push",
+                str(policy_file),
+                "--endpoint",
+                "support-prod",
+                "--report",
+                str(report_file),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert client.calls[0][4] == report_file
