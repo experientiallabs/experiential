@@ -55,6 +55,7 @@ from wmo.optimize.outcomes import ScenarioOutcome
 from wmo.optimize.pipeline import Stage, StageRecord
 from wmo.runs.backfill import cell_payload
 from wmo.runs.client import ControlCommand, PushAck, PushRejected, RunsSink, runs_sink
+from wmo.runs.reader import RunsReader
 from wmo.runs.schema import (
     CELL_BATCH_CAP,
     LEDGER_LINE,
@@ -83,6 +84,15 @@ QUEUE_LIMIT = 2000
 """Events held in memory when the platform is unreachable. Past this the oldest are dropped: a run
 that cannot reach the platform for hours must not convert telemetry into memory pressure."""
 
+FRONTIER_SAMPLE = 50
+"""Descending events read when locating a resumed run's frontier. The newest one carries it (each
+successive descending seq is lower than the last), so a small window is enough; the sample only has
+to survive a few events of another band interleaving."""
+
+FrontierReader = Callable[[str, int], int | None]
+"""Reports a run's DESCENDING frontier in one band, or None when it has none yet (or cannot be
+read). Injected, because locating it needs a read the emitter otherwise never makes."""
+
 SinkFactory = Callable[[], "RunsSink | None"]
 """Opens the transport, or returns None when this machine cannot push. Injected so a test can drive
 the real sink over a fake transport, and so `--no-emit` needs no special case."""
@@ -108,13 +118,19 @@ REJECT_FORCE_FROM_STAGE = (
 )
 
 
-def _status_value(status: RunStatus | str) -> str:
-    """A status as JSON carries it, without ever raising over an unrecognized one.
+def _status_value(status: RunStatus | str) -> str | None:
+    """A status as JSON carries it, or None when this build cannot name it.
 
     `RunStatus(status)` would be the tidy normalization, and it raises on a value outside the enum,
     which is exactly what these hooks may not do: a caller (or a future status this build has not
-    heard of) must not be able to end a paid run through the telemetry path. An unknown status is
-    passed through as text and the platform decides what to make of it.
+    heard of) must not be able to end a paid run through the telemetry path.
+
+    Sending it as text is equally wrong, and less obviously so: the platform's status vocabulary is
+    CLOSED, so an unrecognized value is refused as a permanent 4xx, and a permanent refusal drops
+    the whole batch - including the ledger lines and cells riding with it. One unknown status would
+    cost a chunk's telemetry rather than its own event. So the event is skipped instead: the run
+    stays whatever the platform last heard, which is honest, and the warning names what was
+    dropped.
     """
     if isinstance(status, RunStatus):
         return status.value
@@ -122,9 +138,39 @@ def _status_value(status: RunStatus | str) -> str:
         return RunStatus(status).value
     except ValueError:
         log.warning(
-            "run telemetry: %r is not a status this build knows; sending it as text", status
+            "run telemetry: %r is not a status this build knows; not reporting it "
+            "(the platform refuses unknown statuses, and the refusal would drop the batch)",
+            status,
         )
-        return str(status)
+        return None
+
+
+def platform_frontier(external_id: str, band: int) -> int | None:
+    """Read a run's descending frontier in one band from the platform, or None when it has none.
+
+    Two type-filtered tail reads rather than a scan of the log: the descending walk only ever
+    carries heartbeats and a live `run.status`, and the server filters by type in the database, so
+    this stays small on a run with a hundred thousand cells. Returns the LOWEST such seq inside the
+    band, which is the frontier by construction.
+
+    Never raises: a machine that cannot read simply does not rebase (`_rebase_descending` treats
+    None as "leave the ceiling alone"), which costs a resumed run's heartbeats and not the run.
+    """
+    reader = RunsReader.open()
+    if reader is None:
+        return None
+    floor = band * RUN_SEQ_BAND
+    ceiling = (band + 1) * RUN_SEQ_BAND
+    lowest: int | None = None
+    with reader:
+        for event_type in (RunEventType.HEARTBEAT, RunEventType.RUN_STATUS):
+            page = reader.list_events(
+                external_id, tail=True, limit=FRONTIER_SAMPLE, event_type=event_type
+            )
+            for event in page.events:
+                if floor < event.seq <= ceiling and (lowest is None or event.seq < lowest):
+                    lowest = event.seq
+    return lowest
 
 
 def _undeclared(refused: PushRejected) -> bool:
@@ -178,6 +224,7 @@ class _Reporter:
         *,
         queue_limit: int = QUEUE_LIMIT,
         top_band: int | None = None,
+        frontier: FrontierReader | None = None,
     ) -> None:
         """Hold the transport for one run, or None when emission is off.
 
@@ -186,6 +233,7 @@ class _Reporter:
         """
         self._sink = sink
         self._top_band = top_band
+        self._frontier = frontier
         # The run's declaration. Kept out of the queue's eviction path and re-sendable: the platform
         # refuses every batch of an undeclared run, so losing this one event would end the run's
         # telemetry permanently rather than costing one event.
@@ -259,18 +307,36 @@ class _Reporter:
         # walk expects it, or every ledger line would be renumbered off its artifact position.
         if 0 < ack.last_seq <= RUN_SEQ_BAND:
             self._bands.resume_at(RUN_LEVEL_BAND, ack.last_seq + 1)
-        # And the descending walk, which nothing else rebases: a heartbeat and a terminal status
-        # have no artifact position, so a re-invocation that restarts at the ceiling re-issues
-        # exactly the seqs it used last time.
-        band = self._top_band
-        if band is not None and self._bands.band_start(
-            band
-        ) <= ack.last_seq <= self._bands.band_end(band):
-            self._bands.resume_from_top(band, ack.last_seq - 1)
+        # And the descending walk, which nothing else rebases and which `last_seq` cannot locate
+        # (see `_rebase_descending`).
+        self._rebase_descending()
         self._resumed_from = ack.last_seq
         self._resumed = ack.last_seq > 0
         self._pulled_at_resume = ack.control
         return ack.last_seq
+
+    def _rebase_descending(self) -> None:
+        """Continue the descending walk below where the previous invocation left it.
+
+        This needs a READ, and `last_seq` cannot substitute for it: a descending walk's frontier is
+        the MINIMUM of the seqs it issued, `last_seq` is the maximum over the whole run, and a
+        maximum cannot locate a minimum. Rebasing from `last_seq - 1` re-issues every descending seq
+        but the first, which costs the terminal status and leaves a finished run reading `running`.
+
+        Reading it is cheap because the newest descending event IS the frontier: each successive one
+        is lower than the last. A run with no descending events yet has no frontier, and the ceiling
+        is already correct, so None means "leave it alone".
+        """
+        band = self._top_band
+        if band is None or self._frontier is None:
+            return
+        frontier: int | None = None
+        with self._quiet("could not locate the run's heartbeat frontier"):
+            frontier = self._frontier(self._external_id, band)
+        if frontier is None:
+            return
+        with self._quiet("could not rebase the heartbeat walk"):
+            self._bands.resume_from_top(band, frontier - 1)
 
     def _emit(self, band: int, event_type: str, ts: str, payload: JsonObject) -> None:
         """Number one event from its band's ascending walk and hold it for the next flush.
@@ -569,11 +635,14 @@ class GridEmitter(_Reporter):
         flush_cells: int = CELL_BATCH_CAP,
         flush_seconds: float = HEARTBEAT_INTERVAL_S,
         queue_limit: int = QUEUE_LIMIT,
+        frontier: FrontierReader | None = None,
     ) -> None:
         """Build the emitter directly. Most callers want `create`, which resolves the sink."""
         # `top_band` is this writer's own band: its heartbeats and terminal status descend from that
         # ceiling, so a resume has to rebase that walk too or it re-issues the same seqs.
-        super().__init__(sink, external_id, queue_limit=queue_limit, top_band=band)
+        super().__init__(
+            sink, external_id, queue_limit=queue_limit, top_band=band, frontier=frontier
+        )
         self._band = band
         self._arm = arm
         self._snapshot = snapshot
@@ -599,6 +668,7 @@ class GridEmitter(_Reporter):
         requested: bool = True,
         flush_cells: int = CELL_BATCH_CAP,
         flush_seconds: float = HEARTBEAT_INTERVAL_S,
+        frontier: FrontierReader | None = None,
     ) -> GridEmitter:
         """Build the emitter for one arm, off unless a credential and an organization resolve.
 
@@ -614,6 +684,8 @@ class GridEmitter(_Reporter):
                 credentials at all.
             flush_cells: Cells buffered before a send.
             flush_seconds: Age at which a partial buffer is sent anyway.
+            frontier: Locates a resumed run's descending frontier; defaults to reading it from the
+                platform. Only consulted when emission is on.
         """
         external_id = grid_arm_external_id(grid_relpath, arm)
         return cls(
@@ -624,6 +696,7 @@ class GridEmitter(_Reporter):
             snapshot=snapshot,
             flush_cells=flush_cells,
             flush_seconds=flush_seconds,
+            frontier=frontier if frontier is not None else platform_frontier,
         )
 
     @property
@@ -734,7 +807,10 @@ class GridEmitter(_Reporter):
         """The run's terminal transition. Sends buffered cells first, so none are lost."""
         self.send_cells()
         finished_at = now_iso()
-        payload: JsonObject = {"status": _status_value(status), "finished_at": finished_at}
+        value = _status_value(status)
+        if value is None:
+            return
+        payload: JsonObject = {"status": value, "finished_at": finished_at}
         if error is not None:
             payload["error"] = error
         self._emit_from_top(self._band, RunEventType.RUN_STATUS, finished_at, payload)
@@ -936,7 +1012,10 @@ class PipelineEmitter(_Reporter):
     def finished(self, status: RunStatus, *, error: str | None = None) -> None:
         """The run's terminal transition: completed, failed, or stopped by the spend cap."""
         finished_at = now_iso()
-        payload: JsonObject = {"status": _status_value(status), "finished_at": finished_at}
+        value = _status_value(status)
+        if value is None:
+            return
+        payload: JsonObject = {"status": value, "finished_at": finished_at}
         if error is not None:
             payload["error"] = error
         self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS, finished_at, payload)

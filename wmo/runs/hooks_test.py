@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict
@@ -21,6 +22,7 @@ from wmo.runs.hooks import (
     CONTROL_FORCE_FROM_STAGE,
     CONTROL_RETRY_UNSCORED,
     CONTROL_STOP,
+    FrontierReader,
     GridEmitter,
     GridSnapshot,
     PipelineEmitter,
@@ -93,6 +95,9 @@ class FakeTransport:
         # here is what lets a test fail on a collision at all: a double that accepts everything
         # cannot distinguish the band design working from the band design being broken.
         self.held: set[int] = set(range(1, held_last_seq + 1)) if held_last_seq else set()
+        # Type per held seq, so the double can answer the frontier read the way the platform's
+        # type-filtered tail does.
+        self.held_types: dict[int, str] = {}
 
     def push_run_events(
         self,
@@ -126,6 +131,8 @@ class FakeTransport:
         seqs = [int(str(event["seq"])) for event in events]
         fresh = [seq for seq in seqs if seq not in self.held]
         self.held.update(seqs)
+        for event in events:
+            self.held_types.setdefault(int(str(event["seq"])), str(event["type"]))
         return {
             "accepted": len(fresh) if self._accepted is None else self._accepted,
             "last_seq": max(self.held),
@@ -174,6 +181,26 @@ def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("wmo.runs.client.PUSH_BACKOFF_SECONDS", 0.0)
 
 
+def _frontier_of(transport: FakeTransport) -> FrontierReader:
+    """The frontier read, answered from what the double holds.
+
+    Same rule as `platform_frontier`: the LOWEST heartbeat or `run.status` seq inside the band,
+    which is where the previous invocation's descending walk stopped.
+    """
+
+    def read(external_id: str, band: int) -> int | None:
+        floor, ceiling = band * RUN_SEQ_BAND, (band + 1) * RUN_SEQ_BAND
+        descending = [
+            seq
+            for seq, event_type in transport.held_types.items()
+            if floor < seq <= ceiling
+            and event_type in (RunEventType.HEARTBEAT, RunEventType.RUN_STATUS)
+        ]
+        return min(descending) if descending else None
+
+    return read
+
+
 def _sink(transport: FakeTransport) -> RunsSink:
     return RunsSink(transport, org_id=ORG, emitter_id="test")
 
@@ -186,6 +213,7 @@ def _grid(
         arm=ARM,
         band=band,
         factory=lambda: _sink(transport),
+        frontier=_frontier_of(transport),
         snapshot=lambda: GridSnapshot(done=4, scored=3, total=10, candidate_usd=1.5, wm_usd=3.0),
         flush_cells=flush_cells,
     )
@@ -724,11 +752,89 @@ def test_an_unreachable_probe_is_not_read_as_a_fresh_run() -> None:
     assert transport.of_type("heartbeat")[0].seq > 7
 
 
-def test_an_unknown_status_is_reported_rather_than_raised() -> None:
-    """Telemetry may not end a paid run, not even over a status this build has not heard of."""
+def test_an_unknown_status_is_skipped_rather_than_raised_or_sent() -> None:
+    """Telemetry may not end a paid run, and may not cost a batch, over an unknown status.
+
+    Two wrong answers are available here. Raising ends a paid run through the telemetry path.
+    Sending the value as text is refused by the platform's closed vocabulary as a permanent 4xx,
+    and a permanent refusal drops the whole batch, so one unknown status would take the ledger
+    lines and cells riding with it. Skipping the event costs only the event.
+    """
     transport = FakeTransport()
     emitter = _declared(transport)
+    ledger_before = len(transport.of_type("ledger.line"))
 
-    emitter.on_status("canceled")  # type: ignore[arg-type]
+    # Cast rather than ignore: the point is a value OUTSIDE the vocabulary, which a correct caller
+    # cannot produce but a future platform status could.
+    emitter.on_status(cast("RunStatus", "canceled"))
+    emitter.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(9), position=9)
 
-    assert transport.of_type("run.status")[0].payload["status"] == "canceled"
+    assert transport.of_type("run.status") == []
+    # The batch behind it is untouched: skipping the event is not skipping the run.
+    assert len(transport.of_type("ledger.line")) == ledger_before + 1
+
+
+def test_a_resumed_arm_with_several_descending_events_does_not_re_use_any() -> None:
+    """The frontier of a descending walk is its MINIMUM, and `last_seq` is a maximum.
+
+    A maximum cannot locate a minimum, so rebasing from `last_seq - 1` re-issues every descending
+    seq the previous invocation used except its first: two heartbeats and a terminal status become
+    two heartbeats and a terminal status the platform discards. The terminal one is the expensive
+    loss, because a finished run then reads `running` forever.
+    """
+    transport = FakeTransport()
+    first = _declared(transport, band=cell_band(0))
+    first.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
+    first.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(2), position=2)
+    first.on_status(RunStatus.STOPPED)
+    spent = {event.seq for event in transport.events if event.seq > RUN_SEQ_BAND}
+    assert len(spent) >= 3, "the first invocation must spend several descending seqs"
+
+    resumed = _declared(transport, band=cell_band(0))
+    resumed.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(3), position=3)
+    resumed.on_status(RunStatus.COMPLETED)
+
+    issued = [
+        event.seq
+        for push in transport.pushes
+        for event in push
+        if event.seq > RUN_SEQ_BAND and event.type in ("heartbeat", "run.status")
+    ]
+    assert len(issued) == len(set(issued)), f"a descending seq was re-issued: {sorted(issued)}"
+    terminal = [event for event in transport.of_type("run.status") if event.seq > RUN_SEQ_BAND]
+    assert terminal[-1].payload["status"] == RunStatus.COMPLETED.value
+
+
+def test_three_invocations_never_re_use_a_descending_seq() -> None:
+    """Resume has to hold for the THIRD invocation, not just the second.
+
+    This is what rules out every scheme derived from a fixed point. `last_seq` stays pinned at the
+    first invocation's ceiling (the highest seq the run ever held), so any constant offset below it
+    hands the second and third invocations the same answer and the third collides with the second.
+    Only reading the descending walk's own frontier survives repetition, which is why the fix costs
+    a read.
+    """
+    transport = FakeTransport()
+    issued: list[int] = []
+    for invocation in range(3):
+        emitter = _declared(transport, band=cell_band(0))
+        emitter.on_ledger_line(
+            {"event": "chunk", "arm": ARM, "chunk": invocation},
+            ts=_ts(invocation + 1),
+            position=invocation + 1,
+        )
+        emitter.on_status(RunStatus.STOPPED if invocation < 2 else RunStatus.COMPLETED)
+        issued.extend(
+            event.seq
+            for push in transport.pushes
+            for event in push
+            if event.seq > RUN_SEQ_BAND
+            and event.type in (RunEventType.HEARTBEAT, RunEventType.RUN_STATUS)
+        )
+        transport.pushes.clear()
+
+    assert len(issued) >= 6, "each invocation spends at least one heartbeat and one status"
+    assert len(issued) == len(set(issued)), f"a descending seq was re-issued: {sorted(issued)}"
+    # Each invocation's terminal status landed, which is the fact the whole exercise protects: a
+    # discarded one leaves a finished run reading `running` on the panel forever.
+    assert sum(1 for kind in transport.held_types.values() if kind == RunEventType.RUN_STATUS) == 3
