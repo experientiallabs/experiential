@@ -124,9 +124,41 @@ def _wall_seconds(artifact_dir: Path) -> float:
     return max(0.0, (result.finished_at - result.started_at).total_seconds())
 
 
-def _failure_class(cell: ScoreCell, stop_reason: str) -> str:
+def _provider_execution_started(trace: dict[str, object]) -> bool:
+    steps = trace.get("steps")
+    if isinstance(steps, list) and bool(steps):
+        return True
+    worker_usage = trace.get("worker_usage")
+    if not isinstance(worker_usage, dict):
+        return False
+    calls = worker_usage.get("calls")
+    if isinstance(calls, int) and calls > 0:
+        return True
+    call_seconds = worker_usage.get("call_seconds")
+    if isinstance(call_seconds, list) and bool(call_seconds):
+        return True
+    return any(
+        isinstance(worker_usage.get(key), int) and worker_usage[key] > 0
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_tokens",
+        )
+    )
+
+
+def _failure_class(
+    cell: ScoreCell,
+    stop_reason: str,
+    *,
+    provider_execution_started: bool,
+) -> str:
     if cell.infra_failed:
         return "infrastructure"
+    if stop_reason == "provider_error" and provider_execution_started:
+        return "agent_failure"
     if stop_reason in INFRASTRUCTURE_STOPS or stop_reason.startswith("agent-exception:"):
         return "infrastructure"
     if cell.reward == 1.0:
@@ -168,7 +200,11 @@ def _outcome(
     instruction = trace.get("instruction")
     stop = trace.get("stop_reason")
     stop_reason = stop if isinstance(stop, str) else ""
-    failure_class = _failure_class(cell, stop_reason)
+    failure_class = _failure_class(
+        cell,
+        stop_reason,
+        provider_execution_started=_provider_execution_started(trace),
+    )
     metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
     usage_estimated = bool(metering_error) and failure_class != "infrastructure"
     if usage_estimated:
@@ -449,6 +485,9 @@ def _normalize_existing_ungradeable_attempts(
         stop_reason = stop if isinstance(stop, str) else ""
         usage = usage_from_trace(trace)
         metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
+        post_execution_provider_error = (
+            stop_reason == "provider_error" and _provider_execution_started(trace)
+        )
         if metering_error and outcome.reward is not None:
             estimated = estimate_usage_from_trace(trace)
             entry = next(
@@ -486,8 +525,11 @@ def _normalize_existing_ungradeable_attempts(
             completion_status = "metering_failure"
             error = metering_error
         elif (
-            outcome.failure_class in {"scaffold", "infrastructure"}
-            or stop_reason in INFRASTRUCTURE_STOPS
+            (
+                outcome.failure_class in {"scaffold", "infrastructure"}
+                and not post_execution_provider_error
+            )
+            or (stop_reason in INFRASTRUCTURE_STOPS and not post_execution_provider_error)
             or stop_reason.startswith("agent-exception:")
         ):
             failure_class = "infrastructure"

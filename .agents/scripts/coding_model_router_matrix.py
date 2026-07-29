@@ -12,6 +12,7 @@ import os
 import shutil
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
 from pathlib import Path
@@ -272,9 +273,41 @@ def _wall_seconds(artifact_dir: Path) -> float:
     return max(0.0, (result.finished_at - result.started_at).total_seconds())
 
 
-def _failure_class(cell: ScoreCell, stop_reason: str) -> str:
+def _provider_execution_started(trace: dict[str, object]) -> bool:
+    steps = trace.get("steps")
+    if isinstance(steps, list) and bool(steps):
+        return True
+    worker_usage = trace.get("worker_usage")
+    if not isinstance(worker_usage, dict):
+        return False
+    calls = worker_usage.get("calls")
+    if isinstance(calls, int) and calls > 0:
+        return True
+    call_seconds = worker_usage.get("call_seconds")
+    if isinstance(call_seconds, list) and bool(call_seconds):
+        return True
+    return any(
+        isinstance(worker_usage.get(key), int) and worker_usage[key] > 0
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_tokens",
+        )
+    )
+
+
+def _failure_class(
+    cell: ScoreCell,
+    stop_reason: str,
+    *,
+    provider_execution_started: bool,
+) -> str:
     if cell.infra_failed:
         return "infrastructure"
+    if stop_reason == "provider_error" and provider_execution_started:
+        return "agent_failure"
     if stop_reason in INFRASTRUCTURE_STOPS or stop_reason.startswith("agent-exception:"):
         return "infrastructure"
     if cell.reward == 1.0:
@@ -317,7 +350,11 @@ def _outcome(
     instruction = trace.get("instruction")
     stop = trace.get("stop_reason")
     stop_reason = stop if isinstance(stop, str) else ""
-    failure_class = _failure_class(cell, stop_reason)
+    failure_class = _failure_class(
+        cell,
+        stop_reason,
+        provider_execution_started=_provider_execution_started(trace),
+    )
     metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
     usage_estimated = bool(metering_error) and failure_class != "infrastructure"
     if usage_estimated:
@@ -386,6 +423,7 @@ class RunState:
         if self.matrix.pool != pool.models:
             raise ValueError("the existing full matrix carries a different frozen pool")
         self.ledger = self._read_ledger()
+        self._normalize_post_execution_provider_errors()
 
     def _read_ledger(self) -> list[dict[str, object]]:
         if not self.ledger_path.is_file():
@@ -403,6 +441,64 @@ class RunState:
             self.ledger_path,
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in self.ledger),
         )
+
+    def _normalize_post_execution_provider_errors(self) -> None:
+        """Repair rows produced before provider output limits were gradeable."""
+        grouped: dict[tuple[str, str], list[ScenarioOutcome]] = defaultdict(list)
+        for outcome in self.matrix.outcomes:
+            grouped[(outcome.scenario_id, outcome.model)].append(outcome)
+        changed = 0
+        for outcomes in grouped.values():
+            outcomes.sort(key=lambda outcome: outcome.attempt_number)
+            eligible: list[tuple[ScenarioOutcome, float]] = []
+            for outcome in outcomes:
+                if (
+                    outcome.reward is not None
+                    or outcome.stop_reason != "provider_error"
+                    or outcome.failure_class != "infrastructure"
+                ):
+                    continue
+                artifact_dir = Path(outcome.artifact_dir)
+                trace_path = _trace_path(artifact_dir)
+                reward_path = artifact_dir / "verifier" / "reward.txt"
+                if not trace_path.is_file() or not reward_path.is_file():
+                    continue
+                trace = _read_object(trace_path)
+                if not _provider_execution_started(trace):
+                    continue
+                reward = float(reward_path.read_text(encoding="utf-8").strip())
+                eligible.append((outcome, reward))
+            canonical_exists = any(outcome.reward is not None for outcome in outcomes)
+            for outcome, reward in eligible:
+                if not canonical_exists:
+                    outcome.reward = reward
+                    outcome.success = reward == 1.0
+                    outcome.completion_status = (
+                        "scored_pass" if outcome.success else "scored_agent_failure"
+                    )
+                    outcome.failure_class = "" if outcome.success else "agent_failure"
+                    outcome.error = None
+                    canonical_exists = True
+                else:
+                    outcome.completion_status = "excluded_protocol_retry"
+                    outcome.failure_class = "protocol_retry_excluded"
+                    outcome.error = (
+                        "excluded because post-execution provider output failure is gradeable "
+                        "and the frozen protocol forbids retries"
+                    )
+                for ledger_row in self.ledger:
+                    if (
+                        ledger_row.get("scenario_id") == outcome.scenario_id
+                        and ledger_row.get("model") == outcome.model
+                        and ledger_row.get("attempt_number") == outcome.attempt_number
+                    ):
+                        ledger_row["completion_status"] = outcome.completion_status
+                        ledger_row["failure_class"] = outcome.failure_class
+                changed += 1
+        if changed:
+            self.matrix.save(self.matrix_path)
+            self._write_ledger()
+            logger.warning("normalized %d post-execution provider-error rows", changed)
 
     def _upsert_ledger(self, row: dict[str, object]) -> None:
         event_id = row["event_id"]

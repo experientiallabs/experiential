@@ -266,6 +266,93 @@ def test_metered_agent_failure_remains_a_gradeable_zero(
 
 
 @pytest.mark.parametrize("runner", [smoke_runner, matrix_runner])
+def test_metered_provider_output_truncation_is_gradeable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: object,
+) -> None:
+    artifact = _metered_artifact(tmp_path, stop_reason="provider_error")
+    trace_path = artifact / "agent" / "wmo-run.json"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    trace["steps"] = [
+        {
+            "action": {"kind": "message", "content": "", "name": None, "arguments": {}},
+            "observation": {
+                "content": (
+                    "worker LLM proxy error: Responses API returned incomplete response: "
+                    "max_output_tokens"
+                ),
+                "is_error": True,
+            },
+        }
+    ]
+    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+    monkeypatch.setattr(runner, "_wall_seconds", lambda path: 0.0)
+    if runner is smoke_runner:
+        outcome = smoke_runner._outcome(
+            _cell(artifact),
+            entry=_entry(),
+            logical_attempt=1,
+            artifact_dir=artifact,
+        )
+    else:
+        outcome = matrix_runner._outcome(
+            _cell(artifact),
+            benchmark="terminal-bench-2",
+            entry=_entry(),
+            attempt=1,
+            artifact_dir=artifact,
+        )
+
+    assert outcome.reward == 0.0
+    assert outcome.completion_status == "scored_agent_failure"
+    assert outcome.failure_class == "agent_failure"
+    assert outcome.error is None
+
+
+@pytest.mark.parametrize("runner", [smoke_runner, matrix_runner])
+def test_provider_error_before_model_execution_is_infrastructure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: object,
+) -> None:
+    artifact = tmp_path / "artifact"
+    trace_path = artifact / "agent" / "wmo-run.json"
+    trace_path.parent.mkdir(parents=True)
+    trace_path.write_text(
+        json.dumps(
+            {
+                "instruction": "repair the repository",
+                "stop_reason": "provider_error",
+                "steps": [],
+                "worker_usage": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "_wall_seconds", lambda path: 0.0)
+    if runner is smoke_runner:
+        outcome = smoke_runner._outcome(
+            _cell(artifact),
+            entry=_entry(),
+            logical_attempt=1,
+            artifact_dir=artifact,
+        )
+    else:
+        outcome = matrix_runner._outcome(
+            _cell(artifact),
+            benchmark="terminal-bench-2",
+            entry=_entry(),
+            attempt=1,
+            artifact_dir=artifact,
+        )
+
+    assert outcome.reward is None
+    assert outcome.completion_status == "infrastructure_failure"
+    assert outcome.failure_class == "infrastructure"
+
+
+@pytest.mark.parametrize("runner", [smoke_runner, matrix_runner])
 def test_submitted_cell_without_worker_usage_uses_labeled_estimate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

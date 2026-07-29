@@ -149,6 +149,88 @@ def test_unreconciled_unknown_cost_still_fails_closed(tmp_path: Path) -> None:
         state.spent_and_reserved()
 
 
+def test_existing_post_execution_provider_errors_keep_one_gradeable_row(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    pool = _pool()
+    outcomes: list[ScenarioOutcome] = []
+    ledger_rows: list[dict[str, object]] = []
+    for attempt in range(1, 4):
+        artifact = tmp_path / "full" / "infra-attempts" / f"attempt-{attempt}"
+        _write_json(
+            artifact / "agent" / "wmo-run.json",
+            {
+                "instruction": "repair the repository",
+                "stop_reason": "provider_error",
+                "steps": [{"action": {"kind": "message"}, "observation": {}}],
+                "worker_usage": {
+                    "calls": 1,
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                },
+            },
+        )
+        (artifact / "verifier").mkdir(parents=True)
+        (artifact / "verifier" / "reward.txt").write_text("0\n", encoding="utf-8")
+        outcomes.append(
+            ScenarioOutcome(
+                scenario_id="terminal-bench-2:task",
+                task="repair the repository",
+                model=FAST_DEV_ARMS[0],
+                benchmark="terminal-bench-2",
+                reward=None,
+                success=False,
+                stop_reason="provider_error",
+                attempt_number=attempt,
+                completion_status="infrastructure_failure",
+                failure_class="infrastructure",
+                artifact_dir=str(artifact),
+                cost_usd=0.1,
+            )
+        )
+        ledger_rows.append(
+            {
+                "event_id": f"full:terminal-bench-2:task:{FAST_DEV_ARMS[0]}:{attempt}",
+                "scenario_id": "terminal-bench-2:task",
+                "model": FAST_DEV_ARMS[0],
+                "attempt_number": attempt,
+                "status": "completed",
+                "completion_status": "infrastructure_failure",
+                "failure_class": "infrastructure",
+                "model_cost_usd": 0.1,
+            }
+        )
+    full = root / "full"
+    full.mkdir(exist_ok=True)
+    OutcomeMatrix(pool=pool.models, outcomes=outcomes).save(full / "outcomes.json")
+    (root / "spend-ledger.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in ledger_rows),
+        encoding="utf-8",
+    )
+
+    state = RunState(root=full, pool=pool, ceiling_usd=20_000.0)
+
+    repaired = sorted(state.matrix.outcomes, key=lambda outcome: outcome.attempt_number)
+    assert repaired[0].reward == 0.0
+    assert repaired[0].completion_status == "scored_agent_failure"
+    assert repaired[0].failure_class == "agent_failure"
+    assert [row.completion_status for row in repaired[1:]] == [
+        "excluded_protocol_retry",
+        "excluded_protocol_retry",
+    ]
+    assert [row.failure_class for row in repaired[1:]] == [
+        "protocol_retry_excluded",
+        "protocol_retry_excluded",
+    ]
+    assert state.completed("terminal-bench-2", "task", FAST_DEV_ARMS[0]) is True
+    assert [row["completion_status"] for row in state.ledger] == [
+        "scored_agent_failure",
+        "excluded_protocol_retry",
+        "excluded_protocol_retry",
+    ]
+
+
 def test_develop_fits_diagnostic_policy_without_outer_heldout(tmp_path: Path) -> None:
     root = _root(tmp_path)
     pool = _pool()
