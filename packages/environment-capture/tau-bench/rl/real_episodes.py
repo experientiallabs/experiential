@@ -803,7 +803,13 @@ def rows_from_results(
                 ),
                 cost_usd_tau2_agent=sim.agent_cost,
                 cost_usd_tau2_user=sim.user_cost,
-                steps=sum(1 for m in sim.messages if m.tool_calls),
+                # BILLED PROVIDER CALLS, not kept tool-calling turns (the program-wide step
+                # unit: it is what the max_turns cap enforces and what cost scales with). An
+                # assistant message carries `usage` exactly when a completion was purchased for
+                # it, which excludes tau2's scripted opening greeting; counting only turns that
+                # happened to call a tool undercounted the real call volume by ~1.5x, and by 3x
+                # on conversational candidates.
+                steps=sum(1 for m in assistant if m.usage is not None),
                 call_seconds=[
                     m.generation_time_seconds
                     for m in assistant

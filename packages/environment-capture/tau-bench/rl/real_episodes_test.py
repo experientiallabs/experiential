@@ -21,8 +21,10 @@ from real_episodes import (
     UNLABELED_COHORT,
     ProtocolPins,
     RealEpisodeRow,
+    Tau2Message,
     Tau2Results,
     Tau2RewardInfo,
+    Tau2Usage,
     Tau2SimulationInfo,
     agent_llm_args,
     append_rows,
@@ -544,6 +546,38 @@ def test_an_unclocked_episode_leaves_the_timestamps_absent(tmp_path: Path) -> No
     [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
     assert row.started_at is None
     assert row.ended_at is None
+
+
+def test_steps_counts_billed_provider_calls_not_tool_calling_turns(tmp_path: Path) -> None:
+    """The program-wide step unit: what the cap enforces and what cost scales with.
+
+    tau2 opens every episode with a scripted greeting that carries no usage because no
+    completion was bought for it, and plenty of billed turns talk to the user without calling a
+    tool. Counting tool-calling turns undercounted real call volume by ~1.5x across the tau grid
+    and by 3x on conversational candidates.
+    """
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].messages = [
+        # The scripted greeting: no usage, so no call was purchased.
+        Tau2Message(role="assistant", content="Hi! How can I help you today?"),
+        Tau2Message(role="user", content="cancel my reservation"),
+        # A billed turn that only talks.
+        Tau2Message(
+            role="assistant",
+            content="Let me check that for you.",
+            usage=Tau2Usage(prompt_tokens=1000, completion_tokens=20),
+        ),
+        # A billed turn that calls a tool.
+        Tau2Message(
+            role="assistant",
+            content="looking",
+            tool_calls=[{"name": "get_reservation_details"}],
+            usage=Tau2Usage(prompt_tokens=1200, completion_tokens=30),
+        ),
+    ]
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.steps == 2, "two completions were purchased; one of them called no tool"
 
 
 def test_matrix_carries_cost_and_latency(tmp_path: Path) -> None:
