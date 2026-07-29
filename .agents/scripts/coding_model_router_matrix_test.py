@@ -19,11 +19,13 @@ from coding_model_router_matrix import (
     SPLIT_SEEDS,
     BudgetExhausted,
     RunState,
+    _failure_class,
     _fast_dev_task_ids,
     _job_template,
     _stage_cell_specs,
 )
 
+from wmo.harness.scoring import ScoreCell
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import ProviderKind
 from wmo.providers.pool import ModelPool, PoolEntry
@@ -113,6 +115,34 @@ def test_job_template_uses_experiment_task_cache(tmp_path: Path) -> None:
     assert template.datasets[0].download_dir == HARBOR_TASK_CACHE
 
 
+def test_post_execution_error_with_official_reward_is_gradeable() -> None:
+    cell = ScoreCell(
+        task_id="task",
+        attempt=1,
+        reward=0.0,
+        passed=False,
+        note="completed with AgentTimeoutError",
+    )
+
+    assert (
+        _failure_class(cell, "error", provider_execution_started=True) == "agent_failure"
+    )
+
+
+def test_pre_execution_error_remains_infrastructure() -> None:
+    cell = ScoreCell(
+        task_id="task",
+        attempt=1,
+        reward=0.0,
+        passed=False,
+        note="failed before provider execution",
+    )
+
+    assert (
+        _failure_class(cell, "error", provider_execution_started=False) == "infrastructure"
+    )
+
+
 def test_conservative_unknown_cost_debit_counts_against_ceiling(tmp_path: Path) -> None:
     (tmp_path / "spend-ledger.jsonl").write_text(
         json.dumps(
@@ -149,8 +179,13 @@ def test_unreconciled_unknown_cost_still_fails_closed(tmp_path: Path) -> None:
         state.spent_and_reserved()
 
 
-def test_existing_post_execution_provider_errors_keep_one_gradeable_row(
+@pytest.mark.parametrize(
+    "stop_reason",
+    ["provider_error", "error", "agent-exception:AgentTimeoutError"],
+)
+def test_existing_post_execution_failures_keep_one_gradeable_row(
     tmp_path: Path,
+    stop_reason: str,
 ) -> None:
     root = _root(tmp_path)
     pool = _pool()
@@ -162,7 +197,7 @@ def test_existing_post_execution_provider_errors_keep_one_gradeable_row(
             artifact / "agent" / "wmo-run.json",
             {
                 "instruction": "repair the repository",
-                "stop_reason": "provider_error",
+                "stop_reason": stop_reason,
                 "steps": [{"action": {"kind": "message"}, "observation": {}}],
                 "worker_usage": {
                     "calls": 1,
@@ -181,7 +216,7 @@ def test_existing_post_execution_provider_errors_keep_one_gradeable_row(
                 benchmark="terminal-bench-2",
                 reward=None,
                 success=False,
-                stop_reason="provider_error",
+                stop_reason=stop_reason,
                 attempt_number=attempt,
                 completion_status="infrastructure_failure",
                 failure_class="infrastructure",

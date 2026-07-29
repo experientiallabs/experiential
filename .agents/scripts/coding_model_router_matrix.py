@@ -274,6 +274,8 @@ def _wall_seconds(artifact_dir: Path) -> float:
 
 
 def _provider_execution_started(trace: dict[str, object]) -> bool:
+    if _known_pre_worker_failure(trace):
+        return False
     steps = trace.get("steps")
     if isinstance(steps, list) and bool(steps):
         return True
@@ -306,10 +308,8 @@ def _failure_class(
 ) -> str:
     if cell.infra_failed:
         return "infrastructure"
-    if stop_reason == "provider_error" and provider_execution_started:
-        return "agent_failure"
     if stop_reason in INFRASTRUCTURE_STOPS or stop_reason.startswith("agent-exception:"):
-        return "infrastructure"
+        return "agent_failure" if provider_execution_started else "infrastructure"
     if cell.reward == 1.0:
         return ""
     return "task_failure" if stop_reason == "submitted" else "agent_failure"
@@ -423,7 +423,7 @@ class RunState:
         if self.matrix.pool != pool.models:
             raise ValueError("the existing full matrix carries a different frozen pool")
         self.ledger = self._read_ledger()
-        self._normalize_post_execution_provider_errors()
+        self._normalize_post_execution_failures()
 
     def _read_ledger(self) -> list[dict[str, object]]:
         if not self.ledger_path.is_file():
@@ -442,8 +442,8 @@ class RunState:
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in self.ledger),
         )
 
-    def _normalize_post_execution_provider_errors(self) -> None:
-        """Repair rows produced before provider output limits were gradeable."""
+    def _normalize_post_execution_failures(self) -> None:
+        """Repair rows whose official reward was hidden by a post-execution failure."""
         grouped: dict[tuple[str, str], list[ScenarioOutcome]] = defaultdict(list)
         for outcome in self.matrix.outcomes:
             grouped[(outcome.scenario_id, outcome.model)].append(outcome)
@@ -454,7 +454,10 @@ class RunState:
             for outcome in outcomes:
                 if (
                     outcome.reward is not None
-                    or outcome.stop_reason != "provider_error"
+                    or (
+                        outcome.stop_reason not in INFRASTRUCTURE_STOPS
+                        and not outcome.stop_reason.startswith("agent-exception:")
+                    )
                     or outcome.failure_class != "infrastructure"
                 ):
                     continue
@@ -483,7 +486,8 @@ class RunState:
                     outcome.completion_status = "excluded_protocol_retry"
                     outcome.failure_class = "protocol_retry_excluded"
                     outcome.error = (
-                        "excluded because post-execution provider output failure is gradeable "
+                        "excluded because a post-execution failure with an official reward is "
+                        "gradeable "
                         "and the frozen protocol forbids retries"
                     )
                 for ledger_row in self.ledger:
@@ -498,7 +502,7 @@ class RunState:
         if changed:
             self.matrix.save(self.matrix_path)
             self._write_ledger()
-            logger.warning("normalized %d post-execution provider-error rows", changed)
+            logger.warning("normalized %d post-execution failure rows", changed)
 
     def _upsert_ledger(self, row: dict[str, object]) -> None:
         event_id = row["event_id"]

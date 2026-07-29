@@ -1,7 +1,7 @@
 # Execution-scored coding-model router protocol
 
-Status: protocol frozen; the original smoke is archived as invalid, one replacement is authorized,
-and execution is waiting for a legitimate E2B slot.
+Status: protocol frozen; the original smoke is archived as invalid, the authorized replacement
+passed, and the fast development tranche is in progress.
 
 Experiment ID: `coding-router-20260728`
 
@@ -184,6 +184,15 @@ gradeable and is marked `estimated`: each trace step is treated as one provider 
 are estimated from the cumulative task plus action-observation transcript with a fixed 4,096-token
 system and tool-schema allowance, and output tokens are estimated from the serialized action.
 Environment duration is recorded even when E2B does not expose its invoice rate.
+
+During the fast development tranche, Luna's first `db-wal-recovery` attempt exhausted the
+900-second agent wall budget after 20 provider calls. Harbor still ran the official verifier and
+recorded reward 0. The matrix runner initially hid that grade behind its generic `error`
+classification and launched attempt 2. The operator interrupted only that retry, terminated its
+exact sandbox, preserved its partial artifacts, and charged a conservative USD 500 budget debit.
+The classifier now treats every post-execution failure with an official reward as gradeable while
+keeping pre-execution failures retryable. Attempt 1 is the canonical zero; attempt 2 is excluded
+from scientific results as a protocol retry.
 
 ## Single smoke gate
 
