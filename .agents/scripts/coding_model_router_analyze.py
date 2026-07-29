@@ -365,6 +365,11 @@ def _static_assignments(ids: list[str], model: str) -> dict[str, str]:
     return dict.fromkeys(ids, model)
 
 
+def _guard_gate(decision: RoutingDecision) -> str | None:
+    evidence = decision.evidence
+    return evidence.gate if evidence is not None else None
+
+
 def _best_single(matrix: OutcomeMatrix, ids: list[str]) -> str:
     """Best 0.5/0.5 quality aggregate, then lower cost, then frozen pool order."""
     order = {entry.name: index for index, entry in enumerate(matrix.pool)}
@@ -1012,6 +1017,7 @@ def _seed_evaluation(
             "baseline_reward": cells[(sid, baseline)].reward,
             "router_cost": cells[(sid, decisions[sid].model)].cost_usd,
             "baseline_cost": cells[(sid, baseline)].cost_usd,
+            "guard_gate": _guard_gate(decisions[sid]),
         }
         for sid in heldout_ids
     ]

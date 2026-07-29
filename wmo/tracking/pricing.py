@@ -18,6 +18,9 @@ from wmo.providers.base import TokenUsage
 # `claude-haiku-4-5-20251001-v1:0` or `claude-opus-4-6-v1`. Strip them so the lookup key matches the
 # undated table rows (`claude-haiku-4-5`). Only applied to `claude-*` ids.
 _BEDROCK_SUFFIX = re.compile(r"(-\d{8})?(-v\d+)?(:\d+)?$")
+_OPENAI_SNAPSHOT_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+_OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
+_OPENAI_LONG_CONTEXT_MODELS = frozenset({"gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
 
 
 class ModelPrice(BaseModel):
@@ -124,6 +127,10 @@ def _normalize(model: str) -> str:
         # Drop a trailing Bedrock snapshot date / version (`-20251001-v1:0`, `-v1`) so dated
         # inference-profile ids match the undated table rows.
         normalized = _BEDROCK_SUFFIX.sub("", normalized)
+    elif normalized.startswith("gpt-"):
+        # OpenAI exact snapshots use an ISO date suffix while the frozen table is keyed by
+        # stable model family. Keep semantic version digits such as gpt-5.3-codex intact.
+        normalized = _OPENAI_SNAPSHOT_SUFFIX.sub("", normalized)
     return normalized
 
 
@@ -132,12 +139,25 @@ def price_for(model: str) -> ModelPrice | None:
     return _PRICES.get(_normalize(model))
 
 
+def request_price_multipliers(model: str, input_tokens: int) -> tuple[float, float]:
+    """Return the input/output price multipliers for one provider request."""
+    if (
+        _normalize(model) in _OPENAI_LONG_CONTEXT_MODELS
+        and input_tokens > _OPENAI_LONG_CONTEXT_THRESHOLD
+    ):
+        return 2.0, 1.5
+    return 1.0, 1.0
+
+
 def cost_usd(model: str, usage: TokenUsage) -> float:
     """USD cost of `usage` on `model`. Unknown models cost 0.0 (see `price_for` to detect that).
 
     Cache-adjusted: cache-read and cache-write subsets of `input_tokens` bill at their tier
     rates when the price row carries them, and at the full input rate otherwise (never $0).
-    With no cache traffic this reduces exactly to input*input_rate + output*output_rate.
+    GPT-5.5 and GPT-5.6 calls above 272k input tokens apply their published per-request 2x
+    input and 1.5x output multipliers. Callers must invoke this once per provider request,
+    which `RunTracker.record` and `MeteredProvider` do. With no cache traffic below that
+    threshold this reduces exactly to input*input_rate + output*output_rate.
     """
     price = price_for(model)
     if price is None:
@@ -152,9 +172,10 @@ def cost_usd(model: str, usage: TokenUsage) -> float:
         if price.cache_write_per_mtok is not None
         else price.input_per_mtok
     )
+    input_multiplier, output_multiplier = request_price_multipliers(model, usage.input_tokens)
     return (
-        (usage.input_tokens - read - write) * price.input_per_mtok
-        + read * read_rate
-        + write * write_rate
-        + usage.output_tokens * price.output_per_mtok
+        (usage.input_tokens - read - write) * price.input_per_mtok * input_multiplier
+        + read * read_rate * input_multiplier
+        + write * write_rate * input_multiplier
+        + usage.output_tokens * price.output_per_mtok * output_multiplier
     ) / 1_000_000

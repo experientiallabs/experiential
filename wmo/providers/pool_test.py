@@ -399,6 +399,25 @@ def test_cost_usd_is_cache_adjusted() -> None:
     assert entry.cost_usd(usage) == pytest.approx(6.4)
 
 
+def test_call_cost_usd_applies_openai_long_context_tier_to_explicit_prices() -> None:
+    entry = PoolEntry(
+        name="gpt55",
+        kind=ProviderKind.OPENAI_RESPONSES,
+        model="gpt-5.5-2026-04-23",
+        model_type="gpt-5.5",
+        input_per_mtok=5.0,
+        output_per_mtok=30.0,
+        cached_input_per_mtok=0.5,
+    )
+    usage = TokenUsage(
+        input_tokens=300_000,
+        output_tokens=10_000,
+        cached_input_tokens=100_000,
+    )
+    assert entry.cost_usd(usage) == pytest.approx(1.35)
+    assert entry.call_cost_usd(usage) == pytest.approx(2.55)
+
+
 def test_cost_usd_without_cache_price_bills_cached_tokens_at_full_rate() -> None:
     entry = PoolEntry(
         name="no-cache-price",

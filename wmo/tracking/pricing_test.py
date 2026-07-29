@@ -38,6 +38,27 @@ def test_gpt_5_5_output_is_30_per_mtok() -> None:
     assert (price.input_per_mtok, price.output_per_mtok) == (5.0, 30.0)
 
 
+def test_gpt_5_5_long_context_prices_each_call_at_published_multipliers() -> None:
+    usage = TokenUsage(
+        input_tokens=300_000,
+        output_tokens=10_000,
+        cached_input_tokens=100_000,
+    )
+    # 200k fresh input at 2x $5/M, 100k cached at 2x $0.50/M,
+    # and 10k output at 1.5x $30/M.
+    assert cost_usd("gpt-5.5", usage) == pytest.approx(2.0 + 0.1 + 0.45)
+
+
+def test_openai_snapshot_id_normalizes_and_keeps_long_context_pricing() -> None:
+    usage = TokenUsage(input_tokens=300_000, output_tokens=10_000)
+    assert cost_usd("gpt-5.5-2026-04-23", usage) == cost_usd("gpt-5.5", usage)
+
+
+def test_gpt_5_5_threshold_is_strictly_above_272k() -> None:
+    usage = TokenUsage(input_tokens=272_000, output_tokens=1_000)
+    assert cost_usd("gpt-5.5", usage) == pytest.approx(1.36 + 0.03)
+
+
 @pytest.mark.parametrize(
     ("model", "expected"),
     [

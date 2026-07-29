@@ -70,10 +70,16 @@ from wmo.optimize.compression import (
     same_compression,
     servable_compressor,
 )
-from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
+from wmo.providers.base import (
+    Embedder,
+    ProviderConfig,
+    ProviderKind,
+    UsageReportingEmbedder,
+)
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
 from wmo.retrieval.embedders import BatchedEmbedder, HashingEmbedder
+from wmo.tracking.pricing import cost_usd
 
 POLICY_VERSION = 2
 POLICY_FILENAME = "policy.json"
@@ -371,6 +377,7 @@ class RoutingDecision(BaseModel):
     # because it is per-request state, not part of the decision's shape: it must not appear in a
     # log row, a report, or a comparison between two decisions.
     _query_embedding: np.ndarray | None = PrivateAttr(default=None)
+    _router_cost_usd: float = PrivateAttr(default=0.0)
 
     def attach_query_embedding(self, vector: np.ndarray) -> None:
         """Record the vector this decision was made from (see `_query_embedding`)."""
@@ -379,6 +386,14 @@ class RoutingDecision(BaseModel):
     def query_embedding(self) -> np.ndarray | None:
         """The vector this decision was made from, when one was embedded for it."""
         return self._query_embedding
+
+    def attach_router_cost(self, value: float) -> None:
+        """Record the semantic embedder's billable cost for this one decision."""
+        self._router_cost_usd = value
+
+    def router_cost_usd(self) -> float:
+        """The routing decision's own provider cost, zero for offline embedders."""
+        return self._router_cost_usd
 
 
 class RoutingPolicy(BaseModel):
@@ -740,7 +755,14 @@ def select_model(
     if policy.kind == "static":
         return RoutingDecision(model=policy.default_model, reason="static policy")
 
-    query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
+    resolved_embedder = embedder or policy.embedder.build()
+    router_cost = 0.0
+    if isinstance(resolved_embedder, UsageReportingEmbedder):
+        embedded = resolved_embedder.embed_with_usage([text])
+        query = np.asarray(embedded.vectors[0])
+        router_cost = cost_usd(embedded.model, embedded.usage)
+    else:
+        query = np.asarray(resolved_embedder.embed([text])[0])
     if policy.kind == "knn":
         credit = cache_credit_usd(policy, incumbent, conversation_chars) if cache_aware_knn else 0.0
         decision = knn_decision(
@@ -756,6 +778,7 @@ def select_model(
     # champion's numerical path for the sake of a logging side effect.
     norm = float(np.linalg.norm(query))
     decision.attach_query_embedding(query / norm if norm > 0.0 else query)
+    decision.attach_router_cost(router_cost)
     return decision
 
 

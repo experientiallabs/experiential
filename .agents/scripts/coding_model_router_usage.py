@@ -10,6 +10,7 @@ from wmo.providers.pool import PoolEntry
 OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
 OPENAI_LONG_CONTEXT_MODELS = frozenset(
     {
+        "gpt-5.5",
         "gpt-5.5-2026-04-23",
         "gpt-5.6-sol",
         "gpt-5.6-terra",

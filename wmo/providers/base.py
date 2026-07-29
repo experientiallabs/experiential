@@ -188,6 +188,21 @@ class Embedder(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
+class EmbeddingResult(BaseModel):
+    """Vectors plus provider-reported billable usage for one embedding request."""
+
+    vectors: list[list[float]]
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+    model: str = Field(min_length=1)
+
+
+@runtime_checkable
+class UsageReportingEmbedder(Protocol):
+    """Optional embedding seam for callers that must meter semantic routing."""
+
+    def embed_with_usage(self, texts: list[str]) -> EmbeddingResult: ...
+
+
 @runtime_checkable
 class Provider(Protocol):
     """The single interface all four backends implement."""

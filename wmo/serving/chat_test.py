@@ -41,6 +41,7 @@ from wmo.optimize.policy import (
 )
 from wmo.providers.base import (
     Completion,
+    EmbeddingResult,
     Message,
     ProviderKind,
     StreamChunk,
@@ -280,6 +281,43 @@ def test_request_log_rows(tmp_path: Path) -> None:
     assert row["leg"] == "serving"
     assert row["cached_tokens"] == 0  # carried for the metering contract, not yet captured
     assert row["router_cost_usd"] == 0.0  # hashing policy routes for free; passed through
+
+
+def test_semantic_router_cost_uses_provider_reported_embedding_tokens(
+    tmp_path: Path,
+) -> None:
+    class _MeteredEmbedder:
+        def embed(self, texts: list[str]) -> list[list[float]]:
+            return self.embed_with_usage(texts).vectors
+
+        def embed_with_usage(self, texts: list[str]) -> EmbeddingResult:
+            return EmbeddingResult(
+                vectors=HashingEmbedder(dim=64).embed(texts),
+                usage=TokenUsage(input_tokens=1_000),
+                model="text-embedding-3-large",
+            )
+
+    log_path = tmp_path / "requests.jsonl"
+    runtime = EndpointRuntime(
+        name="tau-bench",
+        policy=_knn_policy(tmp_path),
+        provider_factory=_EchoProvider,
+        log=RequestLog(log_path),
+    )
+    runtime._policy_embedder = _MeteredEmbedder()
+    app = FastAPI()
+    app.include_router(create_chat_router({"tau-bench": runtime}))
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT 1"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert _rows(log_path)[0]["router_cost_usd"] == pytest.approx(0.00013)
 
 
 def test_create_app_mounts_endpoints_from_policies(tmp_path: Path) -> None:

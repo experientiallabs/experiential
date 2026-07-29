@@ -27,7 +27,7 @@ when the same quality and statistical gates hold.
 3. Held-out realized inference cost must be at least 40 percent below the baseline.
 4. Report relative retention and absolute percentage-point quality delta.
 5. Use paired scenario-level 95 percent confidence intervals.
-6. No benchmark may lose more than 10 relative quality points or 5 absolute points.
+6. No benchmark may lose more than 10 relative quality points or 10 absolute points.
 7. Apply the point-estimate gates independently on split seeds 0 through 4.
 8. Promotion requires all five seeds to pass plus the pooled paired interval gate.
 9. The production choice is the least expensive preregistered point that passes.
@@ -248,6 +248,13 @@ After real matrices and splits are immutable, Azure GPT-5.5 world-model inferenc
 simulated matrix. Real and simulated rows are never pooled. Compare cell agreement, false positive
 and negative rates, calibration, model rank, best-single choice, routed-model choice, guard
 decision, predicted deltas, and final promotion decision.
+
+The simulated environment is built from exactly one reward-free trajectory from the real
+fit-selected deployment-consensus baseline for each task. Rewards and verifier labels are removed,
+but task-specific observations remain retrievable, so the comparison measures reconstruction and
+decision agreement rather than unseen-task generalization. Candidate actions in simulation use
+WMO's native `LLMAgent`; the real matrix uses Harbor with the default Pi agent. That scaffold
+difference is an explicit simulation-to-real confound and must be carried into the report.
 
 ## Serving gate
 

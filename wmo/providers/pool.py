@@ -47,7 +47,7 @@ from wmo.providers.base import (
 )
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.registry import get_provider
-from wmo.tracking.pricing import ModelPrice, price_for
+from wmo.tracking.pricing import ModelPrice, price_for, request_price_multipliers
 
 DEFAULT_POOL_PATH = Path(".wmo/pool.toml")
 
@@ -186,7 +186,9 @@ class PoolEntry(BaseModel):
         entry carries no override, and to the full input rate when the row has no tier either
         (never silently free). The global `wmo.tracking.pricing.cost_usd` only knows the
         built-in table; pool entries with explicit prices must be costed here or they would
-        silently read $0.
+        silently read $0. This aggregate form cannot infer per-request long-context tiers;
+        callers holding one provider request use `call_cost_usd`, and multi-call paths sum it
+        at the request boundary.
         """
         price = self.price()
         read = min(usage.cached_input_tokens, usage.input_tokens)
@@ -210,6 +212,36 @@ class PoolEntry(BaseModel):
             + read * read_rate
             + write * write_rate
             + usage.output_tokens * price.output_per_mtok
+        ) / 1_000_000
+
+    def call_cost_usd(self, usage: TokenUsage) -> float:
+        """Price one provider request, including model-specific context tiers."""
+        base = self.price()
+        read = min(usage.cached_input_tokens, usage.input_tokens)
+        write = min(usage.cache_write_input_tokens, usage.input_tokens - read)
+        read_rate = self.cached_input_per_mtok
+        if read_rate is None:
+            read_rate = (
+                base.cache_read_per_mtok
+                if base.cache_read_per_mtok is not None
+                else base.input_per_mtok
+            )
+        write_rate = self.cache_write_per_mtok
+        if write_rate is None:
+            write_rate = (
+                base.cache_write_per_mtok
+                if base.cache_write_per_mtok is not None
+                else base.input_per_mtok
+            )
+        input_multiplier, output_multiplier = request_price_multipliers(
+            self.model_type or self.model,
+            usage.input_tokens,
+        )
+        return (
+            (usage.input_tokens - read - write) * base.input_per_mtok * input_multiplier
+            + read * read_rate * input_multiplier
+            + write * write_rate * input_multiplier
+            + usage.output_tokens * base.output_per_mtok * output_multiplier
         ) / 1_000_000
 
     def provider_config(self) -> ProviderConfig:
