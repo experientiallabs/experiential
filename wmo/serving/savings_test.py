@@ -293,3 +293,43 @@ def test_a_compressor_that_costs_more_than_it_saves_shows_a_smaller_saving() -> 
     pricey = compute_savings([_row("haiku", compressor_cost_usd=50.0)], _policy(cost_quality=1.0))
     assert pricey.cost_saved_usd == pytest.approx(cheap.cost_saved_usd - 50.0)
     assert pricey.cost_saved_usd < cheap.cost_saved_usd
+
+
+def test_a_free_local_arm_reads_as_the_full_counterfactual_saved() -> None:
+    # A locally hosted candidate bills $0 (explicit zero prices on its pool entry). Every
+    # request it serves saves the whole priced counterfactual; the percentage divides by the
+    # BASELINE (opus's price, never zero here), so the free arm cannot divide anything by zero.
+    local = PoolEntry(
+        name="qwen-local",
+        kind=ProviderKind.OPENAI,
+        model="qwen3:4b",
+        endpoint="http://localhost:11434/v1",
+        input_per_mtok=0.0,
+        output_per_mtok=0.0,
+    )
+    policy = RoutingPolicy(
+        kind="knn",
+        default_model="opus",
+        guard_model="opus",
+        pool=[_OPUS, local],
+        cost_scale=0.0055,
+        cost_quality=1.0,
+        floor_q=0.05,
+    )
+    routed_free = RequestLogRecord(
+        id="req",
+        ts=datetime.now(UTC).isoformat(),
+        endpoint="support",
+        model="qwen-local",
+        provider_model="qwen3:4b",
+        routing_reason="test",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cost_usd=0.0,
+        latency_ms=800.0,
+    )
+    savings = compute_savings([routed_free], policy)
+    assert savings.actual_cost_usd == 0.0
+    assert savings.baseline_cost_estimate_usd == pytest.approx(90.0)
+    assert savings.cost_saved_usd == pytest.approx(90.0)
+    assert savings.cost_saved_pct == pytest.approx(100.0)

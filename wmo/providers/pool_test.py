@@ -1164,3 +1164,82 @@ def test_bedrock_entry_rejects_api_key_env_at_load() -> None:
             input_per_mtok=1.0,
             output_per_mtok=2.0,
         )
+
+
+_LOCAL_POOL = """
+[[model]]
+name = "qwen3-4b-local"
+kind = "openai"
+model = "qwen3:4b"
+endpoint = "http://localhost:11434/v1"
+input_per_mtok = 0.0
+output_per_mtok = 0.0
+
+[[model]]
+name = "fable"
+kind = "anthropic"
+model = "claude-fable-5"
+enabled = false
+"""
+
+
+def test_zero_priced_local_entry_validates_and_costs_zero(tmp_path: Path) -> None:
+    # A self-hosted candidate's marginal price is genuinely $0; the EXPLICIT pair is what
+    # separates "declared free" from the unpriced-entry accident `_validate_price` rejects.
+    pool = load_pool(_write_pool(tmp_path, _LOCAL_POOL))
+    entry = pool.entry("qwen3-4b-local")
+    assert entry.kind is ProviderKind.OPENAI
+    assert entry.endpoint == "http://localhost:11434/v1"
+    price = entry.price()
+    assert (price.input_per_mtok, price.output_per_mtok) == (0.0, 0.0)
+    assert entry.cost_usd(TokenUsage(input_tokens=100_000, output_tokens=20_000)) == 0.0
+
+
+def test_enabled_defaults_on_and_enabled_models_filters(tmp_path: Path) -> None:
+    pool = load_pool(_write_pool(tmp_path, _LOCAL_POOL))
+    assert pool.entry("qwen3-4b-local").enabled is True
+    assert pool.entry("fable").enabled is False
+    assert [entry.name for entry in pool.enabled_models()] == ["qwen3-4b-local"]
+
+
+def test_disabled_entry_still_validates_loudly(tmp_path: Path) -> None:
+    # The toggle removes an entry from selection, not from validation: a typo in a disabled
+    # entry must not rot silently until the flag is flipped back.
+    broken = _LOCAL_POOL.replace('model = "claude-fable-5"', 'model = ""')
+    with pytest.raises(ValueError, match="model"):
+        load_pool(_write_pool(tmp_path, broken))
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "local"),
+    [
+        ("http://localhost:11434/v1", True),
+        ("http://127.0.0.1:8001/v1", True),
+        ("http://host.docker.internal:11434/v1", True),
+        ("http://silens-mac.local:11434/v1", True),
+        ("https://api.openai.com/v1", False),
+        ("https://40.80.93.150:8443", False),
+        (None, False),
+        ("", False),
+    ],
+)
+def test_is_local_endpoint(endpoint: str | None, local: bool) -> None:
+    assert pool_module.is_local_endpoint(endpoint) is local
+
+
+def test_an_endpoint_backed_entry_never_inherits_a_hosted_price() -> None:
+    # "gpt-5.4" has a built-in (hosted) price, but this entry is served by a custom endpoint:
+    # the hosted rate is the wrong server's price, so the entry must demand its own.
+    with pytest.raises(ValidationError, match="custom endpoint"):
+        PoolEntry(
+            name="gpt-at-home",
+            kind=ProviderKind.OPENAI,
+            model="gpt-5.4",
+            endpoint="http://localhost:8001/v1",
+        )
+
+
+def test_is_local_endpoint_never_raises_on_a_malformed_bracket_url() -> None:
+    # urlsplit raises ValueError on `http://[::1:8000`; display copy must read it as
+    # "not local", not crash the roster table.
+    assert pool_module.is_local_endpoint("http://[::1:8000/v1") is False

@@ -12,16 +12,15 @@ files, and fetching never overwrites an existing file unless forced. Downloads s
 
 VENDORED, deliberately. This is a copy of the read half of `environment_capture.hub`, narrowed
 to what `wmo` consumes: the write side, its argparse CLI, and the canonical-repo-id helper the
-push path needs all stayed behind in the member. The flagship wheel must install with no
-dependency on anything under `packages/` (AGENTS.md § Monorepo) — a `Requires-Dist` on a member
-makes every `wmo` release wait on a member release, and it strands the member's unreleased
-fixes: the ``wmh-``/``wmo-`` dataset-name fallback below landed in the member's 0.1.1, which was
-never published, so no pip user has ever had it. `wmo/repo_layout_test.py` keeps the import from
-coming back.
+push path needs all stayed behind upstream. The flagship wheel must install with no runtime
+dependency on `environment-capture` (AGENTS.md section One package). A `Requires-Dist` on it
+would make every `wmo` release wait on an upstream release, and it strands upstream's
+unreleased fixes: the ``wmh-``/``wmo-`` dataset-name fallback below landed in 0.1.1, which was
+never published, so no pip user has ever had it from PyPI.
 
-The two copies still share a registry and a data root, so a benchmark added on one side must be
-added on the other by hand. `test_the_two_copies_agree_on_the_registry_and_the_data_root` fails
-the build when that is forgotten; the rest of the body is not pinned, so keep edits mirrored.
+Upstream is now a PyPI distribution rather than an in-repo directory, so the two diverge by
+release instead of by hand-mirrored edit. This copy is the one `wmo` runs and the one its tests
+cover; a benchmark added upstream has to be added here deliberately.
 """
 
 from __future__ import annotations

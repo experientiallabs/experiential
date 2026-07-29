@@ -1,10 +1,12 @@
-"""Tests for the vendored Hub read core: listing, fetching, atomicity, drift (no network).
+"""Tests for the vendored Hub read core: listing, fetching, atomicity (no network).
 
 This is the copy `pip install world-model-optimizer` actually runs, so it carries its own
-coverage rather than leaning on the member's. Two of these tests exist only because it IS a
-copy: `test_the_vendored_copy_has_not_drifted_from_its_origin` diffs the shared source regions
-against the member's file, and the data-root case pins the one line that could NOT be copied
-verbatim. Neither imports the member — nothing under `wmo/` does.
+coverage rather than leaning on the upstream distribution's. Nothing here imports
+`environment_capture`, and nothing under `wmo/` does either.
+
+There used to be a drift test diffing this file's shared regions against the in-repo
+`packages/environment-capture/` copy. That directory is gone, so the check could only ever
+skip; upstream now diverges by release, not by hand-mirrored edit.
 """
 
 from __future__ import annotations
@@ -478,50 +480,3 @@ def test_data_root_resolution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
     assert hub._data_root() == elsewhere / "environment-capture-data"
-
-
-#: Source regions `wmo/hub.py` copied verbatim from the member and must keep copying verbatim,
-#: as (start marker, end marker) slices. Everything the two copies genuinely share lives here:
-#: the spec dataclass and the registry, the repo-name convention, and the prefix constants
-#: behind it. The rest of each file is allowed to differ — that is what "narrowed to what `wmo`
-#: consumes" means, and `_data_root` is deliberately not the same line in both.
-_SHARED_SOURCE_REGIONS = (
-    ("class CorpusSpec:", "class PublishedCorpus:"),
-    ("def candidate_repo_ids", "def _benchmark_from_repo_name"),
-    ("_REPO_PREFIXES", "_MISSING_REPO_CODES"),
-)
-
-
-def test_the_vendored_copy_has_not_drifted_from_its_origin() -> None:
-    """A vendored copy that drifts from its origin is worse than the import it replaced.
-
-    A benchmark registered on one side only makes `wmo download` and the member's capture
-    disagree about what exists; a repo-id rule that differs makes them look for the same bundle
-    under different dataset names. Both are silent until someone cannot find their data.
-
-    Compared as SOURCE TEXT, read off disk, rather than by importing the member: `wmo/` imports
-    nothing from `packages/`, tests included, and this test is not entitled to an exemption from
-    the rule the rest of the PR exists to establish. Text is also the stricter comparison — it
-    catches a comment or a docstring going stale, which a value check waves through.
-    """
-    copy_path = Path(hub.__file__).resolve()
-    member = (
-        copy_path.parents[1] / "packages" / "environment-capture" / "environment_capture/hub.py"
-    )
-    if not member.is_file():  # installed sdist, or the member is gone: nothing to compare
-        pytest.skip("the environment-capture member is not present in this tree")
-    origin = member.read_text(encoding="utf-8")
-    copy = copy_path.read_text(encoding="utf-8")
-    for start, end in _SHARED_SOURCE_REGIONS:
-        assert _region(copy, start, end) == _region(origin, start, end), (
-            f"wmo/hub.py drifted from the member's hub.py in the region {start!r}..{end!r}; "
-            "the two are hand-mirrored copies, so make the same edit in both (see the VENDORED "
-            "note at the top of wmo/hub.py)"
-        )
-
-
-def _region(source: str, start: str, end: str) -> str:
-    """The text of `source` from the line introducing `start` up to the one introducing `end`."""
-    assert start in source, f"marker {start!r} is gone; update _SHARED_SOURCE_REGIONS"
-    assert end in source, f"marker {end!r} is gone; update _SHARED_SOURCE_REGIONS"
-    return source[source.index(start) : source.index(end)]
