@@ -52,14 +52,18 @@ def _trace_id(job_name: str, trial_name: str) -> str:
 
 
 def find_trial_dirs(roots: list[Path]) -> list[Path]:
-    """Every dir under the roots holding both a result.json and an agent trajectory."""
-    found: list[Path] = []
+    """Every dir under the roots holding both a result.json and an agent trajectory.
+
+    Deduplicated by resolved path, so overlapping roots (`jobs jobs/gpt-5.5`) convert
+    each trial once instead of emitting the same trace twice.
+    """
+    found: dict[Path, None] = {}
     for root in roots:
         for result in sorted(root.rglob("result.json")):
-            trial_dir = result.parent
+            trial_dir = result.parent.resolve()
             if (trial_dir / "agent" / "trajectory.json").exists():
-                found.append(trial_dir)
-    return found
+                found[trial_dir] = None
+    return list(found)
 
 
 def _task_text(steps: list[dict[str, Any]]) -> str:
@@ -187,9 +191,21 @@ def main() -> None:
 
     trial_dirs = find_trial_dirs([Path(s) for s in args.sources])
     n_traces = n_spans = n_skipped = 0
+    seen_ids: dict[str, int] = {}
     with Path(args.out).open("w", encoding="utf-8") as out:
         for trial_dir in trial_dirs:
             spans = spans_for_trial(trial_dir, benchmark=args.benchmark)
+            if spans:
+                # Distinct captures can persist the same job id + trial name (a copied
+                # jobs dir); give the Nth occurrence its own deterministic identity so
+                # two episodes never merge into one trace downstream.
+                trace_id = spans[0]["traceId"]
+                occurrence = seen_ids[trace_id] = seen_ids.get(trace_id, 0) + 1
+                if occurrence > 1:
+                    reid = hashlib.sha256(f"{trace_id}|{occurrence}".encode()).hexdigest()[:32]
+                    for span in spans:
+                        span["traceId"] = reid
+                        span["spanId"] = reid[:12] + span["spanId"][12:]
             if len(spans) < 2 * args.min_tool_calls:
                 n_skipped += 1
                 continue
