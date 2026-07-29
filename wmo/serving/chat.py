@@ -771,12 +771,25 @@ class EndpointRuntime:
         exactly what the model will see.
         """
         incumbent = None
+        conversation_chars = 0
         remembered = _remembered_prefix(messages)
         if remembered is not None:
             with self._lock:
                 incumbent = self._affinity.get(_fingerprint(remembered))
+            if incumbent is not None:
+                # The transcript the fingerprint matched IS the shared prefix a warm cache
+                # would cover; its length feeds the cache-aware credit (chars/4 tokens,
+                # documented in `cache_credit_usd`). Content only: tool payloads are part of
+                # the prefix too, so this errs conservative, which is the designed direction.
+                conversation_chars = sum(len(m.content or "") for m in remembered)
         text = route_text if route_text is not None else _routable_text(messages)
-        return select_model(self.policy, text, incumbent=incumbent, embedder=self._embedder())
+        return select_model(
+            self.policy,
+            text,
+            incumbent=incumbent,
+            embedder=self._embedder(),
+            conversation_chars=conversation_chars,
+        )
 
     def record_query_embedding(self, record_id: str, decision: RoutingDecision) -> str | None:
         """Persist the vector `decision` was routed on, returning the log row's ref (or None).

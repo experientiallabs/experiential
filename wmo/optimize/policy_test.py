@@ -29,6 +29,7 @@ from wmo.optimize.policy import (
     EmbedderSpec,
     KnnBank,
     RoutingPolicy,
+    cache_credit_usd,
     embedder_provenance,
     knn_decision,
     probe_embedder,
@@ -1270,3 +1271,111 @@ def test_a_per_cluster_override_is_version_checked_too(tmp_path: Path) -> None:
     policy.model_copy(update={"clusters": clusters}).save(path)
     with pytest.raises(ValidationError, match="fitted against version 99"):
         RoutingPolicy.load(path)
+
+
+# --- cache-aware decisions (Silen directive 2026-07-28; design in findings/cacheaware.md) ---
+
+
+def _cached_pool() -> list[PoolEntry]:
+    """The test pool with explicit prices and cache-read rates (fable pricey, haiku cheap)."""
+    return [
+        PoolEntry(
+            name="fable-5",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-fable-5",
+            input_per_mtok=10.0,
+            output_per_mtok=40.0,
+            cached_input_per_mtok=1.0,
+        ),
+        PoolEntry(
+            name="haiku-4-5",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-haiku-4-5",
+            input_per_mtok=1.0,
+            output_per_mtok=4.0,
+            cached_input_per_mtok=0.1,
+        ),
+    ]
+
+
+def test_cache_credit_formula_and_its_zero_cases() -> None:
+    policy = _knn_policy(_knn_bank([[0.0, 1.0]] * 12))
+    policy = policy.model_copy(update={"pool": _cached_pool()})
+    # 4000 chars ~= 1000 tokens; fable saves (10 - 1) per Mtok => 1000 * 9 / 1e6.
+    assert cache_credit_usd(policy, "fable-5", 4000) == pytest.approx(0.009)
+    assert cache_credit_usd(policy, "fable-5", 0) == 0.0
+    assert cache_credit_usd(policy, "a-stranger", 4000) == 0.0
+    # No cached rate on the entry: cache reads bill at the full rate, so no credit.
+    no_cache = policy.model_copy(update={"pool": _pool()})
+    assert cache_credit_usd(no_cache, "fable-5", 4000) == 0.0
+
+
+def test_cache_blind_paths_are_bit_identical_with_zero_credit() -> None:
+    """The hard invariant: no incumbent, or credit 0, must not change the decision at all."""
+    for rewards, pick_lam in ([[0.0, 1.0]] * 12, 0.0), ([[1.0, 1.0]] * 12, 0.5):
+        policy = _knn_policy(_knn_bank(rewards), pick_lam=pick_lam)
+        plain = knn_decision(policy, _QUERY)
+        with_args = knn_decision(policy, _QUERY, incumbent="fable-5", cache_credit=0.0)
+        no_incumbent = knn_decision(policy, _QUERY, incumbent=None, cache_credit=0.5)
+        assert plain.model_dump() == with_args.model_dump()
+        assert plain.model_dump() == no_incumbent.model_dump()
+
+
+def test_cache_credit_flips_the_guards_pricier_test() -> None:
+    """A cache-warm pricey incumbent is effectively cheaper, so the challenger doubles z.
+
+    7 wins / 5 losses: delta 0.167 clears z=0.5 (needs > 0.149) but not the doubled bar
+    (needs > 0.297). Cache-blind, haiku is the cheaper pick and routes; with the incumbent
+    fable credited below haiku's price, haiku becomes the effectively-pricier pick and the
+    guard reverts it. Quality evidence identical in both runs: only the billing view moved.
+    """
+    rewards = [[0.0, 1.0]] * 7 + [[1.0, 0.0]] * 5
+    policy = _knn_policy(_knn_bank(rewards), knn_z=0.5, knn_min_pairs=8)
+    blind = knn_decision(policy, _QUERY)
+    assert blind.model == "haiku-4-5"
+    assert blind.evidence is not None
+    credited = knn_decision(
+        policy,
+        _QUERY,
+        incumbent="fable-5",
+        cache_credit=_PRICEY,  # floors fable to $0
+    )
+    assert credited.model == "fable-5"
+    assert credited.evidence is not None
+    assert credited.evidence.cache_credit_usd == pytest.approx(_PRICEY)
+    # The evidence numbers the guard tested are the SAME: cache state bought no confidence.
+    assert credited.evidence.mean_diff == pytest.approx(blind.evidence.mean_diff)
+    assert credited.evidence.se == pytest.approx(blind.evidence.se)
+
+
+def test_cache_credit_reprices_the_cost_knob_tilt() -> None:
+    """Equal quality, pick_lam on: blind tilt prefers cheap haiku (then the guard reverts a
+    zero-delta pick); credited, the incumbent fable is effectively free and IS the argmax."""
+    policy = _knn_policy(_knn_bank([[1.0, 1.0]] * 12), pick_lam=0.5)
+    blind = knn_decision(policy, _QUERY)
+    assert blind.model == "fable-5"
+    assert blind.evidence is not None and blind.evidence.gate == "reverted"
+    credited = knn_decision(policy, _QUERY, incumbent="fable-5", cache_credit=_PRICEY)
+    assert credited.model == "fable-5"
+    assert credited.evidence is not None
+    assert credited.evidence.gate is None  # baseline led the priced argmax outright
+    assert credited.evidence.cache_credit_usd == pytest.approx(_PRICEY)
+
+
+def test_select_model_cache_aware_prices_the_incumbent_instead_of_sticking() -> None:
+    rewards = [[0.0, 1.0]] * 12  # haiku dominates on evidence
+    bank = _knn_bank(rewards)
+    sticky = _knn_policy(bank)
+    aware = _knn_policy(bank).model_copy(update={"cache_aware": True, "pool": _cached_pool()})
+    aware.attach_bank(bank)
+    kwargs = {"incumbent": "fable-5", "embedder": _UnitEmbedder(), "conversation_chars": 4000}
+    stuck = select_model(sticky, "anything", **kwargs)
+    assert stuck.reason == "sticky: conversation affinity"
+    routed = select_model(aware, "anything", **kwargs)
+    # The evidence overwhelms the credit: cache-aware routing may still switch.
+    assert routed.model == "haiku-4-5"
+    assert routed.evidence is not None and routed.evidence.gate == "passed"
+    # And with no incumbent the cache-aware policy behaves exactly like today.
+    fresh_aware = select_model(aware, "anything", embedder=_UnitEmbedder())
+    fresh_sticky = select_model(sticky, "anything", embedder=_UnitEmbedder())
+    assert fresh_aware.model_dump() == fresh_sticky.model_dump()
