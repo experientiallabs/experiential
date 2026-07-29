@@ -13,10 +13,10 @@ from wmo.core.types import Step, Trace
 from wmo.engine import load_world_model
 from wmo.env import WorldModelEnv
 from wmo.env.scenarios import Scenario, tools_hint_from_traces
-from wmo.optimize.outcomes import OutcomeMatrix
+from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.sweep import CostLine, SweepPlan, execute_sweep
 from wmo.providers.base import TokenUsage
-from wmo.providers.pool import ModelPool, load_pool, pool_api_key
+from wmo.providers.pool import ModelPool, PoolEntry, load_pool, pool_api_key
 
 logger = logging.getLogger("router-real-simulate")
 
@@ -128,8 +128,9 @@ def _append_ledger(
     benchmark: str,
     out_dir: Path,
     matrix: OutcomeMatrix,
+    candidate_usd_by_model: dict[str, float],
     world_model_usd: float,
-    world_model_usage_path: Path | None,
+    world_model_usage_paths: list[Path],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
@@ -142,9 +143,9 @@ def _append_ledger(
                 "provider_role": "candidate",
                 "model": model,
                 "run": str(out_dir),
-                "realized_usd": sum(row.cost_usd for row in rows),
+                "realized_usd": candidate_usd_by_model[model],
                 "cells": len(rows),
-                "source": "simulated outcome matrix",
+                "source": "all simulated attempts, including infrastructure retries",
             }
         )
     lines.append(
@@ -156,13 +157,59 @@ def _append_ledger(
             "run": str(out_dir),
             "realized_usd": world_model_usd,
             "cells": len(matrix.outcomes),
-            "source": str(world_model_usage_path) if world_model_usage_path else "unavailable",
+            "source": (
+                [str(path) for path in world_model_usage_paths]
+                if world_model_usage_paths
+                else "unavailable"
+            ),
         }
     )
     with path.open("a", encoding="utf-8") as handle:
         for line in lines:
             handle.write(json.dumps(line, sort_keys=True) + "\n")
-        handle.flush()
+            handle.flush()
+
+
+def _retry_plan(
+    plan: SweepPlan,
+    *,
+    entry: PoolEntry,
+    scenarios: tuple[Scenario, ...],
+    out_path: Path,
+) -> SweepPlan:
+    pool = ModelPool(models=[entry])
+    return plan.model_copy(
+        update={
+            "out_path": out_path,
+            "pool": pool,
+            "scenarios": scenarios,
+            "cost_lines": _cost_lines(
+                pool,
+                scenarios=len(scenarios),
+                max_steps=plan.max_steps,
+                input_tokens=plan.assume_input_tokens,
+                output_tokens=plan.assume_output_tokens,
+            ),
+        }
+    )
+
+
+def _canonical_rows(
+    matrix: OutcomeMatrix,
+    *,
+    task_to_id: dict[str, str],
+    attempt_number: int,
+) -> list[ScenarioOutcome]:
+    return [
+        row.model_copy(
+            update={
+                "scenario_id": task_to_id[row.task],
+                "attempt_number": attempt_number,
+                "remeasured": attempt_number > 1,
+            }
+        )
+        for row in matrix.outcomes
+    ]
 
 
 def main() -> int:
@@ -234,9 +281,70 @@ def main() -> int:
         ),
         runs_dir=args.out_dir / "runs",
     )
+    canonical_rows = _canonical_rows(
+        run.matrix, task_to_id=task_to_id, attempt_number=1
+    )
+    all_attempts = list(canonical_rows)
+    candidate_usd_by_model = {
+        model: sum(row.cost_usd for row in canonical_rows if row.model == model)
+        for model in run.matrix.model_names()
+    }
+    world_model_usd = run.world_model_usd
+    world_model_usage_paths = [run.usage_path] if run.usage_path else []
+    scenario_by_task = {scenario.task: scenario for scenario in scenarios}
+    current = {
+        (row.model, row.scenario_id, row.episode): row for row in canonical_rows
+    }
+    retry_runs = 0
+    for attempt_number in (2, 3):
+        unscored = [row for row in current.values() if row.reward is None]
+        if not unscored:
+            break
+        for model in sorted({row.model for row in unscored}):
+            model_rows = [row for row in unscored if row.model == model]
+            retry_scenarios = tuple(scenario_by_task[row.task] for row in model_rows)
+            retry_dir = args.out_dir / "retries" / f"attempt-{attempt_number}" / model
+            retry_plan = _retry_plan(
+                plan,
+                entry=pool.entry(model),
+                scenarios=retry_scenarios,
+                out_path=retry_dir / "matrix-hashed.json",
+            )
+            retry_run = execute_sweep(
+                retry_plan,
+                world_model=world_model,
+                env_factory=lambda: WorldModelEnv(world_model, score_on_close=True),
+                on_outcome=lambda row, attempt_number=attempt_number: logger.info(
+                    "retry %d %s / %s: %s",
+                    attempt_number,
+                    row.model,
+                    task_to_id[row.task],
+                    "unscored" if row.reward is None else f"{row.reward:.3f}",
+                ),
+                runs_dir=retry_dir / "runs",
+            )
+            retry_runs += 1
+            rows = _canonical_rows(
+                retry_run.matrix,
+                task_to_id=task_to_id,
+                attempt_number=attempt_number,
+            )
+            OutcomeMatrix(pool=[pool.entry(model)], outcomes=rows).save(
+                retry_dir / "matrix.json"
+            )
+            all_attempts.extend(rows)
+            candidate_usd_by_model[model] += retry_run.candidate_usd
+            world_model_usd += retry_run.world_model_usd
+            if retry_run.usage_path:
+                world_model_usage_paths.append(retry_run.usage_path)
+            for row in rows:
+                current[(row.model, row.scenario_id, row.episode)] = row
+    write_text_atomic(
+        args.out_dir / "attempts.jsonl",
+        "".join(row.model_dump_json() + "\n" for row in all_attempts),
+    )
     canonical_rows = [
-        row.model_copy(update={"scenario_id": task_to_id[row.task]})
-        for row in run.matrix.outcomes
+        current[(row.model, row.scenario_id, row.episode)] for row in canonical_rows
     ]
     matrix = OutcomeMatrix(pool=run.matrix.pool, outcomes=canonical_rows)
     matrix.save(matrix_path)
@@ -248,10 +356,15 @@ def main() -> int:
         "models": len(pool.models),
         "cells": len(matrix.outcomes),
         "gradeable": sum(row.reward is not None for row in matrix.outcomes),
-        "candidate_cost_usd": run.candidate_usd,
-        "world_model_cost_usd": run.world_model_usd,
-        "world_model_metering_gap": run.metering_gap,
-        "world_model_usage_path": str(run.usage_path) if run.usage_path else None,
+        "attempt_rows": len(all_attempts),
+        "retry_runs": retry_runs,
+        "candidate_cost_usd": sum(candidate_usd_by_model.values()),
+        "candidate_cost_usd_by_model": candidate_usd_by_model,
+        "world_model_cost_usd": world_model_usd,
+        "world_model_metering_gap": (
+            run.metering_gap if len(world_model_usage_paths) <= 1 else None
+        ),
+        "world_model_usage_paths": [str(path) for path in world_model_usage_paths],
     }
     write_text_atomic(
         args.out_dir / "summary.json",
@@ -262,8 +375,9 @@ def main() -> int:
         benchmark=args.benchmark,
         out_dir=args.out_dir,
         matrix=matrix,
-        world_model_usd=run.world_model_usd,
-        world_model_usage_path=run.usage_path,
+        candidate_usd_by_model=candidate_usd_by_model,
+        world_model_usd=world_model_usd,
+        world_model_usage_paths=world_model_usage_paths,
     )
     return 0
 
