@@ -888,6 +888,42 @@ def test_route_pin_writes_a_serveable_static_policy(tmp_path: Path) -> None:
     assert "no outcome matrix" in policy.fitted_from  # provenance says it measured nothing
 
 
+def test_route_pin_warns_when_out_bypasses_the_model_dir(tmp_path: Path) -> None:
+    """A scratch --out succeeds but serving never sees it; the pin must say so.
+
+    Both bench-defaults lanes shipped an endpoint whose model dir still held
+    the OLD policy because `pin --out /tmp/...` printed the same success line
+    as an in-place pin (2026-07-29).
+    """
+    pool_file = tmp_path / "pool.toml"
+    assert _add_student(tmp_path, pool_file).exit_code == 0
+    _built_model(tmp_path)
+    scratch = tmp_path / "scratch" / "policy-pin.json"
+    scratch.parent.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "support",
+            "--model",
+            "student",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+            "--out",
+            str(scratch),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert scratch.is_file()  # the pin still lands where asked
+    assert "does NOT update" in result.output  # but the operator is told serving will not see it
+
+
 def test_route_pin_serves_through_the_endpoint_it_installed(tmp_path: Path) -> None:
     """The pinned policy is not just well formed: `select_model` actually routes on it."""
     pool_file = tmp_path / "pool.toml"
