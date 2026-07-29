@@ -989,7 +989,13 @@ def fit(
         "call). Only meaningful with --compressor.",
     ),
 ) -> None:
-    """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks)."""
+    """Fit a routing policy on an outcome matrix (kNN evidence or Avengers cluster ranks).
+
+    `--kind knn` is the product router and what `wmo optimize model` fits. `--kind rank` is a
+    retained research direction (a faithful Avengers replication kept for comparison); the
+    staged pipeline never fits it and no served endpoint carries one, so choose it only to
+    measure against the champion.
+    """
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
     matrix, source = _load_matrix(matrix_file)
