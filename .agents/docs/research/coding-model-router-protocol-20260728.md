@@ -408,6 +408,8 @@ uv run python .agents/scripts/coding_model_router_serve_verify.py \
   --root .wmo/experiments/coding-router-20260728 prepare
 uv run python .agents/scripts/coding_model_router_serve_verify.py \
   --root .wmo/experiments/coding-router-20260728 --port 8765 run
+uv run python .agents/scripts/coding_model_router_report.py \
+  --root .wmo/experiments/coding-router-20260728
 ```
 
 Audit the persisted evidence at any point without network access or paid calls:
