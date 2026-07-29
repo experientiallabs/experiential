@@ -387,3 +387,17 @@ uv run python .agents/scripts/coding_model_router_serve_verify.py \
 uv run python .agents/scripts/coding_model_router_serve_verify.py \
   --root .wmo/experiments/coding-router-20260728 --port 8765 run
 ```
+
+Audit the persisted evidence at any point without network access or paid calls:
+
+```bash
+uv run python .agents/scripts/coding_model_router_audit.py \
+  --root .wmo/experiments/coding-router-20260728
+uv run python .agents/scripts/coding_model_router_audit.py \
+  --root .wmo/experiments/coding-router-20260728 --require-complete
+```
+
+The first command atomically writes `completion-audit.json`. The second also exits nonzero unless
+every terminal requirement in the original brief is independently evidenced. A complete audit
+accepts either a measured promotion or a measured target-not-reached conclusion, but never treats
+missing paid evidence as a negative scientific result.
