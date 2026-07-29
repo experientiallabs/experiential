@@ -573,6 +573,46 @@ class PlatformClient:
         self._raise_for_error(finalize)
         return RemoteWorldModel.model_validate(_decode_json(finalize))
 
+    def install_endpoint_policy(
+        self,
+        org_id: str,
+        endpoint: str,
+        policy_path: Path,
+        bank_path: Path | None,
+        report_path: Path | None = None,
+    ) -> JsonValue:
+        """Install a fitted routing policy on a hosted endpoint.
+
+        Multipart rather than a signed-URL handoff like `push_model_bundle`: a policy
+        bank is a few hundred KB to a few MB, not a whole model bundle, and the server
+        has to validate the bank AGAINST the policy before storing it. Splitting them
+        across two requests would mean accepting bytes it cannot yet check.
+
+        Args:
+            org_id: Organization that owns the endpoint.
+            endpoint: Endpoint slug (the `model` a customer's client sends).
+            policy_path: Fitted `policy.json`.
+            bank_path: The `.npz` evidence sidecar; required for a knn policy, and
+                ``None`` for static or rank, which have none.
+            report_path: Optional improvement-report JSON to publish alongside.
+
+        Returns:
+            The endpoint summary the platform returns.
+        """
+        files: dict[str, tuple[str, bytes, str]] = {}
+        if bank_path is not None:
+            files["bank"] = (bank_path.name, bank_path.read_bytes(), "application/octet-stream")
+        data = {"policy": policy_path.read_text(encoding="utf-8")}
+        if report_path is not None:
+            data["report"] = report_path.read_text(encoding="utf-8")
+        response = self._client.put(
+            f"/api/orgs/{org_id}/endpoints/{endpoint}/policy",
+            data=data,
+            files=files or None,
+        )
+        self._raise_for_error(response)
+        return _decode_json(response)
+
     def download_model_bundle(self, org_id: str, name: str, dest: Path) -> str:
         """Stream a model's bundle from storage to ``dest``, verifying its digest.
 

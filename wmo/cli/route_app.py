@@ -1422,3 +1422,84 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
         "IN-SAMPLE, not held out: every request retrieves its own row. Sweep a second matrix "
         "over scenarios the fit never saw and report against that one."
     )
+
+
+@route_app.command("push")
+def push(
+    policy_file: str = typer.Argument(POLICY_FILENAME, help="Fitted policy JSON to install."),
+    endpoint: str = typer.Option(
+        ...,
+        "--endpoint",
+        help="Hosted endpoint slug to install onto (the `model` a customer's client sends).",
+    ),
+    org: str | None = typer.Option(
+        None,
+        "--org",
+        help="Organization id or slug (default: the login's, or $WMO_PLATFORM_ORG).",
+    ),
+    report_file: str | None = typer.Option(
+        None,
+        "--report",
+        help="Improvement report JSON to publish with the policy (see `route report`).",
+    ),
+) -> None:
+    """Install a fitted policy on a hosted endpoint, so serving actually uses it.
+
+    The last link in the chain. `fit` writes a policy that only this machine can see;
+    an endpoint created on the platform serves a `static` policy until something
+    replaces it. This is that something:
+
+        wmo optimize route push models/support/policy.json --endpoint support-prod
+
+    A knn policy is TWO artifacts, and this sends both: the JSON plus the `.npz`
+    evidence bank beside it, resolved from the policy's own `knn_bank_path` rather
+    than guessed, so a renamed sidecar is a local error instead of a server refusal.
+    Sending the policy alone would store a row that validates and cannot serve.
+
+    The endpoint keeps its id, name, and URL, so a customer's client is unaffected by
+    the swap, and live pods pick the new policy up on their own.
+    """
+    policy_path = Path(policy_file)
+    if not policy_path.is_file():
+        raise typer.BadParameter(
+            f"no policy at {policy_path} (`wmo optimize route fit` writes one)"
+        )
+    try:
+        policy = RoutingPolicy.load(policy_path)
+    except (ValidationError, ValueError) as exc:
+        raise typer.BadParameter(f"{policy_path} is not a routing policy: {exc}") from exc
+
+    bank_path: Path | None = None
+    if policy.kind == "knn":
+        bank_path = policy.bank_path()
+        if not bank_path.is_file():
+            # Checked here, not left to the server: the policy names its own sidecar,
+            # so a missing one means the local artifact pair is broken and pushing
+            # would only turn that into a 400 after uploading nothing useful.
+            raise typer.BadParameter(
+                f"{policy_path} is a knn policy whose evidence bank is missing at "
+                f"{bank_path}; a knn policy is served together with its sidecar, so "
+                "copy it beside the policy or refit with `wmo optimize route fit --kind knn`"
+            )
+    report_path = Path(report_file) if report_file is not None else None
+    if report_path is not None and not report_path.is_file():
+        raise typer.BadParameter(
+            f"no report at {report_path} (`wmo optimize route report` writes one)"
+        )
+
+    # Imported here, not at module scope: `platform_cmds` builds its own command
+    # surface at import time, and pulling that in for one command changed behavior
+    # in unrelated `route` commands (15 of this module's tests went red).
+    from wmo.cli.platform_cmds import _connected, _require_connection
+
+    credentials, org_id = _require_connection(org)
+    with _connected(credentials, "Could not install the policy") as client:
+        client.install_endpoint_policy(org_id, endpoint, policy_path, bank_path, report_path)
+
+    size = f", bank {bank_path.stat().st_size / 1024:.0f}KiB" if bank_path is not None else ""
+    _console.print(
+        f"[green]✓[/green] installed {policy.kind} policy on [bold]{endpoint}[/bold]{size}\n"
+        f"  from: {policy_path}\n"
+        f"  serving picks it up without a restart; `wmo runs` and the endpoint's "
+        f"telemetry show what it routes."
+    )

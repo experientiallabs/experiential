@@ -3172,3 +3172,146 @@ def test_route_student_replacement_keeps_a_disabled_entry_disabled(tmp_path: Pat
     entries = load_pool(pool_file).models
     assert len(entries) == 1
     assert entries[0].enabled is False
+
+
+def _fitted_knn_policy(tmp_path: Path) -> Path:
+    """Fit a real knn policy + sidecar through the CLI, returning the policy path."""
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--kind",
+            "knn",
+            "--fallback",
+            "a",
+            "--z",
+            "0.5",
+            "--rag-num",
+            "3",
+            "--min-pairs",
+            "2",
+            "--out",
+            str(policy_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return policy_file
+
+
+class _FakeClient:
+    """Records the install call instead of making it."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Path, Path | None, Path | None]] = []
+
+    def install_endpoint_policy(
+        self,
+        org_id: str,
+        endpoint: str,
+        policy_path: Path,
+        bank_path: Path | None,
+        report_path: Path | None = None,
+    ) -> dict[str, str]:
+        self.calls.append((org_id, endpoint, policy_path, bank_path, report_path))
+        return {"name": endpoint}
+
+
+@contextmanager
+def _connected_to(client: _FakeClient) -> Iterator[None]:
+    """Stand in for a platform login for the duration of one command.
+
+    Patches `platform_cmds`, which is where `push` resolves the connection from, so
+    the command runs its real body against a client that records instead of calling.
+    """
+    import wmo.cli.platform_cmds as platform_module
+
+    @contextmanager
+    def _fake_connected(_credentials: object, _headline: str) -> Iterator[_FakeClient]:
+        yield client
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(platform_module, "_connected", _fake_connected)
+        patch.setattr(platform_module, "_require_connection", lambda _org: (None, "org-1"))
+        yield
+
+
+def test_route_push_sends_the_policy_and_its_sidecar(tmp_path: Path) -> None:
+    """Push sends BOTH artifacts: a knn policy alone would store an unservable row."""
+    policy_file = _fitted_knn_policy(tmp_path)
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app,
+            ["optimize", "route", "push", str(policy_file), "--endpoint", "support-prod"],
+        )
+    assert result.exit_code == 0, result.output
+    assert len(client.calls) == 1
+    _org, endpoint, sent_policy, sent_bank, sent_report = client.calls[0]
+    assert endpoint == "support-prod"
+    assert sent_policy == policy_file
+    # Resolved from the policy's own knn_bank_path, not guessed from the policy name.
+    assert sent_bank == RoutingPolicy.load(policy_file).bank_path()
+    assert sent_bank is not None and sent_bank.is_file()
+    assert sent_report is None
+    assert _says(result.output, "installed knn policy")
+
+
+def test_route_push_refuses_a_knn_policy_whose_sidecar_is_missing(tmp_path: Path) -> None:
+    """A knn policy without its bank fails locally, before any upload."""
+    # The pair is broken on this machine, so pushing would only turn a local mistake
+    # into a server refusal after sending a policy the server must reject.
+    policy_file = _fitted_knn_policy(tmp_path)
+    RoutingPolicy.load(policy_file).bank_path().unlink()
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app,
+            ["optimize", "route", "push", str(policy_file), "--endpoint", "support-prod"],
+        )
+    assert result.exit_code != 0
+    assert _says(result.output, "evidence bank is missing")
+    assert client.calls == []
+
+
+def test_route_push_refuses_a_path_that_is_not_a_policy(tmp_path: Path) -> None:
+    """A file that is not a routing policy is refused without contacting the platform."""
+    junk = tmp_path / "policy.json"
+    junk.write_text('{"kind": "not-a-kind"}', encoding="utf-8")
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app, ["optimize", "route", "push", str(junk), "--endpoint", "support-prod"]
+        )
+    assert result.exit_code != 0
+    assert _says(result.output, "not a routing policy")
+    assert client.calls == []
+
+
+def test_route_push_sends_no_bank_for_a_static_policy(tmp_path: Path) -> None:
+    """A static policy has no sidecar, so none is sent and none is required."""
+    policy_file = tmp_path / "policy.json"
+    RoutingPolicy(
+        kind="static",
+        default_model="a",
+        pool=[
+            PoolEntry(
+                name="a",
+                kind=ProviderKind.OPENAI,
+                model="a",
+                input_per_mtok=1.0,
+                output_per_mtok=1.0,
+            )
+        ],
+    ).save(policy_file)
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app, ["optimize", "route", "push", str(policy_file), "--endpoint", "support-prod"]
+        )
+    assert result.exit_code == 0, result.output
+    assert client.calls[0][3] is None
