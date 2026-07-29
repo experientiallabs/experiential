@@ -5,7 +5,8 @@ outcome.json's call_seconds, so the corrected value is derivable offline. This i
 per-call persistence exists for.
 """
 
-import json, sys
+import json
+import sys
 from pathlib import Path
 
 base = Path(sys.argv[1])
