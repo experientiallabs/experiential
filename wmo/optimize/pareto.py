@@ -60,6 +60,18 @@ REAL_EPISODE = "real_episode"
 # by the benchmark instead and has to say which one.
 DEFAULT_WM_JUDGE = "world-model verifier"
 
+# Frontier eligibility: a point must have scored rows on at least this fraction of the
+# band's best scenario coverage. Without it, an arm that loses most episodes to its own
+# failures is judged only on the survivors — on a real tau2 grid, qwen3.5-9b scored 5 of 12
+# episodes, aced them, and "dominated" the anchor measured on all 12. Survivorship is not
+# dominance, so under-covered points stay plotted and labeled but are never marked frontier
+# nor eligible for `recommended`. On a matrix with full coverage nothing changes.
+FRONTIER_COVERAGE_FRACTION = 0.9
+FRONTIER_RULE = (
+    "frontier eligibility: scored-scenario coverage >= 90% of the band's best; "
+    "under-covered points are plotted but never frontier nor recommended"
+)
+
 
 class ParetoPoint(BaseModel):
     """One measured way to serve the workload, on all three objectives."""
@@ -77,6 +89,9 @@ class ParetoPoint(BaseModel):
     n_scored: int
     n_excluded: int  # unscored episodes behind this point (infrastructure, not zeros)
     on_frontier: bool = False
+    # False when coverage is too thin for this point's axes to be compared against the
+    # band's (see FRONTIER_RULE); such a point can neither hold nor take the frontier.
+    frontier_eligible: bool = True
     dial: float | None = None  # routed points: the cost_quality position replayed
     mix: dict[str, int] = Field(default_factory=dict)  # routed points: scenarios per model
 
@@ -95,6 +110,10 @@ class ParetoCurve(BaseModel):
     n_scenarios: int
     provenance: str  # e.g. "wm_simulated"; consumers print it next to every rendering
     judge: str
+    # The eligibility rule the frontier flags were computed under, stated on the artifact
+    # so a renderer can show WHY an under-covered point is unmarked. Defaulted so curves
+    # written before the rule existed still parse.
+    frontier_rule: str = FRONTIER_RULE
 
 
 def pareto_curve(
@@ -267,25 +286,40 @@ def _mark_frontier(points: list[ParetoPoint]) -> list[ParetoPoint]:
 
     A point with no defined cost cannot be placed on the cost axis and is never on the
     frontier (it stays in `points` so a renderer can show it as unplaced rather than
-    dropping it silently).
+    dropping it silently). A point whose scored-scenario coverage falls below
+    FRONTIER_COVERAGE_FRACTION of the band's best is excluded from the dominance
+    comparison entirely — both as a candidate and as a dominator — because its axes
+    describe the episodes it survived, not the band.
     """
     placeable = [
         (p, p.cost_per_completed_task_usd)
         for p in points
         if p.cost_per_completed_task_usd is not None
     ]
+    best_coverage = max((p.n_scenarios for p, _ in placeable), default=0)
+    floor = FRONTIER_COVERAGE_FRACTION * best_coverage
+    eligible = [(p, cost) for p, cost in placeable if p.n_scenarios >= floor]
 
     def dominated(p: ParetoPoint, cost: float) -> bool:
         return any(
             other_cost <= cost
             and o.mean_reward >= p.mean_reward
             and (other_cost < cost or o.mean_reward > p.mean_reward)
-            for o, other_cost in placeable
+            for o, other_cost in eligible
             if o is not p
         )
 
-    flagged = {p.id: not dominated(p, cost) for p, cost in placeable}
-    return [p.model_copy(update={"on_frontier": flagged.get(p.id, False)}) for p in points]
+    flagged = {p.id: not dominated(p, cost) for p, cost in eligible}
+    eligible_ids = {p.id for p, _ in eligible}
+    return [
+        p.model_copy(
+            update={
+                "on_frontier": flagged.get(p.id, False),
+                "frontier_eligible": p.id in eligible_ids,
+            }
+        )
+        for p in points
+    ]
 
 
 def _recommended(points: list[ParetoPoint], policy: RoutingPolicy | None) -> str | None:

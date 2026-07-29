@@ -139,3 +139,40 @@ def test_serializes_for_the_wire() -> None:
 
     restored = ParetoCurve.model_validate_json(curve.model_dump_json())
     assert restored == curve
+
+
+def test_survivorship_cannot_take_the_frontier() -> None:
+    """An arm judged only on the episodes it survived must not dominate the band.
+
+    Repro from the real tau2 grid: qwen3.5-9b lost most episodes to its own empty
+    replies, aced the survivors, and its (cost, reward) beat the anchor measured on
+    everything. Survivorship is not dominance: the under-covered point stays plotted
+    and labeled, but never holds the frontier and is never recommended.
+    """
+    outcomes = [
+        # "cheap" scores on only 1 of 4 scenarios (the rest unscored) and aces it.
+        _row("s1", "cheap", reward=1.0, cost=0.001),
+        _row("s2", "cheap", reward=None),
+        _row("s3", "cheap", reward=None),
+        _row("s4", "cheap", reward=None),
+        # "strong" is measured on the whole band.
+        _row("s1", "strong", reward=1.0, cost=0.03),
+        _row("s2", "strong", reward=1.0, cost=0.03),
+        _row("s3", "strong", reward=0.5, cost=0.03),
+        _row("s4", "strong", reward=1.0, cost=0.03),
+    ]
+    curve = pareto_curve(_matrix(outcomes), judge="test-judge")
+
+    by_id = {p.id: p for p in curve.points}
+    assert not by_id["cheap"].frontier_eligible
+    assert not by_id["cheap"].on_frontier
+    assert by_id["strong"].on_frontier
+    assert curve.recommended == "strong"
+    assert not curve.complete
+    assert "coverage" in curve.frontier_rule
+
+
+def test_full_coverage_band_is_untouched_by_the_eligibility_rule() -> None:
+    curve = pareto_curve(_three_model_matrix(), judge="test-judge")
+
+    assert all(p.frontier_eligible for p in curve.points)
