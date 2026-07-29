@@ -1,15 +1,16 @@
 """Derive a run's canonical event stream from artifacts already on disk.
 
-`wmo runs backfill` replays work that has already happened — a grid arm's ledger and
-chunk files, an optimize manifest — into the same events the live hooks emit. The two
+`wmo runs backfill` replays work that has already happened (a grid arm's ledger and
+chunk files, an optimize manifest) into the same events the live hooks emit. The two
 paths MUST converge on identical `(run, seq)` identities, because the platform's
 idempotency key is exactly that pair: converging makes a backfill over a live run
 free, and diverging double-counts every fact.
 
 Convergence is what forces the determinism rules below. They are binding, and the
 shared fixtures (`d-runs-fixtures/expected-events.jsonl`) are the executable
-statement of them — `backfill_test.py` asserts byte-exact reproduction, so a change
-here that drifts from the seam fails locally rather than in production.
+statement of them: `backfill_test.py` asserts byte-exact reproduction, so a change
+here that drifts from the seam fails wherever those fixtures are present (they live
+outside this repo, so a checkout without them skips that test rather than failing).
 
 - Seqs are BANDED (see `schema.SeqBands`). Band 0 carries the run-level walk
   (`run.meta`, `ledger.line`, the final `heartbeat`, `run.status`) plus in-flight
@@ -35,9 +36,10 @@ import json
 import logging
 from pathlib import Path
 
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from wmo.core.types import JsonObject
+from wmo.runs.ledger import LedgerLine
 from wmo.runs.schema import (
     CELL_BATCH_CAP,
     LEDGER_LINE,
@@ -59,6 +61,12 @@ PREVIEW_CHARS = 4096
 
 # Outcome fields that can carry unbounded model text.
 TEXT_PREVIEW_FIELDS = ("critique", "replies", "task")
+
+# Items kept from a list-valued preview. `replies` is one entry per step, each up to
+# PREVIEW_CHARS, so a long episode's list crosses the 240 KB document cap on `detail`
+# even though every single entry is inside its own bound. Truncating the list is what
+# keeps a whole cell.batch from being refused over one verbose cell.
+PREVIEW_ITEMS = 20
 
 # Ledger events that count toward a run's completed-cell progress.
 _COUNTED_LEDGER_EVENTS = ("chunk", "chunk-skipped")
@@ -106,11 +114,16 @@ def _as_rows(value: JsonValue, *, field: str) -> list[JsonObject]:
 
 
 def _preview(value: JsonValue) -> JsonValue:
-    """Truncate long free text, recursing into lists of it."""
+    """Truncate long free text, and bound how many items a list keeps.
+
+    Both bounds matter: per-entry truncation alone still lets a per-step list grow
+    past the platform's cap on the whole `detail` document, and that refusal would
+    drop the entire batch the cell rode in.
+    """
     if isinstance(value, str) and len(value) > PREVIEW_CHARS:
         return value[:PREVIEW_CHARS]
     if isinstance(value, list):
-        return [_preview(item) for item in value]
+        return [_preview(item) for item in value[:PREVIEW_ITEMS]]
     return value
 
 
@@ -174,7 +187,7 @@ def _total(values: list[float]) -> float:
     NOT `sum()`, and not for style: CPython 3.12 gave `sum()` a compensated
     (Neumaier) fast path for floats, so the same source over the same ledger
     produces different low bits on 3.11 and 3.12. A byte-exact seam cannot rest
-    on that — the canonical fixtures would stop matching the moment either side
+    on that, because the canonical fixtures would stop matching the moment either side
     changed interpreter. An explicit accumulation is IEEE-deterministic on every
     version, which is worth more here than the extra accuracy: run spend is
     display-only and the ledger's own precision is far coarser than the
@@ -196,11 +209,46 @@ def _stage_total(stages: list[JsonObject], field: str) -> float:
     return _total([_as_float(record.get(field, 0.0), field=f"stage.{field}") for record in stages])
 
 
+def conforms_to_ledger_schema(line: JsonObject) -> bool:
+    """Whether a parsed line is one the grid runner would have counted.
+
+    Both sides validate against the SAME model (`wmo.runs.ledger.LedgerLine`), which is
+    the point: the runner skips what fails and counts what passes, and a seq is derived
+    from a line's position among the ones that passed. A reader with its own looser rule
+    would count a line the runner ignored and renumber everything after it, leaving the
+    platform holding two copies of the run.
+    """
+    try:
+        LedgerLine.model_validate(line)
+    except ValidationError:
+        return False
+    return True
+
+
+def _countable_ledger_lines(path: Path) -> list[JsonObject]:
+    """Ledger lines in the order the runner counts them, non-conforming ones dropped.
+
+    Position among THESE is what a seq is derived from, on both paths.
+    """
+    countable: list[JsonObject] = []
+    for index, line in enumerate(_jsonl(path), start=1):
+        if not conforms_to_ledger_schema(line):
+            logger.warning(
+                "%s line %d does not conform to the ledger schema; skipping it, as the "
+                "runner does, so both paths derive the same positions",
+                path.name,
+                index,
+            )
+            continue
+        countable.append(line)
+    return countable
+
+
 def _latest_chunk_lines(arm_lines: list[JsonObject]) -> list[JsonObject]:
     """The last ledger line per chunk index, which is what progress counts.
 
     Real ledgers carry repair attempts: a chunk that failed and was re-run appears
-    two or three times, and summing all of them double-counts its cells — a
+    two or three times, and summing all of them double-counts its cells: a
     440-cell arm reported 880 done on the live stack, disagreeing with the panel's
     own cell rollup, which is keyed per cell and therefore truthful. The later
     attempt supersedes the earlier one, so only the last line per index counts.
@@ -223,8 +271,47 @@ def _latest_chunk_lines(arm_lines: list[JsonObject]) -> list[JsonObject]:
 
 
 def _jsonl(path: Path) -> list[JsonObject]:
-    """Read a JSONL file, skipping blank lines."""
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    """Read a JSONL file, tolerating a torn FINAL line.
+
+    A half-written last line is the normal state of a file that was being appended
+    when the process died, which is exactly the artifact a backfill exists to
+    recover: refusing it would make the crash unrecoverable by the tool meant to
+    recover from it. The runner's own reader skips it the same way.
+
+    A malformed line anywhere EARLIER is a different thing entirely: the file was
+    corrupted rather than truncated, so every later line's meaning is in doubt, and
+    a partial recovery would silently under-report a run. That is a hard refusal.
+
+    Args:
+        path: The JSONL file.
+
+    Returns:
+        The parsed lines, minus a torn trailing one.
+
+    Raises:
+        ArtifactError: If a line before the last is unparseable.
+    """
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    rows: list[JsonObject] = []
+    for index, line in enumerate(lines):
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            if index == len(lines) - 1:
+                logger.warning(
+                    "%s: ignoring a torn final line (%d bytes); the writer was "
+                    "interrupted mid-append",
+                    path.name,
+                    len(line),
+                )
+                break
+            msg = (
+                f"{path.name} line {index + 1} of {len(lines)} is unparseable, and it is not "
+                "the last: the file is corrupted rather than truncated, so recovering only "
+                "part of it would under-report the run"
+            )
+            raise ArtifactError(msg) from error
+    return rows
 
 
 class BackfillRefused(RuntimeError):
@@ -234,7 +321,7 @@ class BackfillRefused(RuntimeError):
 def ensure_backfillable(existing_events: int, *, force: bool = False) -> None:
     """Refuse to backfill a run that already holds events, unless forced.
 
-    Live emission and backfill place RUN-LEVEL events in different bands — a live
+    Live emission and backfill place RUN-LEVEL events in different bands. A live
     process uses the band of the first chunk it owns, because two or three of them
     drive one arm and all wanting band 0 is the collision the partition exists to
     stop, while a backfill writes the canonical band-0 walk. So replaying a run that
@@ -288,11 +375,43 @@ class _Walker:
             )
         )
 
-    def emit_cells(self, band: int, rows: list[JsonObject], *, chunk: int | None, ts: str) -> None:
+    def emit_from_top(self, band: int, event_type: str, ts: str, payload: JsonObject) -> None:
+        """Append a live-only event, numbered DOWN from the top of its band.
+
+        The facts with no artifact position: a heartbeat, a terminal `run.status`, and
+        an in-flight partial's cells (their chunk has no ledger line yet, so it has no
+        band of its own). Ascending them into the run-level walk would collide with
+        the ledger positions a later resume derives: backfill a killed arm, resume it,
+        and its next ledger lines would land on seqs the backfill had already used and
+        be discarded as duplicates, silently, because a derived seq coming back
+        already-held is indistinguishable from convergence working.
+        """
+        self._events.append(
+            RunEvent(
+                external_id=self._external_id,
+                seq=self._bands.take_from_top(band),
+                ts=ts,
+                type=event_type,
+                payload=payload,
+            )
+        )
+
+    def emit_cells(
+        self,
+        band: int,
+        rows: list[JsonObject],
+        *,
+        chunk: int | None,
+        ts: str,
+        from_top: bool = False,
+    ) -> None:
         """Emit a chunk's rows as `cell.batch` events, in file order."""
         for start in range(0, len(rows), CELL_BATCH_CAP):
             cells = [cell_payload(row, chunk=chunk) for row in rows[start : start + CELL_BATCH_CAP]]
-            self.emit(band, RunEventType.CELL_BATCH, ts, {"cells": cells})
+            if from_top:
+                self.emit_from_top(band, RunEventType.CELL_BATCH, ts, {"cells": cells})
+            else:
+                self.emit(band, RunEventType.CELL_BATCH, ts, {"cells": cells})
 
     @property
     def events(self) -> list[RunEvent]:
@@ -300,7 +419,9 @@ class _Walker:
         return self._events
 
 
-def grid_arm_events(artifacts: Path, *, arm: str, grid_relpath: str) -> list[RunEvent]:
+def grid_arm_events(
+    artifacts: Path, *, arm: str, grid_relpath: str, external_id: str | None = None
+) -> list[RunEvent]:
     """Derive one grid arm's event stream from its cohort, ledger, and chunk files.
 
     Args:
@@ -308,13 +429,20 @@ def grid_arm_events(artifacts: Path, *, arm: str, grid_relpath: str) -> list[Run
             per-arm subdirectory.
         arm: Arm name; the ledger is filtered to it.
         grid_relpath: Grid directory path relative to `.wmo`, for the run's name.
+        external_id: Override the derived run name (an operator's `--name`). Passed
+            through to the events themselves so a dry-run's output names the run it
+            would push to, rather than the name the directory happens to imply.
 
     Returns:
         The arm's events in emission order.
     """
     cohort: JsonObject = json.loads((artifacts / "cohort.json").read_text())
-    arm_lines = [line for line in _jsonl(artifacts / "ledger.jsonl") if line.get("arm") == arm]
-    walker = _Walker(grid_arm_external_id(grid_relpath, arm))
+    arm_lines = [
+        line
+        for line in _countable_ledger_lines(artifacts / "ledger.jsonl")
+        if line.get("arm") == arm
+    ]
+    walker = _Walker(external_id or grid_arm_external_id(grid_relpath, arm))
     created = _as_str(cohort["created"], field="cohort.created")
     model_name = Path(_as_str(cohort["model_dir"], field="cohort.model_dir")).name
 
@@ -353,10 +481,10 @@ def grid_arm_events(artifacts: Path, *, arm: str, grid_relpath: str) -> list[Run
         in_flight = int(partial.name.split("-")[1].split(".")[0])
         rows = _jsonl(partial)[1:]  # line 0 is the PartialHeader
         if rows:
-            walker.emit_cells(RUN_LEVEL_BAND, rows, chunk=in_flight, ts=last_ts)
+            walker.emit_cells(RUN_LEVEL_BAND, rows, chunk=in_flight, ts=last_ts, from_top=True)
 
     counted = _latest_chunk_lines(arm_lines)
-    walker.emit(
+    walker.emit_from_top(
         RUN_LEVEL_BAND,
         RunEventType.HEARTBEAT,
         last_ts,
@@ -365,7 +493,7 @@ def grid_arm_events(artifacts: Path, *, arm: str, grid_relpath: str) -> list[Run
                 # Integer counts, so ordinary `sum` is exact here; only the
                 # float legs below need the explicit rule. `counted` is already
                 # deduped per chunk index, while the spend legs below sum EVERY
-                # line — the two are asymmetric on purpose.
+                # line; the two are asymmetric on purpose.
                 "done": sum(_as_int(line["cells"], field="ledger.cells") for line in counted),
                 # A live arm does not know its denominator; the platform's progress
                 # column is nullable for exactly this.
@@ -387,7 +515,7 @@ def grid_arm_events(artifacts: Path, *, arm: str, grid_relpath: str) -> list[Run
     if meta_file.exists():
         meta: JsonObject = json.loads(meta_file.read_text())
         merged_at = _as_str(meta["merged_at"], field="matrix.meta.merged_at")
-        walker.emit(
+        walker.emit_from_top(
             RUN_LEVEL_BAND,
             RunEventType.RUN_STATUS,
             merged_at,
@@ -396,7 +524,9 @@ def grid_arm_events(artifacts: Path, *, arm: str, grid_relpath: str) -> list[Run
     return walker.events
 
 
-def optimize_events(manifest_path: Path, *, model: str) -> list[RunEvent]:
+def optimize_events(
+    manifest_path: Path, *, model: str, external_id: str | None = None
+) -> list[RunEvent]:
     """Derive one optimize pipeline's event stream from its manifest.
 
     The manifest persists COMPLETED stages only, so every stage event is
@@ -406,13 +536,16 @@ def optimize_events(manifest_path: Path, *, model: str) -> list[RunEvent]:
     Args:
         manifest_path: Path to `optimize-run.json`.
         model: World-model name, for the run's name.
+        external_id: Override the derived run name (an operator's `--name`), used
+            verbatim: appending `/optimize` to a name a person typed would silently
+            rename their run.
 
     Returns:
         The pipeline's events in emission order.
     """
     manifest: JsonObject = json.loads(manifest_path.read_text())
     stages = _as_rows(manifest["stages"], field="manifest.stages")
-    walker = _Walker(pipeline_external_id(model))
+    walker = _Walker(external_id or pipeline_external_id(model))
     if not stages:
         return walker.events
     first_ts = _as_str(stages[0]["completed_at"], field="stage.completed_at")
@@ -456,7 +589,7 @@ def optimize_events(manifest_path: Path, *, model: str) -> list[RunEvent]:
         )
 
     last_ts = _as_str(stages[-1]["completed_at"], field="stage.completed_at")
-    walker.emit(
+    walker.emit_from_top(
         RUN_LEVEL_BAND,
         RunEventType.HEARTBEAT,
         last_ts,
@@ -467,9 +600,9 @@ def optimize_events(manifest_path: Path, *, model: str) -> list[RunEvent]:
                 "stage": _as_str(stages[-1]["stage"], field="stage.stage"),
             },
             "spend": {
-                "candidate_usd": sum(record.get("spend_usd", 0.0) for record in stages),
-                "compressor_usd": sum(record.get("compressor_spend_usd", 0.0) for record in stages),
-                "wm_usd": sum(record.get("world_model_spend_usd", 0.0) for record in stages),
+                "candidate_usd": _stage_total(stages, "spend_usd"),
+                "compressor_usd": _stage_total(stages, "compressor_spend_usd"),
+                "wm_usd": _stage_total(stages, "world_model_spend_usd"),
             },
         },
     )
@@ -482,7 +615,7 @@ def optimize_events(manifest_path: Path, *, model: str) -> list[RunEvent]:
         None,
     )
     if report_ts is not None:
-        walker.emit(
+        walker.emit_from_top(
             RUN_LEVEL_BAND,
             RunEventType.RUN_STATUS,
             report_ts,

@@ -118,6 +118,7 @@ from wmo.optimize.sweep import preflight_pool as run_preflight
 from wmo.optimize.teacher import TeacherSearchVerdict, select_teacher
 from wmo.providers.pool import DEFAULT_POOL_PATH
 from wmo.runs.hooks import PipelineEmitter
+from wmo.runs.schema import RunStatus
 
 _console = Console()
 
@@ -508,18 +509,19 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     except BudgetExceeded as exc:
         # The cap is a clean stop, not a failure: every stage that completed is recorded and the
         # next run resumes at the one that did not start.
-        emitter.finished("stopped", error=str(exc))
+        emitter.finished(RunStatus.STOPPED, error=str(exc))
         _print_budget_stop(model_dir.name, exc)
         raise typer.Exit(1) from exc
     except typer.Exit as exc:
         # A stage refused (the coverage gate, a failed fit): the command's own exit path, which is
         # a failed optimization from the panel's point of view.
-        emitter.finished("failed" if exc.exit_code else "completed")
+        emitter.finished(RunStatus.FAILED if exc.exit_code else RunStatus.COMPLETED)
         raise
     except Exception as exc:
-        emitter.finished("failed", error=f"{type(exc).__name__}: {exc}")
+        emitter.finished(RunStatus.FAILED, error=f"{type(exc).__name__}: {exc}")
         raise
-    emitter.finished("completed")
+    emitter.finished(RunStatus.COMPLETED)
+    emitter.close()
     # No save here: `_run_stages` persists after every stage it runs, which is what keeps a run
     # that dies mid-flight resumable.
     _print_payoff(_console, model_dir.name, paths=paths, cost_quality=cost_quality)

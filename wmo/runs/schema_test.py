@@ -25,8 +25,6 @@ from wmo.runs.schema import (
     pipeline_external_id,
 )
 
-FIXTURES = Path.home() / "Desktop/Projects/wmh-plan/d-runs-fixtures"
-
 
 def test_bands_are_disjoint_and_independent() -> None:
     """Each writer's band is its own range, allocated without touching the others."""
@@ -35,7 +33,7 @@ def test_bands_are_disjoint_and_independent() -> None:
     assert bands.take(RUN_LEVEL_BAND) == 1
     assert bands.take(RUN_LEVEL_BAND) == 2
     # Chunk 0's band starts a full width up, and asking for it consumed nothing
-    # from band 0 — which is what lets a backfill walk chunks in any order and
+    # from band 0, which is what lets a backfill walk chunks in any order and
     # still derive the seqs the live hooks used.
     assert bands.take(cell_band(0)) == RUN_SEQ_BAND + 1
     assert bands.take(cell_band(1)) == 2 * RUN_SEQ_BAND + 1
@@ -93,15 +91,13 @@ def test_external_ids_follow_the_run_naming_convention() -> None:
     assert pipeline_external_id("tau-jt-toy") == "tau-jt-toy/optimize"
 
 
-def test_event_wire_shape_matches_the_shared_fixtures() -> None:
+def test_event_wire_shape_matches_the_shared_fixtures(d_runs_fixtures: Path) -> None:
     """The envelope is exactly the five keys the platform ingest reads.
 
     Pinned against the shared-truth fixtures rather than a hand-written literal:
     this file and the platform's ingest tests are the two halves of one seam.
     """
-    events = FIXTURES / "expected-events.jsonl"
-    if not events.exists():  # pragma: no cover - fixtures live outside the repo
-        pytest.skip(f"shared-truth fixtures not present at {events}")
+    events = d_runs_fixtures / "expected-events.jsonl"
     first = json.loads(events.read_text().splitlines()[0])
 
     parsed = RunEvent.model_validate(first)
@@ -119,11 +115,9 @@ def test_event_wire_shape_matches_the_shared_fixtures() -> None:
     assert parsed.ts == first["ts"]
 
 
-def test_fixture_seqs_respect_the_band_scheme() -> None:
+def test_fixture_seqs_respect_the_band_scheme(d_runs_fixtures: Path) -> None:
     """Every fixture event sits inside the band its content dictates."""
-    events = FIXTURES / "expected-events.jsonl"
-    if not events.exists():  # pragma: no cover - fixtures live outside the repo
-        pytest.skip(f"shared-truth fixtures not present at {events}")
+    events = d_runs_fixtures / "expected-events.jsonl"
     rows = [json.loads(line) for line in events.read_text().splitlines() if line.strip()]
 
     for row in rows:

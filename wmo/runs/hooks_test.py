@@ -13,7 +13,7 @@ from wmo.optimize.outcomes import ScenarioOutcome
 from wmo.optimize.pipeline import Stage, StageRecord
 from wmo.platform.client import PlatformUnreachable
 from wmo.runs.backfill import cell_payload
-from wmo.runs.client import RunsSink
+from wmo.runs.client import PUSH_ATTEMPTS, PushRejected, RunsSink
 from wmo.runs.hooks import (
     ACK_ACKED,
     ACK_DONE,
@@ -30,6 +30,8 @@ from wmo.runs.schema import (
     RUN_LEVEL_BAND,
     RUN_META_SEQ,
     RUN_SEQ_BAND,
+    RunEventType,
+    RunStatus,
     cell_band,
     ledger_walk_seq,
 )
@@ -78,16 +80,19 @@ class FakeTransport:
     ) -> None:
         """Initialize the double.
 
-        `held_last_seq` is what the zero-event resume probe answers: a run the platform already
-        holds events for.
+        `held_last_seq` seeds a run the platform already holds events for (seqs 1..N), which is
+        what the resume probe reports and what a re-numbered event then collides with.
         """
         self.pushes: list[list[Pushed]] = []
         self.acks: list[tuple[str, str, str | None]] = []
         self.probes = 0
-        self._failures = failures or []
+        self.failures = list(failures or [])
         self._accepted = accepted
         self._control = control or []
-        self._held_last_seq = held_last_seq
+        # The platform keys events on (run, seq) and DISCARDS a seq it already holds. Modelling that
+        # here is what lets a test fail on a collision at all: a double that accepts everything
+        # cannot distinguish the band design working from the band design being broken.
+        self.held: set[int] = set(range(1, held_last_seq + 1)) if held_last_seq else set()
 
     def push_run_events(
         self,
@@ -98,19 +103,32 @@ class FakeTransport:
         events: Sequence[JsonObject],
     ) -> JsonObject:
         """Record a push, raising a queued failure first, and hand back any control commands."""
-        if self._failures:
-            raise self._failures.pop(0)
+        if not events:
+            # Counted before any injected failure, so a probe that FAILS is still an attempt: the
+            # question a test asks is how many times the emitter asked, not how many times it was
+            # answered.
+            self.probes += 1
+        if self.failures:
+            raise self.failures.pop(0)
         control, self._control = self._control, []
         if not events:
             # The resume probe: a zero-event push, answered with the run's mark and its pending
             # commands (the real ingest 422s an unknown run, which the sink turns into 0).
-            self.probes += 1
-            return {"accepted": 0, "last_seq": self._held_last_seq, "control": control}
+            mark = max(self.held) if self.held else 0
+            return {"accepted": 0, "last_seq": mark, "control": control}
+        types = [str(event["type"]) for event in events]
+        if not self.held and RunEventType.RUN_META not in types:
+            # The real ingest refuses a new run's first batch unless it declares the run, and that
+            # refusal is PERMANENT: every later batch fails the same way until run.meta arrives.
+            msg = "a new run's first batch must carry run.meta"
+            raise PushRejected(msg, status_code=422)
         self.pushes.append([Pushed.model_validate(event) for event in events])
         seqs = [int(str(event["seq"])) for event in events]
+        fresh = [seq for seq in seqs if seq not in self.held]
+        self.held.update(seqs)
         return {
-            "accepted": len(events) if self._accepted is None else self._accepted,
-            "last_seq": max(seqs) if seqs else 0,
+            "accepted": len(fresh) if self._accepted is None else self._accepted,
+            "last_seq": max(self.held),
             "control": control,
         }
 
@@ -138,6 +156,13 @@ class FakeTransport:
         """Every pushed event of one type."""
         return [event for event in self.events if event.type == event_type]
 
+    def close(self) -> None:
+        """No-op: this double owns no connection pool.
+
+        Required by `RunsTransport`, which declares `close()` so a sink's release is
+        a checked contract rather than a runtime `getattr` probe.
+        """
+
 
 @pytest.fixture(autouse=True)
 def _no_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,6 +189,17 @@ def _grid(
         snapshot=lambda: GridSnapshot(done=4, scored=3, total=10, candidate_usd=1.5, wm_usd=3.0),
         flush_cells=flush_cells,
     )
+
+
+def _declared(transport: FakeTransport, **kwargs: int) -> GridEmitter:
+    """A grid emitter whose run is already declared, which is every real run's first act.
+
+    The platform refuses a new run's first batch unless it carries `run.meta`, so a test about
+    ledger lines or cells has to start where a real arm starts.
+    """
+    emitter = _grid(transport, **kwargs)
+    emitter.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
+    return emitter
 
 
 def _ts(minute: int) -> str:
@@ -206,7 +242,7 @@ def test_arm_start_declares_the_run_at_its_derived_position() -> None:
 def test_ledger_lines_are_numbered_from_their_position_in_the_file() -> None:
     """The Nth line of the arm's ledger holds `1 + N`, the same seq a backfill derives for it."""
     transport = FakeTransport()
-    emitter = _grid(transport)
+    emitter = _declared(transport)
 
     for position in (1, 2, 3):
         emitter.on_ledger_line(
@@ -230,10 +266,10 @@ def test_heartbeats_and_status_descend_from_the_bands_ceiling() -> None:
     one band carry both without either knowing the other's count.
     """
     transport = FakeTransport()
-    emitter = _grid(transport, band=cell_band(0))
+    emitter = _declared(transport, band=cell_band(0))
 
     emitter.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
-    emitter.on_status("completed")
+    emitter.on_status(RunStatus.COMPLETED)
 
     ceiling = 2 * RUN_SEQ_BAND
     beats = transport.of_type("heartbeat")
@@ -247,7 +283,7 @@ def test_heartbeats_and_status_descend_from_the_bands_ceiling() -> None:
 def test_cells_go_to_their_chunks_band_with_the_backfill_payload() -> None:
     """A live cell is numbered in its chunk's band and carries the same payload a replay would."""
     transport = FakeTransport()
-    emitter = _grid(transport)
+    emitter = _declared(transport)
     outcome = _outcome()
 
     emitter.on_outcome(outcome, chunk=7)
@@ -266,7 +302,7 @@ def test_cells_go_to_their_chunks_band_with_the_backfill_payload() -> None:
 def test_cells_are_buffered_until_the_batch_is_full() -> None:
     """One request per cell would be one request per episode, so cells wait for a batch."""
     transport = FakeTransport()
-    emitter = _grid(transport, flush_cells=3)
+    emitter = _declared(transport, flush_cells=3)
 
     for index in range(2):
         emitter.on_outcome(_outcome(episode=index), chunk=0)
@@ -281,7 +317,7 @@ def test_cells_are_buffered_until_the_batch_is_full() -> None:
 def test_ledger_line_travels_verbatim_with_a_whole_run_heartbeat() -> None:
     """The ledger line is log-only and unedited; the heartbeat beside it is whole-run."""
     transport = FakeTransport()
-    emitter = _grid(transport)
+    emitter = _declared(transport)
     line: JsonObject = {"event": "chunk", "arm": ARM, "chunk": 0, "cells": 4, "candidate_usd": 1.5}
 
     emitter.on_ledger_line(line, ts="2026-07-27T10:00:00+00:00", position=1)
@@ -298,10 +334,10 @@ def test_ledger_line_travels_verbatim_with_a_whole_run_heartbeat() -> None:
 def test_buffered_cells_are_sent_before_a_terminal_status() -> None:
     """A stopped run's last measured cells are not lost to the stop."""
     transport = FakeTransport()
-    emitter = _grid(transport, flush_cells=100)
+    emitter = _declared(transport, flush_cells=100)
     emitter.on_outcome(_outcome(), chunk=0)
 
-    emitter.on_status("stopped", error="cap reached")
+    emitter.on_status(RunStatus.STOPPED, error="cap reached")
 
     types = [event.type for event in transport.events]
     assert types.index("cell.batch") < types.index("run.status")
@@ -323,7 +359,7 @@ def test_stop_command_is_honored_and_acked_then_completed() -> None:
         "stopping at the next chunk boundary; finished chunks stay on disk",
     )
 
-    emitter.on_status("stopped")
+    emitter.on_status(RunStatus.STOPPED)
     assert transport.acks[-1][:2] == ("c1", ACK_DONE)
 
 
@@ -343,7 +379,7 @@ def test_commands_the_runner_does_not_own_are_rejected_with_a_reason(command: st
 
 def test_emission_survives_a_platform_that_only_fails(caplog: pytest.LogCaptureFixture) -> None:
     """Every hook returns normally when every push fails, and says so exactly once."""
-    transport = FakeTransport(failures=[PlatformUnreachable("down")] * 20)
+    transport = FakeTransport(failures=[PlatformUnreachable("down")] * 200)
     emitter = _grid(transport)
 
     with caplog.at_level(logging.WARNING, logger="wmo.runs.hooks"):
@@ -351,7 +387,7 @@ def test_emission_survives_a_platform_that_only_fails(caplog: pytest.LogCaptureF
         emitter.on_outcome(_outcome(), chunk=0)
         emitter.send_cells()
         emitter.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(0), position=1)
-        emitter.on_status("completed")
+        emitter.on_status(RunStatus.COMPLETED)
 
     assert transport.pushes == []
     warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
@@ -361,7 +397,7 @@ def test_emission_survives_a_platform_that_only_fails(caplog: pytest.LogCaptureF
 def test_a_full_queue_drops_the_oldest_events_and_warns(caplog: pytest.LogCaptureFixture) -> None:
     """An outage costs telemetry, never memory: a failed push is retried, then the oldest go."""
     transport = FakeTransport(failures=[PlatformUnreachable("down")] * 200)
-    emitter = GridEmitter(_sink(transport), external_id=RUN, band=1, queue_limit=5)
+    emitter = GridEmitter(_sink(transport), external_id=RUN, band=1, arm=ARM, queue_limit=5)
 
     with caplog.at_level(logging.WARNING, logger="wmo.runs.hooks"):
         for index in range(12):
@@ -375,7 +411,7 @@ def test_a_full_queue_drops_the_oldest_events_and_warns(caplog: pytest.LogCaptur
 def test_accepted_shortfall_trips_the_collision_warning(caplog: pytest.LogCaptureFixture) -> None:
     """A freshly ALLOCATED seq the platform did not take means two writers share one band."""
     transport = FakeTransport(accepted=0)
-    emitter = _grid(transport)
+    emitter = _declared(transport)
 
     with caplog.at_level(logging.INFO, logger="wmo.runs.hooks"):
         # A cell is allocated, not derived, so a shortfall here is a real collision.
@@ -453,7 +489,7 @@ def test_emission_is_off_without_a_credential() -> None:
     emitter.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
     emitter.on_outcome(_outcome(), chunk=0)
     emitter.on_ledger_line({"event": "chunk"}, ts="2026-07-27T10:00:00+00:00", position=1)
-    emitter.on_status("completed")
+    emitter.on_status(RunStatus.COMPLETED)
     assert emitter.stop_requested is False
 
 
@@ -494,7 +530,7 @@ def test_pipeline_reports_stages_in_the_run_level_band() -> None:
         lifetime_spend_usd=9.0,
     )
     emitter.stage_skipped(Stage.FIT, reason="policy.json is current")
-    emitter.finished("completed")
+    emitter.finished(RunStatus.COMPLETED)
 
     assert all(event.seq <= RUN_SEQ_BAND for event in transport.events), (
         "a single-process run stays in band 0"
@@ -518,6 +554,7 @@ def test_pipeline_heartbeat_carries_lifetime_spend() -> None:
     """The panel's spend for a staged run is the manifest's lifetime total, both sides."""
     transport = FakeTransport()
     emitter = PipelineEmitter.create(world_model="tau-bench", factory=lambda: _sink(transport))
+    emitter.start(world_model="tau-bench", config={})
 
     emitter.heartbeat(stage=Stage.TUNE, lifetime_spend_usd=12.5)
 
@@ -536,3 +573,152 @@ def test_the_emitter_names_its_arm_so_a_caller_can_scope_ledger_lines() -> None:
 
     assert emitter.arm == "llmlingua2-endpoint"
     assert emitter.external_id == "jt/grid-c2/llmlingua2-endpoint"
+
+
+def test_a_permanent_refusal_drops_its_batch_instead_of_retrying_forever(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refused payload cannot be fixed by sending it again, so it must not stay in the queue.
+
+    Requeueing it would head-of-line block this run's telemetry for the rest of a twelve-hour grid
+    on one bad event, which is worse than losing that event: everything AFTER it would be lost too.
+    """
+    transport = FakeTransport()
+    emitter = _declared(transport)
+    # Armed after the run is declared: this is a mid-run refusal, not a refused declaration.
+    transport.failures.append(PushRejected("detail is 300000 bytes", status_code=422))
+
+    with caplog.at_level(logging.WARNING, logger="wmo.runs.hooks"):
+        emitter.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
+        # The next flush must carry the FOLLOWING events, not the refused ones again.
+        emitter.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(2), position=2)
+
+    refused = [r for r in caplog.records if "DROPPED" in r.getMessage()]
+    assert len(refused) == 1
+    assert "422" in refused[0].getMessage()
+    assert "300000 bytes" in refused[0].getMessage(), "the field the platform named must survive"
+    # The second batch went through, so one bad payload did not block the run's telemetry.
+    assert [event.payload["event"] for event in transport.of_type("ledger.line")] == ["merge"]
+
+
+def test_a_transient_failure_keeps_its_events_for_the_next_flush() -> None:
+    """When the platform is unreachable the batch is kept and retried, oldest first.
+
+    `PUSH_ATTEMPTS` failures, not one: the sink absorbs a blip by retrying internally, so what
+    reaches these hooks is only the case where it has already given up.
+    """
+    transport = FakeTransport()
+    emitter = _declared(transport)
+    declared = len(transport.pushes)
+    transport.failures.extend([PlatformUnreachable("down")] * PUSH_ATTEMPTS)
+
+    emitter.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
+    assert len(transport.pushes) == declared, "the failed push landed nothing"
+
+    emitter.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(2), position=2)
+
+    # Both lines land, oldest first, on the flush that succeeds.
+    assert [event.payload["event"] for event in transport.of_type("ledger.line")] == [
+        "chunk",
+        "merge",
+    ]
+
+
+def test_a_resumed_arm_does_not_re_use_its_descending_seqs() -> None:
+    """The documented resume flow: stop an arm from the panel, re-run it, and it continues.
+
+    Heartbeats and the terminal status descend from the run-level band's ceiling, and nothing used
+    to rebase THAT walk on resume, so a resumed arm re-issued the same high seqs and the platform
+    discarded every one of them. The visible cost was the worst possible: a finished run stuck
+    reading `running` because its terminal status was dropped as a replay.
+    """
+    transport = FakeTransport()
+    first = _grid(transport, band=cell_band(0))
+    first.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
+    first.on_status(RunStatus.STOPPED)
+
+    resumed = _grid(transport, band=cell_band(0))
+    resumed.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
+    resumed.on_status(RunStatus.COMPLETED)
+
+    statuses = transport.of_type("run.status")
+    assert len(statuses) == 2
+    assert statuses[0].seq != statuses[1].seq, "the resumed status collided with the first one"
+    assert statuses[1].payload["status"] == RunStatus.COMPLETED
+
+
+def test_a_resumed_run_does_not_cry_collision(caplog: pytest.LogCaptureFixture) -> None:
+    """A resume converging on itself must not log the concurrency alarm.
+
+    A false alarm on every ordinary resume is how the one message that means real loss gets ignored.
+    """
+    transport = FakeTransport()
+    first = _grid(transport, band=cell_band(0))
+    first.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
+    first.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
+
+    resumed = _grid(transport, band=cell_band(0))
+    with caplog.at_level(logging.INFO, logger="wmo.runs.hooks"):
+        resumed.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
+        resumed.on_ledger_line({"event": "chunk", "arm": ARM}, ts=_ts(1), position=1)
+
+    assert not [r for r in caplog.records if "share one band" in r.getMessage()]
+
+
+def test_run_meta_is_never_evicted_so_a_run_can_always_be_declared() -> None:
+    """Losing `run.meta` to the queue bound would kill a run's telemetry permanently.
+
+    It is the OLDEST event, so drop-oldest evicts it first; the platform then refuses every later
+    batch ("a new run's first batch must carry run.meta"), and that refusal is permanent, so the run
+    would report nothing for the rest of a twelve-hour grid.
+    """
+    transport = FakeTransport(failures=[PlatformUnreachable("down")] * (PUSH_ATTEMPTS * 3))
+    emitter = GridEmitter(_sink(transport), external_id=RUN, band=1, arm=ARM, queue_limit=3)
+
+    # Declare the run while the platform is unreachable, then overflow the queue many times over.
+    emitter.on_arm_start(cohort=COHORT, world_model="tau-bench", created=CREATED)
+    for position in range(1, 12):
+        emitter.on_ledger_line({"event": "retry", "arm": ARM}, ts=_ts(position), position=position)
+
+    # The platform comes back: the run must still be declarable, and it is only declarable if
+    # `run.meta` survived the eviction.
+    emitter.on_ledger_line({"event": "merge", "arm": ARM}, ts=_ts(20), position=20)
+
+    assert transport.of_type("run.meta"), "run.meta was evicted, so the run can never be declared"
+    assert transport.of_type("ledger.line"), "later events landed once the run was declared"
+
+
+def test_a_fresh_pipeline_records_that_it_started() -> None:
+    """The declaration and the running transition are two facts and need two seqs."""
+    transport = FakeTransport()
+    emitter = PipelineEmitter.create(world_model="tau-bench", factory=lambda: _sink(transport))
+
+    emitter.start(world_model="tau-bench", config={})
+
+    meta = transport.of_type("run.meta")[0]
+    running = transport.of_type("run.status")[0]
+    assert meta.seq == RUN_META_SEQ
+    assert running.seq != meta.seq
+    assert running.payload["status"] == RunStatus.RUNNING
+
+
+def test_an_unreachable_probe_is_not_read_as_a_fresh_run() -> None:
+    """ "Cannot reach the platform" and "the platform has never heard of this run" are different.
+
+    Treating the first as the second numbers a resumed run from the floor, and every event of it is
+    then discarded as a replay. The probe is retried instead.
+    """
+    transport = FakeTransport(held_last_seq=7)
+    # `PUSH_ATTEMPTS` failures, so the sink's own retry gives up and the probe really fails.
+    transport.failures.extend([PlatformUnreachable("down")] * PUSH_ATTEMPTS)
+    emitter = PipelineEmitter.create(world_model="tau-bench", factory=lambda: _sink(transport))
+
+    emitter.start(world_model="tau-bench", config={})
+    emitter.heartbeat(stage=Stage.SWEEP, lifetime_spend_usd=1.0)
+
+    # The failed probe did not stand as "fresh run": it was retried, the mark was learned, and
+    # numbering continued past it. Events numbered DURING the outage may still be discarded (they
+    # were numbered before the mark was known); what must not happen is numbering from the floor
+    # forever after.
+    assert transport.probes >= 2
+    assert transport.of_type("heartbeat")[0].seq > 7

@@ -1,8 +1,9 @@
 """Run telemetry: the events wmo pushes to the platform's runs surface (D-RUNS v1).
 
 `schema` holds the wire contract and the seq-band allocator every writer shares,
-`client` the batched emitter that pushes it, and `backfill` the mapping from
-artifacts already on disk to the same events live emission produces.
+`client` the transport that pushes it, `backfill` the mapping from artifacts already
+on disk to the same events live emission produces, and `reader` the org-scoped views
+behind `wmo runs`.
 """
 
 from wmo.runs.backfill import (
@@ -17,11 +18,9 @@ from wmo.runs.client import (
     PushAck,
     PushRejected,
     PushUnavailable,
-    RunsEmitter,
     RunsSink,
     RunsTransport,
     default_emitter_id,
-    open_emitter,
     runs_sink,
 )
 from wmo.runs.schema import (
@@ -65,7 +64,6 @@ __all__ = [
     "PushRejected",
     "PushUnavailable",
     "BackfillRefused",
-    "RunsEmitter",
     "RunsSink",
     "RunsTransport",
     "SeqBandOverrun",
@@ -79,7 +77,6 @@ __all__ = [
     "grid_arm_external_id",
     "is_terminal_status",
     "ledger_walk_seq",
-    "open_emitter",
     "optimize_events",
     "pipeline_external_id",
     "runs_sink",

@@ -21,11 +21,13 @@ hang on a finished run.
 from __future__ import annotations
 
 import logging
+import random
 import time
+import uuid
 from collections.abc import Iterator
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.core.types import JsonObject
 from wmo.platform.client import PlatformClient, PlatformError, PlatformUnreachable
@@ -48,9 +50,42 @@ RECONNECT_DELAY_S = 2.0
 """Pause before a tail reconnects. Matches the server's safe-frontier lag, so a reconnect lands
 where the next frame is about to be servable rather than spinning."""
 
+RECONNECT_JITTER = 0.25
+"""Fraction of the delay randomized. Several tails of one run (a person and a script, or a fleet of
+agents) otherwise reconnect in lockstep after an outage and arrive as a thundering herd."""
+
 MAX_RECONNECTS = 60
 """Reconnect attempts before a tail gives up and says so. At `RECONNECT_DELAY_S` that is two
 minutes of a platform being unreachable, which is a real outage rather than a blip."""
+
+
+def _resolve_org(client: PlatformClient, wanted: str) -> str:
+    """Turn an organization id or slug into the id the routes take.
+
+    A uuid is passed through untouched and costs no request. Anything else is looked up against
+    the credential's own organizations by slug, then by name, so `WMO_PLATFORM_ORG=acme` and
+    `--org acme` work as well as the uuid does.
+
+    Raises:
+        PlatformError: The name matches none of the organizations this credential can see, listing
+            what it can.
+    """
+    try:
+        uuid.UUID(wanted)
+    except ValueError:
+        pass
+    else:
+        return wanted
+    orgs = client.whoami().orgs
+    for org in orgs:
+        if wanted in (org.slug, org.name):
+            return org.id
+    visible = ", ".join(f"{org.slug} ({org.name})" for org in orgs) or "none"
+    msg = (
+        f"no organization named {wanted!r} is visible to this credential; it can see: {visible}. "
+        "Pass --org with one of those slugs, or a uuid."
+    )
+    raise PlatformError(msg)
 
 
 class RunSummary(BaseModel):
@@ -215,41 +250,67 @@ class RunsReader:
     """The org-scoped read surface for runs, over one authenticated platform client."""
 
     def __init__(self, client: PlatformClient, org_id: str) -> None:
+        """Wrap an authenticated platform client, scoping every read to one organization."""
         self._client = client
         self._org_id = org_id
 
     @classmethod
-    def open(cls, *, transport: httpx.BaseTransport | None = None) -> RunsReader | None:
+    def open(
+        cls, *, org: str | None = None, transport: httpx.BaseTransport | None = None
+    ) -> RunsReader | None:
         """Build a reader from the saved credential, or None when this machine is not connected.
 
         None rather than an exception: "not logged in" is a state a CLI reports in one line with a
         next step, not a traceback.
+
+        Args:
+            org: An organization id OR slug, overriding the saved default (and `WMO_PLATFORM_ORG`).
+                A slug is resolved against the credential's own organizations, because a slug is
+                what a person reads off the platform's URL bar and a uuid is not something anyone
+                has to hand.
+            transport: Injected HTTP transport, for tests.
         """
         credentials = load_credentials()
         if not credentials.is_complete():
             return None
         if credentials.api_url is None or credentials.token is None:
             return None
-        if not credentials.default_org:
+        wanted = org or credentials.default_org
+        if not wanted:
             return None
-        return cls(
-            PlatformClient(credentials.api_url, credentials.token, transport=transport),
-            credentials.default_org,
-        )
+        client = PlatformClient(credentials.api_url, credentials.token, transport=transport)
+        try:
+            resolved = _resolve_org(client, wanted)
+        except PlatformError:
+            client.close()
+            raise
+        return cls(client, resolved)
 
     @property
     def org_id(self) -> str:
         """The organization every read is scoped to."""
         return self._org_id
 
+    @property
+    def client(self) -> PlatformClient:
+        """The authenticated client behind these reads.
+
+        Exposed so a command that both READS and WRITES a run (`wmo runs backfill`, which checks the
+        run then pushes to it) can do both over one connection pool and close it once, instead of
+        opening a second client for the write half.
+        """
+        return self._client
+
     def close(self) -> None:
         """Release the HTTP client."""
         self._client.close()
 
     def __enter__(self) -> RunsReader:
+        """Return the reader for use in a `with` block."""
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Release the HTTP client on the way out, however the block ended."""
         self.close()
 
     def list_runs(
@@ -374,22 +435,72 @@ class RunsReader:
                     yield event
             except (PlatformUnreachable, httpx.HTTPError) as error:
                 attempts += 1
-                if attempts > MAX_RECONNECTS:
-                    msg = (
-                        f"the run stream for {external_id} could not be re-established after "
-                        f"{MAX_RECONNECTS} attempts: {error}"
-                    )
-                    raise PlatformUnreachable(msg) from error
+                self._give_up_after(external_id, attempts, error)
                 log.debug("run stream for %s dropped (%s); reconnecting", external_id, error)
-                time.sleep(RECONNECT_DELAY_S)
+                self._pause()
+                continue
+            except PlatformError as error:
+                # A 5xx is the platform having a bad minute, not a verdict about this run, so it is
+                # retried like a dropped connection. Every other status (401, 403, 404) is an answer
+                # and is raised: reconnecting cannot fix a credential or a run that is not there.
+                if error.status_code is None or error.status_code < 500:
+                    raise
+                attempts += 1
+                self._give_up_after(external_id, attempts, error)
+                log.debug(
+                    "run stream for %s failed with %s; retrying", external_id, error.status_code
+                )
+                self._pause()
                 continue
             # A clean close means one of two things: the run is terminal and drained (done), or a
             # live run's connection ended between frames (resume). Asking the run itself is the
             # only way to tell them apart, and it costs one request per close.
             if self._terminal(external_id):
+                # One more read AFTER the run went terminal: a live stream trails the safe frontier
+                # by a couple of seconds, so the events that made it terminal (its last ledger line,
+                # final heartbeat and the terminal status itself) are usually still behind the
+                # frontier when the stream closes. Without this pass a tail routinely ends just
+                # before the three events a watcher was waiting for.
+                for event in self._drain(external_id, cursor):
+                    cursor = event.pos
+                    yield event
                 return
             if served == 0:
-                time.sleep(RECONNECT_DELAY_S)
+                # A clean close that served nothing is not progress, so it counts against the
+                # reconnect budget: otherwise a server closing immediately spins here forever and
+                # presents to the user as a hang.
+                attempts += 1
+                self._give_up_after(external_id, attempts, None)
+                self._pause()
+
+    def _give_up_after(self, external_id: str, attempts: int, error: Exception | None) -> None:
+        """Stop retrying once the budget is spent, saying what was tried.
+
+        Raises:
+            PlatformUnreachable: The stream could not be kept open within `MAX_RECONNECTS`.
+        """
+        if attempts <= MAX_RECONNECTS:
+            return
+        detail = f": {error}" if error is not None else " (the stream closed without any events)"
+        msg = (
+            f"the run stream for {external_id} could not be re-established after "
+            f"{MAX_RECONNECTS} attempts{detail}"
+        )
+        raise PlatformUnreachable(msg) from error
+
+    def _pause(self) -> None:
+        """Wait out one safe-frontier lag, jittered so parallel tails do not reconnect in step."""
+        time.sleep(RECONNECT_DELAY_S * (1.0 + random.uniform(0.0, RECONNECT_JITTER)))
+
+    def _drain(self, external_id: str, after_pos: int) -> Iterator[EventRow]:
+        """Page out whatever is left of a terminal run's log, which is served in full."""
+        cursor = after_pos
+        while True:
+            page = self.list_events(external_id, after_pos=cursor)
+            yield from page.events
+            if page.last_pos <= cursor or not page.events:
+                return
+            cursor = page.last_pos
 
     def _stream_once(self, external_id: str, after_pos: int) -> Iterator[EventRow]:
         """One SSE connection's worth of frames, typed."""
@@ -397,7 +508,16 @@ class RunsReader:
             self._org_id, external_id, after_pos=after_pos, timeout_s=STREAM_TIMEOUT_S
         ) as frames:
             for frame in frames:
-                yield EventRow.model_validate(frame)
+                try:
+                    yield EventRow.model_validate(frame)
+                except ValidationError:
+                    # One malformed frame is not worth ending a twelve-hour follow over, and the
+                    # cursor is unaffected: the next frame carries its own position.
+                    log.warning(
+                        "run stream for %s sent a frame this client does not understand; "
+                        "skipping it",
+                        external_id,
+                    )
 
     def event_count(self, external_id: str) -> int:
         """Events the platform already holds for a run; 0 when it does not hold the run at all.

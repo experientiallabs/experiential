@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -15,8 +15,7 @@ from wmo.cli import runs_app as runs_module
 from wmo.cli.app import app
 from wmo.core.types import JsonObject
 from wmo.platform.client import PlatformClient
-from wmo.runs.client import RunsSink
-from wmo.runs.reader import EventPage, EventRow, RunsReader
+from wmo.runs.reader import EventPage, EventRow, RunDetail, RunsReader
 from wmo.runs.schema import RUN_SEQ_BAND
 
 runner = CliRunner()
@@ -388,77 +387,35 @@ def test_backfill_refuses_a_path_that_is_neither(tmp_path: Path) -> None:
 def test_backfill_pushes_and_reports_what_was_already_recorded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A push says how many events were new, so a replay reads as the no-op it is."""
+    """A push says how many events were new, so a replay reads as the no-op it is.
+
+    Also covers the single-client path: the guard's read and the push travel over ONE connection
+    pool, which is why one handler serves both here.
+    """
     grid = _write_grid(tmp_path)
-    pushed: list[list[JsonObject]] = []
+    pushed: list[JsonObject] = []
 
-    class Transport:
-        def push_run_events(
-            self,
-            org_id: str,
-            external_id: str,
-            *,
-            emitter_id: str,
-            events: Sequence[JsonObject],
-        ) -> JsonObject:
-            pushed.append([dict(event) for event in events])
-            # Two of the seven were already there: the replay case.
-            return {"accepted": len(events) - 2, "last_seq": 100002, "control": []}
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            body = json.loads(request.read())
+            events = body["events"]
+            pushed.extend(dict(event) for event in events)
+            # Two of the seven were already held: the replay case.
+            return httpx.Response(
+                200, json={"accepted": len(events) - 2, "last_seq": 100002, "control": []}
+            )
+        # The backfill guard's probe: a run the platform has never heard of.
+        return httpx.Response(404, json={"error": "Run not found"})
 
-        def ack_run_control(
-            self,
-            org_id: str,
-            external_id: str,
-            control_id: str,
-            *,
-            status: str,
-            note: str | None = None,
-        ) -> JsonObject:
-            return {}
-
-    monkeypatch.setattr(
-        runs_module, "runs_sink", lambda: RunsSink(Transport(), org_id=ORG, emitter_id="test")
-    )
-    monkeypatch.setattr(runs_module.RunsReader, "open", classmethod(lambda cls, **_: None))
+    _connect(monkeypatch, handler)
 
     result = _invoke("backfill", str(grid), "--arm", "identity")
 
     assert result.exit_code == 0, result.output
-    assert len(pushed) == 1
+    assert len(pushed) == 7
     assert "already recorded" in result.output
     # No event carries the run in its body: on the wire the run is named in the URL.
-    assert all("external_id" not in event for event in pushed[0])
-
-
-class _RefusingTransport:
-    """A transport that must never be reached: proves a refusal happens before any push."""
-
-    def __init__(self) -> None:
-        self.pushed = 0
-
-    def push_run_events(
-        self,
-        org_id: str,
-        external_id: str,
-        *,
-        emitter_id: str,
-        events: Sequence[JsonObject],
-    ) -> JsonObject:
-        """Count the call that should not happen."""
-        self.pushed += 1
-        raise AssertionError("a refused backfill must not push")
-
-    def ack_run_control(
-        self,
-        org_id: str,
-        external_id: str,
-        control_id: str,
-        *,
-        status: str,
-        note: str | None = None,
-    ) -> JsonObject:
-        """Never called."""
-        raise AssertionError("a refused backfill must not ack")
+    assert all("external_id" not in event for event in pushed)
 
 
 def test_backfill_refuses_a_run_that_already_reported_itself(
@@ -466,21 +423,21 @@ def test_backfill_refuses_a_run_that_already_reported_itself(
 ) -> None:
     """A live-emitted run must not be merged with a replay, or its spend curve doubles."""
     grid = _write_grid(tmp_path)
+    posts: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request)
+            raise AssertionError("a refused backfill must not push")
         return httpx.Response(200, json={"run": _RUN_ROW, "event_count": 42})
 
-    refusing = _RefusingTransport()
-    monkeypatch.setattr(
-        runs_module, "runs_sink", lambda: RunsSink(refusing, org_id=ORG, emitter_id="test")
-    )
     _connect(monkeypatch, handler)
 
     result = _invoke("backfill", str(grid), "--arm", "identity")
 
     assert result.exit_code != 0
     assert "--force" in result.output
-    assert refusing.pushed == 0, "the refusal happens before anything is sent"
+    assert posts == [], "the refusal happens before anything is sent"
 
 
 # -- reads ---------------------------------------------------------------------------------------
@@ -648,10 +605,21 @@ def test_reads_without_a_login_say_what_to_run(monkeypatch: pytest.MonkeyPatch) 
 class _FakeReader:
     """A reader whose backlog and stream are fixed, for driving the tail without a platform."""
 
-    def __init__(self, backlog: list[JsonObject], streamed: list[JsonObject]) -> None:
+    def __init__(
+        self,
+        backlog: list[JsonObject],
+        streamed: list[JsonObject],
+        *,
+        filtered: list[JsonObject] | None = None,
+        statuses: list[str] | None = None,
+    ) -> None:
         self._backlog = backlog
         self._streamed = streamed
+        self._filtered = filtered or []
+        self._statuses = statuses or ["completed"]
         self.resumed_from: int | None = None
+        self.filters: list[str | None] = []
+        self.cursors: list[int] = []
 
     def __enter__(self) -> _FakeReader:
         return self
@@ -668,8 +636,16 @@ class _FakeReader:
         tail: bool = False,
         event_type: str | None = None,
     ) -> EventPage:
-        rows = tuple(EventRow.model_validate(row) for row in self._backlog)
+        self.filters.append(event_type)
+        self.cursors.append(after_pos)
+        source = self._filtered if event_type is not None and after_pos else self._backlog
+        rows = tuple(EventRow.model_validate(row) for row in source)
         return EventPage(events=rows, last_pos=rows[-1].pos if rows else after_pos)
+
+    def get_run(self, external_id: str) -> RunDetail:
+        """Answer `running` until the statuses run out, so a poll loop takes a lap then ends."""
+        status = self._statuses.pop(0) if len(self._statuses) > 1 else self._statuses[0]
+        return RunDetail.model_validate({"run": {**_RUN_ROW, "status": status}, "event_count": 3})
 
     def tail(self, external_id: str, *, after_pos: int = 0) -> Iterator[EventRow]:
         self.resumed_from = after_pos
@@ -770,3 +746,37 @@ def test_backfill_without_name_still_derives_from_the_path(tmp_path: Path) -> No
     assert result.exit_code == 0, result.output
     events = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert {event["external_id"] for event in events} == {"jt/grid-t1/identity"}
+
+
+def test_tail_of_one_event_type_polls_the_filtered_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--type` pages the server's filtered read instead of draining the whole stream.
+
+    The server filters in the database, so a ledger-line tail reads the handful of events it wants;
+    filtering an SSE stream client-side would pull every cell batch of a grid over the wire to throw
+    it away. The poll also has to END, which it does through `is_terminal_status`.
+    """
+    ledger: JsonObject = {
+        "pos": 8,
+        "seq": 2,
+        "type": "ledger.line",
+        "payload": {"event": "chunk", "chunk": 0, "cells": 2, "scored": 1},
+        "ts": LEDGER_TS,
+    }
+    later: JsonObject = {**ledger, "pos": 9, "seq": 3}
+    reader = _FakeReader(
+        backlog=[ledger], streamed=[], filtered=[later], statuses=["running", "completed"]
+    )
+    monkeypatch.setattr(runs_module, "_sleep_between_polls", lambda: None)
+    monkeypatch.setattr(runs_module.RunsReader, "open", classmethod(lambda cls, **_: reader))
+
+    result = _invoke("tail", RUN, "--type", "ledger.line")
+
+    assert result.exit_code == 0, result.output
+    # Never opened the stream, and every read carried the filter.
+    assert reader.resumed_from is None
+    assert set(reader.filters) == {"ledger.line"}
+    # Paged forward by pos rather than re-reading the same window.
+    assert reader.cursors == [0, 8, 9]
+    assert "chunk=0" in result.output

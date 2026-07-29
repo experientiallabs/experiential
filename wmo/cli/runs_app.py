@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
@@ -33,9 +34,25 @@ from wmo.core.types import JsonObject
 from wmo.platform.client import PlatformError
 from wmo.platform.credentials import credentials_path
 from wmo.runs.backfill import BackfillRefused, ensure_backfillable, grid_arm_events, optimize_events
-from wmo.runs.client import PushRejected, PushUnavailable, runs_sink
+from wmo.runs.client import (
+    PushRejected,
+    PushUnavailable,
+    RunsSink,
+    default_emitter_id,
+)
 from wmo.runs.reader import CellStats, EventRow, RunDetail, RunsReader, RunSummary
-from wmo.runs.schema import RunEvent, grid_relpath, pipeline_external_id
+from wmo.runs.schema import (
+    LEDGER_LINE,
+    LOG_LINE,
+    RunEvent,
+    RunEventType,
+    RunKind,
+    RunStatus,
+    grid_arm_external_id,
+    grid_relpath,
+    is_terminal_status,
+    pipeline_external_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -62,16 +79,30 @@ _NOT_CONNECTED = (
 )
 
 _STATUS_STYLE = {
-    "running": "cyan",
-    "completed": "green",
-    "failed": "red",
-    "stopped": "yellow",
+    RunStatus.RUNNING: "cyan",
+    RunStatus.COMPLETED: "green",
+    RunStatus.FAILED: "red",
+    RunStatus.STOPPED: "yellow",
 }
 
+# Listed from the enums rather than retyped, so the help can never drift from what the platform
+# actually accepts.
+_STATUSES = ", ".join(status.value for status in RunStatus)
+_KINDS = ", ".join(kind.value for kind in RunKind)
 
-def _reader() -> RunsReader:
+
+_ORG = typer.Option(
+    "--org",
+    help="Organization id or slug to read (default: the login's, or $WMO_PLATFORM_ORG).",
+)
+
+
+def _reader(org: str | None = None) -> RunsReader:
     """The org-scoped reader, or a clean usage error naming the fix."""
-    reader = RunsReader.open()
+    try:
+        reader = RunsReader.open(org=org)
+    except PlatformError as error:
+        raise _failed("Could not resolve the organization", error) from error
     if reader is None:
         raise typer.BadParameter(f"{_NOT_CONNECTED} (credential file: {credentials_path()})")
     return reader
@@ -102,21 +133,24 @@ def _progress(summary: RunSummary) -> str:
 def list_runs(
     status: Annotated[
         str | None,
-        typer.Option("--status", help="Only one state: running, completed, failed, stopped."),
+        typer.Option("--status", help=f"Only one state: {_STATUSES}."),
     ] = None,
     kind: Annotated[
         str | None,
-        typer.Option("--kind", help="Only one kind: grid_arm, pipeline, build, distill, research."),
+        typer.Option("--kind", help=f"Only one kind: {_KINDS}."),
     ] = None,
     limit: Annotated[int, typer.Option("--limit", help="How many runs to show.")] = 20,
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
+    org: Annotated[str | None, _ORG] = None,
 ) -> None:
     """List this organization's runs, newest first."""
-    with _reader() as reader:
+    with _reader(org) as reader:
         try:
             page = reader.list_runs(status=status, kind=kind, limit=limit)
         except PlatformError as error:
             raise _failed("Could not list runs", error) from error
+        except ValidationError as error:
+            raise _shape_error("the run list", error) from error
     if as_json:
         _console.print_json(
             json.dumps({"runs": [run.model_dump(mode="json") for run in page.runs]})
@@ -130,8 +164,8 @@ def list_runs(
         table.add_column(column)
     for run in page.runs:
         table.add_row(
-            run.external_id,
-            run.kind,
+            escape(run.external_id),
+            escape(run.kind),
             _status(run.status),
             _progress(run),
             f"${run.spend_usd:,.2f}",
@@ -146,13 +180,16 @@ def list_runs(
 def show_run(
     external_id: Annotated[str, typer.Argument(help="The run's name, e.g. jt/grid-c2/identity.")],
     as_json: Annotated[bool, typer.Option("--json", help="Machine-readable output.")] = False,
+    org: Annotated[str | None, _ORG] = None,
 ) -> None:
     """Show one run: where it is, what it spent, its stages and its cells."""
-    with _reader() as reader:
+    with _reader(org) as reader:
         try:
             detail = reader.get_run(external_id)
         except PlatformError as error:
             raise _failed(f"Could not read run {external_id!r}", error) from error
+        except ValidationError as error:
+            raise _shape_error(f"run {external_id!r}", error) from error
     if as_json:
         _console.print_json(json.dumps(detail.model_dump(mode="json")))
         return
@@ -191,7 +228,7 @@ def _print_detail(detail: RunDetail) -> None:
         for stage in detail.stages:
             spend = (stage.candidate_usd or 0.0) + (stage.wm_usd or 0.0)
             table.add_row(
-                stage.stage,
+                escape(stage.stage),
                 _status(stage.status),
                 f"${spend:,.4f}",
                 (stage.completed_at or "")[:19],
@@ -205,7 +242,7 @@ def _print_detail(detail: RunDetail) -> None:
         _console.print("[bold]pending commands[/bold]")
         for control in detail.pending_control:
             note = f" - {escape(control.note)}" if control.note else ""
-            _console.print(f"  {control.command} ({control.status}){note}")
+            _console.print(f"  {escape(control.command)} ({escape(control.status)}){note}")
 
 
 def _cells_table(stats: tuple[CellStats, ...]) -> Table:
@@ -220,7 +257,7 @@ def _cells_table(stats: tuple[CellStats, ...]) -> Table:
         table.add_column(column)
     for row in stats:
         table.add_row(
-            row.model,
+            escape(row.model),
             str(row.cell_count),
             str(row.scored_count),
             str(row.error_count) if row.error_count else "-",
@@ -242,7 +279,7 @@ def tail_run(
         ),
     ] = 0,
     event_type: Annotated[
-        str | None, typer.Option("--type", help="Only one event type, e.g. ledger.line.")
+        str | None, typer.Option("--type", help=f"Only one event type, e.g. {LEDGER_LINE}.")
     ] = None,
     backlog: Annotated[
         int, typer.Option("--backlog", help="Events of history to print before following.")
@@ -256,7 +293,9 @@ def tail_run(
     """
     with _reader() as reader:
         try:
-            cursor = _print_backlog(reader, external_id, from_pos=from_pos, backlog=backlog)
+            cursor = _print_backlog(
+                reader, external_id, from_pos=from_pos, backlog=backlog, event_type=event_type
+            )
             if event_type is None:
                 _follow(reader, external_id, cursor)
             else:
@@ -267,11 +306,30 @@ def tail_run(
             _console.print("\n[dim]stopped following; the run is untouched[/dim]")
 
 
-def _print_backlog(reader: RunsReader, external_id: str, *, from_pos: int, backlog: int) -> int:
-    """Print the history a viewer wants before following, and return the cursor to resume at."""
+def _print_backlog(
+    reader: RunsReader,
+    external_id: str,
+    *,
+    from_pos: int,
+    backlog: int,
+    event_type: str | None = None,
+) -> int:
+    """Print the history a viewer wants before following, and return the cursor to resume at.
+
+    Carries `--type` too: a backlog of every event type followed by a single-type tail would look
+    like the filter had been ignored and then applied halfway down the screen.
+    """
     if backlog <= 0:
+        # Explicitly none. Falling through would open at the END of the log with `tail=True`, which
+        # is the opposite of what asking for no history means.
         return from_pos
-    page = reader.list_events(external_id, after_pos=from_pos, limit=backlog, tail=from_pos == 0)
+    page = reader.list_events(
+        external_id,
+        after_pos=from_pos,
+        limit=backlog,
+        tail=from_pos == 0,
+        event_type=event_type,
+    )
     for event in page.events:
         _console.print(_event_line(event))
     return page.last_pos
@@ -295,7 +353,10 @@ def _poll(reader: RunsReader, external_id: str, cursor: int, event_type: str) ->
         for event in page.events:
             _console.print(_event_line(event))
         cursor = page.last_pos
-        if reader.get_run(external_id).run.status != "running":
+        # The shared vocabulary, not `!= running`: a future status meaning still-writing (paused,
+        # resuming) would make the inversion end a LIVE tail early and silently drop the rest of
+        # the run. `is_terminal_status` errs the other way (see its docstring).
+        if is_terminal_status(reader.get_run(external_id).run.status):
             return
         _sleep_between_polls()
 
@@ -316,11 +377,11 @@ def _event_line(event: EventRow) -> str:
 def _summarize(event: EventRow) -> str:
     """The part of a payload worth a terminal line, per event type."""
     payload = event.payload
-    if event.type == "cell.batch":
+    if event.type == RunEventType.CELL_BATCH:
         cells = payload.get("cells")
         count = len(cells) if isinstance(cells, list) else 0
         return f"{count} cell(s)"
-    if event.type == "heartbeat":
+    if event.type == RunEventType.HEARTBEAT:
         progress = payload.get("progress")
         spend = payload.get("spend")
         shown = []
@@ -332,15 +393,17 @@ def _summarize(event: EventRow) -> str:
             if isinstance(candidate, int | float) and isinstance(wm, int | float):
                 shown.append(f"spend=${candidate + wm:,.2f}")
         return " ".join(shown)
-    if event.type == "ledger.line":
+    if event.type == LEDGER_LINE:
         note = str(payload.get("note") or "")
         return (
             f"{payload.get('event')} chunk={payload.get('chunk')} cells={payload.get('cells')} "
             f"scored={payload.get('scored')}{f' {note}' if note else ''}"
         )
-    if event.type in ("run.status", "stage.upsert", "run.meta"):
+    if event.type in (RunEventType.RUN_STATUS, RunEventType.STAGE_UPSERT, RunEventType.RUN_META):
         keys = ("status", "stage", "kind", "error", "reason")
         return " ".join(f"{key}={payload[key]}" for key in keys if payload.get(key) is not None)
+    if event.type == LOG_LINE:
+        return f"[{payload.get('level')}] {payload.get('line')}"
     return ""
 
 
@@ -383,8 +446,9 @@ def _command(external_id: str, command: str, args: JsonObject | None, label: str
         except PlatformError as error:
             raise _failed(f"Could not {label} run {external_id!r}", error) from error
     _console.print(
-        f"queued [bold]{control.command}[/bold] for {external_id} (id {control.id}, "
-        f"{control.status}). It takes effect when the process feeding the run next reports in; "
+        f"queued [bold]{escape(control.command)}[/bold] for {escape(external_id)} "
+        f"(id {control.id}, {control.status}). It takes effect when the process feeding the run "
+        "next reports in; "
         "`wmo runs show` lists it until then."
     )
 
@@ -444,10 +508,10 @@ def backfill(
         wmo runs backfill /restored/artifacts --name jt/grid-c2   # moved out of .wmo
     """
     plans = _plan_backfill(path, arm, name)
+    if dry_run:
+        _write_jsonl(plans, out)
+        return
     for external_id, events in plans:
-        if dry_run:
-            _write_jsonl(external_id, events, out)
-            continue
         _push(external_id, events, force=force)
 
 
@@ -473,7 +537,8 @@ def _plan_backfill(
         # `--name` is the WHOLE run name for a manifest, so it is not put through
         # `pipeline_external_id`: an operator naming a run has to get the name they typed, and
         # appending "/optimize" to it would silently rename it.
-        return [(name or pipeline_external_id(model), optimize_events(manifest, model=model))]
+        external_id = name or pipeline_external_id(model)
+        return [_named(external_id, optimize_events(manifest, model=model))]
     raise typer.BadParameter(
         f"{path} is neither a grid directory (no {COHORT_FILE}) nor an optimize run (no "
         f"{MANIFEST_RELPATH}). Point it at a grid directory under {ARTIFACT_DIR}/, at a built "
@@ -519,9 +584,26 @@ def _grid_plans(
             "Name one with --arm if it is somewhere unusual."
         )
     return [
-        (f"{relpath}/{name}", grid_arm_events(grid_dir, arm=name, grid_relpath=relpath))
-        for name in arms
+        _named(
+            grid_arm_external_id(relpath, arm_name),
+            grid_arm_events(grid_dir, arm=arm_name, grid_relpath=relpath),
+        )
+        for arm_name in arms
     ]
+
+
+def _named(external_id: str, events: list[RunEvent]) -> tuple[str, list[RunEvent]]:
+    """Bind a run's events to the name they will be pushed under.
+
+    The walk stamps each event with the name it DERIVED from the artifacts' location, so a `--name`
+    override would otherwise leave the events disagreeing with the run they are pushed to: harmless
+    on the wire (the pushed body has no run name, the URL does) but visible in a dry run and exactly
+    the kind of divergence that later reads as a bug in the mapping. Rebinding once here keeps one
+    answer to "which run is this".
+    """
+    if all(event.external_id == external_id for event in events):
+        return external_id, events
+    return external_id, [event.model_copy(update={"external_id": external_id}) for event in events]
 
 
 def _arms(grid_dir: Path) -> list[str]:
@@ -550,23 +632,26 @@ def _arms(grid_dir: Path) -> list[str]:
     return sorted(found)
 
 
-def _write_jsonl(external_id: str, events: list[RunEvent], out: Path | None) -> None:
-    """Write one run's events as JSONL: the dry run, and the shared-fixture format.
+def _write_jsonl(plans: list[tuple[str, list[RunEvent]]], out: Path | None) -> None:
+    """Write every planned run's events as JSONL: the dry run, in the shared-fixture format.
 
-    Each line carries `external_id` ahead of the event, which the pushed body does not: on the wire
-    the run is named in the URL, but a file holding several runs has to say which run each line
-    belongs to. That is exactly the format of the D-RUNS shared-truth fixture, so a dry run is
-    diffable against it line for line.
+    `RunEvent.jsonl_row` is the line shape, which names its run: on the wire the run is in the URL,
+    but a file holding several arms has to say which run each line belongs to. Same order and keys
+    as the D-RUNS shared-truth fixture, so a dry run is diffable against it line for line.
+
+    Takes ALL the runs at once and truncates once, for two reasons a per-run write got wrong: a
+    re-run appended to the previous one and silently doubled the file, and truncating per run would
+    have left a multi-arm grid with only its last arm.
     """
-    lines = [json.dumps({"external_id": external_id, **event.wire()}) for event in events]
+    lines = [json.dumps(event.jsonl_row()) for _external_id, events in plans for event in events]
     if out is None:
         for line in lines:
             _console.print_json(line)
         return
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("a" if out.exists() else "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    _console.print(f"{len(events)} event(s) for [bold]{external_id}[/bold] -> {out}")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    named = ", ".join(external_id for external_id, _events in plans)
+    _console.print(f"{len(lines)} event(s) for [bold]{named}[/bold] -> {out}")
 
 
 def _push(external_id: str, events: list[RunEvent], *, force: bool) -> None:
@@ -577,18 +662,21 @@ def _push(external_id: str, events: list[RunEvent], *, force: bool) -> None:
     wrote under different seqs, which is why an already-reported run is refused rather than merged:
     its ledger lines would land twice and the spend curve would double.
     """
-    sink = runs_sink()
-    if sink is None:
-        raise typer.BadParameter(_NOT_CONNECTED)
-    try:
-        ensure_backfillable(_reported_events(external_id), force=force)
-    except BackfillRefused as error:
-        raise typer.BadParameter(str(error)) from error
-    try:
-        ack = sink.push(external_id, events)
-    except (PushRejected, PushUnavailable) as error:
-        _console.print(f"[red]Could not push {external_id}:[/red] {escape(str(error))}")
-        raise typer.Exit(code=1) from error
+    # ONE client for both halves of this command, closed when it is done: the guard reads the run
+    # and the push writes it, and opening a second connection pool to do that leaked one per arm.
+    with _reader() as reader:
+        try:
+            ensure_backfillable(reader.event_count(external_id), force=force)
+        except BackfillRefused as error:
+            raise typer.BadParameter(str(error)) from error
+        except PlatformError as error:
+            raise _failed(f"Could not check run {external_id!r}", error) from error
+        sink = RunsSink(reader.client, org_id=reader.org_id, emitter_id=default_emitter_id())
+        try:
+            ack = sink.push(external_id, events)
+        except (PushRejected, PushUnavailable) as error:
+            _console.print(f"[red]Could not push {external_id}:[/red] {escape(str(error))}")
+            raise typer.Exit(code=1) from error
     already = len(events) - ack.accepted
     _console.print(
         f"pushed {len(events)} event(s) for [bold]{external_id}[/bold]: {ack.accepted} newly "
@@ -596,18 +684,17 @@ def _push(external_id: str, events: list[RunEvent], *, force: bool) -> None:
     )
 
 
-def _reported_events(external_id: str) -> int:
-    """How many events this run already has, or 0 when the platform has never heard of it."""
-    reader = RunsReader.open()
-    if reader is None:
-        return 0
-    with reader:
-        try:
-            # `event_count` answers 0 for an absent run, which is the ordinary case for a backfill;
-            # anything else failing is a real problem worth stopping for rather than assuming zero.
-            return reader.event_count(external_id)
-        except PlatformError as error:
-            raise _failed(f"Could not check run {external_id!r}", error) from error
+def _shape_error(what: str, error: ValidationError) -> typer.Exit:
+    """Report a response this build cannot read, which is a version skew rather than a crash.
+
+    The platform owns these shapes and can add to them safely, but a REMOVED or renamed field is a
+    real mismatch: the remedy is upgrading wmo, and saying that beats a pydantic traceback.
+    """
+    _console.print(
+        f"[red]The platform's answer for {what} is not one this build understands[/red] "
+        f"({error.error_count()} field(s)); upgrade wmo, or report the mismatch."
+    )
+    return typer.Exit(code=1)
 
 
 def _failed(headline: str, error: PlatformError) -> typer.Exit:

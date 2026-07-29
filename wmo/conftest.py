@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from wmo.platform.credentials import ENV_HOME
+from wmo.platform.credentials import ENV_API_URL, ENV_HOME, ENV_ORG, ENV_TOKEN, ENV_WEB_URL
 from wmo.providers import openrouter_pricing
 
 
@@ -54,7 +54,10 @@ def _no_platform_login(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     their own emitter; credential tests set `WMO_HOME` themselves and a later `monkeypatch` wins.
     """
     monkeypatch.setenv(ENV_HOME, str(tmp_path / "no-wmo-home"))
-    for name in ("WMO_PLATFORM_TOKEN", "WMO_PLATFORM_ORG", "WMO_PLATFORM_URL"):
+    # Every credential variable, imported rather than spelled out: `is_complete()`
+    # needs only ENV_API_URL and ENV_TOKEN, and the earlier literal list omitted
+    # ENV_API_URL, so an exported api url alone still resolved a live credential.
+    for name in (ENV_API_URL, ENV_TOKEN, ENV_ORG, ENV_WEB_URL):
         monkeypatch.delenv(name, raising=False)
 
 

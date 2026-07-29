@@ -10,6 +10,7 @@ stops early on a live run.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 
 import httpx
@@ -17,7 +18,7 @@ import pytest
 
 from wmo.core.types import JsonObject, JsonValue
 from wmo.platform.client import PlatformClient, PlatformError, PlatformUnreachable
-from wmo.runs.reader import RunsReader
+from wmo.runs.reader import RunsReader, _resolve_org
 
 ORG = "org-1"
 RUN = "jt/grid-c2/identity"
@@ -359,9 +360,10 @@ def test_tail_yields_frames_then_ends_when_the_run_is_terminal() -> None:
         rows = list(reader.tail(RUN))
 
     assert [row.pos for row in rows] == [7, 8]
-    # One stream, then exactly one status check to tell "finished" from "dropped".
+    # One stream, then a status check to tell "finished" from "dropped", then the drain pass.
     assert paths.count(f"/api/orgs/{ORG}/runs/{RUN}/stream") == 1
-    assert paths[-1] == f"/api/orgs/{ORG}/runs/{RUN}"
+    assert f"/api/orgs/{ORG}/runs/{RUN}" in paths
+    assert paths[-1] == f"/api/orgs/{ORG}/runs/{RUN}/events"
 
 
 def test_tail_resumes_from_the_last_pos_after_a_dropped_stream() -> None:
@@ -477,3 +479,161 @@ def test_open_returns_none_without_a_credential() -> None:
     into a test.
     """
     assert RunsReader.open() is None
+
+
+def test_tail_drains_what_the_frontier_was_still_hiding() -> None:
+    """The events that END a run are exactly the ones a naive tail misses.
+
+    A live stream trails the safe frontier by a couple of seconds, so when the run goes terminal its
+    last ledger line, final heartbeat and terminal status are usually still behind it. The tail does
+    one paged read after observing terminal, which is where those three arrive.
+    """
+    late = [_event(9, event_type="ledger.line"), _event(10, event_type="run.status")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, content=_frames(_event(8)))
+        if request.url.path.endswith("/events"):
+            after = int(dict(request.url.params).get("after_pos", 0))
+            remaining = [event for event in late if int(str(event["pos"])) > after]
+            return httpx.Response(
+                200,
+                json={
+                    "events": remaining,
+                    "last_pos": remaining[-1]["pos"] if remaining else after,
+                },
+            )
+        return httpx.Response(200, json=_detail(run={**_RUN_ROW, "status": "completed"}))
+
+    with _reader(handler) as reader:
+        rows = list(reader.tail(RUN))
+
+    assert [row.pos for row in rows] == [8, 9, 10]
+    assert rows[-1].type == "run.status"
+
+
+def test_a_stream_that_closes_empty_forever_gives_up(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server closing immediately must not spin: that is indistinguishable from a hang."""
+    monkeypatch.setattr("wmo.runs.reader.MAX_RECONNECTS", 2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(200, content=b"")
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"events": [], "last_pos": 0})
+        return httpx.Response(200, json=_detail())
+
+    with (
+        _reader(handler) as reader,
+        pytest.raises(PlatformUnreachable, match="without any events"),
+    ):
+        list(reader.tail(RUN))
+
+
+def test_a_5xx_on_the_stream_is_retried_but_a_403_is_not() -> None:
+    """The platform having a bad minute is a blip; a credential answer is a verdict."""
+    attempts: list[int] = []
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/stream"):
+            if request.url.path.endswith("/events"):
+                return httpx.Response(200, json={"events": [], "last_pos": 0})
+            return httpx.Response(200, json=_detail(run={**_RUN_ROW, "status": "completed"}))
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(503, json={"error": "upstream unavailable"})
+        return httpx.Response(200, content=_frames(_event(4)))
+
+    with _reader(flaky) as reader:
+        assert [row.pos for row in reader.tail(RUN)] == [4]
+    assert len(attempts) == 2
+
+    def forbidden(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stream"):
+            return httpx.Response(403, json={"error": "Organization not found"})
+        return httpx.Response(200, json=_detail())
+
+    with _reader(forbidden) as reader, pytest.raises(PlatformError, match="Organization not found"):
+        list(reader.tail(RUN))
+
+
+def test_a_frame_of_the_wrong_shape_is_skipped_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A frame this client cannot parse must not end a twelve-hour follow with a traceback."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/stream"):
+            body = b'data: {"pos": "not-an-int"}\n\n' + _frames(_event(6))
+            return httpx.Response(200, content=body)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"events": [], "last_pos": 6})
+        return httpx.Response(200, json=_detail(run={**_RUN_ROW, "status": "completed"}))
+
+    with _reader(handler) as reader, caplog.at_level(logging.WARNING, logger="wmo.runs.reader"):
+        rows = list(reader.tail(RUN))
+
+    assert [row.pos for row in rows] == [6]
+    assert any("does not understand" in record.getMessage() for record in caplog.records)
+
+
+def test_an_org_slug_resolves_to_its_id() -> None:
+    """A slug is what a person reads off the platform's URL; a uuid is not something anyone has."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/api/whoami":
+            return httpx.Response(
+                200,
+                json={
+                    "actor": {"kind": "api_key", "id": "key-1"},
+                    "orgs": [{"id": ORG, "slug": "acme", "name": "Acme"}],
+                },
+            )
+        return httpx.Response(200, json={"runs": [], "next_cursor": None})
+
+    reader = RunsReader(
+        PlatformClient("https://api.test", "xpl_secret", transport=httpx.MockTransport(handler)),
+        _resolve_org(
+            PlatformClient(
+                "https://api.test", "xpl_secret", transport=httpx.MockTransport(handler)
+            ),
+            "acme",
+        ),
+    )
+    with reader:
+        reader.list_runs()
+
+    assert reader.org_id == ORG
+    assert f"/api/orgs/{ORG}/runs" in seen
+
+
+def test_a_uuid_org_costs_no_lookup() -> None:
+    """The common path stays one request: an id needs no resolving."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"a uuid must not be looked up (asked {request.url.path})")
+
+    client = PlatformClient("https://api.test", "x", transport=httpx.MockTransport(handler))
+    with client:
+        assert _resolve_org(client, "6f1b7a4e-6c2e-4f2a-9a3e-0b8f6f7c1d22") == (
+            "6f1b7a4e-6c2e-4f2a-9a3e-0b8f6f7c1d22"
+        )
+
+
+def test_an_unknown_org_name_lists_what_is_visible() -> None:
+    """The error is the interface: it says what to pass instead."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "actor": {"kind": "api_key", "id": "key-1"},
+                "orgs": [{"id": ORG, "slug": "acme", "name": "Acme"}],
+            },
+        )
+
+    client = PlatformClient("https://api.test", "x", transport=httpx.MockTransport(handler))
+    with client, pytest.raises(PlatformError, match="it can see: acme"):
+        _resolve_org(client, "nope")

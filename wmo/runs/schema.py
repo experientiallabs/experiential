@@ -1,7 +1,7 @@
 """The D-RUNS v1 wire contract and the seq-band allocator every writer shares.
 
-One wmo run — a grid arm, an optimize pipeline, a build, a distill job, a research
-probe — has a platform counterpart row identified by `(org, external_id)`. Progress
+One wmo run (a grid arm, an optimize pipeline, a build, a distill job, a research
+probe) has a platform counterpart row identified by `(org, external_id)`. Progress
 travels as a per-run sequence of events; the platform stores them keyed on
 `(run_id, seq)` and discards a seq it already holds, which is what makes a replayed
 backfill free.
@@ -28,7 +28,7 @@ depends only on whether the fact has a position in an artifact:
 - Facts with a deterministic artifact position take that position, from either path.
   `run.meta` is band-0 seq 1. The Nth `ledger.line` (1-based, among the arm's own
   ledger lines) is band-0 seq `1 + N`, which is exactly where backfill's walk puts
-  it — and any process can compute it after appending, because its line has a fixed
+  it, and any process can compute it after appending, because its line has a fixed
   file index. Cells take their chunk's band, which is a function of the chunk alone.
   All of these are idempotent across processes and across replays: re-deriving one
   produces the same seq, so the platform discards it as the duplicate it is.
@@ -46,13 +46,13 @@ depends only on whether the fact has a position in an artifact:
 The one remaining asymmetry is why `wmo runs backfill` refuses a run that already
 holds events unless forced: a backfill re-walks the artifact positions, which is
 idempotent, but it ALSO re-derives the final heartbeat and status, and those are
-live-only facts whose seqs it cannot know — so it would add a second copy under
+live-only facts whose seqs it cannot know, so it would add a second copy under
 band-0 seqs and double-count the panel's spend curve.
 
 Timestamps are carried verbatim as the strings the artifacts hold. Two reasons, both
 load-bearing: the platform's projection guards compare event clocks and a
 re-serialized timestamp that differs by a digit is a different clock, and a backfill
-must reproduce `expected-events.jsonl` byte for byte. Never invent a clock here — no
+must reproduce `expected-events.jsonl` byte for byte. Never invent a clock here: no
 `now()`, no reformatting.
 """
 
@@ -115,16 +115,16 @@ def is_terminal_status(status: str) -> bool:
     """Whether a run has no writer left, so nothing more will arrive for it.
 
     Load-bearing rather than cosmetic: the platform closes a drained terminal run's
-    SSE tail on its own, which makes a closed connection ambiguous — finished, or
-    dropped mid-run — and this is what a reader disambiguates it with.
+    SSE tail on its own, which makes a closed connection ambiguous (finished, or
+    dropped mid-run), and this is what a reader disambiguates it with.
 
     Deliberately a membership test against the KNOWN terminal statuses, not
     `status != "running"`. The two agree today and diverge the moment the platform
     adds a status that means still-writing (paused, resuming): inverting `running`
     would call that terminal, and a tail would exit early and silently drop the rest
     of the run. An unrecognized status therefore reads as NOT terminal, which errs
-    toward a stream that stays open too long — recoverable — over one that ends
-    early, which is not.
+    toward a stream that stays open too long, which is recoverable, over one that
+    ends early, which is not.
 
     Args:
         status: A run's status as the platform reported it.
@@ -138,8 +138,8 @@ def is_terminal_status(status: str) -> bool:
 class RunEventType(StrEnum):
     """Event types the platform projects onto its derived tables.
 
-    The vocabulary is open — any other type is stored and streamed but projects
-    nothing — so `ledger.line` and `log.line` are deliberately absent: they are
+    The vocabulary is open: any other type is stored and streamed but projects
+    nothing, so `ledger.line` and `log.line` are deliberately absent. They are
     log-only, and the spend curve reads them straight off the event log.
     """
 
@@ -166,8 +166,8 @@ def ledger_walk_seq(position: int) -> int:
 
     Live emission and backfill must agree on this without talking to each other,
     which is why it is derived from the ledger FILE rather than from a counter: a
-    line's index is fixed the moment it is appended, so any process — and a later
-    backfill — computes the same seq for it.
+    line's index is fixed the moment it is appended, so any process (and a later
+    backfill) computes the same seq for it.
 
     Args:
         position: The line's 1-based position among the arm's own ledger lines.
@@ -286,7 +286,7 @@ class SeqBands:
     def take_from_top(self, band: int) -> int:
         """Consume and return the next seq in a band, DESCENDING from its ceiling.
 
-        For facts with no artifact position — a heartbeat, a live `run.status` —
+        For facts with no artifact position (a heartbeat, a live `run.status`),
         which therefore cannot be re-derived. Descending from the top keeps them
         clear of the ascending, artifact-derived walk growing up from the floor, so
         one band safely carries both without either needing to know the other's
@@ -317,7 +317,7 @@ class SeqBands:
 
         A re-invocation that restarts numbering at the band floor has every event
         discarded as a replay, because `(run, seq)` is the platform's idempotency
-        key — the run looks healthy while its new telemetry silently vanishes. This
+        key, so the run looks healthy while its new telemetry silently vanishes. This
         only ever moves the cursor FORWARD: a stale, lower resume mark cannot rewind
         a walk that has already gone further.
 
@@ -327,6 +327,25 @@ class SeqBands:
         """
         current = self._next.get(band, self.band_start(band))
         self._next[band] = max(current, next_seq)
+
+    def resume_from_top(self, band: int, next_seq: int) -> None:
+        """Rebase a band's DESCENDING walk so it continues below what already landed.
+
+        The twin of `resume_at`, and needed for the same reason: a re-invocation that restarts the
+        descending walk at the band ceiling re-issues the seqs its previous invocation used, and the
+        platform discards every one as a replay. That loss is quieter than the ascending kind and
+        worse in one specific way: a run's terminal `run.status` descends, so a resumed run whose
+        status is discarded stays `running` on the panel forever.
+
+        Only ever moves the cursor DOWN, so a stale higher mark cannot rewind a walk that has
+        already descended further.
+
+        Args:
+            band: Writer's band.
+            next_seq: The first seq to hand out (typically the run's high-water minus one).
+        """
+        current = self._next_from_top.get(band, self.band_end(band))
+        self._next_from_top[band] = min(current, next_seq)
 
 
 def cell_band(chunk: int) -> int:
@@ -371,8 +390,9 @@ def grid_relpath(grid_dir: Path) -> str:
     Returns:
         The run-name prefix (e.g. `jt/grid-c2`).
     """
-    parts = Path(grid_dir).resolve().parts
+    resolved = Path(grid_dir).resolve()
+    parts = resolved.parts
     if ARTIFACT_DIR in parts:
         index = len(parts) - 1 - parts[::-1].index(ARTIFACT_DIR)
-        return "/".join(parts[index + 1 :]) or grid_dir.name
-    return grid_dir.name
+        return "/".join(parts[index + 1 :]) or resolved.name
+    return resolved.name

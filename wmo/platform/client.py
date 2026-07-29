@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import urllib.parse
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from importlib import metadata
@@ -113,12 +114,23 @@ def _decode_json(response: httpx.Response) -> JsonObject:
     return payload
 
 
+def _run_path(external_id: str) -> str:
+    """A run name as a URL path segment, keeping its slashes.
+
+    Run names are hierarchical (`jt/grid-c2/identity`) and the route takes them as a path parameter,
+    so the slashes are structural and must survive. Everything else is data an operator chose and
+    has to be escaped: a name with a `?` or a `#` would otherwise silently truncate the path into a
+    query or a fragment and read a different run.
+    """
+    return urllib.parse.quote(external_id, safe="/")
+
+
 def _sse_frames(response: httpx.Response) -> Iterator[JsonObject]:
     """Decode an SSE response into one JSON body per `data:` frame.
 
     Only `data:` lines carry payload. `id:` lines restate the frame's `pos`, which
-    the body already holds, and comment lines (`:`) are the server's keep-alives —
-    both are skipped rather than surfaced, so a caller sees events and nothing else.
+    the body already holds, and comment lines (`:`) are the server's keep-alives.
+    Both are skipped rather than surfaced, so a caller sees events and nothing else.
     """
     for line in response.iter_lines():
         if not line.startswith("data:"):
@@ -313,7 +325,19 @@ class PlatformClient:
         token: str,
         *,
         transport: httpx.BaseTransport | None = None,
+        timeout: float | None = None,
     ) -> None:
+        """Open an authenticated client.
+
+        Args:
+            api_url: Backend host.
+            token: Org API key.
+            transport: Test transport override.
+            timeout: Request timeout; defaults to the registry's patient bound.
+                Callers on a run's critical path should pass a short one (see
+                `wmo.runs.client.TELEMETRY_TIMEOUT_SECONDS`), because a
+                black-holing platform would otherwise stall the run itself.
+        """
         try:
             version = metadata.version("world-model-optimizer")
         except metadata.PackageNotFoundError:
@@ -324,7 +348,7 @@ class PlatformClient:
                 "Authorization": f"Bearer {token}",
                 "User-Agent": f"wmo/{version}",
             },
-            timeout=_TIMEOUT_SECONDS,
+            timeout=timeout if timeout is not None else _TIMEOUT_SECONDS,
             transport=_guarded(transport),
         )
         # Bundle bytes move directly against storage's signed URLs; that
@@ -673,7 +697,7 @@ class PlatformClient:
         the run's resume mark, and any pending control commands.
         """
         response = self._client.post(
-            f"/api/orgs/{org_id}/runs/{external_id}/events",
+            f"/api/orgs/{org_id}/runs/{_run_path(external_id)}/events",
             json={"emitter_id": emitter_id, "events": list(events)},
         )
         self._raise_for_error(response)
@@ -693,7 +717,7 @@ class PlatformClient:
         if note is not None:
             body["note"] = note
         response = self._client.post(
-            f"/api/orgs/{org_id}/runs/{external_id}/control/{control_id}/ack",
+            f"/api/orgs/{org_id}/runs/{_run_path(external_id)}/control/{control_id}/ack",
             json=body,
         )
         self._raise_for_error(response)
@@ -729,7 +753,7 @@ class PlatformClient:
 
     def get_org_run(self, org_id: str, external_id: str) -> JsonObject:
         """One run with its stages, per-model cell rollup, and pending control commands."""
-        return self._read(f"/api/orgs/{org_id}/runs/{external_id}", {})
+        return self._read(f"/api/orgs/{org_id}/runs/{_run_path(external_id)}", {})
 
     def list_org_run_cells(
         self,
@@ -750,7 +774,7 @@ class PlatformClient:
         for key, flag in (("scored", scored), ("error", error)):
             if flag is not None:
                 params[key] = flag
-        return self._read(f"/api/orgs/{org_id}/runs/{external_id}/cells", params)
+        return self._read(f"/api/orgs/{org_id}/runs/{_run_path(external_id)}/cells", params)
 
     def list_org_run_events(
         self,
@@ -774,7 +798,7 @@ class PlatformClient:
         }
         if event_type is not None:
             params["type"] = event_type
-        return self._read(f"/api/orgs/{org_id}/runs/{external_id}/events", params)
+        return self._read(f"/api/orgs/{org_id}/runs/{_run_path(external_id)}/events", params)
 
     @contextmanager
     def stream_org_run_events(
@@ -794,7 +818,7 @@ class PlatformClient:
             headers["Last-Event-ID"] = str(after_pos)
         with self._client.stream(
             "GET",
-            f"/api/orgs/{org_id}/runs/{external_id}/stream",
+            f"/api/orgs/{org_id}/runs/{_run_path(external_id)}/stream",
             params={"after_pos": after_pos},
             headers=headers,
             timeout=httpx.Timeout(timeout_s, connect=30.0),
@@ -813,7 +837,7 @@ class PlatformClient:
         reaches its machine must not make the panel claim the run stopped.
         """
         response = self._client.post(
-            f"/api/orgs/{org_id}/runs/{external_id}/control",
+            f"/api/orgs/{org_id}/runs/{_run_path(external_id)}/control",
             json={"command": command, "args": args or {}},
         )
         self._raise_for_error(response)

@@ -47,7 +47,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import Lock
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -55,15 +54,17 @@ from wmo.core.types import JsonObject
 from wmo.optimize.outcomes import ScenarioOutcome
 from wmo.optimize.pipeline import Stage, StageRecord
 from wmo.runs.backfill import cell_payload
-from wmo.runs.client import ControlCommand, PushAck, RunsSink, runs_sink
+from wmo.runs.client import ControlCommand, PushAck, PushRejected, RunsSink, runs_sink
 from wmo.runs.schema import (
     CELL_BATCH_CAP,
+    LEDGER_LINE,
     RUN_LEVEL_BAND,
     RUN_META_SEQ,
     RUN_SEQ_BAND,
     RunEvent,
     RunEventType,
     RunKind,
+    RunStatus,
     SeqBands,
     cell_band,
     grid_arm_external_id,
@@ -73,16 +74,10 @@ from wmo.runs.schema import (
 
 log = logging.getLogger(__name__)
 
-LEDGER_LINE_TYPE = "ledger.line"
-"""Log-only event type, absent from `RunEventType` because the platform projects nothing from it."""
-
 HEARTBEAT_INTERVAL_S = 15.0
 """Least time between heartbeats, and the age at which buffered cells are sent. Driven by callbacks
 the run already makes, never by a timer thread: a grid buys a cell every few tens of seconds, which
 is a finer cadence than any panel needs."""
-
-RunLifecycle = Literal["running", "completed", "failed", "stopped"]
-"""A run's status vocabulary, as `run.status` carries it."""
 
 QUEUE_LIMIT = 2000
 """Events held in memory when the platform is unreachable. Past this the oldest are dropped: a run
@@ -111,6 +106,16 @@ REJECT_FORCE_FROM_STAGE = (
     "a grid arm has chunks, not stages, and its resume unit is the chunk file on disk. Delete the "
     "chunk files that should be re-bought, then re-run the arm."
 )
+
+
+def _undeclared(refused: PushRejected) -> bool:
+    """Whether a refusal means "this run was never declared" rather than "this payload is wrong".
+
+    Matched on the ingest's own wording because the status alone cannot tell them apart: both come
+    back as 422, but one is fixed by restating `run.meta` and the other by fixing the payload.
+    """
+    message = str(refused).lower()
+    return refused.status_code == 422 and ("run.meta" in message or "first batch" in message)
 
 
 def now_iso() -> str:
@@ -148,9 +153,26 @@ class _Reporter:
     """
 
     def __init__(
-        self, sink: RunsSink | None, external_id: str, *, queue_limit: int = QUEUE_LIMIT
+        self,
+        sink: RunsSink | None,
+        external_id: str,
+        *,
+        queue_limit: int = QUEUE_LIMIT,
+        top_band: int | None = None,
     ) -> None:
+        """Hold the transport for one run, or None when emission is off.
+
+        `top_band` is the band whose DESCENDING walk this writer uses, when it has one, so a resume
+        can rebase that walk as well as the ascending one.
+        """
         self._sink = sink
+        self._top_band = top_band
+        # The run's declaration. Kept out of the queue's eviction path and re-sendable: the platform
+        # refuses every batch of an undeclared run, so losing this one event would end the run's
+        # telemetry permanently rather than costing one event.
+        self._meta: RunEvent | None = None
+        self._resumed = False
+        self._resume_pending = False
         self._external_id = external_id
         self._bands = SeqBands()
         self._queue: deque[tuple[RunEvent, bool]] = deque()
@@ -198,17 +220,36 @@ class _Reporter:
         sink = self._sink
         if sink is None:
             return 0
+        self._resume_pending = False
         ack: PushAck | None = None
-        with self._quiet("could not read the run's resume mark"):
+        try:
             ack = sink.probe(self._external_id)
-        if ack is None:
+        except Exception as exc:  # noqa: BLE001 - telemetry never propagates into a paid run
+            # An unreachable platform is NOT a fresh run. Numbering from the floor on this guess
+            # would have every event of a resumed run discarded as a replay, so the probe is
+            # retried at the next flush instead.
+            # Retried at the next flush rather than standing as "fresh run" forever. Events this
+            # emitter numbers before that retry succeeds may still be discarded as replays, because
+            # seqs are assigned when an event is queued; what this prevents is a resumed run
+            # numbering from the floor for its whole life.
+            self._resume_pending = True
+            self._warn(f"could not read the run's resume mark, will retry: {exc}")
             return 0
         # Only a mark INSIDE band 0 says anything about the run-level walk: a grid arm whose chunk
         # bands pushed `last_seq` to 100004 must leave band 0 starting where the derived ledger
         # walk expects it, or every ledger line would be renumbered off its artifact position.
         if 0 < ack.last_seq <= RUN_SEQ_BAND:
             self._bands.resume_at(RUN_LEVEL_BAND, ack.last_seq + 1)
+        # And the descending walk, which nothing else rebases: a heartbeat and a terminal status
+        # have no artifact position, so a re-invocation that restarts at the ceiling re-issues
+        # exactly the seqs it used last time.
+        band = self._top_band
+        if band is not None and self._bands.band_start(
+            band
+        ) <= ack.last_seq <= self._bands.band_end(band):
+            self._bands.resume_from_top(band, ack.last_seq - 1)
         self._resumed_from = ack.last_seq
+        self._resumed = ack.last_seq > 0
         self._pulled_at_resume = ack.control
         return ack.last_seq
 
@@ -277,6 +318,8 @@ class _Reporter:
 
     def _enqueue(self, event: RunEvent, *, derived: bool) -> None:
         """Hold one numbered event, remembering where its seq came from."""
+        if event.type == RunEventType.RUN_META:
+            self._meta = event
         self._queue.append((event, derived))
         self._drop_overflow()
 
@@ -289,7 +332,13 @@ class _Reporter:
         `wmo runs backfill`.
         """
         while len(self._queue) > self._queue_limit:
-            self._queue.popleft()
+            # Oldest first, EXCEPT the declaration: it is the oldest event by definition, and the
+            # platform refuses every batch of a run that has not been declared, so evicting it would
+            # cost the whole run's telemetry rather than one event.
+            victim = 0
+            if len(self._queue) > 1 and self._queue[0][0] is self._meta:
+                victim = 1
+            del self._queue[victim]
             self._dropped += 1
             if self._dropped == 1 or self._dropped % self._queue_limit == 0:
                 log.warning(
@@ -310,18 +359,64 @@ class _Reporter:
         sink = self._sink
         if sink is None or not self._queue:
             return self._take_resume_control()
+        if self._resume_pending:
+            # The resume probe never got an answer. Ask again before numbering anything else on the
+            # assumption that this run is new.
+            self._resume()
         batch = list(self._queue)
         self._queue.clear()
         events = [event for event, _derived in batch]
-        ack: PushAck | None = None
-        with self._quiet(f"could not push {len(events)} event(s)"):
-            ack = sink.push(self._external_id, events)
-        if ack is None:
+        try:
+            ack = self._push(sink, events)
+        except PushRejected as refused:
+            # PERMANENT. Retrying cannot help, and requeueing it would head-of-line block this
+            # run's telemetry for the rest of a twelve-hour grid on one bad payload, so the batch
+            # is dropped and the reason said out loud every time rather than once per run: each
+            # rejection is a distinct bug, and the sink's message names the field that caused it.
+            log.warning(
+                "run telemetry for %s: the platform refused %d event(s) with HTTP %s and they have "
+                "been DROPPED (retrying cannot fix a refused payload): %s",
+                self._external_id,
+                len(events),
+                refused.status_code,
+                refused,
+            )
+            return self._take_resume_control()
+        except Exception as exc:  # noqa: BLE001 - telemetry never propagates into a paid run
+            # Transient: the platform, the network, or something unforeseen. Keep the events at the
+            # FRONT so the next flush retries them in order; the bound is what limits the growth.
+            self._warn(f"could not push {len(events)} event(s): {exc}")
             self._queue.extendleft(reversed(batch))
             self._drop_overflow()
             return self._take_resume_control()
         self._check_accepted(ack, batch)
         return self._take_resume_control() + ack.control
+
+    def _push(self, sink: RunsSink, events: list[RunEvent]) -> PushAck:
+        """Push one batch, restating the run's declaration once if that is what it was missing.
+
+        The platform refuses any batch of a run it has not been told about, and that can happen
+        even though this emitter declared the run: an outage can swallow the batch the declaration
+        travelled in. Restating it costs nothing (its seq is derived, so a platform that already
+        holds it discards the copy) and it is the difference between a run recovering and a run
+        reporting nothing for the rest of its life.
+
+        Raises:
+            PushRejected: For any other permanent refusal, and for a second declaration failure.
+        """
+        try:
+            return sink.push(self._external_id, events)
+        except PushRejected as refused:
+            meta = self._meta
+            if meta is None or not _undeclared(refused) or any(event is meta for event in events):
+                raise
+            log.warning(
+                "run telemetry for %s: the platform does not know this run, so its declaration is "
+                "being restated and the batch retried once (%s)",
+                self._external_id,
+                refused,
+            )
+            return sink.push(self._external_id, [meta, *events])
 
     def _take_resume_control(self) -> tuple[ControlCommand, ...]:
         """Commands the resume probe pulled, handed over once.
@@ -344,6 +439,18 @@ class _Reporter:
         allocated = sum(1 for _event, derived in batch if not derived)
         sent = len(batch)
         if ack.accepted >= sent:
+            return
+        if self._resumed:
+            # A resumed run re-states facts on purpose, and some of its allocated seqs may have been
+            # used by the invocation it is continuing. Saying "collision" here on every ordinary
+            # resume is how the same message gets ignored when it means real loss.
+            log.info(
+                "run telemetry for %s: %d of %d event(s) were already recorded, which is a resume "
+                "converging on what the platform holds",
+                self._external_id,
+                sent - ack.accepted,
+                sent,
+            )
             return
         if ack.accepted >= allocated:
             log.info(
@@ -372,6 +479,19 @@ class _Reporter:
             return
         with self._quiet(f"could not ack control {control.id}"):
             sink.ack(self._external_id, control.id, status=status, note=note)
+
+    def close(self) -> None:
+        """Send whatever is queued and release the telemetry connection.
+
+        Called once at the end of a run: a multi-arm process opens a sink per arm, and leaving them
+        open holds an idle connection pool per finished run.
+        """
+        self._flush()
+        sink = self._sink
+        if sink is None:
+            return
+        with self._quiet("could not release the telemetry connection"):
+            sink.close()
 
     def _warn(self, message: str) -> None:
         """One warning per run, then silence: a broken platform must not flood a run's log."""
@@ -425,13 +545,18 @@ class GridEmitter(_Reporter):
         *,
         external_id: str,
         band: int,
+        arm: str,
         snapshot: Callable[[], GridSnapshot] | None = None,
         flush_cells: int = CELL_BATCH_CAP,
         flush_seconds: float = HEARTBEAT_INTERVAL_S,
         queue_limit: int = QUEUE_LIMIT,
     ) -> None:
-        super().__init__(sink, external_id, queue_limit=queue_limit)
+        """Build the emitter directly. Most callers want `create`, which resolves the sink."""
+        # `top_band` is this writer's own band: its heartbeats and terminal status descend from that
+        # ceiling, so a resume has to rebase that walk too or it re-issues the same seqs.
+        super().__init__(sink, external_id, queue_limit=queue_limit, top_band=band)
         self._band = band
+        self._arm = arm
         self._snapshot = snapshot
         self._flush_cells = flush_cells
         self._flush_seconds = flush_seconds
@@ -476,6 +601,7 @@ class GridEmitter(_Reporter):
             _open(external_id, factory, requested=requested),
             external_id=external_id,
             band=band,
+            arm=arm,
             snapshot=snapshot,
             flush_cells=flush_cells,
             flush_seconds=flush_seconds,
@@ -483,14 +609,14 @@ class GridEmitter(_Reporter):
 
     @property
     def arm(self) -> str:
-        """The arm this emitter reports, out of its run name (`<grid relpath>/<arm>`).
+        """The arm this emitter reports.
 
-        Exposed because one process walks several arms in turn while each arm is its own run: a
-        caller with a ledger line in hand has to be able to check it belongs to THIS run before
-        reporting it, or a sibling arm's line lands in the wrong run at a seq that collides with
-        this arm's own.
+        The name it was CONSTRUCTED with, not one parsed back out of the run id: an arm whose name
+        contains a slash would split differently coming back, and this value is what the runner
+        compares a ledger line's arm against before reporting it. A mismatch there would file a
+        sibling arm's line under the wrong run at a colliding seq.
         """
-        return self.external_id.rsplit("/", 1)[-1]
+        return self._arm
 
     @property
     def stop_requested(self) -> bool:
@@ -508,10 +634,10 @@ class GridEmitter(_Reporter):
         self._resume()
         self._emit_at(
             RUN_META_SEQ,
-            RunEventType.RUN_META.value,
+            RunEventType.RUN_META,
             created,
             {
-                "kind": RunKind.GRID_ARM.value,
+                "kind": RunKind.GRID_ARM,
                 "benchmark": world_model,
                 "arm": self.arm,
                 "world_model": world_model,
@@ -559,7 +685,7 @@ class GridEmitter(_Reporter):
             for start in range(0, len(cells), CELL_BATCH_CAP):
                 self._emit(
                     band,
-                    RunEventType.CELL_BATCH.value,
+                    RunEventType.CELL_BATCH,
                     ts,
                     {"cells": cells[start : start + CELL_BATCH_CAP]},
                 )
@@ -581,18 +707,18 @@ class GridEmitter(_Reporter):
                 platform keeps one copy of it rather than three.
         """
         self.send_cells()
-        self._emit_at(ledger_walk_seq(position), LEDGER_LINE_TYPE, ts, dict(line))
+        self._emit_at(ledger_walk_seq(position), LEDGER_LINE, ts, dict(line))
         self._heartbeat(force=True)
         self._handle(self._flush())
 
-    def on_status(self, status: RunLifecycle, *, error: str | None = None) -> None:
+    def on_status(self, status: RunStatus, *, error: str | None = None) -> None:
         """The run's terminal transition. Sends buffered cells first, so none are lost."""
         self.send_cells()
         finished_at = now_iso()
         payload: JsonObject = {"status": status, "finished_at": finished_at}
         if error is not None:
             payload["error"] = error
-        self._emit_from_top(self._band, RunEventType.RUN_STATUS.value, finished_at, payload)
+        self._emit_from_top(self._band, RunEventType.RUN_STATUS, finished_at, payload)
         self._flush()
         for control in self._stop_control:
             self._ack(control, status=ACK_DONE, note=f"run {status}")
@@ -614,7 +740,7 @@ class GridEmitter(_Reporter):
         # re-derived, and descending keeps it clear of the ascending derived walk below it.
         self._emit_from_top(
             self._band,
-            RunEventType.HEARTBEAT.value,
+            RunEventType.HEARTBEAT,
             now_iso(),
             {
                 "progress": {
@@ -666,6 +792,7 @@ class PipelineEmitter(_Reporter):
     """
 
     def __init__(self, sink: RunsSink | None, *, external_id: str) -> None:
+        """Build the emitter directly. Most callers want `create`, which resolves the sink."""
         super().__init__(sink, external_id)
         self._stages_done = 0
 
@@ -691,19 +818,25 @@ class PipelineEmitter(_Reporter):
         """
         self._resume()
         started_at = now_iso()
+        # Seq 1 is the declaration's, reserved. Without moving the ascending walk past it the first
+        # ALLOCATED event (the running transition, below) takes seq 1 as well and the platform
+        # discards it, so a fresh run never records that it started.
+        self._bands.resume_at(RUN_LEVEL_BAND, RUN_META_SEQ + 1)
         self._emit_at(
             RUN_META_SEQ,
-            RunEventType.RUN_META.value,
+            RunEventType.RUN_META,
             started_at,
             {
-                "kind": RunKind.PIPELINE.value,
+                "kind": RunKind.PIPELINE,
                 "benchmark": world_model,
                 "world_model": world_model,
                 "config": config,
                 "started_at": started_at,
             },
         )
-        self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS.value, started_at, {"status": "running"})
+        self._emit(
+            RUN_LEVEL_BAND, RunEventType.RUN_STATUS, started_at, {"status": RunStatus.RUNNING}
+        )
         self._flush()
 
     def stage_running(self, stage: Stage) -> None:
@@ -711,7 +844,7 @@ class PipelineEmitter(_Reporter):
         started_at = now_iso()
         self._emit(
             RUN_LEVEL_BAND,
-            RunEventType.STAGE_UPSERT.value,
+            RunEventType.STAGE_UPSERT,
             started_at,
             {"stage": stage.value, "status": "running", "started_at": started_at},
         )
@@ -725,7 +858,7 @@ class PipelineEmitter(_Reporter):
         """
         self._emit(
             RUN_LEVEL_BAND,
-            RunEventType.STAGE_UPSERT.value,
+            RunEventType.STAGE_UPSERT,
             now_iso(),
             {"stage": stage.value, "status": "skipped", "artifact": {"reason": reason}},
         )
@@ -740,7 +873,7 @@ class PipelineEmitter(_Reporter):
         self._stages_done += 1
         self._emit(
             RUN_LEVEL_BAND,
-            RunEventType.STAGE_UPSERT.value,
+            RunEventType.STAGE_UPSERT,
             record.completed_at,
             {
                 "stage": record.stage.value,
@@ -768,7 +901,7 @@ class PipelineEmitter(_Reporter):
         """
         self._emit(
             RUN_LEVEL_BAND,
-            RunEventType.HEARTBEAT.value,
+            RunEventType.HEARTBEAT,
             now_iso(),
             {
                 "progress": {
@@ -781,11 +914,11 @@ class PipelineEmitter(_Reporter):
         )
         self._flush()
 
-    def finished(self, status: RunLifecycle, *, error: str | None = None) -> None:
+    def finished(self, status: RunStatus, *, error: str | None = None) -> None:
         """The run's terminal transition: completed, failed, or stopped by the spend cap."""
         finished_at = now_iso()
         payload: JsonObject = {"status": status, "finished_at": finished_at}
         if error is not None:
             payload["error"] = error
-        self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS.value, finished_at, payload)
+        self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS, finished_at, payload)
         self._flush()

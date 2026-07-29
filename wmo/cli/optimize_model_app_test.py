@@ -1607,6 +1607,9 @@ def test_the_run_reports_its_stages_to_the_platform(
         ) -> JsonObject:
             return {}
 
+        def close(self) -> None:
+            """No-op: this double owns no connection pool."""
+
     monkeypatch.setattr(
         hooks_module, "runs_sink", lambda: RunsSink(Transport(), org_id="org-1", emitter_id="test")
     )
