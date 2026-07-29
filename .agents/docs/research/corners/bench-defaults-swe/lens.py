@@ -43,9 +43,14 @@ directory would let a later cohort's arm be swept into the same figure, which is
 cells-measured-under-two-harnesses error the runner's cohort discipline exists to prevent.
 """
 
+# The SPEC has to live at corners/<name>/lens.py, because that is where `load_lens` looks, but
+# the master's agreed home for this program's deliverables is
+# .agents/docs/research/bench-defaults/<bench>/, so `corner_dir` points the OUTPUTS there.
+# numbers.json and figures/ therefore land beside the other bench-defaults artifacts while the
+# declarative spec stays discoverable by the shared runner.
 LENS = LensSpec(
     name="bench-defaults-swe",
-    corner_dir="bench-defaults-swe",
+    corner_dir="../bench-defaults/swe",
     dataset_root=str(main_checkout() / ".wmo" / "jt" / "bench-defaults" / "swe" / COHORT),
     dataset_label="swe-bench-verified-real",
     judge_label="swe-bench test suite (deterministic verifier; FAIL_TO_PASS + PASS_TO_PASS)",
