@@ -270,7 +270,6 @@ def main() -> int:
     selected = _selected(_read_rows(rows_path))
     outcomes = [ScenarioOutcome.model_validate(row) for row in selected]
     matrix = OutcomeMatrix(pool=real_matrix.pool, outcomes=outcomes)
-    matrix.save(matrix_path)
     gradeable = sum(row.reward is not None for row in outcomes)
     all_attempts = _read_rows(rows_path)
     wm_cost = sum(
@@ -301,24 +300,39 @@ def main() -> int:
         args.out_dir / "summary.json",
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
     )
-    with args.spend_ledger.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "phase": "world-model",
-                    "benchmark": "routerbench",
-                    "provider_role": "world-model-serve",
-                    "model": "azure-gpt-5.5",
-                    "run": str(args.out_dir),
-                    "realized_usd": wm_cost,
-                    "cells": len(outcomes),
-                    "source": str(rows_path),
-                },
-                sort_keys=True,
-            )
-            + "\n"
+    ledger_row = {
+        "phase": "world-model",
+        "benchmark": "routerbench",
+        "provider_role": "world-model-serve",
+        "model": "azure-gpt-5.5",
+        "run": str(args.out_dir),
+        "realized_usd": wm_cost,
+        "cells": len(outcomes),
+        "source": str(rows_path),
+    }
+    ledger_key = (
+        ledger_row["phase"],
+        ledger_row["benchmark"],
+        ledger_row["provider_role"],
+        ledger_row["model"],
+        ledger_row["run"],
+    )
+    existing_keys = {
+        (
+            str(row.get("phase")),
+            str(row.get("benchmark")),
+            str(row.get("provider_role")),
+            str(row.get("model")),
+            str(row.get("run")),
         )
-        handle.flush()
+        for row in _read_rows(args.spend_ledger)
+    }
+    if ledger_key not in existing_keys:
+        with args.spend_ledger.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(ledger_row, sort_keys=True) + "\n")
+            handle.flush()
+    # Completion sentinel, written only after summary and idempotent spend accounting.
+    matrix.save(matrix_path)
     return 0 if gradeable == expected else 1
 
 

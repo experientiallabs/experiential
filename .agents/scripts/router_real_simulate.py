@@ -146,6 +146,20 @@ def _append_ledger(
     world_model_usage_paths: list[Path],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_keys: set[tuple[str, str, str, str, str]] = set()
+    if path.is_file():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            value = json.loads(raw)
+            if isinstance(value, dict):
+                existing_keys.add(
+                    (
+                        str(value.get("phase")),
+                        str(value.get("benchmark")),
+                        str(value.get("provider_role")),
+                        str(value.get("model")),
+                        str(value.get("run")),
+                    )
+                )
     lines = []
     for model in matrix.model_names():
         rows = [row for row in matrix.outcomes if row.model == model]
@@ -179,8 +193,18 @@ def _append_ledger(
     )
     with path.open("a", encoding="utf-8") as handle:
         for line in lines:
+            key = (
+                str(line.get("phase")),
+                str(line.get("benchmark")),
+                str(line.get("provider_role")),
+                str(line.get("model")),
+                str(line.get("run")),
+            )
+            if key in existing_keys:
+                continue
             handle.write(json.dumps(line, sort_keys=True) + "\n")
             handle.flush()
+            existing_keys.add(key)
 
 
 def _retry_plan(
@@ -450,7 +474,6 @@ def main() -> int:
         current[(row.model, row.scenario_id, row.episode)] for row in canonical_rows
     ]
     matrix = OutcomeMatrix(pool=initial.matrix.pool, outcomes=canonical_rows)
-    matrix.save(matrix_path)
     summary = {
         "benchmark": args.benchmark,
         "phase": "world-model",
@@ -480,6 +503,9 @@ def main() -> int:
         world_model_usd=world_model_usd,
         world_model_usage_paths=world_model_usage_paths,
     )
+    # This is the completion sentinel and is deliberately last: a restart that sees it knows
+    # attempts, accounting, summary, and the idempotent spend ledger were all persisted first.
+    matrix.save(matrix_path)
     return 0
 
 
