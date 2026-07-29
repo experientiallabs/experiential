@@ -22,6 +22,7 @@ from real_episodes import (
     ProtocolPins,
     RealEpisodeRow,
     Tau2Results,
+    Tau2RewardInfo,
     Tau2SimulationInfo,
     agent_llm_args,
     append_rows,
@@ -487,6 +488,42 @@ def test_rows_written_before_the_error_field_still_load(tmp_path: Path) -> None:
     [reloaded] = load_rows(path)
     assert reloaded.error is None
     assert reloaded.reward == 1.0
+
+
+def test_row_carries_the_reward_components_not_just_the_total(tmp_path: Path) -> None:
+    # The real shape of a correct-inaction airline task: the DB check passes because the database
+    # is unchanged, and COMMUNICATE contributes full credit while reporting it had nothing to
+    # evaluate. A 1.0 built this way is not the same measurement as a 1.0 a candidate had to act
+    # for, so the parts travel with the total.
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].reward_info = Tau2RewardInfo.model_validate(
+        {
+            "reward": 1.0,
+            "reward_basis": ["DB", "COMMUNICATE"],
+            "reward_breakdown": {"DB": 1.0, "COMMUNICATE": 1.0},
+            "info": {
+                "communicate": {"note": "No communicate_info to evaluate"},
+                "action": {"note": "No actions to evaluate"},
+                "env": None,
+            },
+        }
+    )
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.reward == 1.0
+    assert row.reward_basis == ["DB", "COMMUNICATE"]
+    assert row.reward_breakdown == {"DB": 1.0, "COMMUNICATE": 1.0}
+    assert row.vacuous_components == ["action", "communicate"]
+
+
+def test_a_fully_evaluated_episode_reports_no_vacuous_components(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(0.5)
+    payload.simulations[0].reward_info = Tau2RewardInfo.model_validate(
+        {"reward": 0.5, "reward_basis": ["DB"], "reward_breakdown": {"DB": 0.5}, "info": {}}
+    )
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.vacuous_components == []
 
 
 def test_matrix_carries_cost_and_latency(tmp_path: Path) -> None:

@@ -253,10 +253,34 @@ class Tau2Message(BaseModel):
         return self.content if isinstance(self.content, str) else ""
 
 
+class Tau2CheckInfo(BaseModel):
+    """tau2's per-component commentary. A `note` is how it reports a check it could not apply."""
+
+    note: str | None = None
+
+
 class Tau2RewardInfo(BaseModel):
-    """tau2's verdict. `reward` is None only when tau2 could not score the episode."""
+    """tau2's verdict. `reward` is None only when tau2 could not score the episode.
+
+    The components matter as much as the total. A task whose correct behavior is INACTION scores
+    its DB check by the database being unchanged, which any agent that does nothing satisfies, and
+    a component tau2 cannot apply is reported with a note while still contributing full credit to
+    the breakdown. Keeping the basis, the breakdown, and the notes is what lets analysis separate
+    credit a candidate earned from credit the task handed out.
+    """
 
     reward: float | None = None
+    reward_basis: list[str] = []
+    reward_breakdown: dict[str, float | None] = {}
+    info: dict[str, Tau2CheckInfo | None] = {}
+
+    def vacuous_components(self) -> list[str]:
+        """The scored components tau2 reported it had nothing to evaluate."""
+        return sorted(
+            name
+            for name, check in self.info.items()
+            if check is not None and check.note and "no " in check.note.lower()
+        )
 
 
 class Tau2SimulationInfo(BaseModel):
@@ -311,6 +335,13 @@ class RealEpisodeRow(BaseModel):
     episode: int
     reward: float | None  # None = unscored (infrastructure failure), never treated as 0
     nl_assertion_reward: bool
+    # tau2's scoring components for this episode, so a total can be audited against its parts.
+    # A reward of 1.0 on a correct-inaction task with a vacuous COMMUNICATE check is not the same
+    # measurement as a reward of 1.0 on a task the candidate had to act to solve, and only the
+    # breakdown distinguishes them.
+    reward_basis: list[str] = []
+    reward_breakdown: dict[str, float | None] = {}
+    vacuous_components: list[str] = []
     termination_reason: str
     # WHY an unscored episode has no reward. tau2 collapses every failure into the single
     # termination_reason "infrastructure_error", which merges two cases analysis must keep
@@ -743,6 +774,11 @@ def rows_from_results(
                 episode=episode,
                 reward=sim.reward_info.reward if sim.reward_info is not None else None,
                 nl_assertion_reward=scenario.nl_assertion_reward,
+                reward_basis=sim.reward_info.reward_basis if sim.reward_info else [],
+                reward_breakdown=sim.reward_info.reward_breakdown if sim.reward_info else {},
+                vacuous_components=(
+                    sim.reward_info.vacuous_components() if sim.reward_info else []
+                ),
                 termination_reason=sim.termination_reason,
                 error=error,
                 error_type=error_type,
@@ -1201,12 +1237,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 done.update(row.key for row in batch)
                 spent += spend_usd(batch)
                 scored = [row.reward for row in batch if row.reward is not None]
+                # The mean is over SCORED episodes only, so it has to be printed next to how many
+                # there were. An arm that loses most of its episodes and aces the survivors reads
+                # as a perfect arm otherwise: qwen3.5-9b's first airline batch logged a mean of
+                # 1.000 while 4 of its 7 episodes had died unscored.
                 logger.info(
-                    "  -> %d sims, mean reward %s, running total $%.2f",
+                    "  -> %d/%d scored, mean reward %s, running total $%.2f",
+                    len(scored),
                     len(batch),
                     f"{sum(scored) / len(scored):.3f}" if scored else "n/a",
                     spent,
                 )
+                unscored = [row for row in batch if row.reward is None]
+                if unscored:
+                    reasons = sorted({row.error_type or row.termination_reason for row in unscored})
+                    logger.warning(
+                        "     %d unscored: %s", len(unscored), ", ".join(reasons) or "unreported"
+                    )
 
     if args.dry_run:
         logger.info("dry run: nothing executed, nothing spent")
