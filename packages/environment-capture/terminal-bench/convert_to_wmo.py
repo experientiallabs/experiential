@@ -71,17 +71,32 @@ def _task_text(steps: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _observation_contents(step: dict[str, Any], n_calls: int) -> list[tuple[str, bool]]:
-    """One (content, is_error) per tool call, padded when the episode was cut short."""
-    results = (step.get("observation") or {}).get("results") or []
-    out: list[tuple[str, bool]] = []
-    for index in range(n_calls):
-        if index < len(results):
-            result = results[index] or {}
-            out.append((str(result.get("content") or ""), bool(result.get("is_error"))))
-        else:
-            out.append(("", False))
-    return out
+def _step_pairs(step: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+    """This step's (action arguments, observation content) pairs, honestly paired.
+
+    Measured on real terminus-2 trajectories (9.7k steps): ~52% of steps map results to
+    tool calls 1:1 by `source_call_id`; the rest carry FEWER results than calls with
+    `source_call_id: None` - terminus-2 merged the whole step's terminal output into one
+    observation. Index-wise pairing mispairs that second class (the first call gets the
+    merged output, the rest get nothing), so: pair by id when every call has a match,
+    otherwise emit ONE pair for the step - all calls' arguments as the action, the
+    concatenated results as the observation - because that is what actually executed.
+    ATIF results carry no error flag; failures live in-band in the terminal output.
+    """
+    calls = step.get("tool_calls") or []
+    results = [r for r in ((step.get("observation") or {}).get("results") or []) if r]
+    if not calls:
+        return []
+    by_id = {r.get("source_call_id"): r for r in results if r.get("source_call_id")}
+    if len(by_id) == len(results) and all(c.get("tool_call_id") in by_id for c in calls):
+        return [
+            (c.get("arguments") or {}, str(by_id[c["tool_call_id"]].get("content") or ""))
+            for c in calls
+        ]
+    merged = "\n".join(str(r.get("content") or "") for r in results)
+    if len(calls) == 1:
+        return [(calls[0].get("arguments") or {}, merged)]
+    return [({"calls": [c.get("arguments") or {} for c in calls]}, merged)]
 
 
 def spans_for_trial(trial_dir: Path, *, benchmark: str) -> list[dict[str, Any]]:
@@ -113,15 +128,13 @@ def spans_for_trial(trial_dir: Path, *, benchmark: str) -> list[dict[str, Any]]:
     for step in steps:
         if step.get("source") != "agent":
             continue
-        tool_calls = step.get("tool_calls") or []
-        observations = _observation_contents(step, len(tool_calls))
-        for call, (content, is_error) in zip(tool_calls, observations, strict=True):
-            name = str(call.get("function_name") or "bash_command")
+        name = str((step.get("tool_calls") or [{}])[0].get("function_name") or "bash_command")
+        for arguments, content in _step_pairs(step):
             action_attrs = [
                 _attr("gen_ai.operation.name", "chat"),
                 _attr("gen_ai.request.model", model or "terminal-agent"),
                 _attr("gen_ai.tool.name", name),
-                _attr("gen_ai.tool.call.arguments", json.dumps(call.get("arguments") or {})),
+                _attr("gen_ai.tool.call.arguments", json.dumps(arguments)),
             ]
             if ordinal == 0 and task_text:
                 action_attrs.append(_attr("gen_ai.prompt", task_text))
@@ -144,7 +157,7 @@ def spans_for_trial(trial_dir: Path, *, benchmark: str) -> list[dict[str, Any]]:
                 "name": "execute_tool terminal",
                 "startTimeUnixNano": ordinal * 10 + 2,
                 "endTimeUnixNano": ordinal * 10 + 3,
-                "status": {"code": "STATUS_CODE_ERROR" if is_error else "STATUS_CODE_OK"},
+                "status": {"code": "STATUS_CODE_OK"},
                 "attributes": [
                     _attr("gen_ai.operation.name", "execute_tool"),
                     _attr("gen_ai.tool.name", name),
