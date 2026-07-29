@@ -416,6 +416,11 @@ def litellm_route(entry: PoolEntry) -> str:
         config = entry.provider_config()
         deployment = config.deployment or entry.model
         endpoint = config.endpoint or ""
+        # Foundry's unified v1 endpoint already includes /openai/v1 and speaks the direct
+        # OpenAI protocol. LiteLLM's azure_ai route would append /models/chat/completions,
+        # producing a nonexistent /openai/v1/models/chat/completions path.
+        if endpoint.rstrip("/").endswith("/openai/v1"):
+            return f"openai/{deployment}"
         if _AZURE_AI_HOST in endpoint:
             return f"azure_ai/{deployment}"
         if _AZURE_OPENAI_HOST in endpoint:

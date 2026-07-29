@@ -192,6 +192,18 @@ def test_litellm_route_splits_the_two_azure_families() -> None:
     assert litellm_route(_ANTHROPIC) == "anthropic/claude-fable-5"
 
 
+def test_foundry_unified_v1_uses_direct_openai_route_and_credentials(
+    tmp_path: Path,
+) -> None:
+    unified = _AZURE_AI.model_copy(
+        update={"endpoint": "https://example.services.ai.azure.com/openai/v1"}
+    )
+    assert litellm_route(unified) == "openai/FW-GLM-5.2"
+    env = build_env(tmp_path, unified, _AZURE_OPENAI, _ENVIRON)
+    assert env["OPENAI_API_BASE"].endswith("/openai/v1")
+    assert env["OPENAI_API_KEY"] == "silen-key"
+
+
 def test_unrecognized_azure_endpoint_is_refused() -> None:
     # Guessing the family would send the call to the wrong service with the wrong credential
     # variable and surface as an opaque 401 inside tau2.
