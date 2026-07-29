@@ -118,6 +118,22 @@ def _cell_and_model(
     for seed in SEEDS:
         sim_cells = _cells(simulated[seed])
         keys = sorted(set(real_cells) & set(sim_cells))
+        real_models = real.model_names()
+        coverage_by_model = {}
+        for model in real_models:
+            real_model_keys = {key for key in real_cells if key[1] == model}
+            simulated_model_keys = {key for key in sim_cells if key[1] == model}
+            paired_model_keys = real_model_keys & simulated_model_keys
+            coverage_by_model[model] = {
+                "real_gradeable": len(real_model_keys),
+                "simulated_gradeable": len(simulated_model_keys),
+                "paired_cells": len(paired_model_keys),
+                "paired_coverage_of_real": (
+                    len(paired_model_keys) / len(real_model_keys)
+                    if real_model_keys
+                    else None
+                ),
+            }
         actual = [real_cells[key][0] for key in keys]
         predicted = [sim_cells[key][0] for key in keys]
         fp = sum(p >= 0.5 and a < 0.5 for a, p in zip(actual, predicted, strict=True))
@@ -143,7 +159,10 @@ def _cell_and_model(
         seed_rows.append(
             {
                 "seed": seed,
+                "real_gradeable": len(real_cells),
+                "simulated_gradeable": len(sim_cells),
                 "paired_cells": len(keys),
+                "paired_coverage_of_real": len(keys) / len(real_cells),
                 "binary_agreement": statistics.mean(
                     float((a >= 0.5) == (p >= 0.5))
                     for a, p in zip(actual, predicted, strict=True)
@@ -188,6 +207,7 @@ def _cell_and_model(
         model_rows.append(
             {
                 "seed": seed,
+                "coverage_by_model": coverage_by_model,
                 "quality_spearman": _rank_corr(real_quality, sim_quality, "spearman"),
                 "quality_kendall": _rank_corr(real_quality, sim_quality, "kendall"),
                 "cost_spearman": _rank_corr(real_cost, sim_cost, "spearman"),
