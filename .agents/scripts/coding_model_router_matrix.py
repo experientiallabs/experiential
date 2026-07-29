@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import threading
@@ -40,17 +41,13 @@ RETRY_DELAYS_S = (15, 60)
 # realized usage is persisted.
 CELL_SPEND_RESERVATION_USD = 500.0
 E2B_ACCOUNT_CAP = 100
-SCAFFOLD_STOPS = frozenset(
+SMOKE_TASKS = ("break-filter-js-from-html", "log-summary-date-ranges")
+SMOKE_ARMS = ("oai-luna-high", "ant-haiku45")
+INFRASTRUCTURE_STOPS = frozenset(
     {
-        "budget",
         "error",
-        "max_turns",
-        "no_action",
-        "no_tool_call",
-        "output_truncated",
         "provider_error",
         "unknown_done_reason",
-        "unparsed_tool_call",
     }
 )
 
@@ -190,9 +187,11 @@ def _wall_seconds(artifact_dir: Path) -> float:
 def _failure_class(cell: ScoreCell, stop_reason: str) -> str:
     if cell.infra_failed:
         return "infrastructure"
-    if stop_reason in SCAFFOLD_STOPS or stop_reason.startswith("agent-exception:"):
-        return "scaffold"
-    return "" if cell.reward == 1.0 else "task_failure"
+    if stop_reason in INFRASTRUCTURE_STOPS or stop_reason.startswith("agent-exception:"):
+        return "infrastructure"
+    if cell.reward == 1.0:
+        return ""
+    return "task_failure" if stop_reason == "submitted" else "agent_failure"
 
 
 def _trace_error(trace: dict[str, object]) -> str:
@@ -231,12 +230,10 @@ def _outcome(
     stop = trace.get("stop_reason")
     stop_reason = stop if isinstance(stop, str) else ""
     failure_class = _failure_class(cell, stop_reason)
-    metering_error = (
-        "" if cell.infra_failed or _known_pre_worker_failure(trace) else usage_metering_error(usage)
-    )
+    metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
     if metering_error:
         failure_class = "metering"
-    ungradeable = cell.infra_failed or failure_class in {"scaffold", "metering"}
+    ungradeable = failure_class in {"infrastructure", "metering"}
     return ScenarioOutcome(
         scenario_id=f"{benchmark}:{cell.task_id}",
         task=instruction if isinstance(instruction, str) else cell.task_id,
@@ -260,13 +257,13 @@ def _outcome(
         wall_seconds=_wall_seconds(artifact_dir),
         completion_status=(
             "infrastructure_failure"
-            if cell.infra_failed
-            else "scaffold_failure"
-            if failure_class == "scaffold"
+            if failure_class == "infrastructure"
             else "metering_failure"
             if failure_class == "metering"
             else "scored_pass"
             if cell.passed
+            else "scored_agent_failure"
+            if failure_class == "agent_failure"
             else "scored_failure"
         ),
         failure_class=failure_class,
@@ -577,6 +574,101 @@ def _preflight(root: Path, pool: ModelPool) -> None:
     )
 
 
+def _require_valid_smoke(root: Path) -> None:
+    """Prove the one integrated smoke passed before a material matrix can launch."""
+    smoke_root = root / "smoke"
+    invalidated = smoke_root / "invalidated.json"
+    if invalidated.is_file():
+        status = _read_object(invalidated)
+        if status.get("valid") is False:
+            raise ValueError(
+                "material paid sweep is disabled: the single integrated smoke is invalid; "
+                "an explicitly authorized replacement smoke must pass first"
+            )
+    required = (
+        smoke_root / "outcomes.json",
+        smoke_root / "smoke-report.json",
+        smoke_root / "resume-proof.json",
+        smoke_root / "policy" / "policy.json",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise ValueError(f"material paid sweep is disabled: smoke evidence is missing {missing}")
+
+    matrix = OutcomeMatrix.load(required[0])
+    scored = [outcome for outcome in matrix.outcomes if outcome.reward is not None]
+    expected = {
+        (f"terminal-bench-2:{task_id}", arm) for task_id in SMOKE_TASKS for arm in SMOKE_ARMS
+    }
+    observed = {(outcome.scenario_id, outcome.model) for outcome in scored}
+    if len(scored) != len(expected) or observed != expected:
+        raise ValueError(
+            "material paid sweep is disabled: smoke matrix does not contain exactly one "
+            "gradeable OpenAI and Anthropic result for both frozen tasks"
+        )
+    for outcome in scored:
+        call_lengths = {
+            len(outcome.call_seconds),
+            len(outcome.call_input_tokens),
+            len(outcome.call_output_tokens),
+            len(outcome.call_cached_input_tokens),
+            len(outcome.call_cache_write_input_tokens),
+        }
+        if len(call_lengths) != 1 or 0 in call_lengths:
+            raise ValueError(
+                f"material paid sweep is disabled: {outcome.scenario_id} x {outcome.model} "
+                "has incomplete per-call usage"
+            )
+        if (
+            any(
+                input_tokens + output_tokens <= 0
+                for input_tokens, output_tokens in zip(
+                    outcome.call_input_tokens,
+                    outcome.call_output_tokens,
+                    strict=True,
+                )
+            )
+            or outcome.usage.input_tokens != sum(outcome.call_input_tokens)
+            or outcome.usage.output_tokens != sum(outcome.call_output_tokens)
+            or outcome.usage.cached_input_tokens != sum(outcome.call_cached_input_tokens)
+            or outcome.usage.cache_write_input_tokens != sum(outcome.call_cache_write_input_tokens)
+        ):
+            raise ValueError(
+                f"material paid sweep is disabled: {outcome.scenario_id} x {outcome.model} "
+                "has inconsistent token totals"
+            )
+        artifact = Path(outcome.artifact_dir)
+        if not (artifact / "result.json").is_file():
+            raise ValueError(
+                f"material paid sweep is disabled: {outcome.scenario_id} x {outcome.model} "
+                "has no preserved official Harbor result"
+            )
+
+    report = _read_object(required[1])
+    resume = _read_object(required[2])
+    spend = sum(outcome.cost_usd for outcome in scored)
+    report_spend = report.get("model_spend_usd")
+    if (
+        report.get("gradeable_cells") != 4
+        or report.get("fit_task") != SMOKE_TASKS[0]
+        or report.get("heldout_task") != SMOKE_TASKS[1]
+        or not isinstance(report_spend, (int, float))
+        or isinstance(report_spend, bool)
+        or not math.isclose(float(report_spend), spend, rel_tol=1e-9, abs_tol=1e-12)
+    ):
+        raise ValueError("material paid sweep is disabled: smoke fit/replay report is inconsistent")
+    resumed_cells = resume.get("resumed_cells")
+    if (
+        resume.get("unchanged") is not True
+        or not isinstance(resumed_cells, int)
+        or isinstance(resumed_cells, bool)
+        or resumed_cells < 1
+    ):
+        raise ValueError(
+            "material paid sweep is disabled: smoke resume behavior was not demonstrated"
+        )
+
+
 def _run(
     root: Path,
     *,
@@ -688,6 +780,7 @@ def main() -> None:
             "material paid sweep is disabled: record a positive user-authorized "
             "spend_ceiling_usd in freeze-summary.json"
         )
+    _require_valid_smoke(args.root)
     _run(
         args.root,
         pool=pool,

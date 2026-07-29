@@ -39,17 +39,11 @@ ARMS = ("oai-luna-high", "ant-haiku45")
 MAX_LOGICAL_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
 SMOKE_MODEL_SPEND_CAP_USD = 10.0
-SCAFFOLD_STOPS = frozenset(
+INFRASTRUCTURE_STOPS = frozenset(
     {
-        "budget",
         "error",
-        "max_turns",
-        "no_action",
-        "no_tool_call",
-        "output_truncated",
         "provider_error",
         "unknown_done_reason",
-        "unparsed_tool_call",
     }
 )
 
@@ -109,9 +103,11 @@ def _wall_seconds(artifact_dir: Path) -> float:
 def _failure_class(cell: ScoreCell, stop_reason: str) -> str:
     if cell.infra_failed:
         return "infrastructure"
-    if stop_reason in SCAFFOLD_STOPS or stop_reason.startswith("agent-exception:"):
-        return "scaffold"
-    return "" if cell.reward == 1.0 else "task_failure"
+    if stop_reason in INFRASTRUCTURE_STOPS or stop_reason.startswith("agent-exception:"):
+        return "infrastructure"
+    if cell.reward == 1.0:
+        return ""
+    return "task_failure" if stop_reason == "submitted" else "agent_failure"
 
 
 def _trace_error(trace: dict[str, object]) -> str:
@@ -149,12 +145,10 @@ def _outcome(
     stop = trace.get("stop_reason")
     stop_reason = stop if isinstance(stop, str) else ""
     failure_class = _failure_class(cell, stop_reason)
-    metering_error = (
-        "" if cell.infra_failed or _known_pre_worker_failure(trace) else usage_metering_error(usage)
-    )
+    metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
     if metering_error:
         failure_class = "metering"
-    ungradeable = cell.infra_failed or failure_class in {"scaffold", "metering"}
+    ungradeable = failure_class in {"infrastructure", "metering"}
     return ScenarioOutcome(
         scenario_id=_scenario_id(cell.task_id),
         task=instruction if isinstance(instruction, str) else cell.task_id,
@@ -178,13 +172,13 @@ def _outcome(
         wall_seconds=_wall_seconds(artifact_dir),
         completion_status=(
             "infrastructure_failure"
-            if cell.infra_failed
-            else "scaffold_failure"
-            if failure_class == "scaffold"
+            if failure_class == "infrastructure"
             else "metering_failure"
             if failure_class == "metering"
             else "scored_pass"
             if cell.passed
+            else "scored_agent_failure"
+            if failure_class == "agent_failure"
             else "scored_failure"
         ),
         failure_class=failure_class,
@@ -437,13 +431,13 @@ def _normalize_existing_ungradeable_attempts(
             completion_status = "metering_failure"
             error = metering_error
         elif (
-            outcome.failure_class == "scaffold"
-            or stop_reason in SCAFFOLD_STOPS
+            outcome.failure_class in {"scaffold", "infrastructure"}
+            or stop_reason in INFRASTRUCTURE_STOPS
             or stop_reason.startswith("agent-exception:")
         ):
-            failure_class = "scaffold"
-            completion_status = "scaffold_failure"
-            error = _trace_error(trace) or "scaffold stopped before grading"
+            failure_class = "infrastructure"
+            completion_status = "infrastructure_failure"
+            error = _trace_error(trace) or "infrastructure stopped before grading"
         else:
             continue
         if (
@@ -476,10 +470,77 @@ def _normalize_existing_ungradeable_attempts(
 def _artifact_digest(path: str) -> str:
     root = Path(path)
     digest = hashlib.sha256()
+    if root.is_file():
+        digest.update(root.read_bytes())
+        return digest.hexdigest()
     for item in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
         digest.update(str(item.relative_to(root)).encode())
         digest.update(item.read_bytes())
     return digest.hexdigest()
+
+
+def _quarantine_derived_path(root: Path, path: Path) -> dict[str, str]:
+    """Move one stale derived artifact into a digest-addressed evidence directory."""
+    digest = _artifact_digest(str(path))
+    target = root / "invalid-derived" / f"{path.name}-{digest[:12]}"
+    if target.exists():
+        if _artifact_digest(str(target)) != digest:
+            raise RuntimeError(f"quarantine digest collision at {target}")
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(target))
+    return {
+        "original_path": str(path.resolve()),
+        "quarantined_path": str(target.resolve()),
+        "sha256": digest,
+    }
+
+
+def _invalidate_smoke_derivatives(root: Path, matrix: OutcomeMatrix) -> None:
+    """Quarantine fit/replay outputs when paid rows lack exact usage evidence."""
+    unknown = sorted(
+        (outcome for outcome in matrix.outcomes if outcome.failure_class == "metering"),
+        key=lambda row: (row.scenario_id, row.model, row.attempt_number),
+    )
+    if not unknown:
+        return
+    quarantine: list[dict[str, str]] = []
+    for name in ("policy", "smoke-report.json", "resume-proof.json"):
+        path = root / name
+        if path.exists():
+            quarantine.append(_quarantine_derived_path(root, path))
+    invalid_path = root / "invalidated.json"
+    prior = _read_object(invalid_path) if invalid_path.is_file() else {}
+    invalidated_at = prior.get("invalidated_at")
+    prior_quarantine: list[object] = []
+    raw_prior_quarantine = prior.get("quarantined_derived_artifacts")
+    if isinstance(raw_prior_quarantine, list):
+        prior_quarantine.extend(raw_prior_quarantine)
+    _write_json(
+        invalid_path,
+        {
+            "protocol": "coding-router-smoke-invalid-v1",
+            "valid": False,
+            "invalidated_at": (invalidated_at if isinstance(invalidated_at, str) else _utc_now()),
+            "reason": (
+                "paid model calls completed without provider usage; exact spend, token capture, "
+                "and the smoke cap cannot be proven"
+            ),
+            "paid_execution_allowed": False,
+            "unknown_cost_attempts": [
+                {
+                    "scenario_id": outcome.scenario_id,
+                    "model": outcome.model,
+                    "attempt_number": outcome.attempt_number,
+                    "artifact_dir": outcome.artifact_dir,
+                    "completion_status": outcome.completion_status,
+                    "model_cost_usd": None,
+                }
+                for outcome in unknown
+            ],
+            "quarantined_derived_artifacts": [*prior_quarantine, *quarantine],
+        },
+    )
 
 
 def _drop_duplicate_retry_noops(
@@ -657,6 +718,7 @@ def run(root: Path, template_path: Path, *, interrupt_after_cells: int | None) -
     matrix = _load_matrix(matrix_path, pool)
     matrix = _drop_duplicate_retry_noops(root, matrix_path, ledger_path, matrix)
     matrix = _normalize_existing_ungradeable_attempts(root, matrix_path, ledger_path, matrix)
+    _invalidate_smoke_derivatives(root, matrix)
     prior = [
         {
             "scenario_id": outcome.scenario_id,

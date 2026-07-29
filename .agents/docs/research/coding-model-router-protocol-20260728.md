@@ -1,6 +1,6 @@
 # Execution-scored coding-model router protocol
 
-Status: frozen before the first paid benchmark cell.
+Status: protocol frozen; the single smoke attempt is invalid and material paid work is stopped.
 
 Experiment ID: `coding-router-20260728`
 
@@ -140,6 +140,8 @@ The primary matrix uses one model attempt per task with the same harness, turn c
 wall timeout, and official verifier. Gradeable model failures are never retried. Only a missing
 environment, sandbox failure, transport loss before execution, or missing verifier reward is an
 infrastructure failure. It receives at most two fresh-sandbox retries after 15 and 60 seconds.
+Turn-cap exhaustion, budget exhaustion, no-action or no-tool-call termination, output truncation,
+and unparsed tool calls remain gradeable agent failures with the official verifier reward.
 
 Every attempt is retained. Every completed cell atomically persists reward, success, tokens,
 cache reads and writes, reasoning tokens, realized model cost, per-call latency, wall time, tool
@@ -161,12 +163,29 @@ resumed. The resumed run must retain byte-identical completed artifacts, finish 
 cells, fit a guarded hashing-1024 kNN plumbing policy on the fit task, and replay the held-out task.
 The smoke has a hard USD 10 inference cap and is not headline evidence.
 
-The no-spend task and provider preflight passed for all four cells. The paid gate is blocked on
-shared E2B capacity. At 2026-07-29 00:07 PDT the account reported 226 running sandboxes against
-the configured cap of 100, zero slots free, and no provably orphaned local sandbox eligible for
-safe reaping. A fresh check after the replacement worktree was created still returned a full
-100-sandbox first page plus additional pages. The experiment will not override the shared cap or
-kill account-wide work owned by another process.
+The no-spend task and provider preflight passed for all four cells. Shared E2B capacity later
+opened to 82 active sandboxes, so the one authorized smoke was launched.
+
+The four first attempts failed before provider execution because the configured Pi SSH runner had
+no accepted host key. They are preserved as known-zero infrastructure failures. Harbor then
+resumed two identical deterministic job directories without creating a sandbox or provider
+request. Those no-ops are excluded from the canonical attempt count and retained in
+`smoke/retry-noops.json`.
+
+Fresh attempt directories reached real model execution for two OpenAI cells and one Anthropic
+cell. The local Pi transport did not persist `worker_usage`, so their token counts and exact model
+cost cannot be reconstructed from the raw artifacts. The canonical outcome matrix marks all three
+as ungradeable `metering_failure` rows and the spend ledger records `model_cost_usd: null`.
+Derived fit, replay, and policy artifacts from the earlier incorrect zero-cost interpretation are
+quarantined by content digest and the smoke root carries `invalidated.json`.
+
+The transport now meters every request with per-call input, cached-input, cache-write, reasoning,
+output, and latency counters. It also preserves partial usage on failure. Both smoke and full
+matrix runners stop before another paid call if any completed attempt has unknown cost.
+
+This was the single smoke attempt permitted by the frozen protocol. It did not pass. No replacement
+smoke is authorized, and no material paid cell may launch without both an explicit replacement
+decision and a user-provided spend ceiling.
 
 ## Router search
 

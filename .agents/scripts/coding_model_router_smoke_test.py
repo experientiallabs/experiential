@@ -1,7 +1,8 @@
-"""Offline regression tests for coding-router scaffold-failure handling."""
+"""Offline regression tests for coding-router failure and evidence handling."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import pytest
 
 from wmo.harness.scoring import ScoreCell
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.providers.base import ProviderKind
+from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, PoolEntry
 
 
@@ -95,7 +96,37 @@ def _unmetered_artifact(root: Path, *, stop_reason: str = "submitted") -> Path:
     return artifact
 
 
-def test_smoke_scaffold_stop_is_ungradeable(
+def _metered_artifact(root: Path, *, stop_reason: str) -> Path:
+    artifact = root / "artifact"
+    trace = artifact / "agent" / "wmo-run.json"
+    trace.parent.mkdir(parents=True)
+    trace.write_text(
+        json.dumps(
+            {
+                "instruction": "repair the repository",
+                "stop_reason": stop_reason,
+                "steps": [],
+                "worker_usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "cached_input_tokens": 0,
+                    "cache_write_input_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "calls": 1,
+                    "call_seconds": [0.1],
+                    "call_input_tokens": [10],
+                    "call_output_tokens": [2],
+                    "call_cached_input_tokens": [0],
+                    "call_cache_write_input_tokens": [0],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return artifact
+
+
+def test_smoke_infrastructure_stop_is_ungradeable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -110,12 +141,12 @@ def test_smoke_scaffold_stop_is_ungradeable(
     )
 
     assert outcome.reward is None
-    assert outcome.completion_status == "scaffold_failure"
-    assert outcome.failure_class == "scaffold"
+    assert outcome.completion_status == "infrastructure_failure"
+    assert outcome.failure_class == "infrastructure"
     assert outcome.error == ("remote materialize failed (rc=255): Host key verification failed.")
 
 
-def test_full_matrix_scaffold_stop_is_ungradeable(
+def test_full_matrix_infrastructure_stop_is_ungradeable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -131,8 +162,49 @@ def test_full_matrix_scaffold_stop_is_ungradeable(
     )
 
     assert outcome.reward is None
-    assert outcome.completion_status == "scaffold_failure"
-    assert outcome.failure_class == "scaffold"
+    assert outcome.completion_status == "infrastructure_failure"
+    assert outcome.failure_class == "infrastructure"
+
+
+@pytest.mark.parametrize("runner", [smoke_runner, matrix_runner])
+@pytest.mark.parametrize(
+    "stop_reason",
+    [
+        "budget",
+        "max_turns",
+        "no_action",
+        "no_tool_call",
+        "output_truncated",
+        "unparsed_tool_call",
+    ],
+)
+def test_metered_agent_failure_remains_a_gradeable_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runner: object,
+    stop_reason: str,
+) -> None:
+    artifact = _metered_artifact(tmp_path, stop_reason=stop_reason)
+    monkeypatch.setattr(runner, "_wall_seconds", lambda path: 0.0)
+    if runner is smoke_runner:
+        outcome = smoke_runner._outcome(
+            _cell(artifact),
+            entry=_entry(),
+            logical_attempt=1,
+            artifact_dir=artifact,
+        )
+    else:
+        outcome = matrix_runner._outcome(
+            _cell(artifact),
+            benchmark="terminal-bench-2",
+            entry=_entry(),
+            attempt=1,
+            artifact_dir=artifact,
+        )
+
+    assert outcome.reward == 0.0
+    assert outcome.completion_status == "scored_agent_failure"
+    assert outcome.failure_class == "agent_failure"
 
 
 @pytest.mark.parametrize("runner", [smoke_runner, matrix_runner])
@@ -165,7 +237,7 @@ def test_submitted_cell_without_worker_usage_is_ungradeable(
     assert outcome.error == "worker usage is missing a completed provider call"
 
 
-def test_existing_scaffold_zero_is_normalized_before_resume(tmp_path: Path) -> None:
+def test_existing_infrastructure_zero_is_normalized_before_resume(tmp_path: Path) -> None:
     artifact = _artifact(tmp_path)
     root = tmp_path / "smoke"
     matrix_path = root / "outcomes.json"
@@ -196,11 +268,12 @@ def test_existing_scaffold_zero_is_normalized_before_resume(tmp_path: Path) -> N
 
     outcome = normalized.outcomes[0]
     assert outcome.reward is None
-    assert outcome.completion_status == "scaffold_failure"
+    assert outcome.completion_status == "infrastructure_failure"
+    assert outcome.failure_class == "infrastructure"
     assert outcome.error == ("remote materialize failed (rc=255): Host key verification failed.")
     assert Path(outcome.artifact_dir).is_dir()
     assert json.loads(ledger_path.read_text(encoding="utf-8"))["completion_status"] == (
-        "scaffold_failure"
+        "infrastructure_failure"
     )
 
 
@@ -302,6 +375,52 @@ def test_archive_keeps_distinct_artifacts_for_the_same_logical_attempt(tmp_path:
     )
 
 
+def test_unmetered_smoke_quarantines_derived_policy_and_reports(tmp_path: Path) -> None:
+    root = tmp_path / "smoke"
+    (root / "policy").mkdir(parents=True)
+    (root / "policy" / "policy.json").write_text("{}", encoding="utf-8")
+    (root / "smoke-report.json").write_text('{"valid": true}', encoding="utf-8")
+    (root / "resume-proof.json").write_text('{"unchanged": true}', encoding="utf-8")
+    entry = _entry()
+    matrix = OutcomeMatrix(
+        pool=[entry],
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id="terminal-bench-2:task",
+                task="repair",
+                model=entry.name,
+                benchmark="terminal-bench-2",
+                attempt_number=2,
+                reward=None,
+                completion_status="metering_failure",
+                failure_class="metering",
+                artifact_dir="/evidence/attempt-2",
+            )
+        ],
+    )
+
+    smoke_runner._invalidate_smoke_derivatives(root, matrix)
+    smoke_runner._invalidate_smoke_derivatives(root, matrix)
+
+    assert not (root / "policy").exists()
+    assert not (root / "smoke-report.json").exists()
+    assert not (root / "resume-proof.json").exists()
+    invalid = json.loads((root / "invalidated.json").read_text(encoding="utf-8"))
+    assert invalid["valid"] is False
+    assert invalid["paid_execution_allowed"] is False
+    assert invalid["unknown_cost_attempts"][0]["model_cost_usd"] is None
+    assert len(invalid["quarantined_derived_artifacts"]) == 3
+    assert all(
+        Path(row["quarantined_path"]).exists() for row in invalid["quarantined_derived_artifacts"]
+    )
+    report = next(
+        row
+        for row in invalid["quarantined_derived_artifacts"]
+        if row["original_path"].endswith("smoke-report.json")
+    )
+    assert report["sha256"] == hashlib.sha256(b'{"valid": true}').hexdigest()
+
+
 def test_unknown_paid_cost_stops_before_another_smoke_cell(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -337,6 +456,82 @@ def test_unknown_paid_cost_stops_before_another_smoke_cell(
             ledger_path=ledger_path,
             pool=pool,
         )
+
+
+def test_full_matrix_rejects_an_invalid_smoke_before_paid_work(tmp_path: Path) -> None:
+    smoke_root = tmp_path / "smoke"
+    smoke_root.mkdir(parents=True)
+    (smoke_root / "invalidated.json").write_text(
+        json.dumps({"valid": False}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="replacement smoke"):
+        matrix_runner._require_valid_smoke(tmp_path)
+
+
+def test_full_matrix_accepts_complete_metered_smoke_evidence(tmp_path: Path) -> None:
+    smoke_root = tmp_path / "smoke"
+    artifact = smoke_root / "official-artifact"
+    artifact.mkdir(parents=True)
+    (artifact / "result.json").write_text("{}", encoding="utf-8")
+    entries = [
+        PoolEntry(
+            name="oai-luna-high",
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="gpt-5.6-luna",
+            input_per_mtok=1.0,
+            output_per_mtok=6.0,
+        ),
+        PoolEntry(
+            name="ant-haiku45",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-haiku-4-5-20251001",
+            input_per_mtok=1.0,
+            output_per_mtok=5.0,
+        ),
+    ]
+    outcomes = [
+        ScenarioOutcome(
+            scenario_id=f"terminal-bench-2:{task_id}",
+            task=task_id,
+            model=entry.name,
+            benchmark="terminal-bench-2",
+            reward=1.0,
+            success=True,
+            usage=TokenUsage(input_tokens=10, output_tokens=2),
+            cost_usd=0.001,
+            call_seconds=[0.1],
+            call_input_tokens=[10],
+            call_output_tokens=[2],
+            call_cached_input_tokens=[0],
+            call_cache_write_input_tokens=[0],
+            completion_status="scored_pass",
+            artifact_dir=str(artifact),
+        )
+        for task_id in matrix_runner.SMOKE_TASKS
+        for entry in entries
+    ]
+    OutcomeMatrix(pool=entries, outcomes=outcomes).save(smoke_root / "outcomes.json")
+    (smoke_root / "smoke-report.json").write_text(
+        json.dumps(
+            {
+                "gradeable_cells": 4,
+                "fit_task": matrix_runner.SMOKE_TASKS[0],
+                "heldout_task": matrix_runner.SMOKE_TASKS[1],
+                "model_spend_usd": 0.004,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (smoke_root / "resume-proof.json").write_text(
+        json.dumps({"unchanged": True, "resumed_cells": 2}),
+        encoding="utf-8",
+    )
+    (smoke_root / "policy").mkdir()
+    (smoke_root / "policy" / "policy.json").write_text("{}", encoding="utf-8")
+
+    matrix_runner._require_valid_smoke(tmp_path)
 
 
 def test_identical_harbor_resume_does_not_consume_an_attempt(tmp_path: Path) -> None:
