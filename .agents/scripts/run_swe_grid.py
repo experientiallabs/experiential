@@ -590,6 +590,43 @@ def verify_patch(
         ),
         encoding="utf-8",
     )
+    attempts = 2
+    for attempt in range(attempts):
+        verdict, detail = _verify_once(
+            cell, cell_dir=verify_dir, predictions=predictions, swe_dir=swe_dir, timeout_s=timeout_s
+        )
+        if verdict is not None or not _looks_transient(detail) or attempt == attempts - 1:
+            return verdict, detail
+        logger.info("%s verifier retry after a transient failure: %s", cell.slug, detail)
+    return None, "unreachable"
+
+
+TRANSIENT_VERIFIER_SIGNS = ("wrote no report", "No such container", "404 Client Error")
+"""Verifier failures that are races rather than verdicts, and are worth one retry.
+
+Measured: the swebench harness enumerates EVERY container on the daemon and inspects each one, so
+when one of this grid's own concurrent agent containers exits mid-enumeration the harness dies with
+`docker.errors.NotFound` and writes no report. The evaluation itself was fine; the bystander
+container was not there a millisecond later. One retry costs about 26 seconds and keeps the cell
+scored instead of turning a scheduling race into a hole in the matrix.
+"""
+
+
+def _looks_transient(detail: str) -> bool:
+    """Whether a verifier failure is the concurrency race rather than a real refusal."""
+    return any(sign in detail for sign in TRANSIENT_VERIFIER_SIGNS)
+
+
+def _verify_once(
+    cell: CellKey,
+    *,
+    cell_dir: Path,
+    predictions: Path,
+    swe_dir: Path,
+    timeout_s: float,
+) -> tuple[bool | None, str]:
+    """One invocation of the official verifier over one prediction."""
+    verify_dir = cell_dir
     run_id = f"v{uuid.uuid4().hex[:8]}"
     command = [
         str(swe_dir / ".venv" / "bin" / "python"),
@@ -982,7 +1019,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--episodes", type=int, default=2, help="episodes per (instance, model)")
     parser.add_argument("--concurrency", type=int, default=6, help="cells in flight")
     parser.add_argument("--step-limit", type=int, default=PROGRAM_STEP_LIMIT)
-    parser.add_argument("--cell-deadline-s", type=float, default=3600.0)
+    parser.add_argument(
+        "--cell-deadline-s",
+        type=float,
+        default=2400.0,
+        help=(
+            "wall bound per cell; 1500s was measured too tight (fable-5 and opus-5 both outran "
+            "it on the hardest pinned instance under 14-way emulated concurrency)"
+        ),
+    )
     parser.add_argument("--verify-timeout-s", type=float, default=1800.0)
     parser.add_argument("--pool", default=str(MAIN_CHECKOUT / ".wmo" / "jt" / "pool-17.toml"))
     parser.add_argument(
