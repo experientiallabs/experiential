@@ -869,7 +869,11 @@ def _endpoint_key(endpoint: str | None) -> str:
     default_port = {"http": 80, "https": 443}.get(scheme)
     port = "" if port_number in (None, default_port) else f":{port_number}"
     query = f"?{parts.query}" if parts.query else ""
-    return f"{scheme}://{parts.hostname.lower()}{port}{parts.path}{query}"
+    # Embedded userinfo is part of the route (two proxies differing only by user or
+    # password are two candidates); it rides verbatim, case-sensitive like the path.
+    userinfo, at, _ = parts.netloc.rpartition("@")
+    user = f"{userinfo}{at}" if at else ""
+    return f"{scheme}://{user}{parts.hostname.lower()}{port}{parts.path}{query}"
 
 
 def _existing_handle(

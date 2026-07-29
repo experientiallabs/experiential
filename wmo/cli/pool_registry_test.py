@@ -1156,3 +1156,29 @@ def test_endpoint_identity_survives_bad_ports_and_keeps_queries_distinct(
         "http://localhost:8000/v1?tenant=a",
         "http://localhost:8000/v1?tenant=b",
     }
+
+
+def test_endpoints_differing_only_by_userinfo_are_two_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Embedded credentials route differently (two proxy tenants); the second registration
+    # must not replace the first credentialed candidate.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    for endpoint in ("http://alice@localhost:8000/v1", "http://bob@localhost:8000/v1"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.OPENAI,
+            model_ids=["qwen3:4b"],
+            options=EntryOptions(endpoint=endpoint),
+            verify=_ok,
+        )
+
+    entries = read_pool_entries(pool)
+    assert len(entries) == 2
+    assert {entry.endpoint for entry in entries} == {
+        "http://alice@localhost:8000/v1",
+        "http://bob@localhost:8000/v1",
+    }
