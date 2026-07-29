@@ -100,3 +100,25 @@ def test_extract_push_meta_includes_serve_model_when_configured(tmp_path: Path) 
     meta = extract_push_meta(directory)
 
     assert meta["serve_model"] == "claude-sonnet-4-5"
+
+
+def test_bundle_carries_the_knowledge_base_and_fidelity_winner(tmp_path: Path) -> None:
+    """The hosted copy must be the SAME simulation the local dir serves.
+
+    auto_fidelity.json names the measured-best runtime configuration and
+    knowledge/ is what a "reason+kb" winner runs on; a bundle without them
+    serves a configuration the model's own search rejected.
+    """
+    directory = _model_dir(tmp_path)
+    (directory / "auto_fidelity.json").write_text('{"winner_label": "reason+kb"}')
+    (directory / "knowledge").mkdir()
+    (directory / "knowledge" / "facts.md").write_text("the env fact serving needs")
+
+    bundle = pack_model_dir(directory, tmp_path / "out.tar.gz")
+
+    import tarfile
+
+    with tarfile.open(bundle.path) as archive:
+        names = set(archive.getnames())
+    assert any(name.endswith("auto_fidelity.json") for name in names)
+    assert any("knowledge" in name and name.endswith("facts.md") for name in names)

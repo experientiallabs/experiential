@@ -27,8 +27,14 @@ from pydantic import BaseModel
 from wmo.config.config import HarnessConfig
 from wmo.core.types import JsonValue
 
-_INCLUDED_FILES = ("config.toml", "metrics.json", "card.json")
-_INCLUDED_DIRS = ("prompts", "index")
+# auto_fidelity.json rides along because it names the model's measured-best
+# runtime configuration; knowledge/ because that configuration may BE
+# knowledge-backed (winner_label "reason+kb"). Excluding either made the
+# hosted copy a different simulation than the local one: it could not serve
+# the very configuration its own fidelity search selected (bench-defaults/swe
+# round-trip finding, 2026-07-29).
+_INCLUDED_FILES = ("config.toml", "metrics.json", "card.json", "auto_fidelity.json")
+_INCLUDED_DIRS = ("prompts", "index", "knowledge")
 
 _HASH_CHUNK_BYTES = 1024 * 1024
 
