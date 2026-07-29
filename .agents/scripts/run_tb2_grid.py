@@ -35,26 +35,32 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
-from harbor.models.job.config import JobConfig
+import litellm
+from harbor.models.job.config import DatasetConfig, JobConfig
 from harbor.models.trial.paths import TrialPaths
 from harbor.models.trial.result import TrialResult
 
 from wmo.core.types import JsonObject
 from wmo.evals.harbor.scorer import HarborScorer, TaskEnvironment
+
+# The scorer's OWN reward reader rather than a copy: it encodes the bool/finite/in-range
+# rejections that decide scored-vs-excluded, and a second implementation here would drift from
+# the product's definition of a graded trial.
 from wmo.evals.harbor.scorer import _trial_reward as _scorer_trial_reward
+from wmo.evals.harbor.tasks import resolve_harbor_tasks
 from wmo.harness.doc import HarnessDoc
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import TokenUsage
-from wmo.providers.pool import PoolEntry, load_pool
+from wmo.providers.pool import ModelPool, PoolEntry, load_pool
 
-# `_scorer_trial_reward` is deliberately the scorer's OWN reward reader rather than a copy: it
-# encodes the bool/finite/in-range rejections that decide scored-vs-excluded, and a second
-# implementation here would drift from the product's definition of a graded trial.
 logger = logging.getLogger(__name__)
 
 TASK_LABEL = "terminal-bench-2"
+# One arm: no compaction lever is under test here, so the grid holds the identity arm only.
+ARM_NAME = "identity"
 JUDGE_LABEL = "tb2-verifier (harbor terminus-2, pytest/ctrf)"
 HARBOR_TERMINUS_2 = "harbor.agents.terminus_2.terminus_2:Terminus2"
 
@@ -71,11 +77,17 @@ COMMON_AGENT_KWARGS: JsonObject = {
     "store_all_messages": False,
 }
 
-# A candidate litellm cannot price or size gets an explicit row, else `get_model_context_limit`
-# falls back to 1M tokens and terminus-2 never compacts. Context numbers are conservative
-# published values; they bound compaction, they do not enter any reported cost.
-DEFAULT_MAX_INPUT_TOKENS = 200_000
-DEFAULT_MAX_OUTPUT_TOKENS = 16_384
+# A route litellm has never heard of gets an explicit `model_info`, else its context limit
+# falls back to 1M, terminus-2 never compacts, and the provider rejects the oversized prompt
+# instead. Measured on this pool: litellm knows the gpt-5.x and claude routes but NOT
+# azure/DeepSeek-V4-Pro, azure/Kimi-K2.6, azure/FW-GLM-5.2, the Fireworks kimi-k3 route, or
+# either OpenRouter qwen. The override is applied ONLY to routes litellm cannot resolve, so a
+# model whose real limit is known keeps it (clamping gpt-5.6 to 200k would have made it compact
+# for no reason). 128k is at or below every unknown candidate's published limit, so it can only
+# compact EARLIER than necessary, never overflow; it is applied identically to all of them and
+# enters no reported cost.
+UNKNOWN_ROUTE_MAX_INPUT_TOKENS = 128_000
+UNKNOWN_ROUTE_MAX_OUTPUT_TOKENS = 16_384
 
 # Retry only the transport faults this corpus actually produced: the tb2-cost corner hit a
 # Bedrock/provider ServiceUnavailable window under sustained load where single calls were
@@ -116,20 +128,26 @@ def _agent_wiring(entry: PoolEntry) -> tuple[str, JsonObject]:
     else:
         raise ValueError(f"pool entry {entry.name!r}: unsupported kind {entry.kind.value!r}")
 
-    # Route strings litellm does not carry in its own table need a size hint so terminus-2
-    # compacts at the right point. Prices go in too for harbor's own bookkeeping; our rows
-    # are priced from the pool entry regardless.
-    if entry.kind.value in {"openai", "openrouter"}:
+    if not _litellm_knows(route):
         price = entry.price()
         kwargs["model_info"] = {
-            "max_input_tokens": DEFAULT_MAX_INPUT_TOKENS,
-            "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+            "max_input_tokens": UNKNOWN_ROUTE_MAX_INPUT_TOKENS,
+            "max_output_tokens": UNKNOWN_ROUTE_MAX_OUTPUT_TOKENS,
             "input_cost_per_token": price.input_per_mtok / 1e6,
             "output_cost_per_token": price.output_per_mtok / 1e6,
         }
 
     kwargs["llm_kwargs"] = llm_kwargs
     return route, kwargs
+
+
+def _litellm_knows(route: str) -> bool:
+    """Whether litellm can resolve this route's context limits on its own."""
+    try:
+        litellm.get_model_info(route)
+    except Exception:  # noqa: BLE001 - litellm raises several unrelated types for "unmapped"
+        return False
+    return True
 
 
 def _require_env(name: str, entry: PoolEntry) -> str:
@@ -293,9 +311,62 @@ def _read_rows(rows_path: Path) -> list[ScenarioOutcome]:
 
 
 def _ledger_append(ledger_path: Path, record: JsonObject) -> None:
+    """Append one ledger line, stamped for `wmo runs backfill`.
+
+    `ts` and `arm` are what the backfill walker filters and orders on, so every line carries
+    them even when the event is not a chunk. Without them the directory replays as an arm-less
+    grid and the runs tables never see it.
+    """
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    line: JsonObject = {
+        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "arm": ARM_NAME,
+        **record,
+    }
     with ledger_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
+        handle.write(json.dumps(line, sort_keys=True) + "\n")
+
+
+async def _prewarm_tasks(task_ids: Sequence[str]) -> None:
+    """Download every pinned TB2 task into harbor's shared cache once, serially.
+
+    Harbor caches registry tasks under a single `~/.cache/harbor/tasks/` tree, and it resolves
+    them lazily on first use. Running several models as parallel processes therefore has them
+    racing to populate the same directories, and a reader can observe a half-written task: this
+    run hit `FileNotFoundError` on a tests/ file that appeared on disk moments later. Warming
+    the cache serially before any parallel work makes every later read read-only.
+    """
+    dataset = DatasetConfig.model_validate({"name": "terminal-bench", "version": "2.0"})
+    resolved = await resolve_harbor_tasks(dataset, list(task_ids))
+    logger.info("prewarmed %d harbor tasks into the shared cache", len(resolved))
+
+
+def _consolidate(
+    arm_dir: Path, *, pool: ModelPool, rows_path: Path, matrix_path: Path
+) -> list[ScenarioOutcome]:
+    """Assemble rows.jsonl and matrix.json from every chunk file in the arm directory.
+
+    Idempotent and safe to run while other models are still going: it reads only completed
+    chunk files, so a partial grid consolidates into a partial (but valid) matrix.
+    """
+    rows: list[ScenarioOutcome] = []
+    for chunk_file in sorted(arm_dir.glob("chunk-*.json")):
+        payload = json.loads(chunk_file.read_text(encoding="utf-8"))
+        for raw in payload.get("outcomes", []):
+            rows.append(ScenarioOutcome.model_validate(raw))
+    _write_rows(rows_path, rows)
+    matrix = OutcomeMatrix(pool=list(pool.models), outcomes=rows)
+    matrix_path.write_text(matrix.model_dump_json(indent=2), encoding="utf-8")
+    scored = [row for row in rows if row.scored]
+    logger.info(
+        "consolidated %d rows (%d scored, %d solved) from %d chunks, $%.2f",
+        len(rows),
+        len(scored),
+        sum(1 for row in scored if row.success),
+        len(list(arm_dir.glob("chunk-*.json"))),
+        sum(row.cost_usd for row in rows),
+    )
+    return rows
 
 
 def main() -> None:
@@ -312,6 +383,16 @@ def main() -> None:
     parser.add_argument("--limit-tasks", type=int, default=None, help="first N tasks (smoke only)")
     parser.add_argument(
         "--retries", type=int, default=len(RETRY_DELAYS_S), help="transport-fault retries per model"
+    )
+    parser.add_argument(
+        "--prewarm-tasks",
+        action="store_true",
+        help="download the pinned tasks into harbor's shared cache and exit (run before batches)",
+    )
+    parser.add_argument(
+        "--consolidate-only",
+        action="store_true",
+        help="rebuild rows.jsonl and matrix.json from existing chunks, running no episodes",
     )
     args = parser.parse_args()
 
@@ -331,15 +412,31 @@ def main() -> None:
     if args.limit_tasks is not None:
         task_ids = task_ids[: args.limit_tasks]
 
+    # Grid-directory layout, because that is what `wmo runs backfill` replays into the platform
+    # runs tables: cohort.json beside an arm subdirectory holding chunk-N.json files, with a
+    # ledger naming the arm. One chunk per candidate is the natural unit here (a model is what
+    # this runner completes atomically), so a resumed grid re-emits only the models it re-ran.
     out_dir = args.out_dir
+    arm_dir = out_dir / ARM_NAME
     jobs_root = out_dir / "harbor"
     rows_path = out_dir / "rows.jsonl"
-    matrix_path = out_dir / "matrix.json"
+    matrix_path = arm_dir / "matrix.json"
     ledger_path = out_dir / "ledger.jsonl"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    arm_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.prewarm_tasks:
+        asyncio.run(_prewarm_tasks(task_ids))
+        return
+
+    if args.consolidate_only:
+        _consolidate(arm_dir, pool=pool, rows_path=rows_path, matrix_path=matrix_path)
+        return
 
     doc = HarnessDoc.baseline()
     expected_cells = len(task_ids) * args.episodes
+    # Chunk index is the candidate's position in the FULL pool, not in the filtered --only set,
+    # so a chunk file keeps naming the same model across partial reruns.
+    pool_order = {entry.name: index for index, entry in enumerate(pool.models)}
 
     for entry in entries:
         job_dir = jobs_root / entry.name / f"wmo-{doc.doc_hash[:12]}"
@@ -398,11 +495,17 @@ def main() -> None:
         rows = _harvest(job_dir, entry)
         scored = [row for row in rows if row.scored]
         spend = sum(row.cost_usd for row in rows)
+        chunk = pool_order[entry.name]
+        (arm_dir / f"chunk-{chunk}.json").write_text(
+            json.dumps({"outcomes": [row.model_dump(mode="json") for row in rows]}, indent=2),
+            encoding="utf-8",
+        )
         _ledger_append(
             ledger_path,
             {
                 "model": entry.name,
-                "event": "model_complete",
+                "event": "chunk",
+                "chunk": chunk,
                 "cells": len(rows),
                 "cells_expected": expected_cells,
                 "scored": len(scored),
@@ -422,22 +525,11 @@ def main() -> None:
             time.time() - started,
         )
 
-        # Rewrite the full matrix after every model so an interrupted grid still has one.
-        all_rows: list[ScenarioOutcome] = []
-        for candidate in pool.models:
-            candidate_dir = jobs_root / candidate.name / f"wmo-{doc.doc_hash[:12]}"
-            all_rows.extend(_harvest(candidate_dir, candidate))
-        _write_rows(rows_path, all_rows)
-        matrix = OutcomeMatrix(pool=list(pool.models), outcomes=all_rows)
-        matrix_path.write_text(matrix.model_dump_json(indent=2), encoding="utf-8")
-
-    final = _read_rows(rows_path)
-    logger.info(
-        "grid done: %d rows, %d scored, $%.2f total",
-        len(final),
-        sum(1 for row in final if row.scored),
-        sum(row.cost_usd for row in final),
-    )
+    # The matrix is assembled from chunk files by --consolidate rather than after every model,
+    # because several models run as separate processes (one per provider, to spread rate limits)
+    # and a per-model rewrite of one shared file would race. Each process owns exactly its own
+    # chunk file; consolidation is a separate, idempotent, read-only-of-chunks pass.
+    _consolidate(arm_dir, pool=pool, rows_path=rows_path, matrix_path=matrix_path)
 
 
 if __name__ == "__main__":
