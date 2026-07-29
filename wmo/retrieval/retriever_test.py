@@ -132,6 +132,25 @@ def test_save_load_roundtrip_preserves_topk(tmp_path) -> None:  # noqa: ANN001 -
     assert len(dst._steps) == 3
 
 
+def test_save_load_escapes_unicode_line_separators(tmp_path) -> None:  # noqa: ANN001
+    from wmo.retrieval.embedders import HashingEmbedder
+
+    content = "before\u0085middle\u2028after\u2029done"
+    src = EmbeddingRetriever(HashingEmbedder(dim=16))
+    src.index([Trace(trace_id="t", steps=[_step("alpha", 1, content)])])
+    src.save(tmp_path / "index")
+
+    lines = (tmp_path / "index" / "steps.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert "\\u0085" in lines[0]
+    assert "\\u2028" in lines[0]
+    assert "\\u2029" in lines[0]
+
+    dst = EmbeddingRetriever(HashingEmbedder(dim=16))
+    dst.load(tmp_path / "index")
+    assert dst._steps[0].observation.content == content
+
+
 def test_save_load_empty_buffer(tmp_path) -> None:  # noqa: ANN001 - pytest fixture
     from wmo.retrieval.embedders import HashingEmbedder
 

@@ -132,7 +132,16 @@ class EmbeddingRetriever:
         np.save(path / _MATRIX_FILE, matrix)
         with (path / _STEPS_FILE).open("w", encoding="utf-8") as fh:
             for step in self._steps:
-                fh.write(step.model_dump_json() + "\n")
+                # JSON permits U+0085/U+2028/U+2029 inside strings, but Python's splitlines()
+                # treats them as record boundaries. ASCII escaping keeps this JSONL portable.
+                fh.write(
+                    json.dumps(
+                        step.model_dump(mode="json"),
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
         # Persist key_mode: the matrix was embedded from this mode's key text, so a reload MUST
         # query in the same mode or it cosine-compares mismatched embedding spaces (no dim error,
         # just near-random neighbours). Without this, a reloaded index reverts to state_action.
@@ -144,7 +153,7 @@ class EmbeddingRetriever:
         matrix = np.load(path / _MATRIX_FILE)
         steps = [
             Step.model_validate_json(line)
-            for line in (path / _STEPS_FILE).read_text(encoding="utf-8").splitlines()
+            for line in (path / _STEPS_FILE).read_text(encoding="utf-8").split("\n")
             if line.strip()
         ]
         self._steps = steps

@@ -77,8 +77,7 @@ def _scenarios(
         raise ValueError("two frozen task ids have identical task text; mapping would be ambiguous")
     return (
         tuple(
-            Scenario(task=by_id[task_id], provenance=[f"frozen:{task_id}"])
-            for task_id in task_ids
+            Scenario(task=by_id[task_id], provenance=[f"frozen:{task_id}"]) for task_id in task_ids
         ),
         task_to_id,
     )
@@ -88,7 +87,7 @@ def _tools_hint(model_dir: Path) -> str | None:
     steps_path = model_dir / "index" / "steps.jsonl"
     steps = [
         Step.model_validate_json(line)
-        for line in steps_path.read_text(encoding="utf-8").splitlines()
+        for line in steps_path.read_text(encoding="utf-8").split("\n")
         if line.strip()
     ]
     hint = tools_hint_from_traces([Trace(trace_id="training-side-index", steps=steps)])
@@ -290,9 +289,7 @@ def _execute_or_recover(
         records = load_runs(runs_dir)
         return _MeasuredSweep(
             matrix=matrix,
-            candidate_usd=sum(
-                row.cost_usd + row.compressor_cost_usd for row in matrix.outcomes
-            ),
+            candidate_usd=sum(row.cost_usd + row.compressor_cost_usd for row in matrix.outcomes),
             world_model_usd=sum(record.total.cost_usd for record in records),
             usage_paths=sorted(runs_dir.glob("*.json")),
             metering_gaps=(
@@ -385,8 +382,7 @@ def main() -> int:
     )
     if plan.total_usd > args.budget_usd:
         raise RuntimeError(
-            f"candidate-side projection ${plan.total_usd:.2f} exceeds cap "
-            f"${args.budget_usd:.2f}"
+            f"candidate-side projection ${plan.total_usd:.2f} exceeds cap ${args.budget_usd:.2f}"
         )
     _activate_world_model(pool)
     world_model, _provider = load_world_model(
@@ -406,9 +402,7 @@ def main() -> int:
         runs_dir=args.out_dir / "runs",
         accounting_path=args.out_dir / "initial-accounting.json",
     )
-    canonical_rows = _canonical_rows(
-        initial.matrix, task_to_id=task_to_id, attempt_number=1
-    )
+    canonical_rows = _canonical_rows(initial.matrix, task_to_id=task_to_id, attempt_number=1)
     all_attempts = list(canonical_rows)
     candidate_usd_by_model = {
         model: sum(row.cost_usd for row in canonical_rows if row.model == model)
@@ -418,9 +412,7 @@ def main() -> int:
     world_model_usage_paths = list(initial.usage_paths)
     world_model_metering_gaps = list(initial.metering_gaps)
     scenario_by_task = {scenario.task: scenario for scenario in scenarios}
-    current = {
-        (row.model, row.scenario_id, row.episode): row for row in canonical_rows
-    }
+    current = {(row.model, row.scenario_id, row.episode): row for row in canonical_rows}
     retry_runs = 0
     for attempt_number in (2, 3):
         unscored = [row for row in current.values() if row.reward is None]
@@ -456,9 +448,7 @@ def main() -> int:
                 task_to_id=task_to_id,
                 attempt_number=attempt_number,
             )
-            OutcomeMatrix(pool=[pool.entry(model)], outcomes=rows).save(
-                retry_dir / "matrix.json"
-            )
+            OutcomeMatrix(pool=[pool.entry(model)], outcomes=rows).save(retry_dir / "matrix.json")
             all_attempts.extend(rows)
             candidate_usd_by_model[model] += retry_run.candidate_usd
             world_model_usd += retry_run.world_model_usd
@@ -470,9 +460,7 @@ def main() -> int:
         args.out_dir / "attempts.jsonl",
         "".join(row.model_dump_json() + "\n" for row in all_attempts),
     )
-    canonical_rows = [
-        current[(row.model, row.scenario_id, row.episode)] for row in canonical_rows
-    ]
+    canonical_rows = [current[(row.model, row.scenario_id, row.episode)] for row in canonical_rows]
     matrix = OutcomeMatrix(pool=initial.matrix.pool, outcomes=canonical_rows)
     summary = {
         "benchmark": args.benchmark,
