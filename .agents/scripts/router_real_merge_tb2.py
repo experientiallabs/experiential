@@ -53,11 +53,25 @@ def _selected(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 
 
 def _cost(rows: list[dict[str, object]]) -> float:
-    return sum(
-        float(value)
-        for row in rows
-        if isinstance((value := row.get("cost_usd")), (int, float))
-    )
+    seen: set[str] = set()
+    total = 0.0
+    for index, row in enumerate(rows):
+        artifact = row.get("artifact_dir")
+        identity = (
+            artifact
+            if isinstance(artifact, str) and artifact
+            else (
+                f"row:{index}:{row.get('model')}:{row.get('task_id')}:"
+                f"{row.get('attempt_number')}"
+            )
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        value = row.get("cost_usd")
+        if isinstance(value, (int, float)):
+            total += float(value)
+    return total
 
 
 def main() -> int:

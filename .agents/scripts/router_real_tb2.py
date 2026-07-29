@@ -253,12 +253,37 @@ def _pending_task_ids(
 
 
 def _next_attempt(rows: list[dict[str, object]], model: str) -> int:
-    attempts = [
-        _attempt_number(row)
-        for row in rows
-        if row.get("model") == model
-    ]
-    return max(attempts, default=0) + 1
+    artifacts_by_task: dict[str, set[str]] = {}
+    for row in rows:
+        task_id = row.get("task_id")
+        if row.get("model") != model or not isinstance(task_id, str):
+            continue
+        artifact = row.get("artifact_dir")
+        identity = (
+            artifact
+            if isinstance(artifact, str) and artifact
+            else f"legacy-attempt:{_attempt_number(row)}"
+        )
+        artifacts_by_task.setdefault(task_id, set()).add(identity)
+    return max((len(artifacts) for artifacts in artifacts_by_task.values()), default=0) + 1
+
+
+def _realized_cost(rows: list[dict[str, object]]) -> float:
+    """Sum paid artifacts once when a stale scorer reports the same cached job repeatedly."""
+    seen: set[str] = set()
+    total = 0.0
+    for index, row in enumerate(rows):
+        artifact = row.get("artifact_dir")
+        identity = (
+            artifact
+            if isinstance(artifact, str) and artifact
+            else f"row:{index}:{row.get('model')}:{row.get('task_id')}:{_attempt_number(row)}"
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total += _number(row, "cost_usd")
+    return total
 
 
 def _merge_rows(path: Path, incoming: list[dict[str, object]]) -> None:
@@ -408,10 +433,7 @@ def main() -> int:
                 len(pending_task_ids),
             )
             continue
-        spent = sum(
-            _number(row, "cost_usd")
-            for row in existing_rows
-        )
+        spent = _realized_cost(existing_rows)
         if spent >= args.budget_usd:
             raise RuntimeError(
                 f"Terminal-Bench 2 spend ${spent:.2f} reached cap ${args.budget_usd:.2f}"
@@ -450,10 +472,7 @@ def main() -> int:
                 attempt,
                 len(report.cells) - len(pending_task_ids),
                 len(report.cells),
-                sum(
-                    _number(row, "cost_usd")
-                    for row in _read_rows(rows_path)
-                ),
+                _realized_cost(_read_rows(rows_path)),
             )
             if not pending_task_ids:
                 break
@@ -481,9 +500,7 @@ def main() -> int:
         "cells_expected": len(task_ids) * len(pool.models),
         "cells_present": len(outcomes),
         "gradeable": sum(row.reward is not None for row in outcomes),
-        "model_cost_usd_all_attempts": sum(
-            _number(row, "cost_usd") for row in all_rows
-        ),
+        "model_cost_usd_all_attempts": _realized_cost(all_rows),
         "model_cost_usd_selected_outcomes": sum(row.cost_usd for row in outcomes),
         "environment_cost_usd": None,
         "environment_cost_note": "E2B invoice rate is not exposed in Harbor artifacts",
