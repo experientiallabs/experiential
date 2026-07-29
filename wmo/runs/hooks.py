@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from threading import Lock
@@ -55,7 +55,7 @@ from wmo.optimize.outcomes import ScenarioOutcome
 from wmo.optimize.pipeline import Stage, StageRecord
 from wmo.runs.backfill import cell_payload
 from wmo.runs.client import ControlCommand, PushAck, PushRejected, RunsSink, runs_sink
-from wmo.runs.reader import RunsReader
+from wmo.runs.reader import EventRow, RunsReader
 from wmo.runs.schema import (
     CELL_BATCH_CAP,
     LEDGER_LINE,
@@ -84,10 +84,14 @@ QUEUE_LIMIT = 2000
 """Events held in memory when the platform is unreachable. Past this the oldest are dropped: a run
 that cannot reach the platform for hours must not convert telemetry into memory pressure."""
 
-FRONTIER_SAMPLE = 50
-"""Descending events read when locating a resumed run's frontier. The newest one carries it (each
-successive descending seq is lower than the last), so a small window is enough; the sample only has
-to survive a few events of another band interleaving."""
+FRONTIER_PAGE = 500
+"""Events per page of the frontier read, matching the route's own default."""
+
+FRONTIER_MAX_PAGES = 40
+"""Pages the frontier scan will walk (20k type-filtered events) before giving up. A scan that has to
+STOP EARLY reports no frontier at all rather than the lowest seq it happened to reach: a partial
+scan's minimum is higher than the true frontier, so using it would re-issue seqs, which is the exact
+failure this read exists to prevent."""
 
 FrontierReader = Callable[[str, int], int | None]
 """Reports a run's DESCENDING frontier in one band, or None when it has none yet (or cannot be
@@ -145,13 +149,82 @@ def _status_value(status: RunStatus | str) -> str | None:
         return None
 
 
-def platform_frontier(external_id: str, band: int) -> int | None:
-    """Read a run's descending frontier in one band from the platform, or None when it has none.
+def frontier_from_reader(reader: RunsReader, external_id: str, band: int) -> int | None:
+    """The LOWEST descending seq one band holds, which is that walk's frontier.
 
-    Two type-filtered tail reads rather than a scan of the log: the descending walk only ever
-    carries heartbeats and a live `run.status`, and the server filters by type in the database, so
-    this stays small on a run with a hundred thousand cells. Returns the LOWEST such seq inside the
-    band, which is the frontier by construction.
+    Two properties make this cheap and exact. Only heartbeats and a live `run.status` ever descend,
+    and the server filters by type in the database, so the scan sees a few thousand rows on a run
+    with a hundred thousand cells. And within a band the descending seqs strictly DECREASE over
+    time, so the most recently arrived one is the lowest: a newest-first window that contains any of
+    this band's events already contains its frontier.
+
+    That is why the tail read is a fast path rather than a heuristic, and why it is not enough on
+    its own. Sibling chunk processes share one run's log under their own bands, so a busy sibling's
+    heartbeats can fill the newest page and leave none of this band's in it. Finding nothing there
+    means "look further", NOT "there is no frontier": treating it as the latter leaves the ceiling
+    spent and re-issues a dead process's terminal status.
+
+    Returns None only when the run genuinely holds no descending event in this band, or when the
+    scan could not be completed (see `FRONTIER_MAX_PAGES`).
+    """
+    floor = band * RUN_SEQ_BAND
+    ceiling = (band + 1) * RUN_SEQ_BAND
+
+    def lowest_of(events: Iterable[EventRow]) -> int | None:
+        mine = [event.seq for event in events if floor < event.seq <= ceiling]
+        return min(mine) if mine else None
+
+    lowest: int | None = None
+    for event_type in (RunEventType.HEARTBEAT, RunEventType.RUN_STATUS):
+        newest = reader.list_events(
+            external_id, tail=True, limit=FRONTIER_PAGE, event_type=event_type
+        )
+        found = lowest_of(newest.events)
+        if found is None:
+            found = _scan_for_frontier(reader, external_id, event_type, lowest_of)
+        if found is not None and (lowest is None or found < lowest):
+            lowest = found
+    return lowest
+
+
+def _scan_for_frontier(
+    reader: RunsReader,
+    external_id: str,
+    event_type: str,
+    lowest_of: Callable[[Iterable[EventRow]], int | None],
+) -> int | None:
+    """Page one event type from the start of the log, returning the band's lowest seq.
+
+    Only reached when the newest page held nothing for this band, which on a chunked arm means a
+    sibling's traffic pushed it out. Gives up rather than guessing past `FRONTIER_MAX_PAGES`,
+    because a partial answer is worse than none here: it would be too HIGH, and rebasing to a seq
+    above the true frontier re-issues the ones between.
+    """
+    cursor = 0
+    lowest: int | None = None
+    for _page in range(FRONTIER_MAX_PAGES):
+        page = reader.list_events(
+            external_id, after_pos=cursor, limit=FRONTIER_PAGE, event_type=event_type
+        )
+        found = lowest_of(page.events)
+        if found is not None and (lowest is None or found < lowest):
+            lowest = found
+        if not page.events or page.last_pos <= cursor:
+            return lowest
+        cursor = page.last_pos
+    log.warning(
+        "run telemetry for %s: gave up locating the %s frontier after %d pages, so this "
+        "invocation's heartbeats may collide with the previous one's and be discarded. The run "
+        "itself is unaffected.",
+        external_id,
+        event_type,
+        FRONTIER_MAX_PAGES,
+    )
+    return None
+
+
+def platform_frontier(external_id: str, band: int) -> int | None:
+    """`frontier_from_reader` against the saved credential, or None when this machine cannot read.
 
     Never raises: a machine that cannot read simply does not rebase (`_rebase_descending` treats
     None as "leave the ceiling alone"), which costs a resumed run's heartbeats and not the run.
@@ -159,18 +232,8 @@ def platform_frontier(external_id: str, band: int) -> int | None:
     reader = RunsReader.open()
     if reader is None:
         return None
-    floor = band * RUN_SEQ_BAND
-    ceiling = (band + 1) * RUN_SEQ_BAND
-    lowest: int | None = None
     with reader:
-        for event_type in (RunEventType.HEARTBEAT, RunEventType.RUN_STATUS):
-            page = reader.list_events(
-                external_id, tail=True, limit=FRONTIER_SAMPLE, event_type=event_type
-            )
-            for event in page.events:
-                if floor < event.seq <= ceiling and (lowest is None or event.seq < lowest):
-                    lowest = event.seq
-    return lowest
+        return frontier_from_reader(reader, external_id, band)
 
 
 def _undeclared(refused: PushRejected) -> bool:
@@ -804,16 +867,21 @@ class GridEmitter(_Reporter):
         self._handle(self._flush())
 
     def on_status(self, status: RunStatus, *, error: str | None = None) -> None:
-        """The run's terminal transition. Sends buffered cells first, so none are lost."""
+        """The run's terminal transition. Sends buffered cells first, so none are lost.
+
+        A status this build cannot name is skipped rather than sent (`_status_value`), but the run
+        still ENDED, so everything else here happens anyway. In particular a pending `stop` is acked
+        either way: the command WAS honored, and leaving it pending would show a stop as in-flight
+        forever on a run that has already finished.
+        """
         self.send_cells()
         finished_at = now_iso()
         value = _status_value(status)
-        if value is None:
-            return
-        payload: JsonObject = {"status": value, "finished_at": finished_at}
-        if error is not None:
-            payload["error"] = error
-        self._emit_from_top(self._band, RunEventType.RUN_STATUS, finished_at, payload)
+        if value is not None:
+            payload: JsonObject = {"status": value, "finished_at": finished_at}
+            if error is not None:
+                payload["error"] = error
+            self._emit_from_top(self._band, RunEventType.RUN_STATUS, finished_at, payload)
         self._flush()
         for control in self._stop_control:
             self._ack(control, status=ACK_DONE, note=f"run {status}")
@@ -1010,13 +1078,16 @@ class PipelineEmitter(_Reporter):
         self._flush()
 
     def finished(self, status: RunStatus, *, error: str | None = None) -> None:
-        """The run's terminal transition: completed, failed, or stopped by the spend cap."""
+        """The run's terminal transition: completed, failed, or stopped by the spend cap.
+
+        A status this build cannot name is skipped rather than sent (`_status_value`); the flush
+        still happens, so whatever the last stage queued is not stranded behind it.
+        """
         finished_at = now_iso()
         value = _status_value(status)
-        if value is None:
-            return
-        payload: JsonObject = {"status": value, "finished_at": finished_at}
-        if error is not None:
-            payload["error"] = error
-        self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS, finished_at, payload)
+        if value is not None:
+            payload: JsonObject = {"status": value, "finished_at": finished_at}
+            if error is not None:
+                payload["error"] = error
+            self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS, finished_at, payload)
         self._flush()
