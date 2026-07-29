@@ -188,9 +188,7 @@ def held_out_curve(
     on EVERY scenario has no held-out band; the curve then carries the model points alone
     (over all scenarios) rather than in-sample routed points dressed as measurements.
     """
-    held_out = [
-        sid for sid in matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)
-    ]
+    held_out = [sid for sid in matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)]
     if not held_out:
         return pareto_curve(matrix, judge=judge, provenance=provenance)
     return pareto_curve(
@@ -235,9 +233,7 @@ def _point(
     per_task_seconds: list[float] = []
     for row in scored:
         by_scenario.setdefault(row.scenario_id, []).append(row.reward)
-        success.setdefault(row.scenario_id, []).append(
-            1.0 if completion.completed(row) else 0.0
-        )
+        success.setdefault(row.scenario_id, []).append(1.0 if completion.completed(row) else 0.0)
         per_task_seconds.append(sum(row.call_seconds))
     scenario_means = [sum(v) / len(v) for v in by_scenario.values()]
     success_means = [sum(v) / len(v) for v in success.values()]
@@ -279,9 +275,7 @@ def _mark_frontier(points: list[ParetoPoint]) -> list[ParetoPoint]:
         )
 
     flagged = {p.id: not dominated(p, cost) for p, cost in placeable}
-    return [
-        p.model_copy(update={"on_frontier": flagged.get(p.id, False)}) for p in points
-    ]
+    return [p.model_copy(update={"on_frontier": flagged.get(p.id, False)}) for p in points]
 
 
 def _recommended(points: list[ParetoPoint], policy: RoutingPolicy | None) -> str | None:
@@ -292,9 +286,7 @@ def _recommended(points: list[ParetoPoint], policy: RoutingPolicy | None) -> str
     and fall back to. None only when nothing is placeable.
     """
     if policy is not None:
-        balanced = next(
-            (p for p in points if p.kind == "routed" and p.dial == 0.25), None
-        )
+        balanced = next((p for p in points if p.kind == "routed" and p.dial == 0.25), None)
         if balanced is not None and balanced.cost_per_completed_task_usd is not None:
             return balanced.id
     frontier = [p for p in points if p.on_frontier]

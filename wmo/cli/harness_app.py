@@ -502,9 +502,7 @@ def optimize(
         on_proposal=_proposal,
     )
     champion_version = store.aliases(name).get(CHAMPION_ALIAS)
-    current = (
-        store.load(name, str(champion_version)) if champion_version is not None else None
-    )
+    current = store.load(name, str(champion_version)) if champion_version is not None else None
     unchanged = current is not None and current.doc_hash == result.best.doc_hash
     saved = current if unchanged else store.save_version(result.best, alias=CHAMPION_ALIAS)
     selected = len(result.archive.accepted())
