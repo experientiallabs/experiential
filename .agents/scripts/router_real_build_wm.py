@@ -54,9 +54,16 @@ def _objects(path: Path) -> list[dict[str, object]]:
 
 
 def _string_set(path: Path, key: str) -> set[str]:
-    value = _json(path)
-    if not isinstance(value, list):
-        raise ValueError(f"{path} must contain a list")
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        value: list[object] = []
+    elif text.startswith("["):
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError(f"{path} must contain a list or JSONL objects")
+        value = list(parsed)
+    else:
+        value = list(_objects(path))
     selected = set()
     for raw in value:
         row = _dict(raw)
