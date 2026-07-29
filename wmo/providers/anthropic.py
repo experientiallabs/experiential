@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from wmo.providers._anthropic_chat import messages_request, messages_response
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 
     from anthropic import Anthropic
     from anthropic.types import MessageParam
+    from llm_waterfall import ChatRequest, ChatResponse
 
 
 class AnthropicProvider:
@@ -94,6 +96,27 @@ class AnthropicProvider:
             cache_write_input_tokens=cache_write,
         )
         return Completion(text=text, usage=usage)
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Return one non-streaming structured chat completion (tools, tool results, usage).
+
+        Satisfies `wmo.providers.base.ToolCallingProvider`, which text-only callers (the world
+        model, the judge, GEPA) never need but agent runtimes do: without it an Anthropic
+        candidate cannot run a tool-calling harness at all, which is what made the serving
+        endpoint refuse Anthropic tool calls and what kept Claude out of real benchmark grids
+        whose harness is tool-based.
+
+        Prompt-cache breakpoints are placed by `messages_request`. Agent loops replay a growing
+        prefix every turn, so the alternative is paying full input price for the whole transcript
+        on every step; the translator's docstring states where the breakpoints land and why.
+        """
+        payload = messages_request(
+            request,
+            self.config.model,
+            default_max_tokens=DEFAULT_MAX_TOKENS,
+        )
+        response = self._get_client().messages.create(**cast("Any", payload))
+        return messages_response(response, self.config.model)
 
     def stream(
         self,
