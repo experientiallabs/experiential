@@ -33,16 +33,19 @@ def _selected(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
     for attempts in grouped.values():
         ordered = sorted(attempts, key=lambda row: int(row.get("attempt_number", 0)))
-        selected.append(
-            next(
-                (
-                    row
-                    for row in ordered
-                    if isinstance(row.get("reward"), (int, float))
-                ),
-                ordered[-1],
-            )
+        chosen = next(
+            (
+                row
+                for row in ordered
+                if isinstance(row.get("reward"), (int, float))
+            ),
+            ordered[-1],
         )
+        # The frozen task and split manifests use Harbor's canonical bare task id. The
+        # per-shard runner prefixes scenario_id for human readability; remove that prefix at
+        # the one merge boundary so the measured matrix keys exactly match the preregistration.
+        task_id = chosen.get("task_id")
+        selected.append({**chosen, "scenario_id": task_id} if isinstance(task_id, str) else chosen)
     return sorted(
         selected,
         key=lambda row: (str(row.get("model")), str(row.get("scenario_id"))),

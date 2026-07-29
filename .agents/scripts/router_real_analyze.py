@@ -69,6 +69,18 @@ def _task_map(matrix: OutcomeMatrix) -> dict[str, str]:
     return tasks
 
 
+def _canonical_matrix_ids(benchmark: str, matrix: OutcomeMatrix) -> OutcomeMatrix:
+    """Align runner-local labels with the task ids frozen before paid execution."""
+    if benchmark != "tau2":
+        return matrix
+    outcomes = []
+    for row in matrix.outcomes:
+        domain, separator, task_id = row.scenario_id.partition(":")
+        canonical = f"{domain}/{task_id}" if separator else row.scenario_id
+        outcomes.append(row.model_copy(update={"scenario_id": canonical}))
+    return matrix.model_copy(update={"outcomes": outcomes})
+
+
 def _cached_semantic_embedder(
     matrix: OutcomeMatrix,
     cache_dir: Path,
@@ -383,6 +395,7 @@ def analyze(
     out_dir: Path,
     cache_root: Path,
 ) -> dict[str, object]:
+    matrix = _canonical_matrix_ids(benchmark, matrix)
     task_manifest_data = _json(task_manifest)
     groups = {}
     for raw_row in _list(task_manifest_data["tasks"]):
