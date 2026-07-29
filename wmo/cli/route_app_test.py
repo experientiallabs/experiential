@@ -218,6 +218,25 @@ def test_a_misspelled_provenance_is_refused_not_written(tmp_path: Path) -> None:
     assert not pareto.exists()
 
 
+def test_the_report_label_defaults_to_the_world_model_phrasing(tmp_path: Path) -> None:
+    result, pareto = _fit_then_report(tmp_path)
+    assert result.exit_code == 0, result.output
+    report = json.loads((pareto.parent / "report.json").read_text())
+    assert "reconstructed from your traces" in report["scenario_label"]
+
+
+def test_a_real_benchmark_report_can_say_what_it_measured(tmp_path: Path) -> None:
+    # scenario_label is the one line of the report a customer actually reads. Telling them their
+    # endpoint was measured on scenarios "reconstructed from your traces" when it was measured on
+    # a pinned public benchmark is false, and until now the phrasing was hardcoded.
+    result, pareto = _fit_then_report(
+        tmp_path, "--scenario-label", "on the 20 pinned tau2-bench eval tasks"
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads((pareto.parent / "report.json").read_text())
+    assert report["scenario_label"] == "on the 20 pinned tau2-bench eval tasks"
+
+
 def test_route_fit_rejects_unknown_embedder(tmp_path: Path) -> None:
     result = runner.invoke(
         app,

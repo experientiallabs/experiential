@@ -1352,6 +1352,14 @@ def report(
         help="What scored the episodes, printed beside every rendering of the curve. Pass the "
         "real scorer for a real-benchmark matrix (for example \\[tau2 reward]).",
     ),
+    scenario_label: str = typer.Option(
+        "",
+        "--scenario-label",
+        help="The report's customer-facing sentence describing WHAT was measured. Defaults to the "
+        "world-model phrasing ('reconstructed from your traces'), which is false for a real "
+        "benchmark, so pass the truth there (for example 'on the 20 pinned tau2-bench eval "
+        "tasks').",
+    ),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
     if provenance not in {WM_SIMULATED, REAL_EPISODE}:
@@ -1369,6 +1377,7 @@ def report(
             baseline=baseline,
             endpoint=endpoint,
             generated_at=datetime.now(tz=UTC).isoformat(),
+            scenario_label=scenario_label or None,
         )
     except KeyError as exc:
         # `--baseline` is a pool entry handle; the KeyError already lists the ones this matrix
