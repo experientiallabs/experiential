@@ -776,12 +776,16 @@ def _runner_sha() -> str:
     return _git_head(Path(__file__).resolve().parent.parent.parent)
 
 
-ARM = "real"
-"""This grid's single arm: real benchmark episodes. There is no second condition to compare.
+ARM = "identity"
+"""This grid's single arm, named for the contract two consumers already share.
 
-It is a directory rather than an implicit default because two consumers key on that layout: the
-shared corners runner reads `<dataset_root>/<arm>/matrix.json`, and `wmo runs backfill` refuses a
-grid directory that holds no arm to replay. One name, two contracts already written.
+The arm is a directory because the shared corners runner reads
+`<dataset_root>/<arm>/matrix.json` and `wmo runs backfill` refuses a grid directory that holds no
+arm to replay. The NAME is `identity` because that is what the corners loader calls the
+uncompressed control arm (`data.GRID_ARMS`, and it raises on an arm it does not know), and
+uncompressed is exactly what this grid is: there is no compression axis here and no second
+condition to compare. Calling it `real` would have meant patching shared code that all three
+lanes read, to say the same thing.
 """
 
 

@@ -1,0 +1,82 @@
+{
+  "status": "no grid data on disk yet",
+  "dataset": "swe-bench-verified-real",
+  "judge": "swe-bench test suite (deterministic verifier; FAIL_TO_PASS + PASS_TO_PASS)",
+  "pending_arms": [
+    "identity",
+    "truncate",
+    "llmlingua2-endpoint"
+  ],
+  "anchor": "fable-5",
+  "best_single": null,
+  "teacher_verdict": null,
+  "teacher_unavailable_reason": null,
+  "records": {},
+  "routed": [],
+  "embedding_replay": {
+    "calls": 0,
+    "est_usd_at_3large_list": 0.0,
+    "label": "estimate; analysis spend allowed by Silen 2026-07-28 ruling"
+  },
+  "real_probe": {
+    "label": "measured",
+    "provenance": "real_episode",
+    "judge": "tau2 reward (7/20 pinned tasks include tau2's NL-assertion judge)",
+    "deviation": "routed arm executed direct (served endpoint 501s tool calls on anthropic-kind entries; finding filed); balanced policy routes 100% opus-5, verified live + 20/20 LOO folds",
+    "vs_anchor": {
+      "label": "measured",
+      "provenance": "real_episode",
+      "judge": "tau2 reward (7/20 pinned tasks include tau2's NL-assertion judge)",
+      "cost_delta_percent_ci95": {
+        "low": -44.8,
+        "high": 6.6,
+        "n_scenarios": 20,
+        "undefined_resamples": 0
+      },
+      "quality_delta_points": -25.0,
+      "quality_delta_paired": {
+        "mean": -0.25,
+        "ci95": [
+          -0.425,
+          -0.05
+        ],
+        "sign_test_p": 0.01171875,
+        "n_pairs": 20,
+        "within_noise_floor": false
+      },
+      "cost_delta_percent": -25.0,
+      "latency_p50_delta_percent": -28.9,
+      "cost_per_completed_task_usd": 1.0917835714285713,
+      "anchor_cost_per_completed_task_usd": 1.4559035483870968,
+      "task_success_rate": 0.525,
+      "mean_reward": 0.525,
+      "latency_p50_model_s": 51.33,
+      "latency_p95_model_s": 171.74,
+      "scenarios_compared": 20,
+      "scenarios_excluded": 0,
+      "n_scored": 40,
+      "n_excluded_episodes": 0,
+      "excluded_cost_usd": 0.0,
+      "overhead_components": [],
+      "cost_assumptions": "Arm 'routed-decision-direct [real]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone. Anchor 'fable-5 [real]': Effective cost is cache-adjusted provider spend plus optimizer-side inference, divided by the number of COMPLETED tasks. Provider spend is the amount recorded per episode at the serving pool's own per-token prices, which bill cache reads and cache writes at their separate tiers. Unscored episodes are excluded from both the numerator and the denominator and reported separately, because an infrastructure failure is not a judge verdict of 0. A task counts as completed when the verifier marked the episode a success. No optimizer-side inference was recorded for these episodes, so the figure is provider spend alone."
+    },
+    "sim_vs_real": {
+      "note": "sign agreement requires a scenario-id bridge (wm ids are trace hashes, real ids are domain:task); computed by the probe script via the pinned split order and reported in findings",
+      "wm_mean_delta_pt": 10.88,
+      "real_mean_delta_pt": -25.0,
+      "wm_n_up_down_tied": [
+        8,
+        5,
+        7
+      ],
+      "real_n_up_down_tied": [
+        1,
+        10,
+        9
+      ]
+    }
+  },
+  "notes": [
+    "identity arm (or its anchor rows) not landed: records empty"
+  ]
+}
