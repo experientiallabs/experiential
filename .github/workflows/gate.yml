@@ -25,8 +25,11 @@ jobs:
       - name: ruff check
         run: uv run ruff check .
       - name: ruff format
+        if: always()
         run: uv run ruff format --check .
       - name: ty check
+        if: always()
         run: uv run ty check
       - name: pytest
+        if: always()
         run: uv run pytest -q
