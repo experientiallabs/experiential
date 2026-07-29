@@ -291,6 +291,7 @@ def main() -> int:
     }
     world_model_usd = run.world_model_usd
     world_model_usage_paths = [run.usage_path] if run.usage_path else []
+    world_model_metering_gaps = [run.metering_gap] if run.metering_gap else []
     scenario_by_task = {scenario.task: scenario for scenario in scenarios}
     current = {
         (row.model, row.scenario_id, row.episode): row for row in canonical_rows
@@ -337,6 +338,8 @@ def main() -> int:
             world_model_usd += retry_run.world_model_usd
             if retry_run.usage_path:
                 world_model_usage_paths.append(retry_run.usage_path)
+            if retry_run.metering_gap:
+                world_model_metering_gaps.append(retry_run.metering_gap)
             for row in rows:
                 current[(row.model, row.scenario_id, row.episode)] = row
     write_text_atomic(
@@ -361,9 +364,7 @@ def main() -> int:
         "candidate_cost_usd": sum(candidate_usd_by_model.values()),
         "candidate_cost_usd_by_model": candidate_usd_by_model,
         "world_model_cost_usd": world_model_usd,
-        "world_model_metering_gap": (
-            run.metering_gap if len(world_model_usage_paths) <= 1 else None
-        ),
+        "world_model_metering_gaps": world_model_metering_gaps,
         "world_model_usage_paths": [str(path) for path in world_model_usage_paths],
     }
     write_text_atomic(
