@@ -269,26 +269,6 @@ class WmoHarborAgent(BaseAgent):
         # unwrapped ThrottlingException would otherwise kill a whole trial.
         return wrap_provider_with_retries(get_provider(config))
 
-    def _build_provider(self, config: ProviderConfig) -> Provider:
-        """Construct the worker provider; the one seam subclasses may override.
-
-        Called exactly once, from ``__init__``, after ``BaseAgent`` has set
-        ``self.logs_dir`` and the validated provider config and model identity are in
-        place, so an override can key per-trial state (e.g. a token sink named after
-        the harbor trial) off the logs directory.
-
-        Args:
-            config: The validated worker provider config.
-
-        Returns:
-            The provider the episode runtime will drive. Overrides must keep the
-            retry contract by wrapping their provider with
-            ``wrap_provider_with_retries``.
-        """
-        # Retry-wrap the worker provider: Bedrock disables botocore's own retries, so one
-        # unwrapped ThrottlingException would otherwise kill a whole trial.
-        return wrap_provider_with_retries(get_provider(config))
-
     @staticmethod
     def name() -> str:
         return "wmo-harness"

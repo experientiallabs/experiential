@@ -106,10 +106,17 @@ async def _scorer(
     concurrency: int,
     timeout_s: float,
 ) -> HarborScorer:
+    provider_config = entry.provider_config()
+    if entry.kind is ProviderKind.AZURE_OPENAI:
+        # Harbor persists its job config. The worker reads these two values from the trusted
+        # standard environment so neither resolved endpoint nor deployment enters that artifact.
+        provider_config = provider_config.model_copy(
+            update={"endpoint": None, "deployment": None}
+        )
     return await HarborScorer.create(
         _job_template(root, jobs_dir),
         task_ids,
-        provider_config=entry.provider_config(),
+        provider_config=provider_config,
         reward_key="reward",
         reward_mode="positive-binary",
         attempts=1,
@@ -133,6 +140,9 @@ def _activate_entry_credentials(entry: PoolEntry) -> None:
         raise ValueError(f"{entry.name} did not resolve its Azure endpoint and key")
     os.environ["AZURE_OPENAI_ENDPOINT"] = config.endpoint
     os.environ["AZURE_OPENAI_API_KEY"] = key
+    if not config.deployment:
+        raise ValueError(f"{entry.name} did not resolve its Azure deployment")
+    os.environ["AZURE_OPENAI_DEPLOYMENT"] = config.deployment
 
 
 def _trace_task(cell: ScoreCell) -> str:
@@ -143,8 +153,27 @@ def _trace_task(cell: ScoreCell) -> str:
     return value if isinstance(value, str) and value else cell.task_id
 
 
+def _is_tool_step(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    action = value.get("action")
+    return isinstance(action, dict) and action.get("kind") == "tool_call"
+
+
 def _row(cell: ScoreCell, entry: PoolEntry, attempt: int) -> dict[str, object]:
     usage, traces = _usage(Path(cell.artifact_dir))
+    trace_payload = _json_object(Path(traces[0])) if traces else {}
+    raw_steps = trace_payload.get("steps")
+    steps = raw_steps if isinstance(raw_steps, list) else []
+    tool_calls = sum(_is_tool_step(step) for step in steps)
+    raw_stop = trace_payload.get("stop_reason")
+    stop_reason = (
+        raw_stop
+        if isinstance(raw_stop, str)
+        else "infrastructure_failure"
+        if cell.infra_failed
+        else "official_verifier"
+    )
     reward = None if cell.infra_failed else cell.reward
     return {
         "scenario_id": f"{BENCHMARK}:{cell.task_id}",
@@ -155,9 +184,9 @@ def _row(cell: ScoreCell, entry: PoolEntry, attempt: int) -> dict[str, object]:
         "reward": reward,
         "success": bool(cell.passed and not cell.infra_failed),
         "critique": cell.note,
-        "steps": 0,
-        "tool_calls": 0,
-        "stop_reason": "infrastructure_failure" if cell.infra_failed else "official_verifier",
+        "steps": len(steps),
+        "tool_calls": tool_calls,
+        "stop_reason": stop_reason,
         "usage": usage.model_dump(mode="json"),
         "cost_usd": entry.cost_usd(_priced_usage(usage)),
         "call_seconds": usage.call_seconds,
@@ -393,4 +422,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     raise SystemExit(main())

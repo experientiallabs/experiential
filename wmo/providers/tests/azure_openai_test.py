@@ -160,6 +160,36 @@ def test_complete_sends_deployment_as_model(monkeypatch: pytest.MonkeyPatch) -> 
     assert chat.last_kwargs["max_completion_tokens"] == 16
 
 
+def test_complete_can_read_trusted_deployment_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat = _FakeChatCompletions(_FakeChatResponse("yo", _FakeUsage(3, 2)))
+    config = _config().model_copy(update={"deployment": None})
+    provider = AzureOpenAIProvider(config)
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "private-deployment")
+    monkeypatch.setattr(provider, "_get_client", lambda: _FakeClient(chat))
+
+    provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
+
+    assert chat.last_kwargs["model"] == "private-deployment"
+
+
+def test_complete_requires_config_or_environment_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config().model_copy(update={"deployment": None})
+    provider = AzureOpenAIProvider(config)
+    monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT", raising=False)
+    monkeypatch.setattr(
+        provider,
+        "_get_client",
+        lambda: _FakeClient(_FakeChatCompletions(_FakeChatResponse("yo", _FakeUsage(3, 2)))),
+    )
+
+    with pytest.raises(ValueError, match="AZURE_OPENAI_DEPLOYMENT"):
+        provider.complete("sys", [Message(role="user", content="hi")], max_tokens=16)
+
+
 @pytest.mark.parametrize(
     ("model_type", "expects_temperature"),
     [("gpt-5.5", False), ("deepseek-v4-pro", True)],

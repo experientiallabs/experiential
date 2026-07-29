@@ -168,9 +168,13 @@ class AzureOpenAIProvider:
 
     def _deployment(self) -> str:
         # On Azure, the `model` arg to the API is the deployment name, not the base model id.
-        if self.config.deployment is None:
-            raise ValueError("AzureOpenAIProvider requires config.deployment to be set.")
-        return self.config.deployment
+        deployment = self.config.deployment or os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+        if deployment is None:
+            raise ValueError(
+                "AzureOpenAIProvider requires config.deployment or "
+                "AZURE_OPENAI_DEPLOYMENT to be set."
+            )
+        return deployment
 
     def complete(
         self,
