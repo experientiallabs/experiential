@@ -83,7 +83,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from llm_waterfall.types import ChatRequest, ChatResponse
+from llm_waterfall.types import ChatMessage, ChatRequest, ChatResponse
 from pydantic import BaseModel, JsonValue
 
 from wmo.distill.tau2_proxy import EpisodeProxy
@@ -150,6 +150,44 @@ class CellKey:
         return f"{self.model}--{self.instance_id}--ep{self.episode}"
 
 
+OPENAI_MESSAGE_FIELDS = frozenset(
+    {"role", "content", "name", "tool_calls", "tool_call_id", "function_call", "refusal"}
+)
+"""Message keys an OpenAI-compatible upstream is documented to accept."""
+
+
+def _without_client_debris(request: ChatRequest) -> ChatRequest:
+    """The same conversation with client-injected message extras dropped.
+
+    A WORKAROUND for a product gap, filed rather than hidden: `ChatMessage` is `extra="allow"`,
+    so anything a client hangs on a message survives validation and is forwarded verbatim to the
+    upstream API. litellm hangs `provider_specific_fields` on every assistant message it echoes
+    back, and a strict upstream answers the whole request with a 400 naming
+    `messages[2].provider_specific_fields`. Measured candidate by candidate on the same request:
+    glm-5.2 rejects it (400, and the episode dies at the first assistant replay, so all 40 of
+    its cells), while deepseek-v4-pro and kimi-k2.6 on the same Azure resource tolerate it and
+    the Anthropic and OpenAI backends accept it. One strict upstream is enough: the debris has
+    no business on the wire for any of them.
+
+    Dropping unknown keys cannot change what the model is asked: every documented field is kept,
+    and the debris carries no instruction. The real fix belongs at the provider boundary in wmo
+    (an allowlist when building the upstream payload) so the serving endpoint stops forwarding
+    the same debris; that is a shipped-behavior change with its own tests, not something to land
+    under a running grid.
+    """
+    messages = [
+        ChatMessage.model_validate(
+            {
+                k: v
+                for k, v in message.model_dump(exclude_none=True).items()
+                if k in OPENAI_MESSAGE_FIELDS
+            }
+        )
+        for message in request.messages
+    ]
+    return request.model_copy(update={"messages": messages})
+
+
 class _RecordingChatProvider:
     """One cell's provider: the pool candidate's own `complete_chat`, metered per call.
 
@@ -177,7 +215,7 @@ class _RecordingChatProvider:
         """One agent step: sample the candidate, record what it cost, pass the response back."""
         started = time.monotonic()
         try:
-            response = self._provider.complete_chat(request)
+            response = self._provider.complete_chat(_without_client_debris(request))
         except Exception as exc:
             with self._lock:
                 # First fault wins: it is the one that ended the episode.
@@ -708,6 +746,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--grid-root", default=str(MAIN_CHECKOUT / ".wmo" / "jt" / "bench-defaults")
     )
     parser.add_argument("--smoke", action="store_true", help="2 instances x 1 episode")
+    parser.add_argument(
+        "--retry-unscored",
+        action="store_true",
+        help="re-buy cells whose recorded outcome is an infrastructure failure, not a verdict",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -768,13 +811,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         for instance_id in instance_ids
         for entry in pool.models
     ]
-    todo = [cell for cell in cells if load_cell(grid_dir, cell) is None]
+    todo: list[CellKey] = []
+    retried = 0
+    for cell in cells:
+        measured = load_cell(grid_dir, cell)
+        if measured is None:
+            todo.append(cell)
+        elif not measured.scored and args.retry_unscored:
+            # An unscored cell recorded an infrastructure failure, not a verdict, so re-buying it
+            # is buying the measurement we did not get. Off by default: a cell that fails twice
+            # for the same reason is evidence about the backend, and silently re-running it
+            # forever would hide that.
+            todo.append(cell)
+            retried += 1
     logger.info(
-        "cohort %s: %d cells total, %d already measured, %d to buy",
+        "cohort %s: %d cells total, %d already measured, %d to buy (%d of them re-buys of "
+        "unscored cells)",
         cohort,
         len(cells),
         len(cells) - len(todo),
         len(todo),
+        retried,
     )
 
     proxy = EpisodeProxy()
