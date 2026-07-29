@@ -8,13 +8,16 @@ WHICH KIND THE PRODUCT USES, because the three below are not peers:
   `kind="knn"`), so every optimized endpoint serves a knn policy.
 - `static` is not an algorithm, it is the pre-optimization state: an endpoint must serve from
   the moment it exists, before any fit has run, and the improvement report needs an honest
-  "before" to measure against. A seeded or freshly created endpoint gets one of these over
-  the strongest available serving model.
+  "before" to measure against. Two producers choose its model differently: the hosted platform
+  seeds one over the strongest serving model available to the org, while `wmo optimize route
+  pin` installs one for whichever `--model` an operator names, which may deliberately be a
+  weaker one.
 - `rank` is a RESEARCH DIRECTION, retained deliberately: a faithful replication kept for
   comparison, reachable only through the manual `wmo optimize route fit --kind rank`. The
-  product pipeline never fits it and no served endpoint carries one. It is also the only kind
-  with clusters, which is why a request log's cluster columns are empty for everything the
-  product serves.
+  staged pipeline never fits one, so nothing serves one today - but the runtime DOES dispatch a
+  manually installed rank artifact through `rank_decision`, so read this as unfitted by the
+  product rather than unservable. It is also the only kind with clusters, which is why a
+  request log's cluster columns are empty for everything the product serves.
 
 The three kinds:
 
