@@ -6,9 +6,13 @@ per-call persistence exists for.
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 
+logger = logging.getLogger("repair_swe_steps")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
 base = Path(sys.argv[1])
 fixed = unchanged = 0
 for outcome_path in sorted(base.glob("cells/*/*/ep*/outcome.json")):
@@ -18,8 +22,8 @@ for outcome_path in sorted(base.glob("cells/*/*/ep*/outcome.json")):
         before = outcome["steps"]
         outcome["steps"] = calls
         outcome_path.write_text(json.dumps(outcome, indent=2))
-        print(f"  {outcome['model']:16s} {outcome['scenario_id']:26s} steps {before} -> {calls}")
+        logger.info("%s %s steps %d -> %d", outcome["model"], outcome["scenario_id"], before, calls)
         fixed += 1
     else:
         unchanged += 1
-print(f"repaired {fixed}, unchanged {unchanged}")
+logger.info("repaired %d, unchanged %d", fixed, unchanged)
