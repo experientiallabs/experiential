@@ -33,10 +33,12 @@ cost-per-task chart are dataset-native and carry the routed rungs this leg fits.
 from build_corners import REAL_EPISODE, FigureSpec, LensSpec
 from data import main_checkout
 
-COHORT = "swe-8bd6c3a11dea"
+COHORT = "swe-cachefix-8bd6c3a11dea"
 """The cohort these figures were rendered from, named so a rerun cannot silently pick another.
 
-A cohort is one harness, one pool, one pin, one step limit. Pointing the lens at the parent
+A cohort is one harness, one pool, one pin, one step limit, and one pricing path (the previous
+cohort was discarded because its cache-split reader missed the OpenAI backends, so its rows priced
+cached prompts at the full input rate). Pointing the lens at the parent
 directory would let a later cohort's arm be swept into the same figure, which is the
 cells-measured-under-two-harnesses error the runner's cohort discipline exists to prevent.
 """

@@ -147,6 +147,11 @@ class CellRecord(BaseModel):
     call_seconds: list[float] = []
     replies: list[str] = []
     provider_error: str | None = None
+    # PER-CALL usage, kept beside the total because the total cannot be repaired. A cache-split
+    # reading bug (this runner shipped one: the nested OpenAI field was missed, so 95%-cached
+    # prompts priced at the full input rate) is otherwise only fixable by re-buying every cell.
+    # With the per-call rows on disk, a repricing is an offline pass over artifacts.
+    call_usage: list[TokenUsage] = []
 
 
 @dataclass(frozen=True)
@@ -316,6 +321,7 @@ class _RecordingChatProvider:
                 ),
             )
             self._record.call_seconds.append(elapsed)
+            self._record.call_usage.append(call_usage)
             self._record.replies.append(text)
             calls = len(self._record.call_seconds)
             running = self._entry.cost_usd(self._record.usage)
@@ -337,26 +343,47 @@ class _RecordingChatProvider:
 def _usage_of(response: ChatResponse) -> TokenUsage:
     """The call's usage on `TokenUsage`'s cached-as-subset contract.
 
-    `ChatResponse.token_usage()` projects only the two totals, and the cache split is exactly
-    what cache-adjusted pricing needs, so the provider-carried cache counters are read here.
-    Backends that report no cache tokens leave the split at zero, which prices the whole prompt
-    at the full input rate (never silently free).
+    `ChatResponse.token_usage()` projects only the two totals, and the cache split is exactly what
+    cache-adjusted pricing needs, so the provider-carried cache counters are read here. They live
+    in two different places depending on the backend, and reading only one of them is a costing
+    bug that hides in plain sight, so both are measured rather than assumed:
+
+    - Anthropic (through this repo's own translator) reports `cache_read_input_tokens` and
+      `cache_creation_input_tokens` at the TOP level of usage.
+    - OpenAI-compatible backends nest the read count at `prompt_tokens_details.cached_tokens`
+      (and sometimes `cache_write_tokens` beside it). Measured on a replayed 5.5k-token prefix:
+      gpt-5.5 5248, gpt-5.4-mini 5248, gpt-5.6-luna 5535, deepseek-v4-pro 5632, all against
+      prompt totals of about 5.5k, so ignoring the nested field prices a 95%-cached prompt at the
+      full input rate. kimi-k2.6 reports no details at all and therefore genuinely earns no
+      credit, which is a backend fact and not a parsing miss.
+
+    A backend that reports nothing leaves the split at zero, which prices the whole prompt at the
+    full input rate: never silently free.
     """
     if response.usage is None:
         return TokenUsage()
     extra = response.usage.model_dump()
-    read = extra.get("cache_read_input_tokens")
-    write = extra.get("cache_creation_input_tokens")
-    if not isinstance(read, int):
-        read = extra.get("cached_tokens") if isinstance(extra.get("cached_tokens"), int) else 0
-    if not isinstance(write, int):
-        write = 0
+    details = extra.get("prompt_tokens_details")
+    nested = details if isinstance(details, dict) else {}
+    read = _first_int(extra.get("cache_read_input_tokens"), nested.get("cached_tokens"))
+    write = _first_int(
+        extra.get("cache_creation_input_tokens"),
+        nested.get("cache_write_tokens"),
+    )
     return TokenUsage(
         input_tokens=response.usage.prompt_tokens,
         output_tokens=response.usage.completion_tokens,
-        cached_input_tokens=int(read or 0),
-        cache_write_input_tokens=int(write),
+        cached_input_tokens=read,
+        cache_write_input_tokens=write,
     )
+
+
+def _first_int(*candidates: object) -> int:
+    """The first candidate that is an int, or 0. Order is the backends' precedence."""
+    for candidate in candidates:
+        if isinstance(candidate, int):
+            return candidate
+    return 0
 
 
 def _reply_text(response: ChatResponse) -> str:
@@ -726,6 +753,7 @@ def run_cell(
                 "patch_chars": len(patch or ""),
                 "provenance": "real_episode",
                 "judge": "swe-bench test suite (deterministic verifier)",
+                "call_usage": [u.model_dump(mode="json") for u in record.call_usage],
             },
             indent=2,
         ),
