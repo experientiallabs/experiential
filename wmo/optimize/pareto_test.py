@@ -176,3 +176,30 @@ def test_full_coverage_band_is_untouched_by_the_eligibility_rule() -> None:
     curve = pareto_curve(_three_model_matrix(), judge="test-judge")
 
     assert all(p.frontier_eligible for p in curve.points)
+
+
+def test_a_pinned_policy_still_ships_the_workload_frontier() -> None:
+    """A pin has no dial to replay, but the workload's frontier exists anyway.
+
+    `route report` was skipping the pareto write for static policies, so an
+    honestly-pinned endpoint shipped NO curve for the product's dial UI. The
+    curve now carries the model points over the full matrix and recommends
+    what the product mounts today: the pinned model itself.
+    """
+    from wmo.optimize.pareto import held_out_curve
+    from wmo.optimize.policy import RoutingPolicy
+    from wmo.providers.pool import PoolEntry as PolicyPoolEntry
+
+    matrix = _three_model_matrix()
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="strong",
+        pool=[PolicyPoolEntry(name="strong", kind=ProviderKind.ANTHROPIC, model="claude-fable-5")],
+    )
+
+    curve = held_out_curve(matrix, policy, judge="test-judge", provenance="real_episode")
+
+    assert curve.recommended == "strong"
+    assert all(point.kind == "model" for point in curve.points)
+    assert {point.id for point in curve.points} == {"cheap", "mid", "strong"}
+    assert curve.provenance == "real_episode"

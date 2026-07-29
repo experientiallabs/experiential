@@ -216,7 +216,18 @@ def held_out_curve(
     excluded so no routed point is graded on the fit's own training data. A policy fitted
     on EVERY scenario has no held-out band; the curve then carries the model points alone
     (over all scenarios) rather than in-sample routed points dressed as measurements.
+
+    A non-knn policy (a pin, a rank) has no dial to replay, but the WORKLOAD's frontier
+    exists regardless of what serves it — and a pinned endpoint is exactly the case where
+    an operator most wants to see what else was measured. The curve then carries the model
+    points over the full matrix, with `recommended` naming what the product mounts today:
+    the policy's own default model (bench-defaults/tau finding 11, 2026-07-29).
     """
+    if policy.kind != "knn":
+        curve = pareto_curve(matrix, judge=judge, provenance=provenance)
+        if any(point.id == policy.default_model for point in curve.points):
+            return curve.model_copy(update={"recommended": policy.default_model})
+        return curve
     held_out = [sid for sid in matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)]
     if not held_out:
         return pareto_curve(matrix, judge=judge, provenance=provenance)
