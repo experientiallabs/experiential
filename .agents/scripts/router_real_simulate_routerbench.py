@@ -141,11 +141,20 @@ def _cell(
             "ground_truth_reward": real.reward,
         }
     except Exception as exc:  # noqa: BLE001
+        failure_usage: dict[str, object] | None = None
+        failure_cost = 0.0
+        metering_gap: str | None = None
         if session is not None:
             try:
-                world_model.end_session(session.id)
-            except Exception:  # noqa: BLE001
-                pass
+                usage_record = world_model.end_session(session.id)
+                failure_usage, failure_cost = _priced_usage(pool, usage_record)
+            except Exception as usage_exc:  # noqa: BLE001
+                metering_gap = (
+                    "world-model session failed and its usage record could not be closed: "
+                    f"{type(usage_exc).__name__}: {usage_exc}"
+                )[:1000]
+        else:
+            metering_gap = "world-model session failed before a metered session was created"
         return {
             "scenario_id": real.scenario_id,
             "task": real.task,
@@ -163,7 +172,9 @@ def _cell(
             "replies": real.replies,
             "error": f"{type(exc).__name__}: {exc}"[:1000],
             "remeasured": attempt > 1,
-            "world_model_cost_usd": 0.0,
+            "world_model_usage": failure_usage,
+            "world_model_cost_usd": failure_cost,
+            "world_model_metering_gap": metering_gap,
             "ground_truth_reward": real.reward,
         }
 
@@ -261,9 +272,10 @@ def main() -> int:
     matrix = OutcomeMatrix(pool=real_matrix.pool, outcomes=outcomes)
     matrix.save(matrix_path)
     gradeable = sum(row.reward is not None for row in outcomes)
+    all_attempts = _read_rows(rows_path)
     wm_cost = sum(
         _number(row.get("world_model_cost_usd", 0.0))
-        for row in selected
+        for row in all_attempts
         if isinstance(row.get("world_model_cost_usd"), (int, float))
     )
     summary = {
@@ -273,8 +285,13 @@ def main() -> int:
         "cells_expected": expected,
         "cells_present": len(outcomes),
         "gradeable": gradeable,
+        "attempt_rows": len(all_attempts),
         "format_failures": sum(
             row.get("failure_class") == "world_model_format" for row in selected
+        ),
+        "unmetered_attempts": sum(
+            isinstance(row.get("world_model_metering_gap"), str)
+            for row in all_attempts
         ),
         "world_model_cost_usd": wm_cost,
         "candidate_cost_usd": 0.0,
