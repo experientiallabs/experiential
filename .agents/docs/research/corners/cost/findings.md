@@ -271,3 +271,20 @@ THIS cohort, the real Pareto winner is a $0.10/$0.15 model and the product story
 "we found a 50x cheaper parity model"); (2) a judge-affinity check (rescore a sample of WM
 episodes with a non-Anthropic judge); (3) refit the policy on real-validated evidence for
 this workload.
+
+### The discrepancy, diagnosed (2026-07-28, zero-spend forensics)
+
+The WM judge cannot recognize correct inaction. On the 8 bridgeable scenarios where
+fable-5 scored a perfect 1.00 on real tau2 (the explain-policy-and-do-nothing task class:
+basic-economy cancellations, post-booking insurance), the WM judge scored the same model
+0.00-0.57 with critiques of the form "you only retrieved the reservation details and took
+no action" - on transcripts showing correct policy refusals. The judge zeroes correct
+refusal for every model (opus-5's WM rows on the same tasks: 0.00 vs real 1.00), so the
+inversion is not family favoritism: clipping the refusal class deletes fable-5's real
+advantage from the sim. Ruled out by the same pass: truncation (episodes end normally in
+both worlds), scaffold early-quit (uniform), judge parse fail-close (real but rare, 0-2
+rows/model). One open verification: config.toml names haiku-4-5 as judge_model while the
+program has quoted opus-4-8 - the master confirms the actual grid judge. The router is
+exonerated: it optimized correctly against wrong rewards. Fixes filed in DECISIONS
+(inaction clause / end-state verification, real-evidence refit, /improve-judge with the 8
+divergent scenarios as the labeled regression set).
