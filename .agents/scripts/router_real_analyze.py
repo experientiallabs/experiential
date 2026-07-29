@@ -12,6 +12,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+from router_real_ids import canonical_tau2_scenario_id
 
 from wmo.core.files import write_text_atomic
 from wmo.optimize.knn import apply_cost_quality, best_single_on_fit, fit_knn_policy
@@ -75,8 +76,7 @@ def _canonical_matrix_ids(benchmark: str, matrix: OutcomeMatrix) -> OutcomeMatri
         return matrix
     outcomes = []
     for row in matrix.outcomes:
-        domain, separator, task_id = row.scenario_id.partition(":")
-        canonical = f"{domain}/{task_id}" if separator else row.scenario_id
+        canonical = canonical_tau2_scenario_id(row.scenario_id)
         outcomes.append(row.model_copy(update={"scenario_id": canonical}))
     return matrix.model_copy(update={"outcomes": outcomes})
 

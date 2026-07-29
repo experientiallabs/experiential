@@ -46,7 +46,21 @@ the balanced dial it predicts a 0.225-point quality loss and a 108.78 percent co
 routes do not match closely, however. Replaying the WMO-selected policy against real outcomes
 loses 0.337 quality points and costs 12.12 percent more than the policy fit on real outcomes.
 
-Tau2 and Terminal-Bench 2 are still running. Their simulated rewards are world-model judgments,
+Tau2 replay is complete:
+
+- 170 / 180 gradeable final cells and 208 all-attempt rows
+- $130.820903 candidate inference plus $159.026555 Azure GPT-5.5 world-model inference
+- 47.65% binary cell agreement and 53.72-point mean absolute error
+- 0 / 5 best-single agreement
+- 0% selected-model agreement and 72% guard-gate agreement
+
+The WMO-fitted Tau2 policy rejects promotion, matching the real deployment decision. It predicts
+the same simulated quality as its simulated best single and 1.74 percent lower cost, but only two
+of five seeds pass the joint point-estimate gate. The agreement is not sufficient validation:
+WMO chooses Fable as the baseline instead of the real matrix's Sonnet, and replaying its policy
+on real outcomes loses 20.0 reward points and costs 149.45 percent more than the real-data policy.
+
+Terminal-Bench 2 is still running. Its simulated rewards, like Tau2's, are world-model judgments,
 not official real-environment verifier results. Real and simulated rows will never be pooled.
 
 Terminal-Bench 2 has already exposed a fidelity limitation: many candidate episodes exhaust the

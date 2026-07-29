@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from router_real_ids import canonical_tau2_scenario_id
 
 from wmo.core.files import write_text_atomic
 from wmo.optimize.outcomes import OutcomeMatrix
@@ -61,8 +62,7 @@ def _canonical(benchmark: str, matrix: OutcomeMatrix) -> OutcomeMatrix:
         return matrix
     rows = []
     for row in matrix.outcomes:
-        domain, separator, task_id = row.scenario_id.partition(":")
-        scenario_id = f"{domain}/{task_id}" if separator else row.scenario_id
+        scenario_id = canonical_tau2_scenario_id(row.scenario_id)
         rows.append(row.model_copy(update={"scenario_id": scenario_id}))
     return matrix.model_copy(update={"outcomes": rows})
 
