@@ -8,7 +8,6 @@ import json
 import math
 import random
 import statistics
-import tempfile
 from collections import defaultdict
 from pathlib import Path
 
@@ -480,59 +479,65 @@ def analyze(
             }
             paired_by_arm[name].append((rows, baseline_rows))
         for representation, (spec, embedder) in representations.items():
-            with tempfile.TemporaryDirectory() as temp:
-                strict = fit_knn_policy(
-                    seed_matrix,
-                    bank_path=Path(temp) / KNN_BANK_FILENAME,
-                    fit_ids=fit_ids,
-                    embedder=spec,
-                    embed_with=embedder,
-                    guard_model=baseline,
-                    rag_num=50,
-                    rag_thres=0.95,
-                    z=0.5,
-                    min_pairs=8,
-                    se_floor=True,
-                    floor_q=0.05,
-                    fitted_from=f"{benchmark} seed={seed} representation={representation}",
-                )
-                policies = {
-                    "unguarded": strict.model_copy(
-                        update={
-                            "knn_z": 0.0,
-                            "knn_min_pairs": 0,
-                            "se_floor": False,
-                            "floor_sim": None,
-                            "floor_q": 0.0,
-                        }
-                    ),
-                    **{
-                        f"dial-{dial:g}": apply_cost_quality(strict, dial)
-                        for dial in DIALS
-                    },
-                }
-                for arm, policy in policies.items():
-                    policy.attach_bank(strict.knn_bank())
-                    decisions = route_scenarios(
-                        policy, seed_matrix, heldout_ids, embedder=embedder
-                    )
-                    metrics, rows = _evaluate_choices(
-                        heldout_ids,
-                        {
-                            scenario_id: decision.model
-                            for scenario_id, decision in decisions.items()
-                        },
-                        cells,
-                        groups,
-                        baseline=baseline,
-                        decisions=decisions,
-                    )
-                    arm_name = f"{representation}/{arm}"
-                    arms[arm_name] = {
-                        "metrics": metrics,
-                        "delta": _paired_delta(metrics, baseline_metrics),
+            policy_dir = out_dir / "policies" / benchmark / f"seed-{seed}" / representation
+            policy_dir.mkdir(parents=True, exist_ok=True)
+            strict = fit_knn_policy(
+                seed_matrix,
+                bank_path=policy_dir / KNN_BANK_FILENAME,
+                fit_ids=fit_ids,
+                embedder=spec,
+                embed_with=embedder,
+                guard_model=baseline,
+                rag_num=50,
+                rag_thres=0.95,
+                z=0.5,
+                min_pairs=8,
+                se_floor=True,
+                floor_q=0.05,
+                fitted_from=f"{benchmark} seed={seed} representation={representation}",
+            )
+            strict.save(policy_dir / "guarded.json")
+            policies = {
+                "unguarded": strict.model_copy(
+                    update={
+                        "knn_z": 0.0,
+                        "knn_min_pairs": 0,
+                        "se_floor": False,
+                        "floor_sim": None,
+                        "floor_q": 0.0,
                     }
-                    paired_by_arm[arm_name].append((rows, baseline_rows))
+                ),
+                **{
+                    f"dial-{dial:g}": apply_cost_quality(strict, dial)
+                    for dial in DIALS
+                },
+            }
+            for arm, policy in policies.items():
+                policy.attach_bank(strict.knn_bank())
+                policy_path = policy_dir / f"{arm}.json"
+                policy.save(policy_path)
+                decisions = route_scenarios(
+                    policy, seed_matrix, heldout_ids, embedder=embedder
+                )
+                metrics, rows = _evaluate_choices(
+                    heldout_ids,
+                    {
+                        scenario_id: decision.model
+                        for scenario_id, decision in decisions.items()
+                    },
+                    cells,
+                    groups,
+                    baseline=baseline,
+                    decisions=decisions,
+                )
+                arm_name = f"{representation}/{arm}"
+                arms[arm_name] = {
+                    "metrics": metrics,
+                    "delta": _paired_delta(metrics, baseline_metrics),
+                    "policy": str(policy_path),
+                    "bank": str(policy_dir / KNN_BANK_FILENAME),
+                }
+                paired_by_arm[arm_name].append((rows, baseline_rows))
         seed_results.append(
             {
                 "seed": seed,
