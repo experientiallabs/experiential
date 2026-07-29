@@ -73,7 +73,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 from llm_waterfall.types import ChatChoice, ChatRequest, ChatResponse, ChatTool, ChatToolCall
 from llm_waterfall.types import ChatMessage as ProviderChatMessage
-from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 from starlette.background import BackgroundTask
 
 from wmo.optimize.compression import (
@@ -1118,31 +1118,21 @@ def _provider_request(request: ChatCompletionRequest, messages: list[ChatMessage
     return provider_request
 
 
-class _PromptTokensDetails(BaseModel):
-    """The cached-prompt split an OpenAI-shaped `usage` object carries beside its totals."""
-
-    cached_tokens: int = 0
-
-
 def _structured_usage(response: ChatResponse) -> TokenUsage:
     """Real token usage from a structured response, cached-prompt split included.
 
-    `ChatResponse.token_usage()` keeps only the two totals, but cache reads bill at a discount
-    and the request log prices each row with them (`PoolEntry.cost_usd`), so the split is read
-    off the provider's own `prompt_tokens_details`. A shape this build cannot parse costs the
-    row its cached split (priced at the full input rate, never silently free), not the request.
+    `ChatResponse.token_usage()` parses the provider's own `prompt_tokens_details` (cache
+    reads bill at a discount and the request log prices each row with the split via
+    `PoolEntry.cost_usd`); this projects it onto wmo's counters. A shape the parse cannot
+    read costs the row its cached split (priced at the full input rate, never silently
+    free), not the request.
     """
     counts = response.token_usage()
-    cached = 0
-    if response.usage is not None:
-        raw = (response.usage.model_extra or {}).get("prompt_tokens_details")
-        if isinstance(raw, dict):
-            with contextlib.suppress(ValidationError):
-                cached = _PromptTokensDetails.model_validate(raw).cached_tokens
     return TokenUsage(
         input_tokens=counts.input_tokens,
         output_tokens=counts.output_tokens,
-        cached_input_tokens=cached,
+        cached_input_tokens=counts.cached_input_tokens,
+        cache_write_input_tokens=counts.cache_write_input_tokens,
     )
 
 
@@ -1765,9 +1755,16 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
         # Shared with _finalize: a disconnecting client makes starlette CANCEL the stream
         # without ever closing the sync generator, so cleanup inside the generator (finally,
         # GeneratorExit) never runs on that path. The BackgroundTask below is the only hook
-        # that fires on both normal completion and disconnect.
+        # that fires on both normal completion and disconnect. The generator appends every
+        # delta it emitted to `streamed_parts` so the disconnect path can estimate the
+        # partial generation it never got a usage chunk for.
         stream_state = {"recorded": False}
-        partial_usage = TokenUsage()
+        streamed_parts: list[str] = []
+        # The probe chunk was already pulled off the upstream before the response body
+        # exists, so it is generated (and billed) even when the client disconnects before
+        # the generator ever runs; seed it so the estimate counts it exactly once.
+        if first is not None and first.delta:
+            streamed_parts.append(first.delta)
 
         def _events() -> Iterator[str]:
             yield _sse(
@@ -1775,8 +1772,8 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     completion_id, created, runtime.name, {"role": "assistant", "content": ""}
                 )
             )
-            parts: list[str] = []
-            usage = partial_usage
+            parts = streamed_parts
+            usage = TokenUsage()
             try:
                 chunk = first
                 while chunk is not None:
@@ -1784,7 +1781,8 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                         if chunk.usage is not None:
                             usage = chunk.usage
                     elif chunk.delta:
-                        parts.append(chunk.delta)
+                        if chunk is not first:  # the probe chunk is pre-seeded above
+                            parts.append(chunk.delta)
                         yield _sse(
                             _chunk_payload(
                                 completion_id,
@@ -1830,8 +1828,13 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             """Runs after the response ends, HOWEVER it ends (starlette BackgroundTask).
 
             An abandoned stream still consumed upstream tokens: leaving it unrecorded would
-            be silent usage loss (D-METERING). Also closes the upstream iterator, which the
-            cancelled threadpool iteration otherwise leaks.
+            be silent usage loss (D-METERING). The provider's usage arrives only in the
+            terminal chunk the client never waited for, so the row carries a chars/4
+            estimate of what actually went out and came back — the same documented,
+            conservative proxy the cache-credit estimate uses — and names itself as one.
+            An estimate that errs low still beats the zero-token row an earlier version
+            wrote here, which billed the whole partial generation at $0. Also closes the
+            upstream iterator, which the cancelled threadpool iteration otherwise leaks.
             """
             close = getattr(upstream, "close", None)
             if callable(close):
@@ -1839,11 +1842,22 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     close()
             if not stream_state["recorded"]:
                 stream_state["recorded"] = True
+                sent_chars = sum(
+                    len(message.content) for message in provider_messages if message.content
+                )
+                streamed_chars = sum(len(part) for part in streamed_parts)
                 _record(
-                    partial_usage,
+                    TokenUsage(
+                        input_tokens=sent_chars // 4,
+                        output_tokens=streamed_chars // 4,
+                    ),
                     ttfb_ms=ttfb_ms,
                     status="error",
-                    error_message="client disconnected mid-stream",
+                    error_message=(
+                        "client disconnected mid-stream; usage is a chars/4 estimate of the "
+                        "partial generation (the provider reports exact counts only in the "
+                        "terminal chunk, which never arrived)"
+                    ),
                 )
 
         return StreamingResponse(

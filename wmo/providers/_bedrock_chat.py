@@ -138,14 +138,14 @@ def converse_response(raw: object, model: str) -> ChatResponse:
     # prices at the cache-read rate; the write leg has no OpenAI-compatible
     # field, so it bills at the full input rate — slightly under the write
     # premium, never silently free.
-    cache_read = int(usage_data.get("cacheReadInputTokens", 0) or 0)
-    cache_write = int(usage_data.get("cacheWriteInputTokens", 0) or 0)
+    cache_read = _token_count(usage_data.get("cacheReadInputTokens"))
+    cache_write = _token_count(usage_data.get("cacheWriteInputTokens"))
     return ChatResponse.model_validate(
         {
             "model": model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {
-                "prompt_tokens": int(usage_data.get("inputTokens", 0) or 0)
+                "prompt_tokens": _token_count(usage_data.get("inputTokens"))
                 + cache_read
                 + cache_write,
                 "completion_tokens": usage_data.get("outputTokens", 0),
@@ -153,6 +153,11 @@ def converse_response(raw: object, model: str) -> ChatResponse:
             },
         }
     )
+
+
+def _token_count(value: object) -> int:
+    """A Converse usage counter, or 0 for an absent/malformed one."""
+    return value if isinstance(value, int) else 0
 
 
 def _chat_text(content: JsonValue) -> str:

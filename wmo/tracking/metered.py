@@ -95,8 +95,10 @@ class MeteredProvider:
     ) -> Iterator[StreamChunk]:
         """Forward a native stream, recording usage from the terminal chunk.
 
-        A stream abandoned before its terminal chunk records nothing even though the provider
-        billed the partial generation; serving owns closing streams it starts.
+        A stream abandoned before its terminal chunk still consumed provider tokens; the
+        provider reports exact counts only in the chunk the consumer never took, so the
+        abandonment path records a chars/4 estimate of what was sent and what streamed
+        (the documented, conservative proxy) instead of the zero an earlier version wrote.
         """
         if not isinstance(self._provider, StreamingProvider):
             raise TypeError(
@@ -104,13 +106,32 @@ class MeteredProvider:
                 "stream() is only available for native backends"
             )
         phase = self._classify(system) if self._classify is not None else self._base_phase
-        for chunk in self._provider.stream(
-            system, messages, temperature=temperature, max_tokens=max_tokens
-        ):
-            if chunk.done and chunk.usage is not None:
-                model = chunk.model or self._provider.config.model
-                self._tracker.record(phase, model, chunk.usage)
-            yield chunk
+        recorded = False
+        streamed_chars = 0
+        try:
+            for chunk in self._provider.stream(
+                system, messages, temperature=temperature, max_tokens=max_tokens
+            ):
+                if chunk.delta:
+                    streamed_chars += len(chunk.delta)
+                if chunk.done and chunk.usage is not None:
+                    model = chunk.model or self._provider.config.model
+                    self._tracker.record(phase, model, chunk.usage)
+                    recorded = True
+                yield chunk
+        finally:
+            # Runs on GeneratorExit (consumer closed or dropped the iterator) and on
+            # upstream exceptions alike; a normally finished stream was already recorded.
+            if not recorded:
+                sent_chars = len(system) + sum(len(m.content) for m in messages if m.content)
+                self._tracker.record(
+                    phase,
+                    self._provider.config.model,
+                    TokenUsage(
+                        input_tokens=sent_chars // 4,
+                        output_tokens=streamed_chars // 4,
+                    ),
+                )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         # Embeddings carry no token usage from our providers; record a zero-usage event for the

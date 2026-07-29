@@ -77,4 +77,3 @@ def test_embed_raises_unsupported(fake_anthropic: list[_FakeAnthropic]) -> None:
     adapter = AnthropicAdapter(Backend("anthropic", "claude-opus-4-8"))
     with pytest.raises(EmbeddingsUnsupported):
         adapter.embed(["x"])
-
