@@ -411,11 +411,15 @@ class RunState:
                 reserved += _float(row.get("reserved_usd"))
             elif status == "completed" or status is None:
                 if row.get("model_cost_accounting_status") == "missing_provider_usage":
-                    raise BudgetExhausted(
-                        f"{row.get('event_id')} has unknown paid model cost; "
-                        "no further reservations are safe"
-                    )
-                spent += _float(row.get("model_cost_usd"))
+                    budget_debit = _float(row.get("budget_debit_usd"))
+                    if budget_debit <= 0:
+                        raise BudgetExhausted(
+                            f"{row.get('event_id')} has unknown paid model cost and no "
+                            "authorized conservative budget debit"
+                        )
+                    spent += budget_debit
+                else:
+                    spent += _float(row.get("model_cost_usd"))
         return spent, reserved
 
     def completed(self, benchmark: str, task_id: str, arm: str) -> bool:

@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
 from coding_model_router_analyze import _develop
 from coding_model_router_matrix import (
     BENCHMARKS,
@@ -16,6 +17,8 @@ from coding_model_router_matrix import (
     FULL_STAGE,
     HARBOR_TASK_CACHE,
     SPLIT_SEEDS,
+    BudgetExhausted,
+    RunState,
     _fast_dev_task_ids,
     _job_template,
     _stage_cell_specs,
@@ -108,6 +111,42 @@ def test_job_template_uses_experiment_task_cache(tmp_path: Path) -> None:
     template = _job_template(FAST_DEV_BENCHMARK, tmp_path / "jobs")
 
     assert template.datasets[0].download_dir == HARBOR_TASK_CACHE
+
+
+def test_conservative_unknown_cost_debit_counts_against_ceiling(tmp_path: Path) -> None:
+    (tmp_path / "spend-ledger.jsonl").write_text(
+        json.dumps(
+            {
+                "event_id": "invalid-smoke:paid",
+                "model_cost_accounting_status": "missing_provider_usage",
+                "model_cost_usd": None,
+                "budget_debit_usd": 300.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = RunState(root=tmp_path / "full", pool=_pool(), ceiling_usd=20_000.0)
+
+    assert state.spent_and_reserved() == (300.0, 0.0)
+
+
+def test_unreconciled_unknown_cost_still_fails_closed(tmp_path: Path) -> None:
+    (tmp_path / "spend-ledger.jsonl").write_text(
+        json.dumps(
+            {
+                "event_id": "invalid-smoke:paid",
+                "model_cost_accounting_status": "missing_provider_usage",
+                "model_cost_usd": None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = RunState(root=tmp_path / "full", pool=_pool(), ceiling_usd=20_000.0)
+
+    with pytest.raises(BudgetExhausted, match="no authorized conservative budget debit"):
+        state.spent_and_reserved()
 
 
 def test_develop_fits_diagnostic_policy_without_outer_heldout(tmp_path: Path) -> None:

@@ -11,7 +11,7 @@ Branch: `exp/coding-model-router-20260729`
 Worktree:
 `/Users/admin/Documents/experientiallabs/.codex/worktrees/world-model-optimizer/coding-model-router-20260729`
 
-Material paid sweep ceiling: not authorized.
+Material paid sweep ceiling: USD 20,000, authorized by the user on 2026-07-29.
 
 ## Objective
 
@@ -214,9 +214,11 @@ The transport now meters every request with per-call input, cached-input, cache-
 output, and latency counters. It also preserves partial usage on failure. Both smoke and full
 matrix runners stop before another paid call if any completed attempt has unknown cost.
 
-This was the single smoke attempt permitted by the frozen protocol. It did not pass. No replacement
-smoke is authorized, and no material paid cell may launch without both an explicit replacement
-decision and a user-provided spend ceiling.
+This was the single original smoke attempt permitted by the frozen protocol. It did not pass. On
+2026-07-29 the user authorized one replacement smoke and a USD 20,000 hard experiment ceiling.
+The three historic paid rows remain explicitly unknown-cost. A conservative USD 300 debit is
+charged against the ceiling without relabeling it as realized spend. The original smoke tree is
+preserved by digest before a fresh replacement root is created.
 
 ## Router search
 
@@ -316,8 +318,8 @@ cost-quality dial.
 ## Spend and durability
 
 No full benchmark cell may launch until a user-provided material paid sweep ceiling is recorded in
-the freeze summary and enforced by the spend ledger. The bounded four-cell smoke is the only paid
-work permitted before that ceiling.
+the freeze summary and enforced by the spend ledger. The original and one authorized replacement
+four-cell smoke are the only paid work permitted before a valid smoke gate.
 
 Raw artifacts live under `.wmo/experiments/coding-router-20260728/` and stay out of Git. The
 protocol and one-off runners live under `.agents/`. Long jobs use tmux with persistent logs. A
@@ -341,6 +343,9 @@ uv run python .agents/scripts/coding_model_router_smoke.py \
 An explicitly authorized replacement smoke must demonstrate an actual interruption and resume:
 
 ```bash
+uv run python .agents/scripts/coding_model_router_authorize.py \
+  --root .wmo/experiments/coding-router-20260728 \
+  --ceiling-usd 20000 --unknown-cost-budget-debit-usd 300
 uv run python .agents/scripts/coding_model_router_smoke.py \
   --root .wmo/experiments/coding-router-20260728/smoke \
   --interrupt-after-cells 2

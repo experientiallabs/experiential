@@ -156,6 +156,7 @@ def test_empty_root_fails_closed(tmp_path: Path) -> None:
     assert result.completion_status == "incomplete"
     assert result.ready_for_material_paid_execution is False
     assert result.target_achieved is None
+    assert result.conservative_budget_debit_usd == 0.0
     assert result.blocking_requirements
 
 
@@ -168,6 +169,7 @@ def test_complete_evidence_can_conclude_target_not_reached(tmp_path: Path) -> No
     assert result.target_achieved is False
     assert result.ready_for_material_paid_execution is True
     assert result.known_model_spend_usd == 1.25
+    assert result.conservative_budget_debit_usd == 0.0
     assert not result.blocking_requirements
 
 
@@ -190,3 +192,28 @@ def test_unknown_cost_event_blocks_completion(tmp_path: Path) -> None:
     assert result.completion_status == "incomplete"
     assert result.unknown_cost_events == 1
     assert "exact_spend_ledger" in result.blocking_requirements
+
+
+def test_conservative_debit_reconciles_but_does_not_relabel_unknown_cost(
+    tmp_path: Path,
+) -> None:
+    _complete_fixture(tmp_path)
+    with (tmp_path / "spend-ledger.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "event_id": "invalid-smoke:paid",
+                    "status": "completed",
+                    "model_cost_usd": None,
+                    "budget_debit_usd": 300.0,
+                }
+            )
+            + "\n"
+        )
+
+    result = audit(tmp_path)
+
+    assert result.completion_status == "complete"
+    assert result.known_model_spend_usd == 1.25
+    assert result.conservative_budget_debit_usd == 300.0
+    assert result.unknown_cost_events == 1

@@ -54,6 +54,7 @@ class CompletionAudit(BaseModel):
     ready_for_material_paid_execution: bool
     target_achieved: bool | None
     known_model_spend_usd: float
+    conservative_budget_debit_usd: float
     unknown_cost_events: int
     requirements: list[RequirementResult]
     blocking_requirements: list[str]
@@ -326,7 +327,7 @@ def _dense_matrix(root: Path) -> RequirementResult:
     )
 
 
-def _ledger(root: Path) -> tuple[RequirementResult, float, int]:
+def _ledger(root: Path) -> tuple[RequirementResult, float, float, int]:
     path = root / "spend-ledger.jsonl"
     rows = _read_rows(path)
     if rows is None:
@@ -339,10 +340,13 @@ def _ledger(root: Path) -> tuple[RequirementResult, float, int]:
                 [path],
             ),
             0.0,
+            0.0,
             0,
         )
     known = 0.0
+    debit = 0.0
     unknown = 0
+    unreconciled = 0
     reserved = 0
     for row in rows:
         if row.get("status") == "reserved":
@@ -351,18 +355,26 @@ def _ledger(root: Path) -> tuple[RequirementResult, float, int]:
         cost = _number(row.get("model_cost_usd"))
         if cost is None:
             unknown += 1
+            budget_debit = _number(row.get("budget_debit_usd"))
+            if budget_debit is None or budget_debit <= 0:
+                unreconciled += 1
+            else:
+                debit += budget_debit
         else:
             known += cost
-    valid = unknown == 0 and reserved == 0
+    valid = unreconciled == 0 and reserved == 0
     return (
         _result(
             "exact_spend_ledger",
             "passed" if valid else "blocked",
             (
-                f"All {len(rows)} ledger events have exact model cost and no open reservation."
+                (
+                    f"All {len(rows)} ledger events are exact or carry an explicit "
+                    "conservative ceiling debit, with no open reservation."
+                )
                 if valid
                 else (
-                    f"The ledger has {unknown} unknown-cost events and "
+                    f"The ledger has {unreconciled} unreconciled unknown-cost events and "
                     f"{reserved} open reservations."
                 )
             ),
@@ -370,10 +382,13 @@ def _ledger(root: Path) -> tuple[RequirementResult, float, int]:
             [path],
             events=len(rows),
             known_model_spend_usd=known,
+            conservative_budget_debit_usd=debit,
             unknown_cost_events=unknown,
+            unreconciled_unknown_cost_events=unreconciled,
             open_reservations=reserved,
         ),
         known,
+        debit,
         unknown,
     )
 
@@ -602,7 +617,7 @@ def _final_report(root: Path) -> RequirementResult:
 
 def audit(root: Path) -> CompletionAudit:
     """Evaluate every terminal condition without making network or provider calls."""
-    ledger, known_spend, unknown_costs = _ledger(root)
+    ledger, known_spend, budget_debit, unknown_costs = _ledger(root)
     pareto, target = _pareto_conclusion(root)
     requirements = [
         _frozen_protocol(root),
@@ -635,9 +650,12 @@ def audit(root: Path) -> CompletionAudit:
         experiment_id=EXPERIMENT_ID,
         audited_at=datetime.now(UTC).isoformat(),
         completion_status="complete" if not blocking else "incomplete",
-        ready_for_material_paid_execution=smoke_passed and ceiling_passed and unknown_costs == 0,
+        ready_for_material_paid_execution=smoke_passed
+        and ceiling_passed
+        and ledger.status == "passed",
         target_achieved=target,
         known_model_spend_usd=known_spend,
+        conservative_budget_debit_usd=budget_debit,
         unknown_cost_events=unknown_costs,
         requirements=requirements,
         blocking_requirements=blocking,
