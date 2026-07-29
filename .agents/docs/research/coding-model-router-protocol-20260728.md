@@ -62,6 +62,37 @@ Router features contain only the task statement and metadata available before th
 call. Patches, hidden tests, verifier output, reward, future tool trajectory, and held-out labels
 are excluded.
 
+### Fast development tranche
+
+The full matrix is scheduled in two resumable stages so implementation feedback does not wait for
+SWE-bench setup and repository test latency. `fast-dev` is the first persisted tranche of the real
+matrix, not another smoke or a disposable pilot. Every gradeable row is reused unchanged by the
+full matrix.
+
+The tranche contains 48 cells: four anchor arms crossed with 12 Terminal-Bench 2 tasks. The arms
+are `oai-sol-high`, `oai-luna-high`, `ant-opus5-high`, and `ant-haiku45`, covering both providers
+and one frontier and inexpensive arm from each. Candidate tasks are the intersection of the
+Terminal-Bench fit assignments across all five outer seeds. They are ordered by SHA-256 of
+`fast-dev-v1:<task-id>` and the first 12 are selected:
+
+1. `git-multibranch`
+2. `hf-model-inference`
+3. `model-extraction-relu-logits`
+4. `compile-compcert`
+5. `configure-git-webserver`
+6. `mteb-leaderboard`
+7. `schemelike-metacircular-eval`
+8. `winning-avg-corewars`
+9. `break-filter-js-from-html`
+10. `db-wal-recovery`
+11. `financial-document-processor`
+12. `extract-moves-from-video`
+
+This tranche may guide implementation and offline router debugging only. It cannot select the
+production baseline, lock a promotion configuration, touch any outer-heldout reward, or support a
+headline claim. The `full` stage resumes the same matrix and fills every remaining Terminal-Bench
+2 and SWE-bench Verified cell before nested fit-only selection begins.
+
 Frozen artifact SHA-256 values:
 
 | Artifact | SHA-256 |
@@ -322,7 +353,12 @@ After both a valid smoke and a positive authorized ceiling are frozen:
 ```bash
 uv run python .agents/scripts/coding_model_router_matrix.py \
   --root .wmo/experiments/coding-router-20260728 \
-  --concurrency 4 --timeout-s 900
+  --stage fast-dev --concurrency 4 --timeout-s 900
+uv run python .agents/scripts/coding_model_router_analyze.py \
+  --root .wmo/experiments/coding-router-20260728 develop
+uv run python .agents/scripts/coding_model_router_matrix.py \
+  --root .wmo/experiments/coding-router-20260728 \
+  --stage full --concurrency 4 --timeout-s 900
 uv run python .agents/scripts/coding_model_router_analyze.py \
   --root .wmo/experiments/coding-router-20260728 validate
 uv run python .agents/scripts/coding_model_router_embeddings.py \

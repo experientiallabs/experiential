@@ -21,9 +21,15 @@ from pathlib import Path
 from typing import cast
 
 import numpy as np
+from coding_model_router_matrix import (
+    FAST_DEV_ARMS,
+    FAST_DEV_BENCHMARK,
+    FAST_DEV_TASK_COUNT,
+    _fast_dev_task_ids,
+)
 
 from wmo.core.files import write_text_atomic
-from wmo.optimize.knn import cost_quality_knobs, fit_knn_policy
+from wmo.optimize.knn import cost_quality_knobs, fit_knn_artifact, fit_knn_policy
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import (
     KNN_BANK_FILENAME,
@@ -32,7 +38,7 @@ from wmo.optimize.policy import (
     RoutingEvidence,
     RoutingPolicy,
 )
-from wmo.optimize.routing import fit_rank_policy, route_scenarios
+from wmo.optimize.routing import evaluate_policy, fit_rank_policy, route_scenarios
 from wmo.providers.base import Embedder
 
 EXPERIMENT_ID = "coding-router-20260728"
@@ -47,6 +53,7 @@ BENCHMARK_RETENTION_FLOOR = 0.90
 BENCHMARK_ABSOLUTE_LOSS_LIMIT = 0.10
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-large"
 OPENAI_EMBEDDING_DIM = 3072
+FAST_DEV_FIT_TASKS = 8
 
 logger = logging.getLogger("coding-model-router-analyze")
 
@@ -273,6 +280,137 @@ def _canonical_matrix(root: Path) -> tuple[OutcomeMatrix, dict[str, dict[str, di
         },
     )
     return canonical, manifests
+
+
+def _fast_dev_matrix(root: Path) -> tuple[OutcomeMatrix, list[str]]:
+    """Load the exact gradeable fast tranche without reading any outer-heldout row."""
+    source_path = root / "full" / "outcomes.json"
+    source = OutcomeMatrix.load(source_path)
+    task_ids = _fast_dev_task_ids(root)
+    scenario_ids = [f"{FAST_DEV_BENCHMARK}:{task_id}" for task_id in task_ids]
+    expected = {(scenario_id, model) for scenario_id in scenario_ids for model in FAST_DEV_ARMS}
+    gradeable: dict[tuple[str, str], list[ScenarioOutcome]] = defaultdict(list)
+    for outcome in source.outcomes:
+        key = (outcome.scenario_id, outcome.model)
+        if key in expected and outcome.reward is not None:
+            gradeable[key].append(outcome)
+    missing = sorted(expected - gradeable.keys())
+    duplicates = sorted(key for key, rows in gradeable.items() if len(rows) != 1)
+    if missing or duplicates:
+        _write_json(
+            root / "analysis" / "fast-dev-validation.json",
+            {
+                "expected_cells": len(expected),
+                "gradeable_cells": len(gradeable),
+                "missing": missing,
+                "duplicate_gradeable": duplicates,
+                "status": "incomplete",
+            },
+        )
+        raise ValueError(
+            "fast development tranche is incomplete: "
+            f"{len(missing)} missing, {len(duplicates)} duplicate"
+        )
+    pool = [entry for entry in source.pool if entry.name in FAST_DEV_ARMS]
+    if {entry.name for entry in pool} != set(FAST_DEV_ARMS):
+        raise ValueError("full matrix pool does not contain every fast development arm")
+    matrix = OutcomeMatrix(
+        pool=pool,
+        outcomes=[gradeable[key][0] for key in sorted(expected)],
+    )
+    _write_json(
+        root / "analysis" / "fast-dev-validation.json",
+        {
+            "expected_cells": FAST_DEV_TASK_COUNT * len(FAST_DEV_ARMS),
+            "gradeable_cells": len(matrix.outcomes),
+            "tasks": task_ids,
+            "arms": list(FAST_DEV_ARMS),
+            "status": "complete",
+        },
+    )
+    return matrix, scenario_ids
+
+
+def _fast_static_metric(
+    matrix: OutcomeMatrix,
+    ids: list[str],
+    model: str,
+) -> dict[str, float]:
+    cells = _cell_map(matrix)
+    rows = [cells[(scenario_id, model)] for scenario_id in ids]
+    return {
+        "quality": statistics.fmean(cast("list[float]", [row.reward for row in rows])),
+        "cost_per_task": statistics.fmean(row.cost_usd for row in rows),
+    }
+
+
+def _develop(root: Path) -> None:
+    """Fit a mutable diagnostic router on the fast tranche, never for promotion."""
+    matrix, scenario_ids = _fast_dev_matrix(root)
+    fit_ids = scenario_ids[:FAST_DEV_FIT_TASKS]
+    replay_ids = scenario_ids[FAST_DEV_FIT_TASKS:]
+    order = {entry.name: index for index, entry in enumerate(matrix.pool)}
+    fit_static = {
+        model: _fast_static_metric(matrix, fit_ids, model) for model in matrix.model_names()
+    }
+    baseline = min(
+        matrix.model_names(),
+        key=lambda model: (
+            -fit_static[model]["quality"],
+            fit_static[model]["cost_per_task"],
+            order[model],
+        ),
+    )
+    policy_path = root / "analysis" / "fast-dev-policy" / "policy.json"
+    fitted = fit_knn_artifact(
+        matrix,
+        out_path=policy_path,
+        matrix_source=str(root / "full" / "outcomes.json"),
+        embedder=EmbedderSpec(kind="hashing", dim=1024),
+        fit_ids=fit_ids,
+        fallback=baseline,
+        z=0.5,
+        rag_num=8,
+        rag_thres=0.95,
+        min_pairs=3,
+        se_floor=True,
+        floor_q=0.05,
+    )
+    replay = evaluate_policy(fitted.policy, matrix, replay_ids)
+    replay_baseline = _fast_static_metric(matrix, replay_ids, baseline)
+    retention = (
+        replay.accuracy / replay_baseline["quality"]
+        if replay_baseline["quality"] > 0
+        else float(replay.accuracy >= replay_baseline["quality"])
+    )
+    savings = (
+        1.0 - replay.cost_per_scenario / replay_baseline["cost_per_task"]
+        if replay_baseline["cost_per_task"] > 0
+        else 0.0
+    )
+    _write_json(
+        root / "analysis" / "fast-dev-report.json",
+        {
+            "protocol": "coding-router-fast-dev-v1",
+            "diagnostic_only": True,
+            "promotion_evidence": False,
+            "matrix_sha256": _sha256(root / "full" / "outcomes.json"),
+            "code_commit": _git_commit(),
+            "benchmark": FAST_DEV_BENCHMARK,
+            "arms": list(FAST_DEV_ARMS),
+            "fit_ids": fit_ids,
+            "replay_ids": replay_ids,
+            "fit_selected_baseline": baseline,
+            "fit_static": fit_static,
+            "fit_router": fitted.model_dump(mode="json"),
+            "replay_baseline": replay_baseline,
+            "replay_router": replay.model_dump(mode="json"),
+            "replay_quality_retention": retention,
+            "replay_cost_savings": savings,
+            "policy_path": str(policy_path.resolve()),
+            "outer_heldout_rows_read": 0,
+        },
+    )
 
 
 def _subset(matrix: OutcomeMatrix, ids: list[str]) -> OutcomeMatrix:
@@ -1288,7 +1426,7 @@ def _validate(root: Path) -> None:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("validate", "select", "evaluate"))
+    parser.add_argument("phase", choices=("develop", "validate", "select", "evaluate"))
     parser.add_argument(
         "--root",
         type=Path,
@@ -1301,7 +1439,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = _parse_args()
     root = cast("Path", args.root).resolve()
-    if args.phase == "validate":
+    if args.phase == "develop":
+        _develop(root)
+    elif args.phase == "validate":
         _validate(root)
     elif args.phase == "select":
         _select(root)

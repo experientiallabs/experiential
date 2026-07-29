@@ -33,6 +33,20 @@ logger = logging.getLogger("coding-model-router-matrix")
 
 EXPERIMENT_ID = "coding-router-20260728"
 BENCHMARKS = ("terminal-bench-2", "swe-bench-verified")
+FULL_STAGE = "full"
+FAST_DEV_STAGE = "fast-dev"
+MATRIX_STAGES = (FAST_DEV_STAGE, FULL_STAGE)
+FAST_DEV_BENCHMARK = "terminal-bench-2"
+FAST_DEV_TASK_COUNT = 12
+FAST_DEV_SELECTOR = "all-seed-fit-sha256-v1"
+FAST_DEV_ARMS = (
+    "oai-sol-high",
+    "oai-luna-high",
+    "ant-opus5-high",
+    "ant-haiku45",
+)
+SPLIT_SEEDS = tuple(range(5))
+HARBOR_TASK_CACHE = Path("/private/tmp/wmo-coding-router-harbor/tasks")
 MAX_LOGICAL_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
 # One in-flight cell can use 20 calls with up to 4,096 output tokens each. Reserving $500 is
@@ -87,6 +101,65 @@ def _task_ids(path: Path) -> list[str]:
     return [cast("str", row["task_id"]) for row in _manifest_tasks(path)]
 
 
+def _fast_dev_task_ids(root: Path) -> list[str]:
+    """Select a deterministic development tranche that is fit-only in every split."""
+    fit_sets: list[set[str]] = []
+    for seed in SPLIT_SEEDS:
+        split_path = root / "splits" / f"seed-{seed}.json"
+        benchmark = _read_object(split_path).get(FAST_DEV_BENCHMARK)
+        if not isinstance(benchmark, dict):
+            raise ValueError(f"{split_path} has no {FAST_DEV_BENCHMARK} split")
+        fit = benchmark.get("fit")
+        if not isinstance(fit, list) or not all(isinstance(task_id, str) for task_id in fit):
+            raise ValueError(f"{split_path} has an invalid {FAST_DEV_BENCHMARK} fit list")
+        fit_sets.append(set(cast("list[str]", fit)))
+    common_fit = set.intersection(*fit_sets)
+    manifest_ids = set(_task_ids(root / "tasks" / f"{FAST_DEV_BENCHMARK}.json"))
+    if not common_fit <= manifest_ids:
+        missing = sorted(common_fit - manifest_ids)
+        raise ValueError(f"fast development candidates are absent from the manifest: {missing}")
+    ordered = sorted(
+        common_fit,
+        key=lambda task_id: (
+            hashlib.sha256(f"fast-dev-v1:{task_id}".encode()).hexdigest(),
+            task_id,
+        ),
+    )
+    if len(ordered) < FAST_DEV_TASK_COUNT:
+        raise ValueError(
+            f"fast development requires {FAST_DEV_TASK_COUNT} tasks fit-only in all splits, "
+            f"found {len(ordered)}"
+        )
+    return ordered[:FAST_DEV_TASK_COUNT]
+
+
+def _stage_cell_specs(
+    root: Path,
+    pool: ModelPool,
+    stage: str,
+) -> list[tuple[str, str, PoolEntry]]:
+    """Return the preregistered cells for one resumable matrix stage."""
+    if stage == FAST_DEV_STAGE:
+        entries = [entry for entry in pool.models if entry.name in FAST_DEV_ARMS]
+        found = {entry.name for entry in entries}
+        missing = sorted(set(FAST_DEV_ARMS) - found)
+        if missing:
+            raise ValueError(f"fast development arms are absent from the frozen pool: {missing}")
+        return [
+            (FAST_DEV_BENCHMARK, task_id, entry)
+            for entry in entries
+            for task_id in _fast_dev_task_ids(root)
+        ]
+    if stage != FULL_STAGE:
+        raise ValueError(f"unknown matrix stage {stage!r}")
+    return [
+        (benchmark, task_id, entry)
+        for benchmark in BENCHMARKS
+        for entry in pool.models
+        for task_id in _task_ids(root / "tasks" / f"{benchmark}.json")
+    ]
+
+
 def _expected_pins(path: Path, benchmark: str) -> dict[str, str]:
     pins: dict[str, str] = {}
     for row in _manifest_tasks(path):
@@ -105,9 +178,17 @@ def _expected_pins(path: Path, benchmark: str) -> dict[str, str]:
 
 def _job_template(benchmark: str, jobs_dir: Path) -> JobConfig:
     dataset = (
-        {"name": "terminal-bench", "version": "2.0"}
+        {
+            "name": "terminal-bench",
+            "version": "2.0",
+            "download_dir": str(HARBOR_TASK_CACHE),
+        }
         if benchmark == "terminal-bench-2"
-        else {"name": "swebench-verified", "version": "1.0"}
+        else {
+            "name": "swebench-verified",
+            "version": "1.0",
+            "download_dir": str(HARBOR_TASK_CACHE),
+        }
     )
     return JobConfig.model_validate(
         {
@@ -559,6 +640,16 @@ def _preflight(root: Path, pool: ModelPool) -> None:
             "tasks": len(task_ids),
             "execution_pins": len(scorer.task_pins),
         }
+    fast_tasks = _fast_dev_task_ids(root)
+    fast_specs = _stage_cell_specs(root, pool, FAST_DEV_STAGE)
+    resolved[FAST_DEV_STAGE] = {
+        "selector": FAST_DEV_SELECTOR,
+        "benchmark": FAST_DEV_BENCHMARK,
+        "tasks": fast_tasks,
+        "arms": list(FAST_DEV_ARMS),
+        "cells": len(fast_specs),
+        "rows_reused_by_full_stage": True,
+    }
     _write_json(
         root / "full" / "preflight.json",
         {
@@ -676,6 +767,7 @@ def _run(
     ceiling_usd: float,
     concurrency: int,
     timeout_s: float,
+    stage: str,
 ) -> None:
     for variable in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "E2B_API_KEY"):
         if not os.environ.get(variable):
@@ -690,11 +782,10 @@ def _run(
             f"{E2B_ACCOUNT_CAP}-sandbox account cap"
         )
     state = RunState(root=full_root, pool=pool, ceiling_usd=ceiling_usd)
+    stage_specs = _stage_cell_specs(root, pool, stage)
     cells = [
         (benchmark, task_id, entry)
-        for benchmark in BENCHMARKS
-        for entry in pool.models
-        for task_id in _task_ids(root / "tasks" / f"{benchmark}.json")
+        for benchmark, task_id, entry in stage_specs
         if not state.completed(benchmark, task_id, entry.name)
     ]
     cell_iterator = iter(cells)
@@ -741,12 +832,23 @@ def _run(
                 if not budget_exhausted:
                     submit_next()
     spent, reserved = state.spent_and_reserved()
+    stage_keys = {
+        (f"{benchmark}:{task_id}", entry.name) for benchmark, task_id, entry in stage_specs
+    }
+    full_cells_expected = len(pool.models) * sum(
+        len(_task_ids(root / "tasks" / f"{benchmark}.json")) for benchmark in BENCHMARKS
+    )
     _write_json(
         full_root / "summary.json",
         {
             "updated_at": _utc_now(),
-            "cells_expected": len(pool.models)
-            * sum(len(_task_ids(root / "tasks" / f"{benchmark}.json")) for benchmark in BENCHMARKS),
+            "stage": stage,
+            "stage_cells_expected": len(stage_specs),
+            "stage_gradeable_cells": sum(
+                row.reward is not None and (row.scenario_id, row.model) in stage_keys
+                for row in state.matrix.outcomes
+            ),
+            "cells_expected": full_cells_expected,
             "attempt_rows": len(state.matrix.outcomes),
             "gradeable_cells": sum(row.reward is not None for row in state.matrix.outcomes),
             "model_spend_usd": spent,
@@ -765,6 +867,7 @@ def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout-s", type=float, default=900.0)
+    parser.add_argument("--stage", choices=MATRIX_STAGES, default=FULL_STAGE)
     parser.add_argument("--preflight", action="store_true")
     args = parser.parse_args()
     if args.concurrency < 1:
@@ -787,6 +890,7 @@ def main() -> None:
         ceiling_usd=float(ceiling),
         concurrency=args.concurrency,
         timeout_s=args.timeout_s,
+        stage=args.stage,
     )
 
 
