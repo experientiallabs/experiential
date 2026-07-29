@@ -291,3 +291,63 @@ work permitted before that ceiling.
 Raw artifacts live under `.wmo/experiments/coding-router-20260728/` and stay out of Git. The
 protocol and one-off runners live under `.agents/`. Long jobs use tmux with persistent logs. A
 launch is accepted only after completed-cell counters advance on two successive polls.
+
+## Exact non-secret commands
+
+Run from the isolated worktree root. Paid phases load provider configuration without printing from
+`/Users/admin/Documents/experientiallabs/coding-router/.env.local` and E2B configuration from
+`/Users/admin/Documents/experientiallabs/platform/.env.local`.
+
+```bash
+uv run python .agents/scripts/coding_model_router_freeze.py \
+  --out-dir .wmo/experiments/coding-router-20260728
+uv run python .agents/scripts/coding_model_router_matrix.py \
+  --root .wmo/experiments/coding-router-20260728 --preflight
+uv run python .agents/scripts/coding_model_router_smoke.py \
+  --root .wmo/experiments/coding-router-20260728/smoke --preflight
+```
+
+An explicitly authorized replacement smoke must demonstrate an actual interruption and resume:
+
+```bash
+uv run python .agents/scripts/coding_model_router_smoke.py \
+  --root .wmo/experiments/coding-router-20260728/smoke \
+  --interrupt-after-cells 2
+uv run python .agents/scripts/coding_model_router_smoke.py \
+  --root .wmo/experiments/coding-router-20260728/smoke
+```
+
+After both a valid smoke and a positive authorized ceiling are frozen:
+
+```bash
+uv run python .agents/scripts/coding_model_router_matrix.py \
+  --root .wmo/experiments/coding-router-20260728 \
+  --concurrency 4 --timeout-s 900
+uv run python .agents/scripts/coding_model_router_analyze.py \
+  --root .wmo/experiments/coding-router-20260728 validate
+uv run python .agents/scripts/coding_model_router_embeddings.py \
+  --root .wmo/experiments/coding-router-20260728
+uv run python .agents/scripts/coding_model_router_analyze.py \
+  --root .wmo/experiments/coding-router-20260728 select
+uv run python .agents/scripts/coding_model_router_analyze.py \
+  --root .wmo/experiments/coding-router-20260728 evaluate
+```
+
+The world-model and serving phases remain separate paid gates:
+
+```bash
+uv run python .agents/scripts/coding_model_router_world_model.py \
+  --root .wmo/experiments/coding-router-20260728 prepare
+uv run python .agents/scripts/coding_model_router_world_model.py \
+  --root .wmo/experiments/coding-router-20260728 build
+uv run python .agents/scripts/coding_model_router_world_model.py \
+  --root .wmo/experiments/coding-router-20260728 simulate
+uv run python .agents/scripts/coding_model_router_world_model.py \
+  --root .wmo/experiments/coding-router-20260728 analyze
+uv run python .agents/scripts/coding_model_router_world_model.py \
+  --root .wmo/experiments/coding-router-20260728 compare
+uv run python .agents/scripts/coding_model_router_serve_verify.py \
+  --root .wmo/experiments/coding-router-20260728 prepare
+uv run python .agents/scripts/coding_model_router_serve_verify.py \
+  --root .wmo/experiments/coding-router-20260728 --port 8765 run
+```
