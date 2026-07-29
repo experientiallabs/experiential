@@ -90,6 +90,7 @@ from wmo.optimize.knn import (
     apply_cost_quality,
     cost_quality_named_point,
 )
+from wmo.optimize.pareto import ParetoCurve
 from wmo.optimize.policy import (
     Embedder,
     GateOutcome,
@@ -637,9 +638,13 @@ class EndpointRuntime:
         config_path: Path | None = None,
         embeddings: QueryEmbeddingStore | None = None,
         log_query_embeddings: bool = True,
+        pareto: ParetoCurve | None = None,
     ) -> None:
         self.name = name
         self.policy = policy
+        # The measured curve written at optimize time (pareto.json); served verbatim on
+        # GET /config. None for artifacts that predate it: absence, never an empty curve.
+        self.pareto = pareto
         self.log = log
         self._embeddings = embeddings if log_query_embeddings else None
         self._base_policy = policy
@@ -1293,6 +1298,14 @@ class EndpointConfigResponse(BaseModel):
 
     `dialable` is false for policy kinds with no dial (static and rank endpoints), and then the
     dial fields are null and PUT returns 409.
+
+    `pareto` is the MEASURED cost/quality curve for THIS endpoint's workload
+    (`wmo.optimize.pareto`, written as `pareto.json` beside the report at optimize time):
+    every candidate and the routed dial detents on (effective cost per completed task,
+    reward), frontier-flagged, with a recommended point. None for endpoints optimized before
+    the artifact existed; a renderer shows nothing then, never an empty chart. Unlike
+    `anchors` (a global table measured on routerbench-ours9), the curve is per-workload; the
+    two must never be blended into one figure.
     """
 
     endpoint: str
@@ -1301,6 +1314,7 @@ class EndpointConfigResponse(BaseModel):
     named_point: str
     knobs: ServedKnobs | None
     anchors: list[CostQualityAnchor]
+    pareto: ParetoCurve | None = None
 
 
 class EndpointConfigUpdate(BaseModel):
@@ -1336,6 +1350,7 @@ def _config_response(runtime: EndpointRuntime) -> EndpointConfigResponse:
             else None
         ),
         anchors=list(COST_QUALITY_ANCHORS),
+        pareto=runtime.pareto,
     )
 
 
