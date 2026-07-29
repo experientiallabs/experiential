@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 from collections import defaultdict
 from collections.abc import Sequence
@@ -55,6 +56,7 @@ from wmo.harness.doc import HarnessDoc
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import ModelPool, PoolEntry, load_pool
+from wmo.runs.ledger import LedgerLine
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +69,9 @@ HARBOR_TERMINUS_2 = "harbor.agents.terminus_2.terminus_2:Terminus2"
 # Terminus-2 knobs held identical across every candidate: the scaffold is not the variable.
 # max_turns matches the distill lane's TB2 pin. enable_summarize keeps a context overflow
 # from silently removing a task from the denominator (it compacts and continues instead).
+MAX_TURNS = 100
 COMMON_AGENT_KWARGS: JsonObject = {
-    "max_turns": 100,
+    "max_turns": MAX_TURNS,
     "parser_name": "json",
     "enable_summarize": True,
     "suppress_max_turns_warning": True,
@@ -310,21 +313,109 @@ def _read_rows(rows_path: Path) -> list[ScenarioOutcome]:
     return rows
 
 
-def _ledger_append(ledger_path: Path, record: JsonObject) -> None:
-    """Append one ledger line, stamped for `wmo runs backfill`.
+def _ledger_line(
+    *,
+    event: str,
+    tip_sha: str,
+    episodes: int,
+    chunk: int | None = None,
+    cells: int = 0,
+    scored: int = 0,
+    candidate_usd: float = 0.0,
+    wall_s: float = 0.0,
+    cumulative_usd: float = 0.0,
+    note: str = "",
+) -> LedgerLine:
+    """One conforming ledger line.
 
-    `ts` and `arm` are what the backfill walker filters and orders on, so every line carries
-    them even when the event is not a chunk. Without them the directory replays as an arm-less
-    grid and the runs tables never see it.
+    `LedgerLine` is `extra="forbid"` on purpose: the runner and `wmo runs backfill` both
+    validate against it and SKIP what fails, so a line carrying an unrecognized key is dropped
+    by both and its chunk's cells never reach the runs tables. The first version of this runner
+    wrote `model`, `solved` and `cost_usd` as top-level keys and every line was silently
+    discarded. Anything this schema has no field for goes in `note`.
     """
+    return LedgerLine(
+        event=event,
+        arm=ARM_NAME,
+        chunk=chunk,
+        cells=cells,
+        scored=scored,
+        candidate_usd=candidate_usd,
+        wall_s=wall_s,
+        ts=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        cumulative_usd=cumulative_usd,
+        tip_sha=tip_sha,
+        max_steps=MAX_TURNS,
+        episodes=episodes,
+        note=note,
+    )
+
+
+def _ledger_append(ledger_path: Path, line: LedgerLine) -> None:
+    """Append one conforming ledger line; append-only so a SIGKILL costs one line, not the file."""
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    line: JsonObject = {
-        "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "arm": ARM_NAME,
-        **record,
-    }
     with ledger_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(line, sort_keys=True) + "\n")
+        handle.write(line.model_dump_json() + "\n")
+
+
+def _tip_sha() -> str:
+    """The repo tip this cohort was measured at; every ledger line carries it."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() or "unknown"
+
+
+def _repair_ledger(out_dir: Path, *, pool: ModelPool, episodes: int, tip_sha: str) -> None:
+    """Rewrite `ledger.jsonl` from the chunk files so every line conforms to `LedgerLine`.
+
+    Needed because the ledger is written by several concurrent model processes and any line a
+    reader cannot validate is DROPPED by both the runner and `wmo runs backfill`, taking its
+    chunk's cells out of the runs tables with it. Regenerating from the chunk files (the actual
+    evidence) makes conformance a property of this pass rather than of whichever process wrote
+    the line. The original is preserved as `ledger.raw.jsonl` so nothing is lost, including the
+    retry notes that have no chunk of their own.
+    """
+    arm_dir = out_dir / ARM_NAME
+    ledger_path = out_dir / "ledger.jsonl"
+    chunks = sorted(arm_dir.glob("chunk-*.json"), key=lambda p: int(p.stem.removeprefix("chunk-")))
+    if not chunks:
+        return
+    if ledger_path.is_file() and not (out_dir / "ledger.raw.jsonl").is_file():
+        ledger_path.rename(out_dir / "ledger.raw.jsonl")
+
+    by_index = {index: entry.name for index, entry in enumerate(pool.models)}
+    cumulative = 0.0
+    lines: list[LedgerLine] = []
+    for chunk_file in chunks:
+        chunk = int(chunk_file.stem.removeprefix("chunk-"))
+        payload = json.loads(chunk_file.read_text(encoding="utf-8"))
+        rows = [ScenarioOutcome.model_validate(raw) for raw in payload.get("outcomes", [])]
+        scored = [row for row in rows if row.scored]
+        spend = sum(row.cost_usd for row in rows)
+        cumulative += spend
+        lines.append(
+            _ledger_line(
+                event="chunk",
+                tip_sha=tip_sha,
+                episodes=episodes,
+                chunk=chunk,
+                cells=len(rows),
+                scored=len(scored),
+                candidate_usd=round(spend, 6),
+                cumulative_usd=round(cumulative, 6),
+                note=(
+                    f"{by_index.get(chunk, f'chunk-{chunk}')}: {len(scored)} scored, "
+                    f"{sum(1 for row in scored if row.success)} solved"
+                ),
+            )
+        )
+    ledger_path.write_text("\n".join(line.model_dump_json() for line in lines) + "\n", "utf-8")
+    logger.info("regenerated %s with %d conforming chunk lines", ledger_path.name, len(lines))
 
 
 async def _prewarm_tasks(task_ids: Sequence[str]) -> None:
@@ -342,7 +433,13 @@ async def _prewarm_tasks(task_ids: Sequence[str]) -> None:
 
 
 def _consolidate(
-    arm_dir: Path, *, pool: ModelPool, rows_path: Path, matrix_path: Path
+    arm_dir: Path,
+    *,
+    pool: ModelPool,
+    rows_path: Path,
+    matrix_path: Path,
+    episodes: int,
+    tip_sha: str,
 ) -> list[ScenarioOutcome]:
     """Assemble rows.jsonl and matrix.json from every chunk file in the arm directory.
 
@@ -357,6 +454,7 @@ def _consolidate(
     _write_rows(rows_path, rows)
     matrix = OutcomeMatrix(pool=list(pool.models), outcomes=rows)
     matrix_path.write_text(matrix.model_dump_json(indent=2), encoding="utf-8")
+    _repair_ledger(arm_dir.parent, pool=pool, episodes=episodes, tip_sha=tip_sha)
     scored = [row for row in rows if row.scored]
     logger.info(
         "consolidated %d rows (%d scored, %d solved) from %d chunks, $%.2f",
@@ -423,13 +521,21 @@ def main() -> None:
     matrix_path = arm_dir / "matrix.json"
     ledger_path = out_dir / "ledger.jsonl"
     arm_dir.mkdir(parents=True, exist_ok=True)
+    tip_sha = _tip_sha()
 
     if args.prewarm_tasks:
         asyncio.run(_prewarm_tasks(task_ids))
         return
 
     if args.consolidate_only:
-        _consolidate(arm_dir, pool=pool, rows_path=rows_path, matrix_path=matrix_path)
+        _consolidate(
+            arm_dir,
+            pool=pool,
+            rows_path=rows_path,
+            matrix_path=matrix_path,
+            episodes=args.episodes,
+            tip_sha=tip_sha,
+        )
         return
 
     doc = HarnessDoc.baseline()
@@ -477,14 +583,18 @@ def main() -> None:
                 )
                 _ledger_append(
                     ledger_path,
-                    {
-                        "model": entry.name,
-                        "event": "attempt_failed",
-                        "attempt": attempt + 1,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc)[:500],
-                        "cells_banked": len(harvested),
-                    },
+                    _ledger_line(
+                        event="retry",
+                        tip_sha=tip_sha,
+                        episodes=args.episodes,
+                        chunk=pool_order[entry.name],
+                        cells=len(harvested),
+                        scored=sum(1 for row in harvested if row.scored),
+                        note=(
+                            f"{entry.name}: attempt {attempt + 1} failed with "
+                            f"{type(exc).__name__}: {str(exc)[:200]}"
+                        ),
+                    ),
                 )
                 if attempt >= args.retries:
                     logger.error("%s exhausted %d retries, moving on", entry.name, args.retries)
@@ -502,17 +612,22 @@ def main() -> None:
         )
         _ledger_append(
             ledger_path,
-            {
-                "model": entry.name,
-                "event": "chunk",
-                "chunk": chunk,
-                "cells": len(rows),
-                "cells_expected": expected_cells,
-                "scored": len(scored),
-                "solved": sum(1 for row in scored if row.success),
-                "cost_usd": round(spend, 4),
-                "wall_seconds": round(time.time() - started, 1),
-            },
+            _ledger_line(
+                event="chunk",
+                tip_sha=tip_sha,
+                episodes=args.episodes,
+                chunk=chunk,
+                cells=len(rows),
+                scored=len(scored),
+                candidate_usd=round(spend, 6),
+                wall_s=round(time.time() - started, 1),
+                cumulative_usd=round(spend, 6),
+                note=(
+                    f"{entry.name}: {len(scored)} scored, "
+                    f"{sum(1 for row in scored if row.success)} solved, "
+                    f"{expected_cells} expected"
+                ),
+            ),
         )
         logger.info(
             "%s: %d/%d cells, %d scored, %d solved, $%.2f, %.0fs",
@@ -529,7 +644,14 @@ def main() -> None:
     # because several models run as separate processes (one per provider, to spread rate limits)
     # and a per-model rewrite of one shared file would race. Each process owns exactly its own
     # chunk file; consolidation is a separate, idempotent, read-only-of-chunks pass.
-    _consolidate(arm_dir, pool=pool, rows_path=rows_path, matrix_path=matrix_path)
+    _consolidate(
+        arm_dir,
+        pool=pool,
+        rows_path=rows_path,
+        matrix_path=matrix_path,
+        episodes=args.episodes,
+        tip_sha=tip_sha,
+    )
 
 
 if __name__ == "__main__":
