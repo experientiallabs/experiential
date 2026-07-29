@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tarfile
 from pathlib import Path
 
@@ -122,3 +123,21 @@ def test_bundle_carries_the_knowledge_base_and_fidelity_winner(tmp_path: Path) -
         names = set(archive.getnames())
     assert any(name.endswith("auto_fidelity.json") for name in names)
     assert any("knowledge" in name and name.endswith("facts.md") for name in names)
+
+
+def test_repacking_identical_content_is_byte_reproducible(tmp_path: Path) -> None:
+    """The sha256 must address the content, not the upload.
+
+    Timestamps are the classic leak: tar records member mtimes and gzip
+    records a compression time, so the same directory packed twice minutes
+    apart would digest differently unless both are zeroed.
+    """
+    directory = _model_dir(tmp_path)
+
+    first = pack_model_dir(directory, tmp_path / "first.tar.gz")
+    for path in directory.rglob("*"):
+        os.utime(path, (0, 0))
+    second = pack_model_dir(directory, tmp_path / "second.tar.gz")
+
+    assert first.sha256 == second.sha256
+    assert first.byte_size == second.byte_size

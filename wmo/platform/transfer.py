@@ -14,6 +14,7 @@ in memory whole.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
@@ -60,6 +61,16 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _scrub_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Zero the metadata that varies between packs of identical content."""
+    member.mtime = 0
+    member.uid = 0
+    member.gid = 0
+    member.uname = ""
+    member.gname = ""
+    return member
+
+
 def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
     """Pack a model directory into the platform's bundle format at ``dest``.
 
@@ -68,8 +79,10 @@ def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
         dest: Where to write the gzipped tarball (parent must exist).
 
     Returns:
-        The bundle file plus integrity metadata; member order is sorted so
-        identical inputs produce identical archives.
+        The bundle file plus integrity metadata; member order is sorted and
+        all timestamps/ownership are zeroed (tar members and the gzip header),
+        so identical inputs produce byte-identical archives and the sha256
+        addresses the content, not the upload.
 
     Raises:
         BundleFormatError: If the directory is missing or has no config.toml.
@@ -92,9 +105,18 @@ def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
             members.extend(sorted(path for path in root.rglob("*")))
             members.append(root)
 
-    with tarfile.open(dest, mode="w:gz") as tar:
+    with (
+        dest.open("wb") as raw,
+        gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
         for path in sorted(set(members)):
-            tar.add(path, arcname=str(path.relative_to(directory)), recursive=False)
+            tar.add(
+                path,
+                arcname=str(path.relative_to(directory)),
+                recursive=False,
+                filter=_scrub_member,
+            )
     return PackedModelBundle(
         path=dest,
         sha256=sha256_file(dest),
