@@ -52,6 +52,14 @@ def _selected(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     )
 
 
+def _cost(rows: list[dict[str, object]]) -> float:
+    return sum(
+        float(value)
+        for row in rows
+        if isinstance((value := row.get("cost_usd")), (int, float))
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--central", type=Path, required=True)
@@ -69,7 +77,8 @@ def main() -> int:
     # report so the other eight isolated shards can run in parallel. If it crosses the loop
     # boundary before the watchdog interrupt arrives, those speculative next-model rows must not
     # replace the corresponding shard's preregistered run.
-    ignored_central_rows = sum(row.get("model") != "gpt-5.5" for row in central_rows)
+    ignored_central = [row for row in central_rows if row.get("model") != "gpt-5.5"]
+    ignored_central_rows = len(ignored_central)
     all_rows = [
         *[row for row in central_rows if row.get("model") == "gpt-5.5"],
         *[row for path in shard_paths for row in _rows(path)],
@@ -93,7 +102,9 @@ def main() -> int:
         "cells_present": len(outcomes),
         "gradeable": sum(row.reward is not None for row in outcomes),
         "missing": expected - len(outcomes),
-        "model_cost_usd": sum(row.cost_usd for row in outcomes),
+        "model_cost_usd_all_accepted_attempts": _cost(all_rows),
+        "model_cost_usd_selected_outcomes": sum(row.cost_usd for row in outcomes),
+        "ignored_central_non_gpt55_cost_usd": _cost(ignored_central),
         "environment_cost_usd": None,
         "environment_cost_note": "E2B invoice rate is not exposed in Harbor artifacts",
         "ignored_central_non_gpt55_rows": ignored_central_rows,

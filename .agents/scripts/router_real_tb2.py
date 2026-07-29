@@ -228,6 +228,39 @@ def _number(row: dict[str, object], key: str) -> float:
     return float(value) if isinstance(value, (int, float)) else 0.0
 
 
+def _attempt_number(row: dict[str, object]) -> int:
+    value = row.get("attempt_number", 0)
+    return int(value) if isinstance(value, (int, float)) else 0
+
+
+def _pending_task_ids(
+    rows: list[dict[str, object]],
+    *,
+    model: str,
+    task_ids: list[str],
+) -> list[str]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        task_id = row.get("task_id")
+        if row.get("model") == model and isinstance(task_id, str):
+            grouped.setdefault(task_id, []).append(row)
+    completed: set[str] = set()
+    for task_id, attempts in grouped.items():
+        ordered = sorted(attempts, key=_attempt_number)
+        if any(isinstance(row.get("reward"), (int, float)) for row in ordered):
+            completed.add(task_id)
+    return [task_id for task_id in task_ids if task_id not in completed]
+
+
+def _next_attempt(rows: list[dict[str, object]], model: str) -> int:
+    attempts = [
+        _attempt_number(row)
+        for row in rows
+        if row.get("model") == model
+    ]
+    return max(attempts, default=0) + 1
+
+
 def _merge_rows(path: Path, incoming: list[dict[str, object]]) -> None:
     rows = _read_rows(path)
     keys = {
@@ -335,70 +368,109 @@ def main() -> int:
 
     for entry in [item for item in pool.models if item.name in selected]:
         _activate_entry_credentials(entry)
-        jobs_dir = args.out_dir / "jobs" / entry.name
-        scorer = asyncio.run(
-            _scorer(
-                root=root,
-                jobs_dir=jobs_dir,
-                task_ids=task_ids,
-                entry=entry,
-                concurrency=args.concurrency,
-                timeout_s=args.timeout_s,
-            )
+        model_dir = args.out_dir / "reports"
+        report_path = model_dir / f"{entry.name}.json"
+        existing_rows = _read_rows(rows_path)
+        pending_task_ids = _pending_task_ids(
+            existing_rows,
+            model=entry.name,
+            task_ids=task_ids,
         )
-        expected_pin = (
-            f"git:https://github.com/laude-institute/terminal-bench-2.git@{TB2_COMMIT}"
-        )
-        if set(scorer.task_pins.values()) != {expected_pin}:
-            raise ValueError(f"unexpected task pins for {entry.name}")
+        next_attempt = _next_attempt(existing_rows, entry.name)
+        if report_path.is_file() and not pending_task_ids:
+            logger.info("%s already complete: %s", entry.name, report_path)
+            continue
         if args.dry_run:
-            logger.info("%s: %d tasks resolved", entry.name, len(task_ids))
+            scorer = asyncio.run(
+                _scorer(
+                    root=root,
+                    jobs_dir=args.out_dir / "jobs" / entry.name / "dry-run",
+                    task_ids=task_ids,
+                    entry=entry,
+                    concurrency=args.concurrency,
+                    timeout_s=args.timeout_s,
+                )
+            )
+            logger.info("%s: %d tasks resolved", entry.name, len(scorer.task_pins))
+            continue
+        if not pending_task_ids:
+            logger.info(
+                "%s has gradeable rows for all %d tasks; no retry needed",
+                entry.name,
+                len(task_ids),
+            )
+            continue
+        if next_attempt > MAX_ATTEMPTS:
+            logger.warning(
+                "%s exhausted %d attempts with %d infrastructure cells",
+                entry.name,
+                MAX_ATTEMPTS,
+                len(pending_task_ids),
+            )
             continue
         spent = sum(
             _number(row, "cost_usd")
-            for row in _read_rows(rows_path)
+            for row in existing_rows
         )
         if spent >= args.budget_usd:
             raise RuntimeError(
                 f"Terminal-Bench 2 spend ${spent:.2f} reached cap ${args.budget_usd:.2f}"
             )
         final_report: ScoreReport | None = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        final_scorer: HarborScorer | None = None
+        last_attempt = next_attempt - 1
+        expected_pin = (
+            f"git:https://github.com/laude-institute/terminal-bench-2.git@{TB2_COMMIT}"
+        )
+        for attempt in range(next_attempt, MAX_ATTEMPTS + 1):
             if attempt > 1:
                 time.sleep(RETRY_DELAYS_S[attempt - 2])
+            scorer = asyncio.run(
+                _scorer(
+                    root=root,
+                    jobs_dir=args.out_dir / "jobs" / entry.name / f"attempt-{attempt}",
+                    task_ids=pending_task_ids,
+                    entry=entry,
+                    concurrency=args.concurrency,
+                    timeout_s=args.timeout_s,
+                )
+            )
+            if set(scorer.task_pins.values()) != {expected_pin}:
+                raise ValueError(f"unexpected task pins for {entry.name}")
             report = scorer.score(doc)
             incoming = [_row(cell, entry, attempt) for cell in report.cells]
             _merge_rows(rows_path, incoming)
             final_report = report
-            infra = sum(cell.infra_failed for cell in report.cells)
+            final_scorer = scorer
+            last_attempt = attempt
+            pending_task_ids = [cell.task_id for cell in report.cells if cell.infra_failed]
             logger.info(
                 "%s attempt %d: %d/%d gradeable, $%.4f cumulative",
                 entry.name,
                 attempt,
-                len(report.cells) - infra,
+                len(report.cells) - len(pending_task_ids),
                 len(report.cells),
                 sum(
                     _number(row, "cost_usd")
                     for row in _read_rows(rows_path)
                 ),
             )
-            if infra == 0:
+            if not pending_task_ids:
                 break
-        if final_report is None:
+        if final_report is None or final_scorer is None:
             raise RuntimeError(f"{entry.name} produced no Harbor report")
-        model_dir = args.out_dir / "reports"
         model_dir.mkdir(parents=True, exist_ok=True)
-        report_path = model_dir / f"{entry.name}.json"
         _persist_model_report(
             report_path,
             entry=entry,
-            scorer=scorer,
+            scorer=final_scorer,
             report=final_report,
-            attempts=attempt,
+            attempts=last_attempt,
         )
         logger.info("%s report %s %s", entry.name, _sha256(report_path), report_path)
 
-    outcomes = _selected_outcomes(_read_rows(rows_path))
+    all_rows = _read_rows(rows_path)
+    outcomes = _selected_outcomes(all_rows)
     matrix = OutcomeMatrix(pool=pool.models, outcomes=outcomes)
     matrix.save(args.out_dir / "matrix.json")
     summary = {
@@ -409,7 +481,10 @@ def main() -> int:
         "cells_expected": len(task_ids) * len(pool.models),
         "cells_present": len(outcomes),
         "gradeable": sum(row.reward is not None for row in outcomes),
-        "model_cost_usd": sum(row.cost_usd for row in outcomes),
+        "model_cost_usd_all_attempts": sum(
+            _number(row, "cost_usd") for row in all_rows
+        ),
+        "model_cost_usd_selected_outcomes": sum(row.cost_usd for row in outcomes),
         "environment_cost_usd": None,
         "environment_cost_note": "E2B invoice rate is not exposed in Harbor artifacts",
     }
