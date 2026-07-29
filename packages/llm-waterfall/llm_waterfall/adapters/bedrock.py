@@ -139,9 +139,16 @@ class BedrockAdapter:
         raw = self._get_client().invoke_model(modelId=self.backend.model, body=json.dumps(body))
         data = cast("_MessagesResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
+        # Anthropic-on-Bedrock usage mirrors the direct API: input_tokens
+        # excludes the cache legs, so add them back and keep the split.
+        raw_usage = cast("dict[str, object]", data["usage"])
+        cache_read = int(cast("int", raw_usage.get("cache_read_input_tokens", 0)) or 0)
+        cache_write = int(cast("int", raw_usage.get("cache_creation_input_tokens", 0)) or 0)
         usage = TokenUsage(
-            input_tokens=data["usage"]["input_tokens"],
+            input_tokens=data["usage"]["input_tokens"] + cache_read + cache_write,
             output_tokens=data["usage"]["output_tokens"],
+            cached_input_tokens=cache_read,
+            cache_write_input_tokens=cache_write,
         )
         return text, usage
 

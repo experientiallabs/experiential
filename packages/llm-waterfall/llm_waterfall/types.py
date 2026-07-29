@@ -82,10 +82,18 @@ class RetryPolicy:
 
 
 class TokenUsage(BaseModel):
-    """Raw token counts for one call (pricing converts to USD per 1M tokens)."""
+    """Raw token counts for one call (pricing converts to USD per 1M tokens).
+
+    The cache legs are SUBSETS of `input_tokens` (the total always counts every
+    input token): providers report them separately because reads bill at a
+    discount and writes at a premium, and dropping the split silently re-prices
+    cached traffic at the full input rate.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
 
 
 AttemptOutcome = Literal["ok", "capacity_error", "client_error", "unsupported"]
@@ -201,6 +209,14 @@ class ChatRequest(BaseModel):
         return payload
 
 
+class ChatPromptTokensDetails(BaseModel):
+    """OpenAI-compatible prompt-token breakdown (`prompt_tokens_details`)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    cached_tokens: int = 0
+
+
 class ChatUsage(BaseModel):
     """OpenAI-compatible structured completion usage."""
 
@@ -208,6 +224,7 @@ class ChatUsage(BaseModel):
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    prompt_tokens_details: ChatPromptTokensDetails | None = None
 
 
 class ChatChoice(BaseModel):
@@ -233,9 +250,13 @@ class ChatResponse(BaseModel):
         """Project provider usage onto the waterfall's canonical counters."""
         if self.usage is None:
             return TokenUsage()
+        details = self.usage.prompt_tokens_details
+        cached = details.cached_tokens if details is not None else 0
+        # OpenAI semantics: prompt_tokens already includes the cached subset.
         return TokenUsage(
             input_tokens=self.usage.prompt_tokens,
             output_tokens=self.usage.completion_tokens,
+            cached_input_tokens=min(max(cached, 0), max(self.usage.prompt_tokens, 0)),
         )
 
     def wire_payload(self) -> JsonObject:

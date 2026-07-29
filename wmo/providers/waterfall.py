@@ -166,6 +166,10 @@ class WaterfallProvider:
             usage=TokenUsage(
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
+                # The cache split rides through so cached traffic prices at the
+                # cache tiers instead of the full input rate.
+                cached_input_tokens=result.usage.cached_input_tokens,
+                cache_write_input_tokens=result.usage.cache_write_input_tokens,
             ),
             model=result.model_used,  # true attribution even when a fallback served
         )

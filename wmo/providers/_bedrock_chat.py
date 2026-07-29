@@ -130,13 +130,26 @@ def converse_response(raw: object, model: str) -> ChatResponse:
         message["tool_calls"] = tool_calls
     usage = response.get("usage")
     usage_data = usage if isinstance(usage, dict) else {}
+    # Converse reports `inputTokens` EXCLUDING the cached prefix, so the two
+    # cache legs must be added back or every cached call under-reports its
+    # input by the whole prefix (the `complete` path in bedrock.py does the
+    # same normalization). The read leg rides the OpenAI-compatible
+    # `prompt_tokens_details.cached_tokens` shape the serving log already
+    # prices at the cache-read rate; the write leg has no OpenAI-compatible
+    # field, so it bills at the full input rate — slightly under the write
+    # premium, never silently free.
+    cache_read = int(usage_data.get("cacheReadInputTokens", 0) or 0)
+    cache_write = int(usage_data.get("cacheWriteInputTokens", 0) or 0)
     return ChatResponse.model_validate(
         {
             "model": model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {
-                "prompt_tokens": usage_data.get("inputTokens", 0),
+                "prompt_tokens": int(usage_data.get("inputTokens", 0) or 0)
+                + cache_read
+                + cache_write,
                 "completion_tokens": usage_data.get("outputTokens", 0),
+                "prompt_tokens_details": {"cached_tokens": cache_read},
             },
         }
     )

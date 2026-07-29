@@ -121,3 +121,34 @@ def test_structured_response_preserves_tool_calls_and_usage() -> None:
     assert response.choices[0].message.tool_calls is not None
     assert response.choices[0].message.tool_calls[0].function.name == "bash"
     assert response.token_usage().input_tokens == 10
+
+
+def test_token_usage_projection_keeps_the_cached_subset() -> None:
+    """`prompt_tokens_details.cached_tokens` survives into TokenUsage, clamped to the total."""
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            },
+        }
+    )
+
+    usage = response.token_usage()
+    assert usage.input_tokens == 1000
+    assert usage.cached_input_tokens == 900
+    assert usage.cache_write_input_tokens == 0
+
+    overclaimed = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            },
+        }
+    )
+    assert overclaimed.token_usage().cached_input_tokens == 100
