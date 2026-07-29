@@ -125,6 +125,34 @@ def _complete_fixture(root: Path) -> None:
             ],
             "promoted": True,
             "paired_cluster_bootstrap": {"retention_lower_95": 0.951},
+            "capability_slices": {
+                "repository-level-bug-fixing": {
+                    "seeds_observed": 5,
+                    "points": {
+                        "guarded_knn": {
+                            "quality": 0.96,
+                            "baseline_quality": 1.0,
+                            "quality_retained": 0.96,
+                            "absolute_quality_delta": -0.04,
+                            "cost_per_task": 0.5,
+                            "baseline_cost_per_task": 1.0,
+                            "cost_savings": 0.5,
+                            "success_rate": 0.96,
+                            "latency_p50_s": 10.0,
+                            "latency_p95_s": 20.0,
+                            "scenarios": 5.0,
+                            "model_mix": {"frontier": 0.4, "cheap": 0.6},
+                        }
+                    },
+                }
+            },
+            "one_at_a_time_ablations": {
+                "benchmark_stratified": "ablation:benchmark_stratified",
+                "missing_fit_coverage_0.8": "ablation:missing_fit_coverage_0.8",
+                "missing_fit_coverage_1.0_control": "guarded_knn",
+                "latency_only_static": "latency_only",
+                "production_eligible": False,
+            },
             "deployment_consensus_baseline": "frontier",
             "deployment_consensus_config": {"neighbors": 8},
         },
@@ -143,7 +171,16 @@ def _complete_fixture(root: Path) -> None:
     )
     (root / "analysis" / "deployable" / "policy_knn_bank.npz").write_bytes(b"bank")
     _write_json(root / "serving" / "prepare.json", {"protocol": "coding-router-serving-v1"})
-    _write_json(root / "serving" / "result-1.json", {"completion_status": "passed"})
+    _write_json(
+        root / "serving" / "result-1.json",
+        {
+            "completion_status": "passed",
+            "requests": 8,
+            "fallback_gate": "novelty-abstain",
+            "affinity_reason": "sticky: conversation affinity",
+            "cache_aware_credit_usd": 0.001,
+        },
+    )
     _write_json(
         root / "world-model" / "comparison.json",
         {
@@ -178,10 +215,12 @@ def test_report_renders_required_rows_and_traceable_summary(tmp_path: Path) -> N
     assert "| Oracle Upper Bound |" in report
     assert "The target was achieved." in report
     assert "Cost comparisons are approximate" in report
+    assert "| repository-level-bug-fixing | 5/5 |" in report
     assert summary["target_achieved"] is True
     assert summary["selected_policy"]["id"] == "guarded_knn"
     assert summary["world_model_same_deployment_decision"] is True
     assert summary["cost_accounting"]["estimated_cells"] == 1
+    assert summary["unsafe_capabilities"] == []
 
 
 def test_report_rejects_changed_outer_results(tmp_path: Path) -> None:

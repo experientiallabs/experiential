@@ -100,6 +100,19 @@ def _complete_fixture(root: Path) -> None:
             "promoted": False,
             "all_seed_promotion_gates": [False] * 5,
             "paired_cluster_bootstrap": {"retention_lower_95": 0.9},
+            "capability_slices": {
+                "repository-level-bug-fixing": {
+                    "seeds_observed": 5,
+                    "points": {},
+                }
+            },
+            "one_at_a_time_ablations": {
+                "benchmark_stratified": "ablation:benchmark_stratified",
+                "missing_fit_coverage_0.8": "ablation:missing_fit_coverage_0.8",
+                "missing_fit_coverage_1.0_control": "guarded_knn",
+                "latency_only_static": "latency_only",
+                "production_eligible": False,
+            },
         },
     )
     _write_json(
@@ -117,7 +130,16 @@ def _complete_fixture(root: Path) -> None:
     (root / "analysis" / "deployable" / "policy_knn_bank.npz").write_bytes(b"bank")
 
     _write_json(root / "serving" / "prepare.json", {"protocol": "coding-router-serving-v1"})
-    _write_json(root / "serving" / "result-1.json", {"completion_status": "passed"})
+    _write_json(
+        root / "serving" / "result-1.json",
+        {
+            "completion_status": "passed",
+            "requests": 8,
+            "fallback_gate": "novelty-abstain",
+            "affinity_reason": "sticky: conversation affinity",
+            "cache_aware_credit_usd": 0.001,
+        },
+    )
 
     _write_json(root / "world-model" / "prepare.json", {})
     _write_json(root / "world-model" / "build-usage.json", {})

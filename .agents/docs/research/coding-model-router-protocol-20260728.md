@@ -251,6 +251,36 @@ Baselines are every static arm, fit-selected best single, cheapest single, seede
 only, unguarded kNN, guarded kNN, rank routing, and oracle per-task routing. Cascades and retry
 escalation are research-only policies and cannot be the production choice.
 
+The analysis also freezes three one-at-a-time, non-production ablations before any outer-heldout
+reward is read:
+
+- benchmark-stratified guarded banks, fitted independently on each benchmark's outer-fit rows;
+- deterministic 80 percent nonbaseline fit-cell coverage against the dense 100 percent control,
+  with the pinned baseline left complete so the statistical guard remains defined;
+- a latency-only static model selected by fit p50 latency.
+
+Prompt-cache-aware switching and conversation affinity require a prior conversation incumbent, so
+the one-shot benchmark matrix cannot identify their effect. They remain serving-only operational
+checks and cannot support the headline quality claim. The latency-only point can diagnose a
+speed-quality tradeoff but cannot replace the quality-cost-selected production policy.
+
+### Declared capability slices
+
+Capability reporting uses only scenario identity and task text available before model execution.
+Slices overlap and never change the frozen 0.5/0.5 headline benchmark weights:
+
+- every SWE-bench Verified task is `repository-level-bug-fixing` and
+  `debugging-and-test-repair`;
+- every Terminal-Bench 2 task is `terminal-operation-and-tool-use`;
+- `long-context` is the top quartile of frozen pre-call task-text length;
+- deterministic keyword rules declare `build-and-dependency`,
+  `code-generation-and-translation`, `data-ml-and-scientific`,
+  `debugging-and-test-repair`, and `security-and-recovery`.
+
+The exact keyword tuples live in `coding_model_router_analyze.py`. The final result reports the
+guarded router's quality, retention, absolute quality delta, cost, savings, completion, latency,
+and model mix for each slice, plus how many outer seeds contain that slice.
+
 ### Fit-only selection and heldout lock
 
 Hyperparameters are selected without touching any outer heldout reward:
@@ -328,7 +358,10 @@ difference is an explicit simulation-to-real confound and must be carried into t
 Mount the selected policy and evidence bank through `wmo serve`. Exercise unseen coding requests
 through the OpenAI-compatible endpoint and verify both provider routes, multi-turn tool calls,
 audit evidence, cost and cache accounting, conversation affinity, safe fallback, and the live
-cost-quality dial.
+cost-quality dial. The bounded check makes eight provider requests: two for an OpenAI tool-call
+round trip, one Anthropic path probe, one selected-policy request, one forced-novelty fallback,
+one live-dial request, and two cache-aware kNN turns. The second cache-aware turn must persist a
+positive incumbent cache credit in the routed-model evidence.
 
 ## Spend and durability
 

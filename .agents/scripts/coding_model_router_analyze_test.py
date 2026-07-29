@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -10,8 +12,12 @@ from coding_model_router_analyze import (
     BENCHMARKS,
     INNER_FOLDS,
     RouterConfig,
+    _aggregate_capability_slices,
     _best_single,
+    _capability_slice_ids,
     _inner_evaluate,
+    _missing_fit_matrix,
+    _seed_evaluation,
 )
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
@@ -34,7 +40,7 @@ def _pool() -> list[PoolEntry]:
 def _outcome(scenario_id: str, model: str, reward: float) -> ScenarioOutcome:
     return ScenarioOutcome(
         scenario_id=scenario_id,
-        task=f"pre-call task {scenario_id}",
+        task=(f"pre-call task {scenario_id} compile write- model fix-secret-leak-recovery"),
         model=model,
         benchmark=scenario_id.split(":", 1)[0],
         reward=reward,
@@ -134,3 +140,107 @@ def test_inner_selection_excludes_rows_outside_outer_fit(tmp_path: Path) -> None
     assert rerun_baseline == fit_baseline
     assert fit_router.scenarios == len(fit_ids)
     assert fit_baseline.quality == pytest.approx(0.8)
+
+
+def test_capability_slices_use_only_pre_call_task_information() -> None:
+    scenario_ids = (
+        "swe-bench-verified:repo-fix",
+        "terminal-bench-2:compile-build-system",
+        "terminal-bench-2:write-compiler",
+        "terminal-bench-2:pytorch-model-inference",
+        "terminal-bench-2:fix-secret-leak-recovery",
+    )
+    outcomes = [
+        _outcome(scenario_id, model, 1.0) for scenario_id in scenario_ids for model in ("a", "b")
+    ]
+    matrix = OutcomeMatrix(pool=_pool(), outcomes=outcomes)
+
+    slices = _capability_slice_ids(matrix)
+
+    assert set(slices) == {
+        "build-and-dependency",
+        "code-generation-and-translation",
+        "data-ml-and-scientific",
+        "debugging-and-test-repair",
+        "long-context",
+        "repository-level-bug-fixing",
+        "security-and-recovery",
+        "terminal-operation-and-tool-use",
+    }
+    assert scenario_ids[0] in slices["repository-level-bug-fixing"]
+    assert scenario_ids[1] in slices["build-and-dependency"]
+    assert scenario_ids[2] in slices["code-generation-and-translation"]
+    assert scenario_ids[3] in slices["data-ml-and-scientific"]
+    assert scenario_ids[4] in slices["security-and-recovery"]
+
+
+def test_missing_cell_ablation_preserves_baseline_and_exact_coverage() -> None:
+    matrix, _manifests, ids = _nested_fixture()
+
+    masked = _missing_fit_matrix(
+        matrix,
+        ids,
+        baseline="a",
+        seed=0,
+        coverage=0.8,
+    )
+
+    by_model = {
+        model: {outcome.scenario_id for outcome in masked.outcomes if outcome.model == model}
+        for model in ("a", "b")
+    }
+    assert by_model["a"] == set(ids)
+    assert len(by_model["b"]) == int(len(ids) * 0.8)
+    assert masked == _missing_fit_matrix(
+        matrix,
+        ids,
+        baseline="a",
+        seed=0,
+        coverage=0.8,
+    )
+
+
+def test_seed_evaluation_persists_capability_and_robustness_ablations(
+    tmp_path: Path,
+) -> None:
+    matrix, _manifests, _ids = _nested_fixture()
+    split: dict[str, dict[str, list[str]]] = {}
+    for benchmark in BENCHMARKS:
+        task_ids = [f"task-{index}" for index in range(INNER_FOLDS)]
+        split[benchmark] = {
+            "fit": task_ids[:3],
+            "heldout": task_ids[3:],
+        }
+    split_path = tmp_path / "splits" / "seed-0.json"
+    split_path.parent.mkdir(parents=True)
+    split_path.write_text(json.dumps(split), encoding="utf-8")
+
+    result = _seed_evaluation(
+        matrix,
+        tmp_path,
+        seed=0,
+        lock_row={
+            "baseline": "a",
+            "config": asdict(RouterConfig(neighbors=4, min_pairs=3)),
+        },
+    )
+
+    points = result["points"]
+    assert isinstance(points, dict)
+    assert "latency_only" in points
+    assert "ablation:benchmark_stratified" in points
+    assert "ablation:missing_fit_coverage_0.8" in points
+    slices = result["capability_slices"]
+    assert isinstance(slices, dict)
+    assert set(slices) == {
+        "build-and-dependency",
+        "code-generation-and-translation",
+        "data-ml-and-scientific",
+        "debugging-and-test-repair",
+        "long-context",
+        "repository-level-bug-fixing",
+        "security-and-recovery",
+        "terminal-operation-and-tool-use",
+    }
+    aggregate = _aggregate_capability_slices([{**result, "seed": seed} for seed in range(5)])
+    assert aggregate["repository-level-bug-fixing"]["seeds_observed"] == 5

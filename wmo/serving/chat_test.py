@@ -519,6 +519,55 @@ def test_knn_policy_routes_a_request_end_to_end(tmp_path: Path) -> None:
     assert rows[0]["cluster_id"] is None  # a knn decision cites neighbors, not clusters
 
 
+def test_cache_aware_knn_logs_the_incumbent_credit_end_to_end(
+    tmp_path: Path,
+) -> None:
+    fitted = _knn_policy(tmp_path)
+    priced_pool = [
+        entry.model_copy(
+            update={
+                "input_per_mtok": 1.0,
+                "cached_input_per_mtok": 0.1,
+                "output_per_mtok": 1.0,
+            }
+        )
+        for entry in fitted.pool
+    ]
+    policy = fitted.model_copy(
+        update={
+            "cache_aware": True,
+            "pool": priced_pool,
+        }
+    )
+    policy.attach_bank(fitted.knn_bank())
+    client, log_path = _client(tmp_path, policy=policy)
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "SELECT count(*) FROM superheroes"}],
+        },
+    )
+    reply = first.json()["choices"][0]["message"]["content"]
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "SELECT count(*) FROM superheroes"},
+                {"role": "assistant", "content": reply},
+                {"role": "user", "content": "write a friendly email"},
+            ],
+        },
+    )
+
+    assert first.status_code == second.status_code == 200
+    rows = _rows(log_path)
+    assert rows[0]["cache_credit_usd"] is None
+    assert isinstance(rows[1]["cache_credit_usd"], float)
+    assert rows[1]["cache_credit_usd"] > 0
+
+
 def test_runtime_builds_the_policy_embedder_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2294,7 +2343,15 @@ def test_a_static_endpoint_leaves_the_evidence_columns_null(tmp_path: Path) -> N
         json={"model": "tau-bench", "messages": [{"role": "user", "content": "hi"}]},
     )
     row = _rows(log_path)[0]
-    for column in ("mean_diff", "se", "n_pairs", "gate", "propensity", "query_embedding_ref"):
+    for column in (
+        "mean_diff",
+        "se",
+        "n_pairs",
+        "gate",
+        "propensity",
+        "cache_credit_usd",
+        "query_embedding_ref",
+    ):
         assert row[column] is None, column
 
 

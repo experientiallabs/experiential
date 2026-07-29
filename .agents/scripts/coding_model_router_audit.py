@@ -456,6 +456,8 @@ def _pareto_conclusion(root: Path) -> tuple[RequirementResult, bool | None]:
     promoted = outer.get("promoted") if outer is not None else None
     gates = outer.get("all_seed_promotion_gates") if outer is not None else None
     bootstrap = outer.get("paired_cluster_bootstrap") if outer is not None else None
+    capability_slices = outer.get("capability_slices") if outer is not None else None
+    ablations = outer.get("one_at_a_time_ablations") if outer is not None else None
     target = promoted if isinstance(promoted, bool) else None
     valid = (
         isinstance(pareto, list)
@@ -465,6 +467,12 @@ def _pareto_conclusion(root: Path) -> tuple[RequirementResult, bool | None]:
         and all(isinstance(value, bool) for value in gates)
         and isinstance(bootstrap, dict)
         and _number(bootstrap.get("retention_lower_95")) is not None
+        and isinstance(capability_slices, dict)
+        and bool(capability_slices)
+        and isinstance(ablations, dict)
+        and ablations.get("benchmark_stratified") == "ablation:benchmark_stratified"
+        and ablations.get("missing_fit_coverage_0.8") == "ablation:missing_fit_coverage_0.8"
+        and ablations.get("latency_only_static") == "latency_only"
         and target is not None
     )
     return (
@@ -481,6 +489,9 @@ def _pareto_conclusion(root: Path) -> tuple[RequirementResult, bool | None]:
             [path],
             target_achieved=target,
             pareto_points=len(pareto) if isinstance(pareto, list) else 0,
+            capability_slices=(
+                len(capability_slices) if isinstance(capability_slices, dict) else 0
+            ),
         ),
         target,
     )
@@ -521,7 +532,16 @@ def _serving(root: Path) -> RequirementResult:
     directory = root / "serving"
     results = sorted(directory.glob("result-*.json"))
     passed = [
-        path for path in results if (_read_object(path) or {}).get("completion_status") == "passed"
+        path
+        for path in results
+        if (
+            (result := _read_object(path)) is not None
+            and result.get("completion_status") == "passed"
+            and _number(result.get("requests")) == 8
+            and result.get("fallback_gate") == "novelty-abstain"
+            and result.get("affinity_reason") == "sticky: conversation affinity"
+            and (_number(result.get("cache_aware_credit_usd")) or 0) > 0
+        )
     ]
     prepare = directory / "prepare.json"
     valid = prepare.is_file() and bool(passed)
@@ -694,8 +714,7 @@ def main() -> None:
         json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
     )
     logger.info(
-        "completion audit: %s, %d blockers, $%.6f exact, $%.6f estimated, "
-        "$%.2f conservative debit",
+        "completion audit: %s, %d blockers, $%.6f exact, $%.6f estimated, $%.2f conservative debit",
         result.completion_status,
         len(result.blocking_requirements),
         result.known_model_spend_usd,

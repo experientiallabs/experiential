@@ -552,6 +552,9 @@ class RequestLogRecord(BaseModel):
     n_pairs: int | None = None
     gate: GateOutcome | None = None
     propensity: Propensity | None = None
+    # Expected prompt-cache saving applied to the incumbent's effective input price by a
+    # cache-aware kNN decision. Null when no cache credit entered routing arithmetic.
+    cache_credit_usd: float | None = None
     # Resolves to the vector this request was routed on
     # (`wmo.serving.query_embeddings.QueryEmbeddingStore.get`). Null when the store is off, when
     # the policy embeds nothing (static), or when the write failed.
@@ -1556,6 +1559,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     n_pairs=evidence.n_pairs if evidence else None,
                     gate=evidence.gate if evidence else None,
                     propensity=evidence.propensity if evidence else None,
+                    cache_credit_usd=evidence.cache_credit_usd if evidence else None,
                     query_embedding_ref=embedding_ref,
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,

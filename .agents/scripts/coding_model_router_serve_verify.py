@@ -36,6 +36,7 @@ ENDPOINT = "coding-router"
 OPENAI_PROBE = "coding-router-openai-probe"
 ANTHROPIC_PROBE = "coding-router-anthropic-probe"
 FALLBACK_PROBE = "coding-router-fallback-probe"
+CACHE_AWARE_PROBE = "coding-router-cache-aware-probe"
 OPENAI_ARM = "oai-luna-high"
 ANTHROPIC_ARM = "ant-haiku45"
 SERVING_RESERVATION_USD = 100.0
@@ -60,6 +61,13 @@ FALLBACK_PROMPT = (
 DIAL_PROMPT = (
     "Name one race condition to test when a live routing dial is changed while requests are "
     "already in flight."
+)
+CACHE_PROMPT_ONE = (
+    "Design one invariant for a cache-aware coding router that already has a conversation "
+    "incumbent."
+)
+CACHE_PROMPT_TWO = (
+    "Now name one safe condition under which that router may switch models mid-conversation."
 )
 
 TOOLS: list[dict[str, object]] = [
@@ -129,6 +137,8 @@ def _prepare(root: Path) -> None:
         MAIN_PROMPT,
         FALLBACK_PROMPT,
         DIAL_PROMPT,
+        CACHE_PROMPT_ONE,
+        CACHE_PROMPT_TWO,
     ):
         if prompt in existing_tasks:
             raise ValueError("a serving prompt duplicates a frozen benchmark task")
@@ -165,6 +175,12 @@ def _prepare(root: Path) -> None:
     forced_fallback.attach_bank(policy.knn_bank())
     _copy_policy(forced_fallback, deploy, fallback_dir)
 
+    cache_dir = models / CACHE_AWARE_PROBE
+    _copy_world_artifact(world_artifact, cache_dir)
+    cache_aware = policy.model_copy(update={"cache_aware": True})
+    cache_aware.attach_bank(policy.knn_bank())
+    _copy_policy(cache_aware, deploy, cache_dir)
+
     marker = root / "serving" / "prepare.json"
     _write_json(
         marker,
@@ -178,13 +194,15 @@ def _prepare(root: Path) -> None:
                 OPENAI_PROBE,
                 ANTHROPIC_PROBE,
                 FALLBACK_PROBE,
+                CACHE_AWARE_PROBE,
             ],
             "synthetic_probe_disclosure": (
                 f"{OPENAI_PROBE} and {ANTHROPIC_PROBE} are static provider-path probes; "
                 f"{FALLBACK_PROBE} is the deployable kNN policy with a forced novelty floor. "
-                f"Only {ENDPOINT} is the selected deployable policy."
+                f"{CACHE_AWARE_PROBE} changes only the cache-aware flag for an operational "
+                f"ablation. Only {ENDPOINT} is the selected deployable policy."
             ),
-            "unseen_prompts": 5,
+            "unseen_prompts": 7,
             "paid_calls": 0,
             "launch_command": (
                 "python .agents/scripts/coding_model_router_serve_verify.py run "
@@ -360,6 +378,24 @@ def _exercise(client: httpx.Client) -> dict[str, object]:
         FALLBACK_PROBE,
         messages=[{"role": "user", "content": FALLBACK_PROMPT}],
     )
+    cache_first = _post(
+        client,
+        CACHE_AWARE_PROBE,
+        messages=[{"role": "user", "content": CACHE_PROMPT_ONE}],
+    )
+    cache_first_message = cache_first.json()["choices"][0]["message"]
+    cache_second = _post(
+        client,
+        CACHE_AWARE_PROBE,
+        messages=[
+            {"role": "user", "content": CACHE_PROMPT_ONE},
+            {
+                "role": "assistant",
+                "content": cache_first_message.get("content"),
+            },
+            {"role": "user", "content": CACHE_PROMPT_TWO},
+        ],
+    )
 
     config = client.get(f"/v1/endpoints/{ENDPOINT}/config")
     if config.status_code != 200 or not config.json().get("dialable"):
@@ -396,6 +432,8 @@ def _exercise(client: httpx.Client) -> dict[str, object]:
         "anthropic_route": anthropic.headers["x-wmo-routed-model"],
         "selected_route": main.headers["x-wmo-routed-model"],
         "fallback_route": fallback.headers["x-wmo-routed-model"],
+        "cache_aware_first_route": cache_first.headers["x-wmo-routed-model"],
+        "cache_aware_second_route": cache_second.headers["x-wmo-routed-model"],
         "dial_route": dial_request.headers["x-wmo-routed-model"],
         "tool_call_name": call["function"]["name"],
         "tool_round_trip_finish_reason": tool_second.json()["choices"][0]["finish_reason"],
@@ -409,11 +447,19 @@ def _validate_rows(
     default_model: str,
     pool_names: set[str],
 ) -> dict[str, object]:
-    if len(rows) != 6:
-        raise ValueError(f"expected exactly six serving log rows, found {len(rows)}")
+    if len(rows) != 8:
+        raise ValueError(f"expected exactly eight serving log rows, found {len(rows)}")
     if any(row.get("status") != "ok" for row in rows):
         raise ValueError("one or more serving requests did not finish successfully")
-    if result.get("selected_route") not in pool_names or result.get("dial_route") not in pool_names:
+    if any(
+        result.get(field) not in pool_names
+        for field in (
+            "selected_route",
+            "dial_route",
+            "cache_aware_first_route",
+            "cache_aware_second_route",
+        )
+    ):
         raise ValueError("the selected endpoint emitted an unknown routed-model audit value")
     by_endpoint: dict[str, list[dict[str, object]]] = {}
     for row in rows:
@@ -426,7 +472,10 @@ def _validate_rows(
             "input_tokens",
             "output_tokens",
             "cached_tokens",
+            "cache_credit_usd",
         ):
+            if field == "cache_credit_usd" and row.get(field) is None:
+                continue
             if not isinstance(row.get(field), (int, float)) or isinstance(row.get(field), bool):
                 raise ValueError(f"serving log row has no numeric {field}")
     openai_rows = by_endpoint.get(OPENAI_PROBE, [])
@@ -441,8 +490,20 @@ def _validate_rows(
         or fallback_rows[0].get("model") != default_model
     ):
         raise ValueError("forced novelty probe did not exercise the safe fallback")
+    cache_rows = by_endpoint.get(CACHE_AWARE_PROBE, [])
+    if (
+        len(cache_rows) != 2
+        or not isinstance(cache_rows[1].get("cache_credit_usd"), (int, float))
+        or isinstance(cache_rows[1].get("cache_credit_usd"), bool)
+        or _number(cache_rows[1], "cache_credit_usd") <= 0
+    ):
+        raise ValueError("cache-aware probe did not log a positive incumbent cache credit")
     result["affinity_reason"] = openai_rows[1]["routing_reason"]
     result["fallback_gate"] = fallback_rows[0]["gate"]
+    result["cache_aware_credit_usd"] = _number(
+        cache_rows[1],
+        "cache_credit_usd",
+    )
     result["provider_cost_usd"] = sum(_number(row, "cost_usd") for row in rows)
     result["router_cost_usd"] = sum(_number(row, "router_cost_usd") for row in rows)
     result["cached_input_tokens"] = sum(_number(row, "cached_tokens") for row in rows)
@@ -502,6 +563,7 @@ def _run(root: Path, port: int) -> None:
                         OPENAI_PROBE,
                         ANTHROPIC_PROBE,
                         FALLBACK_PROBE,
+                        CACHE_AWARE_PROBE,
                     },
                 )
                 result = _exercise(client)

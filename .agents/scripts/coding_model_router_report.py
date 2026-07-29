@@ -216,6 +216,22 @@ def _validate_evidence(root: Path) -> tuple[JsonObject, JsonObject, JsonObject, 
         raise ValueError("outer results have no scientific promotion verdict")
     _object_rows(outer.get("pareto"), label="outer pareto")
     _object(outer.get("paired_cluster_bootstrap"), label="paired_cluster_bootstrap")
+    capability_slices = _object(
+        outer.get("capability_slices"),
+        label="outer capability_slices",
+    )
+    if not capability_slices:
+        raise ValueError("outer results have no declared capability slices")
+    ablations = _object(
+        outer.get("one_at_a_time_ablations"),
+        label="outer one_at_a_time_ablations",
+    )
+    if (
+        ablations.get("benchmark_stratified") != "ablation:benchmark_stratified"
+        or ablations.get("missing_fit_coverage_0.8") != "ablation:missing_fit_coverage_0.8"
+        or ablations.get("latency_only_static") != "latency_only"
+    ):
+        raise ValueError("outer results have no frozen one-at-a-time ablations")
     if lock.get("matrix_sha256") != _sha256(outcomes_path):
         raise ValueError("selection lock does not match the real outcome matrix")
     if outer.get("matrix_sha256") != _sha256(outcomes_path):
@@ -245,9 +261,21 @@ def _validate_evidence(root: Path) -> tuple[JsonObject, JsonObject, JsonObject, 
         raise ValueError("world-model deployment comparison is incomplete")
 
     serving_results = sorted((root / "serving").glob("result-*.json"))
-    passed_results = [
-        path for path in serving_results if _read_object(path).get("completion_status") == "passed"
-    ]
+    passed_results = []
+    for path in serving_results:
+        result = _read_object(path)
+        if (
+            result.get("completion_status") == "passed"
+            and _number(result.get("requests"), label="serving.requests") == 8
+            and result.get("fallback_gate") == "novelty-abstain"
+            and result.get("affinity_reason") == "sticky: conversation affinity"
+            and _number(
+                result.get("cache_aware_credit_usd"),
+                label="serving.cache_aware_credit_usd",
+            )
+            > 0
+        ):
+            passed_results.append(path)
     if not (root / "serving" / "prepare.json").is_file() or not passed_results:
         raise ValueError("no passed real WMO serving verification is present")
     return outer, outcomes, comparison, passed_results[-1]
@@ -301,6 +329,42 @@ def _unsafe_benchmarks(guarded: JsonObject, baseline: JsonObject) -> list[str]:
     return unsafe
 
 
+def _capability_rows(outer: JsonObject) -> tuple[list[JsonObject], list[str]]:
+    """Normalize guarded capability results and identify unsafe cohorts."""
+    raw = _object(outer.get("capability_slices"), label="capability_slices")
+    rows: list[JsonObject] = []
+    unsafe: list[str] = []
+    for capability in sorted(raw):
+        value = _object(raw[capability], label=f"capability_slices.{capability}")
+        seeds_observed = _number(
+            value.get("seeds_observed"),
+            label=f"{capability}.seeds_observed",
+        )
+        points = _object(value.get("points"), label=f"{capability}.points")
+        guarded = _object(
+            points.get("guarded_knn"),
+            label=f"{capability}.guarded_knn",
+        )
+        retention = _number(
+            guarded.get("quality_retained"),
+            label=f"{capability}.quality_retained",
+        )
+        absolute_delta = _number(
+            guarded.get("absolute_quality_delta"),
+            label=f"{capability}.absolute_quality_delta",
+        )
+        if retention < 0.90 or absolute_delta < -0.10:
+            unsafe.append(capability)
+        rows.append(
+            {
+                "capability": capability,
+                "seeds_observed": seeds_observed,
+                **guarded,
+            }
+        )
+    return rows, unsafe
+
+
 def _table_row(
     label: str,
     metric: JsonObject,
@@ -352,6 +416,7 @@ def build_report(root: Path) -> tuple[str, JsonObject]:
     )
     guarded = points["guarded_knn"]
     unsafe = _unsafe_benchmarks(guarded, points["best_single"])
+    capability_rows, unsafe_capabilities = _capability_rows(outer)
     accounting = _cost_accounting(outcomes)
     selected_mix = _object(guarded.get("model_mix"), label="guarded.model_mix")
     baseline_name = outer.get("deployment_consensus_baseline")
@@ -407,9 +472,13 @@ def build_report(root: Path) -> tuple[str, JsonObject]:
         else "Full-matrix model costs use provider-reported counters."
     )
     unsafe_statement = (
-        ", ".join(f"`{benchmark}`" for benchmark in unsafe)
-        if unsafe
-        else "No preregistered benchmark cohort failed the catastrophic-loss gate"
+        ", ".join(f"`{capability}`" for capability in unsafe_capabilities)
+        if unsafe_capabilities
+        else (
+            "No declared capability cohort failed the catastrophic-loss gate"
+            if not unsafe
+            else ", ".join(f"`{benchmark}`" for benchmark in unsafe)
+        )
     )
     world_statement = (
         "Yes. Simulation matched the real promotion decision, deployment configuration, "
@@ -474,6 +543,25 @@ def build_report(root: Path) -> tuple[str, JsonObject]:
                 f"{_percent(retention_lower)}. {accounting_statement}"
             ),
             "",
+            "## Capability Slices",
+            "",
+            "| Capability | Seeds | Quality | Quality retained | Absolute delta | "
+            "Cost/task | Cost savings | Completion |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|",
+            *[
+                (
+                    f"| {row['capability']} "
+                    f"| {int(_number(row.get('seeds_observed'), label='seeds'))}/5 "
+                    f"| {_number(row.get('quality'), label='quality'):.4f} "
+                    f"| {_percent(_number(row.get('quality_retained'), label='retention'))} "
+                    f"| {_number(row.get('absolute_quality_delta'), label='delta'):+.4f} "
+                    f"| {_cost(_number(row.get('cost_per_task'), label='cost'))} "
+                    f"| {_percent(_number(row.get('cost_savings'), label='savings'))} "
+                    f"| {_percent(_number(row.get('success_rate'), label='completion'))} |"
+                )
+                for row in capability_rows
+            ],
+            "",
             "## Limitations",
             "",
             (
@@ -492,6 +580,11 @@ def build_report(root: Path) -> tuple[str, JsonObject]:
             (
                 "- The simulated matrix uses WMO's native agent scaffold while the real matrix "
                 "uses Harbor and Pi, which is a simulation-to-real confound."
+            ),
+            (
+                "- Prompt-cache-aware switching and conversation affinity are serving-only "
+                "operational checks. The one-shot benchmark matrix does not identify their "
+                "quality effect."
             ),
             *(
                 [
@@ -535,6 +628,8 @@ def build_report(root: Path) -> tuple[str, JsonObject]:
         },
         "points": points,
         "unsafe_benchmarks": unsafe,
+        "unsafe_capabilities": unsafe_capabilities,
+        "capability_slices": {cast("str", row["capability"]): row for row in capability_rows},
         "world_model_same_deployment_decision": same_world_decision,
         "cost_accounting": accounting,
         "serving_result": str(serving_result_path.relative_to(root)),

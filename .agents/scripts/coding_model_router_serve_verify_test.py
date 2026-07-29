@@ -94,7 +94,7 @@ def test_post_rejects_non_compatible_shape() -> None:
             )
 
 
-def test_validate_rows_requires_and_summarizes_six_requests() -> None:
+def test_validate_rows_requires_and_summarizes_eight_requests() -> None:
     def row(
         endpoint: str,
         model: str,
@@ -103,6 +103,7 @@ def test_validate_rows_requires_and_summarizes_six_requests() -> None:
         gate: str = "",
         cost: float = 0.01,
         router_cost: float = 0.0,
+        cache_credit: float | None = None,
     ) -> dict[str, object]:
         return {
             "endpoint": endpoint,
@@ -115,6 +116,7 @@ def test_validate_rows_requires_and_summarizes_six_requests() -> None:
             "input_tokens": 10,
             "output_tokens": 2,
             "cached_tokens": 3,
+            "cache_credit_usd": cache_credit,
         }
 
     rows = [
@@ -133,23 +135,33 @@ def test_validate_rows_requires_and_summarizes_six_requests() -> None:
             router_cost=0.001,
         ),
         row(runner.ENDPOINT, runner.ANTHROPIC_ARM, router_cost=0.001),
+        row(runner.CACHE_AWARE_PROBE, runner.OPENAI_ARM, router_cost=0.001),
+        row(
+            runner.CACHE_AWARE_PROBE,
+            runner.OPENAI_ARM,
+            router_cost=0.001,
+            cache_credit=0.004,
+        ),
     ]
     result = runner._validate_rows(
         rows,
         {
             "selected_route": runner.OPENAI_ARM,
             "dial_route": runner.ANTHROPIC_ARM,
+            "cache_aware_first_route": runner.OPENAI_ARM,
+            "cache_aware_second_route": runner.OPENAI_ARM,
         },
         runner.ANTHROPIC_ARM,
         {entry.name for entry in _pool()},
     )
     assert result["affinity_reason"] == "sticky: conversation affinity"
     assert result["fallback_gate"] == "novelty-abstain"
-    assert result["provider_cost_usd"] == pytest.approx(0.06)
-    assert result["router_cost_usd"] == pytest.approx(0.003)
-    assert result["cached_input_tokens"] == 18
-    assert result["input_tokens"] == 60
-    assert result["output_tokens"] == 12
+    assert result["cache_aware_credit_usd"] == pytest.approx(0.004)
+    assert result["provider_cost_usd"] == pytest.approx(0.08)
+    assert result["router_cost_usd"] == pytest.approx(0.005)
+    assert result["cached_input_tokens"] == 24
+    assert result["input_tokens"] == 80
+    assert result["output_tokens"] == 16
 
 
 def test_validate_rows_rejects_unknown_selected_route() -> None:
@@ -165,12 +177,18 @@ def test_validate_rows_rejects_unknown_selected_route() -> None:
             "input_tokens": 1,
             "output_tokens": 1,
             "cached_tokens": 0,
+            "cache_credit_usd": None,
         }
-    ] * 6
+    ] * 8
     with pytest.raises(ValueError, match="unknown routed-model"):
         runner._validate_rows(
             rows,
-            {"selected_route": "ghost", "dial_route": runner.OPENAI_ARM},
+            {
+                "selected_route": "ghost",
+                "dial_route": runner.OPENAI_ARM,
+                "cache_aware_first_route": runner.OPENAI_ARM,
+                "cache_aware_second_route": runner.OPENAI_ARM,
+            },
             runner.ANTHROPIC_ARM,
             {entry.name for entry in _pool()},
         )

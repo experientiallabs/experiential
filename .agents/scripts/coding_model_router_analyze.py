@@ -54,6 +54,76 @@ BENCHMARK_ABSOLUTE_LOSS_LIMIT = 0.10
 OPENAI_EMBEDDING_MODEL = "text-embedding-3-large"
 OPENAI_EMBEDDING_DIM = 3072
 FAST_DEV_FIT_TASKS = 8
+MISSING_CELL_COVERAGE = 0.8
+
+CAPABILITY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "build-and-dependency": (
+        "build",
+        "compile",
+        "configure",
+        "cython",
+        "gcov",
+        "install",
+        "pypi",
+        "qemu",
+        "webserver",
+    ),
+    "code-generation-and-translation": (
+        "cobol",
+        "code-from",
+        "codegolf",
+        "compiler",
+        "interpreter",
+        "metacircular",
+        "polyglot",
+        "prove",
+        "write-",
+    ),
+    "data-ml-and-scientific": (
+        "circuit",
+        "data",
+        "dna",
+        "eigen",
+        "fasttext",
+        "fitting",
+        "inference",
+        "mcmc",
+        "model",
+        "mteb",
+        "optimization",
+        "protein",
+        "pytorch",
+        "sampler",
+        "sampling",
+        "scientific",
+        "stan",
+        "tensor",
+        "torch",
+    ),
+    "debugging-and-test-repair": (
+        "break-",
+        "cancel-",
+        "crash",
+        "fix-",
+        "leak",
+        "recovery",
+        "repair",
+        "sanitize",
+        "truncate",
+        "vulnerable",
+    ),
+    "security-and-recovery": (
+        "cert",
+        "crack",
+        "cryptanalysis",
+        "leak",
+        "password",
+        "recovery",
+        "sanitize",
+        "secret",
+        "vulnerab",
+    ),
+}
 
 logger = logging.getLogger("coding-model-router-analyze")
 
@@ -209,6 +279,38 @@ def _scenario_tasks(matrix: OutcomeMatrix) -> tuple[list[str], dict[str, str]]:
         elif tasks[outcome.scenario_id] != outcome.task:
             raise ValueError(f"{outcome.scenario_id} carries inconsistent pre-call task text")
     return ids, tasks
+
+
+def _capability_slice_ids(matrix: OutcomeMatrix) -> dict[str, list[str]]:
+    """Declare overlapping capability cohorts from pre-call task information only."""
+    scenario_ids, tasks = _scenario_tasks(matrix)
+    prompt_lengths = np.asarray([len(tasks[scenario_id]) for scenario_id in scenario_ids])
+    long_context_floor = float(np.quantile(prompt_lengths, 0.75))
+    slices: dict[str, list[str]] = {
+        "repository-level-bug-fixing": [],
+        "terminal-operation-and-tool-use": [],
+        "long-context": [],
+        **{name: [] for name in CAPABILITY_KEYWORDS},
+    }
+    for scenario_id in scenario_ids:
+        benchmark, task_id = scenario_id.split(":", 1)
+        normalized = f"{task_id} {tasks[scenario_id]}".casefold()
+        if benchmark == "swe-bench-verified":
+            slices["repository-level-bug-fixing"].append(scenario_id)
+            slices["debugging-and-test-repair"].append(scenario_id)
+        if benchmark == "terminal-bench-2":
+            slices["terminal-operation-and-tool-use"].append(scenario_id)
+        if len(tasks[scenario_id]) >= long_context_floor:
+            slices["long-context"].append(scenario_id)
+        for name, keywords in CAPABILITY_KEYWORDS.items():
+            if name == "debugging-and-test-repair" and benchmark == "swe-bench-verified":
+                continue
+            if any(keyword in normalized for keyword in keywords):
+                slices[name].append(scenario_id)
+    empty = [name for name, ids in slices.items() if not ids]
+    if empty:
+        raise ValueError(f"declared capability slices are empty: {empty}")
+    return slices
 
 
 def _manifest_rows(root: Path) -> dict[str, dict[str, dict[str, object]]]:
@@ -421,6 +523,43 @@ def _subset(matrix: OutcomeMatrix, ids: list[str]) -> OutcomeMatrix:
     )
 
 
+def _missing_fit_matrix(
+    matrix: OutcomeMatrix,
+    fit_ids: list[str],
+    *,
+    baseline: str,
+    seed: int,
+    coverage: float,
+) -> OutcomeMatrix:
+    """Mask nonbaseline fit cells deterministically for the missing-cell ablation."""
+    if not 0 < coverage <= 1:
+        raise ValueError("missing-cell coverage must be in (0, 1]")
+    fit = set(fit_ids)
+    kept: set[tuple[str, str]] = set()
+    for model in matrix.model_names():
+        model_ids = sorted(
+            {
+                outcome.scenario_id
+                for outcome in matrix.outcomes
+                if outcome.model == model and outcome.scenario_id in fit
+            },
+            key=lambda scenario_id: (
+                hashlib.sha256(f"missing-v1:{seed}:{model}:{scenario_id}".encode()).digest(),
+                scenario_id,
+            ),
+        )
+        keep_count = len(model_ids) if model == baseline else max(1, int(len(model_ids) * coverage))
+        kept.update((scenario_id, model) for scenario_id in model_ids[:keep_count])
+    return OutcomeMatrix(
+        pool=matrix.pool,
+        outcomes=[
+            outcome
+            for outcome in matrix.outcomes
+            if outcome.scenario_id not in fit or (outcome.scenario_id, outcome.model) in kept
+        ],
+    )
+
+
 def _cell_map(matrix: OutcomeMatrix) -> dict[tuple[str, str], ScenarioOutcome]:
     return {(outcome.scenario_id, outcome.model): outcome for outcome in matrix.outcomes}
 
@@ -499,6 +638,78 @@ def _metrics(
     )
 
 
+def _capability_metric(
+    matrix: OutcomeMatrix,
+    ids: list[str],
+    assignments: dict[str, str],
+    *,
+    baseline_assignments: dict[str, str],
+) -> dict[str, object]:
+    """Score one overlapping capability cohort against aligned baseline rows."""
+    cells = _cell_map(matrix)
+    selected = [cells[(scenario_id, assignments[scenario_id])] for scenario_id in ids]
+    baseline = [cells[(scenario_id, baseline_assignments[scenario_id])] for scenario_id in ids]
+    quality = statistics.fmean(cast("list[float]", [row.reward for row in selected]))
+    baseline_quality = statistics.fmean(cast("list[float]", [row.reward for row in baseline]))
+    cost = statistics.fmean(row.cost_usd for row in selected)
+    baseline_cost = statistics.fmean(row.cost_usd for row in baseline)
+    retention = (
+        quality / baseline_quality if baseline_quality > 0 else float(quality >= baseline_quality)
+    )
+    return {
+        "scenarios": len(ids),
+        "quality": quality,
+        "baseline_quality": baseline_quality,
+        "quality_retained": retention,
+        "absolute_quality_delta": quality - baseline_quality,
+        "cost_per_task": cost,
+        "baseline_cost_per_task": baseline_cost,
+        "cost_savings": 1.0 - cost / baseline_cost if baseline_cost > 0 else 0.0,
+        "success_rate": statistics.fmean(float(row.success) for row in selected),
+        "latency_p50_s": _percentile(
+            [sum(row.call_seconds) for row in selected],
+            0.50,
+        ),
+        "latency_p95_s": _percentile(
+            [sum(row.call_seconds) for row in selected],
+            0.95,
+        ),
+        "model_mix": {
+            model: count / len(ids)
+            for model, count in sorted(
+                Counter(assignments[scenario_id] for scenario_id in ids).items()
+            )
+        },
+    }
+
+
+def _capability_metrics(
+    matrix: OutcomeMatrix,
+    ids: list[str],
+    assignments: dict[str, dict[str, str]],
+    *,
+    baseline: str,
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Score named policy points on every declared pre-call capability cohort."""
+    wanted = set(ids)
+    baseline_assignments = _static_assignments(ids, baseline)
+    result: dict[str, dict[str, dict[str, object]]] = {}
+    for capability, slice_ids in _capability_slice_ids(matrix).items():
+        cohort = [scenario_id for scenario_id in slice_ids if scenario_id in wanted]
+        if not cohort:
+            continue
+        result[capability] = {
+            point: _capability_metric(
+                matrix,
+                cohort,
+                point_assignments,
+                baseline_assignments=baseline_assignments,
+            )
+            for point, point_assignments in assignments.items()
+        }
+    return result
+
+
 def _static_assignments(ids: list[str], model: str) -> dict[str, str]:
     return dict.fromkeys(ids, model)
 
@@ -529,6 +740,23 @@ def _cheapest_single(matrix: OutcomeMatrix, ids: list[str]) -> str:
         matrix.model_names(),
         key=lambda model: (
             _metrics(matrix, ids, _static_assignments(ids, model), baseline=model).cost_per_task,
+            order[model],
+        ),
+    )
+
+
+def _fastest_single(matrix: OutcomeMatrix, ids: list[str]) -> str:
+    """Select a latency-only static ablation on outer-fit rows."""
+    order = {entry.name: index for index, entry in enumerate(matrix.pool)}
+    return min(
+        matrix.model_names(),
+        key=lambda model: (
+            _metrics(
+                matrix,
+                ids,
+                _static_assignments(ids, model),
+                baseline=model,
+            ).latency_p50_s,
             order[model],
         ),
     )
@@ -1072,7 +1300,49 @@ def _seed_evaluation(
         baseline=baseline,
         decisions=unguarded_decisions,
     )
+    stratified_decisions: dict[str, RoutingDecision] = {}
+    for benchmark in BENCHMARKS:
+        benchmark_fit = [sid for sid in fit_ids if _benchmark(sid) == benchmark]
+        benchmark_heldout = [sid for sid in heldout_ids if _benchmark(sid) == benchmark]
+        benchmark_policy, benchmark_embedder = _fit_policy(
+            matrix,
+            benchmark_fit,
+            baseline,
+            config,
+            root,
+            seed_dir / f"benchmark-{benchmark}-{KNN_BANK_FILENAME}",
+        )
+        stratified_decisions.update(
+            route_scenarios(
+                benchmark_policy,
+                matrix,
+                benchmark_heldout,
+                embedder=benchmark_embedder,
+            )
+        )
+    missing_matrix = _missing_fit_matrix(
+        matrix,
+        fit_ids,
+        baseline=baseline,
+        seed=seed,
+        coverage=MISSING_CELL_COVERAGE,
+    )
+    missing_policy, missing_embedder = _fit_policy(
+        missing_matrix,
+        fit_ids,
+        baseline,
+        config,
+        root,
+        seed_dir / f"missing-coverage-0.8-{KNN_BANK_FILENAME}",
+    )
+    missing_decisions = route_scenarios(
+        missing_policy,
+        missing_matrix,
+        heldout_ids,
+        embedder=missing_embedder,
+    )
     cheapest = _cheapest_single(matrix, fit_ids)
+    fastest = _fastest_single(matrix, fit_ids)
     random_assignments = _random_assignments(matrix, heldout_ids, seed)
     oracle_assignments = _oracle_assignments(matrix, heldout_ids)
 
@@ -1086,18 +1356,45 @@ def _seed_evaluation(
         fitted_from=f"{EXPERIMENT_ID} seed={seed} rank-ablation",
     )
     rank_decisions = route_scenarios(rank, matrix, heldout_ids)
+    baseline_assignments = _static_assignments(heldout_ids, baseline)
+    cheapest_assignments = _static_assignments(heldout_ids, cheapest)
+    fastest_assignments = _static_assignments(heldout_ids, fastest)
+    guarded_assignments = {sid: decision.model for sid, decision in decisions.items()}
+    unguarded_assignments = {sid: decision.model for sid, decision in unguarded_decisions.items()}
+    rank_assignments = {sid: decision.model for sid, decision in rank_decisions.items()}
+    stratified_assignments = {sid: decision.model for sid, decision in stratified_decisions.items()}
+    missing_assignments = {sid: decision.model for sid, decision in missing_decisions.items()}
+    capability_assignments: dict[str, dict[str, str]] = {
+        "best_single": baseline_assignments,
+        "cheapest_single": cheapest_assignments,
+        "cost_only": cheapest_assignments,
+        "latency_only": fastest_assignments,
+        "random": random_assignments,
+        "unguarded_knn": unguarded_assignments,
+        "guarded_knn": guarded_assignments,
+        "rank": rank_assignments,
+        "oracle": oracle_assignments,
+        "ablation:benchmark_stratified": stratified_assignments,
+        "ablation:missing_fit_coverage_0.8": missing_assignments,
+    }
     points: dict[str, dict[str, object]] = {
         "best_single": baseline_metric.json(),
         "cheapest_single": _metrics(
             matrix,
             heldout_ids,
-            _static_assignments(heldout_ids, cheapest),
+            cheapest_assignments,
             baseline=baseline,
         ).json(),
         "cost_only": _metrics(
             matrix,
             heldout_ids,
-            _static_assignments(heldout_ids, cheapest),
+            cheapest_assignments,
+            baseline=baseline,
+        ).json(),
+        "latency_only": _metrics(
+            matrix,
+            heldout_ids,
+            fastest_assignments,
             baseline=baseline,
         ).json(),
         "random": _metrics(
@@ -1111,7 +1408,7 @@ def _seed_evaluation(
         "rank": _metrics(
             matrix,
             heldout_ids,
-            {sid: decision.model for sid, decision in rank_decisions.items()},
+            rank_assignments,
             baseline=baseline,
             decisions=rank_decisions,
         ).json(),
@@ -1121,12 +1418,29 @@ def _seed_evaluation(
             oracle_assignments,
             baseline=baseline,
         ).json(),
-    }
-    for model in matrix.model_names():
-        points[f"static:{model}"] = _metrics(
+        "ablation:benchmark_stratified": _metrics(
             matrix,
             heldout_ids,
-            _static_assignments(heldout_ids, model),
+            stratified_assignments,
+            baseline=baseline,
+            decisions=stratified_decisions,
+        ).json(),
+        "ablation:missing_fit_coverage_0.8": _metrics(
+            matrix,
+            heldout_ids,
+            missing_assignments,
+            baseline=baseline,
+            decisions=missing_decisions,
+        ).json(),
+    }
+    for model in matrix.model_names():
+        point_id = f"static:{model}"
+        assignments = _static_assignments(heldout_ids, model)
+        capability_assignments[point_id] = assignments
+        points[point_id] = _metrics(
+            matrix,
+            heldout_ids,
+            assignments,
             baseline=baseline,
         ).json()
     for dial in cast("tuple[float, ...]", SEARCH_SPACE[-1][1]):
@@ -1137,10 +1451,13 @@ def _seed_evaluation(
             heldout_ids,
             embedder=embedder,
         )
-        points[f"guarded_dial:{dial:g}"] = _metrics(
+        point_id = f"guarded_dial:{dial:g}"
+        assignments = {sid: decision.model for sid, decision in dial_decisions.items()}
+        capability_assignments[point_id] = assignments
+        points[point_id] = _metrics(
             matrix,
             heldout_ids,
-            {sid: decision.model for sid, decision in dial_decisions.items()},
+            assignments,
             baseline=baseline,
             decisions=dial_decisions,
         ).json()
@@ -1165,8 +1482,15 @@ def _seed_evaluation(
         "heldout_scenarios": len(heldout_ids),
         "baseline": baseline,
         "cheapest_fit_single": cheapest,
+        "fastest_fit_single": fastest,
         "config": asdict(config),
         "points": points,
+        "capability_slices": _capability_metrics(
+            matrix,
+            heldout_ids,
+            capability_assignments,
+            baseline=baseline,
+        ),
         "paired": paired,
         "guarded_retention": _retention(guarded, baseline_metric),
         "guarded_absolute_quality_delta": guarded.quality - baseline_metric.quality,
@@ -1297,6 +1621,79 @@ def _aggregate_points(seed_rows: list[dict[str, object]]) -> list[dict[str, obje
     )
 
 
+def _aggregate_capability_slices(
+    seed_rows: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    """Aggregate overlapping capability results without changing headline weights."""
+    by_seed: list[dict[str, object]] = []
+    for row in seed_rows:
+        slices = row.get("capability_slices")
+        if not isinstance(slices, dict):
+            raise ValueError("seed result has no capability slices")
+        by_seed.append({str(key): value for key, value in slices.items()})
+    capabilities = sorted(set().union(*(rows.keys() for rows in by_seed)))
+    result: dict[str, dict[str, object]] = {}
+    numeric_fields = (
+        "quality",
+        "baseline_quality",
+        "quality_retained",
+        "absolute_quality_delta",
+        "cost_per_task",
+        "baseline_cost_per_task",
+        "cost_savings",
+        "success_rate",
+        "latency_p50_s",
+        "latency_p95_s",
+        "scenarios",
+    )
+    for capability in capabilities:
+        observed = [
+            _object_mapping(rows[capability], label=f"capability {capability}")
+            for rows in by_seed
+            if capability in rows
+        ]
+        point_names = sorted(
+            set.intersection(*[set(_object_mapping(row, label=capability)) for row in observed])
+        )
+        points: dict[str, object] = {}
+        for point_name in point_names:
+            metrics = [
+                _object_mapping(row[point_name], label=f"{capability}.{point_name}")
+                for row in observed
+            ]
+            model_mixes = [
+                _object_mapping(metric.get("model_mix"), label="model_mix") for metric in metrics
+            ]
+            models = sorted(set().union(*(mix.keys() for mix in model_mixes)))
+            points[point_name] = {
+                **{
+                    field: statistics.fmean(
+                        _number(
+                            metric.get(field),
+                            label=f"{capability}.{point_name}.{field}",
+                        )
+                        for metric in metrics
+                    )
+                    for field in numeric_fields
+                },
+                "model_mix": {
+                    model: statistics.fmean(
+                        _number(
+                            mix.get(model, 0.0),
+                            label=f"{capability}.{point_name}.model_mix.{model}",
+                        )
+                        for mix in model_mixes
+                    )
+                    for model in models
+                },
+            }
+        result[capability] = {
+            "seeds_observed": len(observed),
+            "points": points,
+        }
+    return result
+
+
 def _deploy_refit(
     matrix: OutcomeMatrix,
     root: Path,
@@ -1387,6 +1784,14 @@ def _evaluate(root: Path) -> None:
         "all_seed_promotion_gates": seed_promotions,
         "promoted": promoted,
         "pareto": _aggregate_points(seed_rows),
+        "capability_slices": _aggregate_capability_slices(seed_rows),
+        "one_at_a_time_ablations": {
+            "benchmark_stratified": "ablation:benchmark_stratified",
+            "missing_fit_coverage_0.8": "ablation:missing_fit_coverage_0.8",
+            "missing_fit_coverage_1.0_control": "guarded_knn",
+            "latency_only_static": "latency_only",
+            "production_eligible": False,
+        },
         "deployment_consensus_config": lock["deployment_consensus_config"],
         "deployment_consensus_baseline": lock["deployment_consensus_baseline"],
         "headline_scope": "five-seed nested selection; deployable all-row refit is not heldout",
