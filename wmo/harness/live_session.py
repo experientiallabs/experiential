@@ -474,6 +474,10 @@ class LiveSession:
         self.worker_usage.cached_input_tokens += reported.cached_input_tokens
         self.worker_usage.cache_write_input_tokens += reported.cache_write_input_tokens
         self.worker_usage.reasoning_tokens += reported.reasoning_tokens
+        self.worker_usage.call_input_tokens.append(reported.input_tokens)
+        self.worker_usage.call_output_tokens.append(reported.output_tokens)
+        self.worker_usage.call_cached_input_tokens.append(reported.cached_input_tokens)
+        self.worker_usage.call_cache_write_input_tokens.append(reported.cache_write_input_tokens)
 
     def _tool_specs(self) -> list[JsonObject]:
         return [

@@ -88,6 +88,11 @@ class ScenarioOutcome(BaseModel):
     usage: TokenUsage = TokenUsage()
     cost_usd: float = 0.0  # candidate-side cost, priced by ITS pool entry
     call_seconds: list[float] = []  # wall seconds per policy call (env time excluded)
+    # Per-call token counts retain request-level pricing boundaries. Empty on legacy matrices.
+    call_input_tokens: list[int] = []
+    call_output_tokens: list[int] = []
+    call_cached_input_tokens: list[int] = []
+    call_cache_write_input_tokens: list[int] = []
     wall_seconds: float = 0.0
     completion_status: str = ""
     failure_class: str = ""

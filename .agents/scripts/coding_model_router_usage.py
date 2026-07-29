@@ -1,0 +1,130 @@
+"""Exact worker usage extraction and frozen model pricing for the coding-router study."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from wmo.providers.base import TokenUsage
+from wmo.providers.pool import PoolEntry
+
+OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
+OPENAI_LONG_CONTEXT_MODELS = frozenset(
+    {
+        "gpt-5.5-2026-04-23",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    }
+)
+
+
+def _nonnegative_int(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _int_list(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    return [_nonnegative_int(item) for item in value]
+
+
+def _seconds_list(value: object) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    return [
+        float(item)
+        for item in value
+        if isinstance(item, (int, float)) and not isinstance(item, bool) and item >= 0
+    ]
+
+
+@dataclass(frozen=True)
+class DetailedUsage:
+    """Episode totals plus request-level counters needed for tiered pricing."""
+
+    total: TokenUsage
+    call_seconds: list[float]
+    call_input_tokens: list[int]
+    call_output_tokens: list[int]
+    call_cached_input_tokens: list[int]
+    call_cache_write_input_tokens: list[int]
+
+
+def usage_from_trace(trace: dict[str, object]) -> DetailedUsage:
+    """Read a Harbor worker trace, accepting legacy traces with aggregate counters only."""
+    raw = trace.get("worker_usage")
+    if not isinstance(raw, dict):
+        return DetailedUsage(TokenUsage(), [], [], [], [], [])
+    return DetailedUsage(
+        total=TokenUsage(
+            input_tokens=_nonnegative_int(raw.get("input_tokens")),
+            output_tokens=_nonnegative_int(raw.get("output_tokens")),
+            cached_input_tokens=_nonnegative_int(raw.get("cached_input_tokens")),
+            cache_write_input_tokens=_nonnegative_int(raw.get("cache_write_input_tokens")),
+            reasoning_tokens=_nonnegative_int(raw.get("reasoning_tokens")),
+        ),
+        call_seconds=_seconds_list(raw.get("call_seconds")),
+        call_input_tokens=_int_list(raw.get("call_input_tokens")),
+        call_output_tokens=_int_list(raw.get("call_output_tokens")),
+        call_cached_input_tokens=_int_list(raw.get("call_cached_input_tokens")),
+        call_cache_write_input_tokens=_int_list(raw.get("call_cache_write_input_tokens")),
+    )
+
+
+def exact_cost_usd(entry: PoolEntry, usage: DetailedUsage) -> float:
+    """Price one episode, applying the frozen OpenAI long-context multiplier per request."""
+    if entry.model not in OPENAI_LONG_CONTEXT_MODELS:
+        return entry.cost_usd(usage.total)
+
+    lengths = {
+        len(usage.call_input_tokens),
+        len(usage.call_output_tokens),
+        len(usage.call_cached_input_tokens),
+        len(usage.call_cache_write_input_tokens),
+    }
+    if lengths == {0}:
+        if usage.total.input_tokens > OPENAI_LONG_CONTEXT_THRESHOLD:
+            raise ValueError(
+                f"{entry.name} used {usage.total.input_tokens} aggregate input tokens but its "
+                "trace has no per-call counters, so the >272k pricing tier cannot be resolved"
+            )
+        return entry.cost_usd(usage.total)
+    if len(lengths) != 1 or 0 in lengths:
+        raise ValueError(f"{entry.name} trace carries incomplete per-call token counters")
+
+    price = entry.price()
+    read_rate = (
+        entry.cached_input_per_mtok
+        if entry.cached_input_per_mtok is not None
+        else price.cache_read_per_mtok
+        if price.cache_read_per_mtok is not None
+        else price.input_per_mtok
+    )
+    write_rate = (
+        entry.cache_write_per_mtok
+        if entry.cache_write_per_mtok is not None
+        else price.cache_write_per_mtok
+        if price.cache_write_per_mtok is not None
+        else price.input_per_mtok
+    )
+    total = 0.0
+    for input_tokens, output_tokens, cached_tokens, write_tokens in zip(
+        usage.call_input_tokens,
+        usage.call_output_tokens,
+        usage.call_cached_input_tokens,
+        usage.call_cache_write_input_tokens,
+        strict=True,
+    ):
+        read = min(cached_tokens, input_tokens)
+        write = min(write_tokens, input_tokens - read)
+        fresh = input_tokens - read - write
+        long = input_tokens > OPENAI_LONG_CONTEXT_THRESHOLD
+        input_multiplier = 2.0 if long else 1.0
+        output_multiplier = 1.5 if long else 1.0
+        total += (
+            fresh * price.input_per_mtok * input_multiplier
+            + read * read_rate * input_multiplier
+            + write * write_rate * input_multiplier
+            + output_tokens * price.output_per_mtok * output_multiplier
+        ) / 1_000_000
+    return total

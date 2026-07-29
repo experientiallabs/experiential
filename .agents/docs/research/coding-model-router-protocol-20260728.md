@@ -97,6 +97,43 @@ Frozen artifact SHA-256 values:
 Each exact ID was returned by its provider's live read-only model-list API on 2026-07-28. Sonnet 5
 uses the standard 3/15 price rather than a temporary introductory rate.
 
+Exact model capabilities frozen from the providers' official model pages:
+
+| Exact model | Context | Max output | Structured tool use | Availability at freeze |
+| --- | ---: | ---: | --- | --- |
+| `gpt-5.6-sol` | 1,050,000 | 128,000 | Responses function calling | live model list |
+| `gpt-5.6-terra` | 1,050,000 | 128,000 | Responses function calling | live model list |
+| `gpt-5.6-luna` | 1,050,000 | 128,000 | Responses function calling | live model list |
+| `gpt-5.5-2026-04-23` | 1,050,000 | 128,000 | Responses function calling | live model list |
+| `gpt-5.3-codex` | 400,000 | 128,000 | Responses function calling | live model list |
+| `gpt-5.4-mini-2026-03-17` | 400,000 | 128,000 | Responses function calling | live model list |
+| `claude-fable-5` | 1,000,000 | 128,000 | Messages tool use | live model list |
+| `claude-opus-5` | 1,000,000 | 128,000 | Messages tool use | live model list |
+| `claude-sonnet-5` | 1,000,000 | 128,000 | Messages tool use | live model list |
+| `claude-haiku-4-5-20251001` | 200,000 | 64,000 | Messages tool use | live model list |
+
+OpenAI publishes a Tier 1 floor of 500 requests/minute and 500,000 tokens/minute for these
+roster entries; higher account tiers vary by model. Anthropic's published Start tier is
+1,000 requests/minute for every Claude entry, with 500,000 input and 100,000 output
+tokens/minute for Fable 5, and 2,000,000 input and 400,000 output tokens/minute for Opus 5,
+Sonnet 5, and Haiku 4.5. Account and workspace overrides may be lower. The experiment therefore
+starts at four concurrent cells, observes response rate-limit headers, obeys `retry-after`, and
+never interprets a pre-execution 429 as a gradeable model failure.
+
+GPT-5.5 and GPT-5.6 calls above 272,000 input tokens are priced per request at the documented
+long-context tier: 2x input and cached-input rates plus 1.5x output rates. The runners persist
+per-call input, cached-input, cache-write, and output counters because an episode aggregate
+cannot determine that tier.
+
+Official sources:
+
+- `https://developers.openai.com/api/docs/models`
+- `https://developers.openai.com/api/docs/models/gpt-5.5`
+- `https://developers.openai.com/api/docs/models/gpt-5.3-codex`
+- `https://developers.openai.com/api/docs/models/gpt-5.4-mini`
+- `https://platform.claude.com/docs/en/about-claude/models/overview`
+- `https://platform.claude.com/docs/en/api/rate-limits`
+
 ## Attempts, retries, and evidence
 
 The primary matrix uses one model attempt per task with the same harness, turn cap, output cap,
@@ -151,12 +188,61 @@ Baselines are every static arm, fit-selected best single, cheapest single, seede
 only, unguarded kNN, guarded kNN, rank routing, and oracle per-task routing. Cascades and retry
 escalation are research-only policies and cannot be the production choice.
 
+### Fit-only selection and heldout lock
+
+Hyperparameters are selected without touching any outer heldout reward:
+
+1. Within each outer seed's fit partition, assign whole repositories and task families to five
+   inner folds by SHA-256 of
+   `inner-v1:<outer-seed>:<benchmark>:<group>`. The same group never appears in inner train and
+   validation.
+2. Select the static frontier baseline separately on each outer fit partition using the declared
+   0.5/0.5 benchmark aggregate. Ties go to lower realized fit cost, then frozen pool order.
+3. Start from hashing-1024, 50 neighbors, threshold 0.95, novelty quantile 0.05, z 0.5,
+   minimum eight pairs, standard-error floor on, symmetric guard, and dial 0.25.
+   In this factorial search, the dial coordinate contributes its native WMO `pick_lam` cost
+   pressure while the separately searched novelty, z, and guard coordinates remain authoritative.
+   This avoids silently overwriting three earlier coordinates when the dial is visited. The
+   deployable artifact records both the dial label and the effective primitive knobs. Serving
+   verification separately exercises WMO's standard live dial mapping.
+4. Run two deterministic coordinate passes in this order: embedder, neighbors, similarity
+   threshold, novelty quantile, guard z, minimum pairs, standard-error floor, asymmetric guard,
+   cost-quality dial. Run this search independently inside each outer seed. At each coordinate,
+   evaluate every preregistered value by that seed's five-fold inner validation only. A seed's
+   configuration may never use another seed's fit rows because those rows can overlap its own
+   outer heldout set.
+5. A coordinate value is feasible only when that outer seed's inner-validation aggregate retains
+   at least 95 percent of its fit-selected baseline and passes both per-benchmark
+   catastrophic-regression limits. For each of Terminal-Bench 2 and SWE-bench Verified, quality
+   retention must be at least 0.90 and absolute quality loss must be no more than 0.10. Pick the
+   lowest-cost feasible value. If none is feasible, maximize retention, then mean quality, then
+   lower cost, then the frozen value order.
+6. Benchmark-stratified banks and 0.8 missing-cell coverage are reported as one-at-a-time
+   ablations from the selected point. They cannot replace the production point unless they were
+   selected through the same fit-only rule.
+7. Atomically write `selection-lock.json` with five independently selected hyperparameter sets,
+   five fit-selected baselines, inner-validation metrics, matrix digest, split digests, code
+   commit, and a deterministic deployment consensus before any outer-heldout policy replay. For
+   each discrete coordinate, the consensus is the modal selected value; ties use the frozen value
+   order.
+8. Fit one outer policy per seed using that seed's locked configuration and full fit partition,
+   then evaluate that seed's outer heldout exactly once. All preregistered static, dial, guard,
+   rank, random, cost-only, and oracle points may be replayed for the locked Pareto report, but no
+   heldout result may revise any seed configuration or the deployment consensus.
+9. The deployable artifact refits the pre-heldout consensus hyperparameters on all real rows and
+   pins the fit-only consensus baseline: majority of the five outer fit selections, with ties
+   resolved by mean outer-fit quality, mean outer-fit cost, then frozen pool order. The headline
+   heldout claim is the nested five-seed procedure, not a post-hoc evaluation of this all-row
+   deployment refit.
+
 ## Statistics and world-model comparison
 
 Confidence intervals use 10,000 paired scenario bootstrap resamples respecting repository and task
-family clusters. Reports include quality, cost, effective cost per success, completion, gradeability,
-latency p50 and p95, model mix, route-away share, guard reversion, novelty abstention, and declared
-capability slices.
+family clusters. Each resample preserves the 0.5/0.5 benchmark weighting. Promotion requires the
+lower bound of the pooled paired retention interval to remain at or above 0.95, in addition to
+all five split point-estimate gates. Reports include quality, cost, effective cost per success,
+completion, gradeability, latency p50 and p95, model mix, route-away share, guard reversion,
+novelty abstention, and declared capability slices.
 
 After real matrices and splits are immutable, Azure GPT-5.5 world-model inference builds a separate
 simulated matrix. Real and simulated rows are never pooled. Compare cell agreement, false positive

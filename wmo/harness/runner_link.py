@@ -567,6 +567,10 @@ class RunnerLink:
             usage.cached_input_tokens += reported.cached_input_tokens
             usage.cache_write_input_tokens += reported.cache_write_input_tokens
             usage.reasoning_tokens += reported.reasoning_tokens
+            usage.call_input_tokens.append(reported.input_tokens)
+            usage.call_output_tokens.append(reported.output_tokens)
+            usage.call_cached_input_tokens.append(reported.cached_input_tokens)
+            usage.call_cache_write_input_tokens.append(reported.cache_write_input_tokens)
             response: JsonObject = {
                 "type": "llm_response",
                 "episode_id": episode_id,

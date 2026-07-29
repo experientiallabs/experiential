@@ -402,6 +402,10 @@ def test_harbor_timeout_cancellation_still_persists_the_partial_transcript(
         "reasoning_tokens": 0,
         "calls": 1,
         "call_seconds": [],
+        "call_input_tokens": [],
+        "call_output_tokens": [],
+        "call_cached_input_tokens": [],
+        "call_cache_write_input_tokens": [],
     }
     assert "RuntimeCancelled" in trace["error"]
 

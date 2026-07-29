@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from coding_model_router_usage import exact_cost_usd, usage_from_trace
 from e2b import Sandbox
 from harbor.models.job.config import JobConfig
 from harbor.models.trial.result import TrialResult
@@ -24,7 +25,6 @@ from wmo.core.files import write_text_atomic
 from wmo.evals.harbor.scorer import HarborScorer
 from wmo.harness.scoring import ScoreCell
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.providers.base import TokenUsage
 from wmo.providers.pool import ModelPool, PoolEntry, load_pool
 
 logger = logging.getLogger("coding-model-router-matrix")
@@ -158,36 +158,8 @@ def _trace_path(artifact_dir: Path) -> Path:
     raise ValueError(f"no wmo-run.json under Harbor artifact {artifact_dir}")
 
 
-def _int(value: object) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
-
-
 def _float(value: object) -> float:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
-
-
-def _usage(trace: dict[str, object]) -> tuple[TokenUsage, list[float]]:
-    raw = trace.get("worker_usage")
-    if not isinstance(raw, dict):
-        return TokenUsage(), []
-    usage = TokenUsage(
-        input_tokens=_int(raw.get("input_tokens")),
-        output_tokens=_int(raw.get("output_tokens")),
-        cached_input_tokens=_int(raw.get("cached_input_tokens")),
-        cache_write_input_tokens=_int(raw.get("cache_write_input_tokens")),
-        reasoning_tokens=_int(raw.get("reasoning_tokens")),
-    )
-    raw_seconds = raw.get("call_seconds")
-    seconds = (
-        [
-            float(value)
-            for value in raw_seconds
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
-        ]
-        if isinstance(raw_seconds, list)
-        else []
-    )
-    return usage, seconds
 
 
 def _tool_calls(trace: dict[str, object]) -> int:
@@ -231,7 +203,7 @@ def _outcome(
     artifact_dir: Path,
 ) -> ScenarioOutcome:
     trace = _read_object(_trace_path(artifact_dir))
-    usage, call_seconds = _usage(trace)
+    usage = usage_from_trace(trace)
     steps = trace.get("steps")
     instruction = trace.get("instruction")
     stop = trace.get("stop_reason")
@@ -249,9 +221,13 @@ def _outcome(
         steps=len(steps) if isinstance(steps, list) else 0,
         tool_calls=_tool_calls(trace),
         stop_reason=stop_reason,
-        usage=usage,
-        cost_usd=entry.cost_usd(usage),
-        call_seconds=call_seconds,
+        usage=usage.total,
+        cost_usd=exact_cost_usd(entry, usage),
+        call_seconds=usage.call_seconds,
+        call_input_tokens=usage.call_input_tokens,
+        call_output_tokens=usage.call_output_tokens,
+        call_cached_input_tokens=usage.call_cached_input_tokens,
+        call_cache_write_input_tokens=usage.call_cache_write_input_tokens,
         wall_seconds=_wall_seconds(artifact_dir),
         completion_status=(
             "infrastructure_failure"

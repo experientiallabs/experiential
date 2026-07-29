@@ -175,6 +175,10 @@ def test_full_turn_emits_ordered_events_and_answers_frames() -> None:
     assert session.worker_usage.reasoning_tokens == 3
     assert len(session.worker_usage.call_seconds) == 1
     assert session.worker_usage.call_seconds[0] >= 0
+    assert session.worker_usage.call_input_tokens == [5]
+    assert session.worker_usage.call_output_tokens == [7]
+    assert session.worker_usage.call_cached_input_tokens == [2]
+    assert session.worker_usage.call_cache_write_input_tokens == [1]
 
 
 def test_submit_tool_response_is_answered_without_executor() -> None:

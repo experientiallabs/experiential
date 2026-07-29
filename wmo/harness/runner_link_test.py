@@ -667,6 +667,10 @@ def test_worker_usage_accumulates_across_llm_requests() -> None:
     assert result.worker_usage.reasoning_tokens == 3
     assert len(result.worker_usage.call_seconds) == 2
     assert all(seconds >= 0 for seconds in result.worker_usage.call_seconds)
+    assert result.worker_usage.call_input_tokens == [100, 0]
+    assert result.worker_usage.call_output_tokens == [7, 0]
+    assert result.worker_usage.call_cached_input_tokens == [40, 0]
+    assert result.worker_usage.call_cache_write_input_tokens == [10, 0]
     # No llm_request at all -> usage stays None (not zero: the runtime reported nothing).
     quiet = RunnerLink(
         _FakeChannel([{"type": "done", "reason": "submit", "answer": "ok"}]),
