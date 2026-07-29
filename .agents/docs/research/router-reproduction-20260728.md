@@ -105,6 +105,10 @@ missing verifier output, or another failure with no official reward is infrastru
 at most two fresh-environment retries after 15 and 60 seconds. Every attempt is retained. If all
 three attempts are ungradeable, the cell remains missing with its irrecoverable cause.
 
+A scorer returning the same artifact path more than once is a cached report replay, not a fresh
+attempt. Such duplicate rows remain auditable but count once for retry numbering and realized
+cost. A real retry must use a fresh attempt directory and include only ungradeable cells.
+
 ## Statistical and promotion rule
 
 Primary quality is the benchmark's official reward. Report quality, realized model cost, model
