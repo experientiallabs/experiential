@@ -599,12 +599,23 @@ class PlatformClient:
         Returns:
             The endpoint summary the platform returns.
         """
-        files: dict[str, tuple[str, bytes, str]] = {}
-        if bank_path is not None:
-            files["bank"] = (bank_path.name, bank_path.read_bytes(), "application/octet-stream")
-        data = {"policy": policy_path.read_text(encoding="utf-8")}
-        if report_path is not None:
-            data["report"] = report_path.read_text(encoding="utf-8")
+        # File reads are this client's own failure surface: a path that vanished or
+        # became unreadable between the CLI's validation and this call must surface
+        # as the PlatformError every caller already renders, not a raw traceback.
+        try:
+            files: dict[str, tuple[str, bytes, str]] = {}
+            if bank_path is not None:
+                files["bank"] = (
+                    bank_path.name,
+                    bank_path.read_bytes(),
+                    "application/octet-stream",
+                )
+            data = {"policy": policy_path.read_text(encoding="utf-8")}
+            if report_path is not None:
+                data["report"] = report_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            msg = f"could not read the policy artifacts to install: {error}"
+            raise PlatformError(msg) from error
         response = self._client.put(
             f"/api/orgs/{org_id}/endpoints/{endpoint}/policy",
             data=data,
