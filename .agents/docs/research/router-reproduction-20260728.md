@@ -35,6 +35,11 @@ Tau2 uses the intended heldout test band, not the 97 world-model training tasks.
 construction may use only those 97 training IDs. All current-model candidates run once per real
 task. Gradeable failures and zero rewards remain in the matrix.
 
+The real Tau runner must receive `freeze/tasks/tau2.json` through `--task-manifest`. Its legacy
+corpus-derived `scenarios_eval.jsonl` differs on five telecom tasks and is not an admissible
+substitute. Any cohort run from that file is preserved as an invalid attempt and excluded rather
+than relabeled.
+
 Five deterministic paired split seeds are 0, 1, 2, 3, and 4. Each split uses 70 percent fit and
 30 percent heldout, with deterministic hash ordering. RouterBench is stratified by benchmark
 prefix. Tau2 is stratified by domain. Terminal-Bench 2 is grouped by task family. No group crosses
