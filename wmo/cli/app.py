@@ -3320,8 +3320,8 @@ def research_plot_concurrency(
     turns a missing extra into a usage error naming `uv sync --extra viz`, so the import itself
     never surfaces a raw ModuleNotFoundError traceback.
     """
-    from wmo.research.concurrency_plot import render_report
     _require_viz_extra()
+    from wmo.research.concurrency_plot import render_report
 
     try:
         written = render_report(report, out, title=title)
