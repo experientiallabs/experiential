@@ -83,10 +83,13 @@ from stats import (  # noqa: E402
 
 DEFAULT_ANCHOR = "fable-5"
 
-# The WM episodes' scorer, per the canonical grid design (rubric-v2 judge pinned on
-# opus-4-8). Matrices carry no judge field; this label is the cohort's pin and travels on
-# every ConditionLabel so a differently-judged matrix can never be silently compared in.
-GRID_JUDGE = "rubric-v2 (opus-4-8)"
+# The WM episodes' scorer. CORRECTED 2026-07-28: the program had quoted "rubric-v2
+# (opus-4-8)", but the built model's config.toml records judge_model =
+# us.anthropic.claude-haiku-4-5..., so every grid-c2 cell was judged by HAIKU-4-5. The
+# label now states the fact. (wmo PR #366 changed the DEFAULT judge to opus-5 for future
+# builds; grid-c2's matrices keep this label forever - a judge change is a new fidelity
+# era and rewards never compare across judges.)
+GRID_JUDGE = "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)"
 
 # Fixed arm-identity colors (palette rules: amber/teal never on small marks).
 # llmlingua2-endpoint wears red because it IS the compaction lever (SERIES_COLORS).

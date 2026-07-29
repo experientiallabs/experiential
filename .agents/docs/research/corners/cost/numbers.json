@@ -1,7 +1,7 @@
 {
   "status": "identity: merged + addendum grid-c2-qwen (2 model(s)); truncate: merged; llmlingua2-endpoint: merged",
   "dataset": "tau-bench",
-  "judge": "rubric-v2 (opus-4-8)",
+  "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
   "pending_arms": [],
   "anchor": "fable-5",
   "best_single": "opus-5",
@@ -181,7 +181,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.5,
           "high": -42.6,
@@ -218,7 +218,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -23.8,
           "high": 36.7,
@@ -257,7 +257,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -98.2,
           "high": -68.3,
@@ -294,7 +294,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -95.1,
           "high": -26.3,
@@ -333,7 +333,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -93.8,
           "high": -58.1,
@@ -370,7 +370,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -85.3,
           "high": 10.2,
@@ -409,7 +409,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -79.8,
           "high": -31.5,
@@ -446,7 +446,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -52.9,
           "high": 77.0,
@@ -485,7 +485,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -89.0,
           "high": -61.5,
@@ -522,7 +522,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.4,
           "high": -8.2,
@@ -561,7 +561,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -67.0,
           "high": 16.6,
@@ -598,7 +598,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -21.6,
           "high": 161.1,
@@ -637,7 +637,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -94.2,
           "high": -75.4,
@@ -674,7 +674,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -85.7,
           "high": -36.0,
@@ -713,7 +713,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.7,
           "high": -33.1,
@@ -750,7 +750,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -35.5,
           "high": 85.0,
@@ -789,7 +789,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -74.1,
           "high": -39.4,
@@ -826,7 +826,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 0.0,
@@ -865,7 +865,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -68.3,
           "high": 29.2,
@@ -902,7 +902,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -19.1,
           "high": 196.3,
@@ -941,7 +941,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -99.6,
           "high": -98.7,
@@ -978,7 +978,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -99.0,
           "high": -97.2,
@@ -1017,7 +1017,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -97.5,
           "high": -92.3,
@@ -1054,7 +1054,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -93.6,
           "high": -81.1,
@@ -1093,7 +1093,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -66.6,
           "high": 34.7,
@@ -1132,7 +1132,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -8.9,
           "high": 213.5,
@@ -1173,7 +1173,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -95.9,
           "high": -53.1,
@@ -1212,7 +1212,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -90.4,
           "high": 18.4,
@@ -1253,7 +1253,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -92.6,
           "high": -50.3,
@@ -1292,7 +1292,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -81.6,
           "high": 24.4,
@@ -1333,7 +1333,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -77.2,
           "high": 0.7,
@@ -1372,7 +1372,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -38.2,
           "high": 134.5,
@@ -1413,7 +1413,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -82.0,
           "high": 47.1,
@@ -1452,7 +1452,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -49.8,
           "high": 240.6,
@@ -1493,7 +1493,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -21.9,
           "high": 175.1,
@@ -1532,7 +1532,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 99.9,
           "high": 573.5,
@@ -1573,7 +1573,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -65.9,
           "high": 98.2,
@@ -1612,7 +1612,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -15.0,
           "high": 372.4,
@@ -1653,7 +1653,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -83.3,
           "high": -0.6,
@@ -1692,7 +1692,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -60.5,
           "high": 163.5,
@@ -1733,7 +1733,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -65.3,
           "high": 20.6,
@@ -1772,7 +1772,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -10.2,
           "high": 195.8,
@@ -1813,7 +1813,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -63.1,
           "high": 42.6,
@@ -1852,7 +1852,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -2.6,
           "high": 247.0,
@@ -1893,7 +1893,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -63.4,
           "high": 99.5,
@@ -1932,7 +1932,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 1.7,
           "high": 347.8,
@@ -1973,7 +1973,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -61.0,
           "high": -9.6,
@@ -2012,7 +2012,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -13.6,
           "high": 153.4,
@@ -2053,7 +2053,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -98.4,
           "high": -83.5,
@@ -2092,7 +2092,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -96.2,
           "high": -60.1,
@@ -2133,7 +2133,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -90.0,
           "high": -22.2,
@@ -2172,7 +2172,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -76.6,
           "high": 99.5,
@@ -2213,7 +2213,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -64.0,
           "high": 108.5,
@@ -2252,7 +2252,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -6.1,
           "high": 414.6,
@@ -2293,7 +2293,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -80.3,
           "high": -26.2,
@@ -2332,7 +2332,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -53.1,
           "high": 101.4,
@@ -2373,7 +2373,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -29.6,
           "high": 147.3,
@@ -2412,7 +2412,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 58.0,
           "high": 565.9,
@@ -2453,7 +2453,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -71.4,
           "high": 23.2,
@@ -2492,7 +2492,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -33.4,
           "high": 239.3,
@@ -2533,7 +2533,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -87.4,
           "high": -9.2,
@@ -2572,7 +2572,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -66.4,
           "high": 131.7,
@@ -2613,7 +2613,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -51.7,
           "high": 201.0,
@@ -2652,7 +2652,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 18.4,
           "high": 696.2,
@@ -2693,7 +2693,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -53.1,
           "high": 73.5,
@@ -2732,7 +2732,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 13.2,
           "high": 353.7,
@@ -2773,7 +2773,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -73.4,
           "high": -12.2,
@@ -2812,7 +2812,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -34.9,
           "high": 115.6,
@@ -2861,7 +2861,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -84.9,
           "high": -44.6,
@@ -2900,7 +2900,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 0.0,
@@ -2947,7 +2947,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -84.9,
           "high": -44.6,
@@ -2986,7 +2986,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 0.0,
@@ -3034,7 +3034,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -81.8,
           "high": -43.6,
@@ -3073,7 +3073,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 57.2,
@@ -3121,7 +3121,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -81.8,
           "high": -43.6,
@@ -3160,7 +3160,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 57.2,
@@ -3208,7 +3208,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -81.8,
           "high": -43.6,
@@ -3247,7 +3247,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 57.2,
@@ -3294,7 +3294,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.6,
           "high": 277.9,
@@ -3334,7 +3334,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 12.8,
           "high": 1222.9,
@@ -3382,7 +3382,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.6,
           "high": 277.9,
@@ -3422,7 +3422,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 12.8,
           "high": 1222.9,
@@ -3470,7 +3470,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.6,
           "high": 277.9,
@@ -3510,7 +3510,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 12.8,
           "high": 1222.9,
@@ -3558,7 +3558,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.6,
           "high": 277.9,
@@ -3598,7 +3598,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 12.8,
           "high": 1222.9,
@@ -3647,7 +3647,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -76.2,
           "high": 203.8,
@@ -3687,7 +3687,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -1.8,
           "high": 930.2,
@@ -3735,7 +3735,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -83.5,
           "high": 70.9,
@@ -3775,7 +3775,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -41.7,
           "high": 502.8,
@@ -3823,7 +3823,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -83.5,
           "high": 70.9,
@@ -3863,7 +3863,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -41.7,
           "high": 502.8,
@@ -3911,7 +3911,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -83.5,
           "high": 70.9,
@@ -3951,7 +3951,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -41.7,
           "high": 502.8,
@@ -3999,7 +3999,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -83.5,
           "high": 70.9,
@@ -4039,7 +4039,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -41.7,
           "high": 502.8,
@@ -4087,7 +4087,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -83.5,
           "high": 70.9,
@@ -4127,7 +4127,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -41.7,
           "high": 502.8,
@@ -4176,7 +4176,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.7,
           "high": -37.3,
@@ -4215,7 +4215,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 17.1,
@@ -4263,7 +4263,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.7,
           "high": -37.3,
@@ -4302,7 +4302,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 17.1,
@@ -4350,7 +4350,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -72.7,
           "high": -37.3,
@@ -4389,7 +4389,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": 0.0,
           "high": 17.1,
@@ -4432,37 +4432,37 @@
       "n_eval_scenarios": 20,
       "routed_mix": {
         "opus-5": 17,
-        "opus-4-8": 1,
+        "qwen3.6-27b": 1,
         "kimi-k2.6": 1,
         "qwen3.5-9b": 1
       },
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
-          "low": -74.1,
-          "high": -40.6,
+          "low": -74.2,
+          "high": -41.2,
           "n_scenarios": 20,
           "undefined_resamples": 0
         },
-        "quality_delta_points": 9.13,
+        "quality_delta_points": 9.38,
         "quality_delta_paired": {
-          "mean": 0.0912,
+          "mean": 0.0938,
           "ci95": [
-            -0.0063,
-            0.1975
+            -0.0037,
+            0.2
           ],
-          "sign_test_p": 0.5810546875,
+          "sign_test_p": 0.3876953125,
           "n_pairs": 20,
           "within_noise_floor": false
         },
-        "cost_delta_percent": -59.6,
+        "cost_delta_percent": -59.9,
         "latency_p50_delta_percent": -3.0,
-        "cost_per_completed_task_usd": 0.3866073812105263,
+        "cost_per_completed_task_usd": 0.3837037706842105,
         "anchor_cost_per_completed_task_usd": 0.957891875,
         "task_success_rate": 0.475,
-        "mean_reward": 0.5388,
+        "mean_reward": 0.5413,
         "latency_p50_model_s": 40.23,
         "latency_p95_model_s": 198.9,
         "scenarios_compared": 20,
@@ -4478,30 +4478,30 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
-          "low": -18.1,
-          "high": 14.6,
+          "low": -19.2,
+          "high": 14.2,
           "n_scenarios": 20,
           "undefined_resamples": 0
         },
-        "quality_delta_points": -1.75,
+        "quality_delta_points": -1.5,
         "quality_delta_paired": {
-          "mean": -0.0175,
+          "mean": -0.015,
           "ci95": [
             -0.0563,
-            0.0037
+            0.0112
           ],
           "sign_test_p": 1.0,
           "n_pairs": 20,
           "within_noise_floor": true
         },
-        "cost_delta_percent": -1.5,
+        "cost_delta_percent": -2.3,
         "latency_p50_delta_percent": 6.0,
-        "cost_per_completed_task_usd": 0.3866073812105263,
+        "cost_per_completed_task_usd": 0.3837037706842105,
         "anchor_cost_per_completed_task_usd": 0.39262074999999996,
         "task_success_rate": 0.475,
-        "mean_reward": 0.5388,
+        "mean_reward": 0.5413,
         "latency_p50_model_s": 40.23,
         "latency_p95_model_s": 198.9,
         "scenarios_compared": 20,
@@ -4528,7 +4528,7 @@
       "vs_anchor": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -74.8,
           "high": -43.6,
@@ -4567,7 +4567,7 @@
       "vs_best_single": {
         "label": "measured",
         "provenance": "wm_simulated",
-        "judge": "rubric-v2 (opus-4-8)",
+        "judge": "rubric-v2 (haiku-4-5; config-verified, mislabeled opus-4-8 before 2026-07-28)",
         "cost_delta_percent_ci95": {
           "low": -30.0,
           "high": 19.9,
