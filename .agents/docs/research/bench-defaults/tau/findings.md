@@ -12,33 +12,37 @@ FIFTEEN candidates, not sixteen: the pinned user simulator is excluded from the 
 
 ## Results
 
-Paired per scenario against anchor fable-5 ($1.3494 per completed task), cache-adjusted effective cost per COMPLETED task from wmo.optimize.scorecard, cluster-bootstrap CI95, exact sign test:
+Paired per scenario against anchor fable-5 ($1.3494 per completed task), cache-adjusted effective cost per COMPLETED task from wmo.optimize.scorecard, cluster-bootstrap CI95, exact sign test. All 594 cells scored (candidate-caused deaths are zeros per the program rule), sorted by quality delta:
 
-    candidate         cost %        cost CI95     quality pt     quality CI95      p     n
-    glm-5.2           -88.1   [-90.9, -84.4]          -2.63   [-23.7, +18.4]  1.000    19
-    sonnet-5          -62.8   [-72.3, -48.9]          -2.63   [-23.7, +21.1]  1.000    19
-    opus-5            -49.3   [-63.4, -31.4]          -2.78   [-27.8, +22.2]  1.000    18
-    gpt-5.6-sol       -68.3   [-76.6, -56.0]          -5.26   [-28.9, +18.4]  0.754    19
-    gpt-5.6-terra     -85.5   [-88.9, -81.5]          -7.89   [-28.9, +13.2]  0.727    19
-    qwen3.6-27b       -96.3   [-97.3, -94.7]          -7.89   [-28.9, +13.2]  0.727    19
-    kimi-k3           -73.8   [-80.9, -63.4]         -10.53   [-34.2, +15.8]  0.388    19
-    opus-4-8          -42.5   [-59.9, -15.5]         -10.53   [-34.2, +13.2]  0.754    19
-    kimi-k2.6         -91.1   [-93.2, -87.5]         -13.16   [-31.6,  +5.3]  0.219    19
-    deepseek-v4-pro   -82.2   [-87.1, -75.4]         -15.79   [-39.5,  +7.9]  0.388    19
-    gpt-5.5           -61.5   [-72.3, -41.0]         -21.05   [-44.7,  +2.6]  0.227    19
-    qwen3.5-9b        -99.0   [-99.3, -98.6]         -29.17    [-54.2, -4.2]  0.125    12
-    gpt-5.6-luna      -91.2   [-94.1, -84.3]         -36.84   [-57.9, -15.8]  0.012    19
-    haiku-4-5         -84.9   [-89.4, -74.5]         -39.47   [-63.2, -15.8]  0.006    19
+    candidate           cost %          cost CI95   quality pt        quality CI95      p    n
+    sonnet-5             -62.8     [-72.3, -48.9]        -2.63     [-23.7, +21.1]  1.000   19
+    opus-5               -49.6     [-62.9, -32.5]        -2.63     [-26.3, +21.1]  1.000   19
+    glm-5.2              -88.0     [-90.8, -84.5]        -2.63     [-23.7, +18.4]  1.000   19
+    gpt-5.6-sol          -68.3     [-76.6, -56.0]        -5.26     [-28.9, +18.4]  0.754   19
+    qwen3.6-27b          -96.0     [-97.1, -94.5]        -7.89     [-28.9, +13.2]  0.727   19
+    gpt-5.6-terra        -84.4     [-87.8, -80.0]        -7.89     [-28.9, +13.2]  0.727   19
+    opus-4-8             -42.5     [-59.9, -15.5]       -10.53     [-34.2, +13.2]  0.754   19
+    kimi-k3              -73.8     [-80.9, -63.4]       -10.53     [-34.2, +15.8]  0.388   19
+    kimi-k2.6            -91.1     [-93.2, -87.5]       -13.16      [-31.6, +5.3]  0.219   19
+    deepseek-v4-pro      -82.2     [-87.1, -75.4]       -15.79      [-39.5, +7.9]  0.388   19
+    gpt-5.5              -58.5     [-70.7, -35.3]       -21.05      [-44.7, +2.6]  0.227   19
+    gpt-5.6-luna         -91.2     [-94.1, -84.3]       -36.84     [-57.9, -15.8]  0.012   19
+    qwen3.5-9b           -99.2     [-99.5, -98.8]       -39.47     [-57.9, -21.1]  0.003   19
+    haiku-4-5            -84.9     [-89.4, -74.5]       -39.47     [-63.2, -15.8]  0.006   19
+
+Every arm is n=19 of 20, because the anchor holds 37 of 40 cells and paired comparisons intersect. Unpaired means for orientation: fable-5 0.757, glm-5.2 0.750, opus-5 0.737, sonnet-5 0.700, then qwen3.6-27b / kimi-k3 / gpt-5.6-sol 0.675, down to qwen3.5-9b and haiku-4-5 at 0.350.
 
 Routed rungs, LOO-CV over all 20 scenarios (refit per fold on the other 19, route only the held-out one), which is the properly powered reading:
 
     dial 0.00 (quality-max)   cost +20.3%   quality -28.95 pt   p=0.016
     dial 0.25 (balanced)      cost +16.6%   quality -28.95 pt   p=0.016
-    dial 0.50                 cost -41.8%   quality -26.32 pt   p=0.039
-    dial 0.75                 cost -49.0%   quality -23.68 pt   p=0.070
-    dial 1.00 (max-savings)   cost -46.9%   quality -21.05 pt   p=0.125
+    dial 0.50                 cost -36.3%   quality -26.32 pt   p=0.039
+    dial 0.75                 cost -43.5%   quality -23.68 pt   p=0.070
+    dial 1.00 (max-savings)   cost -48.8%   quality -21.05 pt   p=0.125
 
 Balanced and quality-max are NOT SHIPPABLE here: worse on both axes. Max-savings is a real tradeoff but strictly worse than serving glm-5.2. The single split (n=6) said -83% at -25 pt with p=0.500, which is what an underpowered held-out band looks like and why the LOO leg was required. MECHANISM: fit instability. fable-5 and glm-5.2 differ by 2.63 points, far below noise, so which is "best single" flips between folds, and fable-5-heavy fold policies route away from fable-5 exactly where it was right.
+
+The installed configuration's own numbers, which are what a reader of the endpoint sees: pinned sonnet-5 scores 0.7368 at $0.36989 per run against fable-5's 0.7568 at $1.02113, i.e. 63.8% savings for 2.0 points of quality that the sample cannot resolve.
 
 ## Caveats that travel with every number
 
@@ -46,7 +50,7 @@ Balanced and quality-max are NOT SHIPPABLE here: worse on both axes. Max-savings
 2. 7 of 20 tasks are NOT deterministic: they carry NL_ASSERTION in their reward_basis, scored by tau2's own NL-assertion judge. Rows record which.
 3. THE gpt-5.6 FAMILY RAN WITH REASONING OFF. All three refuse function tools any other way ("Function tools with reasoning_effort are not supported ... use /v1/responses or set reasoning_effort to 'none'"). Reasoning off is the only configuration in which they complete an episode AND the only one our serving path can reach, so these rows measure what a customer could route to. They are not comparable to a reasoning-on number.
 4. A REWARD OF 1.0 DOES NOT ALWAYS MEAN THE SAME THING. Several pinned airline tasks are correct-INACTION tasks: policy forbids the refund, the right behavior is to leave the database alone, and the DB check passes for any agent that does nothing. tau2 additionally reports COMMUNICATE with "No communicate_info to evaluate" while still contributing full credit. Rows carry reward_basis, reward_breakdown and the vacuous components so earned credit can be separated from credit the task handed out. This is the WM judge's blind spot appearing on the real benchmark from the other side.
-5. UNSCORED AND MISSING, named not hidden. 6 of 600 cells never produced a row: the two hardest telecom [mms_issue] scenarios on fable-5 (x3), opus-5 (x2) and gpt-5.5, whose episodes hit the batch kill deadline twice. 20 more unscored: 25 total empty-assistant-message failures (overwhelmingly qwen3.5-9b, which lost 21 of 40 and reproduced identically on retry) and 3 provider ContentPolicyViolationError. qwen3.5-9b reads 0.632 over survivors and 0.300 counting its own failures; the second is fair. Nothing was imputed into stored rows.
+5. UNSCORED AND MISSING, named not hidden. Every cell that ran is now SCORED: candidate-caused deaths (an assistant message with neither content nor a tool call) are scored zeros per the program rule, and both ContentPolicyViolationError cells were retried and scored, so they were transient. 6 of 600 cells never produced a row at all: the two hardest telecom [mms_issue] scenarios on fable-5 (x3), opus-5 (x2) and gpt-5.5, whose episodes hit the batch kill deadline on two separate attempts; a third buy was declined. Because 3 of those 6 are the ANCHOR's own, every paired comparison against fable-5 runs at n=19 of 20, and the report states scenarios_compared 19 / scenarios_excluded 1. Zero cap-hits at the max_turns=100 pin in all 15 arms, so the pin never bound on tau. tau2 records only prompt_tokens and completion_tokens and discards every cache field, so no arm receives cache credit: absolute costs here are UPPER BOUNDS, uniformly, with no cross-arm bias.
 
 ## Statistics
 
