@@ -304,6 +304,7 @@ def record_metering(invocation: dict) -> None:
     if METERING_PATH.exists():
         for ln in METERING_PATH.open():
             prior += json.loads(ln).get("spend_usd", 0.0)
+    invocation.setdefault("owner", "c1")
     invocation["cumulative_spend_usd"] = round(prior + invocation["spend_usd"], 4)
     with METERING_PATH.open("a") as f:
         f.write(json.dumps(invocation) + "\n")

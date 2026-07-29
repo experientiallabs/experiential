@@ -182,6 +182,7 @@ def main() -> None:
                     "ts": datetime.now(UTC).isoformat(),
                     "provider_model": args.model,
                     "purpose": "tiebreak-labels",
+                    "owner": "c1",
                     "spend_usd": round(spent, 4),
                     "discarded": n_discarded,
                 }

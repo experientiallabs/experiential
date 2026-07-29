@@ -363,6 +363,7 @@ def main() -> None:
                         json.dumps(
                         {
                             "ts": datetime.now(UTC).isoformat(),
+                    "owner": "c1",
                             "arm": args.arm,
                             "aggressiveness": args.aggressiveness,
                             "task_id": task["task_id"],
