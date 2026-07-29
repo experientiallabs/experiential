@@ -9,13 +9,13 @@ writer's line still counts and does not renumber everything after it).
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, ValidationError
 
 from wmo.core.types import JsonObject
 from wmo.runs.ledger import Calibration, LedgerLine
 
 
-def _line(**overrides: object) -> JsonObject:
+def _line(**overrides: JsonValue) -> JsonObject:
     """One conforming ledger line, as the runner writes them."""
     line: JsonObject = {
         "event": "chunk",
@@ -26,7 +26,7 @@ def _line(**overrides: object) -> JsonObject:
         "max_steps": 20,
         "episodes": 2,
     }
-    line.update(overrides)  # type: ignore[arg-type]
+    line.update(overrides)
     return line
 
 

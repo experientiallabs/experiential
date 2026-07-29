@@ -722,3 +722,13 @@ def test_an_unreachable_probe_is_not_read_as_a_fresh_run() -> None:
     # forever after.
     assert transport.probes >= 2
     assert transport.of_type("heartbeat")[0].seq > 7
+
+
+def test_an_unknown_status_is_reported_rather_than_raised() -> None:
+    """Telemetry may not end a paid run, not even over a status this build has not heard of."""
+    transport = FakeTransport()
+    emitter = _declared(transport)
+
+    emitter.on_status("canceled")  # type: ignore[arg-type]
+
+    assert transport.of_type("run.status")[0].payload["status"] == "canceled"

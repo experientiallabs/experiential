@@ -58,6 +58,50 @@ def test_band_overrun_fails_loudly_instead_of_walking_into_the_next_band() -> No
     assert bands.take(1) == 4
 
 
+def test_resume_from_top_only_moves_down_and_refuses_the_wrong_direction() -> None:
+    """The descending twin of `resume_at`, with the misuse it has to refuse.
+
+    A resumed descending walk that restarts at the ceiling re-issues the seqs its
+    previous invocation used, and the platform discards each as a replay. That is
+    quiet and, for a terminal `run.status`, permanent: the run stays `running` on the
+    panel forever.
+    """
+    bands = SeqBands()
+    bands.resume_from_top(1, 2 * RUN_SEQ_BAND - 5)
+
+    assert bands.take_from_top(1) == 2 * RUN_SEQ_BAND - 5
+    # Only downward: a stale higher mark cannot rewind a walk already further down.
+    bands.resume_from_top(1, 2 * RUN_SEQ_BAND)
+    assert bands.take_from_top(1) == 2 * RUN_SEQ_BAND - 6
+
+    # And a seq belonging to the ascending walk is refused AT THE RESUME, where the
+    # caller's mistake is visible, rather than at some later heartbeat.
+    ascending = SeqBands()
+    for _ in range(4):
+        ascending.take(1)
+    with pytest.raises(SeqBandOverrun, match="belongs to the other direction"):
+        ascending.resume_from_top(1, RUN_SEQ_BAND + 2)
+
+
+def test_a_maximum_cannot_locate_a_descending_frontier() -> None:
+    """Why `last_seq` is the wrong input to `resume_from_top`, as an executable note.
+
+    A descending walk's frontier is the LOWEST seq it issued; the platform reports the
+    HIGHEST seq in the run. After three live-only events the highest is still the
+    ceiling, so `last_seq - 1` names a seq the previous invocation already used, and
+    the resumed walk re-issues it.
+    """
+    bands = SeqBands()
+    issued = [bands.take_from_top(1) for _ in range(3)]
+    platform_last_seq = max(issued)
+
+    assert platform_last_seq == bands.band_end(1)
+    # The frontier is the minimum, three below the maximum.
+    assert min(issued) == platform_last_seq - 2
+    # So resuming at last_seq - 1 lands on an already-issued seq.
+    assert platform_last_seq - 1 in issued
+
+
 def test_terminal_status_is_a_membership_test_not_an_inversion() -> None:
     """An unrecognized status must not read as terminal.
 

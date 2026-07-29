@@ -209,7 +209,7 @@ def _stage_total(stages: list[JsonObject], field: str) -> float:
     return _total([_as_float(record.get(field, 0.0), field=f"stage.{field}") for record in stages])
 
 
-def conforms_to_ledger_schema(line: JsonObject) -> bool:
+def _conforms_to_ledger_schema(line: JsonObject) -> bool:
     """Whether a parsed line is one the grid runner would have counted.
 
     Both sides validate against the SAME model (`wmo.runs.ledger.LedgerLine`), which is
@@ -232,7 +232,7 @@ def _countable_ledger_lines(path: Path) -> list[JsonObject]:
     """
     countable: list[JsonObject] = []
     for index, line in enumerate(_jsonl(path), start=1):
-        if not conforms_to_ledger_schema(line):
+        if not _conforms_to_ledger_schema(line):
             logger.warning(
                 "%s line %d does not conform to the ledger schema; skipping it, as the "
                 "runner does, so both paths derive the same positions",
@@ -242,6 +242,28 @@ def _countable_ledger_lines(path: Path) -> list[JsonObject]:
             continue
         countable.append(line)
     return countable
+
+
+def _rescued_scored(arm_lines: list[JsonObject]) -> int:
+    """Cells a `retry` line rescued after their chunk's latest counted line.
+
+    A retry scores a cell the chunk line already counted as run-but-unscored, so
+    it lifts `scored` alone. Rescues before a chunk index's latest counted line
+    are dropped: that line already restates the chunk's own totals.
+    """
+    rescued: dict[int, int] = {}
+    for line in arm_lines:
+        raw_chunk = line.get("chunk")
+        if raw_chunk is None:
+            continue
+        chunk = _as_int(raw_chunk, field="ledger.chunk")
+        if line.get("event") in _COUNTED_LEDGER_EVENTS:
+            rescued[chunk] = 0
+        elif line.get("event") == "retry":
+            rescued[chunk] = rescued.get(chunk, 0) + _as_int(
+                line.get("scored", 0), field="ledger.scored"
+            )
+    return sum(rescued.values())
 
 
 def _latest_chunk_lines(arm_lines: list[JsonObject]) -> list[JsonObject]:
@@ -498,7 +520,14 @@ def grid_arm_events(
                 # A live arm does not know its denominator; the platform's progress
                 # column is nullable for exactly this.
                 "total": None,
-                "scored": sum(_as_int(line["scored"], field="ledger.scored") for line in counted),
+                # Rescues ride alongside: a `retry` line scores a cell the chunk
+                # line already counted in `cells`, so it raises `scored` without
+                # raising `done`, and only until a later chunk line for that index
+                # restates both. The live snapshot applies the same rule.
+                "scored": (
+                    sum(_as_int(line["scored"], field="ledger.scored") for line in counted)
+                    + _rescued_scored(arm_lines)
+                ),
             },
             "spend": {
                 "candidate_usd": _ledger_total(arm_lines, "candidate_usd"),

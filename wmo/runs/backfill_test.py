@@ -17,7 +17,6 @@ from wmo.core.types import JsonObject
 from wmo.runs.backfill import (
     ArtifactError,
     _total,
-    conforms_to_ledger_schema,
     grid_arm_events,
     optimize_events,
 )

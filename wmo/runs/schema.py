@@ -342,8 +342,27 @@ class SeqBands:
 
         Args:
             band: Writer's band.
-            next_seq: The first seq to hand out (typically the run's high-water minus one).
+            next_seq: The first seq to hand out. It must be the descending walk's own
+                frontier, which is a MINIMUM over the seqs that walk issued. The
+                platform's `last_seq` is a MAXIMUM over the whole run and cannot
+                supply it: see the failure modes below.
+
+        Raises:
+            SeqBandOverrun: If `next_seq` falls at or below the band's ascending
+                frontier, which would point the descending walk into the ascending
+                walk's territory. Refused here rather than at the next
+                `take_from_top`, because the mistake is in what the caller passed and
+                the stack at the failing heartbeat would not show it.
         """
+        floor = self._next.get(band, self.band_start(band))
+        if next_seq < floor:
+            msg = (
+                f"cannot resume band {band}'s descending walk at {next_seq}: its ascending walk "
+                f"has reached {floor}, so that seq belongs to the other direction. A descending "
+                f"frontier is the MINIMUM of the seqs that walk issued; the platform's `last_seq` "
+                f"is a maximum over the whole run and cannot supply it"
+            )
+            raise SeqBandOverrun(msg)
         current = self._next_from_top.get(band, self.band_end(band))
         self._next_from_top[band] = min(current, next_seq)
 

@@ -353,12 +353,22 @@ def arm_snapshot(state: GridState, arm: str, *, total: int | None) -> GridSnapsh
     # `chunk-skipped` line for the same chunk, and summing both would report done > the arm's
     # real cell count. Spend still sums every line: every attempt's dollars were really spent.
     latest_per_chunk: dict[int, LedgerLine] = {}
+    rescued: dict[int, int] = {}
     for line in lines:
         if line.event in ("chunk", "chunk-skipped") and line.chunk is not None:
             latest_per_chunk[line.chunk] = line
+            # A later attempt's own count supersedes the rescues that preceded it.
+            rescued[line.chunk] = 0
+        elif line.event == "retry" and line.chunk is not None:
+            # A retry rescues a cell the chunk line already counted in `cells` but
+            # recorded as unscored. It raises `scored` without raising `done`, and
+            # only until a later chunk line for that index restates both. Without
+            # this an arm that finishes on a rescue under-reports scored forever,
+            # because no later line ever arrives to correct it.
+            rescued[line.chunk] = rescued.get(line.chunk, 0) + line.scored
     return GridSnapshot(
         done=sum(line.cells for line in latest_per_chunk.values()),
-        scored=sum(line.scored for line in latest_per_chunk.values()),
+        scored=sum(line.scored for line in latest_per_chunk.values()) + sum(rescued.values()),
         total=total,
         candidate_usd=sum(line.candidate_usd for line in lines),
         compressor_usd=sum(line.compressor_usd for line in lines),
@@ -490,11 +500,7 @@ class GridState:
         # collides with this arm's own line at the same position.
         # `enabled` first: `arm_line_position` re-reads the whole ledger, which is pure waste when
         # telemetry is off (--no-emit, or no credential).
-        if (
-            self.emitter is not None
-            and self.emitter.enabled
-            and stamped.arm == self.emitter.arm
-        ):
+        if self.emitter is not None and self.emitter.enabled and stamped.arm == self.emitter.arm:
             position = self.arm_line_position(stamped)
             if position is not None:
                 self.emitter.on_ledger_line(

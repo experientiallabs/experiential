@@ -108,6 +108,25 @@ REJECT_FORCE_FROM_STAGE = (
 )
 
 
+def _status_value(status: RunStatus | str) -> str:
+    """A status as JSON carries it, without ever raising over an unrecognized one.
+
+    `RunStatus(status)` would be the tidy normalization, and it raises on a value outside the enum,
+    which is exactly what these hooks may not do: a caller (or a future status this build has not
+    heard of) must not be able to end a paid run through the telemetry path. An unknown status is
+    passed through as text and the platform decides what to make of it.
+    """
+    if isinstance(status, RunStatus):
+        return status.value
+    try:
+        return RunStatus(status).value
+    except ValueError:
+        log.warning(
+            "run telemetry: %r is not a status this build knows; sending it as text", status
+        )
+        return str(status)
+
+
 def _undeclared(refused: PushRejected) -> bool:
     """Whether a refusal means "this run was never declared" rather than "this payload is wrong".
 
@@ -637,7 +656,7 @@ class GridEmitter(_Reporter):
             RunEventType.RUN_META,
             created,
             {
-                "kind": RunKind.GRID_ARM,
+                "kind": RunKind.GRID_ARM.value,
                 "benchmark": world_model,
                 "arm": self.arm,
                 "world_model": world_model,
@@ -715,7 +734,7 @@ class GridEmitter(_Reporter):
         """The run's terminal transition. Sends buffered cells first, so none are lost."""
         self.send_cells()
         finished_at = now_iso()
-        payload: JsonObject = {"status": status, "finished_at": finished_at}
+        payload: JsonObject = {"status": _status_value(status), "finished_at": finished_at}
         if error is not None:
             payload["error"] = error
         self._emit_from_top(self._band, RunEventType.RUN_STATUS, finished_at, payload)
@@ -827,7 +846,7 @@ class PipelineEmitter(_Reporter):
             RunEventType.RUN_META,
             started_at,
             {
-                "kind": RunKind.PIPELINE,
+                "kind": RunKind.PIPELINE.value,
                 "benchmark": world_model,
                 "world_model": world_model,
                 "config": config,
@@ -835,7 +854,7 @@ class PipelineEmitter(_Reporter):
             },
         )
         self._emit(
-            RUN_LEVEL_BAND, RunEventType.RUN_STATUS, started_at, {"status": RunStatus.RUNNING}
+            RUN_LEVEL_BAND, RunEventType.RUN_STATUS, started_at, {"status": RunStatus.RUNNING.value}
         )
         self._flush()
 
@@ -917,7 +936,7 @@ class PipelineEmitter(_Reporter):
     def finished(self, status: RunStatus, *, error: str | None = None) -> None:
         """The run's terminal transition: completed, failed, or stopped by the spend cap."""
         finished_at = now_iso()
-        payload: JsonObject = {"status": status, "finished_at": finished_at}
+        payload: JsonObject = {"status": _status_value(status), "finished_at": finished_at}
         if error is not None:
             payload["error"] = error
         self._emit(RUN_LEVEL_BAND, RunEventType.RUN_STATUS, finished_at, payload)
