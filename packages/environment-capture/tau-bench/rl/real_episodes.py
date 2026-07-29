@@ -321,12 +321,76 @@ def _task_index(capture_dir: Path, domain: str) -> dict[str, JsonObject]:
     return index
 
 
+def _task_id_index(capture_dir: Path, domain: str) -> dict[str, JsonObject]:
+    """Tau task id -> task, for an experiment whose task manifest is frozen before execution."""
+    path = domains_dir(capture_dir) / domain / "tasks.json"
+    if not path.is_file():
+        raise SystemExit(
+            f"no tau2 task file at {path}. Clone tau2-bench into the capture dir first "
+            "(see packages/environment-capture/tau-bench/README.md § Setup), or pass "
+            "--capture-dir pointing at an existing clone."
+        )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, list):
+        raise SystemExit(f"tau2 task file {path} is not a list")
+    return {
+        str(task["id"]): task
+        for task in value
+        if isinstance(task, dict) and isinstance(task.get("id"), (str, int))
+    }
+
+
 def _has_nl_assertion(task: JsonObject) -> bool:
     criteria = task.get("evaluation_criteria")
     if not isinstance(criteria, dict):
         return False
     basis = criteria.get("reward_basis")
     return isinstance(basis, list) and "NL_ASSERTION" in basis
+
+
+def load_manifest_scenarios(capture_dir: Path, manifest_path: Path) -> list[RealScenario]:
+    """Resolve the exact preregistered task ids, without substituting a corpus-derived split."""
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_tasks = value.get("tasks") if isinstance(value, dict) else None
+    if not isinstance(raw_tasks, list):
+        raise SystemExit(f"task manifest {manifest_path} has no tasks list")
+    indexes: dict[str, dict[str, JsonObject]] = {}
+    resolved: list[RealScenario] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_tasks:
+        task_id = raw.get("task_id") if isinstance(raw, dict) else None
+        if not isinstance(task_id, str) or "/" not in task_id:
+            raise SystemExit(f"task manifest {manifest_path} has invalid task id {task_id!r}")
+        if task_id in seen:
+            raise SystemExit(f"task manifest {manifest_path} repeats task id {task_id}")
+        seen.add(task_id)
+        domain, local_id = task_id.split("/", 1)
+        if domain not in indexes:
+            indexes[domain] = _task_id_index(capture_dir, domain)
+        task = indexes[domain].get(local_id)
+        if task is None:
+            missing.append(task_id)
+            continue
+        scenario = task.get("user_scenario")
+        instructions = scenario.get("instructions") if isinstance(scenario, dict) else None
+        if not isinstance(instructions, dict):
+            raise SystemExit(f"tau2 task {task_id} has no user_scenario.instructions object")
+        resolved.append(
+            RealScenario(
+                scenario_id=f"{domain}:{local_id}",
+                domain=domain,
+                task_id=local_id,
+                task=_instructions_key(instructions),
+                provenance=[f"manifest:{task_id}"],
+                nl_assertion_reward=_has_nl_assertion(task),
+            )
+        )
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} task manifest ids are absent from the pinned tau2 data: {missing[:5]}"
+        )
+    return sorted(resolved, key=lambda scenario: scenario.scenario_id)
 
 
 def load_pinned_scenarios(
@@ -904,6 +968,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--capture-dir", type=Path, default=DEFAULT_CAPTURE_DIR)
     parser.add_argument("--pool", type=Path, default=DEFAULT_POOL_PATH)
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
+    parser.add_argument(
+        "--task-manifest",
+        type=Path,
+        help="run the exact '<domain>/<task_id>' rows frozen in this manifest",
+    )
     parser.add_argument("--episodes", type=int, default=1, help="episode indices 0..N-1")
     parser.add_argument("--only", nargs="*", default=None, help="restrict to these pool names")
     parser.add_argument(
@@ -1039,7 +1108,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.error("--only names models that are not in the pool: %s", unknown_models)
         return 2
 
-    scenarios = load_pinned_scenarios(args.capture_dir)
+    scenarios = (
+        load_manifest_scenarios(args.capture_dir, args.task_manifest)
+        if args.task_manifest is not None
+        else load_pinned_scenarios(args.capture_dir)
+    )
     if args.scenario:
         wanted = set(args.scenario)
         unknown = sorted(wanted - {s.scenario_id for s in scenarios})

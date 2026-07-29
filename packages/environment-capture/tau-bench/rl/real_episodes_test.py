@@ -29,6 +29,7 @@ from real_episodes import (
     domains_dir,
     latest_per_cell,
     litellm_route,
+    load_manifest_scenarios,
     load_pinned_scenarios,
     load_rows,
     main,
@@ -117,6 +118,52 @@ def test_every_committed_pinned_scenario_resolves(tmp_path: Path) -> None:
     assert len(scenarios) == len(pinned)
     assert all(s.scenario_id == f"{s.domain}:{s.task_id}" for s in scenarios)
     assert {s.domain for s in scenarios} == {row["domain"] for row in pinned}
+
+
+def test_frozen_task_manifest_resolves_exact_ids(tmp_path: Path) -> None:
+    airline: dict[str, object] = {"domain": "airline", "reason_for_call": "cancel"}
+    telecom: dict[str, object] = {"domain": "telecom", "reason_for_call": "repair"}
+    _write_tasks(tmp_path, "airline", [_task("0", airline, ["DB"])])
+    _write_tasks(
+        tmp_path,
+        "telecom",
+        [_task("[service_issue]exact[PERSONA:Easy]", telecom, ["DB", "NL_ASSERTION"])],
+    )
+    manifest = tmp_path / "tasks.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "tasks": [
+                    {"task_id": "airline/0"},
+                    {"task_id": "telecom/[service_issue]exact[PERSONA:Easy]"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scenarios = load_manifest_scenarios(tmp_path, manifest)
+
+    assert [scenario.scenario_id for scenario in scenarios] == [
+        "airline:0",
+        "telecom:[service_issue]exact[PERSONA:Easy]",
+    ]
+    assert scenarios[1].nl_assertion_reward is True
+    assert scenarios[1].provenance == [
+        "manifest:telecom/[service_issue]exact[PERSONA:Easy]"
+    ]
+
+
+def test_frozen_task_manifest_refuses_missing_id(tmp_path: Path) -> None:
+    _write_tasks(tmp_path, "airline", [_task("0", {"domain": "airline"}, ["DB"])])
+    manifest = tmp_path / "tasks.json"
+    manifest.write_text(
+        json.dumps({"tasks": [{"task_id": "airline/999"}]}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="absent from the pinned tau2 data"):
+        load_manifest_scenarios(tmp_path, manifest)
 
 
 def test_scenario_ids_disambiguate_colliding_task_ids(tmp_path: Path) -> None:
