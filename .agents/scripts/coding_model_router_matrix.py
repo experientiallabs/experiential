@@ -346,6 +346,7 @@ def _outcome(
 ) -> ScenarioOutcome:
     trace = _read_object(_trace_path(artifact_dir))
     usage = usage_from_trace(trace)
+    provider_execution_started = _provider_execution_started(trace)
     steps = trace.get("steps")
     instruction = trace.get("instruction")
     stop = trace.get("stop_reason")
@@ -353,10 +354,12 @@ def _outcome(
     failure_class = _failure_class(
         cell,
         stop_reason,
-        provider_execution_started=_provider_execution_started(trace),
+        provider_execution_started=provider_execution_started,
     )
     metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
-    usage_estimated = bool(metering_error) and failure_class != "infrastructure"
+    usage_estimated = bool(metering_error) and (
+        failure_class != "infrastructure" or provider_execution_started
+    )
     if usage_estimated:
         usage = estimate_usage_from_trace(trace)
     ungradeable = failure_class == "infrastructure"
@@ -423,6 +426,7 @@ class RunState:
         if self.matrix.pool != pool.models:
             raise ValueError("the existing full matrix carries a different frozen pool")
         self.ledger = self._read_ledger()
+        self._normalize_post_execution_usage()
         self._normalize_post_execution_failures()
 
     def _read_ledger(self) -> list[dict[str, object]]:
@@ -441,6 +445,56 @@ class RunState:
             self.ledger_path,
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in self.ledger),
         )
+
+    def _normalize_post_execution_usage(self) -> None:
+        """Estimate legacy post-provider rows whose exact request counters are missing."""
+        entries = {entry.name: entry for entry in self.pool.models}
+        changed = 0
+        for outcome in self.matrix.outcomes:
+            if outcome.usage_accounting == "estimated":
+                continue
+            artifact_dir = Path(outcome.artifact_dir)
+            try:
+                trace_path = _trace_path(artifact_dir)
+            except ValueError:
+                continue
+            trace = _read_object(trace_path)
+            if not _provider_execution_started(trace):
+                continue
+            exact_usage = usage_from_trace(trace)
+            if not usage_metering_error(exact_usage):
+                continue
+            estimated_usage = estimate_usage_from_trace(trace)
+            if estimated_usage.calls < 1:
+                continue
+            entry = entries.get(outcome.model)
+            if entry is None:
+                raise ValueError(f"matrix outcome uses unknown frozen arm {outcome.model!r}")
+            outcome.usage = estimated_usage.total
+            outcome.cost_usd = exact_cost_usd(entry, estimated_usage)
+            outcome.call_seconds = estimated_usage.call_seconds
+            outcome.call_input_tokens = estimated_usage.call_input_tokens
+            outcome.call_output_tokens = estimated_usage.call_output_tokens
+            outcome.call_cached_input_tokens = estimated_usage.call_cached_input_tokens
+            outcome.call_cache_write_input_tokens = estimated_usage.call_cache_write_input_tokens
+            outcome.usage_accounting = "estimated"
+            outcome.usage_estimate_method = ESTIMATE_METHOD
+            for ledger_row in self.ledger:
+                if (
+                    ledger_row.get("scenario_id") == outcome.scenario_id
+                    and ledger_row.get("model") == outcome.model
+                    and ledger_row.get("attempt_number") == outcome.attempt_number
+                ):
+                    ledger_row["usage"] = estimated_usage.total.model_dump(mode="json")
+                    ledger_row["model_call_seconds"] = estimated_usage.call_seconds
+                    ledger_row["model_cost_usd"] = outcome.cost_usd
+                    ledger_row["model_cost_accounting_status"] = "estimated_from_trace"
+                    ledger_row["usage_estimate_method"] = ESTIMATE_METHOD
+            changed += 1
+        if changed:
+            self.matrix.save(self.matrix_path)
+            self._write_ledger()
+            logger.warning("estimated missing usage for %d post-provider rows", changed)
 
     def _normalize_post_execution_failures(self) -> None:
         """Repair rows whose official reward was hidden by a post-execution failure."""

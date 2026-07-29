@@ -67,6 +67,7 @@ _ENTRY_TS = os.path.join(_PI_ENTRY_DIR, "entry.ts")
 _TERMINATION_TS = os.path.join(_PI_ENTRY_DIR, "runner_termination.ts")
 # Cleanup headroom past the node wall budget: one SSH round trip plus process teardown.
 _NODE_TEARDOWN_GRACE_S = 60.0
+_NODE_HARD_KILL_AFTER_S = 10
 # A newly provisioned control host often has no known_hosts entry for the operator-configured
 # runner. `accept-new` permits that first connection but still rejects a changed key, unlike
 # `StrictHostKeyChecking=no`. Keep the same policy on materialization and the tunneled node run.
@@ -509,7 +510,8 @@ class PiRuntime:
         node_timeout_s = math.ceil(self._episode_timeout_s)
         remote_cmd = (
             f"cd {self._workdir} && PI_SHIM_URL={url} "
-            f"timeout {node_timeout_s} node --experimental-strip-types entry.ts"
+            f"timeout --kill-after={_NODE_HARD_KILL_AFTER_S} {node_timeout_s} "
+            "node --experimental-strip-types entry.ts"
         )
         proc = subprocess.run(
             [

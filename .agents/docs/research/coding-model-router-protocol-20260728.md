@@ -1,7 +1,7 @@
 # Execution-scored coding-model router protocol
 
 Status: protocol frozen; the original smoke is archived as invalid, the authorized replacement
-passed, and the fast development tranche is in progress.
+passed, and the 48-cell fast development tranche is complete pending diagnostic analysis.
 
 Experiment ID: `coding-router-20260728`
 
@@ -194,6 +194,19 @@ The classifier now treats every post-execution failure with an official reward a
 keeping pre-execution failures retryable. Attempt 1 is the canonical zero; attempt 2 is excluded
 from scientific results as a protocol retry.
 
+The fast tranche completed all 48 gradeable cells on 2026-07-29. Official pass counts were 6 of 12
+for `oai-sol-high`, 5 of 12 for `ant-opus5-high`, 3 of 12 for `oai-luna-high`, and 1 of 12 for
+`ant-haiku45`. Every canonical matrix reward matched both Harbor's raw `result.json` reward and
+`verifier/reward.txt`, with exactly one completed canonical ledger event per task and arm.
+
+One Opus `compile-compcert` infrastructure attempt exposed a remote teardown defect: GNU
+`timeout` sent TERM at the 900-second boundary, but the Node worker remained alive until the outer
+SSH subprocess raised after its 60-second grace, so Harbor could not run the verifier. The remote
+command now uses `timeout --kill-after=10`, inside the existing 60-second outer teardown grace.
+Post-provider infrastructure attempts with missing counters now retain a labeled trace estimate
+instead of incorrect exact zero usage. The migration repaired four historic rows, including the
+ungradeable Opus attempt at an estimated USD 0.650145.
+
 ## Single smoke gate
 
 The only paid pre-sweep gate has exactly four cells:
@@ -376,10 +389,11 @@ positive incumbent cache credit in the routed-model evidence.
 ## Spend and durability
 
 The USD 20,000 ceiling is recorded in the freeze summary. The user monitors provider usage
-externally; the local ledger remains a rough guard using exact counters when available, labeled
-trace estimates otherwise, and the USD 300 conservative debit for the archived unknown-cost calls.
-The original and one authorized replacement four-cell smoke are the only paid work permitted
-before a valid smoke gate.
+externally; the local ledger remains a rough guard using exact counters when available and labeled
+trace estimates otherwise. It carries USD 1,300 in conservative unknown-cost debits: USD 300 for
+the archived invalid smoke, USD 500 for the interrupted Sol cell, and USD 500 for the interrupted
+Luna protocol retry. The original and one authorized replacement four-cell smoke are the only
+paid work permitted before a valid smoke gate.
 
 Raw artifacts live under `.wmo/experiments/coding-router-20260728/` and stay out of Git. The
 protocol and one-off runners live under `.agents/`. Long jobs use tmux with persistent logs. A

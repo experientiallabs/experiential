@@ -22,6 +22,7 @@ from coding_model_router_matrix import (
     _failure_class,
     _fast_dev_task_ids,
     _job_template,
+    _outcome,
     _stage_cell_specs,
 )
 
@@ -124,9 +125,7 @@ def test_post_execution_error_with_official_reward_is_gradeable() -> None:
         note="completed with AgentTimeoutError",
     )
 
-    assert (
-        _failure_class(cell, "error", provider_execution_started=True) == "agent_failure"
-    )
+    assert _failure_class(cell, "error", provider_execution_started=True) == "agent_failure"
 
 
 def test_pre_execution_error_remains_infrastructure() -> None:
@@ -138,9 +137,50 @@ def test_pre_execution_error_remains_infrastructure() -> None:
         note="failed before provider execution",
     )
 
-    assert (
-        _failure_class(cell, "error", provider_execution_started=False) == "infrastructure"
+    assert _failure_class(cell, "error", provider_execution_started=False) == "infrastructure"
+
+
+def test_post_execution_infrastructure_failure_estimates_missing_usage(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "trial"
+    _write_json(
+        artifact / "agent" / "wmo-run.json",
+        {
+            "instruction": "repair the repository",
+            "stop_reason": "agent-exception:TimeoutExpired",
+            "turns": 1,
+            "steps": [
+                {
+                    "action": {"kind": "tool_call", "name": "bash"},
+                    "observation": {"content": "partial result"},
+                }
+            ],
+        },
     )
+    cell = ScoreCell(
+        task_id="task",
+        attempt=1,
+        reward=0.0,
+        passed=False,
+        note="verifier produced no reward",
+        infra_failed=True,
+    )
+
+    outcome = _outcome(
+        cell,
+        benchmark=FAST_DEV_BENCHMARK,
+        entry=_pool().models[0],
+        attempt=1,
+        artifact_dir=artifact,
+    )
+
+    assert outcome.reward is None
+    assert outcome.failure_class == "infrastructure"
+    assert outcome.usage_accounting == "estimated"
+    assert outcome.usage_estimate_method == "trace-char-prefix-4k-overhead-v1"
+    assert outcome.usage.input_tokens > 0
+    assert outcome.cost_usd > 0
 
 
 def test_conservative_unknown_cost_debit_counts_against_ceiling(tmp_path: Path) -> None:
@@ -258,12 +298,18 @@ def test_existing_post_execution_failures_keep_one_gradeable_row(
         "protocol_retry_excluded",
         "protocol_retry_excluded",
     ]
+    assert all(row.usage_accounting == "estimated" for row in repaired)
+    assert all(row.usage.input_tokens > 0 for row in repaired)
+    assert all(row.cost_usd > 0 for row in repaired)
     assert state.completed("terminal-bench-2", "task", FAST_DEV_ARMS[0]) is True
     assert [row["completion_status"] for row in state.ledger] == [
         "scored_agent_failure",
         "excluded_protocol_retry",
         "excluded_protocol_retry",
     ]
+    assert all(
+        row["model_cost_accounting_status"] == "estimated_from_trace" for row in state.ledger
+    )
 
 
 def test_develop_fits_diagnostic_policy_without_outer_heldout(tmp_path: Path) -> None:

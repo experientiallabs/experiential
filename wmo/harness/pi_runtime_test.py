@@ -392,6 +392,10 @@ def test_the_node_wall_budget_comes_from_the_configured_episode_timeout(
     def fake_run(command: list[str], **kwargs: object) -> _Completed:
         commands.append(command)
         assert kwargs["timeout"] == pytest.approx(1800.0 + 60.0)
+        assert (
+            pi_runtime_module._NODE_HARD_KILL_AFTER_S  # noqa: SLF001 - timeout contract
+            < pi_runtime_module._NODE_TEARDOWN_GRACE_S  # noqa: SLF001 - timeout contract
+        )
         return _Completed()
 
     runtime = PiRuntime(
@@ -407,7 +411,9 @@ def test_the_node_wall_budget_comes_from_the_configured_episode_timeout(
 
     assert code == 0
     assert "StrictHostKeyChecking=accept-new" in commands[0]
-    assert "timeout 1800 node --experimental-strip-types entry.ts" in commands[0][-1]
+    assert (
+        "timeout --kill-after=10 1800 node --experimental-strip-types entry.ts" in commands[0][-1]
+    )
 
 
 @pytest.mark.parametrize(
@@ -445,7 +451,10 @@ def test_a_fractional_node_wall_budget_rounds_up_instead_of_truncating(
 
     runtime._run_node()  # noqa: SLF001 - the remote command is the contract
 
-    assert f"timeout {expected} node --experimental-strip-types entry.ts" in commands[0][-1]
+    assert (
+        f"timeout --kill-after=10 {expected} node --experimental-strip-types entry.ts"
+        in commands[0][-1]
+    )
 
 
 def test_the_shared_termination_policy_is_materialized_next_to_entry_ts() -> None:
