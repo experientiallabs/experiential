@@ -204,6 +204,45 @@ def test_a_missing_pool_file_is_a_sweep_error_not_a_traceback(tmp_path: Path) ->
         preflight_pool(tmp_path / "nope.toml")
 
 
+def test_preflight_skips_disabled_entries_and_refuses_an_all_disabled_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `enabled = false` is the roster's per-model toggle: a turned-off entry is neither
+    # prepared (its backend may legitimately be unusable right now) nor swept.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    pool_file = tmp_path / "pool.toml"
+    pool_file.write_text(
+        """
+[[model]]
+name = "on"
+kind = "openai"
+model = "gpt-5.4"
+
+[[model]]
+name = "off"
+kind = "openai"
+model = "gpt-5.4"
+api_key_env = "TEST_VAR_NOBODY_SETS"
+enabled = false
+""",
+        encoding="utf-8",
+    )
+    # The disabled entry names an unset api_key_env, which would fail preflight loudly if it
+    # were still a candidate; skipping it is the point of the toggle. (Schema validation still
+    # covers it: the toggle removes an entry from selection, not from load.)
+    preflight = preflight_pool(pool_file)
+    assert [entry.name for entry in preflight.pool.models] == ["on"]
+
+    pool_file.write_text(
+        pool_file.read_text(encoding="utf-8").replace(
+            'model = "gpt-5.4"', 'model = "gpt-5.4"\nenabled = false'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SweepError, match="disabled"):
+        preflight_pool(pool_file)
+
+
 def _matrix(cells: dict[tuple[str, str], list[float | None]]) -> OutcomeMatrix:
     """A matrix from {(model, scenario): [reward per episode]}; None is an unscored episode."""
     names = sorted({model for model, _ in cells})

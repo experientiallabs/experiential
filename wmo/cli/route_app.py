@@ -1192,8 +1192,14 @@ def pin(
         raise typer.BadParameter(str(exc)) from exc
     except ValueError as exc:
         raise typer.BadParameter(f"cannot read the pool at {pool_path}: {exc}") from exc
-    if all(entry.name != model for entry in roster.models):
-        available = ", ".join(entry.name for entry in roster.models)
+    active = roster.enabled_models()
+    if all(entry.name != model for entry in active):
+        if any(entry.name == model for entry in roster.models):
+            raise typer.BadParameter(
+                f"pool model '{model}' is disabled (enabled = false) in {pool_path}; flip it "
+                "back on to pin it"
+            )
+        available = ", ".join(entry.name for entry in active)
         raise typer.BadParameter(
             f"no pool model named '{model}' in {pool_path}; available: {available}"
         )
@@ -1204,7 +1210,10 @@ def pin(
     policy = RoutingPolicy(
         kind="static",
         default_model=model,
-        pool=roster.models,
+        # Only the enabled roster travels: the policy's pool is what serving may construct
+        # providers for, and a turned-off candidate must not become reachable through an
+        # endpoint pinned after the operator turned it off.
+        pool=active,
         fitted_from=f"pinned to {model} from {pool_path} (no outcome matrix)",
     )
     policy.save(out_path)

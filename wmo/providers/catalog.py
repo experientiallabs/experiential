@@ -19,6 +19,12 @@ the hardcoded model-name knowledge this module exists to avoid, and neither it n
 publishes prices, so every enumerated row would still stop at a manual price prompt. The built-in
 registry is better data for those kinds, and a typed id covers everything either list would add.
 
+A SELF-HOSTED OpenAI-compatible server is the exception to that reasoning, which is why
+`endpoint_catalog` exists beside `list_provider_models`: its `GET {endpoint}/models` lists
+exactly what that one server serves (Ollama lists the pulled models, vLLM the model it was
+launched with), there is no embeddings/speech noise to filter, and no price is expected because
+a self-hosted candidate's price is whatever the operator declares (default 0).
+
 A catalog is a set of SUGGESTIONS, never a whitelist: every kind accepts a typed id, because a
 vendor's lineup moves faster than any release of this package.
 """
@@ -27,7 +33,8 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+import httpx
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from wmo.providers.base import ProviderKind
 from wmo.providers.models import model_types_for_provider, resolve_provider_model
@@ -176,4 +183,57 @@ def _built_in_catalog(kind: ProviderKind) -> ProviderCatalog:
             f"{len(models)} models from WMO's built-in registry; "
             f"{kind.value} publishes no priced catalog, so type any id it serves"
         ),
+    )
+
+
+ENDPOINT_CATALOG_TIMEOUT_S = 5.0
+"""Bound on the one `GET {endpoint}/models` probe: a wrong URL must fail as a prompt answer,
+not hang the registration flow."""
+
+
+class _EndpointModelRow(BaseModel):
+    """One row of an OpenAI-compatible `GET /models` response; extras ignored on purpose."""
+
+    id: str = Field(min_length=1)
+
+
+class _EndpointModelList(BaseModel):
+    """The `{"object": "list", "data": [...]}` body every compatible server answers with."""
+
+    data: list[_EndpointModelRow]
+
+
+def endpoint_catalog(endpoint: str) -> ProviderCatalog:
+    """What one OpenAI-compatible server serves, from its own `GET {endpoint}/models`.
+
+    The self-hosted counterpart of `list_provider_models`, keyed on the URL instead of the kind
+    (the entries it feeds are plain `ProviderKind.OPENAI` rows with `endpoint` set). Rows carry
+    no price: a self-hosted candidate is priced by the operator, default 0. Like every other
+    catalog it never raises and is only ever a set of suggestions; an unreachable or
+    non-conforming server comes back as an empty catalog whose `detail` says what happened, and
+    the caller falls back to a typed id.
+
+    Args:
+        endpoint: The server's base URL as a pool entry would carry it (".../v1").
+
+    Returns:
+        The catalog, with `detail` naming the URL it asked.
+    """
+    url = f"{endpoint.rstrip('/')}/models"
+    try:
+        response = httpx.get(url, timeout=ENDPOINT_CATALOG_TIMEOUT_S)
+        response.raise_for_status()
+        listing = _EndpointModelList.model_validate(response.json())
+    except (httpx.HTTPError, ValidationError, ValueError) as exc:
+        return ProviderCatalog(
+            kind=ProviderKind.OPENAI,
+            source=CatalogSource.NONE,
+            detail=f"could not list models from {url} ({exc}); type the model id the server serves",
+        )
+    models = [CatalogModel(id=row.id) for row in listing.data]
+    return ProviderCatalog(
+        kind=ProviderKind.OPENAI,
+        source=CatalogSource.PUBLISHED,
+        models=models,
+        detail=f"{len(models)} models served at {url}",
     )

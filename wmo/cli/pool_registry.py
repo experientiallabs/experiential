@@ -41,11 +41,18 @@ from wmo.cli.ui import PromptReader, creds_note, ensure_credentials, has_credent
 from wmo.config import PROVIDER_ENV_VARS
 from wmo.core.locks import FileLockTimeout
 from wmo.providers.base import ProviderKind, VerifyResult
-from wmo.providers.catalog import CatalogModel, CatalogSource, ProviderCatalog, list_provider_models
+from wmo.providers.catalog import (
+    CatalogModel,
+    CatalogSource,
+    ProviderCatalog,
+    endpoint_catalog,
+    list_provider_models,
+)
 from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
 from wmo.providers.pool import (
     PoolEntry,
     Tier,
+    is_local_endpoint,
     load_pool,
     pool_provider,
     static_requirements,
@@ -128,12 +135,20 @@ def print_pool(console: Console, path: Path, entries: list[PoolEntry]) -> None:
     table.add_column("tier")
     for entry in entries:
         price = entry.price()
+        # "(local)" is derived from the endpoint URL, never stored: the wire kind stays plain
+        # openai, and copy is the only place the distinction exists.
+        kind = entry.kind.value
+        if is_local_endpoint(entry.endpoint):
+            kind = f"{kind} (local)"
+        elif entry.endpoint:
+            kind = f"{kind} (custom endpoint)"
         table.add_row(
             entry.name,
-            entry.kind.value,
+            kind,
             entry.deployment or entry.model,
             f"{price.input_per_mtok:g} / {price.output_per_mtok:g}",
-            entry.tier,
+            entry.tier if entry.enabled else f"{entry.tier} (off)",
+            style=None if entry.enabled else "dim",
         )
     console.print(table)
 
@@ -211,9 +226,19 @@ def register_from_provider(
     operator-chosen deployment, so a first deployment that answers proves nothing about the
     second. `wmo providers verify` bills a call per model for the same reason.
     """
-    catalog = list_provider_models(kind)
+    if kind is ProviderKind.OPENAI:
+        # The one kind that can point at a self-hosted server (Ollama, vLLM, llama.cpp), so the
+        # endpoint question comes BEFORE the catalog: a set URL swaps the built-in registry for
+        # what that server actually serves.
+        options = _ask_endpoint(console, ask, options)
+    if kind is ProviderKind.OPENAI and options.endpoint:
+        catalog = endpoint_catalog(options.endpoint)
+    else:
+        catalog = list_provider_models(kind)
     _describe_catalog(console, catalog)
-    chosen = choose_models(console, ask, catalog, read_pool_entries(pool_path))
+    chosen = choose_models(
+        console, ask, catalog, read_pool_entries(pool_path), endpoint=options.endpoint
+    )
     if not chosen:
         console.print("[dim]nothing selected[/dim]")
         return 0
@@ -225,6 +250,28 @@ def register_from_provider(
         ):
             written += 1
     return written
+
+
+def _ask_endpoint(console: Console, ask: PromptReader, options: EntryOptions) -> EntryOptions:
+    """Ask which server the OpenAI pass talks to: blank is OpenAI's own API.
+
+    Answered once per pass, because every model registered against a server shares its URL. The
+    stored value is exactly what was typed (a platform serving inside a container translates
+    known-local hostnames at ITS boundary; the pool file never carries the translated form).
+    """
+    raw = _read(
+        ask,
+        "[bold]OpenAI-compatible endpoint URL[/bold] "
+        "[dim](blank = OpenAI's own API; e.g. http://localhost:11434/v1 for Ollama)[/dim]"
+        + (f" [dim]\\[{escape(options.endpoint)}][/dim]" if options.endpoint else "")
+        + ": ",
+    )
+    endpoint = raw or options.endpoint
+    if not endpoint:
+        return options.model_copy(update={"endpoint": None})
+    if is_local_endpoint(endpoint):
+        console.print(f"  [dim]{escape(endpoint)} reads as a locally hosted server[/dim]")
+    return options.model_copy(update={"endpoint": endpoint})
 
 
 def _verify_candidate(
@@ -306,7 +353,18 @@ def register_model_ids(
             than writing a candidate that does not work.
     """
     _check_azure_deployment(kind, model_ids, options)
-    catalog = list_provider_models(kind)
+    if _self_hosted(kind, options) and options.input_per_mtok is None:
+        # The scripted twin of the interactive default: a self-hosted candidate is priced by
+        # the operator or it is explicitly free, never priced off a shadowed built-in id.
+        console.print(
+            f"  [dim]self-hosted endpoint {escape(options.endpoint or '')}: pricing at $0/Mtok "
+            "(override with --input-per-mtok/--output-per-mtok)[/dim]"
+        )
+        options = options.model_copy(update={"input_per_mtok": 0.0, "output_per_mtok": 0.0})
+    if _self_hosted(kind, options):
+        catalog = endpoint_catalog(options.endpoint or "")
+    else:
+        catalog = list_provider_models(kind)
     check = verify or verify_pool_entry
     existing = read_pool_entries(pool_path)
     taken = {entry.name for entry in existing}
@@ -369,6 +427,7 @@ def choose_models(
     ask: PromptReader,
     catalog: ProviderCatalog,
     existing: list[PoolEntry],
+    endpoint: str | None = None,
 ) -> list[CatalogModel]:
     """Search-and-pick over one catalog: type a term to filter, numbers to toggle, blank to finish.
 
@@ -383,15 +442,20 @@ def choose_models(
         ask: Reads one prompt line.
         catalog: The backend's offerable models.
         existing: The roster as it stands, used to annotate what is already registered.
+        endpoint: The server this pass registers against (None = the backend's own API), part
+            of candidate identity: the same model id on two servers is two candidates.
 
     Returns:
         The chosen models, in selection order.
     """
-    by_target = {_target(entry.kind, entry.model, entry.deployment): entry for entry in existing}
+    by_target = {
+        _target(entry.kind, entry.model, entry.deployment, entry.endpoint): entry
+        for entry in existing
+    }
     selected: dict[str, CatalogModel] = {}
     shown: list[CatalogModel] = catalog.models[:_MAX_LISTED]
     if catalog.models:
-        _list_matches(console, catalog, shown, len(catalog.models), by_target, selected)
+        _list_matches(console, catalog, shown, len(catalog.models), by_target, selected, endpoint)
     while True:
         raw = _read(ask, "[bold]models[/bold] [dim](search / numbers / blank when done)[/dim]> ")
         if not raw:
@@ -416,7 +480,7 @@ def choose_models(
         matches = catalog.search(raw)
         if matches:
             shown = matches[:_MAX_LISTED]
-            _list_matches(console, catalog, shown, len(matches), by_target, selected)
+            _list_matches(console, catalog, shown, len(matches), by_target, selected, endpoint)
             continue
         console.print(f"  [yellow]no {catalog.kind.value} model matches[/yellow] {escape(raw)}")
         if _ask_yes_no(console, ask, f"Register '{raw}' as a literal model id?", default=False):
@@ -587,14 +651,15 @@ def _list_matches(
     catalog: ProviderCatalog,
     shown: list[CatalogModel],
     total: int,
-    by_target: dict[tuple[str, str, str], PoolEntry],
+    by_target: dict[tuple[str, str, str, str], PoolEntry],
     selected: dict[str, CatalogModel],
+    endpoint: str | None = None,
 ) -> None:
     """Number the current matches, marking what is already registered and already picked."""
     for index, model in enumerate(shown, start=1):
-        registered = by_target.get(_target(catalog.kind, model.id, None)) or by_target.get(
-            _target(catalog.kind, model.id, model.id)
-        )
+        registered = by_target.get(
+            _target(catalog.kind, model.id, None, endpoint)
+        ) or by_target.get(_target(catalog.kind, model.id, model.id, endpoint))
         notes = []
         if registered is not None:
             notes.append(f"in pool as {registered.name}")
@@ -688,7 +753,24 @@ def _ask_per_model_options(
     # suppressing the prompts on a half-supplied price would skip the model instead of asking
     # for the number it is missing.
     priced_by_flags = options.input_per_mtok is not None and options.output_per_mtok is not None
-    if not priced_by_flags and needs_price(kind, model):
+    if not priced_by_flags and _self_hosted(kind, options):
+        # A self-hosted server ALWAYS takes an explicit price, even when the id shadows a
+        # built-in one (someone serving `gpt-4o` locally must not inherit OpenAI's hosted
+        # rate). Default 0: local inference has no marginal per-token bill, and the stamped
+        # explicit zero says the $0 downstream is declared, not an accident.
+        console.print(
+            f"  [dim]{escape(model.id)} is served by "
+            f"{escape(options.endpoint or 'a custom endpoint')}; built-in prices do not apply. "
+            "0 = free (local inference); declare an amortized rate to make cost-aware routing "
+            "weigh it[/dim]"
+        )
+        updates["input_per_mtok"] = _ask_price(
+            console, ask, "Input price, USD per 1M tokens", default=0.0
+        )
+        updates["output_per_mtok"] = _ask_price(
+            console, ask, "Output price, USD per 1M tokens", default=0.0
+        )
+    elif not priced_by_flags and needs_price(kind, model):
         console.print(
             f"  [yellow]{escape(model.id)} has no published or built-in price[/yellow]"
             "[dim]; an unpriced candidate reports $0 and a cost-aware policy routes"
@@ -699,15 +781,27 @@ def _ask_per_model_options(
     return options.model_copy(update=updates) if updates else options
 
 
+def _self_hosted(kind: ProviderKind, options: EntryOptions) -> bool:
+    """Whether this pass registers against an operator-run OpenAI-compatible server."""
+    return kind is ProviderKind.OPENAI and options.endpoint is not None
+
+
 def _default_key_env(kind: ProviderKind) -> str:
     """The variable this backend reads by default, named so the blank answer is not a mystery."""
     env_vars = PROVIDER_ENV_VARS.get(kind, [])
     return env_vars[0] if env_vars else "the backend default"
 
 
-def _target(kind: ProviderKind, model: str, deployment: str | None) -> tuple[str, str, str]:
-    """What makes two entries the SAME callable candidate, for idempotent re-registration."""
-    return (kind.value, model.lower(), (deployment or model).lower())
+def _target(
+    kind: ProviderKind, model: str, deployment: str | None, endpoint: str | None
+) -> tuple[str, str, str, str]:
+    """What makes two entries the SAME callable candidate, for idempotent re-registration.
+
+    The endpoint is part of identity: `gpt-oss:20b` on this machine's Ollama and the same id on
+    a teammate's vLLM box are two different candidates, and collapsing them would silently
+    delete one server's entry, exactly like the multi-account case `_existing_handle` guards.
+    """
+    return (kind.value, model.lower(), (deployment or model).lower(), (endpoint or "").rstrip("/"))
 
 
 def _existing_handle(
@@ -723,9 +817,9 @@ def _existing_handle(
     candidate.
     """
     deployment = options.deployment if kind is ProviderKind.AZURE_OPENAI else None
-    wanted = _target(kind, model.id, deployment)
+    wanted = _target(kind, model.id, deployment, options.endpoint)
     for entry in entries:
-        if _target(entry.kind, entry.model, entry.deployment) != wanted:
+        if _target(entry.kind, entry.model, entry.deployment, entry.endpoint) != wanted:
             continue
         if entry.api_key_env == (None if kind is ProviderKind.BEDROCK else options.api_key_env):
             return entry.name
@@ -762,10 +856,19 @@ def _ask_text(console: Console, ask: PromptReader, label: str, default: str) -> 
     return _read(ask, f"[bold]{label}[/bold]{suffix}: ") or default
 
 
-def _ask_price(console: Console, ask: PromptReader, label: str) -> float:
-    """Prompt until a non-negative price is given; there is no sane default to fall back on."""
+def _ask_price(
+    console: Console, ask: PromptReader, label: str, default: float | None = None
+) -> float:
+    """Prompt until a non-negative price is given.
+
+    `default` is taken on a blank answer; None means there is no sane default to fall back on
+    (a hosted model with no published price), so the prompt insists.
+    """
+    suffix = f" [dim]\\[{default:g}][/dim]" if default is not None else ""
     while True:
-        raw = _read(ask, f"[bold]{label}[/bold]: ")
+        raw = _read(ask, f"[bold]{label}[/bold]{suffix}: ")
+        if not raw and default is not None:
+            return default
         try:
             value = float(raw)
         except ValueError:

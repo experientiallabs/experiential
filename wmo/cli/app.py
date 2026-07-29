@@ -323,6 +323,12 @@ def providers_set(
     Scripts keep the old contract: with `--provider` and `--model` both given, nothing is
     prompted. Registering non-interactively is `--pool-model <id>`, repeated per model, with
     `--input-per-mtok`/`--output-per-mtok` when the model has no published price.
+
+    A locally hosted OpenAI-compatible server (Ollama, vLLM, llama.cpp) registers through the
+    same command: `--provider openai --endpoint http://localhost:11434/v1` with `--model` and
+    `--pool-model` naming what that server serves. Self-hosted candidates are priced explicitly
+    at $0 per Mtok unless the price flags say otherwise, and the interactive openai pass asks
+    for the endpoint URL and lists the server's own models.
     """
     if tier is not None and tier not in pool_registry.TIERS:
         raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")

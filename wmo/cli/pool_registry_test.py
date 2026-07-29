@@ -30,7 +30,12 @@ from wmo.cli.pool_registry import (
 )
 from wmo.config import PROVIDER_ENV_VARS
 from wmo.providers.base import ProviderKind, VerifyResult
-from wmo.providers.catalog import list_provider_models
+from wmo.providers.catalog import (
+    CatalogModel,
+    CatalogSource,
+    ProviderCatalog,
+    list_provider_models,
+)
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import PoolEntry, load_pool
 from wmo.tracking.pricing import ModelPrice
@@ -252,6 +257,7 @@ def test_a_typed_id_outside_the_catalog_is_registered_after_confirmation(tmp_pat
         [
             "y",
             "openai",
+            "",  # endpoint URL: blank = OpenAI's own API
             "my-vllm/qwen3-32b",
             "y",  # yes, take it as a literal id
             "",
@@ -275,7 +281,7 @@ def test_a_typed_id_outside_the_catalog_is_registered_after_confirmation(tmp_pat
 
 def test_declining_a_literal_id_registers_nothing(tmp_path: Path) -> None:
     pool = tmp_path / "pool.toml"
-    written, _, _ = _drive(pool, ["y", "openai", "typo-model", "n", "", "n"])
+    written, _, _ = _drive(pool, ["y", "openai", "", "typo-model", "n", "", "n"])
 
     assert written == 0
     assert not pool.exists()
@@ -286,7 +292,7 @@ def test_a_price_is_re_asked_until_it_is_a_non_negative_number(tmp_path: Path) -
     pool = tmp_path / "pool.toml"
     written, output, _ = _drive(
         pool,
-        ["y", "openai", "self-hosted", "y", "", "open", "", "free", "-2", "0", "1.5", "", "n"],
+        ["y", "openai", "", "self-hosted", "y", "", "open", "", "free", "-2", "0", "1.5", "", "n"],
     )
 
     assert "non-negative" in output
@@ -300,7 +306,9 @@ def test_a_built_in_priced_model_is_not_asked_for_a_price(tmp_path: Path) -> Non
     # and stays as small as a hand-written one.
     pool = tmp_path / "pool.toml"
     written, _, _ = _drive(
-        pool, ["y", "openai", "gpt-5.4", "", "frontier", "", "", "n"], kind=ProviderKind.OPENAI
+        pool,
+        ["y", "openai", "", "gpt-5.4", "", "frontier", "", "", "n"],
+        kind=ProviderKind.OPENAI,
     )
 
     assert written == 1
@@ -859,3 +867,129 @@ def test_pool_path_follows_the_root_unless_it_is_overridden(tmp_path: Path) -> N
     assert pool_path_for(tmp_path, "elsewhere/roster.toml") == Path("elsewhere/roster.toml")
     # The default root resolves to exactly what the routing commands read.
     assert pool_path_for(".wmo") == Path(".wmo/pool.toml")
+
+
+def _local_catalog(endpoint: str) -> ProviderCatalog:
+    """What a live Ollama would list, without the network."""
+    return ProviderCatalog(
+        kind=ProviderKind.OPENAI,
+        source=CatalogSource.PUBLISHED,
+        models=[CatalogModel(id="qwen3:4b")],
+        detail=f"1 models served at {endpoint.rstrip('/')}/models",
+    )
+
+
+def test_an_openai_endpoint_pass_lists_the_server_and_defaults_the_price_to_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole local-model flow in one interactive pass: URL, the server's own model list,
+    # explicit $0 stamped (blank answers take the self-hosted default), plain openai on the wire.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    written, output, _ = _drive(
+        pool,
+        [
+            "y",
+            "openai",
+            "http://localhost:11434/v1",  # the endpoint prompt
+            "1",  # pick qwen3:4b off the server's list
+            "",  # done choosing
+            "open",
+            "",  # api_key_env: none, a local server needs no key
+            "",  # input price: blank takes the self-hosted default 0
+            "",  # output price: same
+            "",  # handle: default qwen3-4b
+            "n",
+        ],
+        kind=ProviderKind.OPENAI,
+    )
+
+    assert written == 1
+    assert "reads as a locally hosted server" in output
+    entry = read_pool_entries(pool)[0]
+    assert entry.name == "qwen3-4b"
+    assert entry.kind is ProviderKind.OPENAI
+    assert entry.model == "qwen3:4b"
+    assert entry.endpoint == "http://localhost:11434/v1"
+    assert entry.api_key_env is None
+    # Explicit zeros, not absent prices: declared free is not the unpriced accident.
+    assert (entry.input_per_mtok, entry.output_per_mtok) == (0.0, 0.0)
+
+
+def test_a_self_hosted_id_shadowing_a_built_in_model_still_takes_an_explicit_price(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Someone serving "gpt-5.4" locally must not inherit OpenAI's hosted rate: the price a
+    # candidate bills at is a property of the SERVER, and this one is the operator's own.
+    monkeypatch.setattr(
+        pool_registry,
+        "endpoint_catalog",
+        lambda endpoint: ProviderCatalog(
+            kind=ProviderKind.OPENAI,
+            source=CatalogSource.PUBLISHED,
+            models=[CatalogModel(id="gpt-5.4")],
+        ),
+    )
+    pool = tmp_path / "pool.toml"
+    written, _, _ = _drive(
+        pool,
+        ["y", "openai", "http://localhost:8001/v1", "1", "", "open", "", "", "", "", "n"],
+        kind=ProviderKind.OPENAI,
+    )
+
+    assert written == 1
+    entry = read_pool_entries(pool)[0]
+    assert (entry.input_per_mtok, entry.output_per_mtok) == (0.0, 0.0)
+    assert entry.price().input_per_mtok == 0.0
+
+
+def test_register_model_ids_prices_a_self_hosted_candidate_at_zero_without_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The scripted twin: `wmo providers set --provider openai --endpoint <url> --pool-model ...`
+    # with no price flags lands as an explicit $0 pair, never as an unpriced entry.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+
+    written = register_model_ids(
+        console,
+        pool_path=pool,
+        kind=ProviderKind.OPENAI,
+        model_ids=["qwen3:4b"],
+        options=EntryOptions(endpoint="http://localhost:11434/v1", tier="open"),
+        verify=_ok,
+    )
+
+    assert written == 1
+    entry = read_pool_entries(pool)[0]
+    assert entry.endpoint == "http://localhost:11434/v1"
+    assert (entry.input_per_mtok, entry.output_per_mtok) == (0.0, 0.0)
+    assert isinstance(console.file, StringIO)
+    assert "pricing at $0/Mtok" in console.file.getvalue()
+
+
+def test_the_same_model_on_two_endpoints_is_two_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The endpoint is part of candidate identity, like the account: collapsing the two would
+    # silently delete one server's entry on re-registration.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    for endpoint in ("http://localhost:11434/v1", "http://silens-mac.local:8001/v1"):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.OPENAI,
+            model_ids=["qwen3:4b"],
+            options=EntryOptions(endpoint=endpoint),
+            verify=_ok,
+        )
+
+    entries = read_pool_entries(pool)
+    assert [entry.name for entry in entries] == ["qwen3-4b", "qwen3-4b-2"]
+    assert {entry.endpoint for entry in entries} == {
+        "http://localhost:11434/v1",
+        "http://silens-mac.local:8001/v1",
+    }

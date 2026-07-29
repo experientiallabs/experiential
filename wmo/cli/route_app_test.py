@@ -3072,3 +3072,64 @@ def test_route_student_help_keeps_the_pool_table_name() -> None:
     result = runner.invoke(app, ["optimize", "route", "student", "--help"])
     assert result.exit_code == 0, result.output
     assert "[[model]]" in _flat(result.output)
+
+
+def test_route_pin_refuses_a_disabled_model_and_drops_disabled_entries_from_the_pool(
+    tmp_path: Path,
+) -> None:
+    """`enabled = false` is honored at pin time: not pinnable, and not carried into the policy.
+
+    The policy's pool is what serving may construct providers for, so a candidate the operator
+    turned off must not ride into an endpoint pinned afterwards.
+    """
+    pool_file = tmp_path / "pool.toml"
+    assert _add_student(tmp_path, pool_file).exit_code == 0
+    pool_file.write_text(
+        pool_file.read_text(encoding="utf-8")
+        + """
+[[model]]
+name = "off-limits"
+kind = "openai"
+model = "gpt-5.4"
+enabled = false
+""",
+        encoding="utf-8",
+    )
+    model_dir = _built_model(tmp_path)
+
+    refused = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "support",
+            "--model",
+            "off-limits",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert refused.exit_code != 0
+    assert "disabled" in refused.output
+
+    pinned = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "support",
+            "--model",
+            "student",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert pinned.exit_code == 0, pinned.output
+    policy = RoutingPolicy.load(model_dir / POLICY_FILENAME)
+    assert [entry.name for entry in policy.pool] == ["student"]

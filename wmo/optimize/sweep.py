@@ -223,13 +223,26 @@ def preflight_pool(pool_file: Path) -> PoolPreflight:
     Reports EVERY unusable candidate, not just the first: a pool is edited as a file, so an
     operator fixing one entry at a time pays a full round trip per typo.
 
+    Only ENABLED entries are candidates: `enabled = false` is the roster's per-model toggle, so
+    a turned-off entry is neither prepared nor swept (and is not an error even when its backend
+    is unusable, which is half the point of turning one off). A pool with every entry off is
+    answered like an empty one, naming the flag to flip.
+
     Raises:
-        SweepError: The pool could not be read, or one or more candidates cannot be used.
+        SweepError: The pool could not be read, every candidate is disabled, or one or more
+            enabled candidates cannot be used.
     """
     try:
-        pool = load_pool(pool_file)
+        full_roster = load_pool(pool_file)
     except (FileNotFoundError, ValueError) as exc:
         raise SweepError(str(exc)) from exc
+    enabled = full_roster.enabled_models()
+    if not enabled:
+        raise SweepError(
+            f"every candidate in {pool_file} is disabled (enabled = false); re-enable at least "
+            "one [[model]] entry to have a pool to measure"
+        )
+    pool = ModelPool(models=enabled)
     problems: list[str] = []
     for entry in pool.models:
         try:
