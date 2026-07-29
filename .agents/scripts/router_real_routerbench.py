@@ -256,6 +256,43 @@ def _write_json(path: Path, value: object) -> None:
     write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def _quarantine_unscored(rows_path: Path, models: list[str]) -> None:
+    """Preserve and remove wholly unscored model attempts after a repaired provider route."""
+    if not models:
+        return
+    rows = _read_rows(rows_path)
+    for model in models:
+        selected = [row for row in rows if row.get("model") == model]
+        if not selected:
+            raise ValueError(f"cannot quarantine {model}: it has no persisted attempts")
+        if any(isinstance(row.get("reward"), (int, float)) for row in selected):
+            raise ValueError(
+                f"refusing to quarantine {model}: at least one attempt is gradeable"
+            )
+        safe_model = re.sub(r"[^A-Za-z0-9_.-]", "_", model)
+        destination = rows_path.parent / "invalid-attempts" / f"{safe_model}-unscored.jsonl"
+        if destination.exists():
+            raise FileExistsError(
+                f"{destination} already exists; refusing to overwrite preserved attempts"
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(
+            destination,
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in selected),
+        )
+        rows = [row for row in rows if row.get("model") != model]
+        logger.info(
+            "quarantined %d unscored %s attempts -> %s",
+            len(selected),
+            model,
+            destination,
+        )
+    write_text_atomic(
+        rows_path,
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+    )
+
+
 def main() -> int:
     """Resume every missing RouterBench cell and rebuild the matrix."""
     parser = argparse.ArgumentParser()
@@ -263,6 +300,16 @@ def main() -> int:
     parser.add_argument("--pool", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--only", action="append")
+    parser.add_argument(
+        "--quarantine-unscored",
+        action="append",
+        default=[],
+        metavar="MODEL",
+        help=(
+            "Preserve then remove every attempt for a wholly unscored model before resume; "
+            "for repaired infrastructure routes only."
+        ),
+    )
     parser.add_argument("--concurrency", type=int, default=24)
     parser.add_argument("--budget-usd", type=float, default=500.0)
     parser.add_argument("--dry-run", action="store_true")
@@ -279,6 +326,7 @@ def main() -> int:
     rows_path = args.out_dir / "rows.jsonl"
     matrix_path = args.out_dir / "matrix.json"
     lock = threading.Lock()
+    _quarantine_unscored(rows_path, args.quarantine_unscored)
 
     for entry in pool.models:
         rows = _normalize_gradeable_provider_failures(rows_path, _read_rows(rows_path))
