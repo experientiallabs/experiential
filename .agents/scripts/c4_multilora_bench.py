@@ -157,6 +157,8 @@ def run_windowed(
 
 def switch_overhead(compressor: MultiAdapterCompressor, threshold: float) -> dict:
     """Sticky vs alternating tenants on identical payloads, plus bare set_adapter."""
+    if len(compressor.adapter_names) < 2:
+        return {"skipped": "needs 2+ resident adapters to alternate"}
     names = compressor.adapter_names[:2]
     payload = [SERVER.SELF_TEST_SEGMENTS[0]]
     for adapter in (*names, names[0]):
@@ -210,8 +212,14 @@ def main() -> None:
     residency = [int(part) for part in args.residency.split(",")]
     concurrency = [int(part) for part in args.concurrency.split(",")]
     requests = load_requests(args.requests_per_corpus, args.max_segment_chars)
+    if not requests:
+        raise SystemExit(
+            f"no live-segment episodes found under {DATA_ROOT}/cache/; every timing below "
+            "would divide by zero. Point C4_DATA_ROOT at the compression data root."
+        )
     log.info("%d requests (episodes) loaded", len(requests))
     results: dict = {
+        "owner": "c4",
         "device": args.device,
         "gpu": torch.cuda.get_device_name(),
         "server_sha256": SERVER.LOADED_SERVER_SHA256,
@@ -322,15 +330,24 @@ def main() -> None:
                 deltas.append(round(gpu_mem_mb() - before, 1))
         except torch.cuda.OutOfMemoryError:
             log.info("OOM at %d resident full models", len(instances))
-        per_model = statistics.mean(deltas[1:]) if len(deltas) > 1 else deltas[0]
         total_gb = torch.cuda.get_device_properties(args.device).total_memory / 1e9
-        results["memory_rung_c"] = {
-            "resident_loaded": len(instances),
-            "mem_mb_per_model": round(per_model, 1),
-            "deltas_mb": deltas,
-            "gpu_total_gb": round(total_gb, 1),
-            "implied_ceiling_models": int((total_gb * 1000 * 0.9 - base_mem) / per_model),
-        }
+        if not deltas:
+            # Even the first full model OOMed (tenant holding the GPU): report the fact
+            # instead of crashing past the already-collected curve results.
+            results["memory_rung_c"] = {
+                "resident_loaded": 0,
+                "gpu_total_gb": round(total_gb, 1),
+                "error": "first full-model load OOMed; GPU not idle enough for rung (c)",
+            }
+        else:
+            per_model = statistics.mean(deltas[1:]) if len(deltas) > 1 else deltas[0]
+            results["memory_rung_c"] = {
+                "resident_loaded": len(instances),
+                "mem_mb_per_model": round(per_model, 1),
+                "deltas_mb": deltas,
+                "gpu_total_gb": round(total_gb, 1),
+                "implied_ceiling_models": int((total_gb * 1000 * 0.9 - base_mem) / per_model),
+            }
         log.info("rung c memory: %s", results["memory_rung_c"])
         del instances
         torch.cuda.empty_cache()
@@ -341,6 +358,7 @@ def main() -> None:
     log.info("results -> %s", out_path)
     run_row = {
         "run_id": f"c4-bench-{device_slug}",
+        "owner": "c4",
         "ts": datetime.datetime.now(tz=datetime.UTC).isoformat(),
         "matrix": "c4-multilora-bench",
         "variant": args.device,

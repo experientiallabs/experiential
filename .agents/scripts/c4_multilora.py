@@ -51,8 +51,14 @@ SERVER_CANDIDATES = (
     HERE / "server.py",
 )
 
-# PEFT's reserved name for "no adapter" rows in mixed batches; reused here as the
-# public name for stock (unadapted) compression so one vocabulary covers all modes.
+# PEFT's reserved name for "no adapter" rows in mixed batches, recognized by BOTH
+# adapter code paths: the LoRA layers skip the delta for "__base__" rows
+# (tuners/lora/model.py filters it from unique_adapters) and the saved classifier
+# head routes them to original_module (utils/other.py,
+# AuxiliaryTrainingWrapper._mixed_batch_forward's `active_adapter == "__base__"`
+# branch). Reused here as the public name for stock compression so one vocabulary
+# covers all serving modes; the invariance suite byte-checks base passthrough in
+# every mode against a plain single-tenant server instance.
 BASE_ADAPTER = "__base__"
 
 

@@ -94,6 +94,7 @@ def main() -> None:
             merged_workdir=None if args.skip_merged else Path(workdir),
         )
 
+    verdicts["owner"] = "c4"
     verdicts["segments_per_corpus"] = args.segments_per_corpus
     verdicts["max_chars"] = args.max_chars
     device_slug = args.device.replace(":", "")
@@ -110,6 +111,7 @@ def main() -> None:
 
     run_row = {
         "run_id": f"c4-invariance-{device_slug}",
+        "owner": "c4",
         "ts": datetime.datetime.now(tz=datetime.UTC).isoformat(),
         "matrix": "c4-multilora-invariance",
         "variant": args.device,
