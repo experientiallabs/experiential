@@ -15,24 +15,13 @@ import webbrowser
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from wmo.cli.runs_app import MANIFEST_RELPATH
 from wmo.config.store import WorldModelStore
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
-from wmo.platform.auth import BrowserLogin
-from wmo.platform.client import (
-    PlatformClient,
-    PlatformError,
-    PlatformUnreachable,
-    WhoAmI,
-    fetch_cli_config,
-)
 from wmo.platform.credentials import (
     DEFAULT_WEB_URL,
     PlatformCredentials,
@@ -41,11 +30,12 @@ from wmo.platform.credentials import (
     load_credentials,
     save_credentials,
 )
-from wmo.platform.transfer import extract_push_meta, pack_model_dir, unpack_model_bundle
-from wmo.runs.backfill import BackfillRefused, ensure_backfillable, optimize_events
-from wmo.runs.client import PushRejected, PushUnavailable, RunsSink, default_emitter_id
-from wmo.runs.reader import RunsReader
-from wmo.runs.schema import pipeline_external_id
+if TYPE_CHECKING:
+    from wmo.platform.client import PlatformClient, PlatformError, WhoAmI
+
+# Kept here rather than importing wmo.cli.runs_app: platform commands are registered by the
+# root CLI, and loading their run-history implementation would defeat the light-command boundary.
+MANIFEST_RELPATH = Path("optimize") / "optimize-run.json"
 
 _console = Console()
 _CHECK = "[green]✓[/green]"
@@ -93,6 +83,13 @@ def login(
     no_browser: Annotated[bool, _LOGIN_NO_BROWSER] = False,
 ) -> None:
     """Connect this machine to a platform account."""
+    from wmo.platform.client import (
+        PlatformClient,
+        PlatformError,
+        PlatformUnreachable,
+        fetch_cli_config,
+    )
+
     credentials = load_credentials()
     web_url: str | None
 
@@ -167,6 +164,8 @@ def logout() -> None:
 
 def status() -> None:
     """Show the platform connection: account and organizations."""
+    from wmo.platform.client import PlatformError
+
     credentials = load_credentials()
     if not credentials.is_complete():
         _console.print(
@@ -204,6 +203,7 @@ def push(
     absent are skipped with a note, so a bundle-only directory pushes exactly
     as before.
     """
+    from wmo.harness.store import HarnessStore
     model_dir = WorldModelStore(root).dir_for(name)
     harness_exists = HarnessStore(root).exists(name)
     resolved_kind = _resolve_kind(
@@ -273,6 +273,8 @@ def pull(
 
 def _browser_login(web_url: str, *, open_browser: bool) -> str | None:
     """Run the loopback browser flow; fall back to a hidden paste prompt."""
+    from wmo.platform.auth import BrowserLogin
+
     login_attempt = BrowserLogin(web_url)
     try:
         login_attempt.start()
@@ -291,6 +293,8 @@ def _browser_login(web_url: str, *, open_browser: bool) -> str | None:
 
 
 def _client(credentials: PlatformCredentials) -> PlatformClient:
+    from wmo.platform.client import PlatformClient
+
     if credentials.api_url is None or credentials.token is None:
         raise typer.BadParameter("not connected to a platform; run `wmo login` first")
     return PlatformClient(credentials.api_url, credentials.token)
@@ -303,6 +307,8 @@ def _connected(credentials: PlatformCredentials, headline: str) -> Iterator[Plat
     `PlatformClient` reports every failure as a `PlatformError` (unreachable
     hosts included), so this one handler covers every request the body makes.
     """
+    from wmo.platform.client import PlatformError
+
     with _client(credentials) as client:
         try:
             yield client
@@ -348,6 +354,8 @@ def _resolve_kind(kind: str | None, *, name: str, root: str, model: bool, harnes
 
 def _nothing_local(name: str, root: str, *, kind: str | None) -> str:
     """Say what was looked for, where, what is actually there, and what to run next."""
+    from wmo.harness.store import HarnessStore
+
     if kind == "model":
         label, have = "world model", WorldModelStore(root).list_names()
         hint = f"`wmo build --name {name}` builds one"
@@ -375,6 +383,8 @@ def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str
     # The model list goes first ON PURPOSE: a dead credential fails here with
     # the platform's own sentence, so the tolerant harness probe below never
     # masks a real auth problem.
+    from wmo.platform.client import PlatformError
+
     model_names = {model.name for model in client.list_world_models(org_id)}
     try:
         harness_names = {harness.name for harness in client.list_harnesses(org_id)}
@@ -407,6 +417,8 @@ def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str
 
 
 def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
+    from wmo.platform.client import PlatformError
+    from wmo.platform.transfer import extract_push_meta, pack_model_dir
     meta = extract_push_meta(model_dir)
     with tempfile.TemporaryDirectory(prefix="wmo-push-") as staging:
         bundle = pack_model_dir(model_dir, Path(staging) / f"{remote_name}.tar.gz")
@@ -508,6 +520,11 @@ def _push_pipeline(client: PlatformClient, org_id: str, remote_name: str, model_
     free. A run that already reported itself live is left alone rather than
     double-counted.
     """
+    from wmo.runs.backfill import BackfillRefused, ensure_backfillable, optimize_events
+    from wmo.runs.client import PushRejected, PushUnavailable, RunsSink, default_emitter_id
+    from wmo.runs.reader import RunsReader
+    from wmo.runs.schema import pipeline_external_id
+
     manifest = model_dir / MANIFEST_RELPATH
     if not manifest.is_file():
         _console.print("no optimize manifest in the model directory; skipping the pipeline leg")
@@ -546,6 +563,8 @@ def _push_harness(
     ref: str | None,
     root: str,
 ) -> None:
+    from wmo.harness.store import HarnessStore
+
     try:
         doc = HarnessStore(root).load(local_name, ref)
     except (FileNotFoundError, ValueError) as error:
@@ -571,6 +590,8 @@ def _push_harness(
 
 
 def _pull_model(client: PlatformClient, org_id: str, name: str, root: str, *, force: bool) -> None:
+    from wmo.platform.transfer import unpack_model_bundle
+
     dest_dir = WorldModelStore(root).model_dir(name)
     with tempfile.TemporaryDirectory(prefix="wmo-pull-") as staging:
         bundle_path = Path(staging) / f"{name}.tar.gz"
@@ -633,6 +654,9 @@ def _pull_endpoint_artifacts(
 def _pull_harness(
     client: PlatformClient, org_id: str, name: str, root: str, *, version: int | None
 ) -> None:
+    from wmo.harness.doc import HarnessDoc
+    from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
+
     if version is None:
         harness, _versions = client.get_harness(org_id, name)
         if harness.latest_version < 1:

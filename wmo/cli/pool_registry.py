@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import typer
@@ -38,34 +39,21 @@ from rich.markup import escape
 from rich.table import Table
 
 from wmo.cli.model_roles import DEFAULT_AZURE_API_VERSION
-from wmo.cli.ui import PromptReader, creds_note, ensure_credentials, has_credentials, select_option
+from wmo.cli.ui import creds_note, ensure_credentials, has_credentials, select_option
 from wmo.config import PROVIDER_ENV_VARS
-from wmo.core.locks import FileLockTimeout
 from wmo.providers.base import ProviderKind, VerifyResult
-from wmo.providers.catalog import (
-    CatalogModel,
-    CatalogSource,
-    ProviderCatalog,
-    endpoint_catalog,
-    list_provider_models,
-)
-from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
-from wmo.providers.pool import (
-    PoolEntry,
-    Tier,
-    is_local_endpoint,
-    load_pool,
-    pool_provider,
-    static_requirements,
-    upsert_pool_entry,
-)
-from wmo.tracking.pricing import price_for
+from wmo.providers.pool import Tier
+
+if TYPE_CHECKING:
+    from wmo.cli.ui import PromptReader
+    from wmo.providers.catalog import CatalogModel, ProviderCatalog
+    from wmo.providers.pool import PoolEntry
 
 logger = logging.getLogger(__name__)
 
 # The live provider ping, as a seam: one cheap completion against a built candidate. Injected
 # so tests never reach a backend, mirroring `run_build_wizard`'s `verify` parameter.
-ProviderCheck = Callable[[PoolEntry], VerifyResult]
+ProviderCheck = Callable[["PoolEntry"], VerifyResult]
 
 POOL_FILENAME = "pool.toml"
 """The roster's name inside a project root, so `--root <dir>` keeps settings and pool together."""
@@ -116,6 +104,8 @@ def read_pool_entries(path: Path) -> list[PoolEntry]:
     parsed is `upsert_pool_entry`'s error to raise, with its own actionable message. Swallowing
     it here would only pre-empt that with a worse one.
     """
+    from wmo.providers.pool import load_pool
+
     try:
         return list(load_pool(path).models)
     except (FileNotFoundError, ValueError) as exc:
@@ -125,6 +115,8 @@ def read_pool_entries(path: Path) -> list[PoolEntry]:
 
 def print_pool(console: Console, path: Path, entries: list[PoolEntry]) -> None:
     """Show the roster the router chooses from, so a second pass adds to a visible starting set."""
+    from wmo.providers.pool import is_local_endpoint
+
     if not entries:
         console.print(f"[dim]routing pool[/dim] {path} [dim]is empty[/dim]")
         return
@@ -227,6 +219,8 @@ def register_from_provider(
     operator-chosen deployment, so a first deployment that answers proves nothing about the
     second. `wmo providers verify` bills a call per model for the same reason.
     """
+    from wmo.providers.catalog import endpoint_catalog, list_provider_models
+
     if kind is ProviderKind.OPENAI:
         # The one kind that can point at a self-hosted server (Ollama, vLLM, llama.cpp), so the
         # endpoint question comes BEFORE the catalog: a set URL swaps the built-in registry for
@@ -265,6 +259,8 @@ def _ask_endpoint(console: Console, ask: PromptReader, options: EntryOptions) ->
     with `-` as the explicit way back to the hosted API. Without that escape a session started
     with `--endpoint` could never register a hosted candidate at all.
     """
+    from wmo.providers.pool import is_local_endpoint
+
     if options.endpoint:
         hint = f"blank = keep {escape(options.endpoint)}; '-' = OpenAI's own API"
     else:
@@ -318,6 +314,8 @@ def verify_pool_entry(entry: PoolEntry) -> VerifyResult:
     Never raises: a backend that refuses to be built at all (an unset `api_key_env`, Bedrock
     handed a key) comes back as a failure with its own message, like any other.
     """
+    from wmo.providers.pool import pool_provider
+
     try:
         return pool_provider(entry).verify()
     except ValueError as exc:
@@ -358,6 +356,9 @@ def register_model_ids(
             models for one. Non-interactively there is nobody to ask, so this fails loudly rather
             than writing a candidate that does not work.
     """
+    from wmo.providers.catalog import CatalogModel, endpoint_catalog, list_provider_models
+    from wmo.providers.pool import is_local_endpoint, static_requirements
+
     _check_azure_deployment(kind, model_ids, options)
     if _self_hosted(kind, options) and (options.input_per_mtok is None) != (
         options.output_per_mtok is None
@@ -473,6 +474,8 @@ def choose_models(
     Returns:
         The chosen models, in selection order.
     """
+    from wmo.providers.catalog import CatalogModel
+
     by_target = {
         _target(entry.kind, entry.model, entry.deployment, entry.endpoint): entry
         for entry in existing
@@ -530,6 +533,8 @@ def build_pool_entry(
         pydantic.ValidationError: The entry is not a valid candidate, most often a model with no
             built-in price and no declared one.
     """
+    from wmo.providers.pool import PoolEntry
+
     azure = kind is ProviderKind.AZURE_OPENAI
     bedrock = kind is ProviderKind.BEDROCK
     return PoolEntry(
@@ -560,6 +565,9 @@ def needs_price(kind: ProviderKind, model: CatalogModel) -> bool:
     The OpenRouter lookup reads the same cached table the picker listed from, so it costs no
     second fetch.
     """
+    from wmo.providers.openrouter_pricing import resolve_price as resolve_openrouter_price
+    from wmo.tracking.pricing import price_for
+
     if price_for(model.id) is not None:
         return False
     if kind is ProviderKind.OPENROUTER:
@@ -586,6 +594,8 @@ def _register_one(
     Returns:
         True when the roster gained or changed this entry, False when it was skipped.
     """
+    from wmo.providers.pool import static_requirements
+
     per_model = _ask_per_model_options(console, ask, kind, model, options)
     try:
         probe = build_pool_entry(name="probe", kind=kind, model=model, options=per_model)
@@ -628,6 +638,9 @@ def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
     Returns:
         True when the roster changed, False when it was already right or the write was refused.
     """
+    from wmo.core.locks import FileLockTimeout
+    from wmo.providers.pool import upsert_pool_entry
+
     existing = {row.name: row for row in read_pool_entries(pool_path)}.get(entry.name)
     if existing is not None and not existing.enabled:
         # `enabled = false` is an explicit operator edit; a re-run of a registration script
@@ -670,6 +683,8 @@ def _write(console: Console, entry: PoolEntry, pool_path: Path) -> bool:
 
 def _describe_catalog(console: Console, catalog: ProviderCatalog) -> None:
     """One line saying where this backend's model list came from, before the picker opens."""
+    from wmo.providers.catalog import CatalogSource
+
     match catalog.source:
         case CatalogSource.PUBLISHED:
             origin = "published catalog"
@@ -774,6 +789,8 @@ def _ask_per_model_options(
     options: EntryOptions,
 ) -> EntryOptions:
     """Ask what THIS model needs and nothing else: an Azure deployment, or a missing price."""
+    from wmo.providers.pool import is_local_endpoint
+
     updates: dict[str, str | float | None] = {}
     if kind is ProviderKind.AZURE_OPENAI:
         # On the wire Azure's model IS the deployment name, and every deployment is named by the

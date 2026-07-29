@@ -20,6 +20,7 @@ import os
 import sys
 from collections import deque
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import click
 import typer
@@ -49,13 +50,12 @@ from wmo.config import (
     upsert_env_var,
     validate_name,
 )
-from wmo.core.types import Action, ActionKind, Session
-from wmo.engine.build import DEFAULT_TRAIN_SPLIT
-from wmo.engine.play import PlayTurn, parse_action, play_turn
-from wmo.engine.world_model import WorldModel
-from wmo.providers import verify_all, verify_embedder
 from wmo.providers.base import ProviderConfig, ProviderKind, VerifyResult
-from wmo.providers.models import resolve_provider_model
+
+if TYPE_CHECKING:
+    from wmo.core.types import Action, Session
+    from wmo.engine.play import PlayTurn
+    from wmo.engine.world_model import WorldModel
 
 # A reader takes a fully-rendered prompt string and returns the user's typed line.
 PromptReader = Callable[[str], str]
@@ -150,7 +150,9 @@ class BuildParams(BaseModel):
     judge_model: str | None = None
     region: str | None = None
     fidelity: str = "medium"
-    train_split: float = DEFAULT_TRAIN_SPLIT
+    # Mirrors wmo.engine.build.DEFAULT_TRAIN_SPLIT (0.8): kept as a literal here so this light,
+    # importable-without-the-engine module never has to pull in wmo.engine.build.
+    train_split: float = 0.8
     embed_provider: str = "hashing"
     embed_model: str | None = None
     embed_dim: int = 512
@@ -253,6 +255,8 @@ def select_provider_and_model(
     retry default. Also reused by `wmo demo`'s switch-provider flow. Returns
     (provider, model, region).
     """
+    from wmo.providers.models import resolve_provider_model
+
     providers = list(_PROVIDER_MODELS)
     with_creds = [p for p in providers if has_credentials(p)]
     # Name the actual variable so a key inherited from the shell (e.g. exported in ~/.zshrc)
@@ -320,6 +324,9 @@ def run_build_wizard(
     to the picker instead of surfacing after the wizard. `verify`/`verify_embed` exist so tests
     can stub the pings. Raises `ValueError` if no trace source (file or vendor) is provided.
     """
+    from wmo.providers import verify_all, verify_embedder
+    from wmo.providers.models import resolve_provider_model
+
     interactive = reader is None
     check = verify if verify is not None else (lambda cfg: verify_all([cfg])[0])
     check_embed = verify_embed if verify_embed is not None else verify_embedder
@@ -1095,6 +1102,8 @@ def _handle_action(console: Console, world_model: WorldModel, session_id: str, l
     A failed step (e.g. a provider/network error) is reported and swallowed so the REPL keeps the
     session alive instead of crashing the whole interactive run.
     """
+    from wmo.engine.play import parse_action, play_turn
+
     try:
         action = parse_action(line)
     except ValueError as exc:
@@ -1131,6 +1140,8 @@ def _render_state(console: Console, session: Session) -> None:
 
 
 def _action_text(action: Action) -> str:
+    from wmo.core.types import ActionKind
+
     if action.kind == ActionKind.TOOL_CALL:
         return f"{action.name}({action.arguments})"
     return f'message: "{action.content}"'

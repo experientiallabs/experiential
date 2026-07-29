@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import json
+import sys
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from filelock import FileLock
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+import wmo.env as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
@@ -608,6 +610,10 @@ def test_route_tune_refuses_a_snapshot_after_the_matrix_was_rebuilt_in_place(
     assert RoutingPolicy.load(policy_file).cost_quality is None  # the refit is untouched
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows rejects '|' in path components used by this regression fixture",
+)
 def test_route_tune_survives_a_matrix_path_that_looks_like_a_dial_suffix(tmp_path: Path) -> None:
     """An operator-supplied path must not be able to truncate the fit identity it opens.
 
@@ -1418,12 +1424,12 @@ def _patch_seams(
             _ScriptedCandidate(config, seams.systems, throttled=throttled),
         )
 
-    monkeypatch.setattr(route_module, "load_world_model", _load)
+    monkeypatch.setattr("wmo.engine.load_world_model", _load)
     monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
     if no_scoring:
-        real = route_module.WorldModelEnv
+        real = env_module.WorldModelEnv
         monkeypatch.setattr(
-            route_module,
+            env_module,
             "WorldModelEnv",
             lambda world_model, *, score_on_close=False: real(world_model),
         )
@@ -1570,7 +1576,7 @@ def test_route_sweep_resumes_the_cells_an_interrupted_run_already_bought(
     """
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
-    real_env = route_module.WorldModelEnv
+    real_env = env_module.WorldModelEnv
     cells = itertools.count(1)
 
     class _DiesOnTheFourthCell:
@@ -1586,14 +1592,14 @@ def test_route_sweep_resumes_the_cells_an_interrupted_run_already_bought(
         def __getattr__(self, name: str) -> object:
             return getattr(self._inner, name)
 
-    monkeypatch.setattr(route_module, "WorldModelEnv", _DiesOnTheFourthCell)
+    monkeypatch.setattr(env_module, "WorldModelEnv", _DiesOnTheFourthCell)
     out, first = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
     assert first.exit_code != 0
     assert not out.exists()  # no matrix: the sweep never finished
     sidecar = out.with_name(out.name + ".partial.jsonl")
     assert len(sidecar.read_text(encoding="utf-8").splitlines()) == 4  # header + 3 paid cells
 
-    monkeypatch.setattr(route_module, "WorldModelEnv", real_env)
+    monkeypatch.setattr(env_module, "WorldModelEnv", real_env)
     scored_before = len(seams.world_model.scored)
     _, second = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
     assert second.exit_code == 0, second.output
@@ -2653,7 +2659,8 @@ def test_route_fit_refuses_compressed_rewards_under_a_raw_fit(tmp_path: Path) ->
         ],
     )
     assert result.exit_code != 0
-    assert "would stamp raw text" in result.output
+    flat = "".join(ch for ch in result.output if not ch.isspace() and ch not in "│┌┐└┘─╔╗╚╝║═")
+    assert "wouldstamprawtext" in flat
 
 
 def test_route_sweep_rejects_an_unservable_compressor_before_spending(tmp_path: Path) -> None:

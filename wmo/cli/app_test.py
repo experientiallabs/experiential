@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import subprocess
+import sys
 import time
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -285,7 +286,7 @@ def test_build_wizard_does_not_reuse_connection_for_changed_provider(
             }
         )
 
-    monkeypatch.setattr(cli_app_module, "run_build_wizard", switch_provider)
+    monkeypatch.setattr("wmo.cli.ui.run_build_wizard", switch_provider)
 
     result = runner.invoke(app, ["build", "--interactive", "--root", str(root)])
 
@@ -317,7 +318,7 @@ def test_build_survives_card_write_failure(patched_provider, monkeypatch, tmp_pa
     def _boom(card, model_dir) -> None:  # noqa: ANN001
         raise OSError("disk full")
 
-    monkeypatch.setattr(cli_app_module, "save_card", _boom)
+    monkeypatch.setattr("wmo.config.card.save_card", _boom)
     root = tmp_path / ".wmo"
     _build(root, "tau2-airline", tmp_path)  # asserts exit_code == 0 internally
     assert (root / "models" / "tau2-airline" / "config.toml").exists()
@@ -572,6 +573,7 @@ def test_examples_data_only_bundle_is_marked_and_points_at_wmo_build(tmp_path, m
     assert "--name demo-corpus" in output
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows ignores the Unix exec bit")
 def test_examples_run_rejects_a_non_executable_launcher(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     # A run.sh that lost its exec bit (archive, checkout) must be a usage error naming chmod,
     # not a PermissionError traceback out of subprocess.
@@ -840,8 +842,7 @@ def test_demo_keeps_the_traceback_for_a_wmo_bug(patched_provider, tmp_path, monk
     root = tmp_path / ".wmo"
     _build(root, "demo-model", tmp_path)
     monkeypatch.setattr(
-        cli_app_module,
-        "run_demo",
+        "wmo.engine.demo.run_demo",
         lambda *a, **kw: (_ for _ in ()).throw(KeyError("internal")),
     )
 
@@ -1026,7 +1027,7 @@ def test_providers_set_verifies_and_saves_local_worker(monkeypatch, tmp_path) ->
         checked.extend(configs)
         return [VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs]
 
-    monkeypatch.setattr(cli_app_module, "verify_all", verify)
+    monkeypatch.setattr("wmo.providers.verify_all", verify)
     result = runner.invoke(
         app,
         [
@@ -1059,8 +1060,7 @@ def _accept_every_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     provider, and `verify_pool_entry` proves each routing candidate over its own route.
     """
     monkeypatch.setattr(
-        cli_app_module,
-        "verify_all",
+        "wmo.providers.verify_all",
         lambda configs: [
             VerifyResult(ok=True, kind=config.kind, model=config.model) for config in configs
         ],
@@ -1412,8 +1412,7 @@ def test_providers_set_without_pool_flags_leaves_scripted_runs_untouched(
 def test_providers_set_does_not_save_a_failed_provider(monkeypatch, tmp_path) -> None:  # noqa: ANN001
     root = tmp_path / ".wmo"
     monkeypatch.setattr(
-        cli_app_module,
-        "verify_all",
+        "wmo.providers.verify_all",
         lambda configs: [
             VerifyResult(
                 ok=False,
@@ -1466,9 +1465,9 @@ def test_examples_run_invokes_task_launcher(monkeypatch) -> None:  # noqa: ANN00
 
     assert result.exit_code == 0, result.output
     command = cast(list[str], seen["command"])
-    assert command[0].endswith("environment-capture/tau-bench/run.sh")
+    assert Path(command[0]).as_posix().endswith("environment-capture/tau-bench/run.sh")
     assert command[1:] == ["--trace", "0"]
-    assert str(seen["cwd"]).endswith("environment-capture/tau-bench")
+    assert Path(str(seen["cwd"])).as_posix().endswith("environment-capture/tau-bench")
     assert seen["check"] is False
 
 
@@ -1532,8 +1531,8 @@ def _record_eval_providers(monkeypatch: pytest.MonkeyPatch) -> list[ProviderConf
         seen.append(config)
         return fake
 
-    monkeypatch.setattr(cli_app_module.providers, "provider_or_chain", record)
-    monkeypatch.setattr(cli_app_module.providers, "get_provider", record)
+    monkeypatch.setattr("wmo.providers.provider_or_chain", record)
+    monkeypatch.setattr("wmo.providers.get_provider", record)
     return seen
 
 
@@ -1713,7 +1712,8 @@ def test_eval_on_a_directory_is_a_usage_error(tmp_path) -> None:  # noqa: ANN001
     assert result.exit_code == 2  # usage error, not an IsADirectoryError traceback
     flat = _flat(result.output)
     assert "is a directory" in flat
-    assert "traces.otel.jsonl" in flat  # names the file to pass instead
+    # Rich may soft-wrap long Windows paths mid-token (`traces.otel.j` / `sonl`); strip spaces.
+    assert "traces.otel.jsonl" in flat.replace(" ", "")  # names the file to pass instead
 
 
 def test_eval_file_with_no_traces_fails_instead_of_scoring_zero(tmp_path) -> None:  # noqa: ANN001
@@ -1946,7 +1946,7 @@ def test_the_model_picker_offers_only_readable_artifacts(
         return infos[0].name
 
     monkeypatch.setattr(cli_app_module, "_console", SimpleNamespace(is_terminal=True))
-    monkeypatch.setattr(cli_app_module, "select_model", fake_select_model)
+    monkeypatch.setattr("wmo.cli.ui.select_model", fake_select_model)
 
     assert cli_app_module._resolve_name(WorldModelStore(root), None) == "alpha-healthy"
     assert offered == ["alpha-healthy", "beta-healthy"]
@@ -2233,8 +2233,6 @@ def test_build_pull_limit_is_a_fetch_cap_applied_once(
     it would only read as a promise of N usable traces that this transport cannot keep. Pinning
     both halves: the adapter receives the cap, and `build` is not handed it a second time.
     """
-    import sys
-
     from wmo.config.card import load_card
 
     seen: list[VendorPull] = []
@@ -2250,16 +2248,20 @@ def test_build_pull_limit_is_a_fetch_cap_applied_once(
             traces = [_pull_trace(f"{i:032d}", usable=bool(i % 2)) for i in range(6)]
             return traces if pull.limit is None else traces[: pull.limit]
 
-    real_run_build = cli_app_module.run_build
+    # `wmo.engine.build` is shadowed by the `build` function re-exported from
+    # `wmo.engine.__init__`, so attribute / `import wmo.engine.build` resolve the function.
+    # Reach the submodule only through importlib / sys.modules.
+    import importlib
+
+    engine_build = importlib.import_module("wmo.engine.build")
+    real_run_build = engine_build.build
 
     def _spy(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - passthrough spy
         passed_to_build.update(kwargs)
         return real_run_build(*args, **kwargs)
 
-    monkeypatch.setattr(
-        sys.modules["wmo.engine.build"], "get_adapter", lambda name: _CappingAdapter()
-    )
-    monkeypatch.setattr(cli_app_module, "run_build", _spy)
+    monkeypatch.setattr(engine_build, "get_adapter", lambda name: _CappingAdapter())
+    monkeypatch.setattr(engine_build, "build", _spy)
     root = tmp_path / ".wmo"
     result = runner.invoke(
         app,
@@ -2395,14 +2397,10 @@ def test_build_aborts_when_provider_sdk_missing(monkeypatch, tmp_path) -> None: 
     Regression: previously the ModuleNotFoundError was swallowed inside GEPA and the build
     "succeeded" with a useless held-out-0.0 model.
     """
-    import sys
-
     from wmo.providers.base import VerifyResult
 
-    appmod = sys.modules["wmo.cli.app"]
     monkeypatch.setattr(
-        appmod,
-        "verify_all",
+        "wmo.providers.verify_all",
         lambda configs: [
             VerifyResult(
                 ok=False,
@@ -2522,7 +2520,9 @@ def test_providers_verify_unreadable_model_config_is_clean_error(tmp_path: Path)
     assert result.exit_code == 2
     assert not isinstance(result.exception, ValueError)
     flat = _flat(result.output)
-    assert "foo/config.toml is not valid TOML" in flat
+    # Path separators and rich soft-wraps vary by OS; match the durable pieces.
+    assert "foo" in flat and "config.toml" in flat.replace(" ", "")
+    assert "is not valid TOML" in flat
     assert "re-run `wmo build`" in flat
 
 
@@ -2533,7 +2533,7 @@ def _record_verify_all(monkeypatch: pytest.MonkeyPatch, pinged: list[ProviderCon
         pinged.extend(configs)
         return [VerifyResult(ok=True, kind=c.kind, model=c.model) for c in configs]
 
-    monkeypatch.setattr(cli_app_module, "verify_all", fake_verify_all)
+    monkeypatch.setattr("wmo.providers.verify_all", fake_verify_all)
 
 
 def test_providers_verify_nothing_configured_is_actionable(tmp_path: Path) -> None:
@@ -2582,8 +2582,7 @@ def test_providers_verify_reports_a_role_failure_with_its_credentials(
     settings.models.worker = ModelRole(provider="bedrock", model="claude-opus-4-8")
     save_settings(settings, root)
     monkeypatch.setattr(
-        cli_app_module,
-        "verify_all",
+        "wmo.providers.verify_all",
         lambda configs: [
             VerifyResult(
                 ok=False,
@@ -2615,8 +2614,7 @@ def test_providers_verify_missing_optional_sdk_points_at_the_install(
     settings.models.worker = ModelRole(provider="tinker", model="Qwen/Qwen3-8B")
     save_settings(settings, root)
     monkeypatch.setattr(
-        cli_app_module,
-        "verify_all",
+        "wmo.providers.verify_all",
         lambda configs: [
             VerifyResult(ok=False, kind=c.kind, model=c.model, detail=_MISSING_TINKER_EXTRA)
             for c in configs
@@ -2825,15 +2823,13 @@ def test_research_concurrency_uses_the_configured_worker_provider(
     monkeypatch.chdir(tmp_path)
     # get_provider is the identity here, so calling the runner's factory yields its config.
     built: list[ProviderConfig] = []
-    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
     monkeypatch.setattr(
-        cli_app_module,
-        "build_world_runner",
+        "wmo.research.concurrency_run.build_world_runner",
         lambda factory, prompt, demos, selected: built.append(factory()),
     )
     monkeypatch.setattr(
-        cli_app_module,
-        "run_concurrency_scaling",
+        "wmo.research.run_concurrency_scaling",
         lambda *a, **kw: SimpleNamespace(benchmark="", best_speedup=lambda: None),
     )
 
@@ -3030,6 +3026,7 @@ def test_scenarios_build_non_utf8_corpus_is_clean_error(tmp_path) -> None:  # no
     assert "--file" in flat and "is not UTF-8 text" in flat
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod(0) does not revoke read on Windows")
 def test_scenarios_build_unreadable_corpus_is_clean_error(tmp_path) -> None:  # noqa: ANN001
     # Regression (Greptile P1): chmod-000 raised PermissionError out of Path.read_text.
     corpus = tmp_path / "traces.jsonl"
@@ -3068,7 +3065,7 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
         made.append(config)
         return config  # identity provider: assertions read the config directly
 
-    monkeypatch.setattr(cli_app_module.providers, "get_provider", fake_get_provider)
+    monkeypatch.setattr("wmo.providers.get_provider", fake_get_provider)
     monkeypatch.setattr(
         cli_app_module,
         "load_settings_or_abort",
@@ -3093,7 +3090,7 @@ def test_scenario_role_llms_resolve_from_settings(monkeypatch) -> None:  # noqa:
 def test_scenario_role_llms_cli_flags_pin_every_role(monkeypatch) -> None:  # noqa: ANN001
     from wmo.config.settings import ProjectSettings
 
-    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
     monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms("bedrock", "some-model", None)
     assert summary is worker
@@ -3106,7 +3103,7 @@ def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch
     # asked bedrock for an OpenAI model id.
     from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings
 
-    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
     monkeypatch.setattr(
         cli_app_module,
         "load_settings_or_abort",
@@ -3122,7 +3119,7 @@ def test_scenario_role_llms_model_flag_keeps_the_configured_provider(monkeypatch
 def test_scenario_role_llms_default_when_nothing_configured(monkeypatch) -> None:  # noqa: ANN001
     from wmo.config.settings import ProjectSettings
 
-    monkeypatch.setattr(cli_app_module.providers, "get_provider", lambda config: config)
+    monkeypatch.setattr("wmo.providers.get_provider", lambda config: config)
     monkeypatch.setattr(cli_app_module, "load_settings_or_abort", lambda: ProjectSettings())
     summary, worker, judge = cli_app_module._scenario_role_llms(None, None, None)
     assert summary is worker
@@ -3272,8 +3269,8 @@ def test_download_fetches_named_benchmarks(monkeypatch, tmp_path: Path) -> None:
         fetched.append((name, force))
         return tmp_path / name / "traces.otel.jsonl"
 
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fake_fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.fetch_corpus", fake_fetch)
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "bird-sql", "dabstep", "--force"])
     assert result.exit_code == 0, result.output
     assert fetched == [("bird-sql", True), ("dabstep", True)]
@@ -3285,13 +3282,12 @@ def test_download_all_expands_to_the_published_list(monkeypatch, tmp_path: Path)
     # registry entry that isn't published yet would 404.
     fetched: list[str] = []
     published = [SimpleNamespace(benchmark=n, last_modified=None) for n in ("a-bench", "b-bench")]
-    monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
+    monkeypatch.setattr("wmo.hub.published_corpora", lambda: published)
     monkeypatch.setattr(
-        cli_app_module,
-        "fetch_corpus",
+        "wmo.hub.fetch_corpus",
         lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "all"])
     assert result.exit_code == 0, result.output
     assert fetched == ["a-bench", "b-bench"]
@@ -3310,8 +3306,8 @@ def test_download_multi_skips_a_404_and_fetches_the_rest(monkeypatch, tmp_path: 
         fetched.append(name)
         return tmp_path
 
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "a-bench", "broken", "z-bench"])
     assert fetched == ["a-bench", "z-bench"]  # kept going past the 404
     assert result.exit_code != 0  # ...but the failure is still reported at the end
@@ -3329,23 +3325,24 @@ def test_download_all_offline_skips_the_unpublished_and_still_succeeds(  # noqa:
     # subset, and it says what it dropped.
     import urllib.error
 
-    unpublished = sorted(n for n, spec in cli_app_module.CORPORA.items() if not spec.published)
+    from wmo.hub import CORPORA, downloadable_benchmarks
+
+    unpublished = sorted(n for n, spec in CORPORA.items() if not spec.published)
     assert unpublished, "this test is meaningless once every registered corpus is published"
     fetched: list[str] = []
 
     def no_catalogue(*_args: object, **_kwargs: object) -> None:
         raise urllib.error.URLError("offline")
 
-    monkeypatch.setattr(cli_app_module, "published_corpora", no_catalogue)
+    monkeypatch.setattr("wmo.hub.published_corpora", no_catalogue)
     monkeypatch.setattr(
-        cli_app_module,
-        "fetch_corpus",
+        "wmo.hub.fetch_corpus",
         lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "all"])
     assert result.exit_code == 0, result.output  # no failure over an unpushed registry entry
-    assert fetched == cli_app_module.downloadable_benchmarks()
+    assert fetched == downloadable_benchmarks()
     for name in unpublished:
         assert name not in fetched
         assert name in result.output  # the narrowing is announced, never silent
@@ -3363,8 +3360,8 @@ def test_download_multi_keeps_going_past_a_truncated_transfer(monkeypatch, tmp_p
         fetched.append(name)
         return tmp_path
 
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "a-bench", "short", "z-bench"])
     assert fetched == ["a-bench", "z-bench"]  # kept going past the short transfer
     assert result.exit_code != 0  # ...but the failure is still reported at the end
@@ -3379,8 +3376,8 @@ def test_download_of_one_bundle_reports_a_truncated_transfer_as_a_failure(  # no
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
         raise OSError("traces.otel.jsonl: 6 bytes, tree lists 4096 — truncated transfer")
 
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "dabstep"])
     assert result.exit_code == 1
     assert "truncated transfer" in result.output
@@ -3395,14 +3392,16 @@ def test_download_multi_reports_an_unknown_name_without_stranding_the_rest(  # n
     # hand-typed list used to abort the command before the good ones were attempted.
     fetched: list[str] = []
 
+    from wmo.hub import CORPORA
+
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
-        if name not in cli_app_module.CORPORA:
+        if name not in CORPORA:
             raise ValueError(f"{name!r} has no published corpus (available: dabstep)")
         fetched.append(name)
         return tmp_path
 
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "nope", "dabstep"])
     assert fetched == ["dabstep"]
     assert result.exit_code != 0
@@ -3427,8 +3426,8 @@ def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Pa
     def fetch(name, force=False, on_progress=None):  # noqa: ANN001, ANN202
         raise CorpusRepoUnavailable(name, "main", attempts)
 
-    monkeypatch.setattr(cli_app_module, "fetch_corpus", fetch)
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.fetch_corpus", fetch)
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "dabstep"])
     assert result.exit_code != 0
     for repo_id in candidate_repo_ids("dabstep"):
@@ -3436,7 +3435,7 @@ def test_download_failure_names_every_repo_id_it_tried(monkeypatch, tmp_path: Pa
 
 
 def test_download_unknown_benchmark_is_a_usage_error(monkeypatch, tmp_path: Path) -> None:  # noqa: ANN001
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download", "nope"])
     assert result.exit_code != 0
     assert "no published corpus" in result.output
@@ -3456,13 +3455,12 @@ def test_download_picker_lists_published_and_fetches_choice(
         )
     ]
     fetched: list[str] = []
-    monkeypatch.setattr(cli_app_module, "published_corpora", lambda: published)
+    monkeypatch.setattr("wmo.hub.published_corpora", lambda: published)
     monkeypatch.setattr(
-        cli_app_module,
-        "fetch_corpus",
+        "wmo.hub.fetch_corpus",
         lambda name, force=False, on_progress=None: fetched.append(name) or tmp_path,
     )
-    monkeypatch.setattr(cli_app_module, "corpus_path", lambda name: tmp_path / name / "missing")
+    monkeypatch.setattr("wmo.hub.corpus_path", lambda name: tmp_path / name / "missing")
     result = runner.invoke(app, ["download"], input="1\n")
     assert result.exit_code == 0, result.output
     assert fetched == ["gaia2"]

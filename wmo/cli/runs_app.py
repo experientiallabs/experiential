@@ -21,7 +21,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from pydantic import ValidationError
@@ -30,17 +30,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from wmo.config import ARTIFACT_DIR
-from wmo.core.types import JsonObject
-from wmo.platform.client import PlatformError
 from wmo.platform.credentials import credentials_path
-from wmo.runs.backfill import BackfillRefused, ensure_backfillable, grid_arm_events, optimize_events
-from wmo.runs.client import (
-    PushRejected,
-    PushUnavailable,
-    RunsSink,
-    default_emitter_id,
-)
-from wmo.runs.reader import CellStats, EventRow, RunDetail, RunsReader, RunSummary
 from wmo.runs.schema import (
     LEDGER_LINE,
     LOG_LINE,
@@ -53,6 +43,12 @@ from wmo.runs.schema import (
     is_terminal_status,
     pipeline_external_id,
 )
+
+if TYPE_CHECKING:
+    from wmo.core.types import JsonObject
+    from wmo.platform.client import PlatformError
+    from wmo.runs.reader import CellStats, EventRow, RunDetail, RunsReader, RunSummary
+    from wmo.runs.schema import RunEvent
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +95,9 @@ _ORG = typer.Option(
 
 def _reader(org: str | None = None) -> RunsReader:
     """The org-scoped reader, or a clean usage error naming the fix."""
+    from wmo.platform.client import PlatformError
+    from wmo.runs.reader import RunsReader
+
     try:
         reader = RunsReader.open(org=org)
     except PlatformError as error:
@@ -144,6 +143,8 @@ def list_runs(
     org: Annotated[str | None, _ORG] = None,
 ) -> None:
     """List this organization's runs, newest first."""
+    from wmo.platform.client import PlatformError
+
     with _reader(org) as reader:
         try:
             page = reader.list_runs(status=status, kind=kind, limit=limit)
@@ -183,6 +184,8 @@ def show_run(
     org: Annotated[str | None, _ORG] = None,
 ) -> None:
     """Show one run: where it is, what it spent, its stages and its cells."""
+    from wmo.platform.client import PlatformError
+
     with _reader(org) as reader:
         try:
             detail = reader.get_run(external_id)
@@ -291,6 +294,8 @@ def tail_run(
     positions nothing can arrive behind), and a finished run's tail ends on its own rather than
     hanging. Ctrl-C stops following and changes nothing about the run.
     """
+    from wmo.platform.client import PlatformError
+
     with _reader() as reader:
         try:
             cursor = _print_backlog(
@@ -440,6 +445,8 @@ def retry_run(
 
 def _command(external_id: str, command: str, args: JsonObject | None, label: str) -> None:
     """Queue one control command and report what the platform recorded."""
+    from wmo.platform.client import PlatformError
+
     with _reader() as reader:
         try:
             control = reader.request_control(external_id, command, args)
@@ -529,6 +536,8 @@ def _plan_backfill(
         typer.BadParameter: The path is neither a grid directory nor an optimize manifest, which is
             almost always a mistyped path rather than an empty directory.
     """
+    from wmo.runs.backfill import optimize_events
+
     if path.is_dir() and (path / COHORT_FILE).is_file():
         return _grid_plans(path, arm, name)
     manifest = path if path.is_file() else path / MANIFEST_RELPATH
@@ -576,6 +585,8 @@ def _grid_plans(
     directory holds several arms and each is its own run: a `--name` that named the whole run would
     collapse three arms into one.
     """
+    from wmo.runs.backfill import grid_arm_events
+
     relpath = (name or grid_relpath(grid_dir)).strip("/")
     arms = [arm] if arm is not None else _arms(grid_dir)
     if not arms:
@@ -662,6 +673,10 @@ def _push(external_id: str, events: list[RunEvent], *, force: bool) -> None:
     wrote under different seqs, which is why an already-reported run is refused rather than merged:
     its ledger lines would land twice and the spend curve would double.
     """
+    from wmo.platform.client import PlatformError
+    from wmo.runs.backfill import BackfillRefused, ensure_backfillable
+    from wmo.runs.client import PushRejected, PushUnavailable, RunsSink, default_emitter_id
+
     # ONE client for both halves of this command, closed when it is done: the guard reads the run
     # and the push writes it, and opening a second connection pool to do that leaked one per arm.
     with _reader() as reader:

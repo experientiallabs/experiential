@@ -15,22 +15,15 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.progress import BarColumn, Progress, TextColumn
 
-from wmo.ingest import VendorPull, list_adapters
-from wmo.ingest.stream import (
-    DetectedEvent,
-    DoneEvent,
-    ErrorEvent,
-    IngestEvent,
-    ProgressEvent,
-    event_json,
-    ingest_events,
-)
+if TYPE_CHECKING:
+    from wmo.ingest.stream import IngestEvent
 
 _console = Console()
 
@@ -43,6 +36,8 @@ def _default_out(file: str | None, source: str | None) -> Path:
 
 def _render_rich(stream: Iterator[IngestEvent]) -> bool:
     """Consume the event stream behind a progress bar; returns True on success."""
+    from wmo.ingest.stream import DetectedEvent, DoneEvent, ErrorEvent, ProgressEvent
+
     ok = False
     with Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -125,6 +120,9 @@ def ingest(
     any other command that reads a trace file). Progress events follow the D-INGEST vocabulary:
     detected -> progress... -> done | error.
     """
+    from wmo.ingest import VendorPull, list_adapters
+    from wmo.ingest.stream import DoneEvent, ErrorEvent, event_json, ingest_events
+
     if (dsn is not None or table is not None) and source is None:
         source = "postgres"
     is_pull = pull or dsn is not None or table is not None

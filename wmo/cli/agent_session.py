@@ -36,49 +36,26 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from wmo.cli.hosted_session import (
-    DetachedCommandDriver,
-    DetachedStartDriver,
-    LiveWorkspace,
-    SessionAction,
-    patch_revision,
-)
-from wmo.cli.session_state import (
-    DetachedSessionState,
-    SessionStateError,
-    SessionStateStore,
-    WorkspaceCheckpoint,
-)
-from wmo.cli.workspace_sync import (
-    WorkspaceSnapshot,
-    WorkspaceSyncError,
-    snapshot_workspace,
-)
-from wmo.config import load_settings
-from wmo.engine.play import parse_action
-from wmo.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
-from wmo.harness.live_session import LiveSession, SessionEvent, ToolOutcome
-from wmo.harness.pi_local import LocalStdioChannel, start_local_live_runner
-from wmo.harness.pi_vendor import pi_agent_code_surfaces
-from wmo.harness.tools import READ_SKILL, resolve_tools
-from wmo.harness.workspace_patch import WorkspacePatchError
-from wmo.platform.client import PlatformClient, PlatformError, RemoteAgentSession
-from wmo.platform.credentials import PlatformCredentials, load_credentials
-from wmo.providers.base import (
-    PreparableProvider,
-    ProviderConfig,
-    ProviderKind,
-    ToolCallingProvider,
-)
-from wmo.providers.models import resolve_provider_model
-from wmo.providers.registry import get_provider
-
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from llm_waterfall import ChatRequest, ChatResponse
 
+    from wmo.cli.hosted_session import (
+        DetachedCommandDriver,
+        DetachedStartDriver,
+        LiveWorkspace,
+        SessionAction,
+    )
+    from wmo.cli.session_state import SessionStateStore, WorkspaceCheckpoint
+    from wmo.cli.workspace_sync import WorkspaceSnapshot
     from wmo.core.types import JsonObject
+    from wmo.harness.doc import HarnessDoc
+    from wmo.harness.live_session import LiveSession, SessionEvent, ToolOutcome
+    from wmo.harness.pi_local import LocalStdioChannel
+    from wmo.platform.client import PlatformClient, RemoteAgentSession
+    from wmo.platform.credentials import PlatformCredentials
+    from wmo.providers.base import ToolCallingProvider
 
 _console = Console()
 
@@ -99,6 +76,8 @@ class _JailEscape(RuntimeError):
 
 def _capped(content: str, *, is_error: bool = False) -> ToolOutcome:
     """Cap tool output to the head+tail budget with a truncation marker."""
+    from wmo.harness.live_session import ToolOutcome
+
     if len(content) <= _TOOL_OUTPUT_CAP:
         return ToolOutcome(content=content, is_error=is_error)
     half = _TOOL_OUTPUT_CAP // 2
@@ -114,6 +93,8 @@ def _assemble(doc: HarnessDoc) -> tuple[str, list, dict[str, str], dict[str, str
     the resolved tool specs, the code surfaces as {path: content} (the agent's own
     code, materialized into the local runner), and skill bodies answered host-side.
     """
+    from wmo.harness.tools import READ_SKILL, resolve_tools
+
     tool_names = doc.tools()
     if doc.skills() and READ_SKILL.name not in tool_names:
         tool_names.append(READ_SKILL.name)
@@ -132,6 +113,9 @@ def _pi_node_baseline() -> HarnessDoc:
     pi code surfaces on and pins ``param:runtime-kind = pi-node`` so a not-logged-in
     session has a runnable agent without fetching a champion.
     """
+    from wmo.harness.doc import RUNTIME_KIND_ID, HarnessDoc, Surface, SurfaceKind
+    from wmo.harness.pi_vendor import pi_agent_code_surfaces
+
     base = HarnessDoc.baseline("local-session")
     surfaces = [
         *base.surfaces,
@@ -161,6 +145,8 @@ class LocalToolExecutor:
         self, name: str, args: JsonObject, emit: Callable[[str, str], None]
     ) -> ToolOutcome:
         """Execute one tool call locally; a failure is an observation, not a crash."""
+        from wmo.harness.live_session import ToolOutcome
+
         try:
             if name == "bash":
                 return self._bash(str(args.get("command", "")), emit)
@@ -239,6 +225,8 @@ class LocalPiRunRecorder:
 
     def finish(self, *, ended_reason: str, error: str | None) -> None:
         """Report the terminal state and release the HTTP client."""
+        from wmo.platform.client import PlatformError
+
         status = "failed" if error is not None else "ended"
         with contextlib.suppress(PlatformError):
             self._client.finish_local_pi_run(
@@ -347,6 +335,9 @@ class LocalLiveDriver:
 
     def run(self) -> None:
         """Boot the local runner, drive the session, and always tear down."""
+        from wmo.harness.live_session import LiveSession
+        from wmo.harness.pi_local import start_local_live_runner
+
         system, tool_specs, files, skill_bodies = _assemble(self._doc)
         _console.print("[dim]starting the built-in pi harness locally...[/dim]")
         session: LiveSession | None = None
@@ -492,6 +483,8 @@ class RemoteAgentCommandReader(threading.Thread):
         Returns:
             Whether the command was accepted.
         """
+        from wmo.platform.client import PlatformError
+
         try:
             self._client.post_agent_session_command(
                 self._agent_id, self._session_id, kind, text=text
@@ -529,6 +522,12 @@ class RemoteAgentDriver:
 
     def run(self) -> None:
         """Run and stream one E2B session, syncing local files only when requested."""
+        from wmo.cli.hosted_session import LiveWorkspace
+        from wmo.cli.session_state import SessionStateError
+        from wmo.cli.workspace_sync import WorkspaceSyncError, snapshot_workspace
+        from wmo.harness.workspace_patch import WorkspacePatchError
+        from wmo.platform.client import PlatformError
+
         try:
             initial: WorkspaceSnapshot | None = None
             if self._jail is not None:
@@ -589,6 +588,12 @@ class RemoteAgentDriver:
         next send/attach/end catches up from here. No final workspace sync
         runs: the session stays alive.
         """
+        from wmo.cli.session_state import (
+            DetachedSessionState,
+            SessionStateError,
+            WorkspaceCheckpoint,
+        )
+
         checkpoint: WorkspaceCheckpoint | None = None
         base_archive: bytes | None = None
         if workspace is not None and self._jail is not None:
@@ -638,6 +643,11 @@ class RemoteAgentDriver:
         Returns:
             The terminal session record, or ``None`` when the user detached.
         """
+        from wmo.cli.hosted_session import patch_revision
+        from wmo.cli.workspace_sync import WorkspaceSyncError
+        from wmo.harness.live_session import SessionEvent
+        from wmo.platform.client import PlatformError
+
         last_workspace_push = time.monotonic()
         sink = TerminalEventSink(recorder=None, on_running=lambda _running: None)
         saw_running = False
@@ -728,6 +738,8 @@ class RemoteWorldModelDriver:
 
     def run(self) -> None:
         """Create one hosted session and step it until the user exits."""
+        from wmo.platform.client import PlatformError
+
         try:
             session = self._client.create_world_model_session(self._target_id, task=self._task)
             _console.print(
@@ -747,6 +759,9 @@ class RemoteWorldModelDriver:
 
     def _loop(self, session_id: str) -> None:
         """Read actions and render hosted observations."""
+        from wmo.engine.play import parse_action
+        from wmo.platform.client import PlatformError
+
         while True:
             try:
                 line = _console.input("[bold]agent>[/bold] ").strip()
@@ -809,6 +824,16 @@ def _local_worker_provider(provider: str | None, model: str | None) -> ToolCalli
         typer.BadParameter: The provider name is unknown, the model cannot do tool calling, or
             the backend cannot be prepared. Every message names `wmo providers set`.
     """
+    from wmo.config import load_settings
+    from wmo.providers.base import (
+        PreparableProvider,
+        ProviderConfig,
+        ProviderKind,
+        ToolCallingProvider,
+    )
+    from wmo.providers.models import resolve_provider_model
+    from wmo.providers.registry import get_provider
+
     configured = load_settings().models.resolve("worker")
     provider_name = provider or (
         configured.provider if configured is not None else _DEFAULT_PROVIDER
@@ -1012,6 +1037,11 @@ def _build_session_command_driver(
     *, action: SessionAction, text: str | None, session_override: str | None
 ) -> DetachedCommandDriver:
     """Assemble the authenticated driver behind --send/--attach/--end."""
+    from wmo.cli.hosted_session import DetachedCommandDriver
+    from wmo.cli.session_state import SessionStateStore
+    from wmo.platform.client import PlatformClient
+    from wmo.platform.credentials import load_credentials
+
     credentials = load_credentials()
     if not credentials.is_complete():
         raise typer.BadParameter("run `wmo login` to use hosted agent sessions")
@@ -1051,6 +1081,11 @@ def _build_driver(
     detach: bool = False,
 ) -> LocalLiveDriver | RemoteAgentDriver | RemoteWorldModelDriver | DetachedStartDriver:
     """Resolve the target kind once and assemble its execution driver."""
+    from wmo.cli.hosted_session import DetachedStartDriver
+    from wmo.cli.session_state import SessionStateStore
+    from wmo.platform.client import PlatformClient, PlatformError
+    from wmo.platform.credentials import load_credentials
+
     credentials = load_credentials()
     logged_in = credentials.is_complete()
 

@@ -11,20 +11,15 @@ docs/reference/closed_loop.md names.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 
-from wmo.cli.model_roles import resolve_opt_in_model_provider
-from wmo.config import WorldModelStore
-from wmo.engine import load_world_model
-from wmo.evals.agreement import compute_agreement
-from wmo.evals.closed_loop import ClosedLoopEval, ClosedLoopReport
-from wmo.evals.gold import GoldJudge, GoldVerdict
-from wmo.evals.tasks import load_tasks
-from wmo.harness.doc import MAX_TURNS_ID, HarnessDoc, Surface, SurfaceKind
-from wmo.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
-from wmo.harness.store import HarnessStore
+if TYPE_CHECKING:
+    from wmo.evals.closed_loop import ClosedLoopReport
+    from wmo.evals.gold import GoldVerdict
+    from wmo.harness.doc import HarnessDoc
 
 
 def run_closed_loop(
@@ -53,6 +48,14 @@ def run_closed_loop(
     (tool calls stay answered by the world model host-side), running all (task, attempt) cells
     at once unless `--eval-concurrency` caps them.
     """
+    from wmo.cli.model_roles import resolve_opt_in_model_provider
+    from wmo.config import WorldModelStore
+    from wmo.engine import load_world_model
+    from wmo.evals.closed_loop import ClosedLoopEval
+    from wmo.evals.gold import GoldJudge
+    from wmo.evals.tasks import load_tasks
+    from wmo.harness.runtime import DEFAULT_MAX_TURNS, AgentRuntime
+
     if harness_backend not in ("local", "e2b"):
         raise typer.BadParameter(
             f"unknown --harness-backend {harness_backend!r}; choose local or e2b"
@@ -170,6 +173,8 @@ def run_closed_loop(
 
 def run_agreement(console: Console, *, report_a: str, report_b: str, threshold: float) -> None:
     """Compare two saved closed-loop reports task-by-task and print the agreement verdict."""
+    from wmo.evals.agreement import compute_agreement
+
     a = _load_report(report_a)
     b = _load_report(report_b)
     result = compute_agreement(a, b, pass_threshold=threshold)
@@ -184,6 +189,8 @@ def run_agreement(console: Console, *, report_a: str, report_b: str, threshold: 
 
 
 def _load_report(path: str) -> ClosedLoopReport:
+    from wmo.evals.closed_loop import ClosedLoopReport
+
     try:
         return ClosedLoopReport.model_validate_json(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -192,12 +199,16 @@ def _load_report(path: str) -> ClosedLoopReport:
 
 def _with_max_turns(doc: HarnessDoc, max_turns: int) -> HarnessDoc:
     """A copy of `doc` with its max-turns surface replaced (re-validated via the constructor)."""
+    from wmo.harness.doc import MAX_TURNS_ID, HarnessDoc, Surface, SurfaceKind
+
     surfaces = [s for s in doc.surfaces if s.id != MAX_TURNS_ID]
     surfaces.append(Surface(id=MAX_TURNS_ID, kind=SurfaceKind.PARAM, content=str(max_turns)))
     return HarnessDoc(name=doc.name, version=doc.version, surfaces=surfaces)
 
 
 def _load_harness(name: str | None, root: str) -> HarnessDoc | None:
+    from wmo.harness.store import HarnessStore
+
     if name is None:
         return None
     base, _, ref = name.partition("@")

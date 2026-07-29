@@ -33,7 +33,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -42,49 +42,29 @@ from rich.markup import escape
 from rich.prompt import Confirm
 from rich.table import Table
 
-from wmo.agents.default import default_agent
 from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.model_roles import load_settings_or_abort
 from wmo.config import ARTIFACT_DIR
-from wmo.config.settings import ModelRole, save_settings, settings_path
-from wmo.config.store import validate_name
-from wmo.core.types import JsonObject
-from wmo.distill.config import DistillConfig, load_distill_config
-from wmo.distill.cost import CostEstimate, estimate_run_cost
-from wmo.distill.gate import DistillGateRecord
-from wmo.distill.loop import (
-    DEFAULT_DISTILL_HARNESS,
-    STUDENT_AFTER_EVAL,
-    STUDENT_BEFORE_EVAL,
-    TEACHER_BASELINE_EVAL,
-    DistillBudgetError,
-    DistillEvalReport,
-    DistillProgress,
-    DistillResult,
-    run_distillation,
-)
-from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
-from wmo.distill.store import (
-    DEFAULT_TINKER_OPENAI_ENDPOINT,
-    STUDENT_CHAT_MAX_TOKENS_FIELD,
-    AdapterStore,
-    DistillRunStore,
-    build_handoff_toml,
-)
-from wmo.distill.tau2 import parse_tau2_task_id
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.e2b_reap import (
-    DEFAULT_E2B_SANDBOX_CAP,
-    E2B_API_KEY_ENV,
-    E2B_SANDBOX_CAP_ENV,
-    CapacityCheck,
-    check_capacity,
-    is_credential_error,
-)
-from wmo.harness.population import write_json_atomic
-from wmo.harness.store import HarnessStore
-from wmo.optimize.outcomes import OutcomeMatrix
-from wmo.optimize.teacher import DEFAULT_MIN_GAP, TeacherSearchVerdict, select_teacher
+
+if TYPE_CHECKING:
+    # Type-only: real imports are local to the commands and helpers that construct or inspect
+    # these values, so importing this module never pulls the distill/harness/optimize bodies
+    # behind it.
+    from wmo.core.types import JsonObject
+    from wmo.distill.config import DistillConfig
+    from wmo.distill.cost import CostEstimate
+    from wmo.distill.gate import DistillGateRecord
+    from wmo.distill.loop import DistillEvalReport, DistillProgress, DistillResult
+    from wmo.distill.store import AdapterStore, DistillRunStore
+    from wmo.harness.doc import HarnessDoc
+    from wmo.harness.e2b_reap import CapacityCheck
+    from wmo.optimize.teacher import TeacherSearchVerdict
+
+# Literal mirrors of constants that otherwise live behind a heavy import (`wmo.distill.loop`,
+# `wmo.optimize.teacher`). Typer evaluates Option defaults at command-definition time, so these
+# have to be values, not names imported from those modules; the real constants are re-imported
+# inside the command bodies that need their behavior.
+_DEFAULT_DISTILL_HARNESS = "pi"
+_DEFAULT_MIN_GAP = 0.10
 
 DISTILL_RUN_RECORD = "distill-run.json"
 """The CLI-level pin file inside the run dir (see `DistillCliRunRecord`)."""
@@ -142,13 +122,13 @@ def run(
         "gate are measured here, disjoint from --task-ids. Required to start a run.",
     ),
     harness: str = typer.Option(
-        DEFAULT_DISTILL_HARNESS,
+        _DEFAULT_DISTILL_HARNESS,
         "--harness",
         help="Stored harness document supplying the rollout params (temperature, max turns, "
         "max output tokens); under the harbor source its hash also keys every harbor job "
         "(the harbor agent is always terminus-2, never this document's runtime), and the "
         f"tau2 source takes its params from the config alone. The bare literal "
-        f"{DEFAULT_DISTILL_HARNESS!r} is the built-in default agent; 'name@ref' pins a stored "
+        f"{_DEFAULT_DISTILL_HARNESS!r} is the built-in default agent; 'name@ref' pins a stored "
         "version. Pinned for the whole run.",
     ),
     backend: str = typer.Option(
@@ -218,6 +198,8 @@ def report(
 
         wmo optimize distill report --run-dir runs/d1
     """
+    from wmo.distill.store import DistillRunStore
+
     store = DistillRunStore(run_dir)
     gate = _load_gate(store)
     color = "green" if gate.accepted else "yellow"
@@ -242,7 +224,7 @@ def probe(
         "which is the one whose price makes distillation worth doing at all.",
     ),
     min_gap: float = typer.Option(
-        DEFAULT_MIN_GAP,
+        _DEFAULT_MIN_GAP,
         "--min-gap",
         min=0.0,
         max=1.0,
@@ -264,6 +246,9 @@ def probe(
     insufficient evidence (this matrix is too thin to say either way; sweep more scenarios).
     Anything else is the usual usage or IO failure.
     """
+    from wmo.optimize.outcomes import OutcomeMatrix
+    from wmo.optimize.teacher import select_teacher
+
     path = Path(matrix_file)
     if not path.is_file():
         raise typer.BadParameter(
@@ -450,6 +435,10 @@ def run_distill(
     # scope, so importing its helpers back at module scope would be a circular
     # import.
     from wmo.cli.harness_app import _load_harbor_task_ids
+    from wmo.distill.cost import estimate_run_cost
+    from wmo.distill.loop import DEFAULT_DISTILL_HARNESS, DistillBudgetError, run_distillation
+    from wmo.distill.store import AdapterStore, DistillRunStore
+    from wmo.harness.population import write_json_atomic
 
     backend_override: Literal["local", "e2b"] | None
     if backend is None:
@@ -648,6 +637,8 @@ def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
     Raises:
         typer.BadParameter: If any prerequisite is missing.
     """
+    from wmo.distill.tau2 import parse_tau2_task_id
+
     assert cfg.tau2 is not None
     if cfg.tau2.backend == "e2b":
         raise typer.BadParameter(
@@ -693,6 +684,8 @@ def _preflight_tau2(cfg: DistillConfig, task_ids: Sequence[str]) -> None:
 
 def _load_config(path: Path) -> DistillConfig:
     """Load the run TOML, turning load failures into usage errors."""
+    from wmo.distill.config import load_distill_config
+
     try:
         return load_distill_config(path)
     except FileNotFoundError as exc:
@@ -768,6 +761,11 @@ def _resolve_seed_doc(root: str, harness_ref: str) -> tuple[str, HarnessDoc, int
     base name, the document, and the resolved store version (None for the
     built-in seed) so a resume can pin exactly what the run started from.
     """
+    from wmo.agents.default import default_agent
+    from wmo.config.store import validate_name
+    from wmo.distill.loop import DEFAULT_DISTILL_HARNESS
+    from wmo.harness.store import HarnessStore
+
     base, _, ref = harness_ref.partition("@")
     try:
         validate_name(base)
@@ -791,6 +789,9 @@ def _pinned_seed_doc(root: str, record: DistillCliRunRecord) -> tuple[str, Harne
     any store edit) between sessions cannot silently change which harness the
     remaining trials run.
     """
+    from wmo.agents.default import default_agent
+    from wmo.harness.store import HarnessStore
+
     base = record.agent.partition("@")[0]
     if record.seed_version is None:
         doc = default_agent(base)
@@ -830,6 +831,9 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
         typer.BadParameter: If capacity cannot be measured (missing extra or credential) or
             too few slots are free after reaping the safe class.
     """
+    from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
+    from wmo.harness.e2b_reap import E2B_API_KEY_ENV, check_capacity, is_credential_error
+
     required = trial_concurrency * E2B_SANDBOXES_PER_TRIAL
     try:
         check = check_capacity(required=required)
@@ -867,6 +871,9 @@ def _preflight_e2b_capacity(console: Console, *, trial_concurrency: int) -> None
 
 def _capacity_failure_message(check: CapacityCheck, trial_concurrency: int) -> str:
     """The actionable message for a run that cannot get enough sandbox slots."""
+    from wmo.distill.rollouts import E2B_SANDBOXES_PER_TRIAL
+    from wmo.harness.e2b_reap import DEFAULT_E2B_SANDBOX_CAP, E2B_SANDBOX_CAP_ENV
+
     reaped = (
         f" Reaping orphans of dead local runs freed {check.reaped} slot(s) and was not enough."
         if check.reaped
@@ -990,6 +997,8 @@ def _print_result(
     base_model: str,
 ) -> None:
     """Print the gate verdict, artifact paths, and the serving handoff snippet."""
+    from wmo.distill.store import build_handoff_toml
+
     gate = result.gate
     color = "green" if gate.accepted else "yellow"
     console.print(f"[{color}]gate[/{color}] {escape(gate.reason)}")
@@ -1030,6 +1039,10 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
     the agent model, so it always asks, even under `--yes`; a rejected gate
     skips the write with a warning.
     """
+    from wmo.cli.model_roles import load_settings_or_abort
+    from wmo.config.settings import ModelRole, save_settings, settings_path
+    from wmo.distill.store import DEFAULT_TINKER_OPENAI_ENDPOINT, STUDENT_CHAT_MAX_TOKENS_FIELD
+
     if result.adapter_version is None:
         console.print(
             "[yellow]--promote skipped[/yellow]: the gate rejected this adapter, so "
@@ -1069,10 +1082,12 @@ def _maybe_promote(console: Console, result: DistillResult, cfg: DistillConfig, 
 
 # -- report ------------------------------------------------------------------------------------
 
+# Literal mirrors of `wmo.distill.loop`'s eval keys, kept here so importing this module for
+# `--help` does not pull the distill loop's own heavy dependencies.
 _REPORT_ROWS: tuple[tuple[str, str], ...] = (
-    ("teacher", TEACHER_BASELINE_EVAL),
-    ("student before", STUDENT_BEFORE_EVAL),
-    ("student after", STUDENT_AFTER_EVAL),
+    ("teacher", "baseline-teacher"),
+    ("student before", "baseline-student-before"),
+    ("student after", "student-after"),
 )
 """The three held-out measurements the gate compares, in table order, paired
 with the `evals/<key>.json` each one was written to."""
@@ -1080,6 +1095,8 @@ with the `evals/<key>.json` each one was written to."""
 
 def _load_gate(store: DistillRunStore) -> DistillGateRecord:
     """Read the run's `gate.json`, turning a missing or corrupt file into a usage error."""
+    from wmo.distill.gate import DistillGateRecord
+
     try:
         text = store.gate_path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -1101,6 +1118,8 @@ def _load_eval_report(store: DistillRunStore, key: str) -> DistillEvalReport | N
     aborted run may have none), so the table degrades to the rates gate.json
     already carries rather than failing.
     """
+    from wmo.distill.loop import DistillEvalReport
+
     try:
         text = (store.evals_dir / f"{key}.json").read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1162,7 +1181,7 @@ def _print_trained_artifact(console: Console, store: DistillRunStore) -> None:
         console: Where to print.
         store: The run store to read the student-after eval report from.
     """
-    after = _load_eval_report(store, STUDENT_AFTER_EVAL)
+    after = _load_eval_report(store, "student-after")
     if after is None or not after.provider_model:
         return
     console.print(f"trained artifact: {escape(after.provider_model)}")
@@ -1172,8 +1191,8 @@ def _print_paired_delta(console: Console, store: DistillRunStore, gate: DistillG
     """Print what training moved, on the same holdout split the gate read."""
     binary = gate.student_after_solve_rate - gate.student_before_solve_rate
     console.print(f"paired delta (after - before): {binary:+.3f} solve rate")
-    before = _load_eval_report(store, STUDENT_BEFORE_EVAL)
-    after = _load_eval_report(store, STUDENT_AFTER_EVAL)
+    before = _load_eval_report(store, "baseline-student-before")
+    after = _load_eval_report(store, "student-after")
     if before is not None and after is not None and before.graded_trials and after.graded_trials:
         graded = after.graded_solve_rate - before.graded_solve_rate
         console.print(f"  graded (same trials at test resolution): {graded:+.3f}")
