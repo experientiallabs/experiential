@@ -88,7 +88,7 @@ Where do traces come from? Two answers:
 - **An existing benchmark**: `uv run wmo download tau-bench` fetches a published
   trace corpus captured from real benchmark runs, and `wmo build --file
   packages/environment-capture/tau-bench/traces.otel.jsonl --name tau-bench` builds
-  from it. Ten benchmarks are published; `wmo download` with no arguments lists them.
+  from it. Run `wmo download` with no arguments to list everything published.
 
 (`--train-split 0.5` only matters for a corpus this tiny: the router is measured on
 the TEST band of the build's three-way split, and 12 traces at the default split leave
@@ -167,6 +167,7 @@ dial; `GET /v1/endpoints/support/savings` stays honest about what a free pool ca
 (nothing, and it says so).
 
 As more traces accumulate, re-run `wmo build` (same `--name` rebuilds in place) and
-`wmo optimize model` to refresh the simulation and the router; new pool entries join
-the next sweep automatically, and `enabled = false` retires a candidate from future
-fits without touching policies that already measured it.
+`wmo optimize model` to refresh the simulation and the router, then restart
+`wmo serve` to pick the refreshed policy up (the server loads it at startup). New
+pool entries join the next sweep automatically, and `enabled = false` retires a
+candidate from future fits without touching policies that already measured it.
