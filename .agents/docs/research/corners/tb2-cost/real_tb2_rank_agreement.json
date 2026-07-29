@@ -1,0 +1,77 @@
+{
+ "rows": [
+  {
+   "model": "fable-5",
+   "real_rate": 0.8823529411764706,
+   "sim_mean": 0.4125,
+   "n_sim": 8
+  },
+  {
+   "model": "gpt-5.5",
+   "real_rate": 0.7647058823529411,
+   "sim_mean": 0.375,
+   "n_sim": 8
+  },
+  {
+   "model": "opus-4-8",
+   "real_rate": 0.7647058823529411,
+   "sim_mean": 0.7685714285714286,
+   "n_sim": 7
+  },
+  {
+   "model": "sonnet-5",
+   "real_rate": 0.7058823529411765,
+   "sim_mean": 0.2875,
+   "n_sim": 8
+  },
+  {
+   "model": "opus-5",
+   "real_rate": 0.6470588235294118,
+   "sim_mean": 0.2625,
+   "n_sim": 8
+  },
+  {
+   "model": "kimi-k3",
+   "real_rate": 0.6470588235294118,
+   "sim_mean": 0.63125,
+   "n_sim": 8
+  },
+  {
+   "model": "kimi-k2.6",
+   "real_rate": 0.5882352941176471,
+   "sim_mean": 0.41428571428571426,
+   "n_sim": 7
+  },
+  {
+   "model": "deepseek-v4-pro",
+   "real_rate": 0.5,
+   "sim_mean": 0.42142857142857143,
+   "n_sim": 7
+  },
+  {
+   "model": "glm-5.2",
+   "real_rate": 0.4117647058823529,
+   "sim_mean": 0.11249999999999999,
+   "n_sim": 8
+  },
+  {
+   "model": "haiku-4-5",
+   "real_rate": 0.4117647058823529,
+   "sim_mean": 0.6687500000000001,
+   "n_sim": 8
+  },
+  {
+   "model": "gpt-5.4-mini",
+   "real_rate": 0.35714285714285715,
+   "sim_mean": 0.575,
+   "n_sim": 8
+  },
+  {
+   "model": "qwen3.5-9b",
+   "real_rate": 0.2,
+   "sim_mean": 0.475,
+   "n_sim": 4
+  }
+ ],
+ "spearman": -0.16168941783425692
+}

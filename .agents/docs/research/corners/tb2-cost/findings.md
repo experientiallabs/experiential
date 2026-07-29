@@ -59,6 +59,38 @@ teacher sonnet-5 keeping 99% - recorded verbatim from `wmo.optimize.teacher`, an
 acted on: distillation is skipped by Silen's ruling (a distilled model from the earlier
 TB2 work already exists on HF).
 
+## The REAL Terminal-Bench 2 leg (Silen directive 2026-07-28: real harness + sim-to-real)
+
+All 13 pool candidates ran the REAL TB2 17-task holdout through harbor terminus-2 on E2B
+(1 attempt, litellm/tinker thin config, the distill lane's pins; timeouts and content
+refusals count as failures per the benchmark's own convention; 6 of 221 cells are
+persistent-infra holes, all on the two weakest models). Data:
+`real_tb2_leaderboard.json` (+ p50 episode seconds and $/task), raw trial dirs preserved
+at main checkout `.wmo/tb2-real/`, corpus + matrices at `.wmo/jt/tb2real/`.
+
+- REAL leaderboard headline: fable-5 15/17 (88%) at $6.50/task; gpt-5.5 and opus-4-8
+  76% at $0.93/$1.82; sonnet-5 71% at $0.72; tail: haiku-4-5 41%, gpt-5.4-mini 36%,
+  qwen3.5-9b 20%. REAL quality headroom exists here (52pt spread) and quality costs real
+  money - the inverse of the terminal-tasks one-shot corpus.
+- HARNESS VALIDATION: the qwen rows reproduce the distill lane's baselines within noise
+  (qwen3.6-27b 53% vs 49.0%; qwen3.5-9b 20% vs 21.6%; n=17 vs their 51 trials) - same
+  pins, same renderer, independent run.
+- THE SIM-TO-REAL RESULT, negative and kept: a WM built from these 201 real episodes
+  (`wmo build` medium, fidelity 0.241, $24.07) and swept with the same 13 candidates
+  (104 cells, ~$142 all-in, env/candidate ~1.0x) produces model rankings that DO NOT
+  track the real benchmark: Spearman rho = -0.162 (n=12 models;
+  `real_tb2_rank_agreement.json`), where tau's sim-to-real was +0.639. The sim winner is
+  opus-4-8 - the WM's own serve AND judge model (sim 0.769 vs real 76%), while sonnet-5
+  (real 71%) sims at 0.287 and haiku-4-5 (real 41%) sims at 0.669. Named hypothesis, not
+  proven mechanism: self-model affinity in the serve/judge loop plus a scenario band too
+  thin to average over (8 scenarios x 1 episode).
+- WHY THIS MATTERS for the corner: on workloads where the WM's fidelity is low (0.24
+  here), the routing matrix is not yet evidence about real deployment - the honest
+  pipeline must gate routing claims on a sim-to-real check, exactly the machinery this
+  leg demonstrates. tau passes that gate; TB2 with a 201-trace corpus does not (corpus
+  size, judge calibration, and self-model bias are the three candidate fixes, in
+  measurement order).
+
 ## Caveats, named
 
 1. **Judge**: wm rewards from the build's own rubric; the fleet-wide wm-scorer autopsy
