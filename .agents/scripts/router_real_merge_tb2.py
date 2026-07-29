@@ -61,8 +61,19 @@ def main() -> int:
     parser.add_argument("--expected-tasks", type=int, default=89)
     args = parser.parse_args()
 
-    sources = [args.central / "rows.jsonl", *sorted(args.shards.glob("*/rows.jsonl"))]
-    all_rows = [row for path in sources for row in _rows(path)]
+    central_path = args.central / "rows.jsonl"
+    shard_paths = sorted(args.shards.glob("*/rows.jsonl"))
+    sources = [central_path, *shard_paths]
+    central_rows = _rows(central_path)
+    # The central process owns GPT-5.5 only. A watchdog stops it immediately after that model's
+    # report so the other eight isolated shards can run in parallel. If it crosses the loop
+    # boundary before the watchdog interrupt arrives, those speculative next-model rows must not
+    # replace the corresponding shard's preregistered run.
+    ignored_central_rows = sum(row.get("model") != "gpt-5.5" for row in central_rows)
+    all_rows = [
+        *[row for row in central_rows if row.get("model") == "gpt-5.5"],
+        *[row for path in shard_paths for row in _rows(path)],
+    ]
     chosen = _selected(all_rows)
     pool = load_pool(args.pool)
     outcomes = [ScenarioOutcome.model_validate(row) for row in chosen]
@@ -85,6 +96,7 @@ def main() -> int:
         "model_cost_usd": sum(row.cost_usd for row in outcomes),
         "environment_cost_usd": None,
         "environment_cost_note": "E2B invoice rate is not exposed in Harbor artifacts",
+        "ignored_central_non_gpt55_rows": ignored_central_rows,
         "sources": [str(path) for path in sources if path.is_file()],
     }
     write_text_atomic(
