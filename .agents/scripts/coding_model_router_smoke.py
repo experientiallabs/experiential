@@ -14,7 +14,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
-from coding_model_router_usage import exact_cost_usd, usage_from_trace, usage_metering_error
+from coding_model_router_usage import (
+    ESTIMATE_METHOD,
+    estimate_usage_from_trace,
+    exact_cost_usd,
+    usage_from_trace,
+    usage_metering_error,
+)
+from e2b import Sandbox
 from harbor.models.job.config import JobConfig
 from harbor.models.trial.result import TrialResult
 
@@ -39,6 +46,7 @@ ARMS = ("oai-luna-high", "ant-haiku45")
 MAX_LOGICAL_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
 SMOKE_MODEL_SPEND_CAP_USD = 10.0
+E2B_ACCOUNT_CAP = 100
 INFRASTRUCTURE_STOPS = frozenset(
     {
         "error",
@@ -65,6 +73,17 @@ def _utc_now() -> str:
 
 def _scenario_id(task_id: str) -> str:
     return f"{BENCHMARK}:{task_id}"
+
+
+def _require_e2b_capacity() -> None:
+    """Fail before paid work when the configured account cap has no slot."""
+    paginator = Sandbox.list(limit=E2B_ACCOUNT_CAP)
+    active = paginator.next_items()
+    if len(active) >= E2B_ACCOUNT_CAP or paginator.has_next:
+        raise RuntimeError(
+            f"E2B has at least {len(active)} active sandboxes against the frozen "
+            f"{E2B_ACCOUNT_CAP}-sandbox account cap"
+        )
 
 
 def _trace_path(artifact_dir: Path) -> Path:
@@ -146,9 +165,10 @@ def _outcome(
     stop_reason = stop if isinstance(stop, str) else ""
     failure_class = _failure_class(cell, stop_reason)
     metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
-    if metering_error:
-        failure_class = "metering"
-    ungradeable = failure_class in {"infrastructure", "metering"}
+    usage_estimated = bool(metering_error) and failure_class != "infrastructure"
+    if usage_estimated:
+        usage = estimate_usage_from_trace(trace)
+    ungradeable = failure_class == "infrastructure"
     return ScenarioOutcome(
         scenario_id=_scenario_id(cell.task_id),
         task=instruction if isinstance(instruction, str) else cell.task_id,
@@ -163,18 +183,18 @@ def _outcome(
         tool_calls=_tool_calls(trace),
         stop_reason=stop_reason,
         usage=usage.total,
-        cost_usd=0.0 if metering_error else exact_cost_usd(entry, usage),
+        cost_usd=exact_cost_usd(entry, usage),
         call_seconds=usage.call_seconds,
         call_input_tokens=usage.call_input_tokens,
         call_output_tokens=usage.call_output_tokens,
         call_cached_input_tokens=usage.call_cached_input_tokens,
         call_cache_write_input_tokens=usage.call_cache_write_input_tokens,
+        usage_accounting="estimated" if usage_estimated else "exact",
+        usage_estimate_method=ESTIMATE_METHOD if usage_estimated else "",
         wall_seconds=_wall_seconds(artifact_dir),
         completion_status=(
             "infrastructure_failure"
             if failure_class == "infrastructure"
-            else "metering_failure"
-            if failure_class == "metering"
             else "scored_pass"
             if cell.passed
             else "scored_agent_failure"
@@ -183,7 +203,7 @@ def _outcome(
         ),
         failure_class=failure_class,
         artifact_dir=str(artifact_dir.resolve()),
-        error=(metering_error or _trace_error(trace) or cell.note or None) if ungradeable else None,
+        error=(_trace_error(trace) or cell.note or None) if ungradeable else None,
         remeasured=logical_attempt > 1,
     )
 
@@ -240,8 +260,11 @@ def _upsert_ledger(path: Path, outcome: ScenarioOutcome) -> None:
         "model_cost_accounting_status": (
             "missing_provider_usage"
             if outcome.failure_class == "metering"
+            else "estimated_from_trace"
+            if outcome.usage_accounting == "estimated"
             else "exact_from_provider_usage"
         ),
+        "usage_estimate_method": outcome.usage_estimate_method,
         "task_environment_cost_usd": None,
         "task_environment_cost_note": "E2B invoice rate is absent from Harbor artifacts",
         "completion_status": outcome.completion_status,
@@ -336,11 +359,6 @@ def _run_cell(
     pool: ModelPool,
 ) -> None:
     matrix = _load_matrix(matrix_path, pool)
-    if any(outcome.failure_class == "metering" for outcome in matrix.outcomes):
-        raise RuntimeError(
-            "smoke has a paid attempt with missing provider usage; exact spend and the $10 cap "
-            "cannot be proven, so paid execution is stopped"
-        )
     if _completed(matrix, task_id, entry.name):
         logger.info("resume: keeping completed %s x %s", task_id, entry.name)
         return
@@ -426,7 +444,39 @@ def _normalize_existing_ungradeable_attempts(
         stop_reason = stop if isinstance(stop, str) else ""
         usage = usage_from_trace(trace)
         metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
-        if metering_error:
+        if metering_error and outcome.reward is not None:
+            estimated = estimate_usage_from_trace(trace)
+            entry = next(
+                pool_entry for pool_entry in matrix.pool if pool_entry.name == outcome.model
+            )
+            outcome.usage = estimated.total
+            outcome.cost_usd = exact_cost_usd(entry, estimated)
+            outcome.call_seconds = estimated.call_seconds
+            outcome.call_input_tokens = estimated.call_input_tokens
+            outcome.call_output_tokens = estimated.call_output_tokens
+            outcome.call_cached_input_tokens = estimated.call_cached_input_tokens
+            outcome.call_cache_write_input_tokens = estimated.call_cache_write_input_tokens
+            outcome.usage_accounting = "estimated"
+            outcome.usage_estimate_method = ESTIMATE_METHOD
+            outcome.failure_class = (
+                ""
+                if outcome.reward == 1.0
+                else "task_failure"
+                if stop_reason == "submitted"
+                else "agent_failure"
+            )
+            outcome.completion_status = (
+                "scored_pass"
+                if outcome.reward == 1.0
+                else "scored_failure"
+                if stop_reason == "submitted"
+                else "scored_agent_failure"
+            )
+            outcome.error = None
+            _upsert_ledger(ledger_path, outcome)
+            changed = True
+            continue
+        if metering_error and outcome.usage_accounting != "estimated":
             failure_class = "metering"
             completion_status = "metering_failure"
             error = metering_error
@@ -628,6 +678,12 @@ def _fit(root: Path, matrix: OutcomeMatrix) -> None:
         floor_q=0.0,
     )
     heldout = evaluate_policy(fitted.policy, matrix, [_scenario_id(HELDOUT_TASK)])
+    exact_spend = sum(
+        outcome.cost_usd for outcome in matrix.outcomes if outcome.usage_accounting == "exact"
+    )
+    estimated_spend = sum(
+        outcome.cost_usd for outcome in matrix.outcomes if outcome.usage_accounting == "estimated"
+    )
     _write_json(
         root / "smoke-report.json",
         {
@@ -635,6 +691,11 @@ def _fit(root: Path, matrix: OutcomeMatrix) -> None:
             "cells": len(matrix.outcomes),
             "gradeable_cells": sum(outcome.reward is not None for outcome in matrix.outcomes),
             "model_spend_usd": _model_spend(matrix),
+            "exact_model_spend_usd": exact_spend,
+            "estimated_model_spend_usd": estimated_spend,
+            "estimated_usage_cells": sum(
+                outcome.usage_accounting == "estimated" for outcome in matrix.outcomes
+            ),
             "fit_task": FIT_TASK,
             "heldout_task": HELDOUT_TASK,
             "fit": fitted.model_dump(mode="json"),
@@ -711,6 +772,7 @@ def run(root: Path, template_path: Path, *, interrupt_after_cells: int | None) -
     for variable in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "E2B_API_KEY"):
         if not os.environ.get(variable):
             raise ValueError(f"{variable} is required for the integrated smoke")
+    _require_e2b_capacity()
     pool = load_pool(root.parent / "pool.toml")
     matrix_path = root / "outcomes.json"
     ledger_path = root.parent / "spend-ledger.jsonl"

@@ -87,6 +87,19 @@ def test_matrix_round_trips_through_json(tmp_path: Path) -> None:
     assert loaded == matrix
 
 
+def test_estimated_usage_provenance_round_trips(tmp_path: Path) -> None:
+    matrix = _matrix()
+    matrix.outcomes[0].usage_accounting = "estimated"
+    matrix.outcomes[0].usage_estimate_method = "trace-char-prefix-4k-overhead-v1"
+    path = tmp_path / "outcomes.json"
+
+    matrix.save(path)
+    loaded = OutcomeMatrix.load(path)
+
+    assert loaded.outcomes[0].usage_accounting == "estimated"
+    assert loaded.outcomes[0].usage_estimate_method == "trace-char-prefix-4k-overhead-v1"
+
+
 def test_mean_reward_unknown_model_errors() -> None:
     with pytest.raises(KeyError, match="fable-5"):
         _matrix().mean_reward("nope")

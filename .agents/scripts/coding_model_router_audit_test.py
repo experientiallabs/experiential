@@ -157,6 +157,7 @@ def test_empty_root_fails_closed(tmp_path: Path) -> None:
     assert result.ready_for_material_paid_execution is False
     assert result.target_achieved is None
     assert result.conservative_budget_debit_usd == 0.0
+    assert result.estimated_model_spend_usd == 0.0
     assert result.blocking_requirements
 
 
@@ -170,6 +171,7 @@ def test_complete_evidence_can_conclude_target_not_reached(tmp_path: Path) -> No
     assert result.ready_for_material_paid_execution is True
     assert result.known_model_spend_usd == 1.25
     assert result.conservative_budget_debit_usd == 0.0
+    assert result.estimated_model_spend_usd == 0.0
     assert not result.blocking_requirements
 
 
@@ -191,7 +193,30 @@ def test_unknown_cost_event_blocks_completion(tmp_path: Path) -> None:
 
     assert result.completion_status == "incomplete"
     assert result.unknown_cost_events == 1
-    assert "exact_spend_ledger" in result.blocking_requirements
+    assert "spend_ledger" in result.blocking_requirements
+
+
+def test_estimated_model_cost_is_reported_separately(tmp_path: Path) -> None:
+    _complete_fixture(tmp_path)
+    (tmp_path / "spend-ledger.jsonl").write_text(
+        json.dumps(
+            {
+                "event_id": "cell:estimated",
+                "status": "completed",
+                "model_cost_usd": 2.5,
+                "model_cost_accounting_status": "estimated_from_trace",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = audit(tmp_path)
+
+    assert result.completion_status == "complete"
+    assert result.known_model_spend_usd == 0.0
+    assert result.estimated_model_spend_usd == 2.5
+    assert "spend_ledger" not in result.blocking_requirements
 
 
 def test_conservative_debit_reconciles_but_does_not_relabel_unknown_cost(
@@ -215,5 +240,6 @@ def test_conservative_debit_reconciles_but_does_not_relabel_unknown_cost(
 
     assert result.completion_status == "complete"
     assert result.known_model_spend_usd == 1.25
+    assert result.estimated_model_spend_usd == 0.0
     assert result.conservative_budget_debit_usd == 300.0
     assert result.unknown_cost_events == 1

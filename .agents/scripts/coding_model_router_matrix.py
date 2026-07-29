@@ -17,7 +17,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-from coding_model_router_usage import exact_cost_usd, usage_from_trace, usage_metering_error
+from coding_model_router_usage import (
+    ESTIMATE_METHOD,
+    estimate_usage_from_trace,
+    exact_cost_usd,
+    usage_from_trace,
+    usage_metering_error,
+)
 from e2b import Sandbox
 from harbor.models.job.config import JobConfig
 from harbor.models.trial.result import TrialResult
@@ -312,9 +318,10 @@ def _outcome(
     stop_reason = stop if isinstance(stop, str) else ""
     failure_class = _failure_class(cell, stop_reason)
     metering_error = "" if _known_pre_worker_failure(trace) else usage_metering_error(usage)
-    if metering_error:
-        failure_class = "metering"
-    ungradeable = failure_class in {"infrastructure", "metering"}
+    usage_estimated = bool(metering_error) and failure_class != "infrastructure"
+    if usage_estimated:
+        usage = estimate_usage_from_trace(trace)
+    ungradeable = failure_class == "infrastructure"
     return ScenarioOutcome(
         scenario_id=f"{benchmark}:{cell.task_id}",
         task=instruction if isinstance(instruction, str) else cell.task_id,
@@ -329,18 +336,18 @@ def _outcome(
         tool_calls=_tool_calls(trace),
         stop_reason=stop_reason,
         usage=usage.total,
-        cost_usd=0.0 if metering_error else exact_cost_usd(entry, usage),
+        cost_usd=exact_cost_usd(entry, usage),
         call_seconds=usage.call_seconds,
         call_input_tokens=usage.call_input_tokens,
         call_output_tokens=usage.call_output_tokens,
         call_cached_input_tokens=usage.call_cached_input_tokens,
         call_cache_write_input_tokens=usage.call_cache_write_input_tokens,
+        usage_accounting="estimated" if usage_estimated else "exact",
+        usage_estimate_method=ESTIMATE_METHOD if usage_estimated else "",
         wall_seconds=_wall_seconds(artifact_dir),
         completion_status=(
             "infrastructure_failure"
             if failure_class == "infrastructure"
-            else "metering_failure"
-            if failure_class == "metering"
             else "scored_pass"
             if cell.passed
             else "scored_agent_failure"
@@ -349,7 +356,7 @@ def _outcome(
         ),
         failure_class=failure_class,
         artifact_dir=str(artifact_dir.resolve()),
-        error=(metering_error or _trace_error(trace) or cell.note or None) if ungradeable else None,
+        error=(_trace_error(trace) or cell.note or None) if ungradeable else None,
         remeasured=attempt > 1,
     )
 
@@ -499,8 +506,11 @@ class RunState:
                     "model_cost_accounting_status": (
                         "missing_provider_usage"
                         if outcome.failure_class == "metering"
+                        else "estimated_from_trace"
+                        if outcome.usage_accounting == "estimated"
                         else "exact_from_provider_usage"
                     ),
+                    "usage_estimate_method": outcome.usage_estimate_method,
                     "task_environment_cost_usd": None,
                     "task_environment_cost_note": (
                         "E2B invoice rate is absent from Harbor artifacts"
@@ -855,9 +865,20 @@ def _run(
             "cells_expected": full_cells_expected,
             "attempt_rows": len(state.matrix.outcomes),
             "gradeable_cells": sum(row.reward is not None for row in state.matrix.outcomes),
-            "model_spend_usd": spent,
+            "model_spend_usd": sum(row.cost_usd for row in state.matrix.outcomes),
+            "experiment_accounted_spend_usd": spent,
+            "exact_model_spend_usd": sum(
+                row.cost_usd for row in state.matrix.outcomes if row.usage_accounting == "exact"
+            ),
+            "estimated_model_spend_usd": sum(
+                row.cost_usd for row in state.matrix.outcomes if row.usage_accounting == "estimated"
+            ),
+            "estimated_usage_cells": sum(
+                row.usage_accounting == "estimated" for row in state.matrix.outcomes
+            ),
             "outstanding_reservations_usd": reserved,
             "spend_ceiling_usd": ceiling_usd,
+            "remaining_accounted_budget_usd": ceiling_usd - spent - reserved,
         },
     )
 

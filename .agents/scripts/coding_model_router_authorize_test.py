@@ -28,6 +28,7 @@ def _fixture(root: Path) -> None:
         {
             "event_id": "smoke:paid",
             "phase": "smoke",
+            "artifact_dir": str(root / "smoke" / "infra-attempts" / "paid"),
             "model_cost_usd": None,
             "model_cost_accounting_status": "missing_provider_usage",
         },
@@ -65,6 +66,8 @@ def test_authorize_preserves_invalid_smoke_and_debits_unknown_cost(tmp_path: Pat
     assert paid["model_cost_usd"] is None
     assert paid["budget_debit_usd"] == 300.0
     assert str(paid["event_id"]).startswith("invalid-smoke-attempt-1:")
+    assert Path(paid["artifact_dir"]).is_relative_to(archive)
+    assert paid["original_artifact_dir"] == str(tmp_path / "smoke" / "infra-attempts" / "paid")
 
 
 def test_authorize_is_idempotent_for_identical_parameters(tmp_path: Path) -> None:

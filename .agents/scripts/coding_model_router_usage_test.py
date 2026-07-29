@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 from coding_model_router_usage import (
+    ESTIMATE_METHOD,
     DetailedUsage,
+    estimate_usage_from_trace,
     exact_cost_usd,
     usage_from_trace,
     usage_metering_error,
@@ -97,3 +99,29 @@ def test_usage_metering_rejects_missing_and_partial_request_counters() -> None:
 
     assert "missing" in usage_metering_error(missing)
     assert "incomplete" in usage_metering_error(partial)
+
+
+def test_trace_usage_estimate_is_cumulative_and_priceable() -> None:
+    usage = estimate_usage_from_trace(
+        {
+            "instruction": "repair the repository",
+            "turns": 2,
+            "steps": [
+                {
+                    "action": {"kind": "tool_call", "name": "bash"},
+                    "observation": {"content": "first result"},
+                },
+                {
+                    "action": {"kind": "message", "content": "done"},
+                    "observation": {"content": ""},
+                },
+            ],
+        }
+    )
+
+    assert ESTIMATE_METHOD == "trace-char-prefix-4k-overhead-v1"
+    assert usage.calls == 2
+    assert usage.call_input_tokens[1] > usage.call_input_tokens[0]
+    assert usage.total.input_tokens == sum(usage.call_input_tokens)
+    assert usage.total.output_tokens == sum(usage.call_output_tokens)
+    assert exact_cost_usd(_entry(), usage) > 0

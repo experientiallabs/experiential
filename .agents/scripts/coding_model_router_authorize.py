@@ -71,10 +71,36 @@ def _historical_event_id(event_id: str) -> str:
     return f"{INVALID_SMOKE_PREFIX}{event_id}"
 
 
+def _rebase_ledger_artifacts(
+    rows: list[JsonObject],
+    *,
+    original_smoke_root: Path,
+    archive: Path,
+) -> list[JsonObject]:
+    """Point active ledger rows at preserved artifacts without mutating the archive."""
+    original = original_smoke_root.resolve()
+    rebased: list[JsonObject] = []
+    for row in rows:
+        updated = dict(row)
+        raw_artifact = updated.get("artifact_dir")
+        if isinstance(raw_artifact, str):
+            try:
+                relative = Path(raw_artifact).resolve().relative_to(original)
+            except ValueError:
+                pass
+            else:
+                updated.setdefault("original_artifact_dir", raw_artifact)
+                updated["artifact_dir"] = str((archive / relative).resolve())
+        rebased.append(updated)
+    return rebased
+
+
 def _ledger_transition(
     rows: list[JsonObject],
     *,
     unknown_cost_budget_debit_usd: float,
+    original_smoke_root: Path,
+    archive: Path,
 ) -> tuple[list[JsonObject], list[str]]:
     """Namespace the invalid smoke and attach a conservative ceiling debit."""
     already_transitioned = [
@@ -113,7 +139,14 @@ def _ledger_transition(
             unknown_ids.append(str(updated["event_id"]))
         transitioned.append(updated)
     unrelated = [row for row in rows if row not in source]
-    return [*unrelated, *transitioned], sorted(unknown_ids)
+    return (
+        _rebase_ledger_artifacts(
+            [*unrelated, *transitioned],
+            original_smoke_root=original_smoke_root,
+            archive=archive,
+        ),
+        sorted(unknown_ids),
+    )
 
 
 def authorize(
@@ -146,6 +179,16 @@ def authorize(
             and existing.get("ceiling_usd") == ceiling_usd
             and existing.get("unknown_cost_budget_debit_usd") == unknown_cost_budget_debit_usd
         ):
+            replacement = _read_object(smoke_root / "replacement-authorization.json")
+            raw_archive = replacement.get("archived_smoke_path")
+            if not isinstance(raw_archive, str) or not Path(raw_archive).is_dir():
+                raise ValueError("the matching authorization has no preserved smoke archive")
+            rows = _rebase_ledger_artifacts(
+                _read_ledger(ledger_path),
+                original_smoke_root=smoke_root,
+                archive=Path(raw_archive),
+            )
+            _write_ledger(ledger_path, rows)
             logger.info("matching spend authorization is already frozen")
             return
         raise ValueError("a different spend authorization is already frozen")
@@ -169,6 +212,8 @@ def authorize(
     ledger, unknown_ids = _ledger_transition(
         _read_ledger(ledger_path),
         unknown_cost_budget_debit_usd=unknown_cost_budget_debit_usd,
+        original_smoke_root=smoke_root,
+        archive=archive,
     )
     _write_ledger(ledger_path, ledger)
 

@@ -54,6 +54,7 @@ class CompletionAudit(BaseModel):
     ready_for_material_paid_execution: bool
     target_achieved: bool | None
     known_model_spend_usd: float
+    estimated_model_spend_usd: float
     conservative_budget_debit_usd: float
     unknown_cost_events: int
     requirements: list[RequirementResult]
@@ -327,13 +328,13 @@ def _dense_matrix(root: Path) -> RequirementResult:
     )
 
 
-def _ledger(root: Path) -> tuple[RequirementResult, float, float, int]:
+def _ledger(root: Path) -> tuple[RequirementResult, float, float, float, int]:
     path = root / "spend-ledger.jsonl"
     rows = _read_rows(path)
     if rows is None:
         return (
             _result(
-                "exact_spend_ledger",
+                "spend_ledger",
                 "failed",
                 "The spend ledger is missing or malformed.",
                 root,
@@ -341,9 +342,11 @@ def _ledger(root: Path) -> tuple[RequirementResult, float, float, int]:
             ),
             0.0,
             0.0,
+            0.0,
             0,
         )
     known = 0.0
+    estimated = 0.0
     debit = 0.0
     unknown = 0
     unreconciled = 0
@@ -361,16 +364,19 @@ def _ledger(root: Path) -> tuple[RequirementResult, float, float, int]:
             else:
                 debit += budget_debit
         else:
-            known += cost
+            if row.get("model_cost_accounting_status") == "estimated_from_trace":
+                estimated += cost
+            else:
+                known += cost
     valid = unreconciled == 0 and reserved == 0
     return (
         _result(
-            "exact_spend_ledger",
+            "spend_ledger",
             "passed" if valid else "blocked",
             (
                 (
-                    f"All {len(rows)} ledger events are exact or carry an explicit "
-                    "conservative ceiling debit, with no open reservation."
+                    f"All {len(rows)} ledger events are exact, trace-estimated, or carry "
+                    "an explicit conservative ceiling debit, with no open reservation."
                 )
                 if valid
                 else (
@@ -382,12 +388,14 @@ def _ledger(root: Path) -> tuple[RequirementResult, float, float, int]:
             [path],
             events=len(rows),
             known_model_spend_usd=known,
+            estimated_model_spend_usd=estimated,
             conservative_budget_debit_usd=debit,
             unknown_cost_events=unknown,
             unreconciled_unknown_cost_events=unreconciled,
             open_reservations=reserved,
         ),
         known,
+        estimated,
         debit,
         unknown,
     )
@@ -617,7 +625,7 @@ def _final_report(root: Path) -> RequirementResult:
 
 def audit(root: Path) -> CompletionAudit:
     """Evaluate every terminal condition without making network or provider calls."""
-    ledger, known_spend, budget_debit, unknown_costs = _ledger(root)
+    ledger, known_spend, estimated_spend, budget_debit, unknown_costs = _ledger(root)
     pareto, target = _pareto_conclusion(root)
     requirements = [
         _frozen_protocol(root),
@@ -655,6 +663,7 @@ def audit(root: Path) -> CompletionAudit:
         and ledger.status == "passed",
         target_achieved=target,
         known_model_spend_usd=known_spend,
+        estimated_model_spend_usd=estimated_spend,
         conservative_budget_debit_usd=budget_debit,
         unknown_cost_events=unknown_costs,
         requirements=requirements,
@@ -685,10 +694,13 @@ def main() -> None:
         json.dumps(result.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
     )
     logger.info(
-        "completion audit: %s, %d blocking requirements, $%.6f known model spend",
+        "completion audit: %s, %d blockers, $%.6f exact, $%.6f estimated, "
+        "$%.2f conservative debit",
         result.completion_status,
         len(result.blocking_requirements),
         result.known_model_spend_usd,
+        result.estimated_model_spend_usd,
+        result.conservative_budget_debit_usd,
     )
     if args.require_complete and result.completion_status != "complete":
         raise SystemExit(1)

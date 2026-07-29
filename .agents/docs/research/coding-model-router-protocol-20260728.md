@@ -1,6 +1,7 @@
 # Execution-scored coding-model router protocol
 
-Status: protocol frozen; the single smoke attempt is invalid and material paid work is stopped.
+Status: protocol frozen; the original smoke is archived as invalid, one replacement is authorized,
+and execution is waiting for a legitimate E2B slot.
 
 Experiment ID: `coding-router-20260728`
 
@@ -17,8 +18,9 @@ Material paid sweep ceiling: USD 20,000, authorized by the user on 2026-07-29.
 
 Build and serve the least expensive pre-inference WMO routing policy that retains at least 95
 percent of the held-out quality of the strongest OpenAI or Anthropic static model selected on fit,
-while saving at least 40 percent of its realized inference cost. Prefer at least 60 percent savings
-when the same quality and statistical gates hold.
+while saving at least 40 percent of its inference cost. Provider-reported usage is used when
+available; otherwise cost is a clearly labeled trace-derived estimate. Prefer at least 60 percent
+savings when the same quality and statistical gates hold.
 
 ## Scientific gates
 
@@ -175,8 +177,12 @@ Turn-cap exhaustion, budget exhaustion, no-action or no-tool-call termination, o
 and unparsed tool calls remain gradeable agent failures with the official verifier reward.
 
 Every attempt is retained. Every completed cell atomically persists reward, success, tokens,
-cache reads and writes, reasoning tokens, realized model cost, per-call latency, wall time, tool
-calls, stop reason, completion status, failure class, attempt number, and raw Harbor artifact path.
+cache reads and writes, reasoning tokens, model cost, per-call latency, wall time, tool calls, stop
+reason, completion status, failure class, attempt number, and raw Harbor artifact path. Usage and
+cost are marked `exact` when provider counters exist. Otherwise, an officially scored cell remains
+gradeable and is marked `estimated`: each trace step is treated as one provider call, input tokens
+are estimated from the cumulative task plus action-observation transcript with a fixed 4,096-token
+system and tool-schema allowance, and output tokens are estimated from the serialized action.
 Environment duration is recorded even when E2B does not expose its invoice rate.
 
 ## Single smoke gate
@@ -194,6 +200,9 @@ resumed. The resumed run must retain byte-identical completed artifacts, finish 
 cells, fit a guarded hashing-1024 kNN plumbing policy on the fit task, and replay the held-out task.
 The smoke has a hard USD 10 inference cap and is not headline evidence.
 
+The smoke and matrix runners fail before paid execution when the read-only E2B listing shows no
+slot under the configured 100-sandbox account cap.
+
 The no-spend task and provider preflight passed for all four cells. Shared E2B capacity later
 opened to 82 active sandboxes, so the one authorized smoke was launched.
 
@@ -210,9 +219,11 @@ as ungradeable `metering_failure` rows and the spend ledger records `model_cost_
 Derived fit, replay, and policy artifacts from the earlier incorrect zero-cost interpretation are
 quarantined by content digest and the smoke root carries `invalidated.json`.
 
-The transport now meters every request with per-call input, cached-input, cache-write, reasoning,
-output, and latency counters. It also preserves partial usage on failure. Both smoke and full
-matrix runners stop before another paid call if any completed attempt has unknown cost.
+The transport now attempts to meter every request with per-call input, cached-input, cache-write,
+reasoning, output, and latency counters, and preserves partial usage on failure. On 2026-07-29 the
+user explicitly removed exact metering as a launch gate and stated that they monitor account usage
+externally. Missing counters therefore trigger the labeled trace estimate above rather than making
+an official verifier result ungradeable.
 
 This was the single original smoke attempt permitted by the frozen protocol. It did not pass. On
 2026-07-29 the user authorized one replacement smoke and a USD 20,000 hard experiment ceiling.
@@ -296,6 +307,10 @@ all five split point-estimate gates. Reports include quality, cost, effective co
 completion, gradeability, latency p50 and p95, model mix, route-away share, guard reversion,
 novelty abstention, and declared capability slices.
 
+Quality and completion claims always come from official benchmark verifiers. Cost claims report
+exact and estimated portions separately. A cost-savings result with any estimated portion is an
+approximate operational comparison, not exact billing evidence.
+
 After real matrices and splits are immutable, Azure GPT-5.5 world-model inference builds a separate
 simulated matrix. Real and simulated rows are never pooled. Compare cell agreement, false positive
 and negative rates, calibration, model rank, best-single choice, routed-model choice, guard
@@ -317,9 +332,11 @@ cost-quality dial.
 
 ## Spend and durability
 
-No full benchmark cell may launch until a user-provided material paid sweep ceiling is recorded in
-the freeze summary and enforced by the spend ledger. The original and one authorized replacement
-four-cell smoke are the only paid work permitted before a valid smoke gate.
+The USD 20,000 ceiling is recorded in the freeze summary. The user monitors provider usage
+externally; the local ledger remains a rough guard using exact counters when available, labeled
+trace estimates otherwise, and the USD 300 conservative debit for the archived unknown-cost calls.
+The original and one authorized replacement four-cell smoke are the only paid work permitted
+before a valid smoke gate.
 
 Raw artifacts live under `.wmo/experiments/coding-router-20260728/` and stay out of Git. The
 protocol and one-off runners live under `.agents/`. Long jobs use tmux with persistent logs. A

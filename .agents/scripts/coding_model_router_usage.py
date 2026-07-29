@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 
 from wmo.providers.base import TokenUsage
 from wmo.providers.pool import PoolEntry
 
 OPENAI_LONG_CONTEXT_THRESHOLD = 272_000
+ESTIMATE_METHOD = "trace-char-prefix-4k-overhead-v1"
+ESTIMATE_CHARS_PER_TOKEN = 4
+ESTIMATE_CALL_OVERHEAD_TOKENS = 4_096
 OPENAI_LONG_CONTEXT_MODELS = frozenset(
     {
         "gpt-5.5",
@@ -92,6 +97,63 @@ def usage_metering_error(usage: DetailedUsage) -> str:
             f"{incomplete}"
         )
     return ""
+
+
+def estimate_usage_from_trace(trace: dict[str, object]) -> DetailedUsage:
+    """Estimate request tokens from the cumulative trace when counters are absent.
+
+    Each agent step corresponds to one provider response. Input estimates include the task and
+    the prior action-observation transcript plus a fixed allowance for the system prompt and tool
+    schema. Output estimates use the serialized action. This is intentionally labeled and is used
+    for rough cost comparison only.
+    """
+    instruction = trace.get("instruction")
+    base_chars = len(instruction) if isinstance(instruction, str) else 0
+    raw_steps = trace.get("steps")
+    steps = raw_steps if isinstance(raw_steps, list) else []
+    raw_turns = trace.get("turns")
+    turns = (
+        raw_turns
+        if isinstance(raw_turns, int) and not isinstance(raw_turns, bool) and raw_turns > 0
+        else len(steps)
+    )
+    calls = max(turns, len(steps))
+    if calls == 0:
+        return DetailedUsage(TokenUsage(), 0, [], [], [], [], [])
+
+    input_tokens: list[int] = []
+    output_tokens: list[int] = []
+    transcript_chars = 0
+    for index in range(calls):
+        input_tokens.append(
+            ESTIMATE_CALL_OVERHEAD_TOKENS
+            + math.ceil((base_chars + transcript_chars) / ESTIMATE_CHARS_PER_TOKEN)
+        )
+        raw_step = steps[index] if index < len(steps) else None
+        step: dict[str, object] = (
+            {str(key): value for key, value in raw_step.items()}
+            if isinstance(raw_step, dict)
+            else {}
+        )
+        action = step.get("action")
+        observation = step.get("observation")
+        action_chars = len(json.dumps(action, sort_keys=True, default=str))
+        observation_chars = len(json.dumps(observation, sort_keys=True, default=str))
+        output_tokens.append(max(1, math.ceil(action_chars / ESTIMATE_CHARS_PER_TOKEN)))
+        transcript_chars += action_chars + observation_chars
+
+    return DetailedUsage(
+        total=TokenUsage(
+            input_tokens=sum(input_tokens),
+            output_tokens=sum(output_tokens),
+        ),
+        calls=calls,
+        call_seconds=[0.0] * calls,
+        call_input_tokens=input_tokens,
+        call_output_tokens=output_tokens,
+        call_cached_input_tokens=[0] * calls,
+        call_cache_write_input_tokens=[0] * calls,
+    )
 
 
 def exact_cost_usd(entry: PoolEntry, usage: DetailedUsage) -> float:

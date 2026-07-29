@@ -16,6 +16,24 @@ from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import ModelPool, PoolEntry
 
 
+class _SandboxPage:
+    def __init__(self, active: int, *, has_next: bool = False) -> None:
+        self.active = active
+        self.has_next = has_next
+
+    def next_items(self) -> list[object]:
+        return [object()] * self.active
+
+
+class _SandboxClient:
+    page = _SandboxPage(0)
+
+    @classmethod
+    def list(cls, *, limit: int) -> _SandboxPage:
+        assert limit == smoke_runner.E2B_ACCOUNT_CAP
+        return cls.page
+
+
 def _entry() -> PoolEntry:
     return PoolEntry(
         name="test-arm",
@@ -24,6 +42,34 @@ def _entry() -> PoolEntry:
         input_per_mtok=1.0,
         output_per_mtok=2.0,
     )
+
+
+def test_smoke_capacity_gate_accepts_a_legitimate_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _SandboxClient.page = _SandboxPage(smoke_runner.E2B_ACCOUNT_CAP - 1)
+    monkeypatch.setattr(smoke_runner, "Sandbox", _SandboxClient)
+
+    smoke_runner._require_e2b_capacity()
+
+
+@pytest.mark.parametrize(
+    ("active", "has_next"),
+    [
+        (smoke_runner.E2B_ACCOUNT_CAP, False),
+        (smoke_runner.E2B_ACCOUNT_CAP - 1, True),
+    ],
+)
+def test_smoke_capacity_gate_rejects_full_or_paginated_account(
+    monkeypatch: pytest.MonkeyPatch,
+    active: int,
+    has_next: bool,
+) -> None:
+    _SandboxClient.page = _SandboxPage(active, has_next=has_next)
+    monkeypatch.setattr(smoke_runner, "Sandbox", _SandboxClient)
+
+    with pytest.raises(RuntimeError, match="account cap"):
+        smoke_runner._require_e2b_capacity()
 
 
 def _artifact(root: Path) -> Path:
@@ -208,7 +254,7 @@ def test_metered_agent_failure_remains_a_gradeable_zero(
 
 
 @pytest.mark.parametrize("runner", [smoke_runner, matrix_runner])
-def test_submitted_cell_without_worker_usage_is_ungradeable(
+def test_submitted_cell_without_worker_usage_uses_labeled_estimate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     runner: object,
@@ -231,10 +277,13 @@ def test_submitted_cell_without_worker_usage_is_ungradeable(
             artifact_dir=artifact,
         )
 
-    assert outcome.reward is None
-    assert outcome.completion_status == "metering_failure"
-    assert outcome.failure_class == "metering"
-    assert outcome.error == "worker usage is missing a completed provider call"
+    assert outcome.reward == 0.0
+    assert outcome.completion_status == "scored_failure"
+    assert outcome.failure_class == "task_failure"
+    assert outcome.usage_accounting == "estimated"
+    assert outcome.usage_estimate_method == "trace-char-prefix-4k-overhead-v1"
+    assert outcome.cost_usd > 0
+    assert outcome.error is None
 
 
 def test_existing_infrastructure_zero_is_normalized_before_resume(tmp_path: Path) -> None:
@@ -277,7 +326,7 @@ def test_existing_infrastructure_zero_is_normalized_before_resume(tmp_path: Path
     )
 
 
-def test_existing_unmetered_score_is_normalized_and_cost_is_unknown(tmp_path: Path) -> None:
+def test_existing_unmetered_score_is_normalized_to_labeled_estimate(tmp_path: Path) -> None:
     artifact = _unmetered_artifact(tmp_path)
     root = tmp_path / "smoke"
     matrix_path = root / "outcomes.json"
@@ -308,11 +357,13 @@ def test_existing_unmetered_score_is_normalized_and_cost_is_unknown(tmp_path: Pa
     )
 
     outcome = normalized.outcomes[0]
-    assert outcome.reward is None
-    assert outcome.failure_class == "metering"
+    assert outcome.reward == 1.0
+    assert outcome.failure_class == ""
+    assert outcome.usage_accounting == "estimated"
+    assert outcome.cost_usd > 0
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    assert ledger["model_cost_usd"] is None
-    assert ledger["model_cost_accounting_status"] == "missing_provider_usage"
+    assert ledger["model_cost_usd"] == outcome.cost_usd
+    assert ledger["model_cost_accounting_status"] == "estimated_from_trace"
 
 
 def test_existing_unmetered_scaffold_is_reclassified_as_unknown_cost(tmp_path: Path) -> None:
@@ -421,7 +472,7 @@ def test_unmetered_smoke_quarantines_derived_policy_and_reports(tmp_path: Path) 
     assert report["sha256"] == hashlib.sha256(b'{"valid": true}').hexdigest()
 
 
-def test_unknown_paid_cost_stops_before_another_smoke_cell(
+def test_unknown_historical_cost_does_not_block_a_new_estimated_cell(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -445,17 +496,52 @@ def test_unknown_paid_cost_stops_before_another_smoke_cell(
         ],
     ).save(matrix_path)
     monkeypatch.setattr(smoke_runner, "ARMS", (entry.name,))
+    artifact = _unmetered_artifact(tmp_path / "new")
 
-    with pytest.raises(RuntimeError, match="exact spend"):
-        smoke_runner._run_cell(
-            root,
-            template_path=tmp_path / "unused.yaml",
-            task_id="next",
-            entry=entry,
-            matrix_path=matrix_path,
-            ledger_path=ledger_path,
-            pool=pool,
-        )
+    class FakeScorer:
+        def score(self, agent: object) -> object:
+            del agent
+            return type(
+                "ScoreResult",
+                (),
+                {
+                    "cells": [
+                        ScoreCell(
+                            task_id="next",
+                            attempt=1,
+                            reward=0.0,
+                            passed=False,
+                            artifact_dir=str(artifact),
+                            infra_failed=False,
+                        )
+                    ]
+                },
+            )()
+
+    async def fake_scorer(*args: object, **kwargs: object) -> FakeScorer:
+        del args, kwargs
+        return FakeScorer()
+
+    monkeypatch.setattr(smoke_runner, "_scorer", fake_scorer)
+    monkeypatch.setattr(smoke_runner, "_wall_seconds", lambda path: 0.0)
+
+    smoke_runner._run_cell(
+        root,
+        template_path=tmp_path / "unused.yaml",
+        task_id="next",
+        entry=entry,
+        matrix_path=matrix_path,
+        ledger_path=ledger_path,
+        pool=pool,
+    )
+
+    outcome = next(
+        row
+        for row in OutcomeMatrix.load(matrix_path).outcomes
+        if row.scenario_id == "terminal-bench-2:next"
+    )
+    assert outcome.reward == 0.0
+    assert outcome.usage_accounting == "estimated"
 
 
 def test_full_matrix_rejects_an_invalid_smoke_before_paid_work(tmp_path: Path) -> None:

@@ -93,6 +93,10 @@ class ScenarioOutcome(BaseModel):
     call_output_tokens: list[int] = []
     call_cached_input_tokens: list[int] = []
     call_cache_write_input_tokens: list[int] = []
+    # Provider counters are preferred. Experiment runners may preserve a gradeable official
+    # result with a clearly labeled trace-derived estimate when exact counters are unavailable.
+    usage_accounting: str = "exact"
+    usage_estimate_method: str = ""
     wall_seconds: float = 0.0
     completion_status: str = ""
     failure_class: str = ""
