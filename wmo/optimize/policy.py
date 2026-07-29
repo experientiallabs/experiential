@@ -376,6 +376,14 @@ class RoutingPolicy(BaseModel):
     # against quality evidence instead of a blunt rule. The quality evidence test itself is
     # unchanged: cache state never buys quality confidence. Off (the default) is bit-identical
     # to today for every policy file, eval, and serving path.
+    #
+    # Safety outranks cache economics: the novelty abstain and the no-scored-candidates
+    # returns still serve the pinned fallback WITHOUT the switch gate. Consequence vs plain
+    # sticky mode (which never reaches the novelty check): a mid-conversation turn that looks
+    # unlike the fit data leaves a cache-warm incumbent for the fallback and pays full
+    # prefill. Ruled deliberate (routing master, 2026-07-28): on novel input the pinned-
+    # fallback contract wins. The switch gate governs evidence-backed decisions only; an
+    # incumbent absent from the fitted bank cannot be tested and sticks.
     cache_aware: bool = False
     # ProxRouter-inspired support tilt (2510.09852, ADAPTED to clusters: their exponential
     # tilt reweights nonparametric scores by a prior; ours multiplies cluster probabilities
@@ -888,8 +896,24 @@ def knn_decision(
         otherwise the decision that keeps the incumbent. Quality thresholds are identical to
         the baseline guard: cache state raises the switch's price bar, never its confidence.
         """
-        if incumbent is None or serve == incumbent or incumbent not in bank.models:
+        if incumbent is None or serve == incumbent:
             return None
+        if incumbent not in bank.models:
+            # The bank predates this pool model, so the incumbent cannot be tested at all;
+            # the amendment's conservative rule applies: an untestable incumbent sticks.
+            return RoutingDecision(
+                model=incumbent,
+                reason=(
+                    f"cache-aware switch gate: kept incumbent {incumbent}, not in the fitted "
+                    f"bank so {serve} cannot be justified against it"
+                ),
+                evidence=RoutingEvidence(
+                    n_pairs=0,
+                    gate="reverted",
+                    propensity="fallback-forced",
+                    cache_credit_usd=credit_applied or None,
+                ),
+            )
         inc_index = bank.models.index(incumbent)
         inc_paired = scored[:, serve_index] & scored[:, inc_index]
         inc_diffs = rewards[inc_paired, serve_index] - rewards[inc_paired, inc_index]

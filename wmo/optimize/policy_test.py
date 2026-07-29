@@ -1405,3 +1405,16 @@ def test_cache_aware_switch_gate_allows_justified_switches() -> None:
     policy = _knn_policy(_knn_bank(rewards), knn_z=0.5, knn_min_pairs=8)
     switched = knn_decision(policy, _QUERY, incumbent="haiku-4-5", cache_credit=0.001)
     assert switched.model == "fable-5"
+
+
+def test_cache_aware_incumbent_absent_from_the_bank_sticks() -> None:
+    """An incumbent the bank was never fitted on cannot be tested, so the conversation
+    sticks with it (the amendment's conservative rule) instead of switching unjudged."""
+    rewards = [[1.0, 0.0]] * 12  # unanimous for fable, but the incumbent is not a bank column
+    policy = _knn_policy(_knn_bank(rewards), knn_z=0.5, knn_min_pairs=8)
+    kept = knn_decision(policy, _QUERY, incumbent="opus-4-8", cache_credit=0.001)
+    assert kept.model == "opus-4-8"
+    assert "not in the fitted bank" in kept.reason
+    assert kept.evidence is not None
+    assert kept.evidence.gate == "reverted"
+    assert kept.evidence.n_pairs == 0
