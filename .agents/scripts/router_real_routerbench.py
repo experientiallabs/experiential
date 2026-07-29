@@ -22,6 +22,11 @@ BENCHMARK = "routerbench-ours9-refreshed"
 LETTER = re.compile(r"\b([A-E])\b[).:]?", re.IGNORECASE)
 MAX_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
+GRADEABLE_PROVIDER_ERRORS = (
+    "content_filter",
+    "content management policy",
+    "incomplete response: max_output_tokens",
+)
 
 
 def _json_object(path: Path) -> dict[str, object]:
@@ -67,6 +72,41 @@ def _read_rows(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _normalize_gradeable_provider_failures(
+    path: Path, rows: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    """Interpret policy refusal and exhausted output budget as model outcomes, never transport."""
+    changed = False
+    for row in rows:
+        error = row.get("error")
+        if row.get("reward") is not None or not isinstance(error, str):
+            continue
+        lowered = error.lower()
+        if not any(marker in lowered for marker in GRADEABLE_PROVIDER_ERRORS):
+            continue
+        stop_reason = (
+            "content_filter"
+            if "content_filter" in lowered or "content management policy" in lowered
+            else "max_output_tokens"
+        )
+        row.update(
+            {
+                "reward": 0.0,
+                "success": False,
+                "stop_reason": stop_reason,
+                "completion_status": "scored_failure",
+                "failure_class": stop_reason,
+            }
+        )
+        changed = True
+    if changed:
+        write_text_atomic(
+            path,
+            "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        )
+    return rows
+
+
 def _attempts(rows: list[dict[str, object]]) -> dict[tuple[str, str], list[dict[str, object]]]:
     grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
     for row in rows:
@@ -109,18 +149,31 @@ def _outcome(
         )
     except Exception as exc:  # noqa: BLE001
         seconds = time.perf_counter() - started
+        error = f"{type(exc).__name__}: {exc}"[:1000]
+        lowered = error.lower()
+        gradeable = any(marker in lowered for marker in GRADEABLE_PROVIDER_ERRORS)
+        stop_reason = (
+            "content_filter"
+            if gradeable
+            and ("content_filter" in lowered or "content management policy" in lowered)
+            else "max_output_tokens"
+            if gradeable
+            else "provider_error"
+        )
         return ScenarioOutcome(
             scenario_id=task["task_id"],
             task=task["prompt"],
             model=entry.name,
             benchmark=BENCHMARK,
             attempt_number=attempt,
-            stop_reason="provider_error",
+            reward=0.0 if gradeable else None,
+            success=False,
+            stop_reason=stop_reason,
             call_seconds=[seconds],
             wall_seconds=seconds,
-            completion_status="infrastructure_failure",
-            failure_class="provider",
-            error=f"{type(exc).__name__}: {exc}"[:1000],
+            completion_status="scored_failure" if gradeable else "infrastructure_failure",
+            failure_class=stop_reason if gradeable else "provider",
+            error=error,
             remeasured=attempt > 1,
         )
     seconds = time.perf_counter() - started
@@ -228,7 +281,7 @@ def main() -> int:
     lock = threading.Lock()
 
     for entry in pool.models:
-        rows = _read_rows(rows_path)
+        rows = _normalize_gradeable_provider_failures(rows_path, _read_rows(rows_path))
         grouped = _attempts(rows)
         pending = [
             task
@@ -240,7 +293,7 @@ def main() -> int:
             continue
         provider = pool_provider(entry)
         for attempt in range(1, MAX_ATTEMPTS + 1):
-            rows = _read_rows(rows_path)
+            rows = _normalize_gradeable_provider_failures(rows_path, _read_rows(rows_path))
             grouped = _attempts(rows)
             batch = [
                 task
