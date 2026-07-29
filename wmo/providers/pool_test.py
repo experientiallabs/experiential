@@ -175,6 +175,7 @@ def test_provider_config_maps_backend_knobs() -> None:
         deployment="gpt-5.5",
         endpoint="https://google-sheets.openai.azure.com",
         api_version="2024-10-21",
+        reasoning_effort="high",
     )
     config = entry.provider_config()
     assert config.kind is ProviderKind.AZURE_OPENAI
@@ -182,6 +183,54 @@ def test_provider_config_maps_backend_knobs() -> None:
     assert config.deployment == "gpt-5.5"
     assert config.endpoint == "https://google-sheets.openai.azure.com"
     assert config.api_version == "2024-10-21"
+    assert config.reasoning_effort == "high"
+
+
+def test_provider_config_resolves_endpoint_and_deployment_env_without_serializing_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WMO_TEST_ENDPOINT", "https://example.openai.azure.com")
+    monkeypatch.setenv("WMO_TEST_DEPLOYMENT", "private-deployment")
+    entry = PoolEntry(
+        name="gpt",
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        endpoint_env="WMO_TEST_ENDPOINT",
+        deployment_env="WMO_TEST_DEPLOYMENT",
+    )
+
+    config = entry.provider_config()
+
+    assert config.endpoint == "https://example.openai.azure.com"
+    assert config.deployment == "private-deployment"
+    dumped = entry.model_dump_json()
+    assert "private-deployment" not in dumped
+    assert "https://example.openai.azure.com" not in dumped
+
+
+def test_env_backed_endpoint_and_deployment_are_required_at_config_time() -> None:
+    entry = PoolEntry(
+        name="gpt",
+        kind=ProviderKind.AZURE_OPENAI,
+        model="gpt-5.5",
+        endpoint_env="WMO_MISSING_ENDPOINT",
+        deployment_env="WMO_MISSING_DEPLOYMENT",
+    )
+
+    with pytest.raises(ValueError, match="WMO_MISSING_ENDPOINT"):
+        entry.provider_config()
+
+
+def test_pool_rejects_literal_and_env_reference_for_the_same_backend_field() -> None:
+    with pytest.raises(ValidationError, match="endpoint or endpoint_env"):
+        PoolEntry(
+            name="gpt",
+            kind=ProviderKind.AZURE_OPENAI,
+            model="gpt-5.5",
+            endpoint="https://example.openai.azure.com",
+            endpoint_env="WMO_TEST_ENDPOINT",
+            deployment="deployment",
+        )
 
 
 def test_pool_provider_requires_named_env_key(

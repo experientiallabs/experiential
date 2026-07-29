@@ -955,10 +955,10 @@ def fit(
     embedder: str = typer.Option(
         "auto",
         "--embedder",
-        help="auto | hashing | azure. auto uses the Azure text-embedding-3-large deployment when "
-        f"{' and '.join(AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; either way it says "
-        "which one it picked. Resolving to azure means this fit CALLS A PAID EMBEDDING API "
-        "(billed to that resource); --embedder hashing keeps it offline and free.",
+        help="auto | hashing | openai | azure. auto uses the Azure text-embedding-3-large "
+        f"deployment when {' and '.join(AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; "
+        "either way it says which one it picked. OpenAI and Azure call paid embedding APIs; "
+        "--embedder hashing keeps the fit offline and free.",
     ),
     dim: int = typer.Option(
         None,
@@ -968,10 +968,14 @@ def fit(
         f"model's native width ({HASHING_EMBEDDER_DIM} hashing, {AZURE_EMBEDDER_DIM} "
         "text-embedding-3-large). Set it only to reduce a model's output deliberately.",
     ),
-    deployment: str = typer.Option(None, "--deployment", help="(azure) embedding deployment."),
+    deployment: str = typer.Option(
+        None,
+        "--deployment",
+        help="Embedding model for openai, or deployment name for azure.",
+    ),
     endpoint: str = typer.Option(None, "--endpoint", help="(azure) resource endpoint."),
     api_key_env: str = typer.Option(
-        None, "--api-key-env", help="(azure) env var holding the account key."
+        None, "--api-key-env", help="(openai or azure) env var holding the account key."
     ),
     compressor: str = typer.Option(
         None,

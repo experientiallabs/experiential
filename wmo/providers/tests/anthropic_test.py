@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from llm_waterfall import ChatRequest
 
 from wmo.providers.anthropic import AnthropicProvider
 from wmo.providers.base import Message, ProviderConfig, ProviderKind
@@ -30,6 +31,25 @@ class _FakeResponse:
     def __init__(self, content: Sequence[object], usage: _FakeUsage) -> None:
         self.content = content
         self.usage = usage
+
+    def model_dump(self, *, mode: str) -> dict[str, object]:
+        assert mode == "json"
+        return {
+            "model": "claude-sonnet-5",
+            "stop_reason": "tool_use",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "bash",
+                    "input": {"command": "pwd"},
+                }
+            ],
+            "usage": {
+                "input_tokens": self.usage.input_tokens,
+                "output_tokens": self.usage.output_tokens,
+            },
+        }
 
 
 class _FakeMessages:
@@ -75,6 +95,43 @@ def test_embed_raises_pointing_at_embed_provider() -> None:
     provider = AnthropicProvider(_config())
     with pytest.raises(NotImplementedError, match="OpenAI or Bedrock embed provider"):
         provider.embed(["x"])
+
+
+def test_complete_chat_uses_native_messages_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(_FakeResponse([], _FakeUsage(11, 7)))
+    provider = AnthropicProvider(
+        ProviderConfig(
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-sonnet-5",
+            reasoning_effort="high",
+        )
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Inspect."}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            }
+        )
+    )
+
+    calls = response.choices[0].message.tool_calls
+    assert calls is not None
+    assert calls[0].function.name == "bash"
+    assert fake.messages.last_kwargs["thinking"] == {"type": "adaptive"}
+    assert fake.messages.last_kwargs["output_config"] == {"effort": "high"}
 
 
 def test_verify_ok_on_successful_ping(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -642,14 +642,17 @@ def test_the_plan_table_prices_the_sweep_and_labels_the_rest(
     # 3 scenarios x 1 episode x 4 calls = 12 calls; cheap = 12 x (2000 + 250x2)/1e6 = $0.03,
     # pricey = 10x that, so the projected total is $0.33.
     assert "~$0.33" in flat
-    assert "2candidate(s)x3scenario(s)x1episode(s)" in flat
+    assert "sweep2candidate(s)x3" in flat
+    assert "scenario(s)x1" in flat
+    assert "episode(s)" in flat
     # The free stages say free rather than showing a fabricated number, and the estimate names
     # itself a projection with its assumption spelled out.
     # 3 scenarios split 70/30 for router fit vs report: 2 fit, 1 reserved (PR #308).
-    assert _says(
-        result.output, "knn over 2 fit scenario(s) (guarded, fallback best single on the fit split)"
-    )
-    assert _says(result.output, "cost_quality 0.25 (Balanced (default))")
+    assert "fitknnover2fit" in flat
+    assert "scenario(s)(guarded" in flat
+    assert "fallbackbestsingleon" in flat and "thefitsplit" in flat
+    assert "tunecost_quality0.25" in flat
+    assert "Balanced(default)" in flat
     assert "aprojection" in flat and "assumedoutputtoken" in flat
     assert _says(result.output, "are NOT in that figure")
 
@@ -664,7 +667,10 @@ def test_the_plan_table_shows_the_pace_and_what_a_resume_will_not_rebuy(
     monkeypatch.setattr(consent_module, "Confirm", _Answer(False))
     monkeypatch.setattr(optimize_module, "_console", Console(width=240, force_terminal=True))
     paced = _run(tmp_path, root, "--concurrency", "6")
-    assert "2candidate(s)x3scenario(s)x1episode(s),6atatime" in _flat(paced.output)
+    paced_flat = _flat(paced.output)
+    assert "sweep2candidate(s)x3" in paced_flat
+    assert "scenario(s)x1" in paced_flat
+    assert "episode(s),6atatime" in paced_flat
 
     # A sidecar from an interrupted attempt at THIS plan: the row says what is left to buy.
     matrix_path = _paths(root)[0]
@@ -1515,7 +1521,10 @@ def test_an_unknown_embedder_lists_the_real_ones(
     root = _project(tmp_path)
     result = _run(tmp_path, root, "--yes", "--embedder", "word2vec")
     assert result.exit_code != 0
-    assert _says(result.output, "unknown embedder 'word2vec'; use auto, hashing or azure")
+    assert _says(
+        result.output,
+        "unknown embedder 'word2vec'; use auto, hashing, openai or azure",
+    )
 
 
 def test_auto_takes_the_semantic_embedder_when_the_resource_is_configured(

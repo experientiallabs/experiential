@@ -77,6 +77,7 @@ _PRICES: dict[str, ModelPrice] = {
     # --- Anthropic / Bedrock (Claude) ---
     "claude-fable-5": _claude_price(input_per_mtok=10.0, output_per_mtok=50.0),
     "claude-mythos-5": _claude_price(input_per_mtok=10.0, output_per_mtok=50.0),
+    "claude-opus-5": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-opus-4-8": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-opus-4-7": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-opus-4-6": _claude_price(input_per_mtok=5.0, output_per_mtok=25.0),
@@ -86,6 +87,9 @@ _PRICES: dict[str, ModelPrice] = {
     "claude-sonnet-4-6": _claude_price(input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": _claude_price(input_per_mtok=1.0, output_per_mtok=5.0),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
+    "gpt-5.6-sol": _openai_price(input_per_mtok=5.0, output_per_mtok=30.0),
+    "gpt-5.6-terra": _openai_price(input_per_mtok=2.5, output_per_mtok=15.0),
+    "gpt-5.6-luna": _openai_price(input_per_mtok=1.0, output_per_mtok=6.0),
     "gpt-5.5": _openai_price(input_per_mtok=5.0, output_per_mtok=30.0),
     "gpt-5.5-pro": _openai_price(input_per_mtok=30.0, output_per_mtok=180.0),
     "gpt-5.4": _openai_price(input_per_mtok=2.5, output_per_mtok=15.0),

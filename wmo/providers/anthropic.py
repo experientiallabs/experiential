@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
+from wmo.providers import _anthropic_chat
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
+    ChatRequest,
+    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -76,12 +79,16 @@ class AnthropicProvider:
         api_messages = [
             cast("MessageParam", {"role": m.role, "content": m.content}) for m in messages
         ]
-        response = self._get_client().messages.create(
-            model=self.config.model,
-            system=system,
-            messages=api_messages,
-            max_tokens=max_tokens,
-        )
+        kwargs: dict[str, object] = {
+            "model": self.config.model,
+            "system": system,
+            "messages": api_messages,
+            "max_tokens": max_tokens,
+        }
+        if self.config.reasoning_effort is not None:
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": self.config.reasoning_effort}
+        response = cast("Any", self._get_client().messages).create(**kwargs)
         text = "".join(block.text for block in response.content if block.type == "text")
         # Anthropic reports cache reads and writes BESIDE input_tokens (input_tokens excludes
         # them); TokenUsage's contract is cached-as-subset, so normalize by summing.
@@ -94,6 +101,15 @@ class AnthropicProvider:
             cache_write_input_tokens=cache_write,
         )
         return Completion(text=text, usage=usage)
+
+    def complete_chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a structured agent turn through Anthropic's native Messages API."""
+        return _anthropic_chat.complete_chat(
+            self._get_client().messages,
+            self.config.model,
+            request,
+            reasoning_effort=self.config.reasoning_effort,
+        )
 
     def stream(
         self,
@@ -110,15 +126,19 @@ class AnthropicProvider:
         ]
         # The SDK's raw stream-event union stays behind this one boundary cast; the event loop
         # below narrows by the wire `type` tag (same pattern as the Responses provider).
+        kwargs: dict[str, object] = {
+            "model": self.config.model,
+            "system": system,
+            "messages": api_messages,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if self.config.reasoning_effort is not None:
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": self.config.reasoning_effort}
         events = cast(
             "Iterator[Any]",
-            self._get_client().messages.create(
-                model=self.config.model,
-                system=system,
-                messages=api_messages,
-                max_tokens=max_tokens,
-                stream=True,
-            ),
+            cast("Any", self._get_client().messages).create(**kwargs),
         )
         usage = TokenUsage()
         try:
