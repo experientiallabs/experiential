@@ -44,7 +44,8 @@ copy of it. The only thing this script owns is durability:
   stops the run and reports; it never trims an arm to fit.
 - REPORTING. Each arm is one run on the platform's runs panel (`wmo runs list/show/tail`), fed as
   the grid works: the cohort, every ledger line, every measured cell, a whole-run heartbeat, and a
-  terminal status. It is on only when a platform credential with an organization resolves, `--no-emit`
+  terminal status. It is on only when a platform credential with an organization resolves,
+  `--no-emit`
   turns it off, and it CANNOT affect the grid: every call is buffered, guarded, and unable to raise
   (`wmo.runs.hooks`), so the no-hang property above still holds with reporting on. A `stop` command
   from the panel is honored at the same boundary the spend cap uses, between chunks, because mid-chunk
@@ -401,10 +402,17 @@ def arm_snapshot(state: GridState, arm: str, *, total: int | None) -> GridSnapsh
     run and the panel's numbers would jump with whichever writer spoke last.
     """
     lines = [line for line in state.ledger_lines() if line.arm == arm]
-    counted = {"chunk", "chunk-skipped"}
+    # Progress counts the LAST chunk|chunk-skipped line per chunk index, the same rule the
+    # backfill applies: a resumed arm's ledger holds the original `chunk` line AND the resume's
+    # `chunk-skipped` line for the same chunk, and summing both would report done > the arm's
+    # real cell count. Spend still sums every line: every attempt's dollars were really spent.
+    latest_per_chunk: dict[int, LedgerLine] = {}
+    for line in lines:
+        if line.event in ("chunk", "chunk-skipped") and line.chunk is not None:
+            latest_per_chunk[line.chunk] = line
     return GridSnapshot(
-        done=sum(line.cells for line in lines if line.event in counted),
-        scored=sum(line.scored for line in lines if line.event in counted),
+        done=sum(line.cells for line in latest_per_chunk.values()),
+        scored=sum(line.scored for line in latest_per_chunk.values()),
         total=total,
         candidate_usd=sum(line.candidate_usd for line in lines),
         compressor_usd=sum(line.compressor_usd for line in lines),
