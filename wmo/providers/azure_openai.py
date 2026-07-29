@@ -56,7 +56,7 @@ class AzureOpenAIProvider:
         # so its endpoint+key pairing is trusted and the untrusted-endpoint downgrade below
         # does not apply. Multi-account pools (several Azure resources, one key each) need this.
         self._api_key = api_key
-        self._client: AzureOpenAI | None = None
+        self._client: AzureOpenAI | OpenAI | None = None
         self._responses_client: OpenAI | None = None
         self._forward_temperature = config.resolved_chat_forward_temperature()
 
@@ -77,7 +77,7 @@ class AzureOpenAIProvider:
         )
         return endpoint, is_config_endpoint
 
-    def _get_client(self) -> AzureOpenAI:
+    def _get_client(self) -> AzureOpenAI | OpenAI:
         # Lazy: construct on first use. api_version must be supplied by config; the endpoint and
         # api_key are resolved with a trust check (see below), never blindly from the environment.
         if self._client is None:
@@ -88,7 +88,27 @@ class AzureOpenAIProvider:
 
             endpoint, is_config_endpoint = self._resolved_endpoint()
 
-            from openai import AzureOpenAI
+            from openai import AzureOpenAI, OpenAI
+
+            if endpoint.rstrip("/").endswith("/openai/v1"):
+                if self._api_key is not None:
+                    api_key = self._api_key
+                elif is_config_endpoint:
+                    api_key = os.environ.get("WMO_ENDPOINT_API_KEY") or "not-needed"
+                else:
+                    api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+                    if not api_key:
+                        raise ValueError(
+                            "AzureOpenAIProvider needs AZURE_OPENAI_API_KEY for a unified "
+                            "Foundry v1 endpoint."
+                        )
+                self._client = OpenAI(
+                    api_key=api_key,
+                    base_url=endpoint,
+                    timeout=240.0,
+                    max_retries=0,
+                )
+                return self._client
 
             if self._api_key is not None:
                 # Trusted explicit credential (see __init__): authenticate this endpoint with

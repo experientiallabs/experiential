@@ -494,6 +494,30 @@ def test_get_client_requires_api_version(monkeypatch: pytest.MonkeyPatch) -> Non
         provider._get_client()
 
 
+def test_unified_foundry_v1_uses_direct_openai_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class _UnifiedClient:
+        def __init__(self, **kwargs: object) -> None:
+            observed.update(kwargs)
+
+    import openai
+
+    monkeypatch.setattr(openai, "OpenAI", _UnifiedClient)
+    config = _config().model_copy(
+        update={"endpoint": "https://example.services.ai.azure.com/openai/v1"}
+    )
+
+    client = AzureOpenAIProvider(config, api_key="trusted-key")._get_client()
+
+    assert isinstance(client, _UnifiedClient)
+    assert observed["base_url"] == config.endpoint
+    assert observed["api_key"] == "trusted-key"
+    assert observed["max_retries"] == 0
+
+
 def test_verify_reports_failure_without_raising(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Boom:
         class completions:  # noqa: N801 - mimic the SDK attribute path
