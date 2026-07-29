@@ -394,8 +394,23 @@ def analyze(
     task_manifest: Path,
     out_dir: Path,
     cache_root: Path,
+    seed_matrices: dict[int, OutcomeMatrix] | None = None,
 ) -> dict[str, object]:
     matrix = _canonical_matrix_ids(benchmark, matrix)
+    canonical_seed_matrices = {
+        seed: _canonical_matrix_ids(benchmark, value)
+        for seed, value in (seed_matrices or {}).items()
+    }
+    if canonical_seed_matrices and set(canonical_seed_matrices) != set(SEEDS):
+        raise ValueError(
+            f"{benchmark} seed matrices must cover seeds {list(SEEDS)}, got "
+            f"{sorted(canonical_seed_matrices)}"
+        )
+    for seed, value in canonical_seed_matrices.items():
+        if value.model_names() != matrix.model_names():
+            raise ValueError(f"{benchmark} seed {seed} has a different model roster")
+        if set(value.scenario_ids()) != set(matrix.scenario_ids()):
+            raise ValueError(f"{benchmark} seed {seed} has a different task cohort")
     task_manifest_data = _json(task_manifest)
     groups = {}
     for raw_row in _list(task_manifest_data["tasks"]):
@@ -404,7 +419,6 @@ def analyze(
     missing_groups = sorted(set(matrix.scenario_ids()) - set(groups))
     if missing_groups:
         raise ValueError(f"task manifest lacks groups for {missing_groups[:5]}")
-    cells = _cells(matrix)
     semantic_spec, semantic_embedder, cache_info = _cached_semantic_embedder(
         matrix, cache_root / benchmark
     )
@@ -418,10 +432,12 @@ def analyze(
         defaultdict(list)
     )
     for seed in SEEDS:
+        seed_matrix = canonical_seed_matrices.get(seed, matrix)
+        cells = _cells(seed_matrix)
         split = _dict(_json(split_dir / f"seed-{seed}.json")[benchmark])
         fit_ids = [str(value) for value in _list(split["fit"])]
         heldout_ids = [str(value) for value in _list(split["heldout"])]
-        baseline = best_single_on_fit(matrix, fit_ids)
+        baseline = best_single_on_fit(seed_matrix, fit_ids)
         baseline_metrics, baseline_rows = _evaluate_choices(
             heldout_ids,
             _single_choice(heldout_ids, baseline),
@@ -431,7 +447,7 @@ def analyze(
         )
         arms: dict[str, dict[str, object]] = {}
         static_models = {}
-        for model in matrix.model_names():
+        for model in seed_matrix.model_names():
             metrics, _ = _evaluate_choices(
                 heldout_ids,
                 _single_choice(heldout_ids, model),
@@ -442,14 +458,16 @@ def analyze(
             static_models[model] = metrics
         auxiliary = {
             "cheapest-single": _single_choice(
-                heldout_ids, _cheapest_on_fit(matrix, fit_ids)
+                heldout_ids, _cheapest_on_fit(seed_matrix, fit_ids)
             ),
             "seeded-random": {
-                scenario_id: random.Random(seed * 1_000_003 + index).choice(matrix.model_names())
+                scenario_id: random.Random(seed * 1_000_003 + index).choice(
+                    seed_matrix.model_names()
+                )
                 for index, scenario_id in enumerate(heldout_ids)
             },
             "oracle-upper-bound": _oracle_choices(
-                heldout_ids, matrix.model_names(), cells
+                heldout_ids, seed_matrix.model_names(), cells
             ),
         }
         for name, choices in auxiliary.items():
@@ -464,7 +482,7 @@ def analyze(
         for representation, (spec, embedder) in representations.items():
             with tempfile.TemporaryDirectory() as temp:
                 strict = fit_knn_policy(
-                    matrix,
+                    seed_matrix,
                     bank_path=Path(temp) / KNN_BANK_FILENAME,
                     fit_ids=fit_ids,
                     embedder=spec,
@@ -496,7 +514,7 @@ def analyze(
                 for arm, policy in policies.items():
                     policy.attach_bank(strict.knn_bank())
                     decisions = route_scenarios(
-                        policy, matrix, heldout_ids, embedder=embedder
+                        policy, seed_matrix, heldout_ids, embedder=embedder
                     )
                     metrics, rows = _evaluate_choices(
                         heldout_ids,
@@ -556,6 +574,11 @@ def analyze(
         "benchmark": benchmark,
         "matrix_scenarios": len(matrix.scenario_ids()),
         "models": matrix.model_names(),
+        "matrix_mode": (
+            "one independently built world-model matrix per seed"
+            if canonical_seed_matrices
+            else "one shared measured matrix"
+        ),
         "split_seeds": list(SEEDS),
         "baseline_definition": "best mean-reward single model on fit only, ties to lower cost",
         "primary_arm": "semantic-3072/dial-0.25",
@@ -576,6 +599,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--freeze-dir", type=Path, required=True)
     parser.add_argument("--matrix", action="append", nargs=2, metavar=("BENCHMARK", "PATH"))
+    parser.add_argument(
+        "--seed-matrix",
+        action="append",
+        nargs=3,
+        metavar=("BENCHMARK", "SEED", "PATH"),
+        default=[],
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--embedding-cache", type=Path, required=True)
     args = parser.parse_args()
@@ -585,6 +615,12 @@ def main() -> int:
         "terminal_bench_2": "terminal_bench_2.json",
     }
     results: dict[str, dict[str, object]] = {}
+    by_benchmark_seed: dict[str, dict[int, OutcomeMatrix]] = defaultdict(dict)
+    for benchmark, raw_seed, value in args.seed_matrix:
+        seed = int(raw_seed)
+        if seed in by_benchmark_seed[benchmark]:
+            raise ValueError(f"duplicate seed matrix for {benchmark} seed {seed}")
+        by_benchmark_seed[benchmark][seed] = OutcomeMatrix.load(Path(value))
     for benchmark, value in args.matrix:
         matrix = OutcomeMatrix.load(Path(value))
         results[benchmark] = analyze(
@@ -594,6 +630,7 @@ def main() -> int:
             args.freeze_dir / "tasks" / manifest_names[benchmark],
             args.out_dir,
             args.embedding_cache,
+            seed_matrices=by_benchmark_seed.get(benchmark),
         )
     (args.out_dir / "summary.json").write_text(
         json.dumps(
