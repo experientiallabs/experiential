@@ -1125,3 +1125,34 @@ def test_a_half_supplied_price_pair_is_refused_not_zero_filled(
             options=EntryOptions(endpoint="http://localhost:11434/v1", output_per_mtok=12.0),
             verify=_ok,
         )
+
+
+def test_endpoint_identity_survives_bad_ports_and_keeps_queries_distinct(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A non-numeric port must not crash candidate comparison, and two proxy endpoints
+    # differing only by a routing query parameter are two candidates, not one.
+    monkeypatch.setattr(pool_registry, "endpoint_catalog", _local_catalog)
+    pool = tmp_path / "pool.toml"
+    console = Console(file=StringIO(), width=120, no_color=True)
+    for endpoint in (
+        "http://localhost:port/v1",  # unparsable port: raw-text identity, no crash
+        "http://localhost:8000/v1?tenant=a",
+        "http://localhost:8000/v1?tenant=b",
+    ):
+        register_model_ids(
+            console,
+            pool_path=pool,
+            kind=ProviderKind.OPENAI,
+            model_ids=["qwen3:4b"],
+            options=EntryOptions(endpoint=endpoint),
+            verify=_ok,
+        )
+
+    entries = read_pool_entries(pool)
+    assert len(entries) == 3
+    assert {entry.endpoint for entry in entries} == {
+        "http://localhost:port/v1",
+        "http://localhost:8000/v1?tenant=a",
+        "http://localhost:8000/v1?tenant=b",
+    }

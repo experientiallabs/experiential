@@ -851,17 +851,25 @@ def _endpoint_key(endpoint: str | None) -> str:
 
     Scheme and host are case-insensitive on the wire and a default port is the same route as
     no port, so `HTTP://LocalHost:80/v1` and `http://localhost/v1` must not become two
-    candidates a sweep pays for twice. The path keeps its case (paths are case-sensitive).
+    candidates a sweep pays for twice. The path keeps its case (paths are case-sensitive), and
+    the query rides along verbatim: two proxy endpoints differing only by a routing query
+    parameter are two different candidates. A URL urlsplit cannot parse, or whose port is not
+    a number, compares as its raw lowercased text rather than crashing the registration flow.
     """
     if not endpoint:
         return ""
-    parts = urlsplit(endpoint.rstrip("/"))
+    try:
+        parts = urlsplit(endpoint.rstrip("/"))
+        port_number = parts.port  # raises ValueError on a non-numeric or out-of-range port
+    except ValueError:
+        return endpoint.rstrip("/").lower()
     if parts.hostname is None:
         return endpoint.rstrip("/").lower()
     scheme = parts.scheme.lower()
     default_port = {"http": 80, "https": 443}.get(scheme)
-    port = "" if parts.port in (None, default_port) else f":{parts.port}"
-    return f"{scheme}://{parts.hostname.lower()}{port}{parts.path}"
+    port = "" if port_number in (None, default_port) else f":{port_number}"
+    query = f"?{parts.query}" if parts.query else ""
+    return f"{scheme}://{parts.hostname.lower()}{port}{parts.path}{query}"
 
 
 def _existing_handle(
