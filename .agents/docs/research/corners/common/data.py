@@ -147,6 +147,49 @@ class ArmSnapshot(BaseModel):
     meta: JsonObject | None = None
 
 
+# Addendum cohorts: extra candidate cells measured AFTER an arm's merge under the SAME
+# pins (the grid design's "student cells ride a later sweep, merged in"). Keyed by arm;
+# each addendum root mirrors the grid layout. The qwen addendum is Silen's 2026-07-28
+# 13-model directive, run via Tinker after OpenRouter died (see DECISIONS).
+ADDENDUM_ROOTS: dict[str, tuple[Path, ...]] = {
+    "identity": (Path.home() / "Desktop/Projects/world-model-harness/.wmo/jt/grid-c2-qwen",),
+}
+
+
+def _merge_addenda(arm: str, snapshot: ArmSnapshot) -> ArmSnapshot:
+    """Fold measured addendum cells into a snapshot, verifying the scenario cut matches.
+
+    A pin or scenario mismatch refuses loudly (different evidence, never merged); a
+    missing addendum matrix is simply not there yet. The merge is labeled on the status
+    string so every figure footnote names it.
+    """
+    for root in ADDENDUM_ROOTS.get(arm, ()):
+        path = root / arm / "matrix.json"
+        if not path.exists():
+            continue
+        addendum = OutcomeMatrix.model_validate_json(path.read_text(encoding="utf-8"))
+        if set(o.scenario_id for o in addendum.outcomes) != set(
+            o.scenario_id for o in snapshot.matrix.outcomes
+        ):
+            raise ValueError(
+                f"addendum {path} covers a different scenario set than the {arm} matrix; "
+                f"those are two experiments and cannot be merged"
+            )
+        base_names = set(snapshot.matrix.model_names())
+        new_entries = [e for e in addendum.pool if e.name not in base_names]
+        snapshot = ArmSnapshot(
+            name=snapshot.name,
+            matrix=OutcomeMatrix(
+                pool=snapshot.matrix.pool + new_entries,
+                outcomes=snapshot.matrix.outcomes
+                + [o for o in addendum.outcomes if o.model not in base_names],
+            ),
+            status=snapshot.status + f" + addendum {root.name} ({len(new_entries)} model(s))",
+            meta=snapshot.meta,
+        )
+    return snapshot
+
+
 def load_arm_snapshot(arm: str, *, root: Path | None = None) -> ArmSnapshot | None:
     """This arm's merged matrix, else its pre-retry chunk files concatenated, else None.
 
@@ -156,11 +199,15 @@ def load_arm_snapshot(arm: str, *, root: Path | None = None) -> ArmSnapshot | No
     must agree (the runner's merge enforces full equality; this loader checks the names row
     selection keys on).
     """
+    # Addenda are pinned to the CANONICAL tau cohort: a lens reading another dataset root
+    # (tb2's terminal matrices share these arm names) must never inherit tau's extra models.
+    is_canonical = root is None or root == grid_dir()
     matrix = load_arm_matrix(arm, root=root)
     if matrix is not None:
-        return ArmSnapshot(
+        snapshot = ArmSnapshot(
             name=arm, matrix=matrix, status="merged", meta=load_arm_meta(arm, root=root)
         )
+        return _merge_addenda(arm, snapshot) if is_canonical else snapshot
     arm_dir = (root or grid_dir()) / arm
     chunks = sorted(
         arm_dir.glob("chunk-*.json"), key=lambda p: int(p.stem.removeprefix("chunk-"))
