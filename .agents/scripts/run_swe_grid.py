@@ -90,6 +90,7 @@ from wmo.distill.tau2_proxy import EpisodeProxy
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.providers.base import TokenUsage, ToolCallingProvider
 from wmo.providers.pool import ModelPool, PoolEntry, load_pool, pool_provider
+from wmo.runs.ledger import LedgerLine
 
 logger = logging.getLogger("run_swe_grid")
 
@@ -98,6 +99,15 @@ MAIN_CHECKOUT = Path("/Users/silen/Desktop/Projects/world-model-harness")
 
 PIN_SALT = "swe-defaults-v1:"
 """Salt for the deterministic instance pin. Documented in the findings; never change silently."""
+
+SWE_MODEL_DIR = (
+    MAIN_CHECKOUT / "packages" / "environment-capture" / "swe-bench" / "models" / "swe-bench"
+)
+"""The in-repo swe-bench world model this grid's candidates are measured FOR.
+
+The run itself is real-only (no world-model leg), but the product object the matrix feeds is that
+model's endpoint, and `wmo runs backfill` names the run after this directory.
+"""
 
 DATASET = "princeton-nlp/SWE-Bench_Verified"
 SPLIT = "test"
@@ -155,25 +165,52 @@ OPENAI_MESSAGE_FIELDS = frozenset(
 )
 """Message keys an OpenAI-compatible upstream is documented to accept."""
 
+REASONING_OPT_OUT = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
+"""Candidates that must be told `reasoning_effort="none"` before they will accept tools.
 
-def _without_client_debris(request: ChatRequest) -> ChatRequest:
-    """The same conversation with client-injected message extras dropped.
+Measured on all three: with tools and no `reasoning_effort` key at all, /v1/chat/completions
+answers 400 ("Function tools with reasoning_effort are not supported ... use /v1/responses or set
+reasoning_effort to 'none'"), because the model carries a server-side reasoning default that the
+chat-completions endpoint will not combine with function tools. Adding the key explicitly makes
+tool calls work.
 
-    A WORKAROUND for a product gap, filed rather than hidden: `ChatMessage` is `extra="allow"`,
-    so anything a client hangs on a message survives validation and is forwarded verbatim to the
-    upstream API. litellm hangs `provider_specific_fields` on every assistant message it echoes
-    back, and a strict upstream answers the whole request with a 400 naming
-    `messages[2].provider_specific_fields`. Measured candidate by candidate on the same request:
-    glm-5.2 rejects it (400, and the episode dies at the first assistant replay, so all 40 of
-    its cells), while deepseek-v4-pro and kimi-k2.6 on the same Azure resource tolerate it and
-    the Anthropic and OpenAI backends accept it. One strict upstream is enough: the debris has
-    no business on the wire for any of them.
+THE MEASUREMENT CAVEAT, which belongs in the findings and not just here: this runs the gpt-5.6
+family WITHOUT reasoning, which is a weaker and cheaper configuration than their default. Their
+rows are therefore "gpt-5.6-* (reasoning off)", and comparing them to a reasoning configuration
+would be wrong. To measure them WITH reasoning the pool entries need `kind =
+"openai_responses"`, since tools and reasoning coexist on the Responses API; that is a pool-file
+change (shared state other lanes read), so it is filed rather than made here. Note the Azure
+provider already dispatches reasoning models to its v1 Responses client while the plain OpenAI
+provider does not, which is the actual product asymmetry behind this.
+"""
 
-    Dropping unknown keys cannot change what the model is asked: every documented field is kept,
-    and the debris carries no instruction. The real fix belongs at the provider boundary in wmo
-    (an allowlist when building the upstream payload) so the serving endpoint stops forwarding
-    the same debris; that is a shipped-behavior change with its own tests, not something to land
-    under a running grid.
+REQUEST_FIELDS = frozenset(
+    {"messages", "tools", "tool_choice", "temperature", "max_tokens", "max_completion_tokens"}
+)
+"""Request keys this benchmark harness legitimately sets. Everything else is client debris."""
+
+
+def _without_client_debris(request: ChatRequest, *, reasoning_off: bool = False) -> ChatRequest:
+    """The same request with client-injected extras dropped, at both levels.
+
+    A WORKAROUND for a product gap, filed rather than hidden: `ChatRequest` and `ChatMessage` are
+    both `extra="allow"`, so anything a client hangs on a request or a message survives
+    validation and is forwarded verbatim to the upstream API. Two different upstreams rejected
+    two different pieces of litellm's debris, each killing every episode of the candidates behind
+    it:
+
+    - `messages[].provider_specific_fields`, which litellm attaches to every assistant message it
+      echoes back. glm-5.2 answers the whole request with a 400 naming it (all 40 of its cells);
+      deepseek-v4-pro and kimi-k2.6 on the same Azure resource tolerate it, as do Anthropic and
+      OpenAI.
+    - top-level `reasoning_effort`, which gpt-5.6-sol refuses to accept ALONGSIDE function tools
+      on /v1/chat/completions ("use /v1/responses or set reasoning_effort to 'none'").
+
+    So the allowlist is the fix rather than two special cases: forward the documented fields this
+    harness sets and nothing else. It cannot change what the model is asked, since every field
+    that carries instruction is kept. The real fix belongs at wmo's provider boundary so the
+    serving endpoint stops forwarding the same debris; that is a shipped-behavior change with its
+    own tests, not something to land under a running grid.
     """
     messages = [
         ChatMessage.model_validate(
@@ -185,7 +222,28 @@ def _without_client_debris(request: ChatRequest) -> ChatRequest:
         )
         for message in request.messages
     ]
-    return request.model_copy(update={"messages": messages})
+    kept = {
+        k: v
+        for k, v in request.model_dump(exclude_none=True).items()
+        if k in REQUEST_FIELDS and k != "messages"
+    }
+    if reasoning_off:
+        kept["reasoning_effort"] = "none"
+    return ChatRequest.model_validate({**kept, "messages": messages})
+
+
+def _dropped_request_keys(request: ChatRequest) -> list[str]:
+    """Client-supplied keys the allowlist removes, for one log line per cell."""
+    present = set(request.model_dump(exclude_none=True))
+    message_extras = {
+        key
+        for message in request.messages
+        for key in message.model_dump(exclude_none=True)
+        if key not in OPENAI_MESSAGE_FIELDS
+    }
+    return sorted(present - REQUEST_FIELDS - {"model", "stream", "stream_options"}) + sorted(
+        f"messages[].{key}" for key in message_extras
+    )
 
 
 class _RecordingChatProvider:
@@ -214,8 +272,16 @@ class _RecordingChatProvider:
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """One agent step: sample the candidate, record what it cost, pass the response back."""
         started = time.monotonic()
+        with self._lock:
+            first_call = not self._record.call_seconds and self._record.provider_error is None
+        if first_call:
+            dropped = _dropped_request_keys(request)
+            if dropped:
+                logger.info("%s dropping client request keys: %s", self._label, ", ".join(dropped))
         try:
-            response = self._provider.complete_chat(_without_client_debris(request))
+            response = self._provider.complete_chat(
+                _without_client_debris(request, reasoning_off=self._entry.name in REASONING_OPT_OUT)
+            )
         except Exception as exc:
             with self._lock:
                 # First fault wins: it is the one that ended the episode.
@@ -667,16 +733,16 @@ def load_cell(grid_dir: Path, cell: CellKey) -> ScenarioOutcome | None:
 
 
 def append_ledger(grid_dir: Path, payload: dict[str, JsonValue]) -> None:
-    """Append one bill line. One open-append-close per line, so concurrent writers are safe."""
-    with (grid_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+    """Append one per-cell bill line. One open-append-close, so concurrent writers are safe."""
+    with (grid_dir / "cells.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload) + "\n")
 
 
-def _tip_sha() -> str:
-    """The main checkout's current commit, the cohort's harness stamp."""
+def _git_head(repo: Path) -> str:
+    """`repo`'s current commit, short, or "unknown" when git cannot answer."""
     finished = subprocess.run(
         ["git", "rev-parse", "HEAD"],
-        cwd=MAIN_CHECKOUT,
+        cwd=repo,
         capture_output=True,
         text=True,
         check=False,
@@ -684,12 +750,135 @@ def _tip_sha() -> str:
     return finished.stdout.strip()[:12] or "unknown"
 
 
+def _tip_sha() -> str:
+    """The main checkout's commit, which names the corpus and the harness venv."""
+    return _git_head(MAIN_CHECKOUT)
+
+
+def _runner_sha() -> str:
+    """The commit of the tree this runner is EXECUTING from, which is not the same thing.
+
+    The cells were measured by this working tree's wmo (the bench branch, which carries the
+    Anthropic complete_chat this run depends on), while the corpus and harness venv come from
+    the main checkout. Stamping only one of the two would name a harness that never ran.
+    """
+    return _git_head(Path(__file__).resolve().parent.parent.parent)
+
+
+ARM = "real"
+"""This grid's single arm: real benchmark episodes. There is no second condition to compare.
+
+It is a directory rather than an implicit default because two consumers key on that layout: the
+shared corners runner reads `<dataset_root>/<arm>/matrix.json`, and `wmo runs backfill` refuses a
+grid directory that holds no arm to replay. One name, two contracts already written.
+"""
+
+
 def write_matrix(grid_dir: Path, pool: ModelPool, outcomes: list[ScenarioOutcome]) -> Path:
-    """Merge every measured cell into one `OutcomeMatrix` on disk."""
+    """Merge every measured cell into one `OutcomeMatrix` under this grid's arm directory."""
     matrix = OutcomeMatrix(pool=pool.models, outcomes=outcomes)
-    path = grid_dir / "matrix.json"
+    arm_dir = grid_dir / ARM
+    arm_dir.mkdir(parents=True, exist_ok=True)
+    path = arm_dir / "matrix.json"
     matrix.save(path)
     return path
+
+
+def write_product_ledger(grid_dir: Path, outcomes: Sequence[ScenarioOutcome]) -> Path:
+    """Derive the product-contract ledger (`wmo.runs.ledger.LedgerLine`) the runs panel reads.
+
+    The runner's own append-only record is per CELL and richer than `LedgerLine` allows
+    (`extra="forbid"`), so the two coexist: `cells.jsonl` is what this script writes as it
+    spends, and `ledger.jsonl` is this derivation, which is what `wmo runs backfill` replays into
+    the platform. Nothing is inferred that the cells do not say: one line per (instance,
+    episode) group, its timestamp the newest cell clock in the group, so a replay reads as what
+    happened when it happened and re-running it is byte-identical (which is what makes a repeat
+    free on the panel).
+    """
+    cohort = json.loads((grid_dir / "cohort.json").read_text(encoding="utf-8"))
+    groups: dict[tuple[str, int], list[ScenarioOutcome]] = {}
+    for outcome in outcomes:
+        groups.setdefault((outcome.scenario_id, outcome.episode), []).append(outcome)
+    order = [
+        (instance_id, episode)
+        for episode in range(int(cohort.get("episodes", 1)))
+        for instance_id in cohort.get("instance_ids", [])
+        if (instance_id, episode) in groups
+    ]
+    cumulative = 0.0
+    lines: list[str] = []
+    arm_dir = grid_dir / ARM
+    arm_dir.mkdir(parents=True, exist_ok=True)
+    for chunk, key in enumerate(order):
+        rows = groups[key]
+        instance_id, episode = key
+        # One chunk file per group, in the shape `wmo runs backfill` reads to emit CELL rows,
+        # which is what makes the runs panel show per-cell outcomes instead of only a spend line.
+        (arm_dir / f"chunk-{chunk}.json").write_text(
+            json.dumps({"outcomes": [row.model_dump(mode="json") for row in rows]}, indent=2),
+            encoding="utf-8",
+        )
+        spend = sum(row.cost_usd for row in rows)
+        cumulative += spend
+        stamps = [_cell_finished_at(grid_dir, row) for row in rows]
+        lines.append(
+            LedgerLine(
+                event="chunk",
+                arm=ARM,
+                chunk=chunk,
+                cells=len(rows),
+                scored=sum(1 for row in rows if row.scored),
+                candidate_usd=spend,
+                wall_s=sum(sum(row.call_seconds) for row in rows),
+                ts=max(stamps),
+                cumulative_usd=cumulative,
+                tip_sha=str(cohort.get("tip", "unknown")),
+                max_steps=int(cohort.get("step_limit", 0)),
+                episodes=int(cohort.get("episodes", 1)),
+                note=f"{instance_id} ep{episode}",
+            ).model_dump_json()
+        )
+    path = grid_dir / "ledger.jsonl"
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return path
+
+
+def _cell_finished_at(grid_dir: Path, outcome: ScenarioOutcome) -> str:
+    """When this cell's outcome was written, from the file's own mtime."""
+    path = (
+        grid_dir
+        / "cells"
+        / outcome.model
+        / outcome.scenario_id
+        / f"ep{outcome.episode}"
+        / "outcome.json"
+    )
+    stamp = path.stat().st_mtime if path.exists() else time.time()
+    return datetime.fromtimestamp(stamp, UTC).isoformat()
+
+
+def migrate_cell_ledger(grid_dir: Path) -> None:
+    """Move a pre-`cells.jsonl` runner ledger aside so the product ledger can own its name.
+
+    One-time and idempotent. The first cohort was bought while this script wrote its per-cell
+    lines to `ledger.jsonl`, which is the name `wmo runs backfill` reads; leaving them there
+    would make the backfill refuse the file rather than replay it, and deleting them would throw
+    away the bill.
+    """
+    legacy = grid_dir / "ledger.jsonl"
+    if not legacy.exists():
+        return
+    first = legacy.read_text(encoding="utf-8").splitlines()[:1]
+    if not first:
+        return
+    try:
+        LedgerLine.model_validate_json(first[0])
+    except ValueError:
+        target = grid_dir / "cells.jsonl"
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(legacy.read_text(encoding="utf-8"))
+        legacy.unlink()
+        logger.info("moved this runner's per-cell ledger to %s", target)
 
 
 def collect_outcomes(grid_dir: Path, cells: Sequence[CellKey]) -> list[ScenarioOutcome]:
@@ -747,6 +936,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--smoke", action="store_true", help="2 instances x 1 episode")
     parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help="merge what is on disk into the matrix and ledger, buying nothing",
+    )
+    parser.add_argument(
         "--retry-unscored",
         action="store_true",
         help="re-buy cells whose recorded outcome is an infrastructure failure, not a verdict",
@@ -780,7 +974,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "cohort": cohort,
+                # `created` and `model_dir` are read by `wmo runs backfill` (cohort.created,
+                # cohort.model_dir); the rest of this file is this lane's own provenance.
+                "created": datetime.now(UTC).isoformat(),
+                "model_dir": str(SWE_MODEL_DIR),
                 "tip": tip,
+                "runner_tip": _runner_sha(),
                 "pool_file": str(pool_path),
                 "models": [entry.name for entry in pool.models],
                 "instance_ids": instance_ids,
@@ -834,6 +1033,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         retried,
     )
 
+    if args.finalize_only:
+        todo = []
     proxy = EpisodeProxy()
     proxy.start()
     spent = 0.0
@@ -912,6 +1113,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     measured = collect_outcomes(grid_dir, cells)
     path = write_matrix(grid_dir, pool, measured)
+    migrate_cell_ledger(grid_dir)
+    write_product_ledger(grid_dir, measured)
     scored = [o for o in measured if o.scored]
     logger.info(
         "matrix %s: %d cells on disk, %d scored, %d unscored, cohort spend $%.2f",
