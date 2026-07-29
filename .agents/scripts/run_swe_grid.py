@@ -455,8 +455,15 @@ def _read_trajectory(agent_dir: Path, instance_id: str) -> dict[str, JsonValue]:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _agent_steps(trajectory: dict[str, JsonValue]) -> int:
-    """Shell commands the episode issued, counted from its recorded messages."""
+def _assistant_turns(trajectory: dict[str, JsonValue]) -> int:
+    """Assistant turns the trajectory KEPT, which is not the number of calls the episode made.
+
+    mini-swe-agent's format-error path re-queries without keeping the rejected turn, so a
+    candidate that emits malformed actions makes many more calls than the transcript shows.
+    Measured: qwen3.5-9b spent all 75 of its calls on django__django-13343 while the trajectory
+    kept 38 assistant turns. The gap IS the format-error count, which is why this is recorded
+    beside the call count instead of standing in for it.
+    """
     messages = trajectory.get("messages")
     if not isinstance(messages, list):
         return 0
@@ -700,7 +707,10 @@ def run_cell(
         task=task,
         model=cell.model,
         episode=cell.episode,
-        steps=_agent_steps(trajectory),
+        # The candidate's own calls, counted at the provider boundary, which is the unit the step
+        # pin caps and the unit cost scales with. Never the trajectory's turn count: that
+        # silently drops format-error retries the candidate was still charged for.
+        steps=len(record.call_seconds),
         stop_reason=_stop_reason(trajectory),
         usage=record.usage,
         cost_usd=entry.cost_usd(record.usage),
@@ -751,6 +761,7 @@ def run_cell(
                 "alias": alias,
                 "agent_seconds": agent_seconds,
                 "patch_chars": len(patch or ""),
+                "assistant_turns_kept": _assistant_turns(trajectory),
                 "provenance": "real_episode",
                 "judge": "swe-bench test suite (deterministic verifier)",
                 "call_usage": [u.model_dump(mode="json") for u in record.call_usage],
