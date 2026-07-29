@@ -280,18 +280,25 @@ def _oracle_choices(
     ids: list[str],
     models: list[str],
     cells: dict[tuple[str, str], dict[str, object]],
+    *,
+    default_model: str,
 ) -> dict[str, str]:
-    return {
-        scenario_id: min(
-            (model for model in models if (scenario_id, model) in cells),
-            key=lambda model: (
-                -_number(cells[(scenario_id, model)]["reward"]),
-                _number(cells[(scenario_id, model)]["cost"]),
-                model,
-            ),
+    choices = {}
+    for scenario_id in ids:
+        scored = [model for model in models if (scenario_id, model) in cells]
+        choices[scenario_id] = (
+            min(
+                scored,
+                key=lambda model: (
+                    -_number(cells[(scenario_id, model)]["reward"]),
+                    _number(cells[(scenario_id, model)]["cost"]),
+                    model,
+                ),
+            )
+            if scored
+            else default_model
         )
-        for scenario_id in ids
-    }
+    return choices
 
 
 def _paired_delta(
@@ -469,7 +476,10 @@ def analyze(
                 for index, scenario_id in enumerate(heldout_ids)
             },
             "oracle-upper-bound": _oracle_choices(
-                heldout_ids, seed_matrix.model_names(), cells
+                heldout_ids,
+                seed_matrix.model_names(),
+                cells,
+                default_model=baseline,
             ),
         }
         for name, choices in auxiliary.items():

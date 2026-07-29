@@ -289,12 +289,12 @@ def _route_rows(
             for scenario_id in heldout:
                 ground = ground_decisions[scenario_id]
                 predicted = sim_decisions[scenario_id]
-                predicted_reward, predicted_cost = decision_cells[
-                    (scenario_id, predicted.model)
-                ]
-                base_reward, base_cost = decision_cells[
-                    (scenario_id, decision_baseline)
-                ]
+                predicted_key = (scenario_id, predicted.model)
+                baseline_key = (scenario_id, decision_baseline)
+                if predicted_key not in decision_cells or baseline_key not in decision_cells:
+                    continue
+                predicted_reward, predicted_cost = decision_cells[predicted_key]
+                base_reward, base_cost = decision_cells[baseline_key]
                 per_scenario.append(
                     {
                         "benchmark": benchmark,
@@ -315,6 +315,8 @@ def _route_rows(
                 primary_rows.append(
                     {
                         "seed": seed,
+                        "simulated_decision_gradeable": len(per_scenario),
+                        "simulated_decision_coverage": len(per_scenario) / len(heldout),
                         "selected_model_agreement": statistics.mean(
                             float(ground_decisions[sid].model == sim_decisions[sid].model)
                             for sid in heldout
@@ -355,6 +357,9 @@ def _route_rows(
             ),
             "route_away_agreement_mean": statistics.mean(
                 _number(row["route_away_agreement"]) for row in primary_rows
+            ),
+            "simulated_decision_coverage_mean": statistics.mean(
+                _number(row["simulated_decision_coverage"]) for row in primary_rows
             ),
             "quality_consequence_points_mean": statistics.mean(
                 _number(row["quality_consequence_points"]) for row in primary_rows
@@ -517,6 +522,14 @@ def main() -> int:
     parser.add_argument("--sim-analysis", type=Path, required=True)
     parser.add_argument("--embedding-cache", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--cell-only",
+        action="store_true",
+        help=(
+            "write cell and model agreement without fitting or replaying simulated policies; "
+            "use this fail-closed path when simulated coverage cannot support a routing decision"
+        ),
+    )
     args = parser.parse_args()
 
     real = {
@@ -542,8 +555,19 @@ def main() -> int:
         groups = _groups(
             args.freeze_dir / "tasks" / manifest_names[benchmark]
         )
-        embedder = CachedEmbedder(args.embedding_cache / benchmark)
         result = _cell_and_model(benchmark, matrix, simulated[benchmark])
+        if args.cell_only:
+            benchmarks[benchmark] = result
+            continue
+        cache_path = args.embedding_cache / benchmark
+        if not (cache_path / "meta.json").is_file():
+            ground_report = _dict(
+                _json(args.ground_analysis / f"{benchmark}.json")
+            )
+            cache_path = Path(
+                str(_dict(ground_report["embedding_cache"])["path"])
+            )
+        embedder = CachedEmbedder(cache_path)
         route, ground_rows = _route_rows(
             benchmark,
             matrix,
@@ -569,6 +593,18 @@ def main() -> int:
         benchmarks[benchmark] = result
         decision_ground_rows[benchmark] = ground_rows
         decision_sim_rows[benchmark] = sim_rows
+    if args.cell_only:
+        result = {
+            "mode": "cell-only",
+            "benchmarks": benchmarks,
+            "ground_truth_decision": None,
+            "world_model_decision": None,
+            "promotion_decision_agreement": None,
+            "selected_operating_point_agreement": None,
+        }
+        write = json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        write_text_atomic(args.out, write)
+        return 0
     ground_decision = _decision(decision_ground_rows)
     simulated_decision = _decision(decision_sim_rows)
     result = {
