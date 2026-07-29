@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from wmo.core.files import write_text_atomic
 from wmo.optimize.knn import apply_cost_quality, best_single_on_fit, fit_knn_policy
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import KNN_BANK_FILENAME, EmbedderSpec, RoutingDecision
@@ -104,8 +105,11 @@ def _cached_semantic_embedder(
             vectors = np.asarray(data["vectors"], dtype=np.float32)
     else:
         vectors = np.asarray(spec.build().embed(tasks), dtype=np.float32)
-        np.savez_compressed(vectors_path, vectors=vectors)
-        meta_path.write_text(
+        temporary_vectors = cache_dir / "vectors.tmp.npz"
+        np.savez_compressed(temporary_vectors, vectors=vectors)
+        temporary_vectors.replace(vectors_path)
+        write_text_atomic(
+            meta_path,
             json.dumps(
                 {
                     "backend": "openai",
@@ -118,7 +122,6 @@ def _cached_semantic_embedder(
                 sort_keys=True,
             )
             + "\n",
-            encoding="utf-8",
         )
     if vectors.shape != (len(tasks), spec.dim):
         raise ValueError(
@@ -591,9 +594,9 @@ def analyze(
         "promotion": promotion,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"{benchmark}.json").write_text(
+    write_text_atomic(
+        out_dir / f"{benchmark}.json",
         json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
     )
     return result
 
@@ -635,7 +638,8 @@ def main() -> int:
             args.embedding_cache,
             seed_matrices=by_benchmark_seed.get(benchmark),
         )
-    (args.out_dir / "summary.json").write_text(
+    write_text_atomic(
+        args.out_dir / "summary.json",
         json.dumps(
             {
                 name: {
@@ -649,7 +653,6 @@ def main() -> int:
             allow_nan=False,
         )
         + "\n",
-        encoding="utf-8",
     )
     return 0
 
