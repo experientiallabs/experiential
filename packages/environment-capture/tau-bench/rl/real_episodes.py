@@ -121,6 +121,23 @@ MAX_ATTEMPTS_PER_CELL = 100
 # error page, so the message is trimmed to enough text to classify the failure.
 MAX_ERROR_CHARS = 600
 
+# Candidates whose API refuses function tools unless the reasoning budget is switched off.
+# Measured on all three, every episode, 0 messages and $0 spent (bench-defaults smoke,
+# 2026-07-29):
+#
+#   litellm.BadRequestError: OpenAIException - Function tools with reasoning_effort are not
+#   supported for gpt-5.6-sol in /v1/chat/completions. To use function tools, use /v1/responses
+#   or set reasoning_effort to 'none'.
+#
+# tau2 is a tool-calling benchmark driving chat completions, so reasoning off is the only
+# configuration in which these models can complete an episode at all. That is a property of the
+# serving path rather than a workaround for it: an agent product calling them this way gets the
+# same refusal, so these rows measure what a customer could actually route to. They are NOT
+# comparable to a reasoning-on number, and every report naming these candidates has to say the
+# reasoning budget was off. Not part of the canonical pin set (same standing as temperature), so
+# this does not fork the cohort label.
+REASONING_OFF_CANDIDATES = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
+
 # A realistic agent-side episode mix, used only to order the pool cheapest-first. Ordering by
 # input price alone would let a model with a cheap input rate and an expensive output rate look
 # cheaper than it is.
@@ -162,15 +179,25 @@ class ProtocolPins(BaseModel):
         return self.label == ProtocolPins().label
 
 
-def agent_llm_args(pins: ProtocolPins) -> str:
-    """The `--agent-llm-args` JSON for the candidate stream: the token cap, and nothing else.
+def agent_llm_args(entry: PoolEntry, pins: ProtocolPins) -> str:
+    """The `--agent-llm-args` JSON for the candidate stream: the token cap, plus reasoning off
+    for the candidates whose API refuses tools any other way.
 
     `max_tokens=0` drops the key entirely. That escape hatch is deliberate: litellm rewrites
     `max_tokens` to `max_completion_tokens` only for the reasoning models its table knows, so a
     deployment name it has never seen is rejected outright by Azure, and a grid that cannot start
     at all is worse than a second cohort that says so in its label.
+
+    Args:
+        entry: The candidate this batch measures.
+        pins: The protocol pins the batch runs under.
+
+    Returns:
+        The JSON blob for tau2's `--agent-llm-args`.
     """
     args: JsonObject = {} if pins.max_tokens <= 0 else {"max_tokens": pins.max_tokens}
+    if entry.name in REASONING_OFF_CANDIDATES:
+        args["reasoning_effort"] = "none"
     return json.dumps(args)
 
 
@@ -567,7 +594,7 @@ def batch_command(
         "--agent-llm",
         litellm_route(entry),
         "--agent-llm-args",
-        agent_llm_args(pins),
+        agent_llm_args(entry, pins),
         "--user-llm",
         litellm_route(user_sim),
         # The user stream carries no args at all, matching the training lane's `user_llm_args`

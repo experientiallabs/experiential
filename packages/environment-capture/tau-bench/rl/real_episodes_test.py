@@ -17,6 +17,7 @@ from real_episodes import (
     CANONICAL_MAX_TURNS,
     CANONICAL_TAU2_MAX_RETRIES,
     EVAL_SCENARIOS,
+    REASONING_OFF_CANDIDATES,
     UNLABELED_COHORT,
     ProtocolPins,
     RealEpisodeRow,
@@ -294,8 +295,26 @@ def test_max_tokens_zero_omits_the_key_for_a_strict_deployment() -> None:
     # litellm rewrites max_tokens to max_completion_tokens only for reasoning models its table
     # knows; an unrecognized deployment rejects the key outright, and a grid that cannot start is
     # worse than a labelled second cohort.
-    assert agent_llm_args(ProtocolPins(max_tokens=0)) == "{}"
+    assert agent_llm_args(_AZURE_AI, ProtocolPins(max_tokens=0)) == "{}"
     assert ProtocolPins(max_tokens=0).label == "turns100-t1800-tok0-r0-sim-gpt-5.4-mini"
+
+
+def test_a_reasoning_off_candidate_gets_the_arg_that_lets_it_call_tools() -> None:
+    # These three refuse function tools on chat completions at any reasoning budget above none
+    # (measured, every episode, $0 spent). Reasoning off is the only way they run an episode.
+    pins = ProtocolPins()
+    for name in REASONING_OFF_CANDIDATES:
+        entry = _AZURE_AI.model_copy(update={"name": name})
+        assert json.loads(agent_llm_args(entry, pins))["reasoning_effort"] == "none"
+    # Every other candidate is untouched: the key is absent, not set to a default.
+    assert "reasoning_effort" not in json.loads(agent_llm_args(_AZURE_AI, pins))
+
+
+def test_reasoning_off_does_not_fork_the_cohort_label() -> None:
+    # It is a per-candidate serving constraint, not one of the five protocol pins, so rows for
+    # these candidates stay pairable with the rest of the cohort (same standing as temperature).
+    assert ProtocolPins().is_canonical
+    assert "reasoning" not in ProtocolPins().label
 
 
 def test_an_impossible_pin_is_refused_not_run(tmp_path: Path) -> None:
