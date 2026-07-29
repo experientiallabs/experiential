@@ -185,7 +185,18 @@ provider does not, which is the actual product asymmetry behind this.
 """
 
 REQUEST_FIELDS = frozenset(
-    {"messages", "tools", "tool_choice", "temperature", "max_tokens", "max_completion_tokens"}
+    {
+        "messages",
+        "tools",
+        "tool_choice",
+        "temperature",
+        "max_tokens",
+        "max_completion_tokens",
+        # Part of the canonical swebench.yaml, so it is harness configuration rather than debris:
+        # dropping it would quietly run a different agent config from the published one. Verified
+        # accepted by every candidate, including the strict glm-5.2 (2 tool calls in one reply).
+        "parallel_tool_calls",
+    }
 )
 """Request keys this benchmark harness legitimately sets. Everything else is client debris."""
 
