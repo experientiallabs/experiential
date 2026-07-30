@@ -674,4 +674,66 @@ def test_push_model_skips_an_already_recorded_pipeline(
 
     assert result.exit_code == 0, result.output
     assert _FakeSink.pushes == []
-    assert "already recorded" in _flatten(result.output)
+    assert "already has 7 recorded" in _flatten(result.output)
+
+
+def test_push_reports_malformed_artifact_json_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A corrupt policy.json fails through the CLI, not with a raw traceback."""
+    root = str(tmp_path / ".wmo")
+    model_dir = _write_model_dir(root)
+    (model_dir / "policy.json").write_text("{not json", encoding="utf-8")
+    (model_dir / "report.json").write_text("{}", encoding="utf-8")
+    _connected()
+    _RecordingPushClient.calls = []
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _RecordingPushClient)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    _assert_clean_failure(result)
+    assert "not valid JSON" in _flatten(result.output)
+
+
+def test_push_warns_when_the_existing_endpoint_links_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named endpoint tied to another simulation must not silently lie."""
+    root = str(tmp_path / ".wmo")
+    model_dir = _write_model_dir(root)
+    (model_dir / "policy.json").write_text(
+        '{"kind": "static", "default_model": "m1", "pool": []}', encoding="utf-8"
+    )
+    (model_dir / "report.json").write_text('{"headline": {}}', encoding="utf-8")
+    _connected()
+
+    class _LinkedElsewhereClient(_RecordingPushClient):
+        def get_endpoint(self, org_id: str, name: str) -> dict[str, object] | None:
+            del org_id
+            return {"name": name, "world_model_id": "wm-other"}
+
+    _LinkedElsewhereClient.calls = []
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _LinkedElsewhereClient)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    kinds = [kind for kind, _ in _LinkedElsewhereClient.calls]
+    assert kinds == ["bundle", "artifacts"]
+    assert "linked to a different simulation" in _flatten(result.output)
+
+
+def test_push_skip_message_names_the_partial_replay_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupted earlier push is recoverable from the skip message itself."""
+    _FakeReader.count = 1  # fewer than the derivation's 2: possibly partial
+    root = _pipeline_fixture(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert _FakeSink.pushes == []
+    flat = _flatten(result.output)
+    assert "wmo runs backfill" in flat
+    assert "--force" in flat

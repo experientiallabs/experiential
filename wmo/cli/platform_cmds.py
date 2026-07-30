@@ -408,13 +408,29 @@ def _push_endpoint_artifacts(
             "(the report is the endpoint's customer-facing evidence)"
         )
         return
-    policy = json.loads(policy_path.read_text(encoding="utf-8"))
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    if client.get_endpoint(org_id, remote_name) is None:
+    try:
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise typer.BadParameter(
+            f"the model directory's policy.json/report.json is not valid JSON ({error}); "
+            "refit or regenerate the artifact before pushing"
+        ) from error
+    existing = client.get_endpoint(org_id, remote_name)
+    if existing is None:
         client.create_endpoint(
             org_id, remote_name, world_model_id=world_model_id, model=serve_model
         )
         _console.print(f"{_CHECK} Created endpoint [bold]{remote_name}[/bold]")
+    elif existing.get("world_model_id") != world_model_id:
+        # The platform sets the simulation link at create time and exposes no
+        # update surface for it; installing artifacts below is still correct
+        # (the policy is self-contained), but the link must not silently lie.
+        _console.print(
+            f"[yellow]endpoint {remote_name} is linked to a different simulation "
+            f"(or none); the link is set when an endpoint is created and was left "
+            "untouched[/yellow]"
+        )
     if isinstance(policy, dict) and policy.get("kind") == "knn":
         bank_path = Path(f"{policy_path}.bank.npz")
         client.install_endpoint_policy(
@@ -446,11 +462,17 @@ def _push_pipeline(client: PlatformClient, org_id: str, remote_name: str, model_
         return
     external_id = pipeline_external_id(remote_name)
     events = optimize_events(manifest, model=remote_name, external_id=external_id)
+    recorded = RunsReader(client, org_id).event_count(external_id)
     try:
-        ensure_backfillable(RunsReader(client, org_id).event_count(external_id))
+        ensure_backfillable(recorded)
     except BackfillRefused:
+        # `recorded` cannot distinguish a completed earlier push from one that
+        # died between batches, so the skip names the recovery command instead
+        # of calling the run complete.
         _console.print(
-            f"pipeline run [bold]{external_id}[/bold] is already recorded; skipping the replay"
+            f"pipeline run [bold]{external_id}[/bold] already has {recorded} recorded "
+            f"event(s); skipping the replay. If an earlier push was interrupted, "
+            f"`wmo runs backfill {model_dir} --name {external_id} --force` completes it."
         )
         return
     sink = RunsSink(client, org_id=org_id, emitter_id=default_emitter_id())
