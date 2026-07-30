@@ -196,6 +196,15 @@ _sem: threading.Semaphore | None = None
 _sem_lock = threading.Lock()
 RUN_TAG = os.environ.get("ROUTER_A_TAG", "rtra")  # label for orphan reaping
 
+# public.ecr.aws rate-limits anonymous pulls per IP and WILL reject a stampede: measured
+# `toomanyrequests: Rate exceeded` on the 2nd of 2 back-to-back pulls. Each task's image is ~2.7GB
+# and is pulled once then reused by all 15 of that task's jobs, so pulls are throttled hard and
+# retried with long backoff rather than run at task concurrency.
+PULL_SEM = threading.Semaphore(3)
+_PULL_DELAYS = (5.0, 15.0, 45.0, 120.0, 300.0, 600.0)
+_RETRYABLE_PULL = ("toomanyrequests", "rate exceeded", "429", "timeout", "temporary",
+                   "connection reset", "i/o timeout", "unexpected eof")
+
 
 def semaphore(limit: int) -> threading.Semaphore:
     global _sem
@@ -203,6 +212,24 @@ def semaphore(limit: int) -> threading.Semaphore:
         if _sem is None:
             _sem = threading.Semaphore(limit)
     return _sem
+
+
+def pull_image(image: str, log=None) -> None:
+    """Pull once, retrying registry rate limits. Same shape as the E2B capacity retry this
+    harness inherits its invariants from."""
+    last = ""
+    for delay in (*_PULL_DELAYS, None):
+        with PULL_SEM:
+            p = _docker("pull", "--quiet", image, timeout=3600.0, check=False)
+        if p.returncode == 0:
+            return
+        last = (p.stderr or p.stdout or "")[:300]
+        if delay is None or not any(s in last.lower() for s in _RETRYABLE_PULL):
+            raise RuntimeError(f"docker pull {image} failed: {last}")
+        if log:
+            log(f"pull retry in {delay:.0f}s ({image[-24:]}): {last.strip()[:90]}")
+        time.sleep(delay)
+    raise RuntimeError(f"docker pull {image} exhausted retries: {last}")
 
 
 def _docker(*args: str, timeout: float = 300.0, check: bool = True) -> subprocess.CompletedProcess:
@@ -582,8 +609,12 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
     snaps: dict[tuple[str, int], str] = {}
     prefixes: dict[tuple[str, int], tuple[list[Step], list, str]] = {}
     made: list[str] = []
+    # CUMULATIVE probe cost to reach turn k. This is charged to the router: the probe is part of
+    # the routing decision, and the literature's omission of it is the thing we are correcting.
+    probe_cost: dict[tuple[str, int], float] = {}
 
     try:
+        pull_image(image, log)   # once per task; all 15 jobs reuse it
         for direction, arm in (("cheap", CHEAP), ("top", TOP)):
             ck = out / f"{probe_key(task_id, direction)}.json"
             tagbase = f"{RUN_TAG}/{task_id}-{direction}-{uuid.uuid4().hex[:6]}".lower()
@@ -591,6 +622,7 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
                 r = Runner(arm, box)
                 steps: list[Step] = []
                 native: list = []
+                cum = 0.0
                 for k in K_VALUES:
                     if not gov.ok():
                         log(f"BUDGET stop before probe {task_id}/{direction} K={k}")
@@ -598,6 +630,7 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
                     rr = r.run(prompt, prefix=steps, native=native, same_model=True,
                                stop_after=1, deadline=time.time() + EPISODE_WALL_S)
                     gov.add(rr.cost_usd)
+                    cum += rr.cost_usd
                     steps, native = rr.steps, rr.native
                     if rr.stop == "error":
                         log(f"PROBE-ERR {task_id}/{direction} K={k}: {rr.error}")
@@ -605,13 +638,16 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
                     img = box.commit(f"{tagbase}-k{k}")
                     made.append(img)
                     snaps[(direction, k)] = img
+                    probe_cost[(direction, k)] = cum
                     prefixes[(direction, k)] = ([dataclasses.replace(s) for s in steps],
                                                 list(native), arm.id)
                     log(f"snap {task_id}/{direction} K={k} turns={len(steps)} "
-                        f"${rr.cost_usd:.3f} spent=${gov.spent:.0f}")
-                atomic_write(ck, {"task": task_id, "direction": direction, "arm": arm.id,
-                                  "probe_cost_usd_by_k": {}, "steps": [
-                                      dataclasses.asdict(s) for s in steps]})
+                        f"${rr.cost_usd:.3f} cum=${cum:.3f} spent=${gov.spent:.0f}")
+                atomic_write(ck, {
+                    "task": task_id, "direction": direction, "arm": arm.id,
+                    "probe_cost_usd_by_k": {str(k): probe_cost.get((direction, k))
+                                            for k in K_VALUES},
+                    "steps": [dataclasses.asdict(s) for s in steps]})
 
         jobs: list[tuple] = []
         for (direction, k), img in snaps.items():
@@ -643,6 +679,10 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
                 "turns": rr.turns, "stop": rr.stop, "error": rr.error,
                 "outcome": outcome_of(rr, patch, g),
                 "cost_usd": rr.cost_usd, "wall_s": rr.wall_s,
+                # Cumulative probe spend to reach this prefix. total_cost_usd is what the router
+                # is actually charged for choosing this arm on this task.
+                "probe_cost_usd": probe_cost.get((direction, k), 0.0),
+                "total_cost_usd": rr.cost_usd + probe_cost.get((direction, k), 0.0),
                 "usage": dataclasses.asdict(rr.usage),
                 "f2p_passed": g.get("f2p_passed"), "f2p_total": g.get("f2p_total"),
                 "graded": (g["f2p_passed"] / g["f2p_total"]
