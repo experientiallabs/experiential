@@ -71,8 +71,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trials", type=Path, required=True)
     parser.add_argument("--task-meta", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--embedding-provider", choices=("hashing", "openai"), default="hashing")
+    parser.add_argument(
+        "--embedding-provider", choices=("hashing", "openai", "hybrid"), default="hashing"
+    )
     parser.add_argument("--embedding-model", default="text-embedding-3-small")
+    parser.add_argument("--hybrid-weight", type=float, default=0.25)
     return parser
 
 
@@ -243,6 +246,22 @@ def main() -> None:
     tasks, texts, repos, languages, rewards, costs = _load(args.trials, args.task_meta)
     if args.embedding_provider == "openai":
         embeddings = _openai_embed([texts[task] for task in tasks], args.embedding_model)
+    elif args.embedding_provider == "hybrid":
+        semantic = _openai_embed([texts[task] for task in tasks], args.embedding_model)
+        language_names = sorted(set(languages.values()))
+        language_one_hot = np.asarray(
+            [
+                [float(languages[task] == language) for language in language_names]
+                for task in tasks
+            ],
+            dtype=np.float64,
+        )
+        lengths = np.asarray([len(texts[task]) for task in tasks], dtype=np.float64)
+        lengths = (lengths - lengths.mean()) / max(float(lengths.std()), 1.0)
+        metadata_features = np.column_stack((language_one_hot, lengths)) * args.hybrid_weight
+        combined = np.column_stack((semantic, metadata_features))
+        norms = np.linalg.norm(combined, axis=1, keepdims=True)
+        embeddings = combined / np.where(norms > 0.0, norms, 1.0)
     else:
         embeddings = np.asarray([_embed(texts[task]) for task in tasks])
     results: list[dict[str, object]] = []
@@ -377,7 +396,8 @@ def main() -> None:
         "repos": len(set(repos.values())),
         "baseline": GUARD,
         "embedding_provider": args.embedding_provider,
-        "embedding_model": args.embedding_model if args.embedding_provider == "openai" else "hashing-512-char-trigram",
+        "embedding_model": args.embedding_model if args.embedding_provider != "hashing" else "hashing-512-char-trigram",
+        "hybrid_weight": args.hybrid_weight if args.embedding_provider == "hybrid" else None,
         "criterion": {
             "mean_quality_diff_at_least": -0.005,
             "min_quality_diff_at_least": -0.015,
