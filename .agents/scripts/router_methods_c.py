@@ -195,10 +195,15 @@ def pred_blind(R: np.ndarray, fit: np.ndarray, held: np.ndarray, **_) -> np.ndar
 def pred_mix_top5(R: np.ndarray, fit: np.ndarray, held: np.ndarray, seed: int = 0, **_) -> np.ndarray:
     """Control with ZERO information: pick uniformly among the top-5 fit arms, per task.
 
-    Exists because the top arms here sit within ~1pp of each other, so the fit-SELECTED single arm
-    is a winner's-curse pick that regresses on heldout. Anything that merely SPREADS its picks over
-    several near-tied arms therefore gains, with no per-task signal whatsoever. This row measures
-    exactly that gain, so it can be subtracted from every feature-based row.
+    Added to test whether the fit-selected baseline can be beaten by merely SPREADING picks over
+    several near-tied arms (the top arms sit within ~1pp of each other), with no per-task signal.
+    MEASURED ANSWER: no -- it buys +0.0019 on the 50-arm pool and -0.0034 on the 9-arm pool. So
+    hedging is NOT what makes the SHUF-LABEL control look positive. That row's +0.0318 comes from
+    the BASELINE degrading (fit-selected best single arm 0.9278 -> 0.9108 once labels are made
+    exchangeable, because argmax-on-fit then picks an arm whose fit mean is high precisely because
+    its heldout mean is low). Both rows are kept: together they show a +0.03 "lift" over the
+    fit-selected baseline is manufacturable with zero signal, which is the number every
+    feature-based row has to clear.
     """
     mu = R[:, fit].mean(axis=1)
     top = np.argsort(-mu)[:5]
