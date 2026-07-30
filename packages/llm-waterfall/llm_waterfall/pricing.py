@@ -23,35 +23,119 @@ _BEDROCK_SUFFIX = re.compile(r"(-\d{8})?(-v\d+)?(:\d+)?$")
 
 
 class ModelPrice(BaseModel):
-    """USD per 1,000,000 tokens, split by input/output."""
+    """USD per 1,000,000 tokens, split by input/output plus optional cache tiers.
+
+    A missing cache tier bills that leg at the full input rate — an unknown
+    discount must never read as free, and never silently under-charge.
+    """
 
     input_per_mtok: float
     output_per_mtok: float
+    cached_input_per_mtok: float | None = None
+    cache_write_per_mtok: float | None = None
 
 
-# Keyed by normalized model id (see `_normalize`). USD per 1M tokens.
+# Keyed by normalized model id (see `_normalize`). USD per 1M tokens. Cache
+# tiers are the vendors' published multipliers on the row's input rate
+# (Anthropic 5m-TTL: reads 0.1x, writes 1.25x; OpenAI: cached input 0.1x, no
+# write charge); rows without tiers bill cache legs at the full input rate.
 #
 # Completion prices verified 2026-07-01 against the live vendor pricing pages (Claude via
 # platform.claude.com models overview; OpenAI GPT-5.x Standard tier, short context). Embedding
 # prices are long-stable list prices; treat as approximate.
 _PRICES: dict[str, ModelPrice] = {
     # --- Anthropic / Bedrock (Claude) ---
-    "claude-fable-5": ModelPrice(input_per_mtok=10.0, output_per_mtok=50.0),
-    "claude-mythos-5": ModelPrice(input_per_mtok=10.0, output_per_mtok=50.0),
-    "claude-opus-4-8": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-7": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-6": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-5": ModelPrice(input_per_mtok=5.0, output_per_mtok=25.0),
-    "claude-opus-4-1": ModelPrice(input_per_mtok=15.0, output_per_mtok=75.0),
-    "claude-sonnet-5": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
-    "claude-sonnet-4-6": ModelPrice(input_per_mtok=3.0, output_per_mtok=15.0),
-    "claude-haiku-4-5": ModelPrice(input_per_mtok=1.0, output_per_mtok=5.0),
+    "claude-fable-5": ModelPrice(
+        input_per_mtok=10.0,
+        output_per_mtok=50.0,
+        cached_input_per_mtok=1.0,
+        cache_write_per_mtok=12.5,
+    ),
+    "claude-mythos-5": ModelPrice(
+        input_per_mtok=10.0,
+        output_per_mtok=50.0,
+        cached_input_per_mtok=1.0,
+        cache_write_per_mtok=12.5,
+    ),
+    "claude-opus-4-8": ModelPrice(
+        input_per_mtok=5.0,
+        output_per_mtok=25.0,
+        cached_input_per_mtok=0.5,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-opus-4-7": ModelPrice(
+        input_per_mtok=5.0,
+        output_per_mtok=25.0,
+        cached_input_per_mtok=0.5,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-opus-4-6": ModelPrice(
+        input_per_mtok=5.0,
+        output_per_mtok=25.0,
+        cached_input_per_mtok=0.5,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-opus-4-5": ModelPrice(
+        input_per_mtok=5.0,
+        output_per_mtok=25.0,
+        cached_input_per_mtok=0.5,
+        cache_write_per_mtok=6.25,
+    ),
+    "claude-opus-4-1": ModelPrice(
+        input_per_mtok=15.0,
+        output_per_mtok=75.0,
+        cached_input_per_mtok=1.5,
+        cache_write_per_mtok=18.75,
+    ),
+    "claude-sonnet-5": ModelPrice(
+        input_per_mtok=3.0,
+        output_per_mtok=15.0,
+        cached_input_per_mtok=0.3,
+        cache_write_per_mtok=3.75,
+    ),
+    "claude-sonnet-4-6": ModelPrice(
+        input_per_mtok=3.0,
+        output_per_mtok=15.0,
+        cached_input_per_mtok=0.3,
+        cache_write_per_mtok=3.75,
+    ),
+    "claude-haiku-4-5": ModelPrice(
+        input_per_mtok=1.0,
+        output_per_mtok=5.0,
+        cached_input_per_mtok=0.1,
+        cache_write_per_mtok=1.25,
+    ),
     # --- OpenAI / Azure OpenAI (GPT-5.x; Azure deployments reuse the base model's price) ---
-    "gpt-5.5": ModelPrice(input_per_mtok=5.0, output_per_mtok=30.0),
-    "gpt-5.5-pro": ModelPrice(input_per_mtok=30.0, output_per_mtok=180.0),
-    "gpt-5.4": ModelPrice(input_per_mtok=2.5, output_per_mtok=15.0),
-    "gpt-5.4-mini": ModelPrice(input_per_mtok=0.75, output_per_mtok=4.5),
-    "gpt-5.4-nano": ModelPrice(input_per_mtok=0.2, output_per_mtok=1.25),
+    "gpt-5.5": ModelPrice(
+        input_per_mtok=5.0,
+        output_per_mtok=30.0,
+        cached_input_per_mtok=0.5,
+        cache_write_per_mtok=0.0,
+    ),
+    "gpt-5.5-pro": ModelPrice(
+        input_per_mtok=30.0,
+        output_per_mtok=180.0,
+        cached_input_per_mtok=3.0,
+        cache_write_per_mtok=0.0,
+    ),
+    "gpt-5.4": ModelPrice(
+        input_per_mtok=2.5,
+        output_per_mtok=15.0,
+        cached_input_per_mtok=0.25,
+        cache_write_per_mtok=0.0,
+    ),
+    "gpt-5.4-mini": ModelPrice(
+        input_per_mtok=0.75,
+        output_per_mtok=4.5,
+        cached_input_per_mtok=0.075,
+        cache_write_per_mtok=0.0,
+    ),
+    "gpt-5.4-nano": ModelPrice(
+        input_per_mtok=0.2,
+        output_per_mtok=1.25,
+        cached_input_per_mtok=0.02,
+        cache_write_per_mtok=0.0,
+    ),
     # Azure-hosted OSS deployments (qwen3-coder, agentworld, ...) are deliberately absent:
     # a $0 placeholder row would defeat the price_for()->None "cost unavailable" contract.
     # Supply their negotiated rates per Waterfall via the `prices` override.
@@ -105,6 +189,25 @@ def cost_usd(
     price = price_for(model, prices)
     if price is None:
         return 0.0
+    # The cache legs are subsets of input_tokens (TokenUsage contract); clamp
+    # so a malformed split can never bill more input than there was.
+    total_input = max(usage.input_tokens, 0)
+    read = min(max(usage.cached_input_tokens, 0), total_input)
+    write = min(max(usage.cache_write_input_tokens, 0), total_input - read)
+    uncached = total_input - read - write
+    read_rate = (
+        price.cached_input_per_mtok
+        if price.cached_input_per_mtok is not None
+        else price.input_per_mtok
+    )
+    write_rate = (
+        price.cache_write_per_mtok
+        if price.cache_write_per_mtok is not None
+        else price.input_per_mtok
+    )
     return (
-        usage.input_tokens * price.input_per_mtok + usage.output_tokens * price.output_per_mtok
+        uncached * price.input_per_mtok
+        + read * read_rate
+        + write * write_rate
+        + usage.output_tokens * price.output_per_mtok
     ) / 1_000_000

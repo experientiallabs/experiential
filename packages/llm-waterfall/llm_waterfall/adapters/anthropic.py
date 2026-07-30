@@ -80,9 +80,15 @@ class AnthropicAdapter:
                 temperature=temperature,
             )
         text = "".join(block.text for block in response.content if block.type == "text")
+        # Anthropic's input_tokens EXCLUDES the cache legs; normalize so
+        # input_tokens is the full input and the legs are subsets of it.
+        cache_read = int(getattr(response.usage, "cache_read_input_tokens", 0) or 0)
+        cache_write = int(getattr(response.usage, "cache_creation_input_tokens", 0) or 0)
         usage = TokenUsage(
-            input_tokens=response.usage.input_tokens,
+            input_tokens=response.usage.input_tokens + cache_read + cache_write,
             output_tokens=response.usage.output_tokens,
+            cached_input_tokens=cache_read,
+            cache_write_input_tokens=cache_write,
         )
         return text, usage
 

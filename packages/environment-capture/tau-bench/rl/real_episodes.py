@@ -117,6 +117,30 @@ BATCH_KILL_MARGIN_S = 300.0
 # means something is failing every time, and silently piling up directories would hide it.
 MAX_ATTEMPTS_PER_CELL = 100
 
+# Cap on the failure message carried by an unscored row. A provider can answer with a whole HTML
+# error page, so the message is trimmed to enough text to classify the failure.
+MAX_ERROR_CHARS = 600
+
+# Candidates whose API refuses function tools unless the reasoning budget is switched off.
+# Measured on all three, every episode, 0 messages and $0 spent (bench-defaults smoke,
+# 2026-07-29):
+#
+#   litellm.BadRequestError: OpenAIException - Function tools with reasoning_effort are not
+#   supported for gpt-5.6-sol in /v1/chat/completions. To use function tools, use /v1/responses
+#   or set reasoning_effort to 'none'.
+#
+# tau2 is a tool-calling benchmark driving chat completions, so reasoning off is the only
+# configuration in which these models can complete an episode at all. That is a property of the
+# serving path rather than a workaround for it: an agent product calling them this way gets the
+# same refusal, so these rows measure what a customer could actually route to. They are NOT
+# comparable to a reasoning-on number, and every report naming these candidates has to say the
+# reasoning budget was off. Not part of the canonical pin set (same standing as temperature), so
+# this does not fork the cohort label.
+# Matched on entry.MODEL (the runtime id), not entry.name: an arm handle may carry an
+# effort suffix ("gpt-5.6-sol@low") and a missed match here kills every episode for that
+# arm with the documented tools-with-reasoning refusal.
+REASONING_OFF_CANDIDATES = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
+
 # A realistic agent-side episode mix, used only to order the pool cheapest-first. Ordering by
 # input price alone would let a model with a cheap input rate and an expensive output rate look
 # cheaper than it is.
@@ -158,15 +182,25 @@ class ProtocolPins(BaseModel):
         return self.label == ProtocolPins().label
 
 
-def agent_llm_args(pins: ProtocolPins) -> str:
-    """The `--agent-llm-args` JSON for the candidate stream: the token cap, and nothing else.
+def agent_llm_args(entry: PoolEntry, pins: ProtocolPins) -> str:
+    """The `--agent-llm-args` JSON for the candidate stream: the token cap, plus reasoning off
+    for the candidates whose API refuses tools any other way.
 
     `max_tokens=0` drops the key entirely. That escape hatch is deliberate: litellm rewrites
     `max_tokens` to `max_completion_tokens` only for the reasoning models its table knows, so a
     deployment name it has never seen is rejected outright by Azure, and a grid that cannot start
     at all is worse than a second cohort that says so in its label.
+
+    Args:
+        entry: The candidate this batch measures.
+        pins: The protocol pins the batch runs under.
+
+    Returns:
+        The JSON blob for tau2's `--agent-llm-args`.
     """
     args: JsonObject = {} if pins.max_tokens <= 0 else {"max_tokens": pins.max_tokens}
+    if entry.model in REASONING_OFF_CANDIDATES:
+        args["reasoning_effort"] = "none"
     return json.dumps(args)
 
 
@@ -222,10 +256,55 @@ class Tau2Message(BaseModel):
         return self.content if isinstance(self.content, str) else ""
 
 
+class Tau2CheckInfo(BaseModel):
+    """tau2's per-component commentary. A `note` is how it reports a check it could not apply."""
+
+    note: str | None = None
+
+
 class Tau2RewardInfo(BaseModel):
-    """tau2's verdict. `reward` is None only when tau2 could not score the episode."""
+    """tau2's verdict. `reward` is None only when tau2 could not score the episode.
+
+    The components matter as much as the total. A task whose correct behavior is INACTION scores
+    its DB check by the database being unchanged, which any agent that does nothing satisfies, and
+    a component tau2 cannot apply is reported with a note while still contributing full credit to
+    the breakdown. Keeping the basis, the breakdown, and the notes is what lets analysis separate
+    credit a candidate earned from credit the task handed out.
+    """
 
     reward: float | None = None
+    reward_basis: list[str] = []
+    reward_breakdown: dict[str, float | None] = {}
+    info: dict[str, Tau2CheckInfo | None] = {}
+
+    def vacuous_components(self) -> list[str]:
+        """The reported components tau2 said it had nothing to evaluate.
+
+        Iterates every entry of `info` (tau2 reports components beyond the
+        episode's reward_basis); membership in the basis is the caller's cut.
+
+        A HEURISTIC over tau2's note wording, matched tightly to the shape of
+        its known vacuous notes ("No communicate_info to evaluate", "No
+        actions to evaluate"): the note must OPEN with "no" and end in
+        "to evaluate". A loose substring match ("no " anywhere) mislabeled
+        genuinely evaluated components whose notes merely contained the word
+        ("no errors were found"), silently over-counting handed-out credit.
+        """
+        return sorted(
+            name
+            for name, check in self.info.items()
+            if check is not None
+            and check.note
+            and check.note.lower().startswith("no ")
+            and check.note.lower().rstrip(".").endswith("to evaluate")
+        )
+
+
+class Tau2SimulationInfo(BaseModel):
+    """tau2's per-episode failure record. Present only on an episode it could not finish."""
+
+    error: str | None = None
+    error_type: str | None = None
 
 
 class Tau2Simulation(BaseModel):
@@ -238,6 +317,9 @@ class Tau2Simulation(BaseModel):
     user_cost: float | None = None
     reward_info: Tau2RewardInfo | None = None
     messages: list[Tau2Message] = []
+    info: Tau2SimulationInfo | None = None
+    start_time: str | None = None
+    end_time: str | None = None
 
     _null_is_zero = field_validator("duration", mode="before")(_zero_if_null)
 
@@ -272,7 +354,23 @@ class RealEpisodeRow(BaseModel):
     episode: int
     reward: float | None  # None = unscored (infrastructure failure), never treated as 0
     nl_assertion_reward: bool
+    # tau2's scoring components for this episode, so a total can be audited against its parts.
+    # A reward of 1.0 on a correct-inaction task with a vacuous COMMUNICATE check is not the same
+    # measurement as a reward of 1.0 on a task the candidate had to act to solve, and only the
+    # breakdown distinguishes them.
+    reward_basis: list[str] = []
+    reward_breakdown: dict[str, float | None] = {}
+    vacuous_components: list[str] = []
     termination_reason: str
+    # WHY an unscored episode has no reward. tau2 collapses every failure into the single
+    # termination_reason "infrastructure_error", which merges two cases analysis must keep
+    # apart: a candidate that replied with neither content nor a tool call (its own output, a
+    # benchmark failure that belongs in the denominator) and a 429, auth fault, or timeout
+    # (genuinely ours, excluded-and-reported). The distinction decides whether a cell counts as
+    # a zero or a hole, and reading it back out of tau2's save directories is not possible once
+    # they are cleaned, so the signature travels on the row.
+    error: str | None = None
+    error_type: str | None = None
     duration_s: float
     agent_input_tokens: int
     agent_output_tokens: int
@@ -281,6 +379,11 @@ class RealEpisodeRow(BaseModel):
     cost_usd_pool: float  # authoritative: our pool prices
     cost_usd_tau2_agent: float | None  # litellm's guess, kept for audit
     cost_usd_tau2_user: float | None
+    # BILLED PROVIDER CALLS (assistant messages carrying usage), the program's step unit
+    # since 2026-07-29. Rows written before that date counted tool-calling turns (a ~1.5x
+    # smaller number, 3x on conversational candidates); both bench cohorts were repaired
+    # offline (repair_tau_rows) and no unrepaired pre-change rows.jsonl should be resumed
+    # into a post-change cohort - the loader cannot tell the two units apart.
     steps: int
     call_seconds: list[float]
     replies: list[str]
@@ -289,6 +392,13 @@ class RealEpisodeRow(BaseModel):
     # were forwarded have no label and default to UNLABELED_COHORT rather than failing to load:
     # they are readable evidence of a different cohort, and consumers refuse to pair across them.
     cohort: str = UNLABELED_COHORT
+    # WHEN the episode ran, as tau2 clocked it. `wmo runs backfill` replays a run from its
+    # artifacts and refuses to infer anything they do not say, so without these the platform's run
+    # history could only carry the hour someone replayed it instead of the hour the work happened.
+    # Absent on rows bought before this field existed, which is why the converter reports how many
+    # it could not stamp rather than substituting a clock of its own.
+    started_at: str | None = None
+    ended_at: str | None = None
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -618,7 +728,7 @@ def batch_command(
         "--agent-llm",
         litellm_route(entry),
         "--agent-llm-args",
-        agent_llm_args(pins),
+        agent_llm_args(entry, pins),
         "--user-llm",
         litellm_route(user_sim),
         # The user stream carries no args at all, matching the training lane's `user_llm_args`
@@ -704,6 +814,23 @@ def _stream_tokens(messages: Sequence[Tau2Message], role: str) -> tuple[int, int
     return prompt, completion
 
 
+def _error_fields(sim: Tau2Simulation) -> tuple[str | None, str | None]:
+    """tau2's failure signature for one episode, or `(None, None)` when it finished.
+
+    Args:
+        sim: The parsed tau2 simulation.
+
+    Returns:
+        The capped error message and tau2's exception class name.
+    """
+    if sim.info is None:
+        return None, None
+    message = (sim.info.error or "").strip()
+    if len(message) > MAX_ERROR_CHARS:
+        message = message[:MAX_ERROR_CHARS] + "... [truncated]"
+    return message or None, sim.info.error_type
+
+
 def rows_from_results(
     results: Tau2Results,
     entry: PoolEntry,
@@ -737,6 +864,7 @@ def rows_from_results(
         agent_in, agent_out = _stream_tokens(sim.messages, "assistant")
         user_in, user_out = _stream_tokens(sim.messages, "user")
         assistant = [m for m in sim.messages if m.role == "assistant"]
+        error, error_type = _error_fields(sim)
         rows.append(
             RealEpisodeRow(
                 scenario_id=scenario.scenario_id,
@@ -749,7 +877,16 @@ def rows_from_results(
                 episode=episode,
                 reward=sim.reward_info.reward if sim.reward_info is not None else None,
                 nl_assertion_reward=scenario.nl_assertion_reward,
+                reward_basis=sim.reward_info.reward_basis if sim.reward_info else [],
+                reward_breakdown=sim.reward_info.reward_breakdown if sim.reward_info else {},
+                vacuous_components=(
+                    sim.reward_info.vacuous_components() if sim.reward_info else []
+                ),
                 termination_reason=sim.termination_reason,
+                error=error,
+                error_type=error_type,
+                started_at=sim.start_time,
+                ended_at=sim.end_time,
                 duration_s=sim.duration,
                 agent_input_tokens=agent_in,
                 agent_output_tokens=agent_out,
@@ -760,7 +897,13 @@ def rows_from_results(
                 ),
                 cost_usd_tau2_agent=sim.agent_cost,
                 cost_usd_tau2_user=sim.user_cost,
-                steps=sum(1 for m in sim.messages if m.tool_calls),
+                # BILLED PROVIDER CALLS, not kept tool-calling turns (the program-wide step
+                # unit: it is what the max_turns cap enforces and what cost scales with). An
+                # assistant message carries `usage` exactly when a completion was purchased for
+                # it, which excludes tau2's scripted opening greeting; counting only turns that
+                # happened to call a tool undercounted the real call volume by ~1.5x, and by 3x
+                # on conversational candidates.
+                steps=sum(1 for m in assistant if m.usage is not None),
                 call_seconds=[
                     m.generation_time_seconds
                     for m in assistant
@@ -841,9 +984,7 @@ def resume_keys(rows: Sequence[RealEpisodeRow], retry_failed: bool) -> set[tuple
     pass, one retry: a cell that fails again simply stays unscored, and the operator decides
     whether to run the flag again.
     """
-    return {
-        row.key for row in latest_per_cell(rows) if not (retry_failed and row.reward is None)
-    }
+    return {row.key for row in latest_per_cell(rows) if not (retry_failed and row.reward is None)}
 
 
 def to_matrix(rows: Sequence[RealEpisodeRow], pool: Sequence[PoolEntry]) -> OutcomeMatrix:
@@ -1217,12 +1358,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 done.update(row.key for row in batch)
                 spent += spend_usd(batch)
                 scored = [row.reward for row in batch if row.reward is not None]
+                # The mean is over SCORED episodes only, so it has to be printed next to how many
+                # there were. An arm that loses most of its episodes and aces the survivors reads
+                # as a perfect arm otherwise: qwen3.5-9b's first airline batch logged a mean of
+                # 1.000 while 4 of its 7 episodes had died unscored.
                 logger.info(
-                    "  -> %d sims, mean reward %s, running total $%.2f",
+                    "  -> %d/%d scored, mean reward %s, running total $%.2f",
+                    len(scored),
                     len(batch),
                     f"{sum(scored) / len(scored):.3f}" if scored else "n/a",
                     spent,
                 )
+                unscored = [row for row in batch if row.reward is None]
+                if unscored:
+                    reasons = sorted({row.error_type or row.termination_reason for row in unscored})
+                    logger.warning(
+                        "     %d unscored: %s", len(unscored), ", ".join(reasons) or "unreported"
+                    )
 
     if args.dry_run:
         logger.info("dry run: nothing executed, nothing spent")

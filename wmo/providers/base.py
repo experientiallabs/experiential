@@ -73,15 +73,15 @@ class TokenUsage(BaseModel):
 def structured_token_usage(response: ChatResponse) -> TokenUsage:
     """Project a structured response onto cache-aware and reasoning-aware counters."""
     counts = response.token_usage()
-    cached = 0
-    cache_write = 0
+    cached = counts.cached_input_tokens
+    cache_write = counts.cache_write_input_tokens
     reasoning = 0
     if response.usage is not None:
+        prompt_details = response.usage.prompt_tokens_details
+        if prompt_details is not None:
+            detail_extras = prompt_details.model_extra or {}
+            cache_write = _nonnegative_int(detail_extras.get("cache_write_tokens"))
         extras = response.usage.model_extra or {}
-        prompt_details = extras.get("prompt_tokens_details")
-        if isinstance(prompt_details, dict):
-            cached = _nonnegative_int(prompt_details.get("cached_tokens"))
-            cache_write = _nonnegative_int(prompt_details.get("cache_write_tokens"))
         completion_details = extras.get("completion_tokens_details")
         if isinstance(completion_details, dict):
             reasoning = _nonnegative_int(completion_details.get("reasoning_tokens"))

@@ -205,8 +205,9 @@ def test_responses_response_preserves_text_multiple_tools_usage_and_tier() -> No
     assert response.usage is not None
     assert response.usage.prompt_tokens == 321
     assert response.usage.completion_tokens == 45
+    assert response.usage.prompt_tokens_details is not None
+    assert response.usage.prompt_tokens_details.cached_tokens == 120
     assert response.usage.model_extra == {
-        "prompt_tokens_details": {"cached_tokens": 120},
         "completion_tokens_details": {"reasoning_tokens": 30},
     }
     assert response.wire_payload()["service_tier"] == "priority"

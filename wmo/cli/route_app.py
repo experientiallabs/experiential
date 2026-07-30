@@ -21,6 +21,7 @@ customer copy never says router.
 from __future__ import annotations
 
 import itertools
+import json
 from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -63,7 +64,13 @@ from wmo.optimize.outcomes import (
     load_matrix_with_digest,
     split_router_scenarios,
 )
-from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
+from wmo.optimize.pareto import (
+    DEFAULT_WM_JUDGE,
+    PARETO_FILENAME,
+    REAL_EPISODE,
+    WM_SIMULATED,
+    held_out_curve,
+)
 from wmo.optimize.policy import (
     AZURE_EMBEDDER_DIM,
     AZURE_EMBEDDER_ENV,
@@ -775,6 +782,13 @@ def student(
             "are not preserved by a replacement), or --name <other> to keep both"
         )
         raise typer.Exit(0)
+    if _pool_disabled(pool_path, name):
+        # Same rule as the registry writer: `enabled = false` is an explicit operator edit,
+        # and replacing the entry must not silently put the candidate back into selection.
+        entry = entry.model_copy(update={"enabled": False})
+        _console.print(
+            f"[dim]'{name}' is disabled in the roster (enabled = false); keeping it disabled[/dim]"
+        )
     try:
         written = upsert_pool_entry(entry, pool_path)
     except FileLockTimeout as exc:
@@ -814,6 +828,16 @@ def _pool_has(path: Path, name: str) -> bool:
     except (ValueError, FileNotFoundError):
         # An unreadable pool is upsert_pool_entry's error to raise, with its own message; do not
         # pre-empt it here with a confirmation prompt about an entry we cannot see.
+        return False
+
+
+def _pool_disabled(path: Path, name: str) -> bool:
+    """Whether `path` carries an entry called `name` with `enabled = false` (else False)."""
+    if not path.is_file():
+        return False
+    try:
+        return any(entry.name == name and not entry.enabled for entry in load_pool(path).models)
+    except (ValueError, FileNotFoundError):
         return False
 
 
@@ -1202,19 +1226,40 @@ def pin(
         raise typer.BadParameter(str(exc)) from exc
     except ValueError as exc:
         raise typer.BadParameter(f"cannot read the pool at {pool_path}: {exc}") from exc
-    if all(entry.name != model for entry in roster.models):
-        available = ", ".join(entry.name for entry in roster.models)
+    active = roster.enabled_models()
+    if all(entry.name != model for entry in active):
+        if any(entry.name == model for entry in roster.models):
+            raise typer.BadParameter(
+                f"pool model '{model}' is disabled (enabled = false) in {pool_path}; flip it "
+                "back on to pin it"
+            )
+        available = ", ".join(entry.name for entry in active)
         raise typer.BadParameter(
             f"no pool model named '{model}' in {pool_path}; available: {available}"
         )
     out_path = Path(out) if out else model_dir / POLICY_FILENAME
+    if out and out_path.resolve() != (model_dir / POLICY_FILENAME).resolve():
+        # The foot-gun that bit both bench-defaults lanes (2026-07-29): an --out
+        # anywhere but <model dir>/policy.json succeeds, prints the same cheerful
+        # line, and leaves the file serving actually reads holding whatever policy
+        # it held before (a different FILENAME in the right dir misses identically).
+        # The pin still lands where asked; the operator is told serving will not
+        # see it.
+        _console.print(
+            f"[yellow]![/yellow] --out is outside {model_dir}; `wmo serve --name "
+            f"{model_dir.name}` and GET /config read {model_dir / POLICY_FILENAME}, "
+            "which this pin does NOT update"
+        )
     if out_path.is_file() and not yes and not _confirm_overwrite(out_path):
         _console.print(f"left {out_path} in place")
         raise typer.Exit(0)
     policy = RoutingPolicy(
         kind="static",
         default_model=model,
-        pool=roster.models,
+        # Only the enabled roster travels: the policy's pool is what serving may construct
+        # providers for, and a turned-off candidate must not become reachable through an
+        # endpoint pinned after the operator turned it off.
+        pool=active,
         fitted_from=f"pinned to {model} from {pool_path} (no outcome matrix)",
     )
     policy.save(out_path)
@@ -1311,8 +1356,35 @@ def report(
     ),
     endpoint: str = typer.Option("endpoint", "--endpoint", help="Endpoint id for the report."),
     out: str = typer.Option("report.json", "--out", help="Where to write the report JSON."),
+    provenance: str = typer.Option(
+        WM_SIMULATED,
+        "--provenance",
+        help=f"How this matrix's rewards were produced: {WM_SIMULATED} (closed-loop against a "
+        f"world model, the default) or {REAL_EPISODE} (episodes of the real benchmark). It rides "
+        "on the pareto curve and must never be wrong: consumers refuse to blend the two.",
+    ),
+    judge: str = typer.Option(
+        DEFAULT_WM_JUDGE,
+        "--judge",
+        help="What scored the episodes, printed beside every rendering of the curve. Pass the "
+        "real scorer for a real-benchmark matrix (for example \\[tau2 reward]).",
+    ),
+    scenario_label: str = typer.Option(
+        "",
+        "--scenario-label",
+        help="The report's customer-facing sentence describing WHAT was measured. Defaults to the "
+        "world-model phrasing ('reconstructed from your traces'), which is false for a real "
+        "benchmark, so pass the truth there (for example 'on the 20 pinned tau2-bench eval "
+        "tasks').",
+    ),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
+    if provenance not in {WM_SIMULATED, REAL_EPISODE}:
+        # A typo here would silently label real measurements as simulated, which is the one
+        # mistake the curve's provenance field exists to prevent.
+        raise typer.BadParameter(
+            f"--provenance must be {WM_SIMULATED} or {REAL_EPISODE}, not {provenance!r}"
+        )
     matrix, matrix_source = _load_matrix(matrix_file)
     policy = _load_policy(policy_file)
     try:
@@ -1322,6 +1394,7 @@ def report(
             baseline=baseline,
             endpoint=endpoint,
             generated_at=datetime.now(tz=UTC).isoformat(),
+            scenario_label=scenario_label or None,
         )
     except KeyError as exc:
         # `--baseline` is a pool entry handle; the KeyError already lists the ones this matrix
@@ -1342,10 +1415,19 @@ def report(
     # The measured cost/quality curve rides beside every report (D-PARETO): GET /config
     # serves it from the model dir so the platform's graph renders this workload's frontier.
     try:
-        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        curve = held_out_curve(matrix, policy, judge=judge, provenance=provenance)
         pareto_out = Path(out).parent / PARETO_FILENAME
         write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
         _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")
+        # Same foot-gun as `pin --out`: serving loads policy.json and pareto.json from ONE
+        # model dir, so a curve written apart from the policy it describes is a curve
+        # `wmo serve` and GET /config never show. Succeeding silently here is what hid it.
+        if Path(policy_file).resolve().parent != pareto_out.resolve().parent:
+            _console.print(
+                f"[yellow]![/yellow] the curve landed apart from {policy_file}; serving reads "
+                "pareto.json from the same directory as the policy it mounts, so point --out "
+                "there for the endpoint to show this curve"
+            )
     except (ValueError, FileNotFoundError) as exc:
         _console.print(f"[yellow]![/yellow] pareto curve skipped: {exc}")
     headline = improvement.headline
@@ -1399,4 +1481,95 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
         f"({_MATRIX_DIGEST_MARK}{digest}) and records no fit split, so these numbers are "
         "IN-SAMPLE, not held out: every request retrieves its own row. Sweep a second matrix "
         "over scenarios the fit never saw and report against that one."
+    )
+
+
+@route_app.command("push")
+def push(
+    policy_file: str = typer.Argument(POLICY_FILENAME, help="Fitted policy JSON to install."),
+    endpoint: str = typer.Option(
+        ...,
+        "--endpoint",
+        help="Hosted endpoint slug to install onto (the `model` a customer's client sends).",
+    ),
+    org: str | None = typer.Option(
+        None,
+        "--org",
+        help="Organization id (default: the login's, or $WMO_PLATFORM_ORG).",
+    ),
+    report_file: str | None = typer.Option(
+        None,
+        "--report",
+        help="Improvement report JSON to publish with the policy (see `route report`).",
+    ),
+) -> None:
+    """Install a fitted policy on a hosted endpoint, so serving actually uses it.
+
+    The last link in the chain. `fit` writes a policy that only this machine can see;
+    an endpoint created on the platform serves a `static` policy until something
+    replaces it. This is that something:
+
+        wmo optimize route push models/support/policy.json --endpoint support-prod
+
+    A knn policy is TWO artifacts, and this sends both: the JSON plus the `.npz`
+    evidence bank beside it, resolved from the policy's own `knn_bank_path` rather
+    than guessed, so a renamed sidecar is a local error instead of a server refusal.
+    Sending the policy alone would store a row that validates and cannot serve.
+
+    The endpoint keeps its id, name, and URL, so a customer's client is unaffected by
+    the swap, and live pods pick the new policy up on their own.
+    """
+    policy_path = Path(policy_file)
+    if not policy_path.is_file():
+        raise typer.BadParameter(
+            f"no policy at {policy_path} (`wmo optimize route fit` writes one)"
+        )
+    try:
+        policy = RoutingPolicy.load(policy_path)
+    except (OSError, ValidationError, ValueError) as exc:
+        raise typer.BadParameter(f"{policy_path} is not a routing policy: {exc}") from exc
+
+    bank_path: Path | None = None
+    if policy.kind == "knn":
+        bank_path = policy.bank_path()
+        if not bank_path.is_file():
+            # Checked here, not left to the server: the policy names its own sidecar,
+            # so a missing one means the local artifact pair is broken and pushing
+            # would only turn that into a 400 after uploading nothing useful.
+            raise typer.BadParameter(
+                f"{policy_path} is a knn policy whose evidence bank is missing at "
+                f"{bank_path}; a knn policy is served together with its sidecar, so "
+                "copy it beside the policy or refit with `wmo optimize route fit --kind knn`"
+            )
+    report_path = Path(report_file) if report_file is not None else None
+    if report_path is not None:
+        if not report_path.is_file():
+            raise typer.BadParameter(
+                f"no report at {report_path} (`wmo optimize route report` writes one)"
+            )
+        try:
+            json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # Same rule as the sidecar check: a broken local artifact fails here,
+            # not as a server refusal after the upload already happened.
+            raise typer.BadParameter(f"{report_path} is not readable JSON: {exc}") from exc
+
+    # Imported here, not at module scope: `platform_cmds` builds its own command
+    # surface at import time, and pulling that in for one command changed behavior
+    # in unrelated `route` commands (15 of this module's tests went red).
+    from wmo.cli.platform_cmds import _connected, _require_connection
+
+    # Sized before the install: a stat after a SUCCESSFUL install would make the
+    # whole command read as failed if anything removed the local file meanwhile.
+    size = f", bank {bank_path.stat().st_size / 1024:.0f}KiB" if bank_path is not None else ""
+
+    credentials, org_id = _require_connection(org)
+    with _connected(credentials, "Could not install the policy") as client:
+        client.install_endpoint_policy(org_id, endpoint, policy_path, bank_path, report_path)
+
+    _console.print(
+        f"[green]✓[/green] installed {policy.kind} policy on [bold]{endpoint}[/bold]{size}\n"
+        f"  from: {policy_path}\n"
+        f"  serving picks it up without a restart; `wmo runs` and the endpoint's "
+        f"telemetry show what it routes."
     )

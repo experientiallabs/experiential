@@ -29,6 +29,7 @@ import os
 import tomllib
 from pathlib import Path
 from typing import Literal, NamedTuple
+from urllib.parse import urlsplit
 
 import tomli_w
 from llm_waterfall import ChatMaxTokensField
@@ -89,10 +90,35 @@ class PoolEntry(BaseModel):
     region: str | None = None  # AWS Bedrock region (bedrock entries only)
     api_key_env: str | None = None  # env var holding this entry's API key (multi-account pools)
     tier: Tier = "frontier"
+    # The roster's per-candidate toggle: `enabled = false` keeps the entry (its handle, prices,
+    # and comments) but takes it out of everything that CHOOSES models: sweeps, fits, pins, and
+    # the platform's endpoint-creation defaults. A disabled entry still validates and still
+    # resolves in policies already fitted with it, so flipping the flag never strands an
+    # artifact that recorded the entry while it was on.
+    enabled: bool = True
+    # One effort dial across vendors: OpenAI-family backends forward it as
+    # `reasoning.effort` (dispatching through their Responses client), Anthropic as
+    # adaptive thinking's `output_config.effort` (low|medium|high|max, probed live
+    # 2026-07-29). Two entries differing only in effort are two ARMS with one runtime
+    # model id - the router-vs-router comparison's whole premise.
+    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     cached_input_per_mtok: float | None = None  # provider cache-read price, USD per 1M tokens
     cache_write_per_mtok: float | None = None  # provider cache-write price, USD per 1M tokens
+
+    @model_validator(mode="after")
+    def _validate_reasoning_effort_route(self) -> PoolEntry:
+        # Fail at LOAD, not at the first request of a sweep: Bedrock's Converse API has
+        # no effort dial on any path, so an effort-dialed Bedrock entry is a mis-mapped
+        # arm that would burn a preflight and then refuse every cell.
+        if self.reasoning_effort is not None and self.kind == ProviderKind.BEDROCK:
+            raise ValueError(
+                f"pool entry {self.name!r}: reasoning_effort is not supported on bedrock "
+                "(Converse has no effort dial); route effort-dialed Claude through the "
+                "direct anthropic kind instead"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_price(self) -> PoolEntry:
@@ -103,6 +129,20 @@ class PoolEntry(BaseModel):
         catalog_note = ""
         if self.input_per_mtok is None and self.kind is ProviderKind.OPENROUTER:
             catalog_note = self._resolve_openrouter_price()
+        if (
+            self.input_per_mtok is None
+            and self.kind is ProviderKind.OPENAI
+            and self.endpoint is not None
+        ):
+            # A self-hosted server (openai kind + explicit endpoint) always takes an explicit
+            # price: the built-in table describes OpenAI's HOSTED rates, and an entry whose
+            # model id shadows a hosted one (someone serving "gpt-4o" locally) would otherwise
+            # silently bill sweeps, routing, and metering at the wrong server's price.
+            raise ValueError(
+                f"pool model '{self.name}': '{self.model}' is served by a custom endpoint "
+                f"({self.endpoint}), so built-in prices do not apply; add input_per_mtok and "
+                "output_per_mtok to its entry (0 and 0 for free local inference)"
+            )
         if self.input_per_mtok is None and price_for(self.model) is None:
             raise ValueError(
                 f"pool model '{self.name}': '{self.model}' has no built-in price;{catalog_note} "
@@ -231,8 +271,8 @@ class PoolEntry(BaseModel):
                 field="deployment",
             ),
             api_version=self.api_version,
-            reasoning_effort=self.reasoning_effort,
             region=self.region,
+            reasoning_effort=self.reasoning_effort,
         )
 
     def _env_backed_value(
@@ -276,6 +316,41 @@ class ModelPool(BaseModel):
                 return candidate
         available = ", ".join(m.name for m in self.models)
         raise KeyError(f"no pool model named '{name}'; available: {available}")
+
+    def enabled_models(self) -> list[PoolEntry]:
+        """The candidates that participate in model selection (`enabled` not flipped off).
+
+        Everything that CHOOSES models reads this instead of `models`: `wmo optimize route
+        sweep`'s preflight, `wmo optimize route pin`, and the platform's endpoint-creation
+        defaults. Loading and validation stay on the full roster, so a disabled entry keeps
+        failing loudly on a typo rather than silently rotting until it is re-enabled.
+        """
+        return [entry for entry in self.models if entry.enabled]
+
+
+# Hostnames that mean "this machine": how display and the platform's serving boundary recognize
+# a locally hosted, OpenAI-compatible endpoint (Ollama, vLLM, llama.cpp) without a new provider
+# kind. The wire behavior is identical to any custom endpoint; only copy and, in a container,
+# host translation care.
+_LOCAL_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"})  # noqa: S104
+
+
+def is_local_endpoint(endpoint: str | None) -> bool:
+    """Whether `endpoint` points at this machine (see `_LOCAL_HOSTNAMES`; `*.local` counts too).
+
+    Never raises: this feeds display copy and price defaulting, and `urlsplit` raises
+    `ValueError` on malformed bracket URLs (`http://[::1:8000`), which must read as "not
+    local", not crash the roster table or the endpoint prompt.
+    """
+    if not endpoint:
+        return False
+    try:
+        host = urlsplit(endpoint).hostname
+    except ValueError:
+        return False
+    if host is None:
+        return False
+    return host.lower() in _LOCAL_HOSTNAMES or host.lower().endswith(".local")
 
 
 def load_pool(path: Path = DEFAULT_POOL_PATH) -> ModelPool:

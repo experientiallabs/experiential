@@ -45,6 +45,7 @@ from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
 from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
 from wmo.cli.platform_cmds import register as register_platform_commands
+from wmo.cli.reproduce_app import reproduce_app
 from wmo.cli.runs_app import runs_app
 from wmo.cli.ui import (
     BuildParams,
@@ -169,6 +170,7 @@ app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
 app.add_typer(optimize_app, name="optimize")
 app.add_typer(runs_app, name="runs")
+app.add_typer(reproduce_app, name="reproduce")
 app.command("ingest")(_ingest_command)
 register_platform_commands(app)
 register_agent_session_commands(app)
@@ -323,6 +325,12 @@ def providers_set(
     Scripts keep the old contract: with `--provider` and `--model` both given, nothing is
     prompted. Registering non-interactively is `--pool-model <id>`, repeated per model, with
     `--input-per-mtok`/`--output-per-mtok` when the model has no published price.
+
+    A locally hosted OpenAI-compatible server (Ollama, vLLM, llama.cpp) registers through the
+    same command: `--provider openai --endpoint http://localhost:11434/v1` with `--model` and
+    `--pool-model` naming what that server serves. Self-hosted candidates are priced explicitly
+    at $0 per Mtok unless the price flags say otherwise, and the interactive openai pass asks
+    for the endpoint URL and lists the server's own models.
     """
     if tier is not None and tier not in pool_registry.TIERS:
         raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")

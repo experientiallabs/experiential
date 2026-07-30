@@ -178,4 +178,6 @@ exclude = ["examples/", ".agents/", "deploy/",
     "packages/environment-capture/tau-bench/",
     "packages/environment-capture/terminal-tasks/",
     "packages/environment-capture/swe-bench/",
+    # Script-style converter (bare-module test import); ruff-clean, unlike the legacy dirs.
+    "packages/environment-capture/terminal-bench/",
 ]

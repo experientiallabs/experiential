@@ -26,7 +26,13 @@ class _FakeAnthropic:
         self.calls.append(kwargs)
         return SimpleNamespace(
             content=[SimpleNamespace(type="text", text="claude says hi")],
-            usage=SimpleNamespace(input_tokens=12, output_tokens=6),
+            usage=SimpleNamespace(
+                input_tokens=12,
+                output_tokens=6,
+                # Anthropic reports the cache legs beside (not inside) input_tokens.
+                cache_read_input_tokens=900,
+                cache_creation_input_tokens=50,
+            ),
         )
 
 
@@ -61,7 +67,10 @@ def test_request_shape_and_client_config(fake_anthropic: list[_FakeAnthropic]) -
     assert call["max_tokens"] == 64
     assert "temperature" not in call
     assert text == "claude says hi"
-    assert usage.input_tokens == 12 and usage.output_tokens == 6
+    assert usage.input_tokens == 12 + 900 + 50
+    assert usage.output_tokens == 6
+    assert usage.cached_input_tokens == 900
+    assert usage.cache_write_input_tokens == 50
 
 
 def test_embed_raises_unsupported(fake_anthropic: list[_FakeAnthropic]) -> None:

@@ -328,3 +328,23 @@ def test_provider_env_vars_name_the_region_variable_this_provider_reads() -> Non
     # each missing name into `.env`, so listing an ALTERNATIVE spelling of the same value would
     # call a correct environment incomplete and ask for the region twice.
     assert AWS_DEFAULT_REGION_ENV not in PROVIDER_ENV_VARS[ProviderKind.BEDROCK]
+
+
+def test_bedrock_refuses_effort_dialed_configs_on_every_path() -> None:
+    """Converse has no effort dial; an effort-carrying entry here is a mis-mapped arm."""
+    provider = BedrockProvider(
+        ProviderConfig(
+            kind=ProviderKind.BEDROCK,
+            model="us.anthropic.claude-opus-4-8",
+            reasoning_effort="max",
+        )
+    )
+
+    with pytest.raises(ValueError, match="Converse has no effort dial"):
+        provider.complete("system", [Message(role="user", content="hi")])
+    with pytest.raises(ValueError, match="Converse has no effort dial"):
+        provider.complete_chat(
+            ChatRequest.model_validate({"messages": [{"role": "user", "content": "hi"}]})
+        )
+    with pytest.raises(ValueError, match="Converse has no effort dial"):
+        next(provider.stream("system", [Message(role="user", content="hi")]))

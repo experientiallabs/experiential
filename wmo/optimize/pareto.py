@@ -50,6 +50,28 @@ PointKind = Literal["model", "routed"]
 # from the model directory at serving mount (GET /config carries it to the platform).
 PARETO_FILENAME = "pareto.json"
 
+# The two ways a curve's rewards can have been produced. Consumers refuse to blend them, which
+# is exactly why they are named constants rather than literals repeated at each call site: a
+# curve mislabelled here presents real measurements as a simulation, or the reverse.
+WM_SIMULATED = "wm_simulated"
+REAL_EPISODE = "real_episode"
+
+# What scores a world-model sweep: the model's own verifier. A real-benchmark matrix was scored
+# by the benchmark instead and has to say which one.
+DEFAULT_WM_JUDGE = "world-model verifier"
+
+# Frontier eligibility: a point must have scored rows on at least this fraction of the
+# band's best scenario coverage. Without it, an arm that loses most episodes to its own
+# failures is judged only on the survivors - on a real tau2 grid, qwen3.5-9b scored 5 of 12
+# episodes, aced them, and "dominated" the anchor measured on all 12. Survivorship is not
+# dominance, so under-covered points stay plotted and labeled but are never marked frontier
+# nor eligible for `recommended`. On a matrix with full coverage nothing changes.
+FRONTIER_COVERAGE_FRACTION = 0.9
+FRONTIER_RULE = (
+    "frontier eligibility: scored-scenario coverage >= 90% of the band's best; "
+    "under-covered points are plotted but never frontier nor recommended"
+)
+
 
 class ParetoPoint(BaseModel):
     """One measured way to serve the workload, on all three objectives."""
@@ -67,6 +89,9 @@ class ParetoPoint(BaseModel):
     n_scored: int
     n_excluded: int  # unscored episodes behind this point (infrastructure, not zeros)
     on_frontier: bool = False
+    # False when coverage is too thin for this point's axes to be compared against the
+    # band's (see FRONTIER_RULE); such a point can neither hold nor take the frontier.
+    frontier_eligible: bool = True
     dial: float | None = None  # routed points: the cost_quality position replayed
     mix: dict[str, int] = Field(default_factory=dict)  # routed points: scenarios per model
 
@@ -85,13 +110,17 @@ class ParetoCurve(BaseModel):
     n_scenarios: int
     provenance: str  # e.g. "wm_simulated"; consumers print it next to every rendering
     judge: str
+    # The eligibility rule the frontier flags were computed under, stated on the artifact
+    # so a renderer can show WHY an under-covered point is unmarked. Defaulted so curves
+    # written before the rule existed still parse.
+    frontier_rule: str = FRONTIER_RULE
 
 
 def pareto_curve(
     matrix: OutcomeMatrix,
     *,
     judge: str,
-    provenance: str = "wm_simulated",
+    provenance: str = WM_SIMULATED,
     policy: RoutingPolicy | None = None,
     dials: Sequence[float] = (0.0, 0.25, 0.5, 0.75, 1.0),
     scenario_ids: Sequence[str] | None = None,
@@ -178,7 +207,7 @@ def held_out_curve(
     policy: RoutingPolicy,
     *,
     judge: str,
-    provenance: str = "wm_simulated",
+    provenance: str = WM_SIMULATED,
     embedder: Embedder | None = None,
 ) -> ParetoCurve:
     """The curve a report ships: routed points on the fit's held-out band only.
@@ -187,8 +216,32 @@ def held_out_curve(
     excluded so no routed point is graded on the fit's own training data. A policy fitted
     on EVERY scenario has no held-out band; the curve then carries the model points alone
     (over all scenarios) rather than in-sample routed points dressed as measurements.
+
+    A STATIC policy (a pin) has no dial to replay, but the WORKLOAD's frontier
+    exists regardless of what serves it - and a pinned endpoint is exactly the case where
+    an operator most wants to see what else was measured. The curve then carries the model
+    points over the same held-out band a report describes (the full matrix when the policy
+    records no fit split), with `recommended` naming what the product mounts today - the
+    policy's own default model - but only while that point honors the curve's own frontier
+    rule: a pin whose coverage the rule disqualifies must not be recommended by the very
+    artifact that states the rule (bench-defaults/tau finding 11, 2026-07-29). A rank
+    policy is deliberately NOT short-circuited: it routes at serve time, so a curve with
+    no routed points and its degenerate-input fallback as `recommended` would misdescribe
+    it - the dial replay refuses rank policies and the report writer says the curve was
+    skipped, the honest status quo.
     """
     held_out = [sid for sid in matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)]
+    if policy.kind == "static":
+        curve = pareto_curve(
+            matrix,
+            judge=judge,
+            provenance=provenance,
+            scenario_ids=held_out or None,
+        )
+        pinned = next((p for p in curve.points if p.id == policy.default_model), None)
+        if pinned is not None and pinned.frontier_eligible:
+            return curve.model_copy(update={"recommended": policy.default_model})
+        return curve
     if not held_out:
         return pareto_curve(matrix, judge=judge, provenance=provenance)
     return pareto_curve(
@@ -257,12 +310,23 @@ def _mark_frontier(points: list[ParetoPoint]) -> list[ParetoPoint]:
 
     A point with no defined cost cannot be placed on the cost axis and is never on the
     frontier (it stays in `points` so a renderer can show it as unplaced rather than
-    dropping it silently).
+    dropping it silently); its `frontier_eligible` still reports coverage honestly, so a
+    renderer never explains an unplaced point with the coverage rule's copy. A point whose
+    scored-scenario coverage falls below FRONTIER_COVERAGE_FRACTION of the best MODEL
+    point's is excluded from the dominance comparison entirely - both as a candidate and
+    as a dominator - because its axes describe the episodes it survived, not the band. The
+    floor deliberately ignores routed points: a routed point's coverage is the union over
+    the models it picked, and letting the union raise the floor would disqualify every
+    model point on the router's coverage advantage rather than on measurement.
     """
-    placeable = [
+    model_coverage = max((p.n_scenarios for p in points if p.kind == "model"), default=0)
+    best_coverage = model_coverage or max((p.n_scenarios for p in points), default=0)
+    floor = FRONTIER_COVERAGE_FRACTION * best_coverage
+    eligible_ids = {p.id for p in points if p.n_scenarios >= floor}
+    contenders = [
         (p, p.cost_per_completed_task_usd)
         for p in points
-        if p.cost_per_completed_task_usd is not None
+        if p.cost_per_completed_task_usd is not None and p.id in eligible_ids
     ]
 
     def dominated(p: ParetoPoint, cost: float) -> bool:
@@ -270,24 +334,38 @@ def _mark_frontier(points: list[ParetoPoint]) -> list[ParetoPoint]:
             other_cost <= cost
             and o.mean_reward >= p.mean_reward
             and (other_cost < cost or o.mean_reward > p.mean_reward)
-            for o, other_cost in placeable
+            for o, other_cost in contenders
             if o is not p
         )
 
-    flagged = {p.id: not dominated(p, cost) for p, cost in placeable}
-    return [p.model_copy(update={"on_frontier": flagged.get(p.id, False)}) for p in points]
+    flagged = {p.id: not dominated(p, cost) for p, cost in contenders}
+    return [
+        p.model_copy(
+            update={
+                "on_frontier": flagged.get(p.id, False),
+                "frontier_eligible": p.id in eligible_ids,
+            }
+        )
+        for p in points
+    ]
 
 
 def _recommended(points: list[ParetoPoint], policy: RoutingPolicy | None) -> str | None:
     """The point the product would mount today.
 
-    With a policy: its balanced-dial routed point (the shipped default detent). Without
-    one: the frontier's best-quality point, which is what the guarded fit would discover
-    and fall back to. None only when nothing is placeable.
+    With a policy: its balanced-dial routed point (the shipped default detent), unless
+    the curve's own frontier rule disqualified it - the artifact must never recommend a
+    point it marks ineligible. Without one: the frontier's best-quality point, which is
+    what the guarded fit would discover and fall back to. None only when nothing is
+    placeable.
     """
     if policy is not None:
         balanced = next((p for p in points if p.kind == "routed" and p.dial == 0.25), None)
-        if balanced is not None and balanced.cost_per_completed_task_usd is not None:
+        if (
+            balanced is not None
+            and balanced.cost_per_completed_task_usd is not None
+            and balanced.frontier_eligible
+        ):
             return balanced.id
     frontier = [p for p in points if p.on_frontier]
     if not frontier:

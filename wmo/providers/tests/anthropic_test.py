@@ -5,10 +5,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from llm_waterfall import ChatRequest
 
 from wmo.providers.anthropic import AnthropicProvider
-from wmo.providers.base import Message, ProviderConfig, ProviderKind
+from wmo.providers.base import ChatRequest, Message, ProviderConfig, ProviderKind
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -19,6 +18,13 @@ class _FakeTextBlock:
 
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+class _FakeToolUseBlock:
+    type = "tool_use"
+    id = "call-1"
+    name = "bash"
+    input = {"command": "pwd"}
 
 
 class _FakeUsage:
@@ -100,7 +106,7 @@ def test_embed_raises_pointing_at_embed_provider() -> None:
 def test_complete_chat_uses_native_messages_tool_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fake = _FakeClient(_FakeResponse([], _FakeUsage(11, 7)))
+    fake = _FakeClient(_FakeResponse([_FakeToolUseBlock()], _FakeUsage(11, 7)))
     provider = AnthropicProvider(
         ProviderConfig(
             kind=ProviderKind.ANTHROPIC,
@@ -163,3 +169,59 @@ def test_verify_reports_failure_without_raising(monkeypatch: pytest.MonkeyPatch)
 def test_live_verify() -> None:  # pragma: no cover - network
     provider = AnthropicProvider(_config())
     assert provider.verify().ok is True
+
+
+class _FakeChatMessages:
+    """Records create() kwargs and returns a dict-shaped Messages API response."""
+
+    def __init__(self) -> None:
+        self.last_kwargs: dict[str, object] = {}
+
+    def create(self, **kwargs: object) -> dict[str, object]:
+        self.last_kwargs = kwargs
+        return {
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+
+
+class _FakeChatClient:
+    def __init__(self) -> None:
+        self.messages = _FakeChatMessages()
+
+
+def test_complete_chat_wires_the_configs_reasoning_effort_to_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one line that makes PoolEntry.reasoning_effort mean anything on this path.
+
+    The translator is covered on its own; this pins the provider handing the
+    CONFIG's effort through, so two pool arms differing only in effort stay
+    two distinct arms instead of both running at the backend default.
+    """
+    fake = _FakeChatClient()
+    provider = AnthropicProvider(
+        ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-fable-5", reasoning_effort="none")
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)  # inject fake; no network
+
+    response = provider.complete_chat(
+        ChatRequest.model_validate({"messages": [{"role": "user", "content": "hi"}]})
+    )
+
+    assert fake.messages.last_kwargs["output_config"] == {"effort": "none"}
+    assert fake.messages.last_kwargs["model"] == "claude-fable-5"
+    assert response.choices[0].message.content == "ok"
+
+
+def test_text_paths_refuse_a_config_whose_effort_they_would_drop() -> None:
+    """Two arms differing only in effort must never silently collapse into one."""
+    provider = AnthropicProvider(
+        ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-fable-5", reasoning_effort="max")
+    )
+
+    with pytest.raises(ValueError, match="does not forward reasoning_effort"):
+        provider.complete("system", [Message(role="user", content="hi")])
+    with pytest.raises(ValueError, match="does not forward reasoning_effort"):
+        next(provider.stream("system", [Message(role="user", content="hi")]))
