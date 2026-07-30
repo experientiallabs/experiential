@@ -44,6 +44,6 @@ The router was also trained on 1,960 rows from `nvidia/Open-SWE-Traces`, config 
 
 ## Fresh execution status
 
-Fresh WMO official-verifier probes use unique experiment artifacts and the OpenAI and Anthropic credentials from the repo environment file without persisting secret values. GPT-5.6 Sol high has returned strong partial-test scores but zero whole-task rewards in the completed short probes, including one 60-turn task. That indicates the current Pi harness is reaching substantial partial progress but not the explicit submit boundary. A 120-turn Sol probe and a matched Opus 5 probe are running before final promotion is considered.
+Fresh WMO official-verifier probes use unique experiment artifacts and the OpenAI and Anthropic credentials from the repo environment file without persisting secret values. GPT-5.6 Sol high returned zero whole-task rewards in all completed fresh probes. The 60-turn probe reached 91.76% partial score, while the 120-turn probe reached 89.56% partial score, with no infrastructure error. This indicates the current Pi harness reaches substantial partial progress but does not cross the explicit submit boundary. The matched Opus 5 probe stalled before producing a verifier artifact and its experiment-owned tmux process was stopped with its raw metadata preserved.
 
 Promotion requires fresh matched verifier results, quality retention of at least 95%, and cost savings of at least 30%. Until then this document records a tuned candidate, not a completed router result.
