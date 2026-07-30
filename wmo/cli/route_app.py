@@ -1384,7 +1384,6 @@ def report(
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
     from wmo.optimize.pareto import (
-        DEFAULT_WM_JUDGE,
         PARETO_FILENAME,
         REAL_EPISODE,
         WM_SIMULATED,
@@ -1500,7 +1499,7 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
 
 @route_app.command("push")
 def push(
-    policy_file: str = typer.Argument(POLICY_FILENAME, help="Fitted policy JSON to install."),
+    policy_file: str = typer.Argument(_POLICY_FILENAME, help="Fitted policy JSON to install."),
     endpoint: str = typer.Option(
         ...,
         "--endpoint",
@@ -1533,6 +1532,8 @@ def push(
     The endpoint keeps its id, name, and URL, so a customer's client is unaffected by
     the swap, and live pods pick the new policy up on their own.
     """
+    from wmo.optimize.policy import RoutingPolicy
+
     policy_path = Path(policy_file)
     if not policy_path.is_file():
         raise typer.BadParameter(

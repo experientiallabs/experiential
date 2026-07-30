@@ -30,6 +30,7 @@ from wmo.platform.credentials import (
     load_credentials,
     save_credentials,
 )
+
 if TYPE_CHECKING:
     from wmo.platform.client import PlatformClient, PlatformError, WhoAmI
 
