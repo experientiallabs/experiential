@@ -56,6 +56,9 @@ LENS = LensSpec(
     judge_label="swe-bench test suite (deterministic verifier; FAIL_TO_PASS + PASS_TO_PASS)",
     provenance_label=REAL_EPISODE,
     split_label="pinned-eval-20",
+    # This leg never planned the compaction arms; without the declaration the shared
+    # runner advertises truncate/llmlingua2-endpoint as data still to come.
+    arms=("identity",),
     figures=(
         # Cost savings is this program's primary headline, so the frontier leads.
         FigureSpec(kind="savings_frontier", filename="savings_vs_fable5.png"),

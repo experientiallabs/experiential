@@ -93,3 +93,26 @@ def test_converse_response_preserves_filtered_stops(stop_reason: str) -> None:
     )
 
     assert response.choices[0].finish_reason == "content_filter"
+
+
+def test_converse_response_carries_the_cache_split_serving_reads() -> None:
+    """Converse reports cache reads/writes beside inputTokens; dropping them priced
+    cached tokens at the full input rate (the Anthropic path's overcharge, mirrored)."""
+    raw = {
+        "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 100,
+            "outputTokens": 5,
+            "cacheReadInputTokens": 9000,
+            "cacheWriteInputTokens": 500,
+        },
+    }
+
+    response = converse_response(raw, "us.anthropic.claude-opus-4-8")
+
+    assert response.usage is not None
+    extra = response.usage.model_extra or {}
+    assert response.usage.prompt_tokens == 9600  # reads/writes fold into the total
+    assert extra.get("cache_read_input_tokens") == 9000
+    assert extra.get("cache_creation_input_tokens") == 500

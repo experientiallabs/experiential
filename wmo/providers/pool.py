@@ -98,11 +98,24 @@ class PoolEntry(BaseModel):
     # adaptive thinking's `output_config.effort` (low|medium|high|max, probed live
     # 2026-07-29). Two entries differing only in effort are two ARMS with one runtime
     # model id - the router-vs-router comparison's whole premise.
-    reasoning_effort: str | None = None
+    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     cached_input_per_mtok: float | None = None  # provider cache-read price, USD per 1M tokens
     cache_write_per_mtok: float | None = None  # provider cache-write price, USD per 1M tokens
+
+    @model_validator(mode="after")
+    def _validate_reasoning_effort_route(self) -> PoolEntry:
+        # Fail at LOAD, not at the first request of a sweep: Bedrock's Converse API has
+        # no effort dial on any path, so an effort-dialed Bedrock entry is a mis-mapped
+        # arm that would burn a preflight and then refuse every cell.
+        if self.reasoning_effort is not None and self.kind == ProviderKind.BEDROCK:
+            raise ValueError(
+                f"pool entry {self.name!r}: reasoning_effort is not supported on bedrock "
+                "(Converse has no effort dial); route effort-dialed Claude through the "
+                "direct anthropic kind instead"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_price(self) -> PoolEntry:

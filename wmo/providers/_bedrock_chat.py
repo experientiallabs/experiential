@@ -130,13 +130,22 @@ def converse_response(raw: object, model: str) -> ChatResponse:
         message["tool_calls"] = tool_calls
     usage = response.get("usage")
     usage_data = usage if isinstance(usage, dict) else {}
+    # Converse reports cache reads/writes BESIDE inputTokens (which excludes them), the
+    # same shape as the direct Anthropic API. Fold them into the total and carry the
+    # split under the keys serving's _structured_usage reads; dropping them priced every
+    # cached token at the full input rate (the Anthropic path's 5.8x-overcharge bug,
+    # mirrored here).
+    cache_read = usage_data.get("cacheReadInputTokens", 0) or 0
+    cache_write = usage_data.get("cacheWriteInputTokens", 0) or 0
     return ChatResponse.model_validate(
         {
             "model": model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {
-                "prompt_tokens": usage_data.get("inputTokens", 0),
+                "prompt_tokens": usage_data.get("inputTokens", 0) + cache_read + cache_write,
                 "completion_tokens": usage_data.get("outputTokens", 0),
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_write,
             },
         }
     )
