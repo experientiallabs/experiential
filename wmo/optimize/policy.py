@@ -484,6 +484,14 @@ class RoutingPolicy(BaseModel):
     # bar a cost-tilted cheap pick is usually reverted straight back to the pricier baseline,
     # which spends MORE, not less (measured; see `wmo.optimize.knn.apply_cost_quality`).
     guard_mode: Literal["symmetric", "asymmetric"] = "symmetric"
+    # Cost-threshold selection (the "cheapest sufficient" rule). None keeps the validated
+    # tilted-argmax-plus-guard path bit-identical. Set, the decision instead walks candidates
+    # cheapest-first and serves the first whose neighbor profile reaches this reward, with NO
+    # paired guard: it optimises cost subject to a quality floor rather than quality minus a
+    # cost tilt. Measured on DeepSWE v1.1 (9 arms, 112 tasks) at tau=0.5: 1.97x cheaper than
+    # the best static arm at graded 0.939 vs 0.945. It is deliberately less conservative, and
+    # its fold-to-fold spread is far wider than the guarded path's, so it is opt-in.
+    select_tau: float | None = None
     knn_min_pairs: int = Field(default=DEFAULT_KNN_MIN_PAIRS, ge=0)  # neighbors scored on both
     se_floor: bool = True  # small-sample variance floor (see SE_FLOOR_MAX_PAIRS)
     # Novelty floor: queries whose best bank similarity is below this abstain to the baseline
@@ -834,6 +842,65 @@ def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:
     )
 
 
+def _cost_threshold_decision(
+    policy: RoutingPolicy,
+    candidates: list[tuple[int, str]],
+    profile: np.ndarray,
+    effective_cost: np.ndarray,
+    baseline: str,
+    n_neighbors: int,
+) -> RoutingDecision:
+    """Serve the cheapest candidate whose neighbor profile reaches `policy.select_tau`.
+
+    The alternative to tilted-argmax-plus-guard: instead of maximising reward minus a cost
+    tilt and then vetoing unsupported picks, this minimises cost subject to a reward floor.
+    There is no paired-evidence test, so a pick needs only the floor, which is why it is
+    opt-in and why its variance across data splits is much larger.
+
+    Args:
+        policy: the fitted knn policy, with `select_tau` set.
+        candidates: (bank index, model name) pairs that carry a scored profile.
+        profile: similarity-weighted mean reward per bank model, NaN where unscored.
+        effective_cost: per-model mean cost, cache credit already applied.
+        baseline: the model served when no candidate reaches the floor.
+        n_neighbors: neighbor count, for the decision reason.
+
+    Returns:
+        The routing decision. `gate` is always None: this rule runs no paired gate.
+    """
+    tau = float(policy.select_tau)
+    priced = [
+        (
+            policy.cost_scale
+            if np.isnan(effective_cost[index])
+            else float(effective_cost[index]),
+            index,
+            name,
+        )
+        for index, name in candidates
+    ]
+    for cost, index, name in sorted(priced):
+        if profile[index] >= tau:
+            return RoutingDecision(
+                model=name,
+                reason=(
+                    f"knn cost-threshold: cheapest candidate reaching tau={tau:g} over "
+                    f"{n_neighbors} neighbors, profile={profile[index]:.3f} at cost {cost:.4f}"
+                ),
+                # No paired gate runs in this rule, so `gate` stays None per its
+                # contract; the pick is greedy over the cost-sorted candidates.
+                evidence=RoutingEvidence(propensity="greedy"),
+            )
+    return RoutingDecision(
+        model=baseline,
+        reason=(
+            f"knn cost-threshold: no candidate reached tau={tau:g} over {n_neighbors} "
+            f"neighbors, serving {baseline}"
+        ),
+        evidence=RoutingEvidence(propensity="fallback-forced"),
+    )
+
+
 def knn_decision(
     policy: RoutingPolicy,
     query: np.ndarray,
@@ -997,6 +1064,11 @@ def knn_decision(
                 propensity="fallback-forced",
                 cache_credit_usd=credit_applied or None,
             ),
+        )
+
+    if policy.select_tau is not None:
+        return _cost_threshold_decision(
+            policy, candidates, profile, effective_cost, baseline, rows.size
         )
 
     # The cost knob prices each candidate in average-call units before the argmax; at
