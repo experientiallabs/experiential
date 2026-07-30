@@ -53,6 +53,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-seed", type=int, default=0)
     parser.add_argument("--episode-timeout-s", type=float, default=5400.0)
     parser.add_argument("--max-turns", type=int, default=60)
+    parser.add_argument(
+        "--harness-backend",
+        choices=("local", "e2b"),
+        default="local",
+        help="Run Pi locally against the Harbor task environment, or in a nested E2B sandbox.",
+    )
     return parser
 
 
@@ -129,7 +135,7 @@ def main() -> None:
             task_ids,
             provider_config=config,
             task_environment="e2b",
-            harness_backend="e2b",
+            harness_backend=args.harness_backend,
             reward_key="reward",
             reward_mode="raw",
             attempts=1,
