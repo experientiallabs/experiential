@@ -625,3 +625,16 @@ honest compression verdict is "measured tradeoff, not recommendation".
 Caveats that travel with the table: the report band is 6 scenarios, so the paired quality
 CI is wide; routed p95 latency is WORSE than the anchor's; the corpus mix is ~85% telecom;
 7 of the 20 test scenarios include tau2's own natural-language judge in their reward basis.
+
+## Reproduce it with one command
+
+```bash
+uv run wmo reproduce run tau-bench --yes
+```
+
+Downloads the public trace corpus, builds the world model, buys the 440-cell sweep against
+live providers on a pinned public-route pool, fits, reports, and compares against the
+published row within stated tolerances. This is the PROTOCOL-exact reproduction: it spends
+real money (estimated ~$110; the command states it and refuses without `--yes`), providers
+are nondeterministic, and public prices drift - which is exactly what the tolerances in the
+shipped manifest encode. `wmo reproduce list` shows both reproduction classes.

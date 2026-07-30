@@ -108,9 +108,7 @@ def spans_for_trial(trial_dir: Path, *, benchmark: str) -> list[dict[str, Any]]:
     result = json.loads((trial_dir / "result.json").read_text(encoding="utf-8"))
     if result.get("exception_info") is not None:
         return []
-    trajectory = json.loads(
-        (trial_dir / "agent" / "trajectory.json").read_text(encoding="utf-8")
-    )
+    trajectory = json.loads((trial_dir / "agent" / "trajectory.json").read_text(encoding="utf-8"))
     steps = trajectory.get("steps") or []
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     model = ((result.get("agent_info") or {}).get("model_info") or {}).get("name", "")
@@ -144,30 +142,34 @@ def spans_for_trial(trial_dir: Path, *, benchmark: str) -> list[dict[str, Any]]:
                 action_attrs.append(_attr("gen_ai.prompt", task_text))
             if ordinal == 0:
                 action_attrs.append(_attr("wmo.trace.metadata", json.dumps(metadata)))
-            spans.append({
-                "traceId": trace_id,
-                "spanId": f"{trace_id[:12]}{ordinal:04x}a",
-                "parentSpanId": "",
-                "name": "chat terminal",
-                "startTimeUnixNano": ordinal * 10,
-                "endTimeUnixNano": ordinal * 10 + 1,
-                "status": {"code": "STATUS_CODE_OK"},
-                "attributes": action_attrs,
-            })
-            spans.append({
-                "traceId": trace_id,
-                "spanId": f"{trace_id[:12]}{ordinal:04x}b",
-                "parentSpanId": "",
-                "name": "execute_tool terminal",
-                "startTimeUnixNano": ordinal * 10 + 2,
-                "endTimeUnixNano": ordinal * 10 + 3,
-                "status": {"code": "STATUS_CODE_OK"},
-                "attributes": [
-                    _attr("gen_ai.operation.name", "execute_tool"),
-                    _attr("gen_ai.tool.name", name),
-                    _attr("gen_ai.tool.message", content),
-                ],
-            })
+            spans.append(
+                {
+                    "traceId": trace_id,
+                    "spanId": f"{trace_id[:12]}{ordinal:04x}a",
+                    "parentSpanId": "",
+                    "name": "chat terminal",
+                    "startTimeUnixNano": ordinal * 10,
+                    "endTimeUnixNano": ordinal * 10 + 1,
+                    "status": {"code": "STATUS_CODE_OK"},
+                    "attributes": action_attrs,
+                }
+            )
+            spans.append(
+                {
+                    "traceId": trace_id,
+                    "spanId": f"{trace_id[:12]}{ordinal:04x}b",
+                    "parentSpanId": "",
+                    "name": "execute_tool terminal",
+                    "startTimeUnixNano": ordinal * 10 + 2,
+                    "endTimeUnixNano": ordinal * 10 + 3,
+                    "status": {"code": "STATUS_CODE_OK"},
+                    "attributes": [
+                        _attr("gen_ai.operation.name", "execute_tool"),
+                        _attr("gen_ai.tool.name", name),
+                        _attr("gen_ai.tool.message", content),
+                    ],
+                }
+            )
             ordinal += 1
     return spans
 
