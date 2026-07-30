@@ -95,10 +95,13 @@ class MeteredProvider:
     ) -> Iterator[StreamChunk]:
         """Forward a native stream, recording usage from the terminal chunk.
 
-        A stream abandoned before its terminal chunk still consumed provider tokens; the
-        provider reports exact counts only in the chunk the consumer never took, so the
-        abandonment path records a chars/4 estimate of what was sent and what streamed
-        (the documented, conservative proxy) instead of the zero an earlier version wrote.
+        A stream ABANDONED by its consumer (generator closed / dropped) still consumed
+        provider tokens; the provider reports exact counts only in the chunk the consumer
+        never took, so that one path records a chars/4 estimate of what was sent and what
+        streamed (the documented, conservative proxy) instead of the zero an earlier
+        version wrote. Upstream failures and terminal chunks without usage still record
+        nothing: a throttled attempt that generated nothing must not book a full-prompt
+        phantom into the tracker (whose total feeds spend caps).
         """
         if not isinstance(self._provider, StreamingProvider):
             raise TypeError(
@@ -119,9 +122,9 @@ class MeteredProvider:
                     self._tracker.record(phase, model, chunk.usage)
                     recorded = True
                 yield chunk
-        finally:
-            # Runs on GeneratorExit (consumer closed or dropped the iterator) and on
-            # upstream exceptions alike; a normally finished stream was already recorded.
+        except GeneratorExit:
+            # The consumer closed (or dropped) the iterator mid-stream: the partial
+            # generation was billed, so estimate it. This is the ONLY estimating path.
             if not recorded:
                 sent_chars = len(system) + sum(len(m.content) for m in messages if m.content)
                 self._tracker.record(
@@ -132,6 +135,7 @@ class MeteredProvider:
                         output_tokens=streamed_chars // 4,
                     ),
                 )
+            raise
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         # Embeddings carry no token usage from our providers; record a zero-usage event for the

@@ -517,6 +517,11 @@ class RequestLogRecord(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0  # cache-read prompt tokens (subset of input_tokens)
+    # Cache-WRITE prompt tokens (subset of input_tokens, disjoint from
+    # cached_tokens). Priced at the write premium by the entry's cost model;
+    # persisted so a post-hoc reconstruction (savings counterfactuals)
+    # decomposes the same tokens the price did.
+    cache_write_tokens: int = 0
     cost_usd: float = 0.0  # effective cost: cached tokens billed at the cache-read rate
     router_cost_usd: float = 0.0  # the routing decision's own inference cost, passed through
     # D-COMPRESS fields: stored and OPAQUE like the routing fields above (log only, never in
@@ -1221,6 +1226,14 @@ def _usage_dict(usage: TokenUsage) -> dict[str, object]:
         "total_tokens": usage.input_tokens + usage.output_tokens,
         # OpenAI's cached-prompt reporting shape; 0 when the upstream provider reported none.
         "prompt_tokens_details": {"cached_tokens": usage.cached_input_tokens},
+        # Anthropic's cache-write shape, only when one happened: a chained wmo
+        # endpoint keeps pricing writes at the premium, while plain responses
+        # stay free of nonstandard keys.
+        **(
+            {"cache_creation_input_tokens": usage.cache_write_input_tokens}
+            if usage.cache_write_input_tokens > 0
+            else {}
+        ),
     }
 
 
@@ -1550,6 +1563,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                     cached_tokens=usage.cached_input_tokens,
+                    cache_write_tokens=usage.cache_write_input_tokens,
                     cost_usd=entry.cost_usd(usage),
                     tokens_in_raw=compression.tokens_in_raw if compression else 0,
                     tokens_in_compressed=compression.tokens_in_compressed if compression else 0,
@@ -1758,7 +1772,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
         # that fires on both normal completion and disconnect. The generator appends every
         # delta it emitted to `streamed_parts` so the disconnect path can estimate the
         # partial generation it never got a usage chunk for.
-        stream_state = {"recorded": False}
+        stream_state: dict[str, object] = {"recorded": False, "usage": None}
         streamed_parts: list[str] = []
         # The probe chunk was already pulled off the upstream before the response body
         # exists, so it is generated (and billed) even when the client disconnects before
@@ -1776,12 +1790,17 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
             usage = TokenUsage()
             try:
                 chunk = first
+                is_probe = True  # the probe chunk's delta is pre-seeded above
                 while chunk is not None:
                     if chunk.done:
                         if chunk.usage is not None:
                             usage = chunk.usage
+                            # Stash for _finalize: a client that closes on
+                            # [DONE] without reading EOF must still get its
+                            # EXACT usage recorded, never an estimate.
+                            stream_state["usage"] = usage
                     elif chunk.delta:
-                        if chunk is not first:  # the probe chunk is pre-seeded above
+                        if not is_probe:
                             parts.append(chunk.delta)
                         yield _sse(
                             _chunk_payload(
@@ -1791,6 +1810,7 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                                 {"content": chunk.delta},
                             )
                         )
+                    is_probe = False
                     chunk = next(upstream, None)
             except Exception as exc:  # noqa: BLE001 - response already started; log and end
                 stream_state["recorded"] = True
@@ -1798,6 +1818,20 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                 logger.error("stream from %s failed mid-response: %s", entry.name, exc)
                 yield "data: [DONE]\n\n"
                 return
+            # Record BEFORE the closing yields: openai-python clients stop
+            # reading at [DONE], so starlette can cancel this generator
+            # anywhere in the tail — metering must already be done by then.
+            stream_state["recorded"] = True
+            _record(usage, ttfb_ms=ttfb_ms)
+            try:
+                runtime.remember(
+                    request.messages,
+                    ChatMessage(role="assistant", content="".join(parts)),
+                    decision.model,
+                    compressed=provider_messages if compression else None,
+                )
+            except Exception:  # noqa: BLE001 - affinity is best-effort; the response is not
+                logger.exception("conversation affinity update failed for %s", runtime.name)
             yield _sse(
                 _chunk_payload(completion_id, created, runtime.name, {}, finish_reason="stop")
             )
@@ -1815,14 +1849,6 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     }
                 )
             yield "data: [DONE]\n\n"
-            runtime.remember(
-                request.messages,
-                ChatMessage(role="assistant", content="".join(parts)),
-                decision.model,
-                compressed=provider_messages if compression else None,
-            )
-            stream_state["recorded"] = True
-            _record(usage, ttfb_ms=ttfb_ms)
 
         def _finalize() -> None:
             """Runs after the response ends, HOWEVER it ends (starlette BackgroundTask).
@@ -1842,6 +1868,17 @@ def create_chat_router(endpoints: Mapping[str, EndpointRuntime]) -> APIRouter:
                     close()
             if not stream_state["recorded"]:
                 stream_state["recorded"] = True
+                exact = stream_state["usage"]
+                if isinstance(exact, TokenUsage):
+                    # The terminal chunk DID arrive before the disconnect; the
+                    # estimate is for when it did not.
+                    _record(
+                        exact,
+                        ttfb_ms=ttfb_ms,
+                        status="error",
+                        error_message="client disconnected before [DONE]; exact usage recorded",
+                    )
+                    return
                 sent_chars = sum(
                     len(message.content) for message in provider_messages if message.content
                 )

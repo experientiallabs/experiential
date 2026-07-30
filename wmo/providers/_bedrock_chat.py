@@ -147,7 +147,7 @@ def converse_response(raw: object, model: str) -> ChatResponse:
                 "prompt_tokens": _token_count(usage_data.get("inputTokens"))
                 + cache_read
                 + cache_write,
-                "completion_tokens": usage_data.get("outputTokens", 0),
+                "completion_tokens": _token_count(usage_data.get("outputTokens")),
                 "prompt_tokens_details": {"cached_tokens": cache_read},
                 "cache_creation_input_tokens": cache_write,
             },

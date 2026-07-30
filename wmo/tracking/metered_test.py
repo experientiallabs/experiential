@@ -191,3 +191,66 @@ def test_abandoned_stream_records_a_chars_over_four_estimate() -> None:
     # input: (9 system chars + 39 message chars) // 4; output: 8 streamed chars // 4.
     assert event.usage.input_tokens == 12
     assert event.usage.output_tokens == 2
+
+
+class FailingStreamProvider(FakeProvider):
+    """Streams one delta then raises, like a throttled upstream."""
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Iterator[StreamChunk]:
+        yield StreamChunk(delta="partial")
+        msg = "ThrottlingException"
+        raise RuntimeError(msg)
+
+
+def test_upstream_stream_failure_records_nothing() -> None:
+    """An upstream failure must not book a full-prompt phantom estimate.
+
+    The tracker's total feeds spend caps; a throttled retry loop estimating
+    the whole prompt each attempt would trip a cap on money never spent.
+    Only consumer abandonment (GeneratorExit) estimates.
+    """
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(FailingStreamProvider(), tracker, base_phase=Phase.SERVE)
+
+    stream = provider.stream("s" * 400_000, [Message(role="user", content="hi")])
+    assert next(stream).delta == "partial"
+    try:
+        next(stream)
+        raise AssertionError("expected the upstream failure to propagate")
+    except RuntimeError:
+        pass
+
+    assert tracker.events == []
+
+
+class UsagelessStreamProvider(FakeProvider):
+    """Finishes normally but its terminal chunk carries no usage."""
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Iterator[StreamChunk]:
+        yield StreamChunk(delta="hello")
+        yield StreamChunk(done=True)
+
+
+def test_fully_consumed_stream_without_usage_records_nothing() -> None:
+    """Normal exhaustion without a usage chunk stays unrecorded, not estimated."""
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(UsagelessStreamProvider(), tracker, base_phase=Phase.SERVE)
+
+    chunks = list(provider.stream("sys", [Message(role="user", content="hi")]))
+
+    assert chunks[-1].done
+    assert tracker.events == []
