@@ -225,6 +225,10 @@ class ChatUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     prompt_tokens_details: ChatPromptTokensDetails | None = None
+    # Anthropic-style cache-write count (OpenAI has no wire shape for writes;
+    # Anthropic-family backends report it under this name). A SUBSET of
+    # prompt_tokens, like the cached read count.
+    cache_creation_input_tokens: int = 0
 
 
 class ChatChoice(BaseModel):
@@ -252,11 +256,15 @@ class ChatResponse(BaseModel):
             return TokenUsage()
         details = self.usage.prompt_tokens_details
         cached = details.cached_tokens if details is not None else 0
-        # OpenAI semantics: prompt_tokens already includes the cached subset.
+        total = max(self.usage.prompt_tokens, 0)
+        # OpenAI semantics: prompt_tokens already includes both cache subsets.
+        read = min(max(cached, 0), total)
+        write = min(max(self.usage.cache_creation_input_tokens, 0), total - read)
         return TokenUsage(
             input_tokens=self.usage.prompt_tokens,
             output_tokens=self.usage.completion_tokens,
-            cached_input_tokens=min(max(cached, 0), max(self.usage.prompt_tokens, 0)),
+            cached_input_tokens=read,
+            cache_write_input_tokens=write,
         )
 
     def wire_payload(self) -> JsonObject:

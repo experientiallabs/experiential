@@ -124,3 +124,4 @@ def test_converse_response_normalizes_cached_prompt_tokens() -> None:
     usage = response.token_usage()
     assert usage.input_tokens == 1050
     assert usage.cached_input_tokens == 900
+    assert usage.cache_write_input_tokens == 50

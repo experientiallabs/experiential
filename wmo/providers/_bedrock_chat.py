@@ -134,10 +134,9 @@ def converse_response(raw: object, model: str) -> ChatResponse:
     # cache legs must be added back or every cached call under-reports its
     # input by the whole prefix (the `complete` path in bedrock.py does the
     # same normalization). The read leg rides the OpenAI-compatible
-    # `prompt_tokens_details.cached_tokens` shape the serving log already
-    # prices at the cache-read rate; the write leg has no OpenAI-compatible
-    # field, so it bills at the full input rate — slightly under the write
-    # premium, never silently free.
+    # `prompt_tokens_details.cached_tokens` shape; the write leg rides the
+    # Anthropic-style `cache_creation_input_tokens` field, so both price at
+    # their cache tiers.
     cache_read = _token_count(usage_data.get("cacheReadInputTokens"))
     cache_write = _token_count(usage_data.get("cacheWriteInputTokens"))
     return ChatResponse.model_validate(
@@ -150,6 +149,7 @@ def converse_response(raw: object, model: str) -> ChatResponse:
                 + cache_write,
                 "completion_tokens": usage_data.get("outputTokens", 0),
                 "prompt_tokens_details": {"cached_tokens": cache_read},
+                "cache_creation_input_tokens": cache_write,
             },
         }
     )

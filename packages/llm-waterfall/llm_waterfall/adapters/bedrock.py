@@ -65,9 +65,12 @@ class _ConverseOutput(TypedDict):
     message: _ConverseMessage
 
 
-class _ConverseUsage(TypedDict):
+class _ConverseUsage(TypedDict, total=False):
     inputTokens: int
     outputTokens: int
+    # Converse reports inputTokens EXCLUDING these two legs.
+    cacheReadInputTokens: int
+    cacheWriteInputTokens: int
 
 
 class _ConverseResponse(TypedDict):
@@ -183,13 +186,23 @@ class BedrockAdapter:
         message: dict[str, object] = {"role": "assistant", "content": text}
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # Converse reports inputTokens EXCLUDING the cache legs; add them back
+        # and keep the split so cached traffic prices at its cache tiers
+        # (mirrors the wmo-side converse mapping and the invoke path above).
+        converse_usage = response["usage"]
+        cache_read = converse_usage.get("cacheReadInputTokens", 0)
+        cache_write = converse_usage.get("cacheWriteInputTokens", 0)
         return ChatResponse.model_validate(
             {
                 "model": self.backend.model,
                 "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
                 "usage": {
-                    "prompt_tokens": response["usage"]["inputTokens"],
-                    "completion_tokens": response["usage"]["outputTokens"],
+                    "prompt_tokens": converse_usage.get("inputTokens", 0)
+                    + cache_read
+                    + cache_write,
+                    "completion_tokens": converse_usage.get("outputTokens", 0),
+                    "prompt_tokens_details": {"cached_tokens": cache_read},
+                    "cache_creation_input_tokens": cache_write,
                 },
             }
         )

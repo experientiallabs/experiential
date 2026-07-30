@@ -152,3 +152,22 @@ def test_token_usage_projection_keeps_the_cached_subset() -> None:
         }
     )
     assert overclaimed.token_usage().cached_input_tokens == 100
+
+
+def test_token_usage_projection_keeps_the_cache_write_subset() -> None:
+    """Anthropic-style cache_creation_input_tokens prices at the write premium."""
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 900},
+                "cache_creation_input_tokens": 50,
+            },
+        }
+    )
+
+    usage = response.token_usage()
+    assert usage.cached_input_tokens == 900
+    assert usage.cache_write_input_tokens == 50
