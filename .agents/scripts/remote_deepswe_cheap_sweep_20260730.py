@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -70,6 +71,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--trials", type=Path, required=True)
     parser.add_argument("--task-meta", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--embedding-provider", choices=("hashing", "openai"), default="hashing")
+    parser.add_argument("--embedding-model", default="text-embedding-3-small")
     return parser
 
 
@@ -84,6 +87,21 @@ def _embed(text: str) -> np.ndarray:
         vector[bucket] += 1.0 if digest[0] & 1 else -1.0
     norm = np.linalg.norm(vector)
     return vector / norm if norm else vector
+
+
+def _openai_embed(texts: list[str], model: str) -> np.ndarray:
+    from openai import OpenAI
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required for semantic embeddings")
+    client = OpenAI()
+    vectors: list[list[float]] = []
+    for start in range(0, len(texts), 32):
+        response = client.embeddings.create(model=model, input=texts[start : start + 32])
+        vectors.extend(item.embedding for item in sorted(response.data, key=lambda item: item.index))
+    matrix = np.asarray(vectors, dtype=np.float64)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.where(norms > 0.0, norms, 1.0)
 
 
 def _load(
@@ -223,7 +241,10 @@ def _profile_choices(
 def main() -> None:
     args = _parser().parse_args()
     tasks, texts, repos, languages, rewards, costs = _load(args.trials, args.task_meta)
-    embeddings = np.asarray([_embed(texts[task]) for task in tasks])
+    if args.embedding_provider == "openai":
+        embeddings = _openai_embed([texts[task] for task in tasks], args.embedding_model)
+    else:
+        embeddings = np.asarray([_embed(texts[task]) for task in tasks])
     results: list[dict[str, object]] = []
     grid = tuple(
         (z, lam, min_pairs, se_floor)
@@ -355,6 +376,8 @@ def main() -> None:
         "tasks": len(tasks),
         "repos": len(set(repos.values())),
         "baseline": GUARD,
+        "embedding_provider": args.embedding_provider,
+        "embedding_model": args.embedding_model if args.embedding_provider == "openai" else "hashing-512-char-trigram",
         "criterion": {
             "mean_quality_diff_at_least": -0.005,
             "min_quality_diff_at_least": -0.015,
