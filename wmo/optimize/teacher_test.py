@@ -395,3 +395,38 @@ def test_the_distill_reason_names_the_gap_the_teacher_and_the_price() -> None:
         "model can prove the gap exists, but you have to be allowed to train on what the teacher "
         "writes."
     )
+
+
+def test_price_tie_break_judges_candidates_over_their_shared_scenarios_only() -> None:
+    """An easy private subset must not crown the weaker of two equally cheap students.
+
+    `flattered` is scored on the shared band at 0.4 plus a private band of gimmes at 1.0, so
+    its unpaired mean (0.7) beats `honest`'s (0.6) - but on the scenarios BOTH were scored on,
+    `honest` is plainly better. The tie-break must read the shared band and pick `honest`;
+    the old unpaired mean picked `flattered` (the review finding this test pins).
+    """
+    shared = {f"s{i:02d}": None for i in range(8)}
+    # flattered: 0.45 on the 8 shared scenarios (below the 0.5 completion bar) plus 8 private
+    # gimmes at 1.0 -> unpaired mean 0.725, 8 completions over 16 cheap rows = $0.02/task.
+    flattered_rewards: dict[str, float | None] = {sid: 0.45 for sid in shared}
+    flattered_rewards |= {f"easy{i}": 1.0 for i in range(8)}
+    # honest: 0.6 on the same 8 shared scenarios -> unpaired mean 0.6 (LOWER than flattered's),
+    # 8 completions over 8 rows at $0.02 = the same $0.02/task, so the two students tie on the
+    # measured ladder and only the tie-break separates them.
+    honest_rewards: dict[str, float | None] = {sid: 0.6 for sid in shared}
+    teacher_rewards = dict.fromkeys(list(shared) + [f"easy{i}" for i in range(8)], 0.95)
+
+    matrix = OutcomeMatrix(
+        pool=[
+            _entry("flattered", per_mtok=1.0),
+            _entry("honest", per_mtok=1.0),
+            _entry("teacher", per_mtok=9.0),
+        ],
+        outcomes=(
+            _rows("flattered", flattered_rewards, cost=0.01)
+            + _rows("honest", honest_rewards, cost=0.02)
+            + _rows("teacher", teacher_rewards, cost=0.05)
+        ),
+    )
+    verdict = select_teacher(matrix)
+    assert verdict.student == "honest"

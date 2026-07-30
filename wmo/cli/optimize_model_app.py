@@ -117,7 +117,7 @@ from wmo.optimize.sweep import (
 )
 from wmo.optimize.sweep import preflight_pool as run_preflight
 from wmo.optimize.teacher import TeacherSearchVerdict, select_teacher
-from wmo.providers.pool import DEFAULT_POOL_PATH
+from wmo.providers.pool import DEFAULT_POOL_PATH, load_pool
 from wmo.runs.hooks import PipelineEmitter
 from wmo.runs.schema import RunStatus
 
@@ -395,6 +395,13 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         ("--baseline", baseline, "the report can only anchor on a candidate the sweep measures"),
     ):
         if value is not None and value not in known:
+            # Say which of the two different repairs applies: an entry that IS in the file but
+            # turned off needs its flag flipped, not a re-registration.
+            if _is_disabled_in(Path(pool_file), value):
+                raise typer.BadParameter(
+                    f"{flag} '{value}' is disabled (enabled = false) in {pool_file}; {why}. "
+                    "Flip it back on to use it here"
+                )
             raise typer.BadParameter(
                 f"{flag} '{value}' is not a model in {pool_file}; {why}. "
                 f"Available: {', '.join(known)}"
@@ -537,6 +544,20 @@ class _RunPaths(BaseModel):
     matrix: Path
     policy: Path
     report: Path
+
+
+def _is_disabled_in(pool_file: Path, name: str) -> bool:
+    """Whether `name` is a roster entry that exists but is turned off (enabled = false).
+
+    Best-effort for an error message: the pool already loaded once through preflight, so a
+    second read here cannot fail in a new way, and any surprise reads as plain "not a model".
+    """
+    try:
+        return any(
+            entry.name == name and not entry.enabled for entry in load_pool(pool_file).models
+        )
+    except (FileNotFoundError, ValueError):
+        return False
 
 
 def _distill_reserved_message(*, world_model: str | None, root: str) -> str:
@@ -1242,7 +1263,12 @@ def _run_stages(
                 record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
-        emitter.stage_completed(record, lifetime_spend_usd=manifest.lifetime_spend_usd)
+        lifetime_candidate_usd, lifetime_wm_usd = manifest.lifetime_split
+        emitter.stage_completed(
+            record,
+            lifetime_candidate_usd=lifetime_candidate_usd,
+            lifetime_wm_usd=lifetime_wm_usd,
+        )
     return manifest
 
 

@@ -545,3 +545,142 @@ def test_the_dial_records_the_coverage_quantile_it_applied(tmp_path: Path) -> No
         slid = apply_cost_quality(fitted, dial)
         assert slid.floor_q == pytest.approx(cost_quality_knobs(dial).floor_q)
         assert (slid.floor_sim is None) == (slid.floor_q == 0.0)
+
+
+# --- zero-cost (local) arm ---------------------------------------------------------------
+# A locally hosted candidate legitimately prices at $0 per Mtok. These pin that a free arm
+# does not degenerate the cost machinery: the tilt stays finite, the guard reads "free" as
+# "cheaper", and an ALL-free pool refuses the cost knob loudly instead of dividing by zero.
+
+
+def _pool_with_free() -> list[PoolEntry]:
+    return [
+        *_pool(),
+        PoolEntry(
+            name="free-local",
+            kind=ProviderKind.OPENAI,
+            model="qwen3:4b",
+            endpoint="http://localhost:11434/v1",
+            input_per_mtok=0.0,
+            output_per_mtok=0.0,
+        ),
+    ]
+
+
+def _free_arm_matrix() -> OutcomeMatrix:
+    """A near-tie everywhere, with the free arm scored beside the paid two.
+
+    pricey leads by 0.02 (inside the guard's economic bar), so at the savings end of the dial
+    the argmax must land on the free arm on price alone, exactly the situation a local model
+    creates.
+    """
+    rewards = {"cheap": 0.50, "pricey": 0.52, "free-local": 0.50}
+    costs = {"cheap": 0.001, "pricey": 0.01, "free-local": 0.0}
+    return OutcomeMatrix(
+        pool=_pool_with_free(),
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id=f"{group}:{index}",
+                task=task,
+                model=model,
+                reward=rewards[model],
+                success=True,
+                cost_usd=costs[model],
+            )
+            for group, tasks in [("sql", _SQL_TASKS), ("prose", _PROSE_TASKS)]
+            for index, task in enumerate(tasks)
+            for model in rewards
+        ],
+    )
+
+
+def _fit_free(tmp_path: Path, matrix: OutcomeMatrix) -> RoutingPolicy:
+    return fit_knn_policy(
+        matrix,
+        bank_path=tmp_path / KNN_BANK_FILENAME,
+        embedder=EmbedderSpec(dim=256),
+        guard_model="pricey",
+        rag_num=5,
+        rag_thres=0.95,
+        min_pairs=3,
+    )
+
+
+def test_a_zero_cost_arm_keeps_the_cost_unit_positive(tmp_path: Path) -> None:
+    # cost_scale is the mean of the per-model mean costs; a free arm pulls it down but the
+    # priced arms keep it a usable unit, so the tilt never divides by zero.
+    policy = _fit_free(tmp_path, _free_arm_matrix())
+    assert policy.cost_scale == pytest.approx((0.001 + 0.01 + 0.0) / 3)
+
+
+def test_the_savings_dial_routes_to_the_free_arm_without_degenerating(tmp_path: Path) -> None:
+    # At the savings end the free arm's tilt is exactly 0 (it costs nothing), so it outbids the
+    # near-tied paid arms on price; the guard's economic bar accepts it because the evidence
+    # says "not significantly worse", and the whole decision stays finite.
+    policy = apply_cost_quality(_fit_free(tmp_path, _free_arm_matrix()), 1.0)
+    embedder = HashingEmbedder(dim=256)
+    decision = knn_decision(
+        policy, np.asarray(embedder.embed([_SQL_TASKS[0]])[0], dtype=np.float32)
+    )
+    assert decision.model == "free-local"
+    assert decision.evidence is not None and decision.evidence.gate == "passed"
+
+
+def test_a_free_pick_faces_the_cheaper_bar_not_the_pricier_one(tmp_path: Path) -> None:
+    # Under the as-fitted symmetric guard a PRICIER pick pays a doubled z; a free pick is by
+    # definition cheaper than any paid baseline, so its bar is the single z and the reason
+    # never carries the pricier annotation.
+    rewards = {"cheap": 0.2, "pricey": 0.2, "free-local": 0.9}
+    costs = {"cheap": 0.001, "pricey": 0.01, "free-local": 0.0}
+    matrix = OutcomeMatrix(
+        pool=_pool_with_free(),
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id=f"sql:{index}",
+                task=task,
+                model=model,
+                reward=rewards[model],
+                success=rewards[model] > 0.5,
+                cost_usd=costs[model],
+            )
+            for index, task in enumerate(_SQL_TASKS)
+            for model in rewards
+        ],
+    )
+    policy = _fit_free(tmp_path, matrix)
+    embedder = HashingEmbedder(dim=256)
+    decision = knn_decision(
+        policy, np.asarray(embedder.embed([_SQL_TASKS[0]])[0], dtype=np.float32)
+    )
+    assert decision.model == "free-local"
+    assert "pricier" not in decision.reason
+    assert "0.5xSE" in decision.reason
+
+
+def test_an_all_free_pool_refuses_the_cost_knob_loudly(tmp_path: Path) -> None:
+    # Every arm free (an all-local pool): there is no price to trade against, so the savings
+    # half of the dial must refuse with the refit instruction instead of dividing by zero.
+    free_everything = OutcomeMatrix(
+        pool=[
+            entry.model_copy(update={"input_per_mtok": 0.0, "output_per_mtok": 0.0})
+            for entry in _pool_with_free()
+        ],
+        outcomes=[
+            ScenarioOutcome(
+                scenario_id=f"sql:{index}",
+                task=task,
+                model=model,
+                reward=0.5,
+                success=True,
+                cost_usd=0.0,
+            )
+            for index, task in enumerate(_SQL_TASKS)
+            for model in ("cheap", "pricey", "free-local")
+        ],
+    )
+    policy = _fit_free(tmp_path, free_everything)
+    assert policy.cost_scale == 0.0
+    # The coverage leg (dial at or below the balanced point) never prices anything, so it works.
+    assert apply_cost_quality(policy, COST_QUALITY_BALANCED).pick_lam == 0.0
+    with pytest.raises(ValueError, match="cost_scale"):
+        apply_cost_quality(policy, 1.0)

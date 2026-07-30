@@ -65,9 +65,12 @@ class _ConverseOutput(TypedDict):
     message: _ConverseMessage
 
 
-class _ConverseUsage(TypedDict):
+class _ConverseUsage(TypedDict, total=False):
     inputTokens: int
     outputTokens: int
+    # Converse reports inputTokens EXCLUDING these two legs.
+    cacheReadInputTokens: int
+    cacheWriteInputTokens: int
 
 
 class _ConverseResponse(TypedDict):
@@ -139,9 +142,16 @@ class BedrockAdapter:
         raw = self._get_client().invoke_model(modelId=self.backend.model, body=json.dumps(body))
         data = cast("_MessagesResponse", json.loads(raw["body"].read()))
         text = "".join(block["text"] for block in data["content"] if block["type"] == "text")
+        # Anthropic-on-Bedrock usage mirrors the direct API: input_tokens
+        # excludes the cache legs, so add them back and keep the split.
+        raw_usage = cast("dict[str, object]", data["usage"])
+        cache_read = int(cast("int", raw_usage.get("cache_read_input_tokens", 0)) or 0)
+        cache_write = int(cast("int", raw_usage.get("cache_creation_input_tokens", 0)) or 0)
         usage = TokenUsage(
-            input_tokens=data["usage"]["input_tokens"],
+            input_tokens=data["usage"]["input_tokens"] + cache_read + cache_write,
             output_tokens=data["usage"]["output_tokens"],
+            cached_input_tokens=cache_read,
+            cache_write_input_tokens=cache_write,
         )
         return text, usage
 
@@ -176,13 +186,23 @@ class BedrockAdapter:
         message: dict[str, object] = {"role": "assistant", "content": text}
         if tool_calls:
             message["tool_calls"] = tool_calls
+        # Converse reports inputTokens EXCLUDING the cache legs; add them back
+        # and keep the split so cached traffic prices at its cache tiers
+        # (mirrors the wmo-side converse mapping and the invoke path above).
+        converse_usage = response["usage"]
+        cache_read = converse_usage.get("cacheReadInputTokens", 0)
+        cache_write = converse_usage.get("cacheWriteInputTokens", 0)
         return ChatResponse.model_validate(
             {
                 "model": self.backend.model,
                 "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
                 "usage": {
-                    "prompt_tokens": response["usage"]["inputTokens"],
-                    "completion_tokens": response["usage"]["outputTokens"],
+                    "prompt_tokens": converse_usage.get("inputTokens", 0)
+                    + cache_read
+                    + cache_write,
+                    "completion_tokens": converse_usage.get("outputTokens", 0),
+                    "prompt_tokens_details": {"cached_tokens": cache_read},
+                    "cache_creation_input_tokens": cache_write,
                 },
             }
         )

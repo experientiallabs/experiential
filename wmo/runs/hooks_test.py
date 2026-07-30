@@ -593,7 +593,8 @@ def test_pipeline_reports_stages_in_the_run_level_band() -> None:
             compressor_spend_usd=0.5,
             world_model_spend_usd=7.0,
         ),
-        lifetime_spend_usd=9.0,
+        lifetime_candidate_usd=2.0,
+        lifetime_wm_usd=7.0,
     )
     emitter.stage_skipped(Stage.FIT, reason="policy.json is current")
     emitter.finished(RunStatus.COMPLETED)
@@ -617,16 +618,21 @@ def test_pipeline_reports_stages_in_the_run_level_band() -> None:
 
 
 def test_pipeline_heartbeat_carries_lifetime_spend() -> None:
-    """The panel's spend for a staged run is the manifest's lifetime total, both sides."""
+    """The panel's spend for a staged run is the manifest's lifetime total, split by leg.
+
+    Both legs are reported separately: the platform totals `candidate_usd + wm_usd`, so a
+    combined figure under `candidate_usd` (the old behavior) inflated the candidate leg and
+    read the world-model leg as unreported.
+    """
     transport = FakeTransport()
     emitter = PipelineEmitter.create(world_model="tau-bench", factory=lambda: _sink(transport))
     emitter.start(world_model="tau-bench", config={})
 
-    emitter.heartbeat(stage=Stage.TUNE, lifetime_spend_usd=12.5)
+    emitter.heartbeat(stage=Stage.TUNE, lifetime_candidate_usd=9.25, lifetime_wm_usd=3.25)
 
     beat = transport.of_type("heartbeat")[0].payload
     assert obj(beat["progress"])["stage"] == "tune"
-    assert obj(beat["spend"])["candidate_usd"] == 12.5
+    assert obj(beat["spend"]) == {"candidate_usd": 9.25, "wm_usd": 3.25}
 
 
 def test_the_emitter_names_its_arm_so_a_caller_can_scope_ledger_lines() -> None:
@@ -780,7 +786,7 @@ def test_an_unreachable_probe_is_not_read_as_a_fresh_run() -> None:
     emitter = PipelineEmitter.create(world_model="tau-bench", factory=lambda: _sink(transport))
 
     emitter.start(world_model="tau-bench", config={})
-    emitter.heartbeat(stage=Stage.SWEEP, lifetime_spend_usd=1.0)
+    emitter.heartbeat(stage=Stage.SWEEP, lifetime_candidate_usd=1.0, lifetime_wm_usd=0.0)
 
     # The failed probe did not stand as "fresh run": it was retried, the mark was learned, and
     # numbering continued past it. Events numbered DURING the outage may still be discarded (they

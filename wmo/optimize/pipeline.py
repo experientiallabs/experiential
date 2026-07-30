@@ -159,6 +159,19 @@ class RunManifest(BaseModel):
     # predecessor and the stage rows alone cannot answer "what has this cost so far". A spend cap
     # asks exactly that, so the total accumulates here and is never rewritten downward.
     lifetime_spend_usd: float = 0.0
+    # The same lifetime, kept as the two legs the run telemetry reports separately
+    # (candidate side vs world-model side). Manifests written before these fields carry
+    # only the combined total; `lifetime_split` attributes that untracked remainder to
+    # the candidate leg, which is exactly what the emitter used to report.
+    lifetime_candidate_usd: float = 0.0
+    lifetime_wm_usd: float = 0.0
+
+    @property
+    def lifetime_split(self) -> tuple[float, float]:
+        """Lifetime spend as (candidate_usd, wm_usd), summing to `lifetime_spend_usd`."""
+        tracked = self.lifetime_candidate_usd + self.lifetime_wm_usd
+        remainder = max(0.0, self.lifetime_spend_usd - tracked)
+        return self.lifetime_candidate_usd + remainder, self.lifetime_wm_usd
 
     def record_for(self, stage: Stage) -> StageRecord | None:
         """The recorded run of `stage`, or None when it has never completed."""
@@ -177,6 +190,8 @@ class RunManifest(BaseModel):
             update={
                 "stages": sorted(kept, key=lambda item: STAGE_ORDER.index(item.stage)),
                 "lifetime_spend_usd": self.lifetime_spend_usd + record.total_spend_usd,
+                "lifetime_candidate_usd": self.lifetime_candidate_usd + record.spend_usd,
+                "lifetime_wm_usd": self.lifetime_wm_usd + record.world_model_spend_usd,
             }
         )
 
