@@ -93,6 +93,12 @@ class PoolEntry(BaseModel):
     # resolves in policies already fitted with it, so flipping the flag never strands an
     # artifact that recorded the entry while it was on.
     enabled: bool = True
+    # One effort dial across vendors: OpenAI-family backends forward it as
+    # `reasoning.effort` (dispatching through their Responses client), Anthropic as
+    # adaptive thinking's `output_config.effort` (low|medium|high|max, probed live
+    # 2026-07-29). Two entries differing only in effort are two ARMS with one runtime
+    # model id - the router-vs-router comparison's whole premise.
+    reasoning_effort: str | None = None
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     cached_input_per_mtok: float | None = None  # provider cache-read price, USD per 1M tokens
@@ -230,6 +236,7 @@ class PoolEntry(BaseModel):
             deployment=self.deployment,
             api_version=self.api_version,
             region=self.region,
+            reasoning_effort=self.reasoning_effort,
         )
 
 

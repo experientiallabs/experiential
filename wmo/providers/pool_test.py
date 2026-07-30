@@ -1243,3 +1243,21 @@ def test_is_local_endpoint_never_raises_on_a_malformed_bracket_url() -> None:
     # urlsplit raises ValueError on `http://[::1:8000`; display copy must read it as
     # "not local", not crash the roster table.
     assert pool_module.is_local_endpoint("http://[::1:8000/v1") is False
+
+
+def test_pool_entry_threads_reasoning_effort_into_the_provider_config() -> None:
+    """Two entries differing only in effort are two arms over one runtime model."""
+    entry = PoolEntry(
+        name="sonnet-5@max",
+        kind=ProviderKind.ANTHROPIC,
+        model="claude-sonnet-5",
+        reasoning_effort="max",
+    )
+
+    assert entry.provider_config().reasoning_effort == "max"
+    assert (
+        PoolEntry(name="sonnet-5", kind=ProviderKind.ANTHROPIC, model="claude-sonnet-5")
+        .provider_config()
+        .reasoning_effort
+        is None
+    )

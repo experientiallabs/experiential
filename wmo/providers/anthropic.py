@@ -114,6 +114,7 @@ class AnthropicProvider:
             request,
             self.config.model,
             default_max_tokens=DEFAULT_MAX_TOKENS,
+            reasoning_effort=self.config.reasoning_effort,
         )
         response = self._get_client().messages.create(**cast("Any", payload))
         return messages_response(response, self.config.model)

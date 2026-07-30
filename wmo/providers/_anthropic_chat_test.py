@@ -300,3 +300,23 @@ def test_response_maps_length_and_refusal_stops() -> None:
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }
         assert messages_response(raw, "m").choices[0].finish_reason == expected
+
+
+def test_reasoning_effort_sends_adaptive_thinking_and_effort() -> None:
+    """The cross-vendor effort dial reaches the wire as output_config.effort.
+
+    The Claude 5 API refuses budget-token thinking outright ("use
+    thinking.type.adaptive and output_config.effort"), so the dial maps to the
+    adaptive form; None must send NEITHER field (backend default behavior).
+    """
+    request = ChatRequest.model_validate({"messages": [{"role": "user", "content": "hi"}]})
+
+    dialed = messages_request(
+        request, "claude-sonnet-5", default_max_tokens=64, reasoning_effort="high"
+    )
+    plain = messages_request(request, "claude-sonnet-5", default_max_tokens=64)
+
+    assert dialed["thinking"] == {"type": "adaptive"}
+    assert dialed["output_config"] == {"effort": "high"}
+    assert "thinking" not in plain
+    assert "output_config" not in plain

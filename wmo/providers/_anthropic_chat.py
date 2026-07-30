@@ -33,6 +33,7 @@ def messages_request(
     *,
     default_max_tokens: int,
     cache_prompt: bool = True,
+    reasoning_effort: str | None = None,
 ) -> dict[str, object]:
     """Translate the provider-neutral structured contract to an Anthropic Messages payload.
 
@@ -42,6 +43,12 @@ def messages_request(
         default_max_tokens: Output budget when the request names none (the API requires one).
         cache_prompt: Place `cache_control` breakpoints (see the module docstring). Turn it off
             only to measure the uncached cost of the same traffic.
+        reasoning_effort: The cross-vendor effort dial, sent as adaptive thinking's
+            `output_config.effort` (low|medium|high|max). The Claude 5 API refuses
+            budget-token thinking ("use thinking.type.adaptive and output_config.effort")
+            and, probed live on a tool round-trip, does NOT require thinking blocks to be
+            replayed - so an OpenAI-shaped history is sufficient and no caching layer is
+            needed. None sends neither field: the backend's own default behavior.
 
     Returns:
         The keyword payload for `client.messages.create`.
@@ -106,6 +113,9 @@ def messages_request(
         "messages": messages,
         "max_tokens": request.max_tokens or request.max_completion_tokens or default_max_tokens,
     }
+    if reasoning_effort is not None:
+        payload["thinking"] = {"type": "adaptive"}
+        payload["output_config"] = {"effort": reasoning_effort}
 
     tools = _tools(request)
     if tools is not None:
