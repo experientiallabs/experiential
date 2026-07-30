@@ -179,3 +179,17 @@ def test_cached_embedder_refuses_unseen_text_and_wrong_shape(tmp_path: Path) -> 
     np.save(snapshot / "short.npy", short)
     with pytest.raises(ValueError, match="different matrix"):
         CachedTaskEmbedder(matrix, snapshot / "short.npy")
+
+
+def test_cached_embedder_refuses_duplicate_task_texts(tmp_path: Path) -> None:
+    """Two scenarios with identical task text cannot share a text-keyed vector row silently."""
+    snapshot = tmp_path / "data"
+    snapshot.mkdir()
+    matrix = _matrix_dict(n_scenarios=4)
+    for outcome in matrix["outcomes"]:
+        if outcome["scenario_id"] == "s1":
+            outcome["task"] = "task text 0"  # collides with s0's text
+    (snapshot / "matrix.json").write_text(json.dumps(matrix), encoding="utf-8")
+    np.save(snapshot / "vectors.npy", np.zeros((4, 8)))
+    with pytest.raises(ValueError, match="share task text"):
+        CachedTaskEmbedder(OutcomeMatrix.load(snapshot / "matrix.json"), snapshot / "vectors.npy")
