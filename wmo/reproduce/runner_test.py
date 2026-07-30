@@ -208,6 +208,28 @@ def test_cached_embedder_refuses_unseen_text_and_wrong_shape(tmp_path: Path) -> 
         CachedTaskEmbedder(matrix, snapshot / "short.npy")
 
 
+def test_a_second_concurrent_run_into_the_same_out_dir_is_refused(tmp_path: Path) -> None:
+    """The lock makes the shared-out-dir race loud instead of interleaving fit state."""
+    headline = _measure(tmp_path)
+    manifest = _manifest(
+        [
+            {
+                "label": "routed vs pricey",
+                "baseline": "pricey",
+                "accuracy": headline["accuracy"],
+                "cost_per_run_usd": headline["cost_per_run_usd"],
+            }
+        ]
+    )
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / ".reproduce.lock").touch()  # a live (or dead) sibling run
+    with pytest.raises(RuntimeError, match="already running"):
+        run_reproduction(manifest, out_dir=out, data_dir=tmp_path / "data")
+    (out / ".reproduce.lock").unlink()
+    assert run_reproduction(manifest, out_dir=out, data_dir=tmp_path / "data").reproduced
+
+
 def test_cached_embedder_refuses_duplicate_task_texts(tmp_path: Path) -> None:
     """Two scenarios with identical task text cannot share a text-keyed vector row silently."""
     snapshot = tmp_path / "data"

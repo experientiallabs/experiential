@@ -81,6 +81,34 @@ def run_reproduction(
         ValueError: the downloaded data does not match the manifest's expectations.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+    # ONE run per output directory, enforced rather than assumed: every artifact this run
+    # writes (policy, bank, dial snapshot, reports, verdict) lives at a fixed name in
+    # `out_dir`, so a second concurrent run would interleave fit state with this one's.
+    lock = out_dir / ".reproduce.lock"
+    try:
+        lock_fd = lock.open("x")
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"another reproduction is already running in {out_dir} (found {lock.name}); "
+            "give each run its own --out directory, or remove the stale lock if that run "
+            "is dead"
+        ) from exc
+    try:
+        return _run_locked(
+            manifest, out_dir=out_dir, data_dir=data_dir, approve_spend=approve_spend
+        )
+    finally:
+        lock_fd.close()
+        lock.unlink(missing_ok=True)
+
+
+def _run_locked(
+    manifest: Manifest,
+    *,
+    out_dir: Path,
+    data_dir: Path | None,
+    approve_spend: bool,
+) -> ReproduceResult:
     snapshot = data_dir if data_dir is not None else _download(manifest, out_dir)
 
     if manifest.kind == "matrix":
