@@ -1,0 +1,10 @@
+[
+  "bn-fit-modify",
+  "build-pmars",
+  "caffe-cifar-10",
+  "cancel-async-tasks",
+  "build-cython-ext",
+  "build-pov-ray",
+  "constraints-scheduling",
+  "overfull-hbox"
+]

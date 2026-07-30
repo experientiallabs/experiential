@@ -86,6 +86,7 @@ class PoolEntry(BaseModel):
     api_version: str | None = None  # Azure api-version
     region: str | None = None  # AWS Bedrock region (bedrock entries only)
     api_key_env: str | None = None  # env var holding this entry's API key (multi-account pools)
+    reasoning_effort: str | None = None  # OpenAI Responses reasoning.effort
     tier: Tier = "frontier"
     # The roster's per-candidate toggle: `enabled = false` keeps the entry (its handle, prices,
     # and comments) but takes it out of everything that CHOOSES models: sweeps, fits, pins, and
@@ -230,6 +231,7 @@ class PoolEntry(BaseModel):
             deployment=self.deployment,
             api_version=self.api_version,
             region=self.region,
+            reasoning_effort=self.reasoning_effort,
         )
 
 

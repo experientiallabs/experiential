@@ -184,6 +184,17 @@ def test_provider_config_maps_backend_knobs() -> None:
     assert config.api_version == "2024-10-21"
 
 
+def test_provider_config_forwards_reasoning_effort() -> None:
+    entry = PoolEntry(
+        name="gpt-sol-high",
+        kind=ProviderKind.OPENAI,
+        model="gpt-5.6-sol",
+        reasoning_effort="high",
+    )
+
+    assert entry.provider_config().reasoning_effort == "high"
+
+
 def test_pool_provider_requires_named_env_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
