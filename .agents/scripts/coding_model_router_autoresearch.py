@@ -31,6 +31,7 @@ from typing import Literal, Protocol, TypedDict, cast
 
 import joblib
 import numpy as np
+import pyarrow.parquet as pq
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -45,6 +46,8 @@ QUALITY_FLOORS = (0.95, 0.97, 0.99)
 FOLDS = 5
 BOOTSTRAP_SAMPLES = 10_000
 PRIMARY_TARGET_FAMILY = "mini_swe_agent_claude_opus_5"
+SWEBENCH_WEAK_ARM = "20251211_mini-v1.17.2_gpt-5.2-2025-12-11"
+SWEBENCH_STRONG_ARM = "20251211_mini-v1.17.2_gpt-5.2-2025-12-11-high"
 TARGET_LADDERS: dict[str, tuple[str, ...]] = {
     "opus-low-high": (
         "mini_swe_agent_claude_opus_5_low",
@@ -197,8 +200,8 @@ def _canonical_group(value: str) -> str:
 def _empirical_bayes_rate(successes: float, attempts: int, global_mean: float) -> float:
     """Shrink a repeated success rate toward its source-wide mean."""
     prior_strength = 4.0
-    alpha = 1.0 + prior_strength * global_mean
-    beta = 1.0 + prior_strength * (1.0 - global_mean)
+    alpha = max(np.finfo(np.float64).eps, prior_strength * global_mean)
+    beta = max(np.finfo(np.float64).eps, prior_strength * (1.0 - global_mean))
     return (successes + alpha) / (attempts + alpha + beta)
 
 
@@ -309,7 +312,9 @@ def _load_coderouter(root: Path) -> SourceData:
     )
     return SourceData(
         name="coderouterbench-ood176",
-        task_ids=task_ids,
+        task_ids=[
+            str(tasks[task_id].get("original_task_id", task_id)) for task_id in task_ids
+        ],
         groups=[_coderouter_group(tasks[task_id]) for task_id in task_ids],
         texts=[str(tasks[task_id]["prompt"]) for task_id in task_ids],
         weak=np.asarray([cells[(requested[0], task_id)] for task_id in task_ids]),
@@ -319,9 +324,118 @@ def _load_coderouter(root: Path) -> SourceData:
     )
 
 
+def _sigmoid(value: np.ndarray) -> np.ndarray:
+    return np.where(
+        value >= 0.0,
+        1.0 / (1.0 + np.exp(-value)),
+        np.exp(value) / (1.0 + np.exp(value)),
+    )
+
+
+def _calibrated_irt_probability(easiness: np.ndarray, target_mean: float) -> np.ndarray:
+    """Map task easiness to probabilities whose aggregate matches one observed arm."""
+    lower = -30.0
+    upper = 30.0
+    for _ in range(80):
+        midpoint = (lower + upper) / 2.0
+        if float(_sigmoid(easiness + midpoint).mean()) < target_mean:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return _sigmoid(easiness + (lower + upper) / 2.0)
+
+
+def _load_swebench(matrix_path: Path, task_path: Path) -> SourceData:
+    """Build a denoised reasoning-effort source from the published bash-only matrix."""
+    raw = _read_json(matrix_path)
+    if not isinstance(raw, dict):
+        raise ValueError(f"{matrix_path} must contain one JSON object")
+    submissions = cast(dict[str, dict[str, object]], raw)
+    missing = [
+        arm for arm in (SWEBENCH_WEAK_ARM, SWEBENCH_STRONG_ARM) if arm not in submissions
+    ]
+    if missing:
+        raise ValueError(f"{matrix_path} is missing effort-pair submissions: {missing}")
+
+    valid_arms: list[str] = []
+    details_by_arm: dict[str, dict[str, dict[str, object]]] = {}
+    for arm, submission in submissions.items():
+        details = cast(dict[str, dict[str, object]], submission["details"])
+        resolved = sum(bool(cell.get("resolved")) for cell in details.values())
+        spend = sum(_as_float(cell.get("cost", 0.0) or 0.0) for cell in details.values())
+        if resolved == 0 and spend > 1.0:
+            continue
+        valid_arms.append(arm)
+        details_by_arm[arm] = details
+    task_ids = sorted(
+        set.intersection(*(set(details_by_arm[arm]) for arm in valid_arms))
+    )
+    metadata_table = pq.read_table(
+        task_path,
+        columns=["instance_id", "repo", "problem_statement"],
+    )
+    metadata = {
+        str(instance_id): (str(repo), str(problem))
+        for instance_id, repo, problem in zip(
+            metadata_table["instance_id"].to_pylist(),
+            metadata_table["repo"].to_pylist(),
+            metadata_table["problem_statement"].to_pylist(),
+            strict=True,
+        )
+    }
+    task_ids = [task_id for task_id in task_ids if task_id in metadata]
+    outcomes = np.asarray(
+        [
+            [
+                float(bool(details_by_arm[arm][task_id].get("resolved")))
+                for task_id in task_ids
+            ]
+            for arm in valid_arms
+        ],
+        dtype=np.float64,
+    )
+    smoothed_solve_rate = (outcomes.sum(axis=0) + 0.5) / (len(valid_arms) + 1.0)
+    easiness = np.log(smoothed_solve_rate / (1.0 - smoothed_solve_rate))
+    easiness -= float(easiness.mean())
+    weak_observed = np.asarray(
+        [
+            float(bool(details_by_arm[SWEBENCH_WEAK_ARM][task_id].get("resolved")))
+            for task_id in task_ids
+        ],
+        dtype=np.float64,
+    )
+    strong_observed = np.asarray(
+        [
+            float(bool(details_by_arm[SWEBENCH_STRONG_ARM][task_id].get("resolved")))
+            for task_id in task_ids
+        ],
+        dtype=np.float64,
+    )
+    weak = _calibrated_irt_probability(easiness, float(weak_observed.mean()))
+    strong = _calibrated_irt_probability(easiness, float(strong_observed.mean()))
+    logger.info(
+        "SWE-bench effort source normalized with arms=%d tasks=%d weak=%.4f strong=%.4f",
+        len(valid_arms),
+        len(task_ids),
+        float(weak.mean()),
+        float(strong.mean()),
+    )
+    return SourceData(
+        name="swebench-verified-gpt52-effort-irt",
+        task_ids=task_ids,
+        groups=[_canonical_group(metadata[task_id][0]) for task_id in task_ids],
+        texts=[metadata[task_id][1] for task_id in task_ids],
+        weak=weak,
+        strong=strong,
+        weak_attempts=np.full(len(task_ids), len(valid_arms), dtype=np.float64),
+        strong_attempts=np.full(len(task_ids), len(valid_arms), dtype=np.float64),
+    )
+
+
 def _combine(sources: list[SourceData]) -> CombinedData:
     counts = {source.name: len(source.task_ids) for source in sources}
     seen_text: set[str] = set()
+    seen_task_ids: set[str] = set()
     source_names: list[str] = []
     task_ids: list[str] = []
     groups: list[str] = []
@@ -332,9 +446,11 @@ def _combine(sources: list[SourceData]) -> CombinedData:
     for source in sources:
         for index, text in enumerate(source.texts):
             digest = hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
-            if digest in seen_text:
+            task_id = source.task_ids[index].strip().lower()
+            if digest in seen_text or task_id in seen_task_ids:
                 continue
             seen_text.add(digest)
+            seen_task_ids.add(task_id)
             source_names.append(source.name)
             task_ids.append(source.task_ids[index])
             groups.append(source.groups[index])
@@ -567,8 +683,17 @@ def _fit(args: argparse.Namespace) -> None:
     sources = [
         _load_nebius(args.nebius_tasks.resolve()),
         _load_r2e(args.r2e_loader.resolve()),
-        _load_coderouter(args.coderouter_root.resolve()),
     ]
+    if (args.swebench_matrix is None) != (args.swebench_tasks is None):
+        raise ValueError("--swebench-matrix and --swebench-tasks must be supplied together")
+    if args.swebench_matrix is not None and args.swebench_tasks is not None:
+        sources.append(
+            _load_swebench(
+                args.swebench_matrix.resolve(),
+                args.swebench_tasks.resolve(),
+            )
+        )
+    sources.append(_load_coderouter(args.coderouter_root.resolve()))
     combined = _combine(sources)
     _write_json(
         output / "external-sources.json",
@@ -685,6 +810,7 @@ def _fit(args: argparse.Namespace) -> None:
                 "quality_floors": list(QUALITY_FLOORS),
                 "target_outcomes_used": False,
                 "target_embeddings_used": False,
+                "swebench_effort_pair": [SWEBENCH_WEAK_ARM, SWEBENCH_STRONG_ARM],
                 "selection": "minimum_source_balanced_strong_traffic_then_uplift_spearman",
             },
             "leaderboard": leaderboard,
@@ -975,6 +1101,8 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--nebius-tasks", type=Path, required=True)
     fit.add_argument("--r2e-loader", type=Path, required=True)
     fit.add_argument("--coderouter-root", type=Path, required=True)
+    fit.add_argument("--swebench-matrix", type=Path)
+    fit.add_argument("--swebench-tasks", type=Path)
     fit.add_argument("--output", type=Path, required=True)
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--deep-matrix", type=Path, required=True)

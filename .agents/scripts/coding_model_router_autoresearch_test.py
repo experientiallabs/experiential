@@ -71,3 +71,38 @@ def test_combine_deduplicates_exact_normalized_text() -> None:
     )
     combined = module._combine([source, duplicate])
     assert combined.task_ids == ["a", "b"]
+
+
+def test_empirical_bayes_rate_preserves_source_mean_and_arm_order() -> None:
+    module = _module()
+    weak_mean = 0.075
+    strong_mean = 0.112
+    attempts = 2
+    weak_rates = np.asarray(
+        [
+            module._empirical_bayes_rate(0.0, attempts, weak_mean),
+            module._empirical_bayes_rate(1.0, attempts, weak_mean),
+        ]
+    )
+    strong_rates = np.asarray(
+        [
+            module._empirical_bayes_rate(0.0, attempts, strong_mean),
+            module._empirical_bayes_rate(1.0, attempts, strong_mean),
+        ]
+    )
+    assert np.isclose(weak_rates.mean(), (0.5 + 4.0 * weak_mean) / 6.0)
+    assert np.isclose(strong_rates.mean(), (0.5 + 4.0 * strong_mean) / 6.0)
+    assert strong_rates.mean() > weak_rates.mean()
+
+
+def test_calibrated_irt_probability_matches_arm_mean_and_peaks_uplift_midrange() -> None:
+    module = _module()
+    easiness = np.linspace(-4.0, 4.0, 401)
+    weak = module._calibrated_irt_probability(easiness, 0.60)
+    strong = module._calibrated_irt_probability(easiness, 0.72)
+    uplift = strong - weak
+    assert np.isclose(weak.mean(), 0.60)
+    assert np.isclose(strong.mean(), 0.72)
+    assert int(np.argmax(uplift)) not in (0, len(uplift) - 1)
+    assert uplift[len(uplift) // 2] > uplift[0]
+    assert uplift[len(uplift) // 2] > uplift[-1]
