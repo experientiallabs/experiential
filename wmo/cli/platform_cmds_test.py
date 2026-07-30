@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -737,3 +738,142 @@ def test_push_skip_message_names_the_partial_replay_recovery(
     flat = _flatten(result.output)
     assert "wmo runs backfill" in flat
     assert "--force" in flat
+
+
+class _PullStateClient(_StubClient):
+    """Client double for the current-state pull: canned registry and policy reads."""
+
+    model_names: tuple[str, ...] = ()
+    endpoint_names: tuple[str, ...] = ()
+    policy_payload: dict[str, object] = {}
+    bank_bytes: bytes | None = None
+
+    def list_world_models(self, _org_id: str) -> list[RemoteWorldModel]:
+        return [
+            RemoteWorldModel(id=f"wm-{name}", name=name, status="ready")
+            for name in type(self).model_names
+        ]
+
+    def list_harnesses(self, _org_id: str) -> list[object]:
+        return []
+
+    def get_endpoint(self, _org_id: str, name: str) -> dict[str, object] | None:
+        return {"name": name} if name in type(self).endpoint_names else None
+
+    def download_endpoint_policy(
+        self, _org_id: str, name: str, *, bank_dest: Path | None = None
+    ) -> dict[str, object] | None:
+        if name not in type(self).endpoint_names:
+            return None
+        payload = dict(type(self).policy_payload)
+        bank_bytes = type(self).bank_bytes
+        if bank_dest is not None and bank_bytes is not None:
+            bank_dest.write_bytes(bank_bytes)
+        return payload
+
+
+def test_pull_model_overwrites_artifacts_with_the_endpoint_current_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pull hands back what the endpoint serves NOW, not what was pushed."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+    _PullStateClient.model_names = ("demo-model",)
+    _PullStateClient.endpoint_names = ("demo-model",)
+    _PullStateClient.policy_payload = {
+        "policy": {"kind": "static", "default_model": "current-pick", "pool": []},
+        "report": {"headline": {"accuracy": 0.9}},
+        "bank": None,
+    }
+    _PullStateClient.bank_bytes = None
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _PullStateClient)
+
+    def fake_pull_model(
+        _client: object, _org_id: str, name: str, root_dir: str, *, force: bool
+    ) -> None:
+        del force
+        model_dir = Path(root_dir) / "models" / name
+        model_dir.mkdir(parents=True)
+        # The bundle carries the AS-PUSHED policy; the artifacts leg must replace it.
+        (model_dir / "policy.json").write_text(
+            '{"kind": "static", "default_model": "as-pushed"}', encoding="utf-8"
+        )
+    monkeypatch.setattr("wmo.cli.platform_cmds._pull_model", fake_pull_model)
+
+    result = runner.invoke(app, ["pull", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    model_dir = Path(root) / "models" / "demo-model"
+    policy = json.loads((model_dir / "policy.json").read_text(encoding="utf-8"))
+    assert policy["default_model"] == "current-pick"
+    report = json.loads((model_dir / "report.json").read_text(encoding="utf-8"))
+    assert report["headline"] == {"accuracy": 0.9}
+    assert "current" in _flatten(result.output)
+
+
+def test_pull_reaches_an_endpoint_that_was_never_pushed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A platform-created endpoint with no simulation still pulls its artifacts."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+    _PullStateClient.model_names = ()
+    _PullStateClient.endpoint_names = ("hosted-only",)
+    _PullStateClient.policy_payload = {
+        "policy": {"kind": "knn", "default_model": "m1", "pool": []},
+        "report": {"headline": {"accuracy": 0.7}},
+        "bank": {"sha256": "abc", "byte_size": 3},
+    }
+    _PullStateClient.bank_bytes = b"npz"
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _PullStateClient)
+
+    result = runner.invoke(app, ["pull", "hosted-only", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    model_dir = Path(root) / "models" / "hosted-only"
+    assert json.loads((model_dir / "policy.json").read_text(encoding="utf-8"))["kind"] == "knn"
+    assert (model_dir / "policy.json.bank.npz").read_bytes() == b"npz"
+    assert (model_dir / "report.json").is_file()
+    assert "no simulation to pull" in _flatten(result.output)
+
+
+def test_pull_removes_a_stale_bank_when_the_current_policy_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bankless current policy must not keep an older fit's sidecar beside it."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+    _PullStateClient.model_names = ()
+    _PullStateClient.endpoint_names = ("hosted-only",)
+    _PullStateClient.policy_payload = {
+        "policy": {"kind": "static", "default_model": "m1", "pool": []},
+        "report": None,
+        "bank": None,
+    }
+    _PullStateClient.bank_bytes = None
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _PullStateClient)
+    stale = Path(root) / "models" / "hosted-only" / "policy.json.bank.npz"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"old fit")
+
+    result = runner.invoke(app, ["pull", "hosted-only", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert not stale.exists()
+    assert "stale policy.json.bank.npz" in _flatten(result.output)
+
+
+def test_pull_names_endpoints_in_the_nothing_found_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The not-found message covers everything a pull can now reach."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+    _PullStateClient.model_names = ()
+    _PullStateClient.endpoint_names = ()
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _PullStateClient)
+
+    result = runner.invoke(app, ["pull", "ghost", "--root", root])
+
+    _assert_clean_failure(result)
+    assert "no world model, endpoint, or harness" in _flatten(result.output)

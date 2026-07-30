@@ -698,6 +698,50 @@ class PlatformClient:
         self._raise_for_error(response)
         return _decode_json(response)
 
+    def download_endpoint_policy(
+        self, org_id: str, name: str, *, bank_dest: Path | None = None
+    ) -> JsonObject | None:
+        """The endpoint's CURRENT policy and report, streaming its knn bank when asked.
+
+        The pull half of the publish surface (D-LOCAL-PULL): the platform
+        returns the policy the endpoint serves NOW - a hosted optimizer's fit
+        included - beside its improvement report. ``None`` when the org has no
+        endpoint by that name (a 404 is an answer here, exactly like
+        :meth:`get_endpoint`). When the policy carries an evidence bank and
+        ``bank_dest`` is given, the bank bytes stream from the signed URL to
+        that path and are digest-verified; a policy with no bank leaves the
+        path unwritten.
+
+        Returns:
+            The response payload (``policy``, ``report``, ``bank`` metadata),
+            or ``None`` for an absent endpoint.
+        """
+        response = self._client.get(f"/api/orgs/{org_id}/endpoints/{name}/policy")
+        if response.status_code == 404:
+            return None
+        self._raise_for_error(response)
+        payload = _decode_json(response)
+        bank = payload.get("bank")
+        if bank_dest is not None and isinstance(bank, dict):
+            declared = str(bank["sha256"])
+            digest = hashlib.sha256()
+            part_path = bank_dest.with_name(f"{bank_dest.name}.part")
+            with self._transfer.stream("GET", str(bank["url"])) as stream:
+                if not stream.is_success:
+                    msg = f"policy bank download failed with HTTP {stream.status_code}"
+                    raise PlatformError(msg, status_code=stream.status_code)
+                with part_path.open("wb") as fh:
+                    for chunk in stream.iter_bytes():
+                        digest.update(chunk)
+                        fh.write(chunk)
+            actual = digest.hexdigest()
+            if actual != declared:
+                part_path.unlink(missing_ok=True)
+                msg = f"policy bank digest mismatch for {name}: expected {declared}, got {actual}"
+                raise PlatformError(msg)
+            part_path.replace(bank_dest)
+        return payload
+
     def download_model_bundle(self, org_id: str, name: str, dest: Path) -> str:
         """Stream a model's bundle from storage to ``dest``, verifying its digest.
 
