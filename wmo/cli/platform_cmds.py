@@ -8,6 +8,7 @@ exists locally (or remotely, for pulls).
 
 from __future__ import annotations
 
+import json
 import socket
 import tempfile
 import webbrowser
@@ -20,6 +21,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from wmo.cli.runs_app import MANIFEST_RELPATH
 from wmo.config.store import WorldModelStore
 from wmo.harness.doc import HarnessDoc
 from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
@@ -40,6 +42,10 @@ from wmo.platform.credentials import (
     save_credentials,
 )
 from wmo.platform.transfer import extract_push_meta, pack_model_dir, unpack_model_bundle
+from wmo.runs.backfill import BackfillRefused, ensure_backfillable, optimize_events
+from wmo.runs.client import PushRejected, PushUnavailable, RunsSink, default_emitter_id
+from wmo.runs.reader import RunsReader
+from wmo.runs.schema import pipeline_external_id
 
 _console = Console()
 _CHECK = "[green]✓[/green]"
@@ -71,6 +77,12 @@ _PUSH_REF = typer.Option(
 )
 _PULL_VERSION = typer.Option("--version", help="Harness version to pull (default: latest).")
 _PULL_FORCE = typer.Option("--force", help="Replace an existing local artifact.")
+_PUSH_SERVE_MODEL = typer.Option(
+    "--serve-model",
+    help="Day-one serving model for a newly created endpoint (a platform default "
+    "serves when omitted; deployments without that model's credentials refuse "
+    "and name the serveable set).",
+)
 _ROOT = typer.Option("--root", help="Artifact root directory.")
 
 
@@ -180,9 +192,18 @@ def push(
     kind: Annotated[str | None, _KIND] = None,
     push_as: Annotated[str | None, _PUSH_AS] = None,
     ref: Annotated[str | None, _PUSH_REF] = None,
+    serve_model: Annotated[str | None, _PUSH_SERVE_MODEL] = None,
     root: Annotated[str, _ROOT] = ".wmo",
 ) -> None:
-    """Publish a local world model or harness to the platform registry."""
+    """Publish a local world model or harness to the platform registry.
+
+    A model push carries everything the model directory holds: the simulation
+    (the built bundle), the model (a measured policy.json + report.json become
+    the endpoint's installed artifacts), and the pipeline (the optimize run's
+    manifest replays into the platform's run history). Legs whose artifacts are
+    absent are skipped with a note, so a bundle-only directory pushes exactly
+    as before.
+    """
     model_dir = WorldModelStore(root).dir_for(name)
     harness_exists = HarnessStore(root).exists(name)
     resolved_kind = _resolve_kind(
@@ -193,7 +214,16 @@ def push(
     credentials, org_id = _require_connection(org)
     with _connected(credentials, "Push failed") as client:
         if resolved_kind == "model" and model_dir is not None:
-            _push_model(client, org_id, remote_name, model_dir)
+            pushed_id = _push_model(client, org_id, remote_name, model_dir)
+            _push_endpoint_artifacts(
+                client,
+                org_id,
+                remote_name,
+                model_dir,
+                world_model_id=pushed_id,
+                serve_model=serve_model,
+            )
+            _push_pipeline(client, org_id, remote_name, model_dir)
         else:
             _push_harness(client, org_id, remote_name, name, ref, root)
 
@@ -324,7 +354,7 @@ def _detect_remote_kind(client: PlatformClient, org_id: str, name: str) -> str:
     raise typer.BadParameter(f"the organization has no world model or harness named {name!r}")
 
 
-def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> None:
+def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
     meta = extract_push_meta(model_dir)
     with tempfile.TemporaryDirectory(prefix="wmo-push-") as staging:
         bundle = pack_model_dir(model_dir, Path(staging) / f"{remote_name}.tar.gz")
@@ -346,6 +376,91 @@ def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir
     _console.print(
         f"{_CHECK} Pushed world model [bold]{pushed.name}[/bold] "
         f"({bundle.byte_size:,} bytes, sha256 {bundle.sha256[:12]}…)"
+    )
+    return pushed.id
+
+
+def _push_endpoint_artifacts(
+    client: PlatformClient,
+    org_id: str,
+    remote_name: str,
+    model_dir: Path,
+    *,
+    world_model_id: str,
+    serve_model: str | None,
+) -> None:
+    """Publish the model directory's measured policy and report as the endpoint.
+
+    Creates the endpoint when the org has none by this name (linked to the
+    just-pushed simulation), then installs policy.json + report.json on it. A
+    knn policy carries an evidence bank and goes through the multipart
+    installer; static and rank ride the JSON artifacts route. Skipped with a
+    note when either artifact is absent: a bundle-only push is still a push.
+    """
+    policy_path = model_dir / "policy.json"
+    report_path = model_dir / "report.json"
+    if not policy_path.is_file():
+        _console.print("no policy.json in the model directory; skipping the endpoint leg")
+        return
+    if not report_path.is_file():
+        _console.print(
+            "policy.json has no report.json beside it; skipping the endpoint leg "
+            "(the report is the endpoint's customer-facing evidence)"
+        )
+        return
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if client.get_endpoint(org_id, remote_name) is None:
+        client.create_endpoint(
+            org_id, remote_name, world_model_id=world_model_id, model=serve_model
+        )
+        _console.print(f"{_CHECK} Created endpoint [bold]{remote_name}[/bold]")
+    if isinstance(policy, dict) and policy.get("kind") == "knn":
+        bank_path = Path(f"{policy_path}.bank.npz")
+        client.install_endpoint_policy(
+            org_id,
+            remote_name,
+            policy_path,
+            bank_path if bank_path.is_file() else None,
+            report_path,
+        )
+    else:
+        client.install_endpoint_artifacts(org_id, remote_name, policy=policy, report=report)
+    _console.print(
+        f"{_CHECK} Installed measured policy + report on endpoint [bold]{remote_name}[/bold]"
+    )
+
+
+def _push_pipeline(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> None:
+    """Replay the model's optimize pipeline into the platform's run history.
+
+    The same derivation `wmo runs backfill` performs, riding the push's own
+    client: events come from the manifest's recorded clocks, seqs are
+    deterministic, and the platform discards replays, so re-pushing a model is
+    free. A run that already reported itself live is left alone rather than
+    double-counted.
+    """
+    manifest = model_dir / MANIFEST_RELPATH
+    if not manifest.is_file():
+        _console.print("no optimize manifest in the model directory; skipping the pipeline leg")
+        return
+    external_id = pipeline_external_id(remote_name)
+    events = optimize_events(manifest, model=remote_name, external_id=external_id)
+    try:
+        ensure_backfillable(RunsReader(client, org_id).event_count(external_id))
+    except BackfillRefused:
+        _console.print(
+            f"pipeline run [bold]{external_id}[/bold] is already recorded; skipping the replay"
+        )
+        return
+    sink = RunsSink(client, org_id=org_id, emitter_id=default_emitter_id())
+    try:
+        ack = sink.push(external_id, events)
+    except (PushRejected, PushUnavailable) as error:
+        raise _platform_failure(PlatformError(str(error)), "Pipeline push failed") from error
+    _console.print(
+        f"{_CHECK} Pushed pipeline run [bold]{external_id}[/bold] "
+        f"({ack.accepted} of {len(events)} events newly accepted)"
     )
 
 

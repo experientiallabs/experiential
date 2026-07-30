@@ -573,6 +573,80 @@ class PlatformClient:
         self._raise_for_error(finalize)
         return RemoteWorldModel.model_validate(_decode_json(finalize))
 
+    def get_endpoint(self, org_id: str, name: str) -> JsonObject | None:
+        """One endpoint's detail, or ``None`` when the org has no endpoint by that name.
+
+        A 404 is an answer here, not a failure: the push flow asks this question
+        to decide between creating the endpoint and updating it in place.
+        """
+        response = self._client.get(f"/api/orgs/{org_id}/endpoints/{name}")
+        if response.status_code == 404:
+            return None
+        self._raise_for_error(response)
+        decoded = _decode_json(response)
+        if not isinstance(decoded, dict):
+            msg = f"endpoint detail returned a {type(decoded).__name__}, expected an object"
+            raise PlatformError(msg)
+        return decoded
+
+    def create_endpoint(
+        self,
+        org_id: str,
+        name: str,
+        *,
+        world_model_id: str | None = None,
+        model: str | None = None,
+    ) -> JsonObject:
+        """Create one endpoint, optionally tied to a world model.
+
+        Args:
+            org_id: Organization to create under.
+            name: Endpoint slug.
+            world_model_id: Simulation the endpoint links to, or ``None`` for an
+                endpoint whose evidence comes from a real benchmark.
+            model: Pool entry name for the day-one static policy; the platform
+                default serves when omitted. Deployments differ in which models
+                they hold credentials for, so the platform's refusal names the
+                serveable set when this pick (or its default) cannot serve.
+
+        Returns:
+            The created endpoint summary.
+        """
+        body: dict[str, JsonValue] = {"name": name, "world_model_id": world_model_id}
+        if model is not None:
+            body["model"] = model
+        response = self._client.post(f"/api/orgs/{org_id}/endpoints", json=body)
+        self._raise_for_error(response)
+        decoded = _decode_json(response)
+        if not isinstance(decoded, dict):
+            msg = f"endpoint create returned a {type(decoded).__name__}, expected an object"
+            raise PlatformError(msg)
+        return decoded
+
+    def install_endpoint_artifacts(
+        self, org_id: str, name: str, *, policy: JsonObject, report: JsonObject
+    ) -> JsonObject:
+        """Install a measured policy and its improvement report on an endpoint.
+
+        The JSON body twin of :meth:`install_endpoint_policy`, for policies with
+        no evidence bank (static, rank): the pair replaces the endpoint's day-one
+        policy and null report wholesale. A knn policy is two artifacts and must
+        go through the multipart installer instead; the platform refuses it here.
+
+        Returns:
+            The endpoint detail the platform returns.
+        """
+        response = self._client.put(
+            f"/api/orgs/{org_id}/endpoints/{name}/artifacts",
+            json={"policy": policy, "report": report},
+        )
+        self._raise_for_error(response)
+        decoded = _decode_json(response)
+        if not isinstance(decoded, dict):
+            msg = f"artifacts install returned a {type(decoded).__name__}, expected an object"
+            raise PlatformError(msg)
+        return decoded
+
     def install_endpoint_policy(
         self,
         org_id: str,

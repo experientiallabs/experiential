@@ -22,6 +22,8 @@ from wmo.platform.client import (
     WhoAmI,
 )
 from wmo.platform.credentials import ENV_HOME, PlatformCredentials, save_credentials
+from wmo.runs.client import PushAck
+from wmo.runs.schema import pipeline_external_id
 
 if TYPE_CHECKING:
     from wmo.platform.client import PlatformClient
@@ -514,3 +516,162 @@ def test_bare_login_targets_the_hosted_platform(monkeypatch: pytest.MonkeyPatch)
 
     assert result.exit_code == 0, result.output
     assert seen["web_url"] == "https://platform.experientiallabs.ai"
+
+
+def _write_model_dir(root: str, name: str = "demo-model") -> Path:
+    """A minimal local world model: the config file is what makes it one."""
+    model_dir = Path(root) / "models" / name
+    model_dir.mkdir(parents=True)
+    (model_dir / "config.toml").write_text("embed_dim = 64\n", encoding="utf-8")
+    return model_dir
+
+
+_PUSHED = RemoteWorldModel(id="wm-99", name="demo-model", status="ready")
+
+
+class _RecordingPushClient(_StubClient):
+    """Records the push legs; the bundle upload itself is short-circuited."""
+
+    calls: list[tuple[str, object]] = []
+
+    def push_model_bundle(self, *_args: object, **_kwargs: object) -> RemoteWorldModel:
+        type(self).calls.append(("bundle", None))
+        return _PUSHED
+
+    def get_endpoint(self, org_id: str, name: str) -> dict[str, object] | None:
+        del org_id, name
+        return None
+
+    def create_endpoint(self, org_id: str, name: str, **kwargs: object) -> dict[str, object]:
+        del org_id
+        type(self).calls.append(("create", {"name": name, **kwargs}))
+        return {"name": name}
+
+    def install_endpoint_artifacts(
+        self, org_id: str, name: str, *, policy: object, report: object
+    ) -> dict[str, object]:
+        del org_id
+        type(self).calls.append(("artifacts", {"name": name, "policy": policy, "report": report}))
+        return {"name": name, "status": "ready"}
+
+
+def test_push_model_installs_endpoint_artifacts_beside_the_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One push carries the simulation AND the measured endpoint artifacts."""
+    root = str(tmp_path / ".wmo")
+    model_dir = _write_model_dir(root)
+    (model_dir / "policy.json").write_text(
+        '{"kind": "static", "default_model": "m1", "pool": []}', encoding="utf-8"
+    )
+    (model_dir / "report.json").write_text('{"headline": {"accuracy": 1.0}}', encoding="utf-8")
+    _connected()
+    _RecordingPushClient.calls = []
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _RecordingPushClient)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    kinds = [kind for kind, _ in _RecordingPushClient.calls]
+    assert kinds == ["bundle", "create", "artifacts"]
+    _, create = _RecordingPushClient.calls[1]
+    assert create == {"name": "demo-model", "world_model_id": "wm-99", "model": None}
+    _, artifacts = _RecordingPushClient.calls[2]
+    assert isinstance(artifacts, dict)
+    policy = cast("dict[str, object]", artifacts)["policy"]
+    assert isinstance(policy, dict)
+    assert cast("dict[str, object]", policy)["kind"] == "static"
+    # The pipeline leg reports its own absence instead of failing the push.
+    assert "skipping the pipeline leg" in _flatten(result.output)
+
+
+def test_push_model_without_artifacts_still_pushes_the_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bundle-only directory pushes exactly as before, with skip notes."""
+    root = str(tmp_path / ".wmo")
+    _write_model_dir(root)
+    _connected()
+    _RecordingPushClient.calls = []
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _RecordingPushClient)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert [kind for kind, _ in _RecordingPushClient.calls] == ["bundle"]
+    flat = _flatten(result.output)
+    assert "skipping the endpoint leg" in flat
+    assert "skipping the pipeline leg" in flat
+
+
+class _FakeReader:
+    """RunsReader stand-in whose event count is set by the test."""
+
+    count = 0
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def event_count(self, _external_id: str) -> int:
+        return type(self).count
+
+
+class _FakeSink:
+    """RunsSink stand-in recording what was pushed."""
+
+    pushes: list[tuple[str, int]] = []
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def push(self, external_id: str, events: list[object]) -> PushAck:
+        type(self).pushes.append((external_id, len(events)))
+        return PushAck(accepted=len(events), last_seq=len(events))
+
+
+def _pipeline_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    root = str(tmp_path / ".wmo")
+    model_dir = _write_model_dir(root)
+    manifest = model_dir / "optimize" / "optimize-run.json"
+    manifest.parent.mkdir()
+    manifest.write_text("{}", encoding="utf-8")
+    _connected()
+    _RecordingPushClient.calls = []
+    _FakeSink.pushes = []
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _RecordingPushClient)
+    monkeypatch.setattr("wmo.cli.platform_cmds.RunsReader", _FakeReader)
+    monkeypatch.setattr("wmo.cli.platform_cmds.RunsSink", _FakeSink)
+    # The derivation itself is backfill_test.py's contract; here only the
+    # composition is under test.
+    monkeypatch.setattr(
+        "wmo.cli.platform_cmds.optimize_events", lambda *_a, **_k: [object(), object()]
+    )
+    return root
+
+
+def test_push_model_replays_the_pipeline_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The optimize manifest replays into the platform's run history on push."""
+    _FakeReader.count = 0
+    root = _pipeline_fixture(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert _FakeSink.pushes == [(pipeline_external_id("demo-model"), 2)]
+    assert "Pushed pipeline run" in _flatten(result.output)
+
+
+def test_push_model_skips_an_already_recorded_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run the platform already holds is left alone rather than double-counted."""
+    _FakeReader.count = 7
+    root = _pipeline_fixture(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["push", "demo-model", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert _FakeSink.pushes == []
+    assert "already recorded" in _flatten(result.output)
