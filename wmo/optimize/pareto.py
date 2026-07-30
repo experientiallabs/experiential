@@ -217,17 +217,21 @@ def held_out_curve(
     on EVERY scenario has no held-out band; the curve then carries the model points alone
     (over all scenarios) rather than in-sample routed points dressed as measurements.
 
-    A non-knn policy (a pin, a rank) has no dial to replay, but the WORKLOAD's frontier
+    A STATIC policy (a pin) has no dial to replay, but the WORKLOAD's frontier
     exists regardless of what serves it - and a pinned endpoint is exactly the case where
     an operator most wants to see what else was measured. The curve then carries the model
     points over the same held-out band a report describes (the full matrix when the policy
     records no fit split), with `recommended` naming what the product mounts today - the
     policy's own default model - but only while that point honors the curve's own frontier
     rule: a pin whose coverage the rule disqualifies must not be recommended by the very
-    artifact that states the rule (bench-defaults/tau finding 11, 2026-07-29).
+    artifact that states the rule (bench-defaults/tau finding 11, 2026-07-29). A rank
+    policy is deliberately NOT short-circuited: it routes at serve time, so a curve with
+    no routed points and its degenerate-input fallback as `recommended` would misdescribe
+    it - the dial replay refuses rank policies and the report writer says the curve was
+    skipped, the honest status quo.
     """
     held_out = [sid for sid in matrix.scenario_ids() if sid not in set(policy.fit_scenario_ids)]
-    if policy.kind != "knn":
+    if policy.kind == "static":
         curve = pareto_curve(
             matrix,
             judge=judge,

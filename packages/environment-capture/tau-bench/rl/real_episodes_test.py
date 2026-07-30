@@ -306,9 +306,13 @@ def test_a_reasoning_off_candidate_gets_the_arg_that_lets_it_call_tools() -> Non
     # These three refuse function tools on chat completions at any reasoning budget above none
     # (measured, every episode, $0 spent). Reasoning off is the only way they run an episode.
     pins = ProtocolPins()
-    for name in REASONING_OFF_CANDIDATES:
-        entry = _AZURE_AI.model_copy(update={"name": name})
+    for model in REASONING_OFF_CANDIDATES:
+        entry = _AZURE_AI.model_copy(update={"name": model, "model": model})
         assert json.loads(agent_llm_args(entry, pins))["reasoning_effort"] == "none"
+        # The match keys off the runtime MODEL id, so an effort-suffixed arm handle
+        # ("gpt-5.6-sol@low") still gets the argument that lets it run at all.
+        suffixed = entry.model_copy(update={"name": f"{model}@low"})
+        assert json.loads(agent_llm_args(suffixed, pins))["reasoning_effort"] == "none"
     # Every other candidate is untouched: the key is absent, not set to a default.
     assert "reasoning_effort" not in json.loads(agent_llm_args(_AZURE_AI, pins))
 

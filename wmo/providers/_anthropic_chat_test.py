@@ -98,14 +98,19 @@ def test_tools_and_tool_choice_translate() -> None:
     assert payload["tool_choice"] == {"type": "any"}
 
 
-def test_tool_choice_none_drops_the_schemas() -> None:
-    """`none` means the model may not call a tool, so the schemas are not sent at all."""
+def test_tool_choice_none_keeps_schemas_and_maps_the_intent() -> None:
+    """`none` forbids new calls but must NOT drop the schemas.
+
+    The API rejects a transcript carrying tool_use/tool_result blocks when
+    the request declares no tools, so dropping them 400s every mid-loop
+    request with history; the intent rides tool_choice {"type": "none"}.
+    """
     payload = messages_request(
         _request(tool_choice="none"), "claude-fable-5", default_max_tokens=1024
     )
 
-    assert "tools" not in payload
-    assert "tool_choice" not in payload
+    assert payload.get("tools")
+    assert payload.get("tool_choice") == {"type": "none"}
 
 
 def test_named_tool_choice_translates() -> None:
@@ -320,3 +325,44 @@ def test_reasoning_effort_sends_adaptive_thinking_and_effort() -> None:
     assert dialed["output_config"] == {"effort": "high"}
     assert "thinking" not in plain
     assert "output_config" not in plain
+
+
+def test_tool_choice_none_keeps_schemas_and_sends_the_none_intent() -> None:
+    """A transcript with tool_use blocks is rejected by the API unless tools are declared.
+
+    Dropping the schemas on tool_choice="none" therefore 400s every mid-loop
+    request that carries history; the "none" intent must ride tool_choice
+    instead.
+    """
+    request = ChatRequest.model_validate(
+        {
+            "messages": [
+                {"role": "user", "content": "run it"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+                {"role": "user", "content": "now summarize without tools"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "bash", "description": "run", "parameters": {}},
+                }
+            ],
+            "tool_choice": "none",
+        }
+    )
+
+    payload = messages_request(request, "claude-fable-5", default_max_tokens=512)
+
+    assert payload.get("tools"), "schemas must survive tool_choice='none'"
+    assert payload.get("tool_choice") == {"type": "none"}

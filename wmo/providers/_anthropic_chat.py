@@ -8,11 +8,11 @@ branch, which is why this is a second small translator rather than a parameteriz
 PROMPT CACHING is applied here rather than left to the caller. Agent runtimes replay a growing
 conversation prefix every step, so an uncached agent loop pays the full input rate for the whole
 transcript on every turn; on a long SWE-bench episode that is the dominant cost. Anthropic caches
-only what a `cache_control` breakpoint marks, so this places up to two: one closing the stable
-prefix (the tool schemas, or the system prompt when no tools are declared) and one at the end of
-the conversation so the NEXT turn reads this turn's prefix. Writes bill at a premium (1.25x input
-for the 5m TTL) and reads at 0.1x, which is why the breakpoint goes at the end of the prefix
-rather than on every block: one write per turn buys a read of everything before it.
+everything BEFORE a `cache_control` breakpoint, so this places exactly ONE, on the last
+conversation block: it closes the whole prefix (tool schemas and system prompt included), so the
+NEXT turn reads this turn's entire transcript from cache. Writes bill at a premium (1.25x input
+for the 5m TTL) and reads at 0.1x, which is why one breakpoint at the end beats one per block:
+one write per turn buys a read of everything before it.
 """
 
 from __future__ import annotations
@@ -152,8 +152,14 @@ def messages_request(
 
 
 def _tools(request: ChatRequest) -> list[dict[str, object]] | None:
-    """The request's tool schemas in Anthropic shape, or None when tools are not in play."""
-    if not request.tools or request.tool_choice == "none":
+    """The request's tool schemas in Anthropic shape, or None when tools are not in play.
+
+    `tool_choice == "none"` deliberately KEEPS the schemas: an agent transcript
+    carries `tool_use`/`tool_result` blocks, and the Messages API rejects those
+    blocks when the request declares no tools. The "none" intent rides
+    `tool_choice: {"type": "none"}` instead (see `_tool_choice`).
+    """
+    if not request.tools:
         return None
     return [
         {
@@ -167,6 +173,8 @@ def _tools(request: ChatRequest) -> list[dict[str, object]] | None:
 
 def _tool_choice(choice: JsonValue) -> dict[str, object] | None:
     """Anthropic's `tool_choice` for the OpenAI-shaped value, or None to leave it default."""
+    if choice == "none":
+        return {"type": "none"}
     if choice == "required":
         return {"type": "any"}
     if choice == "auto":

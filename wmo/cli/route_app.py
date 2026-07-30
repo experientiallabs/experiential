@@ -1234,12 +1234,13 @@ def pin(
             f"no pool model named '{model}' in {pool_path}; available: {available}"
         )
     out_path = Path(out) if out else model_dir / POLICY_FILENAME
-    if out and out_path.resolve().parent != model_dir.resolve():
-        # The foot-gun that bit both bench-defaults lanes (2026-07-29): a scratch
-        # --out succeeds, prints the same cheerful line, and leaves the model dir -
-        # the path `wmo serve` and GET /config actually read - holding whatever
-        # policy it held before. The pin still lands where asked; the operator is
-        # told serving will not see it.
+    if out and out_path.resolve() != (model_dir / POLICY_FILENAME).resolve():
+        # The foot-gun that bit both bench-defaults lanes (2026-07-29): an --out
+        # anywhere but <model dir>/policy.json succeeds, prints the same cheerful
+        # line, and leaves the file serving actually reads holding whatever policy
+        # it held before (a different FILENAME in the right dir misses identically).
+        # The pin still lands where asked; the operator is told serving will not
+        # see it.
         _console.print(
             f"[yellow]![/yellow] --out is outside {model_dir}; `wmo serve --name "
             f"{model_dir.name}` and GET /config read {model_dir / POLICY_FILENAME}, "

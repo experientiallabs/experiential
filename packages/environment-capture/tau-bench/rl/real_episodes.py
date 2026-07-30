@@ -136,6 +136,9 @@ MAX_ERROR_CHARS = 600
 # comparable to a reasoning-on number, and every report naming these candidates has to say the
 # reasoning budget was off. Not part of the canonical pin set (same standing as temperature), so
 # this does not fork the cohort label.
+# Matched on entry.MODEL (the runtime id), not entry.name: an arm handle may carry an
+# effort suffix ("gpt-5.6-sol@low") and a missed match here kills every episode for that
+# arm with the documented tools-with-reasoning refusal.
 REASONING_OFF_CANDIDATES = frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"})
 
 # A realistic agent-side episode mix, used only to order the pool cheapest-first. Ordering by
@@ -196,7 +199,7 @@ def agent_llm_args(entry: PoolEntry, pins: ProtocolPins) -> str:
         The JSON blob for tau2's `--agent-llm-args`.
     """
     args: JsonObject = {} if pins.max_tokens <= 0 else {"max_tokens": pins.max_tokens}
-    if entry.name in REASONING_OFF_CANDIDATES:
+    if entry.model in REASONING_OFF_CANDIDATES:
         args["reasoning_effort"] = "none"
     return json.dumps(args)
 
@@ -275,7 +278,10 @@ class Tau2RewardInfo(BaseModel):
     info: dict[str, Tau2CheckInfo | None] = {}
 
     def vacuous_components(self) -> list[str]:
-        """The scored components tau2 reported it had nothing to evaluate.
+        """The reported components tau2 said it had nothing to evaluate.
+
+        Iterates every entry of `info` (tau2 reports components beyond the
+        episode's reward_basis); membership in the basis is the caller's cut.
 
         A HEURISTIC over tau2's note wording, matched tightly to the shape of
         its known vacuous notes ("No communicate_info to evaluate", "No
@@ -373,6 +379,11 @@ class RealEpisodeRow(BaseModel):
     cost_usd_pool: float  # authoritative: our pool prices
     cost_usd_tau2_agent: float | None  # litellm's guess, kept for audit
     cost_usd_tau2_user: float | None
+    # BILLED PROVIDER CALLS (assistant messages carrying usage), the program's step unit
+    # since 2026-07-29. Rows written before that date counted tool-calling turns (a ~1.5x
+    # smaller number, 3x on conversational candidates); both bench cohorts were repaired
+    # offline (repair_tau_rows) and no unrepaired pre-change rows.jsonl should be resumed
+    # into a post-change cohort - the loader cannot tell the two units apart.
     steps: int
     call_seconds: list[float]
     replies: list[str]
