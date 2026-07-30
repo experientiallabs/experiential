@@ -23,7 +23,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from wmo.optimize.knn import fit_knn_artifact
+from wmo.optimize.knn import fit_knn_artifact, tune_policy_dial
 from wmo.optimize.outcomes import OutcomeMatrix, split_router_scenarios
 from wmo.optimize.policy import EmbedderSpec, RoutingPolicy
 from wmo.optimize.report import build_report
@@ -154,8 +154,12 @@ def _run_matrix(manifest: Manifest, snapshot: Path, out_dir: Path) -> dict[str, 
         fallback=protocol.fallback,
         built=built,
     )
+    # The REAL dial, through the same function `wmo optimize route tune` uses: it rewrites
+    # the guard/floor/penalty knobs on disk, not just the descriptive field (review finding on
+    # the first cut of this runner: a bare field update reported the balanced policy under a
+    # different dial's label).
+    tune_policy_dial(policy_path, protocol.cost_quality)
     policy = RoutingPolicy.load(policy_path)
-    policy = policy.model_copy(update={"cost_quality": protocol.cost_quality})
 
     reports: dict[str, Path] = {}
     for baseline in protocol.baselines:

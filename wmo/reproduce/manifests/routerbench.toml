@@ -13,6 +13,7 @@ notes = [
 
 [data]
 hf_repo = "experiential-labs/wmo-routerbench-ours9"
+revision = "a216fff0ed11b80e35faf7107601bc41a382c226"
 repo_type = "dataset"
 files = ["matrix.json", "task_embeddings.npy"]
 

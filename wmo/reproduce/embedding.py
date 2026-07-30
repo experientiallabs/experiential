@@ -32,6 +32,14 @@ class CachedTaskEmbedder:
             if outcome.scenario_id not in tasks:
                 tasks[outcome.scenario_id] = outcome.task
                 order.append(outcome.scenario_id)
+        texts = list(tasks.values())
+        if len(set(texts)) != len(texts):
+            duplicates = len(texts) - len(set(texts))
+            raise ValueError(
+                f"{duplicates} scenario(s) share task text with another scenario; a text-keyed "
+                "vector cache cannot tell them apart, so this matrix needs an id-keyed cache "
+                "format before it can be reproduced from recorded vectors"
+            )
         vectors = np.load(cache_path)
         if vectors.ndim != 2 or vectors.shape[0] != len(order):
             raise ValueError(

@@ -17,15 +17,21 @@ because nothing else is in the way: one matrix in, one policy out, one report.
 | 4 | `wmo optimize route report matrix.json policy.json --baseline <anchor>` | `report.json`, held out |
 
 The provenance rules from the [tau-bench walk](tau-bench.md#how-to-read-the-numbers-in-this-walk)
-apply unchanged; the one difference here is that a RouterBench-style matrix holds REAL
-completions at REAL prices, so nothing below is world-model simulated.
+apply with two differences: a RouterBench-style matrix holds REAL completions at REAL
+prices, so nothing below is world-model simulated; and because every row is a single-shot
+completion, the report's cost-per-request IS its cost metric here - the cache-adjusted
+effective-cost-per-completed-task machinery applies to served endpoints and multi-step
+episodes, not to this matrix.
 
 ## Step 1: the matrix
 
-The fitter consumes the same `OutcomeMatrix` JSON the sweep writes: a `pool` (each model
-with its prices) and `outcomes` rows, one per (scenario, model, episode), each carrying the
-task text, the reward, `cost_usd`, and `call_seconds`. A RouterBench-style dump maps onto it
-directly - one row per (prompt, model) with the recorded correctness, cost, and latency.
+The fitter consumes the same `OutcomeMatrix` JSON the sweep writes: a `pool` array (each
+entry at least `name`, `kind`, `model`, plus its prices) and `outcomes` rows, one per
+(scenario, model, episode), each carrying at least `scenario_id`, `task` (the prompt text),
+`model`, `episode`, `reward`, `cost_usd`, and `call_seconds` (a list of per-call wall
+seconds). A RouterBench-style dump maps onto it directly - one row per (prompt, model) with
+the recorded correctness, cost, and latency. The published
+`experiential-labs/wmo-routerbench-ours9` matrix is a complete worked example of the shape.
 
 ## Step 2: fit
 
@@ -37,9 +43,10 @@ uv run wmo optimize route fit matrix.json --kind knn --fallback gpt-5.5 \
 The policy is a guarded nearest-neighbor lookup: the query embeds (the embedder
 auto-resolves; `--embedder hashing` is the offline variant), its neighbors among the FIT
 scenarios vote with their measured per-model rewards, and a non-fallback pick must beat the
-fallback on paired per-neighbor evidence or the fallback serves. `--fallback` pins the model
-the router is never allowed to be worse than; omitted, it defaults to the best single model
-on the fit split. The fit reserves 30% of scenarios for reporting (a deterministic hash
+fallback on paired per-neighbor evidence or the fallback serves. `--fallback` pins the model every request uses unless the paired
+neighbor evidence clears the guard for a substitute - a statistical test on fit-set
+neighbors, not a hard per-request quality bound; omitted, it defaults to the best single
+model on the fit split. The fit reserves 30% of scenarios for reporting (a deterministic hash
 split), and the fit-set accuracy it prints is labeled in-sample for exactly that reason.
 
 ## Step 3 and 4: dial, then report
