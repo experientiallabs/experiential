@@ -1,0 +1,36 @@
+{
+  "benchmark": "DeepSWE 1.1",
+  "tasks": 113,
+  "repositories": 92,
+  "arms": 13,
+  "reward": "graded f2p_passed / f2p_total",
+  "baseline": {
+    "arm": "gpt-5.6-luna__max",
+    "quality": 0.957901255588016,
+    "cost_per_task_usd": 3.002981195747899
+  },
+  "router": {
+    "type": "text-length profile",
+    "bins": [1675.6666666666665, 2608.0],
+    "quality_tolerance": 0.02,
+    "full_fit_models": [
+      "claude-opus-5__low",
+      "gpt-5.6-luna__xhigh",
+      "gpt-5.6-luna__xhigh"
+    ]
+  },
+  "grouped_repo_cv": {
+    "seeds": [11, 23, 37, 41, 59],
+    "fit_fraction_by_repository": 0.7,
+    "report_fraction_by_repository": 0.3,
+    "mean_quality": 0.9318685894162946,
+    "mean_quality_retention_vs_luna_max": 0.9730565710149757,
+    "worst_quality_retention_vs_luna_max": 0.9512929622976906,
+    "mean_cost_per_task_usd": 1.5693219017542017,
+    "mean_cost_savings_vs_luna_max": 0.4788373041784517,
+    "worst_cost_savings_vs_luna_max": 0.30399636049818235,
+    "unscored_scenarios": 0
+  },
+  "compute": "E2B remote sandbox",
+  "data_note": "Replay over the frozen measured DeepSWE matrix; no fresh model calls were needed for fitting."
+}
