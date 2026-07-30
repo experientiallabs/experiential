@@ -1266,11 +1266,14 @@ def test_pool_entry_threads_reasoning_effort_into_the_provider_config() -> None:
 def test_reasoning_effort_validates_at_load_not_first_request() -> None:
     """A bad effort value or a Bedrock effort entry must fail when the pool loads."""
     with pytest.raises(ValidationError, match="reasoning_effort"):
-        PoolEntry(
-            name="sonnet-5@warp",
-            kind=ProviderKind.ANTHROPIC,
-            model="claude-sonnet-5",
-            reasoning_effort="warp",  # type: ignore[arg-type] - the wire shape a TOML can carry
+        # model_validate: the wire shape a TOML actually carries.
+        PoolEntry.model_validate(
+            {
+                "name": "sonnet-5@warp",
+                "kind": "anthropic",
+                "model": "claude-sonnet-5",
+                "reasoning_effort": "warp",
+            }
         )
     with pytest.raises(ValidationError, match="Converse has no effort dial"):
         PoolEntry(
