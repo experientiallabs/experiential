@@ -382,9 +382,15 @@ def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str
         if error.status_code in (401, 403, 404):
             # This platform exposes no harness registry to this credential
             # (the hosted platform serves none at all, and the customer-key
-            # allowlist ends before it); a name cannot collide with what
-            # cannot be read.
+            # allowlist ends before it). The credential could not pull a
+            # harness either way, so the model proceeds - but never silently,
+            # in case a registry this credential cannot see does hold the name.
             harness_names = set()
+            if error.status_code != 404:
+                _console.print(
+                    "harness registry not readable with this credential; "
+                    "assuming the name is not also a harness"
+                )
         else:
             raise
     if name in model_names and name in harness_names:

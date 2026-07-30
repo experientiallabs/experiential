@@ -953,3 +953,6 @@ def test_pull_tolerates_a_platform_with_no_harness_registry(
 
     assert result.exit_code == 0, result.output
     assert (Path(root) / "models" / "hosted-only" / "policy.json").is_file()
+    # An auth-denied registry (as opposed to one the platform does not serve)
+    # is worked around AUDIBLY: the collision assumption is stated.
+    assert "assuming the name is not also a harness" in _flatten(result.output)
