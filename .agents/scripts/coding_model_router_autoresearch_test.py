@@ -106,3 +106,29 @@ def test_calibrated_irt_probability_matches_arm_mean_and_peaks_uplift_midrange()
     assert int(np.argmax(uplift)) not in (0, len(uplift) - 1)
     assert uplift[len(uplift) // 2] > uplift[0]
     assert uplift[len(uplift) // 2] > uplift[-1]
+
+
+def test_shuffled_control_preserves_source_outcomes_but_breaks_pairing() -> None:
+    module = _module()
+    spec = module.CandidateSpec(
+        "shuffle",
+        "word",
+        8,
+        "ridge-uplift",
+        label_mode="shuffled",
+    )
+    weak = np.asarray([0.0, 0.2, 0.4, 0.6, 0.1, 0.3, 0.5, 0.7])
+    strong = np.asarray([0.9, 0.7, 0.5, 0.3, 1.0, 0.8, 0.6, 0.4])
+    sources = ["a"] * 4 + ["b"] * 4
+    shuffled_weak, shuffled_strong = module._training_outcomes(
+        spec,
+        weak,
+        strong,
+        sources,
+        seed=43,
+    )
+    for indices in (slice(0, 4), slice(4, 8)):
+        assert sorted(shuffled_weak[indices]) == sorted(weak[indices])
+        assert sorted(shuffled_strong[indices]) == sorted(strong[indices])
+    assert not np.array_equal(shuffled_weak, weak)
+    assert not np.array_equal(shuffled_strong, strong)

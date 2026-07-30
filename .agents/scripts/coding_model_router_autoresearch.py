@@ -146,6 +146,7 @@ class CandidateSpec:
     estimator: Literal["ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"]
     alpha: float = 1.0
     min_leaf: int = 10
+    label_mode: Literal["observed", "shuffled", "task-blind"] = "observed"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,8 +201,9 @@ def _canonical_group(value: str) -> str:
 def _empirical_bayes_rate(successes: float, attempts: int, global_mean: float) -> float:
     """Shrink a repeated success rate toward its source-wide mean."""
     prior_strength = 4.0
-    alpha = max(np.finfo(np.float64).eps, prior_strength * global_mean)
-    beta = max(np.finfo(np.float64).eps, prior_strength * (1.0 - global_mean))
+    epsilon = float(np.finfo(np.float64).eps)
+    alpha = max(epsilon, prior_strength * global_mean)
+    beta = max(epsilon, prior_strength * (1.0 - global_mean))
     return (successes + alpha) / (attempts + alpha + beta)
 
 
@@ -473,6 +475,21 @@ def _combine(sources: list[SourceData]) -> CombinedData:
 
 def _candidate_space() -> list[CandidateSpec]:
     return [
+        CandidateSpec(
+            "task-blind-uplift",
+            "word",
+            1,
+            "ridge-uplift",
+            label_mode="task-blind",
+        ),
+        CandidateSpec(
+            "word128-ridge-uplift-shuffled-a10",
+            "word",
+            128,
+            "ridge-uplift",
+            alpha=10.0,
+            label_mode="shuffled",
+        ),
         CandidateSpec("word64-ridge-uplift-a1", "word", 64, "ridge-uplift", alpha=1.0),
         CandidateSpec("word128-ridge-uplift-a10", "word", 128, "ridge-uplift", alpha=10.0),
         CandidateSpec("char128-ridge-uplift-a10", "char", 128, "ridge-uplift", alpha=10.0),
@@ -483,6 +500,32 @@ def _candidate_space() -> list[CandidateSpec]:
         CandidateSpec("word128-hist-heads-l10", "word", 128, "hist-heads", min_leaf=10),
         CandidateSpec("word128-hist-heads-l30", "word", 128, "hist-heads", min_leaf=30),
     ]
+
+
+def _is_control(spec: CandidateSpec) -> bool:
+    return spec.label_mode != "observed"
+
+
+def _training_outcomes(
+    spec: CandidateSpec,
+    weak: np.ndarray,
+    strong: np.ndarray,
+    source_names: list[str],
+    *,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if spec.label_mode != "shuffled":
+        return weak, strong
+    rng = np.random.default_rng(seed)
+    shuffled_weak = weak.copy()
+    shuffled_strong = strong.copy()
+    source_array = np.asarray(source_names, dtype=object)
+    for source in sorted(set(source_names)):
+        indices = np.flatnonzero(source_array == source)
+        permutation = rng.permutation(indices)
+        shuffled_weak[indices] = weak[permutation]
+        shuffled_strong[indices] = strong[permutation]
+    return shuffled_weak, shuffled_strong
 
 
 def _features(spec: CandidateSpec) -> Pipeline:
@@ -669,6 +712,44 @@ def _source_metrics(
     return result
 
 
+def _leave_source_out_metrics(
+    spec: CandidateSpec,
+    combined: CombinedData,
+) -> dict[str, dict[str, float]]:
+    """Measure whether one source's text-to-uplift relation transfers to unseen corpora."""
+    source_array = np.asarray(combined.source_names, dtype=object)
+    result: dict[str, dict[str, float]] = {}
+    for source in sorted(set(combined.source_names)):
+        heldout = np.flatnonzero(source_array == source)
+        train = np.flatnonzero(source_array != source)
+        transformer = _features(spec)
+        train_features = np.asarray(
+            transformer.fit_transform([combined.texts[index] for index in train]),
+            dtype=np.float64,
+        )
+        heldout_features = np.asarray(
+            transformer.transform([combined.texts[index] for index in heldout]),
+            dtype=np.float64,
+        )
+        estimators = _fit_estimators(
+            spec,
+            train_features,
+            combined.weak[train],
+            combined.strong[train],
+            combined.sample_weight[train],
+        )
+        scores = _predict_score(spec, estimators, heldout_features)
+        uplift = (combined.strong - combined.weak)[heldout]
+        result[source] = {
+            "tasks": int(len(heldout)),
+            "uplift_spearman": _spearman(scores, uplift),
+            "score_mean": float(scores.mean()),
+            "score_std": float(scores.std()),
+        }
+        logger.info("candidate=%s leave-source-out=%s complete", spec.name, source)
+    return result
+
+
 def _spearman(left: np.ndarray, right: np.ndarray) -> float:
     if len(left) < 2 or np.all(left == left[0]) or np.all(right == right[0]):
         return 0.0
@@ -709,6 +790,9 @@ def _fit(args: argparse.Namespace) -> None:
                 for source in sources
             ],
             "deduplicated_tasks": len(combined.task_ids),
+            "deduplicated_tasks_by_source": dict(
+                sorted(collections.Counter(combined.source_names).items())
+            ),
             "deduplicated_groups": len(set(combined.groups)),
             "deep_swe_labels_read": False,
         },
@@ -723,6 +807,15 @@ def _fit(args: argparse.Namespace) -> None:
     for spec in _candidate_space():
         oof = np.empty(len(combined.task_ids), dtype=np.float64)
         for fold_index, (train, heldout) in enumerate(folds):
+            if spec.label_mode == "task-blind":
+                oof[heldout] = float(
+                    np.average(
+                        (combined.strong - combined.weak)[train],
+                        weights=combined.sample_weight[train],
+                    )
+                )
+                logger.info("candidate=%s fold=%d/%d complete", spec.name, fold_index + 1, FOLDS)
+                continue
             transformer = _features(spec)
             train_features = np.asarray(
                 transformer.fit_transform([combined.texts[index] for index in train]),
@@ -732,11 +825,18 @@ def _fit(args: argparse.Namespace) -> None:
                 transformer.transform([combined.texts[index] for index in heldout]),
                 dtype=np.float64,
             )
+            train_weak, train_strong = _training_outcomes(
+                spec,
+                combined.weak[train],
+                combined.strong[train],
+                [combined.source_names[index] for index in train],
+                seed=10_000 + fold_index,
+            )
             estimators = _fit_estimators(
                 spec,
                 train_features,
-                combined.weak[train],
-                combined.strong[train],
+                train_weak,
+                train_strong,
                 combined.sample_weight[train],
             )
             oof[heldout] = _predict_score(spec, estimators, heldout_features)
@@ -767,11 +867,16 @@ def _fit(args: argparse.Namespace) -> None:
             ),
             "operating_points": operating_points,
             "primary_source_metrics": source_metrics,
+            "is_control": _is_control(spec),
             "deep_swe_labels_read": False,
         }
+        if spec.name in {"word128-ridge-uplift-a10", "word128-ridge-heads-a1"}:
+            row["leave_source_out_metrics"] = _leave_source_out_metrics(spec, combined)
         leaderboard.append(row)
         _append_jsonl(output / "trials.jsonl", row)
 
+        if _is_control(spec):
+            continue
         transformer = _features(spec)
         full_features = np.asarray(transformer.fit_transform(combined.texts), dtype=np.float64)
         estimators = _fit_estimators(
@@ -793,6 +898,7 @@ def _fit(args: argparse.Namespace) -> None:
         )
     leaderboard.sort(
         key=lambda row: (
+            bool(row["is_control"]),
             cast(dict[str, dict[str, float]], row["operating_points"])["0.95"][
                 "strong_traffic"
             ],
@@ -811,6 +917,11 @@ def _fit(args: argparse.Namespace) -> None:
                 "target_outcomes_used": False,
                 "target_embeddings_used": False,
                 "swebench_effort_pair": [SWEBENCH_WEAK_ARM, SWEBENCH_STRONG_ARM],
+                "negative_controls": ["task-blind-uplift", "within-source-shuffled-labels"],
+                "leave_source_out_candidates": [
+                    "word128-ridge-uplift-a10",
+                    "word128-ridge-heads-a1",
+                ],
                 "selection": "minimum_source_balanced_strong_traffic_then_uplift_spearman",
             },
             "leaderboard": leaderboard,
@@ -894,6 +1005,10 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
         ),
         alpha=_as_float(raw_spec.get("alpha", 1.0)),
         min_leaf=int(_as_float(raw_spec.get("min_leaf", 10))),
+        label_mode=cast(
+            Literal["observed", "shuffled", "task-blind"],
+            str(raw_spec.get("label_mode", "observed")),
+        ),
     )
     transformer = cast(Pipeline, fitted["transformer"])
     features = np.asarray(transformer.transform(texts), dtype=np.float64)
@@ -993,6 +1108,8 @@ def _evaluate(args: argparse.Namespace) -> None:
     rows: list[dict[str, object]] = []
     for untyped in cast(list[dict[str, object]], frozen_object["leaderboard"]):
         candidate = cast(dict[str, object], untyped["candidate"])
+        if str(candidate.get("label_mode", "observed")) != "observed":
+            continue
         name = str(candidate["name"])
         scores = _candidate_score(output / f"{name}.joblib", target.texts)
         operating_points = cast(dict[str, dict[str, float]], untyped["operating_points"])
