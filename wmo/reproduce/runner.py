@@ -135,27 +135,41 @@ def _run_matrix(manifest: Manifest, snapshot: Path, out_dir: Path) -> dict[str, 
     if protocol.embedding_cache_file is not None:
         built = CachedTaskEmbedder(matrix, snapshot / protocol.embedding_cache_file)
 
-    spec = EmbedderSpec(
-        kind=protocol.embedder_kind,
-        dim=protocol.embedder_dim,
-        deployment=protocol.embedder_deployment,
-        endpoint=protocol.embedder_endpoint,
-    )
-    # The same deterministic 70/30 scenario split the CLI fit computes, so the manifest
-    # reproduces the shipped protocol rather than a private variant of it.
-    split = split_router_scenarios(matrix.scenario_ids())
     policy_path = out_dir / "policy.json"
-    fit_knn_artifact(
-        matrix,
-        out_path=policy_path,
-        matrix_source=str(matrix_path),
-        embedder=spec,
-        fit_ids=list(split.fit_ids),
-        fallback=protocol.fallback,
-        built=built,
-    )
-    policy = RoutingPolicy.load(policy_path)
-    policy = policy.model_copy(update={"cost_quality": protocol.cost_quality})
+    if protocol.pin_model is not None:
+        # The bench-defaults protocol: a static pin (what `wmo optimize route
+        # pin` writes) instead of a kNN fit. A pin routes nothing, so the
+        # replay needs no embedder and no cache; it is arithmetic over the
+        # matrix, which is why these manifests can honestly claim bit-exact.
+        pin = RoutingPolicy(
+            kind="static",
+            default_model=protocol.pin_model,
+            pool=list(matrix.pool),
+            fitted_from=f"pinned to {protocol.pin_model} from the published matrix (reproduction)",
+        )
+        pin.save(policy_path)
+        policy = pin
+    else:
+        spec = EmbedderSpec(
+            kind=protocol.embedder_kind,
+            dim=protocol.embedder_dim,
+            deployment=protocol.embedder_deployment,
+            endpoint=protocol.embedder_endpoint,
+        )
+        # The same deterministic 70/30 scenario split the CLI fit computes, so the manifest
+        # reproduces the shipped protocol rather than a private variant of it.
+        split = split_router_scenarios(matrix.scenario_ids())
+        fit_knn_artifact(
+            matrix,
+            out_path=policy_path,
+            matrix_source=str(matrix_path),
+            embedder=spec,
+            fit_ids=list(split.fit_ids),
+            fallback=protocol.fallback,
+            built=built,
+        )
+        policy = RoutingPolicy.load(policy_path)
+        policy = policy.model_copy(update={"cost_quality": protocol.cost_quality})
 
     reports: dict[str, Path] = {}
     for baseline in protocol.baselines:

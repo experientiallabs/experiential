@@ -116,3 +116,17 @@ The product outcome: the platform's `terminal-bench-2` default serves pinned son
 this table installed as its evidence, and the quality claim ships as "+2.5 pt, unresolved
 at n=20" - never "beats the anchor" - because a 20-scenario paired CI cannot resolve
 single-digit differences in either direction.
+
+### Reproduce it
+
+One command, offline, credential-free — the shipped default is a static pin, so the replay
+is arithmetic over the published outcome matrix:
+
+```bash
+uv run wmo reproduce run terminal-bench-2
+```
+
+Downloads the pinned matrix from
+[`experiential-labs/wmo-terminal-bench-2`](https://huggingface.co/datasets/experiential-labs/wmo-terminal-bench-2)
+(revision pinned in the manifest), replays the pin + report protocol, and says REPRODUCED
+or DIVERGED against the table above at bit-exactness.

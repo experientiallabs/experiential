@@ -30,7 +30,13 @@ class DataSource(BaseModel):
 
 
 class MatrixProtocol(BaseModel):
-    """The `matrix` kind: fit + tune + report on a downloaded outcome matrix, offline."""
+    """The `matrix` kind: fit + tune + report on a downloaded outcome matrix, offline.
+
+    With `pin_model` set, the protocol is the bench-defaults one: a static
+    policy pinned to that pool entry (what `wmo optimize route pin` writes)
+    instead of a kNN fit. A pin routes nothing, so no embedding identity or
+    cache is needed at all - the replay is arithmetic over the matrix.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -43,6 +49,8 @@ class MatrixProtocol(BaseModel):
     embedder_deployment: str | None = None
     embedder_endpoint: str | None = None
     fallback: str | None = None
+    # Pool entry every request goes to; replaces the kNN fit with a static pin.
+    pin_model: str | None = None
     cost_quality: float = 0.25
     baselines: list[str] = Field(min_length=1)
 

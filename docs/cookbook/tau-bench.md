@@ -638,3 +638,23 @@ published row within stated tolerances. This is the PROTOCOL-exact reproduction:
 real money (estimated ~$110; the command states it and refuses without `--yes`), providers
 are nondeterministic, and public prices drift - which is exactly what the tolerances in the
 shipped manifest encode. `wmo reproduce list` shows both reproduction classes.
+
+## The real-episode leg, reproduced free
+
+The walk above measures inside the world model. The product's `tau-bench` default was
+re-measured on Sierra's actual benchmark - 594 real tau2 episodes, 15 candidates, tau2's
+own reward - and ships as a pinned sonnet-5 at 63.8% savings against the fable-5 anchor
+(quality −2.0pt, unresolved at n=19 paired scenarios). The measured winner on that matrix
+is glm-5.2 at −88%, unserveable until it has an authoritative price; the published matrix
+carries both, so the reproduction shows the gap. That leg is bit-exact and free to replay:
+
+```bash
+uv run wmo reproduce run tau-bench-real
+```
+
+Offline and credential-free (a static pin routes nothing, so the replay is arithmetic over
+the matrix published at
+[`experiential-labs/wmo-tau-bench-real`](https://huggingface.co/datasets/experiential-labs/wmo-tau-bench-real)).
+The two tau manifests are deliberately separate: `tau-bench` reproduces the world-model
+protocol against live providers; `tau-bench-real` reproduces the real-benchmark numbers
+from recorded evidence. Their provenances differ and their numbers are never blended.

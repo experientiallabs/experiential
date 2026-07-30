@@ -1,0 +1,30 @@
+name = "terminal-bench-2"
+title = "Terminal-Bench 2.0: the pinned sonnet-5 default, measured on 640 real episodes"
+cookbook = "docs/cookbook/terminal-tasks.md"
+exactness = "bit-exact"
+kind = "matrix"
+
+notes = [
+  "640 real harbor terminus-2 episodes: 20 pinned Terminal-Bench 2.0 registry tasks x 16 candidates x 2 episodes, each graded by its task's own pytest suite (no LLM judge). Zero unscored cells.",
+  "Offline and credential-free: the shipped default is a static pin, so the replay is arithmetic over the published matrix.",
+  "The only bench-defaults benchmark where the pin's quality point estimate is ABOVE the anchor (+2.5pt) - still UNRESOLVED at n=20 (CI -15..+20, p=1.00); the resolved claim is the cost saving.",
+  "Read together with the simulated terminal-tasks leg in the same cookbook page: same constant policy, aggregate agreement only (per-scenario sim-to-real rho=-0.162), numbers never blended.",
+]
+
+[data]
+hf_repo = "experiential-labs/wmo-terminal-bench-2"
+repo_type = "dataset"
+revision = "dfd17bc1f51c008242a04247ef8d3d08ffefe501"
+files = ["matrix.json"]
+
+[matrix]
+matrix_file = "matrix.json"
+pin_model = "sonnet-5"
+baselines = ["fable-5"]
+
+[[published]]
+label = "pinned sonnet-5 (the shipped terminal default) vs anchor (fable-5)"
+baseline = "fable-5"
+accuracy = 0.8
+cost_per_run_usd = 0.9461717025
+latency_p50_ms = 6142.0698165893555
