@@ -926,3 +926,30 @@ def test_pull_removes_a_stale_report_when_the_endpoint_has_none(
     assert result.exit_code == 0, result.output
     assert not stale.exists()
     assert "stale report.json" in _flatten(result.output)
+
+
+def test_pull_tolerates_a_platform_with_no_harness_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hosted platform serves no harness routes; detection must not die there."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+
+    class _NoHarnessRegistryClient(_PullStateClient):
+        def list_harnesses(self, _org_id: str) -> list[RemoteHarness]:
+            raise PlatformError("Unauthorized", status_code=401)
+
+    _NoHarnessRegistryClient.model_names = ()
+    _NoHarnessRegistryClient.endpoint_names = ("hosted-only",)
+    _NoHarnessRegistryClient.policy_payload = {
+        "policy": {"kind": "static", "default_model": "m1", "pool": []},
+        "report": None,
+        "bank": None,
+    }
+    _NoHarnessRegistryClient.bank_bytes = None
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _NoHarnessRegistryClient)
+
+    result = runner.invoke(app, ["pull", "hosted-only", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert (Path(root) / "models" / "hosted-only" / "policy.json").is_file()

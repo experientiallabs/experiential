@@ -372,8 +372,21 @@ def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str
     evidence is a real benchmark) is still pullable: its measured artifacts
     are the whole point of fetching current state.
     """
+    # The model list goes first ON PURPOSE: a dead credential fails here with
+    # the platform's own sentence, so the tolerant harness probe below never
+    # masks a real auth problem.
     model_names = {model.name for model in client.list_world_models(org_id)}
-    harness_names = {harness.name for harness in client.list_harnesses(org_id)}
+    try:
+        harness_names = {harness.name for harness in client.list_harnesses(org_id)}
+    except PlatformError as error:
+        if error.status_code in (401, 403, 404):
+            # This platform exposes no harness registry to this credential
+            # (the hosted platform serves none at all, and the customer-key
+            # allowlist ends before it); a name cannot collide with what
+            # cannot be read.
+            harness_names = set()
+        else:
+            raise
     if name in model_names and name in harness_names:
         raise typer.BadParameter("both a model and a harness have this name remotely; pass --kind")
     if name in model_names:
