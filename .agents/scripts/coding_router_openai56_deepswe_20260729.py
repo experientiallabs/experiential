@@ -31,6 +31,7 @@ from coding_router_deepswe_20260729 import (  # noqa: E402
 LOGGER = logging.getLogger("coding-router-openai56-deepswe-20260729")
 PREFIX = "coding-router-small-agent-20260729-openai56"
 PRICE = {
+    "gpt-5.5": (5.0, 30.0, 0.5),
     "gpt-5.6-sol": (5.0, 30.0, 0.5),
     "gpt-5.6-terra": (2.5, 15.0, 0.25),
     "gpt-5.6-luna": (1.0, 6.0, 0.1),

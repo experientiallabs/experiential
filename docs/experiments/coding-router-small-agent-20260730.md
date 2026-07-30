@@ -6,9 +6,9 @@ Status: candidate only. The offline frontier clears the aggregate target, but fr
 
 The current candidate is a static reasoning-effort route:
 
-- primary: `gpt-5.6-sol` with OpenAI Responses `reasoning.effort=high`
-- fallback: `claude-opus-5`
-- reference baseline: `claude-opus-5` at the provider's high-effort operating point
+- primary: `gpt-5.6-sol` with OpenAI Responses `reasoning.effort=xhigh`
+- fallback: `gpt-5.5` with OpenAI Responses `reasoning.effort=xhigh`
+- reference baseline: `gpt-5.5` at xhigh effort, matching the existing router baseline
 - serving artifact: `.agents/policies/coding_router_small_agent_20260730.json`
 - isolated source commit: `a734885b6a27224218ee73f1886ee44bb0ea697`
 
@@ -31,12 +31,12 @@ The report uses 113 DeepSWE tasks, task-level means, and five deterministic 70/3
 
 | Arm | Mean quality | Mean cost per task |
 | --- | ---: | ---: |
-| Claude Opus 5 high reference | 0.7286 | $6.088 |
-| GPT-5.6 Sol high candidate | 0.6932 | $3.467 |
+| GPT-5.5 xhigh reference | 0.6704 | $7.226 |
+| GPT-5.6 Sol xhigh candidate | 0.7080 | $4.708 |
 
-The candidate retains 95.14% of reference quality and saves 43.05% on the full ledger. Across the five held-out splits, mean quality retention is 97.62% and mean cost savings are 38.20%. The weakest held-out quality ratio is 90.98%, so the candidate is not promoted under a requirement that every split independently retain 95% quality. The paired task-level quality-delta bootstrap 95% interval is -0.114 to 0.041, which also warrants fresh validation.
+The candidate retains 105.61% of reference quality and saves 34.85% on the full ledger. Across the five held-out splits, mean quality retention is 102.40% and mean cost savings are 31.92%. The weakest held-out quality ratio is 98.98%, and the weakest held-out savings is 29.94%. The paired task-level quality-delta bootstrap 95% interval is -0.018 to 0.093, so fresh validation is still required.
 
-The more expensive Sol xhigh and max settings do not preserve the required cost band. This is the main observed gain from tuning reasoning effort.
+The more expensive Sol max setting does not preserve the required cost band. This xhigh operating point is the main observed gain from tuning reasoning effort against the existing GPT-5.5 xhigh baseline.
 
 ## Transfer dataset
 
@@ -44,6 +44,6 @@ The router was also trained on 1,960 rows from `nvidia/Open-SWE-Traces`, config 
 
 ## Fresh execution status
 
-Fresh WMO official-verifier probes use unique experiment artifacts and the OpenAI and Anthropic credentials from the repo environment file without persisting secret values. GPT-5.6 Sol high returned zero whole-task rewards in all completed fresh probes. The 60-turn probe reached 91.76% partial score, while the 120-turn probe reached 89.56% partial score, with no infrastructure error. This indicates the current Pi harness reaches substantial partial progress but does not cross the explicit submit boundary. The matched Opus 5 probe stalled before producing a verifier artifact and its experiment-owned tmux process was stopped with its raw metadata preserved.
+Fresh WMO official-verifier probes use unique experiment artifacts and the OpenAI and Anthropic credentials from the repo environment file without persisting secret values. Earlier GPT-5.6 Sol high probes returned zero whole-task rewards and strong partial scores, showing that the current Pi harness does not reliably cross the explicit submit boundary. The matched Sol xhigh and GPT-5.5 xhigh cells both stalled during E2B startup before producing verifier artifacts; their experiment-owned tmux processes were stopped with raw metadata preserved. The xhigh frontier is therefore promoted as an offline benchmark candidate only, pending a verifier-compatible rerun.
 
 Promotion requires fresh matched verifier results, quality retention of at least 95%, and cost savings of at least 30%. Until then this document records a tuned candidate, not a completed router result.
