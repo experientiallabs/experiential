@@ -362,7 +362,16 @@ def _nothing_local(name: str, root: str, *, kind: str | None) -> str:
     return f"no local {label} named {name!r} under {root} ({found}); {hint}, or pass --root <dir>"
 
 
-def _detect_remote_kind(client: PlatformClient, org_id: str, name: str) -> str:
+def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str:
+    """What a pull by this name reaches: model, harness, or endpoint-only.
+
+    The endpoint probe runs only after the model and harness reads both come
+    up empty, so a genuine model/harness ambiguity still refuses with the
+    pass-`--kind` message instead of silently selecting a same-named endpoint.
+    An endpoint with no same-named simulation (platform-created, or its
+    evidence is a real benchmark) is still pullable: its measured artifacts
+    are the whole point of fetching current state.
+    """
     model_names = {model.name for model in client.list_world_models(org_id)}
     harness_names = {harness.name for harness in client.list_harnesses(org_id)}
     if name in model_names and name in harness_names:
@@ -371,24 +380,11 @@ def _detect_remote_kind(client: PlatformClient, org_id: str, name: str) -> str:
         return "model"
     if name in harness_names:
         return "harness"
-    raise typer.BadParameter(f"the organization has no world model or harness named {name!r}")
-
-
-def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str:
-    """`_detect_remote_kind` plus the endpoint-only fallback for pulls.
-
-    An endpoint with no same-named simulation (platform-created, or its
-    evidence is a real benchmark) is still pullable: its measured artifacts
-    are the whole point of fetching current state.
-    """
-    try:
-        return _detect_remote_kind(client, org_id, name)
-    except typer.BadParameter:
-        if client.get_endpoint(org_id, name) is not None:
-            return "endpoint"
-        raise typer.BadParameter(
-            f"the organization has no world model, endpoint, or harness named {name!r}"
-        ) from None
+    if client.get_endpoint(org_id, name) is not None:
+        return "endpoint"
+    raise typer.BadParameter(
+        f"the organization has no world model, endpoint, or harness named {name!r}"
+    )
 
 
 def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
@@ -591,9 +587,15 @@ def _pull_endpoint_artifacts(
     )
     wrote = ["policy.json"]
     report = payload.get("report")
+    report_path = dest_dir / "report.json"
     if report is not None:
-        (dest_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         wrote.append("report.json")
+    elif report_path.is_file():
+        # Same rule as the bank below: a reportless current endpoint must not
+        # keep an as-pushed or earlier-pull report reading as current evidence.
+        report_path.unlink()
+        _console.print("removed a stale report.json from an earlier state")
     bank_path = dest_dir / "policy.json.bank.npz"
     if isinstance(payload.get("bank"), dict):
         wrote.append("policy.json.bank.npz")

@@ -19,6 +19,7 @@ from wmo.platform.client import (
     HarnessVersionDoc,
     PlatformError,
     PlatformUnreachable,
+    RemoteHarness,
     RemoteWorldModel,
     WhoAmI,
 )
@@ -754,7 +755,7 @@ class _PullStateClient(_StubClient):
             for name in type(self).model_names
         ]
 
-    def list_harnesses(self, _org_id: str) -> list[object]:
+    def list_harnesses(self, _org_id: str) -> list[RemoteHarness]:
         return []
 
     def get_endpoint(self, _org_id: str, name: str) -> dict[str, object] | None:
@@ -798,6 +799,7 @@ def test_pull_model_overwrites_artifacts_with_the_endpoint_current_state(
         (model_dir / "policy.json").write_text(
             '{"kind": "static", "default_model": "as-pushed"}', encoding="utf-8"
         )
+
     monkeypatch.setattr("wmo.cli.platform_cmds._pull_model", fake_pull_model)
 
     result = runner.invoke(app, ["pull", "demo-model", "--root", root])
@@ -877,3 +879,50 @@ def test_pull_names_endpoints_in_the_nothing_found_error(
 
     _assert_clean_failure(result)
     assert "no world model, endpoint, or harness" in _flatten(result.output)
+
+
+def test_pull_still_refuses_a_model_harness_ambiguity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A same-named endpoint must not swallow the deliberate ambiguity refusal."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+
+    class _AmbiguousClient(_PullStateClient):
+        def list_harnesses(self, _org_id: str) -> list[RemoteHarness]:
+            return [RemoteHarness(id="h-1", name="demo-model", latest_version=1)]
+
+    _AmbiguousClient.model_names = ("demo-model",)
+    _AmbiguousClient.endpoint_names = ("demo-model",)
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _AmbiguousClient)
+
+    result = runner.invoke(app, ["pull", "demo-model", "--root", root])
+
+    _assert_clean_failure(result)
+    assert "pass --kind" in _flatten(result.output)
+
+
+def test_pull_removes_a_stale_report_when_the_endpoint_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reportless current endpoint must not keep old evidence reading as current."""
+    root = str(tmp_path / ".wmo")
+    _connected()
+    _PullStateClient.model_names = ()
+    _PullStateClient.endpoint_names = ("hosted-only",)
+    _PullStateClient.policy_payload = {
+        "policy": {"kind": "static", "default_model": "m1", "pool": []},
+        "report": None,
+        "bank": None,
+    }
+    _PullStateClient.bank_bytes = None
+    monkeypatch.setattr("wmo.cli.platform_cmds.PlatformClient", _PullStateClient)
+    stale = Path(root) / "models" / "hosted-only" / "report.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"headline": {"accuracy": 0.99}}', encoding="utf-8")
+
+    result = runner.invoke(app, ["pull", "hosted-only", "--root", root])
+
+    assert result.exit_code == 0, result.output
+    assert not stale.exists()
+    assert "stale report.json" in _flatten(result.output)

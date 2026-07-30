@@ -721,7 +721,15 @@ class PlatformClient:
             return None
         self._raise_for_error(response)
         payload = _decode_json(response)
+        if not isinstance(payload.get("policy"), dict):
+            msg = f"policy download for {name} returned no policy object"
+            raise PlatformError(msg)
         bank = payload.get("bank")
+        if bank is not None and not (
+            isinstance(bank, dict) and isinstance(bank.get("url"), str) and "sha256" in bank
+        ):
+            msg = f"policy download for {name} returned an unusable bank reference"
+            raise PlatformError(msg)
         if bank_dest is not None and isinstance(bank, dict):
             declared = str(bank["sha256"])
             digest = hashlib.sha256()
