@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import os
 import threading
+from bisect import bisect_right
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -379,7 +380,7 @@ class RoutingPolicy(BaseModel):
     """The persisted policy artifact (see module docstring)."""
 
     version: int = POLICY_VERSION
-    kind: Literal["static", "rank", "knn"]
+    kind: Literal["static", "rank", "knn", "profile"]
     default_model: str  # the static answer; also the fallback for degenerate rank inputs
     pool: list[PoolEntry]  # snapshot of the roster this policy was defined over
     embedder: EmbedderSpec = Field(default_factory=EmbedderSpec)
@@ -437,6 +438,12 @@ class RoutingPolicy(BaseModel):
     # A policy that routes may only serve the config it was fitted under: see
     # `_check_compression`.
     fit_compression: CompressionConfig | None = None
+
+    # Profile policies route on a cheap deterministic task feature. The initial implementation
+    # uses raw task-text length and persists the learned boundaries plus one pool arm per bin.
+    profile_feature: Literal["text_length"] = "text_length"
+    profile_bins: list[float] = Field(default_factory=list)
+    profile_models: list[str] = Field(default_factory=list)
 
     # kNN policies only (see module docstring and `wmo.optimize.knn`). The fitter records the
     # bank it actually wrote (`knn_bank_path_for(<policy path>)`), so serving resolves the
@@ -548,6 +555,22 @@ class RoutingPolicy(BaseModel):
                         f"cluster {cluster.cluster_id} centroid has dim "
                         f"{len(cluster.centroid)}, embedder dim is {self.embedder.dim}"
                     )
+        if self.kind == "profile":
+            if len(self.profile_models) != len(self.profile_bins) + 1:
+                raise ValueError(
+                    "a profile policy needs exactly one profile model per text-length bin"
+                )
+            if any(
+                left >= right
+                for left, right in zip(self.profile_bins, self.profile_bins[1:], strict=False)
+            ):
+                raise ValueError("profile_bins must be strictly increasing")
+            unknown = sorted(set(self.profile_models) - names)
+            if unknown:
+                raise ValueError(
+                    f"profile routes to {unknown}, not in the policy pool "
+                    f"(available: {sorted(names)})"
+                )
         return self
 
     def _check_compression(self) -> None:
@@ -733,6 +756,8 @@ def select_model(
         return RoutingDecision(model=incumbent, reason="sticky: conversation affinity")
     if policy.kind == "static":
         return RoutingDecision(model=policy.default_model, reason="static policy")
+    if policy.kind == "profile":
+        return profile_decision(policy, text)
 
     query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
     if policy.kind == "knn":
@@ -751,6 +776,20 @@ def select_model(
     norm = float(np.linalg.norm(query))
     decision.attach_query_embedding(query / norm if norm > 0.0 else query)
     return decision
+
+
+def profile_decision(policy: RoutingPolicy, text: str) -> RoutingDecision:
+    """Select the persisted arm for the request's text-length profile bin."""
+    if policy.kind != "profile":
+        raise ValueError(f"profile_decision needs a profile policy, got kind='{policy.kind}'")
+    bucket = bisect_right(policy.profile_bins, float(len(text)))
+    model = policy.profile_models[bucket]
+    return RoutingDecision(
+        model=model,
+        reason=(
+            f"profile router: text length {len(text)} in bin {bucket}, serving {model}"
+        ),
+    )
 
 
 def rank_decision(policy: RoutingPolicy, query: np.ndarray) -> RoutingDecision:

@@ -6,6 +6,7 @@ import pytest
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import ClusterRanking, EmbedderSpec, RoutingPolicy
+from wmo.optimize.profile import fit_profile_policy
 from wmo.optimize.routing import (
     evaluate_policy,
     fit_rank_policy,
@@ -329,6 +330,63 @@ def test_route_scenarios_rejects_repeated_ids() -> None:
     ids = matrix.scenario_ids()
     with pytest.raises(ValueError, match="scenario ids repeat"):
         route_scenarios(policy, matrix, [*ids, ids[0]])
+
+
+def test_profile_policy_routes_short_tasks_to_the_cheaper_arm() -> None:
+    entries = [
+        PoolEntry(
+            name="safe",
+            kind=ProviderKind.OPENAI,
+            model="safe",
+            input_per_mtok=1.0,
+            output_per_mtok=1.0,
+        ),
+        PoolEntry(
+            name="cheap",
+            kind=ProviderKind.OPENAI,
+            model="cheap",
+            input_per_mtok=1.0,
+            output_per_mtok=1.0,
+        ),
+    ]
+    outcomes: list[ScenarioOutcome] = []
+    tasks = [
+        ("short", "fix x"),
+        ("long", "implement the complete distributed cache repair workflow"),
+    ]
+    for group, task in tasks:
+        for index in range(3):
+            sid = f"{group}:{index}"
+            outcomes.extend(
+                [
+                    ScenarioOutcome(
+                        scenario_id=sid,
+                        task=task,
+                        model="safe",
+                        reward=1.0,
+                        cost_usd=0.01,
+                    ),
+                    ScenarioOutcome(
+                        scenario_id=sid,
+                        task=task,
+                        model="cheap",
+                        reward=1.0 if group == "short" else 0.0,
+                        cost_usd=0.001,
+                    ),
+                ]
+            )
+    matrix = OutcomeMatrix(pool=entries, outcomes=outcomes)
+    policy = fit_profile_policy(
+        matrix,
+        guard_model="safe",
+        quality_tolerance=0.0,
+        bins=2,
+    )
+    result = evaluate_policy(policy, matrix, matrix.scenario_ids())
+    assert policy.kind == "profile"
+    assert result.accuracy == 1.0
+    assert result.cost_per_scenario < 0.01
+    assert policy.profile_models == ["cheap", "safe"]
 
 
 def _prefixless_matrix() -> OutcomeMatrix:

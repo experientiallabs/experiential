@@ -45,6 +45,7 @@ from wmo.optimize.policy import (
     RoutingDecision,
     RoutingPolicy,
     knn_decision,
+    profile_decision,
     rank_decision,
 )
 
@@ -364,6 +365,8 @@ def route_scenarios(
             sid: RoutingDecision(model=policy.default_model, reason="static policy")
             for sid in wanted
         }
+    if policy.kind == "profile":
+        return {sid: profile_decision(policy, scenario_tasks[sid]) for sid in wanted}
     decide = knn_decision if policy.kind == "knn" else rank_decision
     built = embedder or policy.embedder.build()
     embeddings = np.asarray(built.embed([scenario_tasks[sid] for sid in wanted]))
