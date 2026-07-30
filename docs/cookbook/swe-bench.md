@@ -1,7 +1,17 @@
 # Cookbook: SWE-bench Verified, measured for real
 
-The evidence behind the product's `swe-bench` default: 640 real mini-swe-agent episodes —
-20 pinned SWE-bench Verified instances x 16 candidate models x 2 episodes — each run inside
+Scope note up front: this page is deliberately a REPLAY page, not a pipeline walk. The grid
+harness that bought these episodes drives the external SWE-bench harness and is not a product
+CLI step, so there is no build/pool/optimize walk to retrace here; the canonical end-to-end
+walk lives in [tau-bench.md](tau-bench.md). What this page owes you instead is the evidence
+behind the shipped default and one command that reproduces it exactly.
+
+| Step | Command | Artifact |
+|---|---|---|
+| 1 | `uv run wmo reproduce run swe-bench` | `verdict.json` + `policy.json` + `report_vs_fable-5.json` under the run's out dir |
+
+The evidence behind the product's `swe-bench` default: 640 real mini-swe-agent episodes - 
+20 pinned SWE-bench Verified instances x 16 candidate models x 2 episodes - each run inside
 the instance's own SWE-bench Docker image and graded by the benchmark's own test suite
 (FAIL_TO_PASS + PASS_TO_PASS; there is no LLM judge on this path). Provenance on every
 number: `measured, real_episode`. Anchor: fable-5, zero unscored anchor cells, every
@@ -26,7 +36,7 @@ SWE-bench leaderboard.
 
 ## Reproduce it
 
-One command, offline, credential-free — the shipped default is a static pin, so the replay
+One command, offline, credential-free - the shipped default is a static pin, so the replay
 is arithmetic over the published outcome matrix:
 
 ```bash

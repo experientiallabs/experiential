@@ -1271,7 +1271,8 @@ def test_routing_reads_the_user_turn_not_the_tool_result(tmp_path: Path) -> None
 
 
 def test_tools_on_a_pool_model_without_a_structured_backend(tmp_path: Path) -> None:
-    # _EchoProvider has complete/stream but no complete_chat, like the direct anthropic backend.
+    # _EchoProvider has complete/stream but no complete_chat: the text-only provider
+    # class this fallback path exists for.
     client, log_path = _client(tmp_path)
     response = client.post(
         "/v1/chat/completions",

@@ -969,3 +969,27 @@ def test_self_hosted_openai_endpoint_is_not_dropped(tmp_path: Path) -> None:
 def test_missing_pinned_split_says_how_to_regenerate(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="pin_scenarios.py"):
         load_pinned_scenarios(tmp_path, tmp_path / "absent.jsonl")
+
+
+def test_a_note_that_merely_contains_no_is_not_vacuous() -> None:
+    """The vacuous matcher is a tight heuristic, not a substring search.
+
+    A component tau2 genuinely evaluated whose note happens to contain the
+    word "no" ("no errors were found") must never be counted as credit the
+    task handed out; the corruption would silently inflate vacuous credit in
+    published tables with nothing failing.
+    """
+    info = Tau2RewardInfo.model_validate(
+        {
+            "reward": 1.0,
+            "reward_basis": ["DB"],
+            "reward_breakdown": {"DB": 1.0},
+            "info": {
+                "db": {"note": "no errors were found in the final database state"},
+                "action": {"note": "agent did no worse than the reference trajectory"},
+                "communicate": {"note": "No communicate_info to evaluate."},
+            },
+        }
+    )
+
+    assert info.vacuous_components() == ["communicate"]

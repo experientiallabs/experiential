@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.optimize.pareto import ParetoCurve, pareto_curve
+from wmo.optimize.pareto import ParetoCurve, held_out_curve, pareto_curve
+from wmo.optimize.policy import RoutingPolicy
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -186,15 +187,11 @@ def test_a_pinned_policy_still_ships_the_workload_frontier() -> None:
     curve now carries the model points over the full matrix and recommends
     what the product mounts today: the pinned model itself.
     """
-    from wmo.optimize.pareto import held_out_curve
-    from wmo.optimize.policy import RoutingPolicy
-    from wmo.providers.pool import PoolEntry as PolicyPoolEntry
-
     matrix = _three_model_matrix()
     policy = RoutingPolicy(
         kind="static",
         default_model="strong",
-        pool=[PolicyPoolEntry(name="strong", kind=ProviderKind.ANTHROPIC, model="claude-fable-5")],
+        pool=[PoolEntry(name="strong", kind=ProviderKind.ANTHROPIC, model="claude-fable-5")],
     )
 
     curve = held_out_curve(matrix, policy, judge="test-judge", provenance="real_episode")

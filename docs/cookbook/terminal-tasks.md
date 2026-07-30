@@ -119,7 +119,7 @@ single-digit differences in either direction.
 
 ### Reproduce it
 
-One command, offline, credential-free — the shipped default is a static pin, so the replay
+One command, offline, credential-free - the shipped default is a static pin, so the replay
 is arithmetic over the published outcome matrix:
 
 ```bash

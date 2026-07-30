@@ -275,11 +275,22 @@ class Tau2RewardInfo(BaseModel):
     info: dict[str, Tau2CheckInfo | None] = {}
 
     def vacuous_components(self) -> list[str]:
-        """The scored components tau2 reported it had nothing to evaluate."""
+        """The scored components tau2 reported it had nothing to evaluate.
+
+        A HEURISTIC over tau2's note wording, matched tightly to the shape of
+        its known vacuous notes ("No communicate_info to evaluate", "No
+        actions to evaluate"): the note must OPEN with "no" and end in
+        "to evaluate". A loose substring match ("no " anywhere) mislabeled
+        genuinely evaluated components whose notes merely contained the word
+        ("no errors were found"), silently over-counting handed-out credit.
+        """
         return sorted(
             name
             for name, check in self.info.items()
-            if check is not None and check.note and "no " in check.note.lower()
+            if check is not None
+            and check.note
+            and check.note.lower().startswith("no ")
+            and check.note.lower().rstrip(".").endswith("to evaluate")
         )
 
 

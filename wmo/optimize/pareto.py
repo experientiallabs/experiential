@@ -62,7 +62,7 @@ DEFAULT_WM_JUDGE = "world-model verifier"
 
 # Frontier eligibility: a point must have scored rows on at least this fraction of the
 # band's best scenario coverage. Without it, an arm that loses most episodes to its own
-# failures is judged only on the survivors — on a real tau2 grid, qwen3.5-9b scored 5 of 12
+# failures is judged only on the survivors - on a real tau2 grid, qwen3.5-9b scored 5 of 12
 # episodes, aced them, and "dominated" the anchor measured on all 12. Survivorship is not
 # dominance, so under-covered points stay plotted and labeled but are never marked frontier
 # nor eligible for `recommended`. On a matrix with full coverage nothing changes.
@@ -218,7 +218,7 @@ def held_out_curve(
     (over all scenarios) rather than in-sample routed points dressed as measurements.
 
     A non-knn policy (a pin, a rank) has no dial to replay, but the WORKLOAD's frontier
-    exists regardless of what serves it — and a pinned endpoint is exactly the case where
+    exists regardless of what serves it - and a pinned endpoint is exactly the case where
     an operator most wants to see what else was measured. The curve then carries the model
     points over the full matrix, with `recommended` naming what the product mounts today:
     the policy's own default model (bench-defaults/tau finding 11, 2026-07-29).
@@ -299,7 +299,7 @@ def _mark_frontier(points: list[ParetoPoint]) -> list[ParetoPoint]:
     frontier (it stays in `points` so a renderer can show it as unplaced rather than
     dropping it silently). A point whose scored-scenario coverage falls below
     FRONTIER_COVERAGE_FRACTION of the band's best is excluded from the dominance
-    comparison entirely — both as a candidate and as a dominator — because its axes
+    comparison entirely - both as a candidate and as a dominator - because its axes
     describe the episodes it survived, not the band.
     """
     placeable = [
