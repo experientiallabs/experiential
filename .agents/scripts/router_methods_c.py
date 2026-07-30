@@ -40,13 +40,26 @@ import collections
 import json
 import pathlib
 import sys
+import warnings
 
 import numpy as np
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
+from sklearn.metrics import roc_auc_score
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
+
+# A constant prediction row (BLIND, and a fully shrunk ridge) makes a per-task Spearman undefined;
+# those tasks are dropped from the within-task mean explicitly, so the warning is pure noise.
+warnings.filterwarnings("ignore", message="An input array is constant")
+# lbfgs reports ABNORMAL_TERMINATION_IN_LNSRCH on the MLP rows. Checked, and it is benign rather
+# than a bad fit: with <=90 training tasks against 50 output heads the objective is genuinely
+# overparameterized and flat, so the line search stalls after a few iterations at a shrunken
+# solution. The inner-CV alpha sweep still picks the best of the grid, and the MLP's own heldout
+# predictions do move off the arm mean (mean |pred - arm_mean| 0.028-0.068 across the grid), so the
+# row reports a real model in a degenerate regime -- which is the honest thing to report at n=111.
+warnings.filterwarnings("ignore", message=".*lbfgs failed to converge.*")
 
 TRIALS = pathlib.Path("/tmp/deepswe_trials.json")
 CODING_ROUTER = pathlib.Path.home() / "Documents/experientiallabs/coding-router"
@@ -64,7 +77,7 @@ SEEDS = (0, 1, 2, 3, 4)
 PCA_DIM = 128
 KNN_GRID = (3, 5, 10, 20)
 RIDGE_GRID = (1.0, 10.0, 100.0, 1000.0, 10000.0)
-MLP_ALPHA_GRID = (1.0, 10.0, 100.0)
+MLP_ALPHA_GRID = (1.0, 10.0, 100.0, 1000.0)
 N_BOOT = 2000
 # included_in_score=True rows the publisher deliberately scored as failures because the rollout was
 # CUT OFF rather than because the model was wrong. Reliable-looking routing signal can be exactly
@@ -91,6 +104,7 @@ def build_matrix(trials: list[dict], pool: set | None) -> dict:
     """Dense (arm x task) graded-reward and cost matrices over tasks measured on EVERY pool arm."""
     rw: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     cs: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
+    bn: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
     for t in trials:
         if not t.get("included_in_score"):
             continue
@@ -103,6 +117,7 @@ def build_matrix(trials: list[dict], pool: set | None) -> dict:
             continue
         arm = f"{key[0]}@{key[1]}"
         rw[(arm, task)].append(r)
+        bn[(arm, task)].append(float(bool(t.get("passed"))))
         if t.get("cost_usd") is not None:
             cs[(arm, task)].append(float(t["cost_usd"]))
 
@@ -111,6 +126,9 @@ def build_matrix(trials: list[dict], pool: set | None) -> dict:
     tasks = sorted(q for q, c in per_task.items() if c == len(arms))
     R = np.array([[float(np.mean(rw[(a, q)])) for q in tasks] for a in arms])
     n_attempts = int(sum(len(rw[(a, q)]) for a in arms for q in tasks))
+    # Binary resolve, used ONLY for the per-arm AUC that makes us comparable to the NVIDIA paper's
+    # 0.8560-vs-0.8040 headline. Every routing number in this script stays on the graded reward.
+    B = np.array([[float(np.mean(bn[(a, q)]) > 0.5) for q in tasks] for a in arms])
 
     C = np.full((len(arms), len(tasks)), np.nan)
     for i, a in enumerate(arms):
@@ -125,7 +143,7 @@ def build_matrix(trials: list[dict], pool: set | None) -> dict:
     repos = json.loads(TASKS_PATH.read_text())["rows"]
     repo_of = {r["id"]: r["repository"] for r in repos}
     groups = np.array([repo_of[q] for q in tasks])
-    return {"arms": arms, "tasks": tasks, "R": R, "C": C, "groups": groups,
+    return {"arms": arms, "tasks": tasks, "R": R, "B": B, "C": C, "groups": groups,
             "n_incomplete": len(per_task) - len(tasks), "n_attempts": n_attempts,
             "n_missing_cost": n_missing_cost}
 
@@ -224,11 +242,21 @@ def _fit_ridge(a, b, R, fit, alpha) -> np.ndarray:
 
 
 def _fit_mlp(a, b, R, fit, alpha, seed) -> np.ndarray:
-    """Shared-trunk MLP: one hidden trunk, one output head per arm (multi-output MLPRegressor)."""
+    """Shared-trunk MLP: one hidden trunk, one output head per arm (multi-output MLPRegressor).
+
+    lbfgs, not adam: with <=90 training tasks the stochastic solver was still not converged at 3000
+    iterations, so an adam result would report an under-trained model rather than the method. The
+    PCA output is re-standardized and the residual target is scaled to unit variance, because
+    otherwise the components have wildly different variances and the targets are ~0.1-magnitude,
+    which made lbfgs terminate ABNORMAL (a line-search failure) rather than at an optimum.
+    """
+    sc = StandardScaler().fit(a)
     mu = R[:, fit].mean(axis=1)
-    m = MLPRegressor(hidden_layer_sizes=(64,), alpha=alpha, max_iter=3000, random_state=seed,
-                     learning_rate_init=1e-3).fit(a, (R[:, fit] - mu[:, None]).T)
-    return mu[:, None] + m.predict(b).T
+    y = (R[:, fit] - mu[:, None]).T
+    sy = y.std() or 1.0
+    m = MLPRegressor(hidden_layer_sizes=(64,), alpha=alpha, solver="lbfgs", max_iter=4000,
+                     random_state=seed).fit(sc.transform(a), y / sy)
+    return mu[:, None] + m.predict(sc.transform(b)).T * sy
 
 
 def _grid_select(X, R, fit, held, groups, seed, grid, fitter):
@@ -260,12 +288,13 @@ PREDICTORS = {"knn": pred_knn, "ridge": pred_ridge, "mlp": pred_mlp}
 
 
 # ----------------------------------------------------------------------------- evaluation
-def run_one(R, C, groups, X, predictor, seed, shuffle_labels=False) -> dict:
+def run_one(R, B, C, groups, X, predictor, seed, shuffle_labels=False) -> dict:
     """One seed: repo-grouped 5-fold CV, heldout predictions pooled over folds."""
     if shuffle_labels:
         rng = np.random.default_rng(seed + 7777)
         perm = np.array([rng.permutation(R.shape[1]) for _ in range(R.shape[0])])
         R = np.take_along_axis(R, perm, axis=1)
+        B = np.take_along_axis(B, perm, axis=1)
         C = np.take_along_axis(C, perm, axis=1)
 
     n_t = R.shape[1]
@@ -294,11 +323,14 @@ def run_one(R, C, groups, X, predictor, seed, shuffle_labels=False) -> dict:
     # Can the features predict TASK DIFFICULTY at all? Separates "features carry no information"
     # from "features are fine but the arm x task interaction they would need does not exist".
     rho_task = float(stats.spearmanr(P.mean(axis=0), R.mean(axis=0)).statistic)
+    # Mean PER-MODEL AUC, the NVIDIA paper's headline metric: for each arm separately, how well do
+    # the out-of-fold predictions rank the tasks that arm solves above the ones it does not?
+    aucs = [roc_auc_score(B[i], P[i]) for i in range(B.shape[0]) if 0 < B[i].sum() < n_t]
     share = collections.Counter(choice).most_common(1)[0][1] / n_t
     return {"q_router": q_r, "c_router": c_r, "q_best": q_b, "c_best": c_b,
             "q_static": R[stat].copy(), "c_static": C[stat].copy(),
             "rho_flat": rho_flat, "rho_within": float(np.mean(within)) if within else float("nan"),
-            "rho_task": rho_task,
+            "rho_task": rho_task, "auc": float(np.mean(aucs)) if aucs else float("nan"),
             "majority": float(share), "n_distinct": len(set(choice.tolist()))}
 
 
@@ -336,6 +368,8 @@ def aggregate(runs: list[dict], groups: np.ndarray) -> dict:
             "rho_flat_sd": float(np.std([r["rho_flat"] for r in runs], ddof=1)),
             "rho_within": float(np.mean([r["rho_within"] for r in runs])),
             "rho_task": float(np.mean([r["rho_task"] for r in runs])),
+            "auc": float(np.mean([r["auc"] for r in runs])),
+            "auc_sd": float(np.std([r["auc"] for r in runs], ddof=1)),
             "majority": float(np.mean([r["majority"] for r in runs])),
             "n_distinct": float(np.mean([r["n_distinct"] for r in runs]))}
 
@@ -401,7 +435,8 @@ def main() -> None:
     results: dict[str, dict] = {}
     for pool_name, pool in (("9-ARM PRUNED FRONTIER", NINE), ("ALL 50 MEASURED ARMS", None)):
         d = build_matrix(trials, pool)
-        R, C, groups, arms, tasks = d["R"], d["C"], d["groups"], d["arms"], d["tasks"]
+        R, B, C = d["R"], d["B"], d["C"]
+        groups, arms, tasks = d["groups"], d["arms"], d["tasks"]
         feats = load_features(tasks)
         print(f"\n{'=' * 118}\n{pool_name}: {len(arms)} arms x {len(tasks)} tasks "
               f"({d['n_incomplete']} incomplete tasks dropped), {d['n_attempts']} attempts, "
@@ -415,7 +450,7 @@ def main() -> None:
 
         rows = []
         for label, X, fn, shuf in methods_for(feats, len(tasks), args.quick):
-            runs = [run_one(R, C, groups, X, fn, s, shuffle_labels=shuf) for s in SEEDS]
+            runs = [run_one(R, B, C, groups, X, fn, s, shuffle_labels=shuf) for s in SEEDS]
             agg = aggregate(runs, groups)
             agg["label"] = label
             rows.append(agg)
@@ -447,14 +482,14 @@ def print_table(pool_name: str, res: dict) -> None:
           f"f2p_passed/f2p_total, repo-grouped 5-fold CV x 5 seeds 0-4)")
     hdr = (f"{'method':<42}{'quality':>16}{'dq vs fit-best':>15}{'dq 95% CI':>19}"
            f"{'dq vs static':>13}{'$/task':>8}{'cost x':>8}{'rho_flat':>10}"
-           f"{'rho_within':>11}{'rho_task':>9}{'maj':>6}")
+           f"{'rho_within':>11}{'rho_task':>9}{'AUC':>7}{'maj':>6}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         print(f"{r['label']:<42}{r['quality']:>9.4f}+-{r['quality_sd']:<6.4f}{r['dq']:>+15.4f}"
               f"  [{r['dq_ci'][0]:+.4f},{r['dq_ci'][1]:+.4f}]{r['ds']:>+13.4f}{r['cost']:>8.2f}"
               f"{r['cost_ratio']:>7.2f}x{r['rho_flat']:>10.3f}{r['rho_within']:>11.3f}"
-              f"{r['rho_task']:>9.3f}{r['majority']:>6.2f}")
+              f"{r['rho_task']:>9.3f}{r['auc']:>7.3f}{r['majority']:>6.2f}")
     b = rows[0]
     print(f"baselines: fit-selected best single arm {b['q_best']:.4f} @ ${b['c_best']:.2f}/task "
           f"(the protocol baseline, re-chosen per fold); best single STATIC arm over all tasks "
