@@ -3,7 +3,8 @@
 Status: protocol frozen; the original smoke is archived as invalid, the authorized replacement
 passed, and the 48-cell fast development tranche is complete. The full sweep was paused on the
 user-directed cross-dataset pivot. The follow-up is documented in
-`coding-model-router-cross-dataset-20260729.md`.
+`coding-model-router-cross-dataset-20260729.md`. A resumable Terminal-Bench completion stage now
+finishes the faster real benchmark before the SWE-bench cells without changing the full matrix.
 
 Experiment ID: `coding-router-20260728`
 
@@ -96,6 +97,19 @@ This tranche may guide implementation and offline router debugging only. It cann
 production baseline, lock a promotion configuration, touch any outer-heldout reward, or support a
 headline claim. The `full` stage resumes the same matrix and fills every remaining Terminal-Bench
 2 and SWE-bench Verified cell before nested fit-only selection begins.
+
+### Terminal-Bench completion stage
+
+After the cross-dataset effort-router formulation is frozen, `terminal-full` fills every remaining
+Terminal-Bench 2 model-by-task cell across the complete frozen roster. It is an intermediate view
+of the real full matrix, not a new pilot: it uses the same task manifest, model pool, attempts,
+retry policy, scoring, ledger, artifact paths, and `full/outcomes.json`. Every completed row is
+reused byte-for-byte by the later `full` stage.
+
+This ordering implements the user's direction to iterate on a faster execution benchmark before
+paying SWE-bench setup and repository-test latency. It does not provide final promotion evidence,
+change the 50/50 aggregate weight, open any heldout labels during execution, or remove any
+SWE-bench requirement from the frozen completion audit.
 
 Frozen artifact SHA-256 values:
 
@@ -446,6 +460,9 @@ uv run python .agents/scripts/coding_model_router_matrix.py \
   --stage fast-dev --concurrency 4 --timeout-s 900
 uv run python .agents/scripts/coding_model_router_analyze.py \
   --root .wmo/experiments/coding-router-20260728 develop
+uv run python .agents/scripts/coding_model_router_matrix.py \
+  --root .wmo/experiments/coding-router-20260728 \
+  --stage terminal-full --concurrency 32 --timeout-s 900
 uv run python .agents/scripts/coding_model_router_matrix.py \
   --root .wmo/experiments/coding-router-20260728 \
   --stage full --concurrency 4 --timeout-s 900

@@ -17,6 +17,7 @@ from coding_model_router_matrix import (
     FULL_STAGE,
     HARBOR_TASK_CACHE,
     SPLIT_SEEDS,
+    TERMINAL_FULL_STAGE,
     BudgetExhausted,
     RunState,
     _failure_class,
@@ -108,6 +109,16 @@ def test_full_stage_keeps_every_benchmark_task_and_model(tmp_path: Path) -> None
     expected_tasks = 16 + 1
     assert len(specs) == expected_tasks * len(pool.models)
     assert {benchmark for benchmark, _, _ in specs} == set(BENCHMARKS)
+
+
+def test_terminal_full_stage_keeps_every_terminal_task_and_model(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    pool = _pool()
+    specs = _stage_cell_specs(root, pool, TERMINAL_FULL_STAGE)
+
+    assert len(specs) == 16 * len(pool.models)
+    assert {benchmark for benchmark, _, _ in specs} == {FAST_DEV_BENCHMARK}
+    assert {entry.name for _, _, entry in specs} == {entry.name for entry in pool.models}
 
 
 def test_job_template_uses_experiment_task_cache(tmp_path: Path) -> None:

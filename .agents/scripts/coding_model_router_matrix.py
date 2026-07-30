@@ -42,7 +42,8 @@ EXPERIMENT_ID = "coding-router-20260728"
 BENCHMARKS = ("terminal-bench-2", "swe-bench-verified")
 FULL_STAGE = "full"
 FAST_DEV_STAGE = "fast-dev"
-MATRIX_STAGES = (FAST_DEV_STAGE, FULL_STAGE)
+TERMINAL_FULL_STAGE = "terminal-full"
+MATRIX_STAGES = (FAST_DEV_STAGE, TERMINAL_FULL_STAGE, FULL_STAGE)
 FAST_DEV_BENCHMARK = "terminal-bench-2"
 FAST_DEV_TASK_COUNT = 12
 FAST_DEV_SELECTOR = "all-seed-fit-sha256-v1"
@@ -157,6 +158,12 @@ def _stage_cell_specs(
             (FAST_DEV_BENCHMARK, task_id, entry)
             for entry in entries
             for task_id in _fast_dev_task_ids(root)
+        ]
+    if stage == TERMINAL_FULL_STAGE:
+        return [
+            (FAST_DEV_BENCHMARK, task_id, entry)
+            for entry in pool.models
+            for task_id in _task_ids(root / "tasks" / f"{FAST_DEV_BENCHMARK}.json")
         ]
     if stage != FULL_STAGE:
         raise ValueError(f"unknown matrix stage {stage!r}")
@@ -288,16 +295,17 @@ def _provider_execution_started(trace: dict[str, object]) -> bool:
     call_seconds = worker_usage.get("call_seconds")
     if isinstance(call_seconds, list) and bool(call_seconds):
         return True
-    return any(
-        isinstance(worker_usage.get(key), int) and worker_usage[key] > 0
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cached_input_tokens",
-            "cache_write_input_tokens",
-            "reasoning_tokens",
-        )
-    )
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_write_input_tokens",
+        "reasoning_tokens",
+    ):
+        value = worker_usage.get(key)
+        if isinstance(value, int) and value > 0:
+            return True
+    return False
 
 
 def _failure_class(
