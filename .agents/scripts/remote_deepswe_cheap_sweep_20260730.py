@@ -86,7 +86,9 @@ def _embed(text: str) -> np.ndarray:
     return vector / norm if norm else vector
 
 
-def _load(trials_path: Path, meta_path: Path) -> tuple[list[str], dict[str, str], dict[str, str], np.ndarray, np.ndarray]:
+def _load(
+    trials_path: Path, meta_path: Path
+) -> tuple[list[str], dict[str, str], dict[str, str], dict[str, str], np.ndarray, np.ndarray]:
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     rows = json.loads(trials_path.read_text(encoding="utf-8"))["rows"]
     cells: dict[tuple[str, str], list[tuple[float, float]]] = {}
@@ -114,6 +116,7 @@ def _load(trials_path: Path, meta_path: Path) -> tuple[list[str], dict[str, str]
         raise ValueError(f"incomplete matrix: {len(missing)} missing cells, first={missing[:3]}")
     texts = {task: str(metadata[task]["instruction"]) for task in task_ids}
     repos = {task: str(metadata[task]["repo"]) for task in task_ids}
+    languages = {task: str(metadata[task].get("language", "unknown")) for task in task_ids}
     rewards = np.asarray(
         [[statistics.mean(v[0] for v in cells[(task, arm)]) for arm, _m, _e in ARMS] for task in task_ids],
         dtype=np.float64,
@@ -122,7 +125,7 @@ def _load(trials_path: Path, meta_path: Path) -> tuple[list[str], dict[str, str]
         [[statistics.mean(v[1] for v in cells[(task, arm)]) for arm, _m, _e in ARMS] for task in task_ids],
         dtype=np.float64,
     )
-    return task_ids, texts, repos, rewards, costs
+    return task_ids, texts, repos, languages, rewards, costs
 
 
 def _split(tasks: list[str], repos: dict[str, str], seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -191,9 +194,35 @@ def _evaluate(
     return float(rewards[report, indices].mean()), float(costs[report, indices].mean())
 
 
+def _profile_choices(
+    fit: np.ndarray,
+    report: np.ndarray,
+    groups: list[str],
+    rewards: np.ndarray,
+    costs: np.ndarray,
+    tolerance: float,
+) -> list[str]:
+    """Choose the cheapest arm within a fit-set quality band for each task profile."""
+    choices: dict[str, str] = {}
+    guard_index = ARM_INDEX[GUARD]
+    for group in sorted(set(groups[index] for index in fit)):
+        members = np.asarray([index for index in fit if groups[index] == group], dtype=np.int64)
+        guard_quality = float(rewards[members, guard_index].mean())
+        guard_cost = float(costs[members, guard_index].mean())
+        eligible = []
+        for arm, _model, _effort in ARMS:
+            arm_index = ARM_INDEX[arm]
+            quality = float(rewards[members, arm_index].mean())
+            cost = float(costs[members, arm_index].mean())
+            if cost < guard_cost and quality >= guard_quality - tolerance:
+                eligible.append((cost, -quality, arm))
+        choices[group] = min(eligible)[2] if eligible else GUARD
+    return [choices.get(groups[index], GUARD) for index in report]
+
+
 def main() -> None:
     args = _parser().parse_args()
-    tasks, texts, repos, rewards, costs = _load(args.trials, args.task_meta)
+    tasks, texts, repos, languages, rewards, costs = _load(args.trials, args.task_meta)
     embeddings = np.asarray([_embed(texts[task]) for task in tasks])
     results: list[dict[str, object]] = []
     grid = tuple(
@@ -254,6 +283,50 @@ def main() -> None:
                     "splits": split_rows,
                 }
             )
+    profile_results: list[dict[str, object]] = []
+    lengths = np.asarray([len(texts[task]) for task in tasks], dtype=np.float64)
+    for profile_name in ("language", "length", "language_length"):
+        for tolerance in (0.0, 0.005, 0.01, 0.015, 0.02, 0.03):
+            split_rows = []
+            for seed in SEEDS:
+                fit, report = _split(tasks, repos, seed)
+                if profile_name == "language":
+                    groups = [languages[task] for task in tasks]
+                else:
+                    thresholds = np.quantile(lengths[fit], (1 / 3, 2 / 3))
+                    length_groups = np.digitize(lengths, thresholds).astype(str).tolist()
+                    groups = length_groups
+                    if profile_name == "language_length":
+                        groups = [f"{languages[task]}|{length_groups[index]}" for index, task in enumerate(tasks)]
+                choices = _profile_choices(fit, report, groups, rewards, costs, tolerance)
+                router_q, router_cost = _evaluate(choices, report, rewards, costs)
+                luna_q = float(rewards[report, ARM_INDEX[GUARD]].mean())
+                luna_cost = float(costs[report, ARM_INDEX[GUARD]].mean())
+                split_rows.append(
+                    {
+                        "seed": seed,
+                        "router_quality": router_q,
+                        "router_cost": router_cost,
+                        "luna_quality": luna_q,
+                        "luna_cost": luna_cost,
+                        "quality_diff": router_q - luna_q,
+                        "cost_savings": 1.0 - router_cost / luna_cost,
+                        "model_mix": {
+                            name: choices.count(name) / len(choices) for name in sorted(set(choices))
+                        },
+                    }
+                )
+            profile_results.append(
+                {
+                    "profile": profile_name,
+                    "tolerance": tolerance,
+                    "mean_quality_diff": statistics.mean(row["quality_diff"] for row in split_rows),
+                    "min_quality_diff": min(row["quality_diff"] for row in split_rows),
+                    "mean_cost_savings": statistics.mean(row["cost_savings"] for row in split_rows),
+                    "min_cost_savings": min(row["cost_savings"] for row in split_rows),
+                    "splits": split_rows,
+                }
+            )
     results.sort(
         key=lambda row: (
             float(row["mean_quality_diff"]),
@@ -269,6 +342,14 @@ def main() -> None:
         and float(row["mean_cost_savings"]) > 0.0
     ]
     eligible.sort(key=lambda row: float(row["mean_cost_savings"]), reverse=True)
+    profile_eligible = [
+        row
+        for row in profile_results
+        if float(row["mean_quality_diff"]) >= -0.005
+        and float(row["min_quality_diff"]) >= -0.015
+        and float(row["mean_cost_savings"]) > 0.0
+    ]
+    profile_eligible.sort(key=lambda row: float(row["mean_cost_savings"]), reverse=True)
     report = {
         "benchmark": "DeepSWE 1.1",
         "tasks": len(tasks),
@@ -283,6 +364,12 @@ def main() -> None:
         "eligible_count": len(eligible),
         "best_eligible": eligible[:20],
         "best_quality": results[:20],
+        "profile_candidates": sorted(
+            profile_results,
+            key=lambda row: (float(row["mean_quality_diff"]), float(row["mean_cost_savings"])),
+            reverse=True,
+        ),
+        "profile_eligible": profile_eligible,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
