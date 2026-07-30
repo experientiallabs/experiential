@@ -76,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--embedding-model", default="text-embedding-3-small")
     parser.add_argument("--hybrid-weight", type=float, default=0.25)
+    parser.add_argument("--policy-output", type=Path)
     return parser
 
 
@@ -239,6 +240,39 @@ def _profile_choices(
                 eligible.append((cost, -quality, arm))
         choices[group] = min(eligible)[2] if eligible else GUARD
     return [choices.get(groups[index], GUARD) for index in report]
+
+
+def _fit_length_profile(
+    fit: np.ndarray,
+    lengths: np.ndarray,
+    rewards: np.ndarray,
+    costs: np.ndarray,
+    tolerance: float,
+) -> tuple[list[float], list[str]]:
+    """Fit the persisted length profile used by the deployable router."""
+    thresholds = np.quantile(lengths[fit], (1 / 3, 2 / 3))
+    boundaries = sorted(set(float(value) for value in thresholds))
+    groups = np.digitize(lengths, thresholds).astype(str).tolist()
+    choices: list[str] = []
+    guard_index = ARM_INDEX[GUARD]
+    for group in (str(index) for index in range(len(boundaries) + 1)):
+        members = np.asarray(
+            [index for index in fit if groups[index] == group], dtype=np.int64
+        )
+        if not len(members):
+            choices.append(GUARD)
+            continue
+        guard_quality = float(rewards[members, guard_index].mean())
+        guard_cost = float(costs[members, guard_index].mean())
+        eligible: list[tuple[float, float, str]] = []
+        for arm, _model, _effort in ARMS:
+            arm_index = ARM_INDEX[arm]
+            quality = float(rewards[members, arm_index].mean())
+            cost = float(costs[members, arm_index].mean())
+            if cost < guard_cost and quality >= guard_quality - tolerance:
+                eligible.append((cost, -quality, arm))
+        choices.append(min(eligible)[2] if eligible else GUARD)
+    return boundaries, choices
 
 
 def main() -> None:
@@ -414,6 +448,56 @@ def main() -> None:
         ),
         "profile_eligible": profile_eligible,
     }
+    if args.policy_output is not None:
+        full_fit = np.arange(len(tasks), dtype=np.int64)
+        profile_bins, profile_models = _fit_length_profile(
+            full_fit, lengths, rewards, costs, tolerance=0.02
+        )
+        pool = [
+            {
+                "name": name,
+                "kind": "anthropic" if model.startswith("claude-") else "openai_responses",
+                "model": model,
+                "reasoning_effort": effort if not model.startswith("claude-") else None,
+                "input_per_mtok": (
+                    5.0
+                    if model.startswith(("gpt-5.6-sol", "claude-"))
+                    else (2.5 if model.startswith("gpt-5.6-terra") else 1.0)
+                ),
+                "output_per_mtok": (
+                    25.0
+                    if model.startswith("claude-")
+                    else (
+                        30.0
+                        if model.startswith("gpt-5.6-sol")
+                        else (15.0 if model.startswith("gpt-5.6-terra") else 6.0)
+                    )
+                ),
+            }
+            for name, model, effort in ARMS
+        ]
+        policy = {
+            "version": 2,
+            "kind": "profile",
+            "default_model": GUARD,
+            "pool": pool,
+            "sticky": True,
+            "guard_model": GUARD,
+            "profile_feature": "text_length",
+            "profile_bins": profile_bins,
+            "profile_models": profile_models,
+            "fitted_from": "DeepSWE 1.1 full matrix, remote profile fit",
+            "fit_scenario_ids": [f"deepswe:{task}" for task in tasks],
+        }
+        args.policy_output.parent.mkdir(parents=True, exist_ok=True)
+        args.policy_output.write_text(
+            json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        report["full_fit_policy"] = {
+            "path": str(args.policy_output),
+            "profile_bins": profile_bins,
+            "profile_models": profile_models,
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n")
