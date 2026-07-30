@@ -154,6 +154,11 @@ def _run_matrix(manifest: Manifest, snapshot: Path, out_dir: Path) -> dict[str, 
         fallback=protocol.fallback,
         built=built,
     )
+    # A rerun into the same out_dir leaves the PREVIOUS run's dial snapshot beside the fresh
+    # fit, and `tune_policy_dial` rightly refuses a snapshot from a different fit. This run
+    # just wrote the fit, so any existing snapshot is stale by construction: drop it.
+    stale_snapshot = policy_path.with_name(f"{policy_path.stem}.base{policy_path.suffix}")
+    stale_snapshot.unlink(missing_ok=True)
     # The REAL dial, through the same function `wmo optimize route tune` uses: it rewrites
     # the guard/floor/penalty knobs on disk, not just the descriptive field (review finding on
     # the first cut of this runner: a bare field update reported the balanced policy under a

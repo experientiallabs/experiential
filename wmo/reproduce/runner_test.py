@@ -118,6 +118,33 @@ def test_matrix_reproduction_is_deterministic_and_bit_exact(tmp_path: Path) -> N
     assert verdict["benchmark"] == "fixture"
 
 
+def test_rerun_into_the_same_out_dir_survives_a_changed_fit(tmp_path: Path) -> None:
+    """A rerun must not abort on the previous run's dial snapshot (stale by construction)."""
+    headline = _measure(tmp_path)
+    manifest = _manifest(
+        [
+            {
+                "label": "routed vs pricey",
+                "baseline": "pricey",
+                "accuracy": headline["accuracy"],
+                "cost_per_run_usd": headline["cost_per_run_usd"],
+            }
+        ]
+    )
+    out = tmp_path / "run"
+    assert run_reproduction(manifest, out_dir=out, data_dir=tmp_path / "data").reproduced
+    # Change the matrix bytes (a new episode on one scenario), so the refit is a DIFFERENT
+    # fit and the first run's snapshot no longer describes it.
+    snapshot = tmp_path / "data"
+    matrix = json.loads((snapshot / "matrix.json").read_text(encoding="utf-8"))
+    extra = dict(matrix["outcomes"][0])
+    extra["episode"] = 1
+    matrix["outcomes"].append(extra)
+    (snapshot / "matrix.json").write_text(json.dumps(matrix), encoding="utf-8")
+    result = run_reproduction(manifest, out_dir=out, data_dir=snapshot)
+    assert result.rows  # completed and compared; no snapshot abort
+
+
 def test_divergence_is_reported_not_absorbed(tmp_path: Path) -> None:
     headline = _measure(tmp_path)
     manifest = _manifest(
