@@ -179,6 +179,7 @@ def _run_matrix(manifest: Manifest, snapshot: Path, out_dir: Path) -> dict[str, 
             baseline=baseline,
             endpoint=f"reproduce-{manifest.name}",
             generated_at=datetime.now(UTC).isoformat(),
+            scenario_label=protocol.scenario_label,
             built=built,
         )
         path = out_dir / f"report_vs_{baseline}.json"

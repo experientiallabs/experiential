@@ -200,3 +200,58 @@ def test_a_pinned_policy_still_ships_the_workload_frontier() -> None:
     assert all(point.kind == "model" for point in curve.points)
     assert {point.id for point in curve.points} == {"cheap", "mid", "strong"}
     assert curve.provenance == "real_episode"
+
+
+def test_an_ineligible_pin_is_not_recommended_by_its_own_curve() -> None:
+    """The artifact must not contradict its own frontier rule.
+
+    A pinned model whose coverage the rule disqualifies (the survivorship
+    case) keeps the curve's honest recommendation instead of overriding it.
+    """
+    outcomes = [
+        _row("s1", "cheap", reward=1.0, cost=0.001),
+        _row("s2", "cheap", reward=None),
+        _row("s3", "cheap", reward=None),
+        _row("s4", "cheap", reward=None),
+        _row("s1", "strong", reward=1.0, cost=0.03),
+        _row("s2", "strong", reward=1.0, cost=0.03),
+        _row("s3", "strong", reward=0.5, cost=0.03),
+        _row("s4", "strong", reward=1.0, cost=0.03),
+    ]
+    policy = RoutingPolicy(
+        kind="static",
+        default_model="cheap",
+        pool=[
+            PoolEntry(
+                name="cheap",
+                kind=ProviderKind.OPENAI,
+                model="m",
+                input_per_mtok=1,
+                output_per_mtok=1,
+            )
+        ],
+    )
+
+    curve = held_out_curve(_matrix(outcomes), policy, judge="test-judge", provenance="real_episode")
+
+    by_id = {p.id: p for p in curve.points}
+    assert not by_id["cheap"].frontier_eligible
+    assert curve.recommended == "strong"  # the frontier's answer, not the ineligible pin
+
+
+def test_unplaceable_points_keep_their_honest_coverage_flag() -> None:
+    """frontier_eligible reports COVERAGE; placement is a different exclusion."""
+    outcomes = [
+        _row("s1", "cheap", reward=0.0, cost=0.01),
+        _row("s2", "cheap", reward=0.0, cost=0.01),
+        _row("s1", "strong", reward=1.0, cost=0.03),
+        _row("s2", "strong", reward=1.0, cost=0.03),
+    ]
+    curve = pareto_curve(_matrix(outcomes), judge="test-judge")
+
+    by_id = {p.id: p for p in curve.points}
+    # cheap completed nothing: unplaceable, never on the frontier - but its
+    # coverage is full, so the coverage flag must not misexplain it.
+    assert by_id["cheap"].cost_per_completed_task_usd is None
+    assert not by_id["cheap"].on_frontier
+    assert by_id["cheap"].frontier_eligible

@@ -19,6 +19,7 @@ files = ["matrix.json"]
 
 [matrix]
 matrix_file = "matrix.json"
+scenario_label = "on the pinned tau2-bench eval split (20 scenarios, real benchmark episodes; quality delta unresolved at n=19 paired)"
 pin_model = "sonnet-5"
 baselines = ["fable-5"]
 

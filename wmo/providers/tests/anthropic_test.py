@@ -150,3 +150,15 @@ def test_complete_chat_wires_the_configs_reasoning_effort_to_the_wire(
     assert fake.messages.last_kwargs["output_config"] == {"effort": "none"}
     assert fake.messages.last_kwargs["model"] == "claude-fable-5"
     assert response.choices[0].message.content == "ok"
+
+
+def test_text_paths_refuse_a_config_whose_effort_they_would_drop() -> None:
+    """Two arms differing only in effort must never silently collapse into one."""
+    provider = AnthropicProvider(
+        ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-fable-5", reasoning_effort="max")
+    )
+
+    with pytest.raises(ValueError, match="does not forward reasoning_effort"):
+        provider.complete("system", [Message(role="user", content="hi")])
+    with pytest.raises(ValueError, match="does not forward reasoning_effort"):
+        next(provider.stream("system", [Message(role="user", content="hi")]))

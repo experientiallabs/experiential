@@ -19,6 +19,7 @@ files = ["matrix.json"]
 
 [matrix]
 matrix_file = "matrix.json"
+scenario_label = "on the 20 pinned SWE-bench Verified instances (real benchmark episodes, 2 per instance; 75-step cap; quality delta unresolved at this sample size)"
 pin_model = "opus-5"
 baselines = ["fable-5"]
 

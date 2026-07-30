@@ -1134,15 +1134,27 @@ def _structured_usage(response: ChatResponse) -> TokenUsage:
     """
     counts = response.token_usage()
     cached = 0
+    cache_write = 0
     if response.usage is not None:
-        raw = (response.usage.model_extra or {}).get("prompt_tokens_details")
+        extra = response.usage.model_extra or {}
+        raw = extra.get("prompt_tokens_details")
         if isinstance(raw, dict):
             with contextlib.suppress(ValidationError):
                 cached = _PromptTokensDetails.model_validate(raw).cached_tokens
+        # The Anthropic/Bedrock translators report the split as TOP-LEVEL usage
+        # keys (cache reads already folded into prompt_tokens). Missing them
+        # priced every cached agent-loop token at the full input rate: a 5.8x
+        # overcharge measured on a 9k-cached-token turn, growing with exactly
+        # the traffic prompt caching exists for.
+        if cached == 0 and isinstance(extra.get("cache_read_input_tokens"), int):
+            cached = extra["cache_read_input_tokens"]
+        if isinstance(extra.get("cache_creation_input_tokens"), int):
+            cache_write = extra["cache_creation_input_tokens"]
     return TokenUsage(
         input_tokens=counts.input_tokens,
         output_tokens=counts.output_tokens,
         cached_input_tokens=cached,
+        cache_write_input_tokens=cache_write,
     )
 
 

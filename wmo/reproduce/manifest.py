@@ -51,6 +51,10 @@ class MatrixProtocol(BaseModel):
     fallback: str | None = None
     # Pool entry every request goes to; replaces the kNN fit with a static pin.
     pin_model: str | None = None
+    # The report's one customer-facing sentence describing WHAT was measured. Without it
+    # the report writer's default claims scenarios "reconstructed from your traces",
+    # which is false for every real-benchmark manifest.
+    scenario_label: str | None = None
     cost_quality: float = 0.25
     baselines: list[str] = Field(min_length=1)
 

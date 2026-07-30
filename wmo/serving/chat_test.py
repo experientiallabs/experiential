@@ -2980,3 +2980,62 @@ def test_config_omits_pareto_for_artifacts_that_predate_it(tmp_path: Path) -> No
     body = client.get("/v1/endpoints/tau-bench/config").json()
 
     assert body["pareto"] is None
+
+
+def test_structured_usage_reads_anthropic_shaped_cache_keys() -> None:
+    """Anthropic/Bedrock report the cache split as TOP-LEVEL usage keys.
+
+    Reading only OpenAI's prompt_tokens_details priced every cached agent-loop
+    token at the full input rate (measured 5.8x overcharge on a 9k-cached
+    turn), and dropped cache writes' 1.25x tier entirely.
+    """
+    from wmo.serving.chat import _structured_usage
+
+    response = ChatResponse.model_validate(
+        {
+            "model": "claude-sonnet-5",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 9600,
+                "completion_tokens": 10,
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 500,
+            },
+        }
+    )
+
+    usage = _structured_usage(response)
+
+    assert usage.cached_input_tokens == 9000
+    assert usage.cache_write_input_tokens == 500
+    assert usage.input_tokens == 9600  # totals unchanged: reads/writes are a SUBSET
+
+
+def test_structured_usage_still_prefers_the_openai_shape() -> None:
+    from wmo.serving.chat import _structured_usage
+
+    response = ChatResponse.model_validate(
+        {
+            "model": "gpt-5.5",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            },
+        }
+    )
+
+    assert _structured_usage(response).cached_input_tokens == 40

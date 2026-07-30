@@ -2,10 +2,13 @@
 
 A pushed bundle is byte-compatible with the bundles the platform's own build
 pipeline produces: a gzipped tarball of the model directory with
-archive-relative member paths. Packing is an include-list — the model's
-`config.toml`, `metrics.json`, `card.json`, `prompts/`, and `index/` — so
-local `runs/` cost records and raw `traces/` (customer data) never leave the
-machine.
+archive-relative member paths. Packing is an include-list - the model's
+`config.toml`, `metrics.json`, `card.json`, `auto_fidelity.json`, `prompts/`,
+`index/`, and `knowledge/` - so local `runs/` cost records and raw `traces/`
+(customer data) never leave the machine. The privacy line to be explicit
+about: `knowledge/` is DISTILLED from traces (`wmo knowledge`), so pushing a
+model uploads that distilled text while the raw traces stay local; a model
+whose knowledge must not leave the machine should not be pushed.
 
 Bundles can reach the platform's 1GB cap, so packing and unpacking are
 file-based: bytes stream between disk and the network without ever being held
@@ -62,12 +65,18 @@ def sha256_file(path: Path) -> str:
 
 
 def _scrub_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
-    """Zero the metadata that varies between packs of identical content."""
+    """Normalize the metadata that varies between packs of identical content.
+
+    Mode included: the same directory packed under umask 022 and 002 differs
+    only in st_mode, and a digest that moves with the packing machine's umask
+    is not content-addressed.
+    """
     member.mtime = 0
     member.uid = 0
     member.gid = 0
     member.uname = ""
     member.gname = ""
+    member.mode = 0o755 if member.isdir() else 0o644
     return member
 
 

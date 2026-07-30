@@ -1414,6 +1414,15 @@ def report(
         pareto_out = Path(out).parent / PARETO_FILENAME
         write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
         _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")
+        # Same foot-gun as `pin --out`: serving loads policy.json and pareto.json from ONE
+        # model dir, so a curve written apart from the policy it describes is a curve
+        # `wmo serve` and GET /config never show. Succeeding silently here is what hid it.
+        if Path(policy_file).resolve().parent != pareto_out.resolve().parent:
+            _console.print(
+                f"[yellow]![/yellow] the curve landed apart from {policy_file}; serving reads "
+                "pareto.json from the same directory as the policy it mounts, so point --out "
+                "there for the endpoint to show this curve"
+            )
     except (ValueError, FileNotFoundError) as exc:
         _console.print(f"[yellow]![/yellow] pareto curve skipped: {exc}")
     headline = improvement.headline
