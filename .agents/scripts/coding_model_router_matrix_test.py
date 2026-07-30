@@ -10,6 +10,8 @@ import pytest
 from coding_model_router_analyze import _develop
 from coding_model_router_matrix import (
     BENCHMARKS,
+    CELL_SPEND_RESERVATION_USD,
+    DEFAULT_VERIFIER_TIMEOUT_S,
     FAST_DEV_ARMS,
     FAST_DEV_BENCHMARK,
     FAST_DEV_STAGE,
@@ -125,6 +127,7 @@ def test_job_template_uses_experiment_task_cache(tmp_path: Path) -> None:
     template = _job_template(FAST_DEV_BENCHMARK, tmp_path / "jobs")
 
     assert template.datasets[0].download_dir == HARBOR_TASK_CACHE
+    assert template.verifier.override_timeout_sec == DEFAULT_VERIFIER_TIMEOUT_S
 
 
 def test_post_execution_error_with_official_reward_is_gradeable() -> None:
@@ -230,6 +233,38 @@ def test_unreconciled_unknown_cost_still_fails_closed(tmp_path: Path) -> None:
         state.spent_and_reserved()
 
 
+def test_explicit_stale_reservation_recovery_preserves_debit_and_frees_id(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    pool = _pool()
+    event_id = f"full:terminal-bench-2:task:{FAST_DEV_ARMS[0]}:1"
+    (root / "spend-ledger.jsonl").write_text(
+        json.dumps(
+            {
+                "event_id": event_id,
+                "scenario_id": "terminal-bench-2:task",
+                "model": FAST_DEV_ARMS[0],
+                "attempt_number": 1,
+                "status": "reserved",
+                "reserved_usd": CELL_SPEND_RESERVATION_USD,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = RunState(root=root / "full", pool=pool, ceiling_usd=20_000.0)
+
+    assert state.recover_stale_reservations() == 1
+    assert state.spent_and_reserved() == (CELL_SPEND_RESERVATION_USD, 0.0)
+    assert state.ledger[0]["event_id"] == (f"interrupted:{event_id}:stale-reservation-recovery")
+    assert state.reserve("terminal-bench-2", "task", FAST_DEV_ARMS[0], 1) == event_id
+    assert state.spent_and_reserved() == (
+        CELL_SPEND_RESERVATION_USD,
+        CELL_SPEND_RESERVATION_USD,
+    )
+
+
 @pytest.mark.parametrize(
     "stop_reason",
     ["provider_error", "error", "agent-exception:AgentTimeoutError"],
@@ -321,6 +356,94 @@ def test_existing_post_execution_failures_keep_one_gradeable_row(
     assert all(
         row["model_cost_accounting_status"] == "estimated_from_trace" for row in state.ledger
     )
+
+
+def test_earlier_metered_provider_failure_excludes_later_retry(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    pool = _pool()
+    first_artifact = tmp_path / "full" / "infra-attempts" / "attempt-1"
+    _write_json(
+        first_artifact / "agent" / "wmo-run.json",
+        {
+            "instruction": "repair the repository",
+            "stop_reason": "provider_error",
+            "steps": [
+                {
+                    "action": {"kind": "message"},
+                    "observation": {
+                        "is_error": True,
+                        "content": "incomplete response: max_output_tokens",
+                    },
+                }
+            ],
+            "worker_usage": {
+                "calls": 1,
+                "input_tokens": 10,
+                "output_tokens": 2,
+            },
+        },
+    )
+    outcomes = [
+        ScenarioOutcome(
+            scenario_id="terminal-bench-2:task",
+            task="repair the repository",
+            model=FAST_DEV_ARMS[0],
+            benchmark="terminal-bench-2",
+            attempt_number=1,
+            reward=None,
+            success=False,
+            stop_reason="provider_error",
+            completion_status="infrastructure_failure",
+            failure_class="infrastructure",
+            artifact_dir=str(first_artifact),
+            cost_usd=0.1,
+        ),
+        ScenarioOutcome(
+            scenario_id="terminal-bench-2:task",
+            task="repair the repository",
+            model=FAST_DEV_ARMS[0],
+            benchmark="terminal-bench-2",
+            attempt_number=2,
+            reward=0.0,
+            success=False,
+            stop_reason="submitted",
+            completion_status="scored_failure",
+            failure_class="task_failure",
+            artifact_dir=str(tmp_path / "full" / "attempt-2"),
+            cost_usd=0.1,
+        ),
+    ]
+    full = root / "full"
+    full.mkdir(exist_ok=True)
+    OutcomeMatrix(pool=pool.models, outcomes=outcomes).save(full / "outcomes.json")
+    (root / "spend-ledger.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {
+                    "event_id": f"full:terminal-bench-2:task:{FAST_DEV_ARMS[0]}:{attempt}",
+                    "scenario_id": "terminal-bench-2:task",
+                    "model": FAST_DEV_ARMS[0],
+                    "attempt_number": attempt,
+                    "status": "completed",
+                    "model_cost_usd": 0.1,
+                }
+            )
+            + "\n"
+            for attempt in (1, 2)
+        ),
+        encoding="utf-8",
+    )
+
+    state = RunState(root=full, pool=pool, ceiling_usd=20_000.0)
+
+    repaired = sorted(state.matrix.outcomes, key=lambda outcome: outcome.attempt_number)
+    assert repaired[0].reward == 0.0
+    assert repaired[0].completion_status == "scored_agent_failure"
+    assert repaired[0].failure_class == "agent_failure"
+    assert repaired[1].reward is None
+    assert repaired[1].completion_status == "excluded_protocol_retry"
+    assert repaired[1].failure_class == "protocol_retry_excluded"
+    assert state.completed("terminal-bench-2", "task", FAST_DEV_ARMS[0]) is True
 
 
 def test_develop_fits_diagnostic_policy_without_outer_heldout(tmp_path: Path) -> None:

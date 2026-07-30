@@ -272,6 +272,7 @@ def test_metered_provider_output_truncation_is_gradeable(
     runner: object,
 ) -> None:
     artifact = _metered_artifact(tmp_path, stop_reason="provider_error")
+    cell = _cell(artifact).model_copy(update={"infra_failed": True})
     trace_path = artifact / "agent" / "wmo-run.json"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     trace["steps"] = [
@@ -290,14 +291,14 @@ def test_metered_provider_output_truncation_is_gradeable(
     monkeypatch.setattr(runner, "_wall_seconds", lambda path: 0.0)
     if runner is smoke_runner:
         outcome = smoke_runner._outcome(
-            _cell(artifact),
+            cell,
             entry=_entry(),
             logical_attempt=1,
             artifact_dir=artifact,
         )
     else:
         outcome = matrix_runner._outcome(
-            _cell(artifact),
+            cell,
             benchmark="terminal-bench-2",
             entry=_entry(),
             attempt=1,

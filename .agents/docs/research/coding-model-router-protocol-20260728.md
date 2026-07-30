@@ -232,6 +232,30 @@ binds an OS-assigned local port by default and derives a distinct remote episode
 that port. A parallel regression test holds two default runtimes open concurrently and proves both
 ports and workdirs differ.
 
+The 32-way Terminal-Bench completion launch exposed a second pre-provider concurrency defect.
+Each cell resolved the same remote Harbor dataset into one shared git cache, and concurrent
+`git checkout` operations raced. One `video-processing` reservation has no outcome because scorer
+construction failed before provider execution. Remote task pinning now takes an async
+cross-process file lock around Harbor's shared checkout refresh. The resume uses
+`--recover-stale-reservations`; this preserves an unmatched reservation as an interrupted
+unknown-cost event with the full USD 500 conservative debit, then frees the deterministic event id
+for the real retry.
+
+Agent and verifier timeouts are now separate. The agent remains bounded at 900 seconds, while the
+official verifier gets 2,700 seconds. This is required for
+`torch-tensor-parallelism`, whose verifier installs PyTorch before running the official tests and
+exhausted the earlier 900-second verifier limit. A cell that reaches its three paid-attempt limit
+may be recovered only by replaying the preserved tool actions into the exact task with
+`ReplayWmoTraceAgent`, making zero model calls, and then running the official verifier. The paid
+attempt, replay trial, both replay-agent sources, task checksum, official reward, and content
+digests are combined under a separate recovered artifact with explicit provenance.
+
+One metered OpenAI `max_output_tokens` failure also revealed that Harbor can label an
+agent-side provider truncation as infrastructure when no verifier runs. A provider-error trace
+with recorded model execution is now a definite agent-failure zero. The earliest such attempt is
+canonical and any later retry is excluded, so provider truncation cannot benefit from
+infrastructure retry selection.
+
 ## Single smoke gate
 
 The only paid pre-sweep gate has exactly four cells:
@@ -457,15 +481,15 @@ After both a valid smoke and a positive authorized ceiling are frozen:
 ```bash
 uv run python .agents/scripts/coding_model_router_matrix.py \
   --root .wmo/experiments/coding-router-20260728 \
-  --stage fast-dev --concurrency 4 --timeout-s 900
+  --stage fast-dev --concurrency 4 --timeout-s 900 --verifier-timeout-s 2700
 uv run python .agents/scripts/coding_model_router_analyze.py \
   --root .wmo/experiments/coding-router-20260728 develop
 uv run python .agents/scripts/coding_model_router_matrix.py \
   --root .wmo/experiments/coding-router-20260728 \
-  --stage terminal-full --concurrency 32 --timeout-s 900
+  --stage terminal-full --concurrency 32 --timeout-s 900 --verifier-timeout-s 2700
 uv run python .agents/scripts/coding_model_router_matrix.py \
   --root .wmo/experiments/coding-router-20260728 \
-  --stage full --concurrency 4 --timeout-s 900
+  --stage full --concurrency 4 --timeout-s 900 --verifier-timeout-s 2700
 uv run python .agents/scripts/coding_model_router_analyze.py \
   --root .wmo/experiments/coding-router-20260728 validate
 uv run python .agents/scripts/coding_model_router_embeddings.py \

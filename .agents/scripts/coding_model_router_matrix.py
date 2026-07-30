@@ -57,6 +57,7 @@ SPLIT_SEEDS = tuple(range(5))
 HARBOR_TASK_CACHE = Path("/private/tmp/wmo-coding-router-harbor/tasks")
 MAX_LOGICAL_ATTEMPTS = 3
 RETRY_DELAYS_S = (15, 60)
+DEFAULT_VERIFIER_TIMEOUT_S = 2700.0
 # One in-flight cell can use 20 calls with up to 4,096 output tokens each. Reserving $500 is
 # deliberately conservative for a one-million-token context on the most expensive frozen arm,
 # including cache writes, and prevents concurrency from overshooting the operator's cap before
@@ -191,7 +192,12 @@ def _expected_pins(path: Path, benchmark: str) -> dict[str, str]:
     return pins
 
 
-def _job_template(benchmark: str, jobs_dir: Path) -> JobConfig:
+def _job_template(
+    benchmark: str,
+    jobs_dir: Path,
+    *,
+    verifier_timeout_s: float = DEFAULT_VERIFIER_TIMEOUT_S,
+) -> JobConfig:
     dataset = (
         {
             "name": "terminal-bench",
@@ -211,6 +217,7 @@ def _job_template(benchmark: str, jobs_dir: Path) -> JobConfig:
             "jobs_dir": str(jobs_dir),
             "n_concurrent_trials": 1,
             "environment": {"type": "e2b"},
+            "verifier": {"override_timeout_sec": verifier_timeout_s},
             "datasets": [dataset],
             "agents": [{}],
         }
@@ -224,9 +231,14 @@ async def _scorer(
     task_ids: list[str],
     entry: PoolEntry,
     timeout_s: float,
+    verifier_timeout_s: float,
 ) -> HarborScorer:
     return await HarborScorer.create(
-        _job_template(benchmark, jobs_dir),
+        _job_template(
+            benchmark,
+            jobs_dir,
+            verifier_timeout_s=verifier_timeout_s,
+        ),
         task_ids,
         provider_config=entry.provider_config(),
         attempts=1,
@@ -315,6 +327,8 @@ def _failure_class(
     provider_execution_started: bool,
 ) -> str:
     if cell.infra_failed:
+        if stop_reason == "provider_error" and provider_execution_started:
+            return "agent_failure"
         return "infrastructure"
     if stop_reason in INFRASTRUCTURE_STOPS or stop_reason.startswith("agent-exception:"):
         return "agent_failure" if provider_execution_started else "infrastructure"
@@ -454,6 +468,86 @@ class RunState:
             "".join(json.dumps(row, sort_keys=True) + "\n" for row in self.ledger),
         )
 
+    def recover_stale_reservations(self) -> int:
+        """Reconcile reservations only after the owning matrix process is proven dead.
+
+        A persisted outcome repairs its matching ledger event exactly. A reservation with no
+        outcome is preserved as an interrupted unknown-cost event under a new id, freeing the
+        original deterministic id for a resume without claiming that provider execution never
+        started.
+        """
+        recovered = 0
+        with self.lock:
+            existing_ids = {str(row.get("event_id")) for row in self.ledger}
+            for row in self.ledger:
+                if row.get("status") != "reserved":
+                    continue
+                scenario_id = row.get("scenario_id")
+                model = row.get("model")
+                attempt_number = row.get("attempt_number")
+                outcome = next(
+                    (
+                        item
+                        for item in self.matrix.outcomes
+                        if item.scenario_id == scenario_id
+                        and item.model == model
+                        and item.attempt_number == attempt_number
+                    ),
+                    None,
+                )
+                if outcome is not None:
+                    row.update(
+                        {
+                            "recorded_at": _utc_now(),
+                            "status": "completed",
+                            "usage": outcome.usage.model_dump(mode="json"),
+                            "model_call_seconds": outcome.call_seconds,
+                            "task_environment_wall_seconds": outcome.wall_seconds,
+                            "model_cost_usd": outcome.cost_usd,
+                            "model_cost_accounting_status": (
+                                "estimated_from_trace"
+                                if outcome.usage_accounting == "estimated"
+                                else "exact_from_provider_usage"
+                            ),
+                            "usage_estimate_method": outcome.usage_estimate_method,
+                            "task_environment_cost_usd": None,
+                            "task_environment_cost_note": (
+                                "E2B invoice rate is absent from Harbor artifacts"
+                            ),
+                            "completion_status": outcome.completion_status,
+                            "failure_class": outcome.failure_class,
+                            "artifact_dir": outcome.artifact_dir,
+                        }
+                    )
+                    recovered += 1
+                    continue
+                event_id = str(row.get("event_id"))
+                interrupted_id = f"interrupted:{event_id}:stale-reservation-recovery"
+                if interrupted_id in existing_ids:
+                    raise ValueError(f"duplicate stale-reservation recovery id {interrupted_id}")
+                existing_ids.add(interrupted_id)
+                row.update(
+                    {
+                        "event_id": interrupted_id,
+                        "recorded_at": _utc_now(),
+                        "status": "completed",
+                        "model_cost_usd": None,
+                        "model_cost_accounting_status": "missing_provider_usage",
+                        "budget_debit_usd": CELL_SPEND_RESERVATION_USD,
+                        "completion_status": "interrupted_stale_reservation",
+                        "failure_class": "interrupted",
+                        "recovery_note": (
+                            "owning matrix process terminated without a persisted outcome; "
+                            "provider execution is unknown and the full reservation remains "
+                            "debited"
+                        ),
+                    }
+                )
+                recovered += 1
+            if recovered:
+                self._write_ledger()
+        return recovered
+
     def _normalize_post_execution_usage(self) -> None:
         """Estimate legacy post-provider rows whose exact request counters are missing."""
         entries = {entry.name: entry for entry in self.pool.models}
@@ -505,14 +599,14 @@ class RunState:
             logger.warning("estimated missing usage for %d post-provider rows", changed)
 
     def _normalize_post_execution_failures(self) -> None:
-        """Repair rows whose official reward was hidden by a post-execution failure."""
+        """Keep the earliest gradeable post-execution result and exclude its retries."""
         grouped: dict[tuple[str, str], list[ScenarioOutcome]] = defaultdict(list)
         for outcome in self.matrix.outcomes:
             grouped[(outcome.scenario_id, outcome.model)].append(outcome)
         changed = 0
         for outcomes in grouped.values():
             outcomes.sort(key=lambda outcome: outcome.attempt_number)
-            eligible: list[tuple[ScenarioOutcome, float]] = []
+            recoverable: dict[int, float] = {}
             for outcome in outcomes:
                 if (
                     outcome.reward is not None
@@ -524,34 +618,59 @@ class RunState:
                 ):
                     continue
                 artifact_dir = Path(outcome.artifact_dir)
-                trace_path = _trace_path(artifact_dir)
+                try:
+                    trace_path = _trace_path(artifact_dir)
+                except ValueError:
+                    continue
                 reward_path = artifact_dir / "verifier" / "reward.txt"
-                if not trace_path.is_file() or not reward_path.is_file():
+                if not trace_path.is_file():
                     continue
                 trace = _read_object(trace_path)
                 if not _provider_execution_started(trace):
                     continue
-                reward = float(reward_path.read_text(encoding="utf-8").strip())
-                eligible.append((outcome, reward))
-            canonical_exists = any(outcome.reward is not None for outcome in outcomes)
-            for outcome, reward in eligible:
-                if not canonical_exists:
-                    outcome.reward = reward
-                    outcome.success = reward == 1.0
-                    outcome.completion_status = (
-                        "scored_pass" if outcome.success else "scored_agent_failure"
+                if reward_path.is_file():
+                    recoverable[outcome.attempt_number] = float(
+                        reward_path.read_text(encoding="utf-8").strip()
                     )
-                    outcome.failure_class = "" if outcome.success else "agent_failure"
-                    outcome.error = None
-                    canonical_exists = True
-                else:
+                elif outcome.stop_reason == "provider_error":
+                    # A metered provider truncation is an agent failure before submission. It has
+                    # no verifier artifact by construction, but it is a definite zero rather than
+                    # an infrastructure unknown and therefore may not be retried.
+                    recoverable[outcome.attempt_number] = 0.0
+            candidates = [
+                outcome
+                for outcome in outcomes
+                if outcome.reward is not None or outcome.attempt_number in recoverable
+            ]
+            if not recoverable or not candidates:
+                continue
+            canonical = min(candidates, key=lambda outcome: outcome.attempt_number)
+            for outcome in outcomes:
+                if outcome is canonical:
+                    if outcome.reward is None:
+                        reward = recoverable[outcome.attempt_number]
+                        outcome.reward = reward
+                        outcome.success = reward == 1.0
+                        outcome.completion_status = (
+                            "scored_pass" if outcome.success else "scored_agent_failure"
+                        )
+                        outcome.failure_class = "" if outcome.success else "agent_failure"
+                        outcome.error = None
+                        changed += 1
+                elif outcome.attempt_number > canonical.attempt_number and (
+                    outcome.reward is not None or outcome.attempt_number in recoverable
+                ):
+                    outcome.reward = None
+                    outcome.success = False
                     outcome.completion_status = "excluded_protocol_retry"
                     outcome.failure_class = "protocol_retry_excluded"
                     outcome.error = (
-                        "excluded because a post-execution failure with an official reward is "
-                        "gradeable "
-                        "and the frozen protocol forbids retries"
+                        "excluded because an earlier post-execution result is gradeable and "
+                        "the frozen protocol forbids retries"
                     )
+                    changed += 1
+                else:
+                    continue
                 for ledger_row in self.ledger:
                     if (
                         ledger_row.get("scenario_id") == outcome.scenario_id
@@ -560,7 +679,6 @@ class RunState:
                     ):
                         ledger_row["completion_status"] = outcome.completion_status
                         ledger_row["failure_class"] = outcome.failure_class
-                changed += 1
         if changed:
             self.matrix.save(self.matrix_path)
             self._write_ledger()
@@ -724,6 +842,7 @@ def _run_cell(
     task_id: str,
     entry: PoolEntry,
     timeout_s: float,
+    verifier_timeout_s: float,
 ) -> ScenarioOutcome | None:
     with state.lock:
         if state.completed(benchmark, task_id, entry.name):
@@ -740,6 +859,7 @@ def _run_cell(
                 task_ids=[task_id],
                 entry=entry,
                 timeout_s=timeout_s,
+                verifier_timeout_s=verifier_timeout_s,
             )
         )
         cell = scorer.score(default_agent("coding-router-full")).cells[0]
@@ -803,6 +923,7 @@ def _preflight(root: Path, pool: ModelPool) -> None:
                 task_ids=task_ids,
                 entry=pool.models[0],
                 timeout_s=300.0,
+                verifier_timeout_s=DEFAULT_VERIFIER_TIMEOUT_S,
             )
         )
         expected = _expected_pins(manifest, benchmark)
@@ -944,7 +1065,9 @@ def _run(
     ceiling_usd: float,
     concurrency: int,
     timeout_s: float,
+    verifier_timeout_s: float,
     stage: str,
+    recover_stale_reservations: bool,
 ) -> None:
     for variable in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "E2B_API_KEY"):
         if not os.environ.get(variable):
@@ -963,6 +1086,9 @@ def _run(
             f"{E2B_ACCOUNT_CAP}-sandbox account cap"
         )
     state = RunState(root=full_root, pool=pool, ceiling_usd=ceiling_usd)
+    if recover_stale_reservations:
+        recovered = state.recover_stale_reservations()
+        logger.warning("recovered %d stale reservation(s)", recovered)
     stage_specs = _stage_cell_specs(root, pool, stage)
     cells = [
         (benchmark, task_id, entry)
@@ -985,6 +1111,7 @@ def _run(
                 task_id=task_id,
                 entry=entry,
                 timeout_s=timeout_s,
+                verifier_timeout_s=verifier_timeout_s,
             )
             futures[future] = (benchmark, task_id, entry.name)
             return True
@@ -1024,6 +1151,8 @@ def _run(
         {
             "updated_at": _utc_now(),
             "stage": stage,
+            "agent_timeout_s": timeout_s,
+            "verifier_timeout_s": verifier_timeout_s,
             "stage_cells_expected": len(stage_specs),
             "stage_gradeable_cells": sum(
                 row.reward is not None and (row.scenario_id, row.model) in stage_keys
@@ -1059,11 +1188,19 @@ def main() -> None:
     )
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout-s", type=float, default=900.0)
+    parser.add_argument(
+        "--verifier-timeout-s",
+        type=float,
+        default=DEFAULT_VERIFIER_TIMEOUT_S,
+    )
     parser.add_argument("--stage", choices=MATRIX_STAGES, default=FULL_STAGE)
     parser.add_argument("--preflight", action="store_true")
+    parser.add_argument("--recover-stale-reservations", action="store_true")
     args = parser.parse_args()
     if args.concurrency < 1:
         raise ValueError("--concurrency must be at least 1")
+    if args.verifier_timeout_s < 1:
+        raise ValueError("--verifier-timeout-s must be positive")
     freeze = _read_object(args.root / "freeze-summary.json")
     pool = load_pool(args.root / "pool.toml")
     if args.preflight:
@@ -1082,7 +1219,9 @@ def main() -> None:
         ceiling_usd=float(ceiling),
         concurrency=args.concurrency,
         timeout_s=args.timeout_s,
+        verifier_timeout_s=args.verifier_timeout_s,
         stage=args.stage,
+        recover_stale_reservations=args.recover_stale_reservations,
     )
 
 

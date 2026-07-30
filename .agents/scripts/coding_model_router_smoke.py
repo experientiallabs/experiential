@@ -156,6 +156,8 @@ def _failure_class(
     provider_execution_started: bool,
 ) -> str:
     if cell.infra_failed:
+        if stop_reason == "provider_error" and provider_execution_started:
+            return "agent_failure"
         return "infrastructure"
     if stop_reason == "provider_error" and provider_execution_started:
         return "agent_failure"
