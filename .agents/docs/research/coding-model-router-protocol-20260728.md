@@ -1,7 +1,9 @@
 # Execution-scored coding-model router protocol
 
 Status: protocol frozen; the original smoke is archived as invalid, the authorized replacement
-passed, and the 48-cell fast development tranche is complete pending diagnostic analysis.
+passed, and the 48-cell fast development tranche is complete. The full sweep was paused on the
+user-directed cross-dataset pivot. The follow-up is documented in
+`coding-model-router-cross-dataset-20260729.md`.
 
 Experiment ID: `coding-router-20260728`
 
