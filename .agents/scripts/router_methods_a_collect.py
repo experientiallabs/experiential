@@ -67,9 +67,11 @@ import uuid
 # claude-opus-5, which is newer than most cached docs and IS live (confirmed via models.list).
 # USD per 1M tokens. Reasoning/thinking tokens bill as OUTPUT on both providers.
 #
-# claude-opus-5 at 5/0.50/25/6.25 is corroborated by the published DeepSWE trial table: trial
-# abs-module-cache-flags__MPuAwjS reports 2,695,796 input (2,608,297 cached) + 40,951 output at
-# $2.87464975, which these rates reproduce to within a plausible ~19k cache-write split.
+# claude-opus-5 at 5/0.50/25/6.25 is corroborated EXACTLY by the published DeepSWE trial table:
+# trial abs-module-cache-flags__MPuAwjS reports 2,695,796 input (2,608,297 cached) + 40,951 output
+# at $2.87464975. Solving for the cache-write split gives 87,385 of the 87,499 uncached tokens
+# (99.9%) as writes, which reproduces $2.87464975 to the cent -- so both the rates and the
+# "uncached input is a cache write" assumption in Usage.cost are measured, not assumed.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -566,15 +568,33 @@ def outcome_of(run: RunOut, patch: str, g: dict) -> str:
 class Governor:
     """Wall-clock is usually the constraint, but this method has a hard $ cap, so cost is tracked
     centrally and jobs stop being ISSUED once the soft cap is crossed. Never kills work in flight:
-    a half-finished task is wasted money."""
+    a half-finished task is wasted money.
 
-    def __init__(self, cap: float):
-        self.cap, self.spent = cap, 0.0
+    Spend is banked in an APPEND-ONLY ledger, not by scanning runs/*.json. Those records get
+    deleted when a partial task is redone, and money already paid to the provider does not come
+    back with them -- banking from the records would silently walk the cap upward on every restart.
+    """
+
+    def __init__(self, cap: float, ledger: pathlib.Path):
+        self.cap = cap
+        self.ledger = ledger
         self._lk = threading.Lock()
+        self.spent = 0.0
+        if ledger.exists():
+            for line in ledger.read_text().splitlines():
+                try:
+                    self.spent += float(json.loads(line)["usd"])
+                except Exception:  # noqa: BLE001,S112
+                    continue
 
-    def add(self, usd: float) -> float:
+    def add(self, usd: float, what: str = "") -> float:
         with self._lk:
             self.spent += usd
+            with self.ledger.open("a") as fh:
+                fh.write(json.dumps({"usd": round(usd, 6), "what": what,
+                                     "ts": round(time.time(), 1)}) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())   # the cap must survive a hard kill
             return self.spent
 
     def ok(self) -> bool:
@@ -601,10 +621,35 @@ def static_key(task: str, arm_id: str) -> str:
     return f"{task}__static__{arm_id.replace('/', '_')}"
 
 
+def expected_keys(task_id: str) -> list[str]:
+    ks = [probe_key(task_id, d) for d in ("cheap", "top")]
+    ks += [fork_key(task_id, d, k, arm.id)
+           for d in ("cheap", "top") for k in K_VALUES for arm in FORK_ARMS]
+    ks.append(static_key(task_id, MID.id))
+    return ks
+
+
 def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor,
              limit: int, log) -> None:
-    """Probe both directions, snapshot at K=1 and K=2, fork every snapshot onto every arm."""
+    """Probe both directions, snapshot at K=1 and K=2, fork every snapshot onto every arm.
+
+    THE TASK IS THE ATOMIC UNIT OF RESUMABILITY. A probe cannot be resumed: its snapshot images
+    are deleted when the task finishes, and re-running it draws a DIFFERENT prefix, so any fork
+    record kept from a previous attempt would be conditioned on a prefix that no longer exists.
+    So a task is either complete and skipped entirely, or restarted from scratch with its partial
+    records discarded. At ~$44/task that is a cheap price for never mixing two prefixes.
+    """
     image, task_id, prompt, base = t["image"], t["task_id"], t["prompt"], t["base_commit"]
+    keys = expected_keys(task_id)
+    if all((out / f"{k}.json").exists() for k in keys):
+        log(f"skip {task_id}: all {len(keys)} records present")
+        return
+    stale = [out / f"{k}.json" for k in keys if (out / f"{k}.json").exists()]
+    if stale:
+        log(f"redo {task_id}: {len(stale)}/{len(keys)} partial records discarded "
+            f"(prefix cannot be resumed)")
+        for p in stale:
+            p.unlink(missing_ok=True)
     tests = tests_root / task_id / "tests"
     snaps: dict[tuple[str, int], str] = {}
     prefixes: dict[tuple[str, int], tuple[list[Step], list, str]] = {}
@@ -629,7 +674,7 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
                         return
                     rr = r.run(prompt, prefix=steps, native=native, same_model=True,
                                stop_after=1, deadline=time.time() + EPISODE_WALL_S)
-                    gov.add(rr.cost_usd)
+                    gov.add(rr.cost_usd, f"probe:{task_id}:{direction}:k{k}")
                     cum += rr.cost_usd
                     steps, native = rr.steps, rr.native
                     if rr.stop == "error":
@@ -669,7 +714,7 @@ def run_task(t: dict, tests_root: pathlib.Path, out: pathlib.Path, gov: Governor
                 rr = Runner(arm, box).run(prompt, prefix=pre, native=native if same else [],
                                           same_model=same,
                                           deadline=time.time() + EPISODE_WALL_S)
-                gov.add(rr.cost_usd)
+                gov.add(rr.cost_usd, key)
                 patch = "" if rr.stop == "error" else box.model_patch(base)
             g = ({} if rr.stop == "error"
                  else grade(image, tests, patch, f"v-{key}"[:60], limit))
@@ -720,13 +765,8 @@ def main() -> None:
         manifest = manifest[:a.tasks]
     tests_root = pathlib.Path(a.tests_root)
 
-    # Resume: re-bank what previous runs already spent so the cap is global, not per-process.
-    gov = Governor(a.budget)
-    for f in out.glob("*.json"):
-        try:
-            gov.add(json.loads(f.read_text()).get("cost_usd", 0.0) or 0.0)
-        except Exception:  # noqa: BLE001,S112
-            continue
+    # Resume: the ledger is the single source of truth for cumulative spend across restarts.
+    gov = Governor(a.budget, pathlib.Path(a.out).parent / "spend_ledger.jsonl")
     lk = threading.Lock()
 
     def log(msg: str) -> None:
