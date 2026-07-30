@@ -14,7 +14,14 @@ from typing import cast
 
 from wmo.core.files import write_text_atomic
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
-from wmo.providers.base import Message, Provider
+from wmo.providers.base import (
+    ChatRequest,
+    Message,
+    Provider,
+    ProviderKind,
+    ToolCallingProvider,
+    structured_token_usage,
+)
 from wmo.providers.pool import ModelPool, PoolEntry, load_pool, pool_provider
 
 logger = logging.getLogger("router-real-routerbench")
@@ -142,11 +149,25 @@ def _outcome(
 ) -> ScenarioOutcome:
     started = time.perf_counter()
     try:
-        completion = provider.complete(
-            "",
-            [Message(role="user", content=task["prompt"])],
-            max_tokens=1024,
-        )
+        if entry.kind is ProviderKind.ANTHROPIC and entry.reasoning_effort is not None:
+            structured = cast("ToolCallingProvider", provider).complete_chat(
+                ChatRequest.model_validate(
+                    {
+                        "messages": [{"role": "user", "content": task["prompt"]}],
+                        "max_completion_tokens": 1024,
+                    }
+                )
+            )
+            completion_text = structured.choices[0].message.content or ""
+            completion_usage = structured_token_usage(structured)
+        else:
+            completion = provider.complete(
+                "",
+                [Message(role="user", content=task["prompt"])],
+                max_tokens=1024,
+            )
+            completion_text = completion.text
+            completion_usage = completion.usage
     except Exception as exc:  # noqa: BLE001
         seconds = time.perf_counter() - started
         error = f"{type(exc).__name__}: {exc}"[:1000]
@@ -177,7 +198,7 @@ def _outcome(
             remeasured=attempt > 1,
         )
     seconds = time.perf_counter() - started
-    letter = _parse_letter(completion.text)
+    letter = _parse_letter(completion_text)
     reward = float(letter == task["answer"])
     return ScenarioOutcome(
         scenario_id=task["task_id"],
@@ -189,13 +210,13 @@ def _outcome(
         success=reward == 1.0,
         steps=1,
         stop_reason="exact_answer" if letter is not None else "unparsed_answer",
-        usage=completion.usage,
-        cost_usd=entry.cost_usd(completion.usage),
+        usage=completion_usage,
+        cost_usd=entry.cost_usd(completion_usage),
         call_seconds=[seconds],
         wall_seconds=seconds,
         completion_status="scored_pass" if reward == 1.0 else "scored_failure",
         failure_class="" if reward == 1.0 else "wrong_or_unparsed_answer",
-        replies=[completion.text],
+        replies=[completion_text],
         remeasured=attempt > 1,
     )
 

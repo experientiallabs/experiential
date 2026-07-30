@@ -1,4 +1,6 @@
-from router_real_analyze import _oracle_choices
+import pytest
+import router_real_analyze
+from router_real_analyze import _bootstrap, _oracle_choices
 from router_real_ids import canonical_tau2_scenario_id
 
 
@@ -27,3 +29,22 @@ def test_tau2_id_canonicalization_does_not_rewrite_colons_inside_task_id() -> No
         )
         == "telecom/[mms_issue]break_apn[PERSONA:Hard]"
     )
+
+
+def test_bootstrap_redraws_degenerate_zero_baseline_cost_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(router_real_analyze, "BOOTSTRAP_DRAWS", 200)
+    routed = [
+        {"scenario_id": "free", "group": "g", "reward": 0.0, "cost": 0.0},
+        {"scenario_id": "paid", "group": "g", "reward": 1.0, "cost": 2.0},
+    ]
+    baseline = [
+        {"scenario_id": "free", "group": "g", "reward": 0.0, "cost": 0.0},
+        {"scenario_id": "paid", "group": "g", "reward": 1.0, "cost": 1.0},
+    ]
+
+    result = _bootstrap([(routed, baseline)], seed=7)
+
+    assert result["draws"] == 200
+    assert result["rejected_zero_baseline_cost_draws"] > 0

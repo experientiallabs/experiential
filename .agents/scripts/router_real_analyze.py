@@ -330,13 +330,32 @@ def _bootstrap(
     seed: int,
 ) -> dict[str, object]:
     """Hierarchical paired cluster bootstrap over split seeds and benchmark groups."""
+    for _routed, baseline in paired:
+        gradeable_costs = [
+            _number(row["cost"])
+            for row in baseline
+            if row["reward"] is not None
+        ]
+        if not gradeable_costs or statistics.mean(gradeable_costs) <= 0:
+            raise ValueError(
+                "cost bootstrap requires positive observed baseline mean cost in every split"
+            )
     rng = random.Random(seed)
     draws_q: list[float] = []
     draws_c: list[float] = []
-    for _ in range(BOOTSTRAP_DRAWS):
+    rejected_zero_baseline_cost = 0
+    attempts = 0
+    max_attempts = BOOTSTRAP_DRAWS * 100
+    while len(draws_q) < BOOTSTRAP_DRAWS:
+        attempts += 1
+        if attempts > max_attempts:
+            raise RuntimeError(
+                "could not obtain enough bootstrap draws with positive baseline cost"
+            )
         sampled_seed_indexes = [rng.randrange(len(paired)) for _ in paired]
         seed_q: list[float] = []
         seed_c: list[float] = []
+        valid_cost_draw = True
         for seed_index in sampled_seed_indexes:
             routed, baseline = paired[seed_index]
             route_by_id = {str(row["scenario_id"]): row for row in routed}
@@ -361,13 +380,24 @@ def _bootstrap(
             base_rewards = [_number(base_by_id[sid]["reward"]) for sid in sampled_ids]
             route_costs = [_number(route_by_id[sid]["cost"]) for sid in sampled_ids]
             base_costs = [_number(base_by_id[sid]["cost"]) for sid in sampled_ids]
+            base_cost_mean = statistics.mean(base_costs)
+            if base_cost_mean <= 0:
+                valid_cost_draw = False
+                break
             seed_q.append(100 * (statistics.mean(route_rewards) - statistics.mean(base_rewards)))
-            seed_c.append(100 * (statistics.mean(route_costs) / statistics.mean(base_costs) - 1))
+            seed_c.append(100 * (statistics.mean(route_costs) / base_cost_mean - 1))
+        if not valid_cost_draw:
+            rejected_zero_baseline_cost += 1
+            continue
         draws_q.append(statistics.mean(seed_q))
         draws_c.append(statistics.mean(seed_c))
     return {
         "draws": BOOTSTRAP_DRAWS,
-        "method": "hierarchical paired cluster bootstrap: seeds then benchmark task groups",
+        "method": (
+            "hierarchical paired cluster bootstrap: seeds then benchmark task groups; "
+            "degenerate resamples with zero baseline mean cost are redrawn"
+        ),
+        "rejected_zero_baseline_cost_draws": rejected_zero_baseline_cost,
         "quality_points_ci95": [_percentile(draws_q, 2.5), _percentile(draws_q, 97.5)],
         "cost_percent_ci95": [_percentile(draws_c, 2.5), _percentile(draws_c, 97.5)],
         "quality_probability_gt_zero": sum(value > 0 for value in draws_q) / len(draws_q),
