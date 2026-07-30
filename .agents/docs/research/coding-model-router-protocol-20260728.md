@@ -3,8 +3,10 @@
 Status: protocol frozen; the original smoke is archived as invalid, the authorized replacement
 passed, and the 48-cell fast development tranche is complete. The full sweep was paused on the
 user-directed cross-dataset pivot. The follow-up is documented in
-`coding-model-router-cross-dataset-20260729.md`. A resumable Terminal-Bench completion stage now
-finishes the faster real benchmark before the SWE-bench cells without changing the full matrix.
+`coding-model-router-cross-dataset-20260729.md`. The later Terminal-Bench completion attempt was
+stopped when the user explicitly superseded this benchmark direction with DeepSWE-only
+optimization. It must not be resumed. The final DeepSWE result is documented in
+`coding-model-router-deepswe-20260729.md`.
 
 Experiment ID: `coding-router-20260728`
 
@@ -98,18 +100,17 @@ production baseline, lock a promotion configuration, touch any outer-heldout rew
 headline claim. The `full` stage resumes the same matrix and fills every remaining Terminal-Bench
 2 and SWE-bench Verified cell before nested fit-only selection begins.
 
-### Terminal-Bench completion stage
+### Superseded Terminal-Bench completion stage
 
-After the cross-dataset effort-router formulation is frozen, `terminal-full` fills every remaining
-Terminal-Bench 2 model-by-task cell across the complete frozen roster. It is an intermediate view
-of the real full matrix, not a new pilot: it uses the same task manifest, model pool, attempts,
-retry policy, scoring, ledger, artifact paths, and `full/outcomes.json`. Every completed row is
-reused byte-for-byte by the later `full` stage.
+After the cross-dataset effort-router formulation was frozen, `terminal-full` began filling the
+remaining Terminal-Bench 2 model-by-task cells. It used the same task manifest, model pool,
+attempts, retry policy, scoring, ledger, artifact paths, and `full/outcomes.json`.
 
-This ordering implements the user's direction to iterate on a faster execution benchmark before
-paying SWE-bench setup and repository-test latency. It does not provide final promotion evidence,
-change the 50/50 aggregate weight, open any heldout labels during execution, or remove any
-SWE-bench requirement from the frozen completion audit.
+The user then explicitly stated that Terminal-Bench was not scientifically interesting and
+directed all further optimization to DeepSWE v1.1. The process was interrupted, its partial
+artifacts were preserved, and no result from this incomplete stage supports the final claim. It
+must not be resumed or expanded. This section remains only as an audit record of the frozen
+protocol that was superseded.
 
 Frozen artifact SHA-256 values:
 
