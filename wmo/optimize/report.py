@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from wmo.optimize.compression import CompressingEmbedder
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import RoutingPolicy, select_model
+from wmo.providers.base import Embedder
 from wmo.providers.pool import Tier
 
 # What the v1 cost numbers assume; shipped verbatim in every report until the cache-aware cost
@@ -153,6 +154,7 @@ def build_report(
     baseline: str,
     endpoint: str,
     generated_at: str,
+    built: Embedder | None = None,
 ) -> ImprovementReport:
     """Aggregate `matrix` into the endpoint's improvement report under `policy`.
 
@@ -195,7 +197,13 @@ def build_report(
 
     # One embedder for the whole report: an azure spec builds an HTTP client per `build()`, and
     # a report routes every held-out scenario.
-    embedder = policy.embedder.build() if policy.kind != "static" else None
+    # `built` substitutes the embedding computation only (a reproduction serving recorded
+    # vectors); the policy's spec remains the recorded identity. See `fit_knn_artifact`.
+    embedder = (
+        built
+        if built is not None
+        else (policy.embedder.build() if policy.kind != "static" else None)
+    )
     if embedder is not None and policy.compression is not None:
         # Representation consistency, on the reporting side. A compressed endpoint's bank lives in
         # the geometry of compressed text, and serving compresses each request before the router

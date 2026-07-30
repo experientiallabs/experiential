@@ -45,6 +45,7 @@ from wmo.cli.harness_app import _explicit, harness_app, optimize_app
 from wmo.cli.ingest_cmd import ingest as _ingest_command
 from wmo.cli.model_roles import configured_role_configs, load_settings_or_abort
 from wmo.cli.platform_cmds import register as register_platform_commands
+from wmo.cli.reproduce_app import reproduce_app
 from wmo.cli.runs_app import runs_app
 from wmo.cli.ui import (
     BuildParams,
@@ -169,6 +170,7 @@ app.add_typer(scenarios_app, name="scenarios")
 app.add_typer(harness_app, name="harness")
 app.add_typer(optimize_app, name="optimize")
 app.add_typer(runs_app, name="runs")
+app.add_typer(reproduce_app, name="reproduce")
 app.command("ingest")(_ingest_command)
 register_platform_commands(app)
 register_agent_session_commands(app)

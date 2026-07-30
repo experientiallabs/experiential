@@ -62,13 +62,13 @@ saw. Anchor: fable-5 (the best-single check, gpt-5.5, follows).
 
 | Fit | Traffic mix | Quality vs fable-5 | Cost vs fable-5 | p50 latency |
 |---|---|---|---|---|
-| Frontier-pinned (`--fallback gpt-5.5`) | gpt-5.5 38.1%, sonnet-5 32.8%, fable-5 23.1%, opus-4-8 5.0%, other 1.1% | 0.978 vs 0.897 (+8.1 pt) | $0.0023 vs $0.0033 (-29.9%) | 1.76s vs 3.23s (-45.7%) |
+| Frontier-pinned (`--fallback gpt-5.5`) | gpt-5.5 38.1%, sonnet-5 32.8%, fable-5 23.1%, opus-4-8 5.0%, other 1.1% | 0.978 vs 0.897 (+8.1 pt) | $0.0024 vs $0.0033 (-29.4%) | 1.78s vs 3.23s (-45.1%) |
 | Cost-leaning (fallback auto = sonnet-5) | sonnet-5 77.5%, fable-5 16.1%, gpt-5.5 3.6%, other 2.7% | 0.953 vs 0.897 (+5.6 pt) | $0.0012 vs $0.0033 (-64.0%) | 1.42s (-56.1%) |
 
 Against the strongest single model in the pool instead of the anchor - the comparison an
 expert will ask for, because fable-5 is dominated on this workload and makes the columns
 above read generous - the frontier-pinned fit measures **0.978 vs gpt-5.5's 0.969
-(+0.84 pt) at -35.0% cost** on the same 360 held-out scenarios. The original promotion gate
+(+0.84 pt) at -33.8% cost** on the same 360 held-out scenarios. The original promotion gate
 for this policy family (five seeded 70/30 splits, paired per seed) was re-run on 2026-07-28
 and passed, reproducing its recorded per-seed numbers exactly: +1.04 pt mean over the best
 single model at -26.6% cost, 5 of 5 seeds.
@@ -85,6 +85,18 @@ project's own 9-model pool, not the published RouterBench model grid, and the po
 score within a few points of each other - the regime most favorable to a cost knob. A
 shuffled-label control still cut cost 38% past the balanced dial, so deep-dial savings do
 not depend on the neighbor evidence being informative (see
-[the dial reference](../reference/cost_quality_dial.md)). The `ours9` matrix itself is not
-yet published with the repo; until it is, these exact numbers reproduce only in-house,
-while the four commands above reproduce on any matrix in the documented shape.
+[the dial reference](../reference/cost_quality_dial.md)). The quoted numbers are the
+deterministic cached-vector protocol's (re-embedding live reproduces accuracy exactly and
+moves cost/latency about 1% through embedding-API nondeterminism on near-tie neighbors).
+
+## Reproduce it with one command
+
+```bash
+uv run wmo reproduce run routerbench
+```
+
+Downloads the published matrix and recorded embedding vectors
+(`experiential-labs/wmo-routerbench-ours9` on Hugging Face), refits the policy, rebuilds
+both held-out reports offline - no credentials, no spend - and compares every number above
+against the run, field by field, at bit-exact precision. Exit code 0 is REPRODUCED;
+`verdict.json` carries the row-by-row comparison either way.
