@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from llm_waterfall.pricing import ModelPrice, cost_usd, price_for
 from llm_waterfall.types import TokenUsage
 
@@ -58,3 +60,19 @@ def test_no_zero_price_placeholder_rows() -> None:
 
     assert price_for("qwen3-coder") is None
     assert all(p.input_per_mtok > 0 for p in _PRICES.values())
+
+
+def test_cost_prices_cache_legs_at_their_tiers() -> None:
+    """100 fresh + 900 cache-read tokens on fable-5: reads bill at 0.1x."""
+    usage = TokenUsage(input_tokens=1_000, output_tokens=0, cached_input_tokens=900)
+
+    # 100 * 10 + 900 * 1.0 per MTok = 0.0019
+    assert cost_usd("claude-fable-5", usage) == pytest.approx(0.0019)
+
+
+def test_unknown_cache_tier_bills_the_full_input_rate_never_free() -> None:
+    """A row without tiers charges cache legs at the input rate."""
+    prices = {"custom": ModelPrice(input_per_mtok=2.0, output_per_mtok=4.0)}
+    usage = TokenUsage(input_tokens=1_000, cached_input_tokens=600, cache_write_input_tokens=200)
+
+    assert cost_usd("custom", usage, prices) == pytest.approx(1_000 * 2.0 / 1_000_000)

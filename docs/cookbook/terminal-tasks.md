@@ -52,7 +52,7 @@ fable-5. Provenance label on every number: `measured, wm_simulated`.
 | Every detent, 0 through 1 | sonnet-5 100% | -0.4 pt (paired CI touches zero: within noise) | $0.011 vs $0.035 (-69.4%, CI -77.3..-60.6) | -50.6% |
 
 This workload's lesson is the constant policy. The evidence finds one model (sonnet-5) at
-quality parity with the anchor at roughly a quarter of the effective cost and half the
+quality parity with the anchor at less than a third of the effective cost and half the
 latency, and every cheaper candidate fails enough tasks that its cost per COMPLETED task is
 higher, not lower. So the dial saturates immediately: max savings and balanced are the same
 policy, and the router holds it at every detent. Best single model on the final matrix

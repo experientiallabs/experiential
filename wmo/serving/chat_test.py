@@ -360,7 +360,7 @@ def test_abandoned_stream_still_records_metering(tmp_path: Path) -> None:
             max_tokens: int = 8192,
         ) -> Iterator[StreamChunk]:
             for _ in range(1_000_000):  # far more than any client buffer; never finishes
-                yield StreamChunk(delta="x")
+                yield StreamChunk(delta="xxxxxxxx")
 
     log_path = tmp_path / "requests.jsonl"
     runtime = EndpointRuntime(
@@ -376,7 +376,12 @@ def test_abandoned_stream_still_records_metering(tmp_path: Path) -> None:
     # http.disconnect, which is what starlette listens for to cancel a StreamingResponse
     # and close its body iterator (GeneratorExit in the generator).
     body = json.dumps(
-        {"model": "tau-bench", "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+        {
+            "model": "tau-bench",
+            "stream": True,
+            # Long enough that the disconnect path's chars/4 input estimate is nonzero.
+            "messages": [{"role": "user", "content": "summarize this for me " * 8}],
+        }
     ).encode()
     state = {"request_sent": False}
 
@@ -409,6 +414,12 @@ def test_abandoned_stream_still_records_metering(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert rows[0]["status"] == "error"
     assert "disconnected" in rows[0]["error_message"]
+    # The provider's exact usage rides only the terminal chunk the client never took, so
+    # the row carries a chars/4 estimate of the partial generation and says so. Zero here
+    # was the old behavior: the whole abandoned generation billed as free.
+    assert rows[0]["input_tokens"] > 0
+    assert rows[0]["output_tokens"] > 0
+    assert "estimate" in rows[0]["error_message"]
 
 
 def test_create_app_with_injected_policies_and_no_artifact_dirs(tmp_path: Path) -> None:
@@ -2982,13 +2993,10 @@ def test_config_omits_pareto_for_artifacts_that_predate_it(tmp_path: Path) -> No
     assert body["pareto"] is None
 
 
-def test_structured_usage_reads_anthropic_shaped_cache_keys() -> None:
-    """Anthropic/Bedrock report the cache split as TOP-LEVEL usage keys.
-
-    Reading only OpenAI's prompt_tokens_details priced every cached agent-loop
-    token at the full input rate (measured 5.8x overcharge on a 9k-cached
-    turn), and dropped cache writes' 1.25x tier entirely.
-    """
+def test_structured_usage_prices_the_anthropic_translators_emission() -> None:
+    """The Anthropic/Bedrock translators emit the OpenAI details shape plus the
+    Anthropic write field; serving must price both cache legs from it (missing
+    them measured a 5.8x overcharge on a 9k-cached agent turn)."""
     from wmo.serving.chat import _structured_usage
 
     response = ChatResponse.model_validate(
@@ -3004,6 +3012,7 @@ def test_structured_usage_reads_anthropic_shaped_cache_keys() -> None:
             "usage": {
                 "prompt_tokens": 9600,
                 "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 9000},
                 "cache_read_input_tokens": 9000,
                 "cache_creation_input_tokens": 500,
             },

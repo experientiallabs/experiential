@@ -130,30 +130,37 @@ def converse_response(raw: object, model: str) -> ChatResponse:
         message["tool_calls"] = tool_calls
     usage = response.get("usage")
     usage_data = usage if isinstance(usage, dict) else {}
-
-    # Converse reports cache reads/writes BESIDE inputTokens (which excludes them), the
-    # same shape as the direct Anthropic API. Fold them into the total and carry the
-    # split under the keys serving's _structured_usage reads; dropping them priced every
-    # cached token at the full input rate (the Anthropic path's 5.8x-overcharge bug,
-    # mirrored here).
-    def _count(key: str) -> int:
-        value = usage_data.get(key, 0)
-        return value if isinstance(value, int) else 0
-
-    cache_read = _count("cacheReadInputTokens")
-    cache_write = _count("cacheWriteInputTokens")
+    # Converse reports `inputTokens` EXCLUDING the cached prefix, so the two
+    # cache legs must be added back or every cached call under-reports its
+    # input by the whole prefix (the `complete` path in bedrock.py does the
+    # same normalization). The read leg rides the OpenAI-compatible
+    # `prompt_tokens_details.cached_tokens` shape; the write leg rides the
+    # Anthropic-style `cache_creation_input_tokens` field, so both price at
+    # their cache tiers.
+    cache_read = _token_count(usage_data.get("cacheReadInputTokens"))
+    cache_write = _token_count(usage_data.get("cacheWriteInputTokens"))
     return ChatResponse.model_validate(
         {
             "model": model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
             "usage": {
-                "prompt_tokens": _count("inputTokens") + cache_read + cache_write,
-                "completion_tokens": _count("outputTokens"),
+                "prompt_tokens": _token_count(usage_data.get("inputTokens"))
+                + cache_read
+                + cache_write,
+                "completion_tokens": _token_count(usage_data.get("outputTokens")),
+                "prompt_tokens_details": {"cached_tokens": cache_read},
+                # Raw top-level read count alongside, mirroring the direct
+                # Anthropic translator, so both wire shapes carry the split.
                 "cache_read_input_tokens": cache_read,
                 "cache_creation_input_tokens": cache_write,
             },
         }
     )
+
+
+def _token_count(value: object) -> int:
+    """A Converse usage counter, or 0 for an absent/malformed one."""
+    return value if isinstance(value, int) else 0
 
 
 def _chat_text(content: JsonValue) -> str:

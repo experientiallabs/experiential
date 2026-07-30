@@ -121,3 +121,93 @@ def test_structured_response_preserves_tool_calls_and_usage() -> None:
     assert response.choices[0].message.tool_calls is not None
     assert response.choices[0].message.tool_calls[0].function.name == "bash"
     assert response.token_usage().input_tokens == 10
+
+
+def test_token_usage_projection_keeps_the_cached_subset() -> None:
+    """`prompt_tokens_details.cached_tokens` survives into TokenUsage, clamped to the total."""
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            },
+        }
+    )
+
+    usage = response.token_usage()
+    assert usage.input_tokens == 1000
+    assert usage.cached_input_tokens == 900
+    assert usage.cache_write_input_tokens == 0
+
+    overclaimed = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            },
+        }
+    )
+    assert overclaimed.token_usage().cached_input_tokens == 100
+
+
+def test_token_usage_projection_keeps_the_cache_write_subset() -> None:
+    """Anthropic-style cache_creation_input_tokens prices at the write premium."""
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 900},
+                "cache_creation_input_tokens": 50,
+            },
+        }
+    )
+
+    usage = response.token_usage()
+    assert usage.cached_input_tokens == 900
+    assert usage.cache_write_input_tokens == 50
+
+
+def test_null_usage_fields_from_sdk_dumps_never_fail_the_response() -> None:
+    """openai-python model_dump emits explicit nulls; they read as no split."""
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "prompt_tokens_details": {"audio_tokens": None, "cached_tokens": None},
+                "cache_creation_input_tokens": None,
+            },
+        }
+    )
+
+    usage = response.token_usage()
+    assert usage.input_tokens == 10
+    assert usage.cached_input_tokens == 0
+    assert usage.cache_write_input_tokens == 0
+    # exclude_none keeps the write key OFF the wire when there was no write.
+    wire_usage = response.wire_payload().get("usage")
+    assert isinstance(wire_usage, dict)
+    assert "cache_creation_input_tokens" not in wire_usage
+
+
+def test_an_unreadable_details_blob_costs_the_split_not_the_request() -> None:
+    """A provider emitting a nonsense prompt_tokens_details still parses."""
+    response = ChatResponse.model_validate(
+        {
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "prompt_tokens_details": "cached",
+            },
+        }
+    )
+
+    assert response.token_usage().cached_input_tokens == 0

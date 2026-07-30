@@ -118,6 +118,33 @@ def test_matrix_reproduction_is_deterministic_and_bit_exact(tmp_path: Path) -> N
     assert verdict["benchmark"] == "fixture"
 
 
+def test_rerun_into_the_same_out_dir_survives_a_changed_fit(tmp_path: Path) -> None:
+    """A rerun must not abort on the previous run's dial snapshot (stale by construction)."""
+    headline = _measure(tmp_path)
+    manifest = _manifest(
+        [
+            {
+                "label": "routed vs pricey",
+                "baseline": "pricey",
+                "accuracy": headline["accuracy"],
+                "cost_per_run_usd": headline["cost_per_run_usd"],
+            }
+        ]
+    )
+    out = tmp_path / "run"
+    assert run_reproduction(manifest, out_dir=out, data_dir=tmp_path / "data").reproduced
+    # Change the matrix bytes (a new episode on one scenario), so the refit is a DIFFERENT
+    # fit and the first run's snapshot no longer describes it.
+    snapshot = tmp_path / "data"
+    matrix = json.loads((snapshot / "matrix.json").read_text(encoding="utf-8"))
+    extra = dict(matrix["outcomes"][0])
+    extra["episode"] = 1
+    matrix["outcomes"].append(extra)
+    (snapshot / "matrix.json").write_text(json.dumps(matrix), encoding="utf-8")
+    result = run_reproduction(manifest, out_dir=out, data_dir=snapshot)
+    assert result.rows  # completed and compared; no snapshot abort
+
+
 def test_divergence_is_reported_not_absorbed(tmp_path: Path) -> None:
     headline = _measure(tmp_path)
     manifest = _manifest(
@@ -179,6 +206,42 @@ def test_cached_embedder_refuses_unseen_text_and_wrong_shape(tmp_path: Path) -> 
     np.save(snapshot / "short.npy", short)
     with pytest.raises(ValueError, match="different matrix"):
         CachedTaskEmbedder(matrix, snapshot / "short.npy")
+
+
+def test_a_second_concurrent_run_into_the_same_out_dir_is_refused(tmp_path: Path) -> None:
+    """The lock makes the shared-out-dir race loud instead of interleaving fit state."""
+    headline = _measure(tmp_path)
+    manifest = _manifest(
+        [
+            {
+                "label": "routed vs pricey",
+                "baseline": "pricey",
+                "accuracy": headline["accuracy"],
+                "cost_per_run_usd": headline["cost_per_run_usd"],
+            }
+        ]
+    )
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / ".reproduce.lock").touch()  # a live (or dead) sibling run
+    with pytest.raises(RuntimeError, match="already running"):
+        run_reproduction(manifest, out_dir=out, data_dir=tmp_path / "data")
+    (out / ".reproduce.lock").unlink()
+    assert run_reproduction(manifest, out_dir=out, data_dir=tmp_path / "data").reproduced
+
+
+def test_cached_embedder_refuses_duplicate_task_texts(tmp_path: Path) -> None:
+    """Two scenarios with identical task text cannot share a text-keyed vector row silently."""
+    snapshot = tmp_path / "data"
+    snapshot.mkdir()
+    matrix = _matrix_dict(n_scenarios=4)
+    for outcome in matrix["outcomes"]:
+        if outcome["scenario_id"] == "s1":
+            outcome["task"] = "task text 0"  # collides with s0's text
+    (snapshot / "matrix.json").write_text(json.dumps(matrix), encoding="utf-8")
+    np.save(snapshot / "vectors.npy", np.zeros((4, 8)))
+    with pytest.raises(ValueError, match="share task text"):
+        CachedTaskEmbedder(OutcomeMatrix.load(snapshot / "matrix.json"), snapshot / "vectors.npy")
 
 
 def test_pin_manifest_replays_without_embeddings_and_reports_the_pin(tmp_path: Path) -> None:

@@ -1263,7 +1263,12 @@ def _run_stages(
                 record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
-        emitter.stage_completed(record, lifetime_spend_usd=manifest.lifetime_spend_usd)
+        lifetime_candidate_usd, lifetime_wm_usd = manifest.lifetime_split
+        emitter.stage_completed(
+            record,
+            lifetime_candidate_usd=lifetime_candidate_usd,
+            lifetime_wm_usd=lifetime_wm_usd,
+        )
     return manifest
 
 

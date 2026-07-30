@@ -349,3 +349,43 @@ def test_a_prior_that_was_all_compressor_supplies_no_ratio() -> None:
         1.0, _sweep_record(candidate=0.5, world_model=9.0, compressor=0.5)
     )
     assert projection.basis is None and projection.world_model_usd == 0.0
+
+
+def test_lifetime_split_attributes_presplit_remainder_to_the_candidate_leg() -> None:
+    """Manifests written before the split fields reported the combined total as
+    the candidate figure; the split keeps doing that for the untracked
+    remainder so a resumed run's platform row never jumps."""
+    legacy = RunManifest(world_model="tau-bench", lifetime_spend_usd=12.5)
+
+    assert legacy.lifetime_split == (12.5, 0.0)
+
+    tracked = RunManifest(
+        world_model="tau-bench",
+        lifetime_spend_usd=12.5,
+        lifetime_candidate_usd=9.25,
+        lifetime_wm_usd=3.25,
+    )
+    assert tracked.lifetime_split == (9.25, 3.25)
+
+
+def test_with_record_accumulates_both_lifetime_legs() -> None:
+    """Each stage's spend lands on its own lifetime leg, and re-swept stages
+    keep their replaced spend counted (money left the account either way)."""
+    record = StageRecord(
+        stage=Stage.SWEEP,
+        fingerprint={},
+        artifact_path="matrix.json",
+        artifact_identity="a",
+        completed_at="2026-07-29T00:00:00+00:00",
+        spend_usd=2.0,
+        compressor_spend_usd=0.5,
+        world_model_spend_usd=7.0,
+    )
+    manifest = RunManifest(world_model="tau-bench").with_record(record)
+    twice = manifest.with_record(record)
+
+    assert manifest.lifetime_candidate_usd == 2.0
+    assert manifest.lifetime_wm_usd == 7.0
+    assert manifest.lifetime_split == (2.0, 7.0)
+    assert twice.lifetime_split == (4.0, 14.0)
+    assert twice.lifetime_spend_usd == 18.0

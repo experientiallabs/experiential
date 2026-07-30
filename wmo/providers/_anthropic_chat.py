@@ -251,6 +251,11 @@ def messages_response(raw: object, model: str) -> ChatResponse:
             "usage": {
                 "prompt_tokens": prompt_tokens + cache_read + cache_write,
                 "completion_tokens": _int_field(usage, "output_tokens"),
+                # The read leg rides the OpenAI-compatible details shape (what
+                # ChatResponse.token_usage prices from); the write leg rides the
+                # Anthropic-style field the same parser types. The raw top-level
+                # read count stays alongside for consumers of the wire shape.
+                "prompt_tokens_details": {"cached_tokens": cache_read},
                 "cache_read_input_tokens": cache_read,
                 "cache_creation_input_tokens": cache_write,
             },

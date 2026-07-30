@@ -324,9 +324,13 @@ def _resolve_student(
 ) -> str:
     """The model distillation would train: the named one, else the cheapest measured one.
 
-    A price tie is broken toward the BETTER model (then the name). That is the conservative
-    direction: the better of two equally cheap students makes the gap harder to prove, so a tie
-    can never be resolved into a training run that a different tie-break would have refused.
+    A price tie is broken toward the BETTER model (then the name), and "better" is judged
+    over the scenarios ALL tied candidates share, so an easy private subset cannot flatter one
+    of them (the same paired-first rule every gain in this module follows). When the tied
+    candidates share nothing, the name breaks the tie: deterministic, and honest about there
+    being no evidence to prefer either. The conservative direction stands: the better of two
+    equally cheap students makes the gap harder to prove, so a tie can never be resolved into
+    a training run that a different tie-break would have refused.
     """
     if student is not None:
         if student not in means:
@@ -347,7 +351,12 @@ def _resolve_student(
         return sorted(measured)[0]
     cheapest = min(priced)
     tied = [name for name in measured if prices[name] == cheapest]
-    return sorted(tied, key=lambda name: (-fmean(means[name].values()), name))[0]
+    if len(tied) == 1:
+        return tied[0]
+    shared = set.intersection(*(set(means[name]) for name in tied))
+    if not shared:
+        return sorted(tied)[0]
+    return sorted(tied, key=lambda name: (-fmean(means[name][sid] for sid in shared), name))[0]
 
 
 def _gain_row(
