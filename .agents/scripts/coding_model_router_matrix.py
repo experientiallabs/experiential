@@ -12,7 +12,7 @@ import os
 import shutil
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1095,50 +1095,13 @@ def _run(
         for benchmark, task_id, entry in stage_specs
         if not state.completed(benchmark, task_id, entry.name)
     ]
-    cell_iterator = iter(cells)
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures: dict[Future[ScenarioOutcome | None], tuple[str, str, str]] = {}
-
-        def submit_next() -> bool:
-            try:
-                benchmark, task_id, entry = next(cell_iterator)
-            except StopIteration:
-                return False
-            future = executor.submit(
-                _run_cell,
-                state,
-                benchmark=benchmark,
-                task_id=task_id,
-                entry=entry,
-                timeout_s=timeout_s,
-                verifier_timeout_s=verifier_timeout_s,
-            )
-            futures[future] = (benchmark, task_id, entry.name)
-            return True
-
-        for _ in range(concurrency):
-            if not submit_next():
-                break
-        budget_exhausted = False
-        while futures:
-            done, _ = wait(futures, return_when=FIRST_COMPLETED)
-            for future in done:
-                benchmark, task_id, arm = futures.pop(future)
-                try:
-                    future.result()
-                except BudgetExhausted as error:
-                    logger.warning("%s", error)
-                    budget_exhausted = True
-                except Exception:
-                    logger.exception(
-                        "cell failed unexpectedly: %s x %s x %s",
-                        benchmark,
-                        task_id,
-                        arm,
-                    )
-                    raise
-                if not budget_exhausted:
-                    submit_next()
+    deferred_cells = _run_cells(
+        state,
+        cells=cells,
+        concurrency=concurrency,
+        timeout_s=timeout_s,
+        verifier_timeout_s=verifier_timeout_s,
+    )
     spent, reserved = state.spent_and_reserved()
     stage_keys = {
         (f"{benchmark}:{task_id}", entry.name) for benchmark, task_id, entry in stage_specs
@@ -1172,11 +1135,87 @@ def _run(
             "estimated_usage_cells": sum(
                 row.usage_accounting == "estimated" for row in state.matrix.outcomes
             ),
+            "deferred_budget_cells": deferred_cells,
             "outstanding_reservations_usd": reserved,
             "spend_ceiling_usd": ceiling_usd,
             "remaining_accounted_budget_usd": ceiling_usd - spent - reserved,
         },
     )
+
+
+def _run_cells(
+    state: RunState,
+    *,
+    cells: list[tuple[str, str, PoolEntry]],
+    concurrency: int,
+    timeout_s: float,
+    verifier_timeout_s: float,
+) -> int:
+    """Run cells while treating in-flight reservation pressure as temporary.
+
+    A reservation can fail even when realized spend remains far below the ceiling because other
+    cells conservatively hold USD 500 each. The blocked cell stays pending until a completed
+    future releases reservation headroom. If the same condition occurs with no work in flight,
+    the ceiling is genuinely exhausted for the next cell and the stage stops without spinning.
+    """
+    pending = deque(cells)
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures: dict[
+            Future[ScenarioOutcome | None],
+            tuple[str, str, PoolEntry],
+        ] = {}
+
+        def submit_next() -> bool:
+            if not pending:
+                return False
+            benchmark, task_id, entry = pending.popleft()
+            future = executor.submit(
+                _run_cell,
+                state,
+                benchmark=benchmark,
+                task_id=task_id,
+                entry=entry,
+                timeout_s=timeout_s,
+                verifier_timeout_s=verifier_timeout_s,
+            )
+            futures[future] = (benchmark, task_id, entry)
+            return True
+
+        for _ in range(concurrency):
+            if not submit_next():
+                break
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            released_headroom = False
+            for future in done:
+                benchmark, task_id, entry = futures.pop(future)
+                try:
+                    future.result()
+                except BudgetExhausted as error:
+                    logger.warning("%s", error)
+                    pending.appendleft((benchmark, task_id, entry))
+                except Exception:
+                    logger.exception(
+                        "cell failed unexpectedly: %s x %s x %s",
+                        benchmark,
+                        task_id,
+                        entry.name,
+                    )
+                    raise
+                else:
+                    released_headroom = True
+            if released_headroom:
+                while len(futures) < concurrency:
+                    if not submit_next():
+                        break
+            elif not futures and pending:
+                logger.warning(
+                    "budget ceiling leaves %d cell(s) deferred with no in-flight "
+                    "reservation available to release",
+                    len(pending),
+                )
+                break
+    return len(pending)
 
 
 def main() -> None:

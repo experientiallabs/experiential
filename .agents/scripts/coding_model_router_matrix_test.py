@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections import Counter
 from pathlib import Path
 
+import coding_model_router_matrix as matrix_runner
 import pytest
 from coding_model_router_analyze import _develop
 from coding_model_router_matrix import (
@@ -26,6 +29,7 @@ from coding_model_router_matrix import (
     _fast_dev_task_ids,
     _job_template,
     _outcome,
+    _run_cells,
     _stage_cell_specs,
 )
 
@@ -263,6 +267,91 @@ def test_explicit_stale_reservation_recovery_preserves_debit_and_frees_id(
         CELL_SPEND_RESERVATION_USD,
         CELL_SPEND_RESERVATION_USD,
     )
+
+
+def test_scheduler_retries_temporary_reservation_pressure_after_headroom_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    pool = _pool()
+    state = RunState(root=root / "full", pool=pool, ceiling_usd=20_000.0)
+    entry = pool.models[0]
+    calls: Counter[str] = Counter()
+    completed: list[str] = []
+    first_budget_check = threading.Event()
+
+    def fake_run_cell(
+        state: RunState,
+        *,
+        benchmark: str,
+        task_id: str,
+        entry: PoolEntry,
+        timeout_s: float,
+        verifier_timeout_s: float,
+    ) -> None:
+        del state, benchmark, entry, timeout_s, verifier_timeout_s
+        calls[task_id] += 1
+        if task_id == "task-00":
+            assert first_budget_check.wait(timeout=1.0)
+        elif task_id == "task-01" and calls[task_id] == 1:
+            first_budget_check.set()
+            raise BudgetExhausted("temporary in-flight reservation pressure")
+        completed.append(task_id)
+
+    monkeypatch.setattr(matrix_runner, "_run_cell", fake_run_cell)
+    deferred = _run_cells(
+        state,
+        cells=[
+            (FAST_DEV_BENCHMARK, "task-00", entry),
+            (FAST_DEV_BENCHMARK, "task-01", entry),
+            (FAST_DEV_BENCHMARK, "task-02", entry),
+        ],
+        concurrency=2,
+        timeout_s=1.0,
+        verifier_timeout_s=1.0,
+    )
+
+    assert calls == Counter({"task-01": 2, "task-00": 1, "task-02": 1})
+    assert sorted(completed) == ["task-00", "task-01", "task-02"]
+    assert deferred == 0
+
+
+def test_scheduler_stops_when_budget_blocks_with_nothing_in_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _root(tmp_path)
+    pool = _pool()
+    state = RunState(root=root / "full", pool=pool, ceiling_usd=20_000.0)
+    entry = pool.models[0]
+    calls = 0
+
+    def fake_run_cell(
+        state: RunState,
+        *,
+        benchmark: str,
+        task_id: str,
+        entry: PoolEntry,
+        timeout_s: float,
+        verifier_timeout_s: float,
+    ) -> None:
+        nonlocal calls
+        del state, benchmark, task_id, entry, timeout_s, verifier_timeout_s
+        calls += 1
+        raise BudgetExhausted("true ceiling exhaustion")
+
+    monkeypatch.setattr(matrix_runner, "_run_cell", fake_run_cell)
+    deferred = _run_cells(
+        state,
+        cells=[(FAST_DEV_BENCHMARK, "task-00", entry)],
+        concurrency=1,
+        timeout_s=1.0,
+        verifier_timeout_s=1.0,
+    )
+
+    assert calls == 1
+    assert deferred == 1
 
 
 @pytest.mark.parametrize(

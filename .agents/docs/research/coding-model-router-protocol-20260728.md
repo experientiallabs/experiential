@@ -256,6 +256,13 @@ with recorded model execution is now a definite agent-failure zero. The earliest
 canonical and any later retry is excluded, so provider truncation cannot benefit from
 infrastructure retry selection.
 
+The first hardened resume exposed temporary budget backpressure rather than real ceiling
+exhaustion. Thirty-one concurrent cells held conservative USD 500 reservations, so the
+thirty-second reservation could not fit even though completed cells would release nearly all of
+that headroom. The scheduler now defers the blocked cell and refills the queue only after an
+in-flight completion releases a reservation. It stops only when a reservation is blocked with no
+work in flight, which proves that no future completion can create headroom.
+
 ## Single smoke gate
 
 The only paid pre-sweep gate has exactly four cells:
