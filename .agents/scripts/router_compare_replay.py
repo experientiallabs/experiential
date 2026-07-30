@@ -135,8 +135,26 @@ def main() -> None:
     fallback_model = fallback_spec["model"].removeprefix("claude-")
     fallback = f"{fallback_model}@{fallback_spec['effort']}"
 
-    arms = [entry.name for entry in matrix.pool]
+    cells = _cells(matrix)
     scenarios = matrix.scenario_ids()
+    # An arm with NO scored rows anywhere is unbuyable on this corpus (haiku-4-5 has no
+    # effort dial upstream: "adaptive thinking is not supported on this model"). Neither
+    # router can learn anything about it, and its zero-cost rows would sit first in the
+    # cheapest-first scan, so it leaves the comparison entirely, loudly.
+    arms = []
+    for entry in matrix.pool:
+        if any(r.reward is not None for s in scenarios for r in cells.get((entry.name, s), [])):
+            arms.append(entry.name)
+        else:
+            logger.warning("arm %s has zero scored rows; dropped from the comparison", entry.name)
+    # Drop unscored placeholder rows for excluded arms AND unscored rows generally from the
+    # matrix the OUR-side fit sees: fit_knn_policy reads matrix.outcomes directly.
+    matrix = matrix.model_copy(
+        update={
+            "outcomes": [r for r in matrix.outcomes if r.model in set(arms)],
+            "pool": [e for e in matrix.pool if e.name in set(arms)],
+        }
+    )
     cells = _cells(matrix)
     task_text = {row.scenario_id: row.task for row in matrix.outcomes}
     assert fallback in arms, f"their fallback arm {fallback!r} is not in this pool: {arms}"
