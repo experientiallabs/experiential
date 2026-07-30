@@ -23,7 +23,9 @@ import importlib.util
 import json
 import logging
 import math
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
@@ -36,8 +38,6 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-
-from wmo.core.files import write_text_atomic
 
 logger = logging.getLogger("coding-model_router_autoresearch")
 
@@ -169,7 +169,17 @@ def _as_float(value: object) -> float:
 
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+    content = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(content)
+        temporary = Path(handle.name)
+    os.replace(temporary, path)
 
 
 def _append_jsonl(path: Path, value: object) -> None:
