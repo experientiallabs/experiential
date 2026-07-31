@@ -7,8 +7,10 @@ the original heldout outcomes. DeepSWE artifacts are outside this module.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -19,16 +21,21 @@ from coding_model_router_bigcodebench_fit import (
     CandidateMetric,
     FitData,
     PolicyValue,
+    SelectionLock,
     TaskSplit,
     cost_only_choices,
     evaluate_choices,
     feature_matrix,
     fit_native_knn_replay,
     fit_selected_static,
+    load_fit_data,
+    outer_splits,
     random_choices,
+    require_selection_lock,
     seed_split_provenance,
     shuffled_task_rewards,
 )
+from coding_model_router_bigcodebench_lock import SeedWinnerAudit
 from coding_model_router_bigcodebench_select import (
     CandidateSpec,
     Estimator,
@@ -36,8 +43,12 @@ from coding_model_router_bigcodebench_select import (
     KnnCandidateSpec,
     _candidate_choices,
 )
+from coding_model_router_bigcodebench_select_run import SeedFitReport
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from wmo.core.files import write_text_atomic
+
+logger = logging.getLogger(__name__)
 ControlKind = Literal["static", "matched-task-blind", "random", "cost-only", "shuffled-label"]
 
 
@@ -155,6 +166,11 @@ class SeedHeldoutReport(BaseModel):
         if len(self.tasks) != self.heldout_tasks or len(task_ids) != len(set(task_ids)):
             raise ValueError("heldout task evidence does not match the heldout task count")
         return self
+
+
+def _sha256(path: Path) -> str:
+    """Return one immutable evidence file's SHA-256 digest."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _number(config: dict[str, object], key: str) -> float:
@@ -501,3 +517,134 @@ def replay_outer_heldout(
         baseline=baseline_value,
         metric=metric,
     )
+
+
+def write_outer_heldout_reports(
+    data: FitData,
+    lock: SelectionLock,
+    *,
+    selection_lock_sha256: str,
+    report_paths: list[Path],
+    audit_paths: list[Path],
+    output_dir: Path,
+) -> list[SeedHeldoutReport]:
+    """Replay five locked seeds once and atomically persist resumable reports."""
+    if len(report_paths) != 5 or len(audit_paths) != 5:
+        raise ValueError("outer heldout replay requires five fit reports and five audits")
+    fit_reports = [
+        SeedFitReport.model_validate_json(path.read_text(encoding="utf-8")) for path in report_paths
+    ]
+    audits = [
+        SeedWinnerAudit.model_validate_json(path.read_text(encoding="utf-8"))
+        for path in audit_paths
+    ]
+    reports_by_seed = {report.seed: report for report in fit_reports}
+    audits_by_seed = {audit.seed: audit for audit in audits}
+    paths_by_seed = {
+        report.seed: path for report, path in zip(fit_reports, report_paths, strict=True)
+    }
+    audit_paths_by_seed = {
+        audit.seed: path for audit, path in zip(audits, audit_paths, strict=True)
+    }
+    if set(reports_by_seed) != set(range(5)) or set(audits_by_seed) != set(range(5)):
+        raise ValueError("outer heldout replay requires seeds 0 through 4 exactly once")
+    selections = {selection.seed: selection for selection in lock.seeds}
+    if set(selections) != set(range(5)):
+        raise ValueError("selection lock does not contain seeds 0 through 4")
+    splits = {split.seed: split for split in outer_splits(data.groups)}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results: list[SeedHeldoutReport] = []
+    for seed in range(5):
+        fit_report = reports_by_seed[seed]
+        audit = audits_by_seed[seed]
+        selection = selections[seed]
+        fit_report_sha256 = _sha256(paths_by_seed[seed])
+        audit_sha256 = _sha256(audit_paths_by_seed[seed])
+        if fit_report.code_commit != lock.code_commit:
+            raise ValueError(f"seed {seed} fit report used a different source commit")
+        if audit.seed_report_sha256 != fit_report_sha256:
+            raise ValueError(f"seed {seed} winner audit names a different fit report")
+        if (
+            fit_report.fit_ids_sha256 != selection.fit_ids_sha256
+            or fit_report.heldout_ids_sha256 != selection.heldout_ids_sha256
+            or fit_report.baseline_arm != selection.baseline_arm
+            or fit_report.selected_name != selection.selected.name
+            or audit.candidate_name != selection.selected.name
+            or audit.config_sha256 != selection.selected.config_sha256
+        ):
+            raise ValueError(f"seed {seed} winner evidence differs from the selection lock")
+        output = output_dir / f"seed-{seed}.json"
+        if output.exists():
+            existing = SeedHeldoutReport.model_validate_json(output.read_text(encoding="utf-8"))
+            if (
+                existing.selection_lock_sha256 != selection_lock_sha256
+                or existing.seed_fit_report_sha256 != fit_report_sha256
+                or existing.winner_audit_sha256 != audit_sha256
+                or existing.candidate_config_sha256 != selection.selected.config_sha256
+            ):
+                raise ValueError(f"seed {seed} existing heldout report has different evidence")
+            results.append(existing)
+            continue
+        spec = candidate_spec_from_lock(
+            selection.selected.family,
+            selection.selected.config_json,
+            name=selection.selected.name,
+            order=next(
+                candidate.order
+                for candidate in fit_report.candidates
+                if candidate.name == selection.selected.name
+            ),
+        )
+        result = seed_heldout_report(
+            data,
+            splits[seed],
+            spec,
+            code_commit=lock.code_commit,
+            selection_lock_sha256=selection_lock_sha256,
+            seed_fit_report_sha256=fit_report_sha256,
+            winner_audit_sha256=audit_sha256,
+            candidate_config_sha256=selection.selected.config_sha256,
+            work_dir=output_dir / f"seed-{seed}-work",
+        )
+        write_text_atomic(output, result.model_dump_json(indent=2) + "\n")
+        results.append(result)
+        logger.info(
+            "seed=%d outer heldout replay complete reward=%.6f cost_usd=%.6f",
+            seed,
+            result.router.reward,
+            result.router.cost_usd,
+        )
+    return results
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the immutable outer-heldout replay command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--lock", type=Path, required=True)
+    parser.add_argument("--reports-dir", type=Path, required=True)
+    parser.add_argument("--audits-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Replay five immutable outer-heldout partitions after lock publication."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+    root = args.root.resolve()
+    lock_path = args.lock.resolve()
+    lock = require_selection_lock(root, lock_path)
+    reports = write_outer_heldout_reports(
+        load_fit_data(root),
+        lock,
+        selection_lock_sha256=_sha256(lock_path),
+        report_paths=[args.reports_dir.resolve() / f"seed-{seed}.json" for seed in range(5)],
+        audit_paths=[args.audits_dir.resolve() / f"seed-{seed}-audit.json" for seed in range(5)],
+        output_dir=args.output_dir.resolve(),
+    )
+    logger.info("outer heldout replay complete seeds=%d", len(reports))
+
+
+if __name__ == "__main__":
+    main()

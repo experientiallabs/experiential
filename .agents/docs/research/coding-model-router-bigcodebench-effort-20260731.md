@@ -227,6 +227,25 @@ seed retention, then mean reward, lower mean cost, and frozen order, but marks t
 infeasible and forbids target transfer. The eventual deployable artifact refits this exact locked
 configuration on all external rows only after the external heldout promotion gates pass.
 
+The locked outer replay and promotion commands are resumable but immutable. An existing seed
+report is reused only when its lock, fit report, winner audit, and candidate digests match exactly.
+The promotion report is recomputed from all task rows and must be byte-semantically equivalent to
+an existing verdict:
+
+```bash
+uv run python .agents/scripts/coding_model_router_bigcodebench_evaluate.py \
+  --root /remote/artifacts/bigcodebench \
+  --lock /remote/artifacts/bigcodebench/selection-lock.json \
+  --reports-dir /remote/artifacts/bigcodebench/fit \
+  --audits-dir /remote/artifacts/bigcodebench/audits \
+  --output-dir /remote/artifacts/bigcodebench/heldout
+uv run python .agents/scripts/coding_model_router_bigcodebench_promote.py \
+  --root /remote/artifacts/bigcodebench \
+  --lock /remote/artifacts/bigcodebench/selection-lock.json \
+  --reports-dir /remote/artifacts/bigcodebench/heldout \
+  --output /remote/artifacts/bigcodebench/external-promotion.json
+```
+
 Primary references:
 
 - RouteLLM: `https://arxiv.org/abs/2406.18665`

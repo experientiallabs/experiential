@@ -7,17 +7,27 @@ promotion thresholds are fixed here before source heldout replay.
 
 from __future__ import annotations
 
+import argparse
+import hashlib
+import logging
 import math
 from collections import Counter
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from coding_model_router_bigcodebench_evaluate import SeedHeldoutReport
-from coding_model_router_bigcodebench_fit import ARMS, SelectionLock
+from coding_model_router_bigcodebench_evaluate import SeedHeldoutReport, ValueRecord
+from coding_model_router_bigcodebench_fit import ARMS, SelectionLock, require_selection_lock
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from wmo.core.files import write_text_atomic
+
+logger = logging.getLogger(__name__)
 BOOTSTRAP_SAMPLES = 10_000
 BOOTSTRAP_SEED = 20_260_731
+ChoiceField = Literal[
+    "router_arm", "baseline_arm", "random_arm", "cost_only_arm", "shuffled_label_arm"
+]
 
 
 class Interval(BaseModel):
@@ -159,9 +169,7 @@ def _interval(
 
 def _chosen_values(
     report: SeedHeldoutReport,
-    field: Literal[
-        "router_arm", "baseline_arm", "random_arm", "cost_only_arm", "shuffled_label_arm"
-    ],
+    field: ChoiceField,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return paired reward and cost rows for one recorded route assignment."""
     choices = [getattr(task, field) for task in report.tasks]
@@ -191,7 +199,7 @@ def _close(left: float, right: float) -> bool:
 
 def _verify_report_aggregates(report: SeedHeldoutReport) -> None:
     """Recompute every durable aggregate from task-level paired evidence."""
-    assignments = {
+    assignments: dict[str, tuple[ValueRecord, ChoiceField]] = {
         "router": (report.router, "router_arm"),
         "baseline": (report.baseline, "baseline_arm"),
     }
@@ -421,3 +429,74 @@ def analyze_external_promotion(
         family_regression_gate_passed=family_regression_gate_passed,
         passed=passed,
     )
+
+
+def _sha256(path: Path) -> str:
+    """Return one immutable evidence file's SHA-256 digest."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_external_promotion_report(
+    lock: SelectionLock,
+    *,
+    selection_lock_sha256: str,
+    reports: list[SeedHeldoutReport],
+    output: Path,
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> ExternalPromotionReport:
+    """Write one immutable external promotion verdict, or verify its exact replay."""
+    report = analyze_external_promotion(
+        lock,
+        selection_lock_sha256,
+        reports,
+        samples=samples,
+        seed=seed,
+    )
+    if output.exists():
+        existing = ExternalPromotionReport.model_validate_json(output.read_text(encoding="utf-8"))
+        if existing != report:
+            raise ValueError("existing external promotion report differs from exact replay")
+        return existing
+    write_text_atomic(output, report.model_dump_json(indent=2) + "\n")
+    return report
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the external promotion audit command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--lock", type=Path, required=True)
+    parser.add_argument("--reports-dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Recompute five outer reports and publish one target-safe verdict."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+    root = args.root.resolve()
+    lock_path = args.lock.resolve()
+    lock = require_selection_lock(root, lock_path)
+    reports = [
+        SeedHeldoutReport.model_validate_json(
+            (args.reports_dir.resolve() / f"seed-{seed}.json").read_text(encoding="utf-8")
+        )
+        for seed in range(5)
+    ]
+    report = write_external_promotion_report(
+        lock,
+        selection_lock_sha256=_sha256(lock_path),
+        reports=reports,
+        output=args.output.resolve(),
+    )
+    logger.info(
+        "external promotion audit complete passed=%s output=%s",
+        report.passed,
+        args.output,
+    )
+
+
+if __name__ == "__main__":
+    main()

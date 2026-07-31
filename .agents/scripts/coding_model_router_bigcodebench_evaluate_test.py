@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -23,6 +24,8 @@ def _load(name: str) -> ModuleType:
 
 fit = _load("coding_model_router_bigcodebench_fit")
 select = _load("coding_model_router_bigcodebench_select")
+select_run = _load("coding_model_router_bigcodebench_select_run")
+lock_module = _load("coding_model_router_bigcodebench_lock")
 module = _load("coding_model_router_bigcodebench_evaluate")
 
 
@@ -217,3 +220,196 @@ def test_seed_report_rejects_missing_control(tmp_path: Path) -> None:
     value["controls"] = value["controls"][:-1]
     with pytest.raises(ValueError, match="at least 9 items"):
         module.SeedHeldoutReport.model_validate(value)
+
+
+def test_five_seed_outer_replay_is_resumable_and_lock_bound(tmp_path: Path) -> None:
+    data = _data()
+    selected_spec = select.candidate_grid()[0]
+    specs = [
+        *select.candidate_grid(),
+        *select.knn_candidate_grid(),
+        *select.knn_economic_grid(select.knn_candidate_grid()[0]),
+    ]
+    candidates = []
+    for spec in specs:
+        config_json, config_sha256 = fit.canonical_candidate_config(spec.config())
+        candidates.append(
+            select_run.CandidateRecord(
+                family="knn" if isinstance(spec, select.KnnCandidateSpec) else spec.family,
+                name=spec.name,
+                order=spec.order,
+                config_json=config_json,
+                config_sha256=config_sha256,
+                fit_reward=0.8,
+                fit_cost_usd=0.003,
+                matched_blind_reward=0.5,
+                matched_blind_cost_usd=0.003,
+                baseline_reward=0.8,
+                baseline_cost_usd=0.005,
+            )
+        )
+    assert len(candidates) == 1_028
+    selected = next(candidate for candidate in candidates if candidate.name == selected_spec.name)
+    code_commit = "a" * 40
+    report_paths = []
+    audit_paths = []
+    selections = []
+    for split in fit.outer_splits(data.groups):
+        fit_ids_sha256, heldout_ids_sha256 = fit.seed_split_provenance(data, split)
+        fit_tasks = len(split.train_indices)
+        controls = []
+        for arm_index, arm in enumerate(fit.ARMS):
+            controls.append(
+                select_run.ControlRecord(
+                    kind="static",
+                    name=f"static-{arm}",
+                    reward=0.8,
+                    cost_usd=0.005,
+                    arm_counts={
+                        value: fit_tasks if index == arm_index else 0
+                        for index, value in enumerate(fit.ARMS)
+                    },
+                )
+            )
+        mixed_counts = {
+            arm: fit_tasks // len(fit.ARMS) + (index < fit_tasks % len(fit.ARMS))
+            for index, arm in enumerate(fit.ARMS)
+        }
+        controls.extend(
+            [
+                select_run.ControlRecord(
+                    kind="matched-task-blind",
+                    name="selected-matched-task-blind",
+                    reward=0.5,
+                    cost_usd=0.003,
+                    arm_counts=mixed_counts,
+                ),
+                select_run.ControlRecord(
+                    kind="random",
+                    name="seeded-uniform-random",
+                    reward=0.5,
+                    cost_usd=0.003,
+                    arm_counts=mixed_counts,
+                ),
+                select_run.ControlRecord(
+                    kind="cost-only",
+                    name="fit-cost-only",
+                    reward=0.5,
+                    cost_usd=0.001,
+                    arm_counts={
+                        arm: fit_tasks if index == 0 else 0 for index, arm in enumerate(fit.ARMS)
+                    },
+                ),
+                select_run.ControlRecord(
+                    kind="shuffled-label",
+                    name="selected-shuffled-labels",
+                    reward=0.5,
+                    cost_usd=0.003,
+                    arm_counts=mixed_counts,
+                ),
+            ]
+        )
+        report = select_run.SeedFitReport(
+            seed=split.seed,
+            code_commit=code_commit,
+            tasks_sha256="b" * 64,
+            scores_sha256="c" * 64,
+            outcomes_sha256="d" * 64,
+            oracle_report_sha256="e" * 64,
+            fit_tasks=fit_tasks,
+            heldout_tasks=len(split.test_indices),
+            fit_ids_sha256=fit_ids_sha256,
+            heldout_ids_sha256=heldout_ids_sha256,
+            baseline_arm="luna-max",
+            baseline_fit_reward=0.8,
+            baseline_fit_cost_usd=0.005,
+            candidates=candidates,
+            controls=controls,
+            selected_name=selected.name,
+        )
+        report_path = tmp_path / f"fit-{split.seed}.json"
+        report_path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        audit = lock_module.SeedWinnerAudit(
+            seed=split.seed,
+            seed_report_sha256=report_sha256,
+            candidate_name=selected.name,
+            config_sha256=selected.config_sha256,
+            artifact_kind="numeric-router",
+            artifact_sha256=str(split.seed) * 64,
+            artifact_bytes=1_024,
+            decisions=10_000,
+            latency_p50_ms=0.5,
+            latency_p95_ms=1.0,
+            latency_passed=True,
+        )
+        audit_path = tmp_path / f"audit-{split.seed}.json"
+        audit_path.write_text(audit.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        report_paths.append(report_path)
+        audit_paths.append(audit_path)
+        selections.append(
+            fit.SeedSelection(
+                seed=split.seed,
+                fit_tasks=fit_tasks,
+                heldout_tasks=len(split.test_indices),
+                fit_ids_sha256=fit_ids_sha256,
+                heldout_ids_sha256=heldout_ids_sha256,
+                baseline_arm="luna-max",
+                baseline_fit_reward=0.8,
+                baseline_fit_cost_usd=0.005,
+                selected=fit.LockedCandidate(
+                    family=selected.family,
+                    name=selected.name,
+                    config_json=selected.config_json,
+                    config_sha256=selected.config_sha256,
+                    fit_reward=selected.fit_reward,
+                    fit_cost_usd=selected.fit_cost_usd,
+                    matched_blind_reward=selected.matched_blind_reward,
+                    latency_p95_ms=1.0,
+                    artifact_bytes=1_024,
+                ),
+            )
+        )
+    consensus = fit.DeploymentConsensus(
+        family=selected.family,
+        name=selected.name,
+        order=selected.order,
+        config_json=selected.config_json,
+        config_sha256=selected.config_sha256,
+        mean_fit_reward=0.8,
+        mean_fit_cost_usd=0.003,
+        mean_matched_blind_reward=0.5,
+        mean_baseline_reward=0.8,
+        minimum_seed_retention=1.0,
+        fit_quality_feasible=True,
+    )
+    lock = fit.SelectionLock(
+        protocol="bigcodebench-fit-only-selection-v1",
+        tasks_sha256="b" * 64,
+        scores_sha256="c" * 64,
+        outcomes_sha256="d" * 64,
+        oracle_report_sha256="e" * 64,
+        code_commit=code_commit,
+        seeds=selections,
+        deployment_consensus=consensus,
+    )
+    output_dir = tmp_path / "heldout"
+    first = module.write_outer_heldout_reports(
+        data,
+        lock,
+        selection_lock_sha256="f" * 64,
+        report_paths=report_paths,
+        audit_paths=audit_paths,
+        output_dir=output_dir,
+    )
+    original = [(output_dir / f"seed-{seed}.json").read_bytes() for seed in range(5)]
+    second = module.write_outer_heldout_reports(
+        data,
+        lock,
+        selection_lock_sha256="f" * 64,
+        report_paths=report_paths,
+        audit_paths=audit_paths,
+        output_dir=output_dir,
+    )
+    assert first == second
+    assert original == [(output_dir / f"seed-{seed}.json").read_bytes() for seed in range(5)]

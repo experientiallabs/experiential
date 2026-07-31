@@ -167,3 +167,25 @@ def test_grouped_interval_requires_multiple_families() -> None:
             samples=100,
             seed=1,
         )
+
+
+def test_external_promotion_report_is_immutable_and_resumable(tmp_path: Path) -> None:
+    lock, reports, lock_sha256 = _evidence(tmp_path)
+    output = tmp_path / "external-promotion.json"
+    first = module.write_external_promotion_report(
+        lock,
+        selection_lock_sha256=lock_sha256,
+        reports=reports,
+        output=output,
+        samples=200,
+    )
+    original = output.read_bytes()
+    second = module.write_external_promotion_report(
+        lock,
+        selection_lock_sha256=lock_sha256,
+        reports=reports,
+        output=output,
+        samples=200,
+    )
+    assert first == second
+    assert output.read_bytes() == original
