@@ -14,18 +14,25 @@ import importlib
 import json
 import logging
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 logger = logging.getLogger("coding-model-router-moonshiner-matrix")
 
 MODEL = "gpt-5.6-luna"
 EFFORT_SETS = {
+    "smoke": {
+        "luna-high": "high",
+        "luna-max": "max",
+    },
     "target": {
         "luna-xhigh": "xhigh",
         "luna-max": "max",
@@ -52,15 +59,20 @@ USAGE_ADAPTER = "pi-message-end-usage-v1"
 MAX_TRACE_BYTES = 64 * 1_024 * 1_024
 
 
+class _WorkspaceManager(Protocol):
+    def remove_workspace(self, workspace: Path) -> None: ...
+
+
 @dataclass(frozen=True)
 class Cell:
     task_id: str
     arm: str
     effort: str
+    attempt: int = 0
 
     @property
     def cell_id(self) -> str:
-        return f"{self.task_id}:{self.arm}"
+        return f"{self.task_id}:{self.arm}:attempt-{self.attempt}"
 
 
 def _read_object(path: Path) -> dict[str, Any]:
@@ -78,6 +90,7 @@ def _schedule(
     task_ids: list[str],
     *,
     seed: int,
+    attempt: int = 0,
     arm_efforts: dict[str, str] | None = None,
 ) -> list[Cell]:
     selected_arms = arm_efforts or EFFORT_SETS["target"]
@@ -88,7 +101,7 @@ def _schedule(
             selected_arms,
             key=lambda arm: _stable_key(seed, f"{task_id}:{arm}"),
         )
-        cells.extend(Cell(task_id, arm, selected_arms[arm]) for arm in arms)
+        cells.extend(Cell(task_id, arm, selected_arms[arm], attempt) for arm in arms)
     return cells
 
 
@@ -314,7 +327,7 @@ def _moonshiner_config(root: Path, effort: str) -> dict[str, Any]:
     }
     config["runtimes"] = {
         "pi": {
-            "cli": "node_modules/.bin/pi",
+            "cli": "/usr/local/bin/pi",
             "runtime": "pi-coding-agent",
             "runtime_version": "0.80.7",
             "provider": "openai",
@@ -348,6 +361,24 @@ def _configure_imports(root: Path, state_root: Path) -> None:
     source = str(root / "src")
     if source not in sys.path:
         sys.path.insert(0, source)
+
+
+def _remove_workspace(common: _WorkspaceManager, workspace: Path) -> None:
+    """Remove a Moonshiner workspace on Python versions without rmtree onexc."""
+    try:
+        common.remove_workspace(workspace)
+        return
+    except TypeError as error:
+        if "onexc" not in str(error):
+            raise
+
+    def force_writable(
+        function: Callable[[str], object], path: str, _error: object
+    ) -> None:
+        Path(path).chmod(Path(path).stat().st_mode | stat.S_IWUSR)
+        function(path)
+
+    shutil.rmtree(workspace, onerror=force_writable)
 
 
 def _seed(corpus_by_id: dict[str, dict[str, Any]], root: Path, task_id: str) -> dict[str, Any]:
@@ -406,7 +437,7 @@ def _run_cell(
     state.reserve()
     persisted = False
     try:
-        arm_root = output / "traces" / cell.arm
+        arm_root = output / "traces" / f"attempt-{cell.attempt}" / cell.arm
         config = _moonshiner_config(root, cell.effort)
         teacher = runtime_module.PiRuntime(config, config["teacher"])
         teacher.preflight(require_auth=True)
@@ -437,6 +468,7 @@ def _run_cell(
             "arm": cell.arm,
             "model": MODEL,
             "reasoning_effort": cell.effort,
+            "attempt": cell.attempt,
             "reward": 1.0 if record.get("passed") is True else 0.0,
             "passed": record.get("passed"),
             "verify_passed": record.get("verify_passed"),
@@ -466,7 +498,7 @@ def _run_cell(
         workspace_path = record.get("_workspace_path")
         if not isinstance(workspace_path, str):
             raise RuntimeError(f"cell {cell.cell_id} has no managed workspace path")
-        common.remove_workspace(Path(workspace_path))
+        _remove_workspace(common, Path(workspace_path))
         row["workspace_removed"] = True
         state.persist(row)
         persisted = True
@@ -493,6 +525,7 @@ def run_matrix(
     ceiling_usd: float,
     seed: int,
     arm_set: str,
+    attempt: int,
 ) -> None:
     if concurrency <= 0:
         raise ValueError("concurrency must be positive")
@@ -517,7 +550,12 @@ def run_matrix(
     if arm_set not in EFFORT_SETS:
         raise ValueError(f"unsupported arm set: {arm_set}")
     arm_efforts = EFFORT_SETS[arm_set]
-    scheduled = _schedule(list(corpus_by_id), seed=seed, arm_efforts=arm_efforts)
+    scheduled = _schedule(
+        list(corpus_by_id),
+        seed=seed,
+        attempt=attempt,
+        arm_efforts=arm_efforts,
+    )
     pending = [cell for cell in scheduled if not state.completed(cell.cell_id)]
     logger.info(
         "matrix start tasks=%d cells=%d pending=%d concurrency=%d",
@@ -560,6 +598,7 @@ def run_matrix(
         "cells": len(rows),
         "concurrency": concurrency,
         "seed": seed,
+        "attempt": attempt,
         "target_outcomes_used": False,
         "estimated_spend_usd": sum(float(row.get("cost_usd") or 0.0) for row in rows.values()),
         "outcomes_sha256": hashlib.sha256(
@@ -586,6 +625,7 @@ def main() -> None:
     parser.add_argument("--ceiling-usd", type=float, default=20_000.0)
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument("--arm-set", choices=tuple(EFFORT_SETS), default="target")
+    parser.add_argument("--attempt", type=int, default=0)
     args = parser.parse_args()
     run_matrix(
         args.moonshiner_root,
@@ -596,6 +636,7 @@ def main() -> None:
         ceiling_usd=args.ceiling_usd,
         seed=args.seed,
         arm_set=args.arm_set,
+        attempt=args.attempt,
     )
 
 

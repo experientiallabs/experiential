@@ -30,6 +30,8 @@ def test_schedule_has_paired_arms_and_is_deterministic() -> None:
         (cell.task_id, cell.arm) for cell in second
     ]
     assert len(first) == 6
+    assert all(cell.attempt == 0 for cell in first)
+    assert all(cell.cell_id.endswith(":attempt-0") for cell in first)
     for task_id in {"a", "b", "c"}:
         assert {cell.arm for cell in first if cell.task_id == task_id} == {
             "luna-xhigh",

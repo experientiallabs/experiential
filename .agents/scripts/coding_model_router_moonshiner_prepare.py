@@ -14,14 +14,16 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
 from collections import Counter, defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 logger = logging.getLogger("coding-model-router-moonshiner-prepare")
 
@@ -39,6 +41,10 @@ DEFAULT_LANGUAGES = frozenset(
         "zsh",
     }
 )
+
+
+class _WorkspaceManager(Protocol):
+    def remove_workspace(self, workspace: Path) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -202,12 +208,51 @@ def _target_metadata(path: Path | None) -> tuple[set[str], set[str]]:
     return ids, prompts
 
 
+def _source_task_ids(path: Path) -> set[str]:
+    """Read task identities from a pinned Hugging Face dataset manifest."""
+    raw = _read_object(path)
+    shards = raw.get("shards")
+    if not isinstance(shards, list):
+        raise ValueError(f"{path} has no shards")
+    task_ids: set[str] = set()
+    for shard in shards:
+        if not isinstance(shard, dict):
+            raise ValueError(f"{path} contains an invalid shard")
+        tasks = shard.get("tasks")
+        if not isinstance(tasks, list) or not all(
+            isinstance(task_id, str) and task_id for task_id in tasks
+        ):
+            raise ValueError(f"{path} contains an invalid task inventory")
+        task_ids.update(tasks)
+    if not task_ids:
+        raise ValueError(f"{path} contains no task identities")
+    return task_ids
+
+
 def _configure_moonshiner(moonshiner_root: Path, state_root: Path) -> None:
     os.environ["MOONSHINER_BUNDLE_ROOT"] = str(moonshiner_root)
     os.environ["MOONSHINER_HOME"] = str(state_root)
     source = str(moonshiner_root / "src")
     if source not in sys.path:
         sys.path.insert(0, source)
+
+
+def _remove_workspace(common: _WorkspaceManager, workspace: Path) -> None:
+    """Remove a Moonshiner workspace on Python versions without rmtree onexc."""
+    try:
+        common.remove_workspace(workspace)
+        return
+    except TypeError as error:
+        if "onexc" not in str(error):
+            raise
+
+    def force_writable(
+        function: Callable[[str], object], path: str, _error: object
+    ) -> None:
+        Path(path).chmod(Path(path).stat().st_mode | stat.S_IWUSR)
+        function(path)
+
+    shutil.rmtree(workspace, onerror=force_writable)
 
 
 def _validate_one(row: SeedRow) -> ValidationRow:
@@ -278,7 +323,7 @@ def _validate_one(row: SeedRow) -> ValidationRow:
         )
     finally:
         if workspace is not None:
-            common.remove_workspace(workspace)
+            _remove_workspace(common, workspace)
 
 
 def _validate(rows: list[SeedRow], *, workers: int) -> list[ValidationRow]:
@@ -303,6 +348,7 @@ def prepare(
     moonshiner_root: Path,
     output: Path,
     *,
+    source_manifest: Path,
     target_tasks: Path | None,
     candidate_count: int,
     task_count: int,
@@ -320,6 +366,7 @@ def prepare(
         ["git", "-C", str(moonshiner_root), "rev-parse", "HEAD"],
         text=True,
     ).strip()
+    source_ids = _source_task_ids(source_manifest)
     target_ids, target_prompts = _target_metadata(target_tasks)
     eligible = [
         row
@@ -335,6 +382,7 @@ def prepare(
             )
         )
         is not None
+        and row.task_id in source_ids
     ]
     identity_overlap = sorted(row.task_id for row in eligible if row.task_id in target_ids)
     text_overlap = sorted(
@@ -381,6 +429,9 @@ def prepare(
         "protocol": "moonshiner-effort-corpus-v1",
         "source_repo": "https://github.com/greghavens/moonshiner",
         "source_commit": commit,
+        "source_dataset": "greghavens/kimi-k3-coding-and-debugging-traces",
+        "source_manifest_sha256": _sha256_path(source_manifest),
+        "source_manifest_tasks": len(source_ids),
         "seed": seed,
         "tasks": tasks,
     }
@@ -394,6 +445,9 @@ def prepare(
         "protocol": "moonshiner-effort-corpus-manifest-v1",
         "source_repo": task_payload["source_repo"],
         "source_commit": commit,
+        "source_dataset": task_payload["source_dataset"],
+        "source_manifest_sha256": task_payload["source_manifest_sha256"],
+        "source_manifest_tasks": task_payload["source_manifest_tasks"],
         "eligible_tasks": len(eligible),
         "candidate_tasks": len(candidates),
         "validated_tasks": sum(row.valid for row in validation),
@@ -425,6 +479,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--moonshiner-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-manifest", type=Path, required=True)
     parser.add_argument("--target-tasks", type=Path)
     parser.add_argument("--candidate-count", type=int, default=160)
     parser.add_argument("--task-count", type=int, default=96)
@@ -437,6 +492,7 @@ def main() -> None:
     prepare(
         args.moonshiner_root,
         args.output,
+        source_manifest=args.source_manifest,
         target_tasks=args.target_tasks,
         candidate_count=args.candidate_count,
         task_count=args.task_count,

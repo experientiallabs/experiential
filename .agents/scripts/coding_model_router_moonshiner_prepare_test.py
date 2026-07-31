@@ -126,3 +126,19 @@ def test_target_metadata_normalizes_prompt_whitespace(tmp_path: Path) -> None:
     ids, prompts = module._target_metadata(path)
     assert ids == {"target-1"}
     assert prompts == {"repair this bug"}
+
+
+def test_source_task_ids_reads_shard_inventory(tmp_path: Path) -> None:
+    path = tmp_path / "dataset-manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "shards": [
+                    {"path": "data/one.parquet", "tasks": ["task-a", "task-b"]},
+                    {"path": "data/two.parquet", "tasks": ["task-b", "task-c"]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert module._source_task_ids(path) == {"task-a", "task-b", "task-c"}
