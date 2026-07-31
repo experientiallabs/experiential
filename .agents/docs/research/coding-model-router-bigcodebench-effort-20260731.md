@@ -136,7 +136,9 @@ The preregistered candidate families are:
    arm propensities form augmented inverse-propensity pseudo-values for all five efforts. The
    policy learner is Ridge or histogram gradient boosting with maximum leaf nodes 7, 15, or 31,
    learning rate 0.03 or 0.10, and minimum leaf size 10 or 20. A fit-only shadow price chooses
-   reward minus lambda times cost from lambda 0, 0.0025, 0.005, 0.01, 0.02, and 0.04.
+   reward minus lambda times each arm's mean fit cost divided by the across-arm mean fit cost.
+   This gives lambda units of reward points per average call, matching WMO's `pick_lam` scale.
+   Lambda is 0, 0.0025, 0.005, 0.01, 0.02, or 0.04.
 4. **Empirical-Bayes family shrinkage.** Beta-binomial task and library-family effects shrink
    repeated binary executions toward global and hard-subset priors. A Ridge residual head predicts
    remaining adjacent-effort uplift from the same frozen representations. Prior strength is 2, 5,

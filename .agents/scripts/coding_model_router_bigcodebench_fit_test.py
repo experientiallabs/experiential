@@ -188,6 +188,35 @@ def test_ordinal_predictions_are_bounded_and_monotone() -> None:
     assert np.all(np.diff(predicted, axis=1) >= 0.0)
 
 
+def test_ordinal_extra_trees_are_deterministic_and_monotone() -> None:
+    train_features = sparse.csr_matrix(np.arange(120, dtype=np.float64).reshape(30, 4))
+    test_features = train_features[:3]
+    rewards = np.column_stack(
+        [np.linspace(0.1 + 0.1 * arm, 0.5 + 0.1 * arm, 30) for arm in range(len(module.ARMS))]
+    )
+    first = module.ordinal_extra_trees_predictions(
+        train_features,
+        test_features,
+        rewards,
+        n_estimators=200,
+        min_samples_leaf=5,
+        max_features="sqrt",
+        random_state=11,
+    )
+    second = module.ordinal_extra_trees_predictions(
+        train_features,
+        test_features,
+        rewards,
+        n_estimators=200,
+        min_samples_leaf=5,
+        max_features="sqrt",
+        random_state=11,
+    )
+    assert np.array_equal(first, second)
+    assert np.all((0.0 <= first) & (first <= 1.0))
+    assert np.all(np.diff(first, axis=1) >= 0.0)
+
+
 def test_matched_task_blind_control_preserves_arm_mix() -> None:
     rewards = np.zeros((4, len(module.ARMS)), dtype=np.float64)
     rewards[:2, 0] = 1.0
@@ -216,6 +245,39 @@ def test_doubly_robust_dense_targets_equal_observed_arm_means() -> None:
     direct = np.full((3, len(module.ARMS)), 0.37, dtype=np.float64)
     pseudo = module.doubly_robust_pseudo_values(rewards, direct)
     assert np.allclose(pseudo, rewards.mean(axis=2))
+
+
+def test_multi_action_learners_are_bounded() -> None:
+    train_features = sparse.csr_matrix(np.arange(160, dtype=np.float64).reshape(40, 4))
+    test_features = train_features[:4]
+    pseudo = np.column_stack(
+        [np.linspace(0.1 * arm, 0.8 + 0.02 * arm, 40) for arm in range(len(module.ARMS))]
+    )
+    ridge = module.multi_action_ridge_predictions(
+        train_features,
+        test_features,
+        pseudo,
+        alpha=1.0,
+    )
+    hist = module.multi_action_hist_predictions(
+        train_features,
+        test_features,
+        pseudo,
+        max_leaf_nodes=7,
+        learning_rate=0.03,
+        min_samples_leaf=10,
+        random_state=7,
+    )
+    assert ridge.shape == hist.shape == (4, len(module.ARMS))
+    assert np.all((0.0 <= ridge) & (ridge <= 1.0))
+    assert np.all((0.0 <= hist) & (hist <= 1.0))
+
+
+def test_shadow_price_can_move_choice_to_cheaper_effort() -> None:
+    predicted = np.asarray([[0.80, 0.81, 0.82, 0.83, 0.84]])
+    costs = np.asarray([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert module.shadow_price_choices(predicted, costs, lam=0.0).tolist() == [4]
+    assert module.shadow_price_choices(predicted, costs, lam=0.04).tolist() == [0]
 
 
 def test_empirical_bayes_uses_loo_and_unseen_global_fallback() -> None:

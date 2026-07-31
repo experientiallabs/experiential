@@ -16,6 +16,7 @@ from typing import Literal, cast
 
 import numpy as np
 from scipy import sparse
+from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import GroupKFold
@@ -547,6 +548,43 @@ def ordinal_ridge_predictions(
     return np.maximum.accumulate(np.clip(absolute, 0.0, 1.0), axis=1)
 
 
+def ordinal_extra_trees_predictions(
+    train_features: sparse.csr_matrix,
+    test_features: sparse.csr_matrix,
+    train_rewards: np.ndarray,
+    *,
+    n_estimators: int,
+    min_samples_leaf: int,
+    max_features: Literal["sqrt", "third"],
+    random_state: int,
+) -> np.ndarray:
+    """Predict monotone adjacent-effort rewards with deterministic ExtraTrees heads."""
+    if train_rewards.ndim != 2 or train_rewards.shape[1] != len(ARMS):
+        raise ValueError("ordinal training rewards have the wrong shape")
+    if n_estimators not in {200, 500}:
+        raise ValueError("tree count is outside the frozen search space")
+    if min_samples_leaf not in {5, 10, 20}:
+        raise ValueError("tree leaf size is outside the frozen search space")
+    if max_features not in {"sqrt", "third"}:
+        raise ValueError("tree feature fraction is outside the frozen search space")
+    targets = np.column_stack([train_rewards[:, 0], np.diff(train_rewards, axis=1)])
+    predicted_parts: list[np.ndarray] = []
+    feature_rule: str | float = "sqrt" if max_features == "sqrt" else 1.0 / 3.0
+    for column in range(targets.shape[1]):
+        model = ExtraTreesRegressor(
+            n_estimators=n_estimators,
+            min_samples_leaf=min_samples_leaf,
+            max_features=feature_rule,
+            random_state=random_state + column,
+            n_jobs=1,
+        )
+        model.fit(train_features, targets[:, column])
+        predicted_parts.append(np.asarray(model.predict(test_features), dtype=np.float64))
+    parts = np.column_stack(predicted_parts)
+    absolute = np.column_stack([parts[:, 0], parts[:, 0, None] + np.cumsum(parts[:, 1:], axis=1)])
+    return np.maximum.accumulate(np.clip(absolute, 0.0, 1.0), axis=1)
+
+
 def doubly_robust_pseudo_values(
     rewards: np.ndarray,
     direct_predictions: np.ndarray,
@@ -573,6 +611,77 @@ def doubly_robust_pseudo_values(
         values[:, target_arm, :] += residual
         pseudo[:, target_arm] = values.mean(axis=(1, 2))
     return pseudo
+
+
+def multi_action_ridge_predictions(
+    train_features: sparse.csr_matrix,
+    test_features: sparse.csr_matrix,
+    pseudo_values: np.ndarray,
+    *,
+    alpha: float,
+) -> np.ndarray:
+    """Fit one Ridge policy head per doubly robust effort pseudo-value."""
+    if pseudo_values.ndim != 2 or pseudo_values.shape[1] != len(ARMS):
+        raise ValueError("multi-action pseudo-values have the wrong shape")
+    predictions: list[np.ndarray] = []
+    for arm_index in range(len(ARMS)):
+        model = Ridge(alpha=alpha)
+        model.fit(train_features, pseudo_values[:, arm_index])
+        predictions.append(np.asarray(model.predict(test_features), dtype=np.float64))
+    return np.clip(np.column_stack(predictions), 0.0, 1.0)
+
+
+def multi_action_hist_predictions(
+    train_features: sparse.csr_matrix,
+    test_features: sparse.csr_matrix,
+    pseudo_values: np.ndarray,
+    *,
+    max_leaf_nodes: int,
+    learning_rate: float,
+    min_samples_leaf: int,
+    random_state: int,
+) -> np.ndarray:
+    """Fit deterministic histogram-boosted doubly robust policy heads."""
+    if pseudo_values.ndim != 2 or pseudo_values.shape[1] != len(ARMS):
+        raise ValueError("multi-action pseudo-values have the wrong shape")
+    if max_leaf_nodes not in {7, 15, 31}:
+        raise ValueError("histogram leaf count is outside the frozen search space")
+    if learning_rate not in {0.03, 0.1}:
+        raise ValueError("histogram learning rate is outside the frozen search space")
+    if min_samples_leaf not in {10, 20}:
+        raise ValueError("histogram minimum leaf size is outside the frozen search space")
+    dense_train = np.asarray(train_features.toarray(), dtype=np.float64)
+    dense_test = np.asarray(test_features.toarray(), dtype=np.float64)
+    predictions: list[np.ndarray] = []
+    for arm_index in range(len(ARMS)):
+        model = HistGradientBoostingRegressor(
+            max_leaf_nodes=max_leaf_nodes,
+            learning_rate=learning_rate,
+            min_samples_leaf=min_samples_leaf,
+            random_state=random_state + arm_index,
+        )
+        model.fit(dense_train, pseudo_values[:, arm_index])
+        predictions.append(np.asarray(model.predict(dense_test), dtype=np.float64))
+    return np.clip(np.column_stack(predictions), 0.0, 1.0)
+
+
+def shadow_price_choices(
+    predicted_rewards: np.ndarray,
+    arm_costs: np.ndarray,
+    *,
+    lam: float,
+) -> np.ndarray:
+    """Choose reward minus normalized fit-only cost at one frozen shadow price."""
+    if predicted_rewards.ndim != 2 or predicted_rewards.shape[1] != len(ARMS):
+        raise ValueError("predicted rewards have the wrong effort shape")
+    if arm_costs.shape != (len(ARMS),) or not np.isfinite(arm_costs).all():
+        raise ValueError("arm costs have the wrong shape or contain non-finite values")
+    if np.any(arm_costs < 0.0) or float(np.mean(arm_costs)) <= 0.0:
+        raise ValueError("arm costs must be nonnegative with a positive mean")
+    if lam not in {0.0, 0.0025, 0.005, 0.01, 0.02, 0.04}:
+        raise ValueError("shadow price is outside the frozen search space")
+    normalized_cost = arm_costs / float(np.mean(arm_costs))
+    return np.argmax(predicted_rewards - lam * normalized_cost[None, :], axis=1).astype(np.int64)
 
 
 def _family_posterior(
