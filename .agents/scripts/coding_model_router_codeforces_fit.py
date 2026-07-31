@@ -113,7 +113,12 @@ def _structural(task: dict[str, Any]) -> list[float]:
     ]
 
 
-def load_data(corpus_path: Path, outcomes_path: Path) -> Data:
+def load_data(
+    corpus_path: Path,
+    outcomes_path: Path,
+    *,
+    expected_tasks: int = EXPECTED_TASKS,
+) -> Data:
     """Load and prove the exact dense source matrix without target labels."""
     corpus = _read_object(corpus_path)
     if (
@@ -122,8 +127,8 @@ def load_data(corpus_path: Path, outcomes_path: Path) -> Data:
     ):
         raise ValueError("corpus violated a frozen information boundary")
     raw_tasks = corpus.get("tasks")
-    if not isinstance(raw_tasks, list) or len(raw_tasks) != EXPECTED_TASKS:
-        raise ValueError("corpus does not contain the frozen 160 tasks")
+    if not isinstance(raw_tasks, list) or len(raw_tasks) != expected_tasks:
+        raise ValueError(f"corpus does not contain the expected {expected_tasks} tasks")
     tasks = [
         {str(key): item for key, item in task.items()}
         for task in raw_tasks
@@ -164,7 +169,7 @@ def load_data(corpus_path: Path, outcomes_path: Path) -> Data:
         rewards[index] = float(row["reward"])
         costs[index] = float(row["cost_usd"])
         observed.add(cell_id)
-    if len(observed) != EXPECTED_TASKS * len(ARMS) * ATTEMPTS:
+    if len(observed) != expected_tasks * len(ARMS) * ATTEMPTS:
         raise ValueError("source matrix is incomplete")
     if not np.isfinite(rewards).all() or not np.isfinite(costs).all():
         raise ValueError("source matrix is not finite and dense")
@@ -363,9 +368,16 @@ def _bootstrap(
     return [float(value) for value in np.quantile(values, [0.025, 0.5, 0.975])]
 
 
-def fit(corpus: Path, outcomes: Path, output: Path, *, seed: int) -> None:
+def fit(
+    corpus: Path,
+    outcomes: Path,
+    output: Path,
+    *,
+    seed: int,
+    expected_tasks: int = EXPECTED_TASKS,
+) -> None:
     """Run nested grouped selection and write the external promotion report."""
-    data = load_data(corpus, outcomes)
+    data = load_data(corpus, outcomes, expected_tasks=expected_tasks)
     splitter = GroupKFold(n_splits=5)
     all_indices = np.arange(len(data.task_ids))
     choices = np.full(len(data.task_ids), -1, dtype=np.int64)
@@ -563,8 +575,15 @@ def main() -> None:
     parser.add_argument("--outcomes", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260731)
+    parser.add_argument("--expected-tasks", type=int, default=EXPECTED_TASKS)
     args = parser.parse_args()
-    fit(args.corpus, args.outcomes, args.output, seed=args.seed)
+    fit(
+        args.corpus,
+        args.outcomes,
+        args.output,
+        seed=args.seed,
+        expected_tasks=args.expected_tasks,
+    )
 
 
 if __name__ == "__main__":

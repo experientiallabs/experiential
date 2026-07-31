@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -73,3 +74,49 @@ def test_bootstrap_respects_whole_groups() -> None:
     )
     assert interval[0] == 0.0
     assert interval[2] == 1.0
+
+
+def test_load_data_accepts_explicit_development_task_count(tmp_path: Path) -> None:
+    tasks = [
+        {
+            "task_id": task_id,
+            "contest_id": contest,
+            "bucket": "C",
+            "prompt": f"Solve {task_id}",
+            "tests": [{}] * 10,
+            "time_limit_s": 2.0,
+            "memory_limit_mb": 256,
+        }
+        for task_id, contest in (("a/C", "a"), ("b/C", "b"))
+    ]
+    corpus = tmp_path / "tasks.json"
+    corpus.write_text(
+        json.dumps(
+            {
+                "target_outcomes_used": False,
+                "published_generations_loaded": False,
+                "tasks": tasks,
+            }
+        )
+    )
+    outcomes = tmp_path / "outcomes.jsonl"
+    rows = [
+        {
+            "cell_id": f"{task['task_id']}:{arm}:attempt-{attempt}",
+            "task_id": task["task_id"],
+            "arm": arm,
+            "attempt": attempt,
+            "observed_model": "gpt-5.6-luna",
+            "target_outcomes_used": False,
+            "tests_total": 10,
+            "reward": 1.0,
+            "cost_usd": 0.1,
+        }
+        for task in tasks
+        for arm in module.ARMS
+        for attempt in range(module.ATTEMPTS)
+    ]
+    outcomes.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    data = module.load_data(corpus, outcomes, expected_tasks=2)
+    assert data.task_ids == ["a/C", "b/C"]
+    assert data.rewards.shape == (2, 5)
