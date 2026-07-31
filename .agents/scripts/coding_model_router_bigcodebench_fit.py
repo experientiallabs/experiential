@@ -12,13 +12,20 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 from scipy import sparse
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import GroupKFold
+
+from wmo.optimize.knn import fit_knn_policy
+from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+from wmo.optimize.policy import EmbedderSpec, RoutingPolicy
+from wmo.optimize.routing import evaluate_policy, route_scenarios
+from wmo.providers.base import ProviderKind
+from wmo.providers.pool import PoolEntry
 
 ARMS = ("luna-low", "luna-medium", "luna-high", "luna-xhigh", "luna-max")
 ATTEMPTS = 5
@@ -47,6 +54,16 @@ class PolicyValue:
     matched_blind_reward: float
     matched_blind_cost_usd: float
     arm_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class NativeKnnReplay:
+    """WMO-native kNN policy and its heldout routes."""
+
+    policy: RoutingPolicy
+    choices: np.ndarray
+    value: PolicyValue
+    bank_path: Path
 
 
 def _read_object(path: Path) -> dict[str, object]:
@@ -238,6 +255,134 @@ def grouped_folds(groups: list[str], *, splits: int = 5) -> list[tuple[np.ndarra
             raise AssertionError("task-family group crossed a fit boundary")
         result.append((train, test))
     return result
+
+
+def _indices(data: FitData, values: np.ndarray, *, label: str) -> list[int]:
+    indices = [int(value) for value in np.asarray(values).tolist()]
+    if len(indices) != len(set(indices)):
+        raise ValueError(f"{label} indices contain duplicates")
+    if any(index < 0 or index >= len(data.task_ids) for index in indices):
+        raise ValueError(f"{label} indices are outside the task matrix")
+    if not indices:
+        raise ValueError(f"{label} indices are empty")
+    return indices
+
+
+def effort_pool() -> list[PoolEntry]:
+    """Return five priced WMO arms for one Luna runtime model."""
+    efforts = ("low", "medium", "high", "xhigh", "max")
+    return [
+        PoolEntry(
+            name=arm,
+            kind=ProviderKind.OPENAI_RESPONSES,
+            model="gpt-5.6-luna",
+            reasoning_effort=effort,
+            input_per_mtok=1.0,
+            cached_input_per_mtok=0.1,
+            output_per_mtok=6.0,
+        )
+        for arm, effort in zip(ARMS, efforts, strict=True)
+    ]
+
+
+def outcome_matrix(data: FitData) -> OutcomeMatrix:
+    """Project the dense external tensor into WMO's native outcome contract."""
+    expected = (len(data.task_ids), len(ARMS), ATTEMPTS)
+    if data.rewards.shape != expected or data.costs.shape != expected:
+        raise ValueError("fit tensors do not match the task, arm, and attempt contract")
+    if not np.isfinite(data.rewards).all() or not np.isfinite(data.costs).all():
+        raise ValueError("fit tensors must be finite and dense")
+    outcomes = [
+        ScenarioOutcome(
+            scenario_id=data.task_ids[task_index],
+            task=data.texts[task_index],
+            model=arm,
+            benchmark="bigcodebench-v0.2.4",
+            episode=attempt,
+            attempt_number=attempt + 1,
+            reward=float(data.rewards[task_index, arm_index, attempt]),
+            success=bool(data.rewards[task_index, arm_index, attempt] >= 1.0),
+            cost_usd=float(data.costs[task_index, arm_index, attempt]),
+            completion_status="scored",
+            usage_accounting="exact-or-trace-estimated",
+        )
+        for task_index in range(len(data.task_ids))
+        for arm_index, arm in enumerate(ARMS)
+        for attempt in range(ATTEMPTS)
+    ]
+    return OutcomeMatrix(pool=effort_pool(), outcomes=outcomes)
+
+
+def fit_native_knn_replay(
+    data: FitData,
+    train_indices: np.ndarray,
+    test_indices: np.ndarray,
+    *,
+    bank_path: Path,
+    dim: int,
+    guard_arm: str,
+    rag_num: int,
+    rag_thres: float,
+    z: float,
+    min_pairs: int,
+    se_floor: bool,
+    floor_q: float,
+    pick_lam: float,
+    guard_mode: Literal["symmetric", "asymmetric"],
+) -> NativeKnnReplay:
+    """Fit and replay WMO guarded kNN without any network or target data."""
+    train = _indices(data, train_indices, label="train")
+    test = _indices(data, test_indices, label="test")
+    if set(train) & set(test):
+        raise ValueError("train and test tasks overlap")
+    if dim not in {512, 2_048, 8_192}:
+        raise ValueError("hash dimension is outside the frozen search space")
+    if guard_arm not in ARMS:
+        raise ValueError("guard arm is outside the frozen effort roster")
+    if guard_mode not in {"symmetric", "asymmetric"}:
+        raise ValueError("guard mode must be symmetric or asymmetric")
+
+    matrix = outcome_matrix(data)
+    spec = EmbedderSpec(kind="hashing", dim=dim)
+    train_ids = [data.task_ids[index] for index in train]
+    test_ids = [data.task_ids[index] for index in test]
+    policy = fit_knn_policy(
+        matrix,
+        bank_path=bank_path,
+        fit_ids=train_ids,
+        embedder=spec,
+        guard_model=guard_arm,
+        rag_num=rag_num,
+        rag_thres=rag_thres,
+        z=z,
+        min_pairs=min_pairs,
+        se_floor=se_floor,
+        floor_q=floor_q,
+        pick_lam=pick_lam,
+        fitted_from="bigcodebench-v0.2.4 external fit only",
+    ).model_copy(update={"guard_mode": guard_mode})
+    decisions = route_scenarios(policy, matrix, test_ids, embedder=spec.build())
+    arm_index = {arm: index for index, arm in enumerate(ARMS)}
+    choices = np.asarray(
+        [arm_index[decisions[task_id].model] for task_id in test_ids],
+        dtype=np.int64,
+    )
+    rewards = data.rewards[test].mean(axis=2)
+    costs = data.costs[test].mean(axis=2)
+    value = evaluate_choices(rewards, costs, choices)
+    native = evaluate_policy(policy, matrix, test_ids, embedder=spec.build())
+    if native.unscored_scenarios != 0:
+        raise AssertionError("WMO replay selected an unscored effort cell")
+    if not math.isclose(native.accuracy, value.reward, rel_tol=1e-6, abs_tol=1e-8):
+        raise AssertionError("WMO replay reward differs from tensor evaluation")
+    if not math.isclose(native.cost_per_scenario, value.cost_usd, rel_tol=1e-6, abs_tol=1e-8):
+        raise AssertionError("WMO replay cost differs from tensor evaluation")
+    return NativeKnnReplay(
+        policy=policy,
+        choices=choices,
+        value=value,
+        bank_path=bank_path,
+    )
 
 
 def ordinal_ridge_predictions(

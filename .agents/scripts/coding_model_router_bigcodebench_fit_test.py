@@ -51,6 +51,81 @@ def test_grouped_folds_have_zero_family_overlap() -> None:
         assert {groups[index] for index in train}.isdisjoint({groups[index] for index in test})
 
 
+def _knn_data() -> object:
+    texts = [
+        *(f"sql query select join table {index}" for index in range(10)),
+        *(f"async python coroutine await task {index}" for index in range(10)),
+    ]
+    rewards = np.zeros((20, len(module.ARMS), module.ATTEMPTS), dtype=np.float64)
+    rewards[:10, 0, :] = 1.0
+    rewards[10:, 4, :] = 1.0
+    costs = np.broadcast_to(
+        np.asarray([0.001, 0.002, 0.003, 0.004, 0.005])[None, :, None],
+        rewards.shape,
+    ).copy()
+    return module.FitData(
+        task_ids=[f"task-{index}" for index in range(20)],
+        groups=[f"family-{index // 2}" for index in range(20)],
+        texts=texts,
+        is_hard=np.zeros(20, dtype=np.bool_),
+        rewards=rewards,
+        costs=costs,
+    )
+
+
+def test_outcome_matrix_preserves_every_attempt() -> None:
+    data = _knn_data()
+    matrix = module.outcome_matrix(data)
+    assert [entry.name for entry in matrix.pool] == list(module.ARMS)
+    assert len(matrix.outcomes) == 20 * len(module.ARMS) * module.ATTEMPTS
+    assert {outcome.model for outcome in matrix.outcomes} == set(module.ARMS)
+
+
+def test_native_knn_replay_matches_tensor_value(tmp_path: Path) -> None:
+    data = _knn_data()
+    replay = module.fit_native_knn_replay(
+        data,
+        np.asarray([*range(8), *range(10, 18)]),
+        np.asarray([8, 9, 18, 19]),
+        bank_path=tmp_path / "native-knn.bank.npz",
+        dim=512,
+        guard_arm="luna-max",
+        rag_num=8,
+        rag_thres=0.9,
+        z=0.0,
+        min_pairs=3,
+        se_floor=False,
+        floor_q=0.0,
+        pick_lam=0.0,
+        guard_mode="symmetric",
+    )
+    assert replay.bank_path.exists()
+    assert replay.policy.kind == "knn"
+    assert replay.policy.guard_model == "luna-max"
+    assert replay.choices.shape == (4,)
+    assert replay.value.reward == 1.0
+
+
+def test_native_knn_refuses_overlapping_split(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="overlap"):
+        module.fit_native_knn_replay(
+            _knn_data(),
+            np.asarray([0, 1]),
+            np.asarray([1, 2]),
+            bank_path=tmp_path / "unused.npz",
+            dim=512,
+            guard_arm="luna-max",
+            rag_num=4,
+            rag_thres=0.9,
+            z=0.0,
+            min_pairs=3,
+            se_floor=False,
+            floor_q=0.0,
+            pick_lam=0.0,
+            guard_mode="symmetric",
+        )
+
+
 def test_ordinal_predictions_are_bounded_and_monotone() -> None:
     train_features = sparse.csr_matrix(np.asarray([[0.0], [0.2], [0.8], [1.0]], dtype=np.float64))
     test_features = sparse.csr_matrix(np.asarray([[0.1], [0.9]], dtype=np.float64))
