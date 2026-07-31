@@ -172,17 +172,47 @@ def _predict_probabilities(
     alpha: float,
     label_rewards: np.ndarray | None = None,
 ) -> tuple[np.ndarray, IrtFit]:
+    latent, predictor = _fit_text_policy(
+        data,
+        train,
+        dimension=dimension,
+        alpha=alpha,
+        label_rewards=label_rewards,
+    )
+    return _score_text_policy(data, train, test, dimension, latent, predictor), latent
+
+
+def _fit_text_policy(
+    data: Data,
+    train: np.ndarray,
+    *,
+    dimension: int,
+    alpha: float,
+    label_rewards: np.ndarray | None = None,
+) -> tuple[IrtFit, Ridge]:
     labels = data.rewards if label_rewards is None else label_rewards
     latent = _fit_irt(labels[train])
     features = _features(data, dimension, train)
     targets = np.column_stack([latent.difficulties, latent.log_discriminations])
     predictor = Ridge(alpha=alpha, solver="lsqr", max_iter=500, tol=1e-5)
     predictor.fit(features[train], targets)
+    return latent, predictor
+
+
+def _score_text_policy(
+    data: Data,
+    train: np.ndarray,
+    test: np.ndarray,
+    dimension: int,
+    latent: IrtFit,
+    predictor: Ridge,
+) -> np.ndarray:
+    features = _features(data, dimension, train)
     predicted = np.asarray(predictor.predict(features[test]), dtype=np.float64)
     difficulties = np.clip(predicted[:, 0], -8.0, 8.0)
     discriminations = np.exp(np.clip(predicted[:, 1], -3.0, 3.0))
     logits = discriminations[:, None] * (latent.abilities[None, :] - difficulties[:, None])
-    return expit(logits), latent
+    return expit(logits)
 
 
 def _normalized_costs(mean_costs: np.ndarray) -> np.ndarray:
@@ -478,17 +508,24 @@ def fit(
         ),
     )
     consensus = next(candidate for candidate in CANDIDATES if candidate.name == consensus_name)
-    full_probabilities, full_latent = _predict_probabilities(
+    full_latent, full_predictor = _fit_text_policy(
         data,
-        all_indices,
         all_indices,
         dimension=consensus.dimension,
         alpha=consensus.alpha,
     )
     started = time.perf_counter_ns()
     for _ in range(100):
-        _choose(full_probabilities, np.mean(data.costs, axis=0), consensus)
-    route_batch_ms = (time.perf_counter_ns() - started) / 1_000_000 / 100
+        probabilities = _score_text_policy(
+            data,
+            all_indices,
+            all_indices,
+            consensus.dimension,
+            full_latent,
+            full_predictor,
+        )
+        _choose(probabilities, np.mean(data.costs, axis=0), consensus)
+    inference_batch_ms = (time.perf_counter_ns() - started) / 1_000_000 / 100
     report: dict[str, object] = {
         "protocol": "codeforces-radar-irt-nested-v1",
         "paper": "https://arxiv.org/abs/2509.25426",
@@ -525,7 +562,7 @@ def fit(
         "deployment_consensus_abilities": {
             arm: float(full_latent.abilities[index]) for index, arm in enumerate(ARMS)
         },
-        "route_batch_160_mean_ms": route_batch_ms,
+        "pre_inference_batch_160_mean_ms": inference_batch_ms,
         "development_gate": gate,
         "confirmation_authorized": bool(gate["passed"]),
         "deep_swe_evaluation_authorized": False,
