@@ -84,6 +84,26 @@ def test_make_chunks_rejects_incomplete_matrix(tmp_path: Path) -> None:
         module.make_chunks(tmp_path, tasks_per_chunk=1, cells_per_task=2)
 
 
+def test_validate_official_result_requires_dense_exact_task_set() -> None:
+    module._validate_official_result(
+        {"eval": {"task-a": [{"status": "pass"}, {"status": "fail"}]}},
+        ["task-a"],
+        cells_per_task=2,
+    )
+    with pytest.raises(ValueError, match="task set differs"):
+        module._validate_official_result(
+            {"eval": {"task-b": [{}, {}]}},
+            ["task-a"],
+            cells_per_task=2,
+        )
+    with pytest.raises(ValueError, match="1 results"):
+        module._validate_official_result(
+            {"eval": {"task-a": [{"status": "pass"}]}},
+            ["task-a"],
+            cells_per_task=2,
+        )
+
+
 def test_merge_chunks_builds_dense_scores_in_global_order(tmp_path: Path) -> None:
     tasks = [{"task_id": "task-a"}, {"task_id": "task-b"}]
     index = [

@@ -281,6 +281,88 @@ def make_chunks(
     logger.info("official score chunks built chunks=%d tasks=%d", chunk_count, len(tasks))
 
 
+def _validate_official_result(
+    result: dict[str, Any],
+    task_ids: list[str],
+    *,
+    cells_per_task: int = CELLS_PER_TASK,
+) -> None:
+    raw_eval = result.get("eval")
+    if not isinstance(raw_eval, dict) or set(raw_eval) != set(task_ids):
+        raise ValueError("official result task set differs from its frozen chunk")
+    for task_id in task_ids:
+        rows = raw_eval.get(task_id)
+        if not isinstance(rows, list) or len(rows) != cells_per_task:
+            count = len(rows) if isinstance(rows, list) else 0
+            raise ValueError(f"official task has {count} results: {task_id}")
+        if any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"official task has a non-object result: {task_id}")
+
+
+def official_score(
+    samples: Path,
+    chunk_manifest: Path,
+    *,
+    parallel: int = 8,
+) -> None:
+    if parallel < 1:
+        raise ValueError("parallel must be positive")
+    package = importlib.import_module("bigcodebench")
+    observed_version = str(getattr(package, "__version__", ""))
+    if observed_version != OFFICIAL_VERSION:
+        raise ValueError(
+            f"official evaluator version is {observed_version!r}, expected {OFFICIAL_VERSION}"
+        )
+    chunk = _read_object(chunk_manifest)
+    task_ids_untyped = chunk.get("task_ids")
+    if not isinstance(task_ids_untyped, list):
+        raise ValueError("score chunk has no task id list")
+    task_ids = [str(task_id) for task_id in task_ids_untyped]
+    if (
+        chunk.get("official_version") != OFFICIAL_VERSION
+        or chunk.get("samples_sha256") != _sha256_file(samples)
+    ):
+        raise ValueError("score chunk provenance is invalid")
+    result_path = samples.with_name("samples_eval_results.json")
+    if result_path.exists():
+        raise FileExistsError(f"official result already exists: {result_path}")
+    module = cast(Any, importlib.import_module("bigcodebench.evaluate"))
+    evaluator = cast(Callable[..., Any], module.evaluate)
+    evaluator(
+        split="instruct",
+        subset="full",
+        samples=str(samples),
+        execution="local",
+        selective_evaluate=",".join(task_ids),
+        pass_k="1",
+        save_pass_rate=False,
+        calibrated=True,
+        parallel=parallel,
+    )
+    result = _read_object(result_path)
+    _validate_official_result(result, task_ids)
+    _write_object(
+        samples.with_name("official-score-manifest.json"),
+        {
+            "protocol": "bigcodebench-effort-official-score-v1",
+            "chunk": chunk.get("chunk"),
+            "official_version": observed_version,
+            "parallel": parallel,
+            "tasks": len(task_ids),
+            "samples": len(task_ids) * CELLS_PER_TASK,
+            "samples_sha256": _sha256_file(samples),
+            "official_result_sha256": _sha256_file(result_path),
+            "target_outcomes_used": False,
+        },
+    )
+    logger.info(
+        "official execution scoring complete tasks=%d samples=%d version=%s",
+        len(task_ids),
+        len(task_ids) * CELLS_PER_TASK,
+        observed_version,
+    )
+
+
 def merge_chunks(
     output: Path,
     *,
@@ -396,6 +478,10 @@ def main() -> None:
     chunks_parser = subparsers.add_parser("make-chunks")
     chunks_parser.add_argument("--output", type=Path, required=True)
     chunks_parser.add_argument("--tasks-per-chunk", type=int, default=50)
+    score_parser = subparsers.add_parser("official-score")
+    score_parser.add_argument("--samples", type=Path, required=True)
+    score_parser.add_argument("--chunk-manifest", type=Path, required=True)
+    score_parser.add_argument("--parallel", type=int, default=8)
     merge_parser = subparsers.add_parser("merge-chunks")
     merge_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -410,6 +496,12 @@ def main() -> None:
         )
     elif args.command == "make-chunks":
         make_chunks(args.output, tasks_per_chunk=args.tasks_per_chunk)
+    elif args.command == "official-score":
+        official_score(
+            args.samples,
+            args.chunk_manifest,
+            parallel=args.parallel,
+        )
     elif args.command == "merge-chunks":
         merge_chunks(args.output)
     else:
