@@ -120,6 +120,39 @@ def test_native_candidate_family_uses_servable_hashing_features() -> None:
     assert first.tolist() == HashingEmbedder(dim=512).embed(["same task", "different task"])
 
 
+def test_structural_irt_family_uses_deterministic_pre_inference_features() -> None:
+    module = _module()
+    candidates = module._candidate_space("structural-irt")
+    observed = [candidate for candidate in candidates if candidate.label_mode == "observed"]
+    assert len(observed) == 5
+    assert {candidate.analyzer for candidate in observed} == {"structural"}
+    assert {candidate.estimator for candidate in observed} == {
+        "irt-difficulty",
+        "ridge-heads",
+    }
+
+    transformer = module._features(observed[0])
+    texts = [
+        "Fix timeout in `client.py`.\n\n```python\nraise TimeoutError()\n```",
+        "Add a color option.",
+    ]
+    first = transformer.fit_transform(texts)
+    second = transformer.transform(texts)
+    assert np.array_equal(first, second)
+    assert first.shape == (2, 27)
+
+
+def test_irt_uplift_is_largest_for_middle_difficulty() -> None:
+    module = _module()
+    easiness = np.asarray([-4.0, 0.0, 4.0])
+    weights = np.ones(3)
+    weak_offset = module._weighted_irt_offset(easiness, 0.3, weights)
+    strong_offset = module._weighted_irt_offset(easiness, 0.7, weights)
+    uplift = module._sigmoid(easiness + strong_offset) - module._sigmoid(easiness + weak_offset)
+    assert uplift[1] > uplift[0]
+    assert uplift[1] > uplift[2]
+
+
 def test_native_linear_heads_are_plain_numeric_artifact() -> None:
     module = _module()
     spec = module.CandidateSpec(

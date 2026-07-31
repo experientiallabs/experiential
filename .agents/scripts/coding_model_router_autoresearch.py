@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import os
+import re
 import tarfile
 import tempfile
 from pathlib import Path
@@ -122,6 +123,53 @@ class HashingFeatureTransformer:
         return np.asarray([_hashing_vector(text, self.dim) for text in texts], dtype=np.float64)
 
 
+class StructuralFeatureTransformer:
+    """Deterministic issue-shape features available before model inference."""
+
+    def fit_transform(self, texts: list[str]) -> np.ndarray:
+        return self.transform(texts)
+
+    def transform(self, texts: list[str]) -> np.ndarray:
+        return np.asarray([_structural_vector(text) for text in texts], dtype=np.float64)
+
+
+class IrtDifficultyRegressor:
+    """Map structural task easiness to the expected value of a stronger arm."""
+
+    def __init__(self, alpha: float) -> None:
+        self.model = Ridge(alpha=alpha)
+        self.weak_offset = 0.0
+        self.strong_offset = 0.0
+
+    def fit_pair(
+        self,
+        features: np.ndarray,
+        weak: np.ndarray,
+        strong: np.ndarray,
+        weights: np.ndarray,
+    ) -> None:
+        mean_outcome = np.clip((weak + strong) / 2.0, 1e-4, 1.0 - 1e-4)
+        easiness = np.log(mean_outcome / (1.0 - mean_outcome))
+        self.model.fit(features, easiness, sample_weight=weights)
+        predicted = np.asarray(self.model.predict(features), dtype=np.float64)
+        self.weak_offset = _weighted_irt_offset(
+            predicted,
+            float(np.average(weak, weights=weights)),
+            weights,
+        )
+        self.strong_offset = _weighted_irt_offset(
+            predicted,
+            float(np.average(strong, weights=weights)),
+            weights,
+        )
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        easiness = np.asarray(self.model.predict(features), dtype=np.float64)
+        weak = _sigmoid(easiness + self.weak_offset)
+        strong = _sigmoid(easiness + self.strong_offset)
+        return strong - weak
+
+
 def _hashing_vector(text: str, dim: int) -> list[float]:
     """Mirror WMO HashingEmbedder without importing the package on remote fit workers."""
     if dim <= 0:
@@ -139,6 +187,54 @@ def _hashing_vector(text: str, dim: int) -> list[float]:
     if norm > 0.0:
         vector /= norm
     return vector.tolist()
+
+
+def _structural_vector(text: str) -> list[float]:
+    normalized = text.replace("\r\n", "\n")
+    lowered = normalized.lower()
+    length = max(len(normalized), 1)
+    lines = normalized.splitlines() or [normalized]
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", normalized)
+    unique_words = len({word.lower() for word in words})
+    per_thousand = 1_000.0 / length
+    counts = [
+        normalized.count("\n"),
+        normalized.count("```"),
+        normalized.count("`"),
+        len(re.findall(r"https?://", lowered)),
+        len(re.findall(r"""(?:^|[\s`'"])[\w.-]+/[\w./-]+""", normalized)),
+        len(re.findall(r"\b(?:error|exception|traceback|panic|failed|failure)\b", lowered)),
+        len(re.findall(r"\b(?:test|tests|testing|assert|expected|actual)\b", lowered)),
+        len(re.findall(r"\b(?:bug|fix|regression|broken|incorrect)\b", lowered)),
+        len(re.findall(r"\b(?:feature|support|implement|add|enhancement)\b", lowered)),
+        len(re.findall(r"\b(?:performance|slow|latency|memory|timeout)\b", lowered)),
+        len(re.findall(r"\b(?:api|interface|method|function|class)\b", lowered)),
+        len(re.findall(r"(?m)^\s*(?:[-*+] |\d+[.)] )", normalized)),
+        len(re.findall(r"(?m)^#{1,6}\s", normalized)),
+        len(re.findall(r"(?m)^\s*>", normalized)),
+        normalized.count("{") + normalized.count("}"),
+        normalized.count("[") + normalized.count("]"),
+        normalized.count("(") + normalized.count(")"),
+        normalized.count("="),
+    ]
+    uppercase = sum(character.isupper() for character in normalized)
+    digits = sum(character.isdigit() for character in normalized)
+    punctuation = sum(
+        not character.isalnum() and not character.isspace() for character in normalized
+    )
+    line_lengths = [len(line) for line in lines]
+    return [
+        math.log1p(length) / 12.0,
+        math.log1p(len(lines)) / 8.0,
+        math.log1p(len(words)) / 12.0,
+        min(sum(line_lengths) / len(line_lengths) / 200.0, 2.0),
+        min(max(line_lengths) / 2_000.0, 2.0),
+        unique_words / max(len(words), 1),
+        uppercase / length,
+        digits / length,
+        punctuation / length,
+        *[math.log1p(count * per_thousand) / 8.0 for count in counts],
+    ]
 
 
 class StaticRow(TypedDict):
@@ -181,9 +277,15 @@ class CandidateSpec:
     """One mechanically searchable static-text estimator."""
 
     name: str
-    analyzer: Literal["word", "char", "hashing"]
+    analyzer: Literal["word", "char", "hashing", "structural"]
     components: int
-    estimator: Literal["ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"]
+    estimator: Literal[
+        "ridge-uplift",
+        "ridge-heads",
+        "extra-heads",
+        "hist-heads",
+        "irt-difficulty",
+    ]
     alpha: float = 1.0
     min_leaf: int = 10
     label_mode: Literal["observed", "shuffled", "task-blind"] = "observed"
@@ -247,7 +349,8 @@ def _empirical_bayes_rate(successes: float, attempts: int, global_mean: float) -
     return (successes + alpha) / (attempts + alpha + beta)
 
 
-def _load_nebius(path: Path) -> SourceData:
+def _load_paired_json(path: Path, *, name: str) -> SourceData:
+    """Load one compact paired-arm execution source."""
     raw = _read_json(path)
     if not isinstance(raw, list):
         raise ValueError(f"{path} must contain a JSON list")
@@ -281,7 +384,7 @@ def _load_nebius(path: Path) -> SourceData:
         dtype=np.float64,
     )
     return SourceData(
-        name="nebius-swe-agent-8b-70b",
+        name=name,
         task_ids=[row["instance_id"] for row in rows],
         groups=[_canonical_group(row["repo"]) for row in rows],
         texts=[row["text"] for row in rows],
@@ -290,6 +393,10 @@ def _load_nebius(path: Path) -> SourceData:
         weak_attempts=np.asarray([row["cheap_attempts"] for row in rows], dtype=np.float64),
         strong_attempts=np.asarray([row["strong_attempts"] for row in rows], dtype=np.float64),
     )
+
+
+def _load_nebius(path: Path) -> SourceData:
+    return _load_paired_json(path, name="nebius-swe-agent-8b-70b")
 
 
 def _r2e_string_set(path: Path, column: str) -> set[str]:
@@ -441,6 +548,24 @@ def _sigmoid(value: np.ndarray) -> np.ndarray:
     )
 
 
+def _weighted_irt_offset(
+    easiness: np.ndarray,
+    target_mean: float,
+    weights: np.ndarray,
+) -> float:
+    """Calibrate one IRT arm ability to a weighted observed solve rate."""
+    lower = -30.0
+    upper = 30.0
+    for _ in range(80):
+        midpoint = (lower + upper) / 2.0
+        predicted = float(np.average(_sigmoid(easiness + midpoint), weights=weights))
+        if predicted < target_mean:
+            lower = midpoint
+        else:
+            upper = midpoint
+    return (lower + upper) / 2.0
+
+
 def _calibrated_irt_probability(easiness: np.ndarray, target_mean: float) -> np.ndarray:
     """Map task easiness to probabilities whose aggregate matches one observed arm."""
     lower = -30.0
@@ -576,7 +701,44 @@ def _combine(sources: list[SourceData]) -> CombinedData:
     )
 
 
-def _candidate_space(family: Literal["full", "native-linear"] = "full") -> list[CandidateSpec]:
+def _candidate_space(
+    family: Literal["full", "native-linear", "structural-irt"] = "full",
+) -> list[CandidateSpec]:
+    if family == "structural-irt":
+        return [
+            CandidateSpec(
+                "task-blind-uplift",
+                "structural",
+                27,
+                "ridge-uplift",
+                label_mode="task-blind",
+            ),
+            CandidateSpec(
+                "structural-irt-shuffled-a1",
+                "structural",
+                27,
+                "irt-difficulty",
+                alpha=1.0,
+                label_mode="shuffled",
+            ),
+            *[
+                CandidateSpec(
+                    f"structural-irt-a{alpha:g}",
+                    "structural",
+                    27,
+                    "irt-difficulty",
+                    alpha=alpha,
+                )
+                for alpha in (0.1, 1.0, 10.0, 100.0)
+            ],
+            CandidateSpec(
+                "structural-ridge-heads-a1",
+                "structural",
+                27,
+                "ridge-heads",
+                alpha=1.0,
+            ),
+        ]
     if family == "native-linear":
         return [
             CandidateSpec(
@@ -663,6 +825,13 @@ def _training_outcomes(
 def _features(spec: CandidateSpec) -> FeatureTransformer:
     if spec.analyzer == "hashing":
         return HashingFeatureTransformer(spec.components)
+    if spec.analyzer == "structural":
+        if spec.components != len(_structural_vector("")):
+            raise ValueError(
+                f"structural feature dimension is {len(_structural_vector(''))}, "
+                f"not {spec.components}"
+            )
+        return StructuralFeatureTransformer()
     if spec.analyzer == "word":
         vectorizer = TfidfVectorizer(
             analyzer="word",
@@ -694,6 +863,8 @@ def _features(spec: CandidateSpec) -> FeatureTransformer:
 
 
 def _estimators(spec: CandidateSpec) -> tuple[FittedRegressor, FittedRegressor | None]:
+    if spec.estimator == "irt-difficulty":
+        return cast(FittedRegressor, IrtDifficultyRegressor(spec.alpha)), None
     if spec.estimator in ("ridge-uplift", "ridge-heads"):
         first = Ridge(alpha=spec.alpha)
         second = Ridge(alpha=spec.alpha) if spec.estimator == "ridge-heads" else None
@@ -741,6 +912,10 @@ def _fit_estimators(
     weights: np.ndarray,
 ) -> tuple[FittedRegressor, FittedRegressor | None]:
     first, second = _estimators(spec)
+    if spec.estimator == "irt-difficulty":
+        model = cast(IrtDifficultyRegressor, first)
+        model.fit_pair(features, weak, strong, weights)
+        return first, None
     if spec.estimator == "ridge-uplift":
         first.fit(features, strong - weak, sample_weight=weights)
         return first, None
@@ -757,7 +932,7 @@ def _predict_score(
     features: np.ndarray,
 ) -> np.ndarray:
     first, second = estimators
-    if spec.estimator == "ridge-uplift":
+    if spec.estimator in ("ridge-uplift", "irt-difficulty"):
         return np.asarray(first.predict(features), dtype=np.float64)
     if second is None:
         raise AssertionError(f"{spec.name} has no strong-outcome head")
@@ -927,20 +1102,39 @@ def _spearman(left: np.ndarray, right: np.ndarray) -> float:
 def _fit(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    sources = [
-        _load_nebius(args.nebius_tasks.resolve()),
-        _load_r2e(args.r2e_root.resolve()),
-    ]
-    if (args.swebench_matrix is None) != (args.swebench_tasks is None):
-        raise ValueError("--swebench-matrix and --swebench-tasks must be supplied together")
-    if args.swebench_matrix is not None and args.swebench_tasks is not None:
-        sources.append(
-            _load_swebench(
-                args.swebench_matrix.resolve(),
-                args.swebench_tasks.resolve(),
+    if args.source_set == "open-swe-only":
+        if args.open_swe_tasks is None:
+            raise ValueError("--source-set open-swe-only requires --open-swe-tasks")
+        sources = [
+            _load_paired_json(
+                args.open_swe_tasks.resolve(),
+                name="open-swe-traces-paired",
             )
-        )
-    sources.append(_load_coderouter(args.coderouter_root.resolve()))
+        ]
+    else:
+        sources = [
+            _load_nebius(args.nebius_tasks.resolve()),
+            _load_r2e(args.r2e_root.resolve()),
+        ]
+        if (args.swebench_matrix is None) != (args.swebench_tasks is None):
+            raise ValueError("--swebench-matrix and --swebench-tasks must be supplied together")
+        if args.swebench_matrix is not None and args.swebench_tasks is not None:
+            sources.append(
+                _load_swebench(
+                    args.swebench_matrix.resolve(),
+                    args.swebench_tasks.resolve(),
+                )
+            )
+        sources.append(_load_coderouter(args.coderouter_root.resolve()))
+        if args.source_set == "legacy-plus-open-swe":
+            if args.open_swe_tasks is None:
+                raise ValueError("--source-set legacy-plus-open-swe requires --open-swe-tasks")
+            sources.append(
+                _load_paired_json(
+                    args.open_swe_tasks.resolve(),
+                    name="open-swe-traces-paired",
+                )
+            )
     combined = _combine(sources)
     _write_json(
         output / "external-sources.json",
@@ -1135,7 +1329,8 @@ def _fit(args: argparse.Namespace) -> None:
                 ],
                 "target_candidate_count": 1,
                 "candidate_family": args.candidate_family,
-                "post_target_family_adaptation": args.candidate_family == "native-linear",
+                "source_set": args.source_set,
+                "post_target_family_adaptation": args.candidate_family != "full",
                 "selection": "minimum_source_balanced_strong_traffic_then_uplift_spearman",
             },
             "leaderboard": leaderboard,
@@ -1205,16 +1400,28 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
     raw_spec = cast(dict[str, object], fitted["spec"])
     analyzer = str(raw_spec["analyzer"])
     estimator = str(raw_spec["estimator"])
-    if analyzer not in ("word", "char", "hashing"):
+    if analyzer not in ("word", "char", "hashing", "structural"):
         raise ValueError(f"invalid frozen analyzer {analyzer!r}")
-    if estimator not in ("ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"):
+    if estimator not in (
+        "ridge-uplift",
+        "ridge-heads",
+        "extra-heads",
+        "hist-heads",
+        "irt-difficulty",
+    ):
         raise ValueError(f"invalid frozen estimator {estimator!r}")
     spec = CandidateSpec(
         name=str(raw_spec["name"]),
-        analyzer=cast(Literal["word", "char", "hashing"], analyzer),
+        analyzer=cast(Literal["word", "char", "hashing", "structural"], analyzer),
         components=int(_as_float(raw_spec["components"])),
         estimator=cast(
-            Literal["ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"],
+            Literal[
+                "ridge-uplift",
+                "ridge-heads",
+                "extra-heads",
+                "hist-heads",
+                "irt-difficulty",
+            ],
             estimator,
         ),
         alpha=_as_float(raw_spec.get("alpha", 1.0)),
@@ -1314,13 +1521,9 @@ def _matched_task_blind_control(
     return {
         "traffic_matched": {"weak": tasks - strong_count, "strong": strong_count},
         "expected_reward": expected_reward,
-        "reward_95ci": [
-            float(value) for value in np.quantile(random_rewards, [0.025, 0.975])
-        ],
+        "reward_95ci": [float(value) for value in np.quantile(random_rewards, [0.025, 0.975])],
         "expected_cost_usd": expected_cost,
-        "cost_95ci_usd": [
-            float(value) for value in np.quantile(random_costs, [0.025, 0.975])
-        ],
+        "cost_95ci_usd": [float(value) for value in np.quantile(random_costs, [0.025, 0.975])],
         "router_reward_delta_vs_random_mean": router_reward - expected_reward,
         "router_cost_delta_vs_random_mean_usd": router_cost - expected_cost,
         "router_quality_percentile": float(np.mean(random_rewards <= router_reward)),
@@ -1464,9 +1667,7 @@ def _evaluate(args: argparse.Namespace) -> None:
                 )
                 counts = collections.Counter(int(value) for value in decisions)
                 blind_seed = int.from_bytes(
-                    hashlib.sha256(
-                        f"{name}:{ladder_name}:{quality_floor}".encode()
-                    ).digest()[:8],
+                    hashlib.sha256(f"{name}:{ladder_name}:{quality_floor}".encode()).digest()[:8],
                     "big",
                 )
                 row: dict[str, object] = {
@@ -1709,9 +1910,15 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--coderouter-root", type=Path, required=True)
     fit.add_argument("--swebench-matrix", type=Path)
     fit.add_argument("--swebench-tasks", type=Path)
+    fit.add_argument("--open-swe-tasks", type=Path)
+    fit.add_argument(
+        "--source-set",
+        choices=("legacy", "legacy-plus-open-swe", "open-swe-only"),
+        default="legacy",
+    )
     fit.add_argument(
         "--candidate-family",
-        choices=("full", "native-linear"),
+        choices=("full", "native-linear", "structural-irt"),
         default="full",
     )
     fit.add_argument("--output", type=Path, required=True)
