@@ -205,6 +205,7 @@ def push(
     as before.
     """
     from wmo.harness.store import HarnessStore
+
     model_dir = WorldModelStore(root).dir_for(name)
     harness_exists = HarnessStore(root).exists(name)
     resolved_kind = _resolve_kind(
@@ -420,6 +421,7 @@ def _detect_pullable_kind(client: PlatformClient, org_id: str, name: str) -> str
 def _push_model(client: PlatformClient, org_id: str, remote_name: str, model_dir: Path) -> str:
     from wmo.platform.client import PlatformError
     from wmo.platform.transfer import extract_push_meta, pack_model_dir
+
     meta = extract_push_meta(model_dir)
     with tempfile.TemporaryDirectory(prefix="wmo-push-") as staging:
         bundle = pack_model_dir(model_dir, Path(staging) / f"{remote_name}.tar.gz")

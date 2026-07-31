@@ -237,6 +237,7 @@ def _worker_provider_config(
 ) -> ProviderConfig:
     """Resolve the provider settings used by the built-in worker agent."""
     from wmo.providers import ProviderKind
+
     config = _provider_config(provider, model, region)
     if endpoint is not None:
         config = config.model_copy(update={"endpoint": endpoint})
@@ -267,9 +268,7 @@ def providers_set(
     api_key_env: str = typer.Option(
         None, "--api-key-env", help="Env var holding the pool entries' API key (multi-account)."
     ),
-    tier: str = typer.Option(
-        None, "--tier", help="Pool entry tier: frontier | open."
-    ),
+    tier: str = typer.Option(None, "--tier", help="Pool entry tier: frontier | open."),
     input_per_mtok: float = typer.Option(
         None,
         "--input-per-mtok",
@@ -307,6 +306,7 @@ def providers_set(
     import wmo.cli.pool_registry as pool_registry
     from wmo.cli.ui import select_provider_and_model
     from wmo.providers import verify_all
+
     if tier is not None and tier not in pool_registry.TIERS:
         raise typer.BadParameter(f"--tier must be one of: {', '.join(pool_registry.TIERS)}")
     if (input_per_mtok is None) != (output_per_mtok is None):
@@ -415,6 +415,7 @@ def _register_pool_models(
     nothing.
     """
     import wmo.cli.pool_registry as pool_registry
+
     if pool_model:
         pool_registry.register_model_ids(
             _console, pool_path=pool_path, kind=kind, model_ids=pool_model, options=options
@@ -451,6 +452,7 @@ def providers_verify(
     """
     from wmo.providers import verify_all, verify_embedder
     from wmo.providers.base import EmbedderKind
+
     store = WorldModelStore(root)
     names = [name] if name is not None else store.list_names()
     configs: list[HarnessConfig] = []
@@ -612,6 +614,7 @@ _DB_SOURCES = ("postgres",)
 def _check_build_source(source: str) -> None:
     """Reject a `--source` that `wmo build` cannot drive, naming the `wmo ingest` two-step."""
     from wmo.ingest import list_adapters
+
     if source not in list_adapters():
         raise typer.BadParameter(
             f"unknown --source {source!r}; choose one of: {', '.join(list_adapters())}"
@@ -640,6 +643,7 @@ def _empty_corpus_error(file: str | None, source: str) -> typer.BadParameter:
     """Explain an empty ingest: usually `--source` does not match the export's real format."""
     from wmo.ingest.base import load_payloads
     from wmo.ingest.detect import detect_format
+
     if file is None:
         return typer.BadParameter(
             f"the --source {source} pull returned no traces; widen --since/--limit or check the "
@@ -667,6 +671,7 @@ def _empty_corpus_error(file: str | None, source: str) -> typer.BadParameter:
 def _chain_bad_parameter(err: ValueError) -> typer.BadParameter:
     """Render a failover-chain resolution failure as a usage error naming the file to write."""
     from wmo.providers.waterfall import FALLBACK_CONFIG_PATH
+
     return typer.BadParameter(
         f"{err}. Write {FALLBACK_CONFIG_PATH} as [[chain.<name>]] rung tables (one table per "
         "fallback rung, keys kind/model/profile/region; format in docs/reference/failover.md), "
@@ -677,6 +682,7 @@ def _chain_bad_parameter(err: ValueError) -> typer.BadParameter:
 def _provider_or_chain_or_abort(config: ProviderConfig, chain: str | None) -> Provider:
     """`providers.provider_or_chain`, with chain-resolution errors as clean usage errors."""
     import wmo.providers as providers
+
     try:
         return providers.provider_or_chain(config, chain=chain)
     except ValueError as err:
@@ -799,6 +805,7 @@ def build(
     from wmo.retrieval import get_embedder
     from wmo.telemetry import BuildTelemetryStats, TelemetryBuildReporter, capture_build_completed
     from wmo.tracking import MeteredProvider, Phase, RunTracker, classify_build_call, save_run
+
     if vendor:
         source = vendor
         pull = True
@@ -1077,6 +1084,7 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     import wmo.providers as providers
     from wmo.providers import verify_all, verify_embedder
     from wmo.providers.base import EmbedderKind
+
     checks = [(config.serve_provider_config(), False)]
     if config.embed_provider is not EmbedderKind.HASHING:
         checks.append((config.embed_provider_config(), True))
@@ -1156,6 +1164,7 @@ def list_models(root: str = typer.Option(ARTIFACT_DIR, help="Project dir to list
     `config.toml` costs you that one row instead of the whole listing.
     """
     from wmo.cli.ui import models_table
+
     if Path(root).is_file():
         raise typer.BadParameter(
             f"--root {root} is a file, not a project dir; pass the dir holding models/ "
@@ -1191,6 +1200,7 @@ def download(
     """
     from wmo.cli.ui import select_option
     from wmo.hub import corpus_path, published_corpora
+
     selected = list(benchmarks or [])
     if selected == ["all"]:
         selected = _all_downloadable()
@@ -1283,6 +1293,7 @@ def _all_downloadable() -> list[str]:
     or a quiet drop of a registered benchmark, reads afterwards as "everything was fetched".
     """
     from wmo.hub import CORPORA, downloadable_benchmarks, published_corpora
+
     try:
         return sorted(corpus.benchmark for corpus in published_corpora())
     except urllib.error.URLError as exc:
@@ -1303,6 +1314,7 @@ def _all_downloadable() -> list[str]:
 def _fetch_with_progress(name: str, *, force: bool) -> Path:
     """fetch_corpus with a live byte progress bar (hidden when nothing needs downloading)."""
     from wmo.hub import fetch_corpus
+
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -1349,6 +1361,7 @@ def serve(
     import uvicorn
 
     from wmo.serving.server import create_app
+
     names = list(name) if name else None
     # Bad --name input (unsafe segment, unknown model, nothing built) is a usage error,
     # not a traceback; load the models before uvicorn takes over the process.
@@ -1404,6 +1417,7 @@ def _resolve_eval_suite_or_usage(selector: str, examples_roots: list[str]) -> Ev
     never a traceback.
     """
     from wmo.engine.eval_suites import resolve_eval_suite
+
     try:
         return resolve_eval_suite(selector, examples_roots)
     except ValueError as err:
@@ -1583,6 +1597,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
     from wmo.cli.eval_closed_loop import run_agreement, run_closed_loop
     from wmo.cli.harness_app import _explicit
     from wmo.telemetry import capture_eval_completed
+
     args = tokens or []
     suite_roots = (
         [str(root) for root in _benchmark_roots()] if examples_root is None else [examples_root]
@@ -1738,6 +1753,7 @@ def eval_(  # noqa: A001 - `eval` is the user-facing command name; the builtin i
 
 def _eval_list(examples_roots: list[str]) -> None:
     from wmo.engine.eval_suites import discover_eval_suites
+
     suites = discover_eval_suites(examples_roots)
     if not suites:
         _console.print("[yellow]no eval suites found[/yellow]")
@@ -1765,6 +1781,7 @@ def _eval_results(
     limit: int,
 ) -> None:
     from wmo.engine.eval_suites import list_eval_results, resolve_eval_suite
+
     resolved_suite = suite_filter
     if suite_filter is not None:
         try:
@@ -1820,6 +1837,7 @@ def _parse_model_specs(models: str | None) -> list[ModelSpec]:
     from wmo.evals.grid import ModelSpec
     from wmo.providers import ProviderKind
     from wmo.providers.models import resolve_provider_model
+
     raw = models.split(",") if models else list(_DEFAULT_GRID_MODELS)
     specs: list[ModelSpec] = []
     for entry in raw:
@@ -1875,6 +1893,7 @@ def _eval_run_grid(  # noqa: PLR0913 - a CLI seam threading grid options; each m
     from wmo.engine.prompts import BASE_ENV_PROMPT
     from wmo.evals.grid import run_grid
     from wmo.evals.grid_plot import plot_grid
+
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
     # The chart is the last thing written, so probe its deps before the grid spends anything.
     _require_viz_extra()
@@ -1937,6 +1956,7 @@ def _eval_grid_plot(paths: list[str], *, out: str | None, dataset_label: str | N
     """
     from wmo.evals.grid import GridResult, merge_results
     from wmo.evals.grid_plot import plot_grid
+
     _require_viz_extra()
     results = [GridResult.model_validate_json(Path(p).read_text(encoding="utf-8")) for p in paths]
     merged = merge_results(results)
@@ -1966,6 +1986,7 @@ def _eval_grid_heatmap(paths: list[str], *, out: str | None) -> None:
     """
     from wmo.evals.grid import GridResult, merge_results
     from wmo.evals.grid_plot import plot_grid_heatmap
+
     _require_viz_extra()
     by_suite: dict[str, list[GridResult]] = {}
     for p in paths:
@@ -1996,6 +2017,7 @@ def _eval_run_suite(
 ) -> None:
     from wmo.engine.eval_suites import result_path
     from wmo.telemetry import capture_eval_completed, settings_root_from_results_root
+
     suite = _resolve_eval_suite_or_usage(selector, examples_roots)
     suite_prompt = suite.resolve_prompt()
     options = _eval_options(
@@ -2081,6 +2103,7 @@ def _eval_options(
     reasoning: bool | None = None,
 ) -> _EvalOptions:
     from wmo.engine.build import DEFAULT_TRAIN_SPLIT
+
     split = DEFAULT_TRAIN_SPLIT if train_split is None else train_split
     dim = 512 if embed_dim is None else embed_dim
     retrieval = True if rag is None else rag
@@ -2120,6 +2143,7 @@ def _run_eval_files(
     from wmo.evals.open_loop import OpenLoopEval
     from wmo.optimize.judge import RubricJudge
     from wmo.retrieval import HashingEmbedder
+
     for path in files:
         if not path.exists():
             raise typer.BadParameter(f"trace file not found: {path}")
@@ -2211,6 +2235,7 @@ def _write_ad_hoc_eval_report(path: Path, report: EvalReport) -> None:
 
 def _eval_report_payload(report: EvalReport) -> JsonObject:
     from wmo.optimize.judge import JUDGE_VERSION
+
     return {
         "judge_version": JUDGE_VERSION,
         "overall_fidelity": report.overall_fidelity,
@@ -2238,6 +2263,7 @@ def knowledge_(
     resolved exactly as `wmo demo`/`wmo play` resolve them, so a shipped example needs no `--root`.
     """
     from wmo.engine.knowledge import KnowledgeBase
+
     store_root, resolved = _resolve_model_any(name, root)
     model_dir = WorldModelStore(str(store_root)).resolve(resolved)
     kb = KnowledgeBase(ArtifactPaths(model_dir).knowledge)
@@ -2303,6 +2329,7 @@ def scenarios_build(
     the named clusters they came from, and the corpus-coverage number that justifies them.
     """
     from wmo.scenarios import FacetExtractor, ScenarioBuildConfig, build_scenario_set
+
     traces = _ingest_scenario_corpus(file)
     if limit is not None:
         traces = traces[:limit]
@@ -2357,6 +2384,7 @@ def scenarios_verify(
     from wmo.env.llm_agent import LLMAgent
     from wmo.providers.retry import wrap_provider_with_retries
     from wmo.scenarios import ChecklistJudge, verify_scenarios
+
     scenario_set = _load_scenario_set(scenarios_file)
     traces = _ingest_scenario_corpus(file)
     if provider is not None or model is not None:
@@ -2422,6 +2450,7 @@ def _ingest_scenario_corpus(file: str) -> list[Trace]:
     reaches the user as a stdlib FileNotFoundError/IsADirectoryError traceback.
     """
     from wmo.ingest import get_adapter
+
     path = Path(file)
     if path.is_dir():
         raise typer.BadParameter(
@@ -2447,6 +2476,7 @@ def _load_scenario_set(scenarios_file: str) -> ScenarioSet:
     be the output of `wmo scenarios build`.
     """
     from wmo.scenarios import ScenarioSet
+
     path = Path(scenarios_file)
     build_hint = (
         f"build one with `wmo scenarios build --file <traces.jsonl> --out {scenarios_file}`"
@@ -2493,6 +2523,7 @@ def _unreadable_input(
 def _provider_kind(provider: str) -> ProviderKind:
     """The `ProviderKind` a `--provider` flag names, as a usage error when it names none."""
     from wmo.providers import ProviderKind
+
     try:
         return ProviderKind(provider)
     except ValueError:
@@ -2503,6 +2534,7 @@ def _provider_kind(provider: str) -> ProviderKind:
 def _provider_config(provider: str, model: str, region: str | None) -> ProviderConfig:
     from wmo.providers import ProviderConfig
     from wmo.providers.models import resolve_provider_model
+
     kind = _provider_kind(provider)
     spec = resolve_provider_model(kind, model)
     return ProviderConfig(
@@ -2528,6 +2560,7 @@ def _default_model_for_provider(kind: ProviderKind) -> str:
     told which model to run.
     """
     from wmo.providers.models import model_types_for_provider
+
     catalog = model_types_for_provider(kind)
     if not catalog:
         raise typer.BadParameter(
@@ -2601,6 +2634,7 @@ def _worker_role_provider_config(
     """
     from wmo.providers import ProviderKind
     from wmo.providers.models import resolve_provider_model
+
     configured = _role_provider_config("worker", region)
     if configured is None or (provider is not None and provider != configured.kind.value):
         kind = _provider_kind(provider or _DEFAULT_WORKER_PROVIDER)
@@ -2634,6 +2668,7 @@ def _scenario_role_llms(
     judge carries self-preference bias toward the generator's outputs.
     """
     import wmo.providers as providers
+
     if provider is not None or model is not None:
         llm = providers.get_provider(_worker_role_provider_config(provider, model, region))
         return llm, llm, llm
@@ -2656,6 +2691,7 @@ def _resolve_scenario_embedder(
     from wmo.providers import ProviderConfig
     from wmo.providers.base import EmbedderKind
     from wmo.retrieval import HashingEmbedder
+
     try:
         kind = EmbedderKind(embed_provider)
     except ValueError:
@@ -2718,6 +2754,7 @@ def demo(
     from wmo.engine.world_model import WorldModel
     from wmo.providers import verify_all
     from wmo.providers.retry import wrap_provider_with_retries
+
     wm, resolved_name, _provider, model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
     )
@@ -2855,6 +2892,7 @@ def play(
 ) -> None:
     """Step into the environment yourself: type actions, the world model returns observations."""
     from wmo.cli.ui import run_play_repl
+
     wm, resolved_name, _provider, _model_root = _load_model_any(
         name, root, max_fidelity=max_fidelity
     )
@@ -2871,6 +2909,7 @@ def _demo_traces(model_dir: Path, resolved_name: str, explicit: str | None) -> P
     neither, and the failure has to name the file to pass rather than the directory it searched.
     """
     from wmo.serving.traces_source import TRACES_FILENAME, local_traces_path
+
     if explicit is not None:
         path = Path(explicit)
         if not path.is_file():
@@ -3016,6 +3055,7 @@ def _resolve_name(store: WorldModelStore, name: str | None) -> str:
     (unknown/ambiguous name) are turned into a clean `typer.BadParameter` rather than a traceback.
     """
     from wmo.cli.ui import select_model
+
     try:
         if name is not None:
             store.resolve(name)  # validates existence, raising a friendly error if missing
@@ -3146,6 +3186,7 @@ def research_concurrency(
     from wmo.research.concurrency_scaling import ConcurrencyPoint
     from wmo.retrieval import EmbeddingRetriever, HashingEmbedder
     from wmo.retrieval.leakfree import DemoRetriever
+
     if scenarios < 1:
         raise typer.BadParameter("--scenarios must be at least 1")
     try:
@@ -3437,6 +3478,7 @@ def _load_model(name: str | None, root: str, *, max_fidelity: bool = False):  # 
     import wmo.providers as providers
     from wmo.engine.world_model import WorldModel
     from wmo.providers.retry import wrap_provider_with_retries
+
     store = WorldModelStore(root)
     resolved_name = _resolve_name(store, name)
     model_dir = store.resolve(resolved_name)
@@ -3466,6 +3508,7 @@ def _prepare_serve_provider_or_exit(provider: Provider, config: ProviderConfig) 
     residual gap they cannot close locally; those still fail on the first call.
     """
     from wmo.providers.base import PreparableProvider
+
     if not isinstance(provider, PreparableProvider):
         return
     try:
