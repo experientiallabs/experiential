@@ -151,3 +151,38 @@ The trace-derived cost estimate was USD 0.0329324. E2B sandbox
 `ikhhw5dszmnp81xzuuc86` was terminated after artifact synchronization. A local
 verifier initially joined the attempt directory incorrectly; verification was
 corrected against the downloaded archive without rerunning a provider cell.
+
+## Source result
+
+The full source matrix completed with all 540 preregistered cells. Attempt 0
+contains 155 audited pre-existing cells and 25 fresh cells. Attempts 1 and 2
+contain 180 fresh cells each. The 385 new cells cost USD 6.1687718 by the
+trace-derived estimate. The 155 reused cells retain USD 4.4673053 of original
+cost provenance and caused no new provider calls. All three experiment-owned
+matrix sandboxes were terminated after raw-trace synchronization and
+verification. The attempt-0 reservation guard stopped after five persisted
+cells because its local sub-cap was too tight; the retained sandbox resumed the
+remaining 20 cells without duplication after the sub-cap was corrected.
+
+The permissive grouped out-of-fold screen failed before nested selection was
+warranted:
+
+- `low`: 96.30% mean pass rate, USD 0.5005 mean-attempt corpus spend
+- `medium`: 83.33%, USD 0.5406
+- `high`: 75.93%, USD 0.8527
+- `xhigh`: 78.70%, USD 0.8419
+- `max`: 78.70%, USD 0.8097
+
+`max - xhigh` was positive on 3 tasks, negative on 5, and equal on 28. The best
+real scorer had uplift Spearman `-0.0469`, zero advantage over the matched
+task-blind mixture, and family-bootstrap 95% interval
+`[-0.00392, 0.00376]`. A shuffled-label scorer was better than every real
+scorer, with Spearman `0.1567` and apparent advantage `0.01852`. Twenty of 36
+tasks violated monotonic effort ordering. `low` strictly dominated the routed
+region on both reward and cost.
+
+The exploratory report SHA-256 is
+`07888aa79a05518bcdf061378d3fe41032e2091b2ddeded331f1b8600ed7a90b`.
+Because even this optimistic screen fails all three primary external gates, the
+stricter nested selector cannot promote a candidate. DeepSWE remains sealed and
+no target transfer is authorized from this corpus.

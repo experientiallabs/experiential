@@ -146,33 +146,50 @@ def _load_data(corpus_path: Path, outcome_paths: list[Path]) -> Data:
     ]
     if len(tasks) != len(raw_tasks):
         raise ValueError(f"{corpus_path} contains an invalid task")
-    cells: dict[tuple[str, str], dict[str, object]] = {}
+    cells: dict[tuple[str, str], dict[int, dict[str, object]]] = {}
     for path in outcome_paths:
         for row in _read_rows(path):
             task_id = row.get("task_id")
             arm = row.get("arm")
-            if not isinstance(task_id, str) or not isinstance(arm, str):
+            attempt = row.get("attempt")
+            if (
+                not isinstance(task_id, str)
+                or not isinstance(arm, str)
+                or not isinstance(attempt, int)
+                or isinstance(attempt, bool)
+            ):
                 raise ValueError(f"{path} contains an invalid cell")
             key = (task_id, arm)
-            if key in cells:
-                raise ValueError(f"duplicate outcome cell: {key}")
+            attempts = cells.setdefault(key, {})
+            if attempt in attempts:
+                raise ValueError(f"duplicate outcome cell: {key} attempt={attempt}")
             if (
                 row.get("model_attested") is not True
                 or row.get("protected_intact") is not True
                 or row.get("target_outcomes_used") is not False
             ):
                 raise ValueError(f"ungradeable outcome cell: {key}")
-            cells[key] = row
+            attempts[attempt] = row
     task_ids = [str(task["task_id"]) for task in tasks]
     rewards = np.zeros((len(tasks), len(ARMS)), dtype=np.float64)
     costs = np.zeros_like(rewards)
     for task_index, task_id in enumerate(task_ids):
         for arm_index, arm in enumerate(ARMS):
-            row = cells.get((task_id, arm))
-            if row is None:
+            attempts = cells.get((task_id, arm))
+            if attempts is None:
                 raise ValueError(f"missing outcome cell: {(task_id, arm)}")
-            rewards[task_index, arm_index] = float(cast(float, row["reward"]))
-            costs[task_index, arm_index] = float(cast(float, row["cost_usd"]))
+            if set(attempts) != {0, 1, 2}:
+                raise ValueError(
+                    f"incomplete attempts for {(task_id, arm)}: {sorted(attempts)}"
+                )
+            rewards[task_index, arm_index] = float(
+                np.mean([float(cast(float, row["reward"])) for row in attempts.values()])
+            )
+            costs[task_index, arm_index] = float(
+                np.mean(
+                    [float(cast(float, row["cost_usd"])) for row in attempts.values()]
+                )
+            )
     return Data(
         task_ids=task_ids,
         groups=[
