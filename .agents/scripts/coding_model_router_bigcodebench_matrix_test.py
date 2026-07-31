@@ -162,3 +162,21 @@ def test_heldout_oracle_rejects_task_blind_ordering() -> None:
         bootstraps_per_split=3,
     )
     assert report["mean_heldout_oracle_headroom"] == 0.0
+
+
+def test_heldout_oracle_bootstraps_mean_across_attempt_splits() -> None:
+    rng = module.np.random.default_rng(19)
+    rewards = rng.integers(
+        0,
+        2,
+        size=(6, len(module.ARMS), module.ATTEMPTS),
+    ).astype(module.np.float64)
+    report = module._heldout_oracle(
+        rewards,
+        ["one-family"] * len(rewards),
+        seed=23,
+        bootstraps_per_split=7,
+    )
+    mean = report["mean_heldout_oracle_headroom"]
+    assert report["family_bootstraps"] == 7
+    assert report["heldout_oracle_headroom_95ci"] == pytest.approx([mean] * 3)

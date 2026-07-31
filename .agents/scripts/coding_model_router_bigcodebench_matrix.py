@@ -812,7 +812,7 @@ def _heldout_oracle(
         for group in unique_groups
     }
     split_summaries: list[dict[str, Any]] = []
-    bootstrap_headroom: list[float] = []
+    split_headroom_by_task: list[np.ndarray] = []
     for split_index, fit_attempts_tuple in enumerate(
         itertools.combinations(range(ATTEMPTS), 2)
     ):
@@ -827,7 +827,9 @@ def _heldout_oracle(
         choices = _pick_task_arms(fit, global_fit)
         oracle_by_task = heldout[np.arange(len(choices)), choices]
         static_by_task = heldout[:, static_arm]
-        headroom = float(np.mean(oracle_by_task - static_by_task))
+        headroom_by_task = oracle_by_task - static_by_task
+        headroom = float(np.mean(headroom_by_task))
+        split_headroom_by_task.append(headroom_by_task)
         split_summaries.append(
             {
                 "split": split_index,
@@ -839,22 +841,26 @@ def _heldout_oracle(
                 "headroom": headroom,
             }
         )
-        for _ in range(bootstraps_per_split):
-            sampled_groups = rng.choice(
-                unique_groups,
-                size=len(unique_groups),
-                replace=True,
-            )
-            sampled = np.concatenate(
-                [group_indices[str(group)] for group in sampled_groups]
-            )
-            bootstrap_headroom.append(
-                float(
-                    np.mean(
-                        oracle_by_task[sampled] - static_by_task[sampled]
-                    )
+    bootstrap_headroom: list[float] = []
+    for _ in range(bootstraps_per_split):
+        sampled_groups = rng.choice(
+            unique_groups,
+            size=len(unique_groups),
+            replace=True,
+        )
+        sampled = np.concatenate(
+            [group_indices[str(group)] for group in sampled_groups]
+        )
+        bootstrap_headroom.append(
+            float(
+                np.mean(
+                    [
+                        float(np.mean(headroom_by_task[sampled]))
+                        for headroom_by_task in split_headroom_by_task
+                    ]
                 )
             )
+        )
     interval = np.quantile(bootstrap_headroom, [0.025, 0.5, 0.975])
     mean_headroom = float(
         np.mean([float(row["headroom"]) for row in split_summaries])
@@ -863,7 +869,7 @@ def _heldout_oracle(
         "attempt_splits": len(split_summaries),
         "fit_attempts": 2,
         "heldout_attempts": 3,
-        "family_bootstraps_per_split": bootstraps_per_split,
+        "family_bootstraps": bootstraps_per_split,
         "mean_heldout_oracle_headroom": mean_headroom,
         "heldout_oracle_headroom_95ci": [float(value) for value in interval],
         "split_summaries": split_summaries,
