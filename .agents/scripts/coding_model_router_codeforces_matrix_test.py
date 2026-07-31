@@ -98,3 +98,8 @@ def test_corpus_information_boundary(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert module._read_object(path)["target_outcomes_used"] is True
+
+
+def test_default_and_corrected_output_limits_are_explicit() -> None:
+    assert module.MAX_OUTPUT_TOKENS == 32_768
+    assert 131_072 > module.MAX_OUTPUT_TOKENS

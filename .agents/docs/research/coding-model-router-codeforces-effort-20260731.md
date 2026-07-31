@@ -106,3 +106,32 @@ If the gate fails, report the negative result and keep DeepSWE sealed. If it
 passes, freeze the selected lightweight policy and run exactly one untouched
 DeepSWE v1.1 transfer. No target refit, threshold tuning, or second target
 transfer is permitted.
+
+## Source result
+
+The 1,600-cell source matrix completed with exact coverage, two attempts per
+task and effort, raw-response and code hashes, graded outcomes, and exact model
+attestation. All five matrix sandboxes were terminated after their archives
+passed local verification. The trace-token estimate was USD 72.4096456.
+
+Static source results, using mean attempt reward and cost, were:
+
+- `low`: 79.88% reward at USD 1.5323
+- `medium`: 84.43% at USD 2.6364
+- `high`: 91.47% at USD 6.7991
+- `xhigh`: 85.69% at USD 10.3634
+- `max`: 72.03% at USD 14.8737
+
+The nested contest-grouped router scored 87.69% at USD 6.9710. It was 1.68
+reward points worse than its matched task-blind mixture, with contest-bootstrap
+95% interval `[-0.04657, 0.00846]`, uplift Spearman `-0.3723`, and static-high
+dominance. The shuffled control also failed. The external gate therefore
+failed and DeepSWE remained sealed. The fit report SHA-256 is
+`de706785ba32195cd7bf6d49464aa436c073b2180f40170bdf18abb6c6149c76`.
+
+The protocol exposed a source-specific execution confound. The frozen 32,768
+output-token limit produced 85 incomplete max cells and 33 incomplete xhigh
+cells, all with `max_output_tokens` as the reason. High had three such cells,
+while medium and low had none. This result is retained as a valid negative for
+the frozen protocol, but it cannot establish that task-conditioned effort is
+unlearnable when higher efforts receive enough room to return a final program.

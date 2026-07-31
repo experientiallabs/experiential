@@ -185,6 +185,7 @@ def _provider_call(
     effort: str,
     *,
     api_key: str,
+    max_output_tokens: int,
     max_retries: int = 5,
 ) -> tuple[dict[str, Any], float]:
     payload = {
@@ -194,7 +195,7 @@ def _provider_call(
             {"role": "user", "content": prompt},
         ],
         "reasoning": {"effort": effort},
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "max_output_tokens": max_output_tokens,
     }
     body = json.dumps(payload).encode()
     started = time.monotonic()
@@ -393,12 +394,16 @@ def _run_cell(
     state: MatrixState,
     *,
     api_key: str,
+    max_output_tokens: int,
 ) -> None:
     state.reserve()
     persisted = False
     try:
         response, provider_duration = _provider_call(
-            str(task["prompt"]), cell.effort, api_key=api_key
+            str(task["prompt"]),
+            cell.effort,
+            api_key=api_key,
+            max_output_tokens=max_output_tokens,
         )
         if response.get("model") != MODEL:
             raise RuntimeError(f"unexpected provider model {response.get('model')!r}")
@@ -468,11 +473,14 @@ def run(
     efforts: tuple[str, ...],
     attempts: int,
     task_ids: set[str] | None,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
     """Generate, grade, persist, and resume a frozen matrix."""
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is unavailable")
+    if max_output_tokens < 1:
+        raise ValueError("max_output_tokens must be positive")
     corpus = _read_object(corpus_path)
     if (
         corpus.get("target_outcomes_used") is not False
@@ -507,6 +515,7 @@ def run(
                 output,
                 state,
                 api_key=api_key,
+                max_output_tokens=max_output_tokens,
             ): cell
             for cell in pending
         }
@@ -527,6 +536,7 @@ def run(
         "model": MODEL,
         "efforts": list(efforts),
         "attempts": attempts,
+        "max_output_tokens": max_output_tokens,
         "tasks": len(tasks),
         "cells": len(selected_rows),
         "pending_before_run": len(pending),
@@ -557,6 +567,7 @@ def main() -> None:
         dest="efforts",
     )
     parser.add_argument("--attempts", type=int, default=ATTEMPTS)
+    parser.add_argument("--max-output-tokens", type=int, default=MAX_OUTPUT_TOKENS)
     parser.add_argument("--task-id", action="append", dest="task_ids")
     args = parser.parse_args()
     run(
@@ -568,6 +579,7 @@ def main() -> None:
         efforts=tuple(args.efforts or ARMS),
         attempts=args.attempts,
         task_ids=set(args.task_ids) if args.task_ids else None,
+        max_output_tokens=args.max_output_tokens,
     )
 
 
