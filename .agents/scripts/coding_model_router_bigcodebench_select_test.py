@@ -55,6 +55,9 @@ def test_candidate_grid_is_complete_and_unique() -> None:
         "doubly-robust",
         "empirical-bayes",
     }
+    knn = module.knn_candidate_grid()
+    assert len(knn) == 432
+    assert len({candidate.name for candidate in knn}) == 432
 
 
 def test_grouped_oof_candidate_has_no_unfilled_routes() -> None:
@@ -95,3 +98,20 @@ def test_small_fit_only_search_selects_one_candidate() -> None:
     )
     assert len(results) == 2
     assert selected in results
+
+
+def test_small_knn_search_reuses_one_bank_per_fold(tmp_path: Path) -> None:
+    candidates = [
+        module.KnnCandidateSpec(512, 8, 0.9, z, 8, order)
+        for order, z in enumerate((0.0, 0.5), start=576)
+    ]
+    selected, results = module.select_knn_candidate(
+        _data(),
+        np.arange(30),
+        candidates,
+        seed=2,
+        work_dir=tmp_path,
+    )
+    assert len(results) == 2
+    assert selected in results
+    assert len(list(tmp_path.rglob("*.bank.npz"))) == 5

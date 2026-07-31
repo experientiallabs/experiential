@@ -126,7 +126,10 @@ The preregistered candidate families are:
 1. **Guarded local kNN.** WMO reward-profile kNN over each frozen representation. Search 8, 16,
    32, and 64 neighbors; relative similarity 0.90, 0.95, and 0.98; guard z 0, 0.5, 1.0, and
    1.645; and minimum paired support 8, 16, and 32. Weak or novel neighborhoods revert to the
-   fit-selected static effort.
+   fit-selected static effort. After selecting this 432-point retrieval and statistical grid,
+   run one fit-only economic refinement around its winner: guard effort is each of the five arms,
+   guard mode is asymmetric, and `pick_lam` is 0, 0.01, 0.02, or 0.03. This adds 20 points without
+   redundantly crossing economic settings with every retrieval configuration.
 2. **Ordinal adjacent-effort uplift.** Cross-fitted Ridge and ExtraTrees heads predict the four
    adjacent gains from low through max. Ridge alpha is 0.1, 1, 10, or 100. ExtraTrees uses 200 or
    500 trees, leaf size 5, 10, or 20, and at most square-root or one-third of features per split.
@@ -147,9 +150,9 @@ The preregistered candidate families are:
    Posterior lower bounds use z 0, 0.5, 1.0, or 1.645 and revert to the fit-selected static effort
    when no effort clears the fit-only quality floor.
 
-The Cartesian grids contain 432 guarded kNN points and 576 non-kNN points, for 1,008 candidates
-per outer seed before negative controls. Candidate identities and frozen ordering are generated
-without reading a reward row.
+The grids contain 432 guarded kNN base points, 20 sequential kNN economic refinements, and 576
+non-kNN points, for 1,028 candidate evaluations per outer seed before negative controls. Candidate
+identities and frozen ordering are generated without reading a reward row.
 
 All fitting and hyperparameter search runs remotely. The five outer seeds are 0 through 4. For
 each seed, complete library signatures are ordered by

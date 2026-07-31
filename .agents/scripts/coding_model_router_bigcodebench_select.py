@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -29,10 +30,14 @@ from coding_model_router_bigcodebench_fit import (
     multi_action_ridge_predictions,
     ordinal_extra_trees_predictions,
     ordinal_ridge_predictions,
+    outcome_matrix,
     select_fit_candidate,
     shadow_price_choices,
 )
 from scipy import sparse
+
+from wmo.optimize.knn import fit_knn_policy
+from wmo.optimize.policy import EmbedderSpec, knn_decision
 
 Family = Literal["ordinal", "doubly-robust", "empirical-bayes"]
 Estimator = Literal["ridge", "extra-trees", "histogram"]
@@ -102,10 +107,44 @@ class CandidateSpec:
 class CandidateValidation:
     """Grouped out-of-fold value for one fit-only candidate."""
 
-    spec: CandidateSpec
+    spec: CandidateSpec | KnnCandidateSpec
     value: PolicyValue
     baseline: PolicyValue
     metric: CandidateMetric
+
+
+@dataclass(frozen=True)
+class KnnCandidateSpec:
+    """One preregistered WMO kNN retrieval and statistical-guard point."""
+
+    dim: int
+    rag_num: int
+    rag_thres: float
+    z: float
+    min_pairs: int
+    order: int
+
+    @property
+    def name(self) -> str:
+        """Return the stable grid identity."""
+        return (
+            f"knn-d{self.dim}-k{self.rag_num}-thres{self.rag_thres:g}"
+            f"-z{self.z:g}-pairs{self.min_pairs}"
+        )
+
+    def config(self) -> dict[str, str | int | float | bool]:
+        """Return the complete canonicalizable kNN configuration."""
+        return {
+            "family": "knn",
+            "dim": self.dim,
+            "rag_num": self.rag_num,
+            "rag_thres": self.rag_thres,
+            "z": self.z,
+            "min_pairs": self.min_pairs,
+            "guard_strategy": "fit-best",
+            "guard_mode": "symmetric",
+            "pick_lam": 0.0,
+        }
 
 
 def candidate_grid() -> list[CandidateSpec]:
@@ -164,6 +203,31 @@ def candidate_grid() -> list[CandidateSpec]:
                     )
     if len(candidates) != 576 or len({candidate.name for candidate in candidates}) != 576:
         raise AssertionError("non-kNN candidate grid is incomplete or has duplicate identities")
+    return candidates
+
+
+def knn_candidate_grid() -> list[KnnCandidateSpec]:
+    """Enumerate the exact 432 preregistered WMO kNN base points."""
+    candidates = [
+        KnnCandidateSpec(
+            dim=dim,
+            rag_num=rag_num,
+            rag_thres=rag_thres,
+            z=z,
+            min_pairs=min_pairs,
+            order=576 + index,
+        )
+        for index, (dim, rag_num, rag_thres, z, min_pairs) in enumerate(
+            (dim, rag_num, rag_thres, z, min_pairs)
+            for dim in HASH_DIMS
+            for rag_num in (8, 16, 32, 64)
+            for rag_thres in (0.90, 0.95, 0.98)
+            for z in (0.0, 0.5, 1.0, 1.645)
+            for min_pairs in (8, 16, 32)
+        )
+    ]
+    if len(candidates) != 432 or len({candidate.name for candidate in candidates}) != 432:
+        raise AssertionError("kNN candidate grid is incomplete or has duplicate identities")
     return candidates
 
 
@@ -362,6 +426,99 @@ def select_non_knn_candidate(
     selected_metric = select_fit_candidate(
         [result.metric for result in results],
         baseline_reward=baseline_reward,
+    )
+    selected = next(result for result in results if result.metric.name == selected_metric.name)
+    return selected, results
+
+
+def select_knn_candidate(
+    data: FitData,
+    outer_fit: np.ndarray,
+    candidates: list[KnnCandidateSpec],
+    *,
+    seed: int,
+    work_dir: Path,
+) -> tuple[CandidateValidation, list[CandidateValidation]]:
+    """Select one WMO kNN point using five grouped outer-fit folds and shared banks."""
+    if not candidates:
+        raise ValueError("kNN selection received no candidates")
+    indices = np.asarray(outer_fit, dtype=np.int64)
+    if indices.size == 0 or len(set(indices.tolist())) != len(indices):
+        raise ValueError("outer fit indices are empty or duplicated")
+    unknown_dims = {candidate.dim for candidate in candidates} - set(HASH_DIMS)
+    if unknown_dims:
+        raise ValueError(f"kNN candidates use unfrozen dimensions: {sorted(unknown_dims)}")
+    groups = [data.groups[index] for index in indices]
+    choices = {candidate.name: np.empty(len(indices), dtype=np.int64) for candidate in candidates}
+    baseline_choices = np.empty(len(indices), dtype=np.int64)
+    matrix = outcome_matrix(data)
+    by_dim = {
+        dim: [candidate for candidate in candidates if candidate.dim == dim]
+        for dim in sorted({candidate.dim for candidate in candidates})
+    }
+    for fold, (train_relative, test_relative) in enumerate(grouped_folds(groups)):
+        train = indices[train_relative]
+        test = indices[test_relative]
+        baseline = fit_selected_static(data, train)
+        baseline_choices[test_relative] = ARMS.index(baseline.name)
+        train_ids = [data.task_ids[index] for index in train]
+        test_texts = [data.texts[index] for index in test]
+        for dim, dimensional_candidates in by_dim.items():
+            embedder = EmbedderSpec(kind="hashing", dim=dim)
+            policy = fit_knn_policy(
+                matrix,
+                bank_path=work_dir / f"seed-{seed}" / f"fold-{fold}-d{dim}.bank.npz",
+                fit_ids=train_ids,
+                embedder=embedder,
+                guard_model=baseline.name,
+                rag_num=64,
+                rag_thres=0.90,
+                z=0.0,
+                min_pairs=8,
+                se_floor=True,
+                floor_q=0.0,
+                pick_lam=0.0,
+                fitted_from=f"bigcodebench inner seed={seed} fold={fold}",
+            )
+            vectors = np.asarray(embedder.build().embed(test_texts), dtype=np.float64)
+            for candidate in dimensional_candidates:
+                tuned = policy.model_copy(
+                    update={
+                        "rag_num": candidate.rag_num,
+                        "rag_thres": candidate.rag_thres,
+                        "knn_z": candidate.z,
+                        "knn_min_pairs": candidate.min_pairs,
+                    }
+                )
+                decisions = [knn_decision(tuned, vector).model for vector in vectors]
+                choices[candidate.name][test_relative] = np.asarray(
+                    [ARMS.index(model) for model in decisions],
+                    dtype=np.int64,
+                )
+    rewards = data.rewards[indices].mean(axis=2)
+    costs = data.costs[indices].mean(axis=2)
+    baseline_value = evaluate_choices(rewards, costs, baseline_choices)
+    results: list[CandidateValidation] = []
+    for candidate in candidates:
+        value = evaluate_choices(rewards, costs, choices[candidate.name])
+        results.append(
+            CandidateValidation(
+                spec=candidate,
+                value=value,
+                baseline=baseline_value,
+                metric=CandidateMetric(
+                    name=candidate.name,
+                    reward=value.reward,
+                    cost_usd=value.cost_usd,
+                    latency_p95_ms=0.0,
+                    artifact_bytes=0,
+                    order=candidate.order,
+                ),
+            )
+        )
+    selected_metric = select_fit_candidate(
+        [result.metric for result in results],
+        baseline_reward=baseline_value.reward,
     )
     selected = next(result for result in results if result.metric.name == selected_metric.name)
     return selected, results
