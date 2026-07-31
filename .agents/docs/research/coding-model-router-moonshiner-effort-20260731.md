@@ -139,3 +139,15 @@ passes, freeze the final lightweight route artifact, record local inference
 latency, and run exactly one untouched DeepSWE v1.1 transfer against the best
 static and matched task-blind controls. No DeepSWE refit, threshold tuning, or
 second transfer is permitted.
+
+## Smoke result
+
+The one paid smoke ran from commit `dd068b29`. All four cells passed with exact
+`gpt-5.6-luna` attestation, protected-file integrity, trace-derived usage, and
+hash-verified raw traces. The second worker invocation reported four persisted
+cells and zero pending cells, and the outcomes hash remained
+`399f5bc57c01cbff3d9c7bbf36c664f965b863e30ba96e1c01328625a68b102d`.
+The trace-derived cost estimate was USD 0.0329324. E2B sandbox
+`ikhhw5dszmnp81xzuuc86` was terminated after artifact synchronization. A local
+verifier initially joined the attempt directory incorrectly; verification was
+corrected against the downloaded archive without rerunning a provider cell.
