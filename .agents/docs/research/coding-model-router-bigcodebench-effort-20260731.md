@@ -206,6 +206,23 @@ uv run python .agents/scripts/coding_model_router_bigcodebench_knn_audit.py \
   --output /remote/artifacts/bigcodebench/audits/seed-<seed>-audit.json
 ```
 
+If a seed instead selects an ordinal, doubly robust, or empirical-Bayes candidate, fit and audit
+the exact selected CPU estimator with:
+
+```bash
+uv run python .agents/scripts/coding_model_router_bigcodebench_numeric_audit.py \
+  --root /remote/artifacts/bigcodebench \
+  --report /remote/artifacts/bigcodebench/fit/seed-<seed>.json \
+  --artifact-dir /remote/artifacts/bigcodebench/artifacts/seed-<seed> \
+  --output /remote/artifacts/bigcodebench/audits/seed-<seed>-audit.json
+```
+
+The numeric artifact is a compressed joblib dictionary containing only the fitted hashing-feature
+scale, small CPU estimator heads, fit-only cost and uncertainty values, and empirical-Bayes fit
+evidence when that family requires it. It contains no foundation-model weights and makes no
+network call. Before accepting its latency audit, the runner reloads the persisted artifact and
+proves that its outer-fit routes are identical to the in-memory selected candidate.
+
 After all five selected families have matching audits, and never before, assemble the lock:
 
 ```bash
