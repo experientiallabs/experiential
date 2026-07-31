@@ -196,3 +196,32 @@ def test_shuffled_control_preserves_source_outcomes_but_breaks_pairing() -> None
         assert sorted(shuffled_strong[indices]) == sorted(strong[indices])
     assert not np.array_equal(shuffled_weak, weak)
     assert not np.array_equal(shuffled_strong, strong)
+
+
+def test_promotion_decision_applies_relative_quality_and_paired_allowance() -> None:
+    module = _module()
+    best = {
+        "arm": "best",
+        "reward": 0.95,
+        "cost_usd": 680.0,
+    }
+    passed = module._promotion_decision(
+        0.933,
+        268.0,
+        best,
+        [-0.035, -0.005],
+    )
+    assert passed["quality_retention"] > 0.95
+    assert passed["cost_savings"] > 0.60
+    assert passed["paired_quality_passed"] is True
+    assert passed["passed"] is True
+
+    failed_interval = module._promotion_decision(
+        0.933,
+        268.0,
+        best,
+        [-0.050, -0.005],
+    )
+    assert failed_interval["point_estimate_passed"] is True
+    assert failed_interval["paired_quality_passed"] is False
+    assert failed_interval["passed"] is False

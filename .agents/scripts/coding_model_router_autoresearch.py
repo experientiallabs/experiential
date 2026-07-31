@@ -1176,6 +1176,30 @@ def _static_rows(target: TargetData) -> list[StaticRow]:
     ]
 
 
+def _promotion_decision(
+    router_reward: float,
+    router_cost: float,
+    best_static: StaticRow,
+    quality_delta_95ci: list[float],
+) -> dict[str, float | bool]:
+    """Apply the preregistered quality, savings, and paired-interval gates."""
+    best_reward = float(best_static["reward"])
+    best_cost = float(best_static["cost_usd"])
+    retention = router_reward / best_reward if best_reward else 0.0
+    savings = 1.0 - router_cost / best_cost if best_cost else -math.inf
+    allowed_quality_delta = -0.05 * best_reward
+    point_estimate_passed = retention >= 0.95 and savings >= 0.40
+    paired_quality_passed = quality_delta_95ci[0] >= allowed_quality_delta
+    return {
+        "quality_retention": retention,
+        "cost_savings": savings,
+        "allowed_quality_delta": allowed_quality_delta,
+        "point_estimate_passed": point_estimate_passed,
+        "paired_quality_passed": paired_quality_passed,
+        "passed": point_estimate_passed and paired_quality_passed,
+    }
+
+
 def _evaluate(args: argparse.Namespace) -> None:
     output = args.output.resolve()
     frozen = _read_json(output / "frozen-candidates.json")
@@ -1231,6 +1255,21 @@ def _evaluate(args: argparse.Namespace) -> None:
                 else best_quality
             )
             baseline_index = target.arms.index(str(matched_static["arm"]))
+            best_static_index = target.arms.index(str(best_quality["arm"]))
+            matched_bootstrap = _bootstrap(
+                routed_reward,
+                routed_cost,
+                target.rewards[baseline_index],
+                target.costs[baseline_index],
+                target.groups,
+            )
+            best_static_bootstrap = _bootstrap(
+                routed_reward,
+                routed_cost,
+                target.rewards[best_static_index],
+                target.costs[best_static_index],
+                target.groups,
+            )
             counts = collections.Counter(int(value) for value in decisions)
             row: dict[str, object] = {
                 "candidate": name,
@@ -1253,6 +1292,16 @@ def _evaluate(args: argparse.Namespace) -> None:
                     if router_cost
                     else math.inf
                 ),
+                "cost_ratio_vs_best_static": (
+                    best_quality["cost_usd"] / router_cost
+                    if router_cost
+                    else math.inf
+                ),
+                "cost_savings_vs_best_static": (
+                    1.0 - router_cost / best_quality["cost_usd"]
+                    if best_quality["cost_usd"]
+                    else -math.inf
+                ),
                 "dominated_by_static": bool(dominating),
                 "dominating_static_arms": dominating,
                 "traffic": {
@@ -1261,12 +1310,19 @@ def _evaluate(args: argparse.Namespace) -> None:
                 "target_labels_used_for_fit": False,
                 "target_labels_used_for_thresholds": False,
                 "target_static_aggregates_used_for_ladder_design": True,
-                **_bootstrap(
-                    routed_reward,
-                    routed_cost,
-                    target.rewards[baseline_index],
-                    target.costs[baseline_index],
-                    target.groups,
+                "quality_delta_95ci": matched_bootstrap["quality_delta_95ci"],
+                "cost_ratio_95ci": matched_bootstrap["cost_ratio_95ci"],
+                "best_static_quality_delta_95ci": best_static_bootstrap[
+                    "quality_delta_95ci"
+                ],
+                "best_static_cost_ratio_95ci": best_static_bootstrap[
+                    "cost_ratio_95ci"
+                ],
+                "promotion": _promotion_decision(
+                    router_reward,
+                    router_cost,
+                    best_quality,
+                    best_static_bootstrap["quality_delta_95ci"],
                 ),
             }
             rows.append(row)
