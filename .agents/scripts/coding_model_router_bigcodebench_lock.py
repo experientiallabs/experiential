@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -15,6 +17,8 @@ from coding_model_router_bigcodebench_fit import (
 )
 from coding_model_router_bigcodebench_select_run import CandidateRecord, SeedFitReport
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class SeedWinnerAudit(BaseModel):
@@ -159,3 +163,30 @@ def assemble_selection_lock(
     )
     write_selection_lock(output, lock)
     return require_selection_lock(root, output)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the lock-assembly command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--reports-dir", type=Path, required=True)
+    parser.add_argument("--audits-dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Assemble one immutable selection lock from five audited seed winners."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+    lock = assemble_selection_lock(
+        args.root.resolve(),
+        report_paths=[args.reports_dir.resolve() / f"seed-{seed}.json" for seed in range(5)],
+        audit_paths=[args.audits_dir.resolve() / f"seed-{seed}-audit.json" for seed in range(5)],
+        output=args.output.resolve(),
+    )
+    logger.info("selection lock assembled seeds=%d output=%s", len(lock.seeds), args.output)
+
+
+if __name__ == "__main__":
+    main()

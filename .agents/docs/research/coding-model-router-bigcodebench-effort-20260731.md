@@ -196,6 +196,29 @@ It explicitly records that latency audit is pending and cannot itself authorize 
 The later one-core latency and artifact audit must enrich all five winners before the immutable
 selection lock is assembled.
 
+If a seed selects native kNN, audit it remotely with:
+
+```bash
+uv run python .agents/scripts/coding_model_router_bigcodebench_knn_audit.py \
+  --root /remote/artifacts/bigcodebench \
+  --report /remote/artifacts/bigcodebench/fit/seed-<seed>.json \
+  --artifact-dir /remote/artifacts/bigcodebench/artifacts/seed-<seed> \
+  --output /remote/artifacts/bigcodebench/audits/seed-<seed>-audit.json
+```
+
+After all five selected families have matching audits, and never before, assemble the lock:
+
+```bash
+uv run python .agents/scripts/coding_model_router_bigcodebench_lock.py \
+  --root /remote/artifacts/bigcodebench \
+  --reports-dir /remote/artifacts/bigcodebench/fit \
+  --audits-dir /remote/artifacts/bigcodebench/audits \
+  --output /remote/artifacts/bigcodebench/selection-lock.json
+```
+
+The assembler rechecks the report hashes, exact selected config, source commit, all matrix
+fingerprints, 10,000-decision latency gates, zero-call serving contract, and target-safe flags.
+
 Primary references:
 
 - RouteLLM: `https://arxiv.org/abs/2406.18665`
