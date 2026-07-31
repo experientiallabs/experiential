@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import cast
 
-import coding_model_router_autoresearch as autoresearch  # ty: ignore[unresolved-import]
+import coding_model_router_autoresearch as autoresearch
 import joblib
 import numpy as np
 from sklearn.model_selection import GroupKFold
@@ -52,6 +52,20 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _as_float(value: object) -> float:
+    """Convert one JSON number to float without accepting another type."""
+    if not isinstance(value, int | float):
+        raise TypeError(f"expected a JSON number, got {type(value).__name__}")
+    return float(value)
+
+
+def _as_int(value: object) -> int:
+    """Convert one JSON integer without accepting another type."""
+    if not isinstance(value, int):
+        raise TypeError(f"expected a JSON integer, got {type(value).__name__}")
+    return value
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -105,7 +119,7 @@ def _prepare_splits(args: argparse.Namespace) -> None:
     output.mkdir(parents=True, exist_ok=True)
     seed_reports: list[dict[str, object]] = []
     for raw_split in cast(list[dict[str, object]], selected["splits"]):
-        seed = int(raw_split["seed"])
+        seed = _as_int(raw_split["seed"])
         heldout_ids = {str(value) for value in cast(list[object], raw_split["heldout_ids"])}
         fit_rows = [row for task_id, row in by_id.items() if task_id not in heldout_ids]
         heldout_rows = [row for task_id, row in by_id.items() if task_id in heldout_ids]
@@ -139,9 +153,9 @@ def _prepare_splits(args: argparse.Namespace) -> None:
     logger.info("source split preparation complete seeds=%d", len(seed_reports))
 
 
-def _candidate_specs() -> list[object]:
+def _candidate_specs() -> list[autoresearch.CandidateSpec]:
     """Return the frozen non-kNN candidate union with stable de-duplication."""
-    result: list[object] = []
+    result: list[autoresearch.CandidateSpec] = []
     seen: set[str] = set()
     for family in ("native-linear", "full", "structural-irt"):
         for spec in autoresearch._candidate_space(family):
@@ -152,9 +166,9 @@ def _candidate_specs() -> list[object]:
     return result
 
 
-def _control_specs() -> list[object]:
+def _control_specs() -> list[autoresearch.CandidateSpec]:
     """Return each frozen numeric negative control exactly once."""
-    result: list[object] = []
+    result: list[autoresearch.CandidateSpec] = []
     seen: set[str] = set()
     for family in ("native-linear", "full", "structural-irt"):
         for spec in autoresearch._candidate_space(family):
@@ -184,8 +198,8 @@ def _arrays(
     task_ids = [str(row["instance_id"]) for row in rows]
     groups = [str(row["repo"]) for row in rows]
     texts = [str(row["text"]) for row in rows]
-    weak = np.asarray([float(row["cheap_reward"]) for row in rows], dtype=np.float64)
-    strong = np.asarray([float(row["strong_reward"]) for row in rows], dtype=np.float64)
+    weak = np.asarray([_as_float(row["cheap_reward"]) for row in rows], dtype=np.float64)
+    strong = np.asarray([_as_float(row["strong_reward"]) for row in rows], dtype=np.float64)
     if len(task_ids) != len(set(task_ids)):
         raise ValueError("fit source contains duplicate task ids")
     if len(set(groups)) < INNER_FOLDS:
@@ -194,7 +208,7 @@ def _arrays(
 
 
 def _nonknn_oof(
-    spec: object,
+    spec: autoresearch.CandidateSpec,
     texts: list[str],
     groups: list[str],
     weak: np.ndarray,
@@ -344,7 +358,7 @@ def _candidate_row(
         )
         for floor in QUALITY_FLOORS
     }
-    primary = cast(dict[str, float], operating_points["0.95"])
+    primary = operating_points["0.95"]
     use_strong = scores >= primary["threshold"]
     routed = np.where(use_strong, strong, weak)
     strong_reward = float(np.mean(strong))
@@ -374,14 +388,14 @@ def _fit_artifact(
 ) -> None:
     """Fit and persist the selected fit-only candidate on the full outer-fit partition."""
     config = cast(dict[str, object], winner["config"])
-    threshold = float(cast(dict[str, object], winner["primary"])["threshold"])
+    threshold = _as_float(cast(dict[str, object], winner["primary"])["threshold"])
     if winner["family"] == "knn":
         knn = KnnConfig(
-            dim=int(config["dim"]),
-            neighbors=int(config["neighbors"]),
-            relative_similarity=float(config["relative_similarity"]),
-            guard_z=float(config["guard_z"]),
-            minimum_support=int(config["minimum_support"]),
+            dim=_as_int(config["dim"]),
+            neighbors=_as_int(config["neighbors"]),
+            relative_similarity=_as_float(config["relative_similarity"]),
+            guard_z=_as_float(config["guard_z"]),
+            minimum_support=_as_int(config["minimum_support"]),
         )
         features = autoresearch.HashingFeatureTransformer(knn.dim).fit_transform(texts)
         payload = {
@@ -499,8 +513,8 @@ def _select(args: argparse.Namespace) -> None:
     candidate_order = {row["name"]: index for index, row in enumerate(leaderboard)}
     leaderboard.sort(
         key=lambda row: (
-            float(cast(dict[str, object], row["primary"])["strong_traffic"]),
-            -float(cast(dict[str, object], row["primary"])["router_reward"]),
+            _as_float(cast(dict[str, object], row["primary"])["strong_traffic"]),
+            -_as_float(cast(dict[str, object], row["primary"])["router_reward"]),
             candidate_order[str(row["name"])],
         )
     )
@@ -530,7 +544,7 @@ def _select(args: argparse.Namespace) -> None:
         "fit-only selection complete seed=%d winner=%s traffic=%.4f",
         args.seed,
         winner["name"],
-        float(cast(dict[str, object], winner["primary"])["strong_traffic"]),
+        _as_float(cast(dict[str, object], winner["primary"])["strong_traffic"]),
     )
 
 
