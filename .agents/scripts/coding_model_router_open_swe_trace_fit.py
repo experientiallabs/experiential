@@ -100,6 +100,7 @@ class Data:
     strong_attempts: np.ndarray
     burden: np.ndarray
     attempt_rows: dict[str, dict[str, list[tuple[str, float]]]]
+    overlap_audit: dict[str, object]
 
     @property
     def uplift(self) -> np.ndarray:
@@ -139,6 +140,10 @@ def _repo(value: str) -> str:
     normalized = value.casefold().strip()
     normalized = re.sub(r"^https?://github\.com/", "", normalized)
     return normalized.removesuffix(".git").strip("/") or "unknown"
+
+
+def _normalize_text(value: str) -> str:
+    return " ".join(value.casefold().split())
 
 
 def _rank(values: np.ndarray) -> np.ndarray:
@@ -222,8 +227,46 @@ def _load_text(rebench: Path) -> dict[str, tuple[str, str, str]]:
     return result
 
 
-def _load_data(summary_dir: Path, rebench: Path) -> Data:
+def _load_target_metadata(path: Path) -> tuple[set[str], set[str], dict[str, object]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("target metadata must be an object")
+    if payload.get("target_cost_fields_accessed") is not False:
+        raise ValueError("target metadata accessed cost fields")
+    if payload.get("target_reward_fields_accessed") is not False:
+        raise ValueError("target metadata accessed reward fields")
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("target metadata has no rows")
+    ids: set[str] = set()
+    texts: set[str] = set()
+    for row_value in rows:
+        if not isinstance(row_value, dict) or set(row_value) != {"id", "repository", "text"}:
+            raise ValueError("target metadata row is not label-free")
+        task_id = row_value.get("id")
+        text = row_value.get("text")
+        repository = row_value.get("repository")
+        if not all(isinstance(value, str) and value for value in (task_id, text, repository)):
+            raise ValueError("target metadata row has invalid identity")
+        ids.add(str(task_id).casefold())
+        texts.add(_normalize_text(str(text)))
+    return (
+        ids,
+        texts,
+        {
+            "target_rows": len(rows),
+            "target_task_ids": len(ids),
+            "target_normalized_texts": len(texts),
+            "target_metadata_sha256": _sha256(path),
+            "target_cost_fields_accessed": False,
+            "target_reward_fields_accessed": False,
+        },
+    )
+
+
+def _load_data(summary_dir: Path, rebench: Path, target_metadata: Path) -> Data:
     text = _load_text(rebench)
+    target_ids, target_texts, overlap_audit = _load_target_metadata(target_metadata)
     columns = [
         "instance_id",
         "repo",
@@ -262,13 +305,28 @@ def _load_data(summary_dir: Path, rebench: Path) -> Data:
             if reward not in {0.0, 1.0}:
                 raise ValueError(f"nonbinary source reward for task {task_id}")
             attempts.setdefault(task_id, {}).setdefault(mode, []).append((trajectory_id, reward))
-    retained = sorted(
+    paired = sorted(
         task_id
         for task_id, arm_rows in attempts.items()
         if task_id in text
         and arm_rows.get(WEAK_MODE)
         and arm_rows.get(STRONG_MODE)
         and len(partitions.get(task_id, {})) >= 2
+    )
+    id_overlap = [task_id for task_id in paired if task_id.casefold() in target_ids]
+    text_overlap = [
+        task_id for task_id in paired if _normalize_text(text[task_id][2]) in target_texts
+    ]
+    removed = set(id_overlap) | set(text_overlap)
+    retained = [task_id for task_id in paired if task_id not in removed]
+    overlap_audit.update(
+        {
+            "source_paired_before_decontamination": len(paired),
+            "exact_task_id_overlap": len(id_overlap),
+            "normalized_text_overlap": len(text_overlap),
+            "removed_tasks": len(removed),
+            "source_tasks_after_decontamination": len(retained),
+        }
     )
     if len(retained) < 10_000:
         raise ValueError(f"paired trajectory cohort is unexpectedly small: {len(retained)}")
@@ -300,6 +358,7 @@ def _load_data(summary_dir: Path, rebench: Path) -> Data:
         ),
         burden=burden,
         attempt_rows={task_id: attempts[task_id] for task_id in retained},
+        overlap_audit=overlap_audit,
     )
 
 
@@ -713,8 +772,13 @@ def _select_candidate(rows: list[dict[str, object]]) -> dict[str, object]:
     )
 
 
-def fit(summary_dir: Path, rebench: Path, output: Path) -> dict[str, object]:
-    data = _load_data(summary_dir, rebench)
+def fit(
+    summary_dir: Path,
+    rebench: Path,
+    target_metadata: Path,
+    output: Path,
+) -> dict[str, object]:
+    data = _load_data(summary_dir, rebench, target_metadata)
     all_indices = np.arange(len(data.task_ids), dtype=np.int64)
     features = {dimension: _hash_features(data.texts, dimension) for dimension in (2_048, 8_192)}
     router_scores = np.zeros(len(data.task_ids), dtype=np.float64)
@@ -850,6 +914,10 @@ def fit(summary_dir: Path, rebench: Path, output: Path) -> dict[str, object]:
         "shuffled_control_fails": not (
             shuffled_interval[0] > 0.0 and _spearman(shuffled_scores, data.uplift) > 0.0
         ),
+        "trajectory_family_selected_every_outer_fold": all(
+            str(cast(dict[str, object], row["selected"])["family"]) != "direct"
+            for row in outer_rows
+        ),
         "not_dominated_by_direct_hash": not (
             router_reward_mean < direct_reward_mean and router_traffic >= direct_traffic
         ),
@@ -878,6 +946,7 @@ def fit(summary_dir: Path, rebench: Path, output: Path) -> dict[str, object]:
         "shuffled_advantage_95ci": shuffled_interval,
         "shuffled_uplift_spearman": _spearman(shuffled_scores, data.uplift),
         "heldout_attempt_oracle": _heldout_attempt_oracle(data),
+        "target_overlap_audit": data.overlap_audit,
         "outer_folds": outer_rows,
         "external_gate": gate,
         "target_outcomes_used": False,
@@ -885,6 +954,7 @@ def fit(summary_dir: Path, rebench: Path, output: Path) -> dict[str, object]:
         "no_persisted_fitted_model": True,
         "inputs": {
             "rebench_sha256": _sha256(rebench),
+            "target_metadata_sha256": _sha256(target_metadata),
             "summary_files": len(list(summary_dir.glob("*.parquet"))),
         },
     }
@@ -925,13 +995,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--summaries", type=Path, required=True)
     parser.add_argument("--rebench", type=Path, required=True)
+    parser.add_argument("--target-metadata", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
 def main() -> None:
     args = _parser().parse_args()
-    fit(args.summaries.resolve(), args.rebench.resolve(), args.output.resolve())
+    fit(
+        args.summaries.resolve(),
+        args.rebench.resolve(),
+        args.target_metadata.resolve(),
+        args.output.resolve(),
+    )
 
 
 if __name__ == "__main__":

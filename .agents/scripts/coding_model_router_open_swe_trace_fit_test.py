@@ -62,3 +62,37 @@ def test_burden_signature_rejects_one_partition() -> None:
     module = _module()
     with pytest.raises(ValueError, match="two agent partitions"):
         module._burden_signature({("openhands", "weak"): [[1.0]]})
+
+
+def test_target_metadata_loader_accepts_only_label_free_rows(tmp_path: Path) -> None:
+    module = _module()
+    path = tmp_path / "target.json"
+    path.write_text(
+        """{
+          "target_cost_fields_accessed": false,
+          "target_reward_fields_accessed": false,
+          "rows": [{"id": "task-1", "repository": "owner/repo", "text": "Fix  spacing"}]
+        }""",
+        encoding="utf-8",
+    )
+    ids, texts, audit = module._load_target_metadata(path)
+    assert ids == {"task-1"}
+    assert texts == {"fix spacing"}
+    assert audit["target_rows"] == 1
+
+
+def test_target_metadata_loader_rejects_outcomes(tmp_path: Path) -> None:
+    module = _module()
+    path = tmp_path / "target.json"
+    path.write_text(
+        """{
+          "target_cost_fields_accessed": false,
+          "target_reward_fields_accessed": false,
+          "rows": [{
+            "id": "task-1", "repository": "owner/repo", "text": "Fix it", "reward": 1
+          }]
+        }""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="label-free"):
+        module._load_target_metadata(path)
