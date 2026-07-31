@@ -542,3 +542,8 @@ The first command atomically writes `completion-audit.json`. The second also exi
 every terminal requirement in the original brief is independently evidenced. A complete audit
 accepts either a measured promotion or a measured target-not-reached conclusion, but never treats
 missing paid evidence as a negative scientific result.
+
+The later external-trace DeepSWE work, native linear policy, corrected source weighting, and
+matched task-blind control are recorded in
+`coding-model-router-external-autoresearch-20260730.md`. That control is now required before a
+task router can be called a gain over effort mixing.

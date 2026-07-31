@@ -150,3 +150,7 @@ Tests:
 `.agents/scripts/coding_model_router_deepswe_test.py`
 
 The final run made no model or embedding calls and spent USD 0.
+
+Follow-up external-only autoresearch and the native WMO policy are documented in
+`coding-model-router-external-autoresearch-20260730.md`. The matched task-blind control confirms
+that the current native text router does not add task-selection value beyond effort mixing.
