@@ -354,3 +354,37 @@ def test_lower_bound_choice_uses_cheapest_feasible_or_fallback() -> None:
         z=0.5,
     )
     assert choices.tolist() == [0, 4]
+
+
+def test_negative_controls_are_deterministic_and_preserve_profiles() -> None:
+    rewards = np.arange(4 * len(module.ARMS) * module.ATTEMPTS, dtype=np.float64).reshape(
+        4,
+        len(module.ARMS),
+        module.ATTEMPTS,
+    )
+    first = module.random_choices(20, seed=9)
+    second = module.random_choices(20, seed=9)
+    shuffled = module.shuffled_task_rewards(rewards, seed=4)
+    assert np.array_equal(first, second)
+    assert sorted(shuffled[:, 0, 0].tolist()) == sorted(rewards[:, 0, 0].tolist())
+
+
+def test_cost_only_choice_uses_fit_costs() -> None:
+    costs = np.asarray([[3.0, 2.0, 1.0, 4.0, 5.0], [3.0, 2.0, 1.0, 4.0, 5.0]])
+    assert module.cost_only_choices(costs).tolist() == [2, 2]
+
+
+def test_artifact_size_and_single_route_latency(tmp_path: Path) -> None:
+    first = tmp_path / "policy.json"
+    second = tmp_path / "bank.npz"
+    first.write_bytes(b"abc")
+    second.write_bytes(b"12345")
+    assert module.artifact_size([first, second]) == 8
+
+    latency = module.measure_route_latency(
+        lambda text: len(text) % len(module.ARMS), ["abc"], decisions=20
+    )
+    assert latency.decisions == 20
+    assert latency.p50_ms >= 0.0
+    assert latency.p95_ms >= latency.p50_ms
+    assert latency.passed

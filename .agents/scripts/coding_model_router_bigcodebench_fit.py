@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 
 import numpy as np
 from scipy import sparse
@@ -88,6 +89,24 @@ class CandidateMetric:
     latency_p95_ms: float
     artifact_bytes: int
     order: int
+
+
+@dataclass(frozen=True)
+class LatencyMetric:
+    """Single-request route latency and frozen deployment-gate result."""
+
+    decisions: int
+    p50_ms: float
+    p95_ms: float
+    passed: bool
+
+
+class RouteOne(Protocol):
+    """One latency-neutral route decision callable."""
+
+    def __call__(self, text: str) -> int:
+        """Select one frozen effort index."""
+        ...
 
 
 def _read_object(path: Path) -> dict[str, object]:
@@ -836,6 +855,69 @@ def lower_bound_choices(
         if feasible:
             choices[row_index] = feasible[0]
     return choices
+
+
+def cost_only_choices(costs: np.ndarray) -> np.ndarray:
+    """Route every task to the lowest observed fit-cost arm."""
+    if costs.ndim != 2 or costs.shape[1] != len(ARMS):
+        raise ValueError("cost-only matrix has the wrong effort shape")
+    if not np.isfinite(costs).all() or np.any(costs < 0.0):
+        raise ValueError("cost-only matrix must be finite and nonnegative")
+    arm = int(np.argmin(costs.mean(axis=0)))
+    return np.full(costs.shape[0], arm, dtype=np.int64)
+
+
+def random_choices(tasks: int, *, seed: int) -> np.ndarray:
+    """Return deterministic uniform random effort assignments."""
+    if tasks <= 0:
+        raise ValueError("random control needs at least one task")
+    return np.random.default_rng(seed).integers(0, len(ARMS), size=tasks, dtype=np.int64)
+
+
+def shuffled_task_rewards(rewards: np.ndarray, *, seed: int) -> np.ndarray:
+    """Permute complete task reward profiles for a label-destruction control."""
+    if rewards.ndim != 3 or rewards.shape[1:] != (len(ARMS), ATTEMPTS):
+        raise ValueError("shuffled rewards have the wrong dense effort shape")
+    permutation = np.random.default_rng(seed).permutation(rewards.shape[0])
+    return rewards[permutation].copy()
+
+
+def artifact_size(paths: list[Path]) -> int:
+    """Return the exact bytes in a fitted policy's declared files."""
+    if not paths:
+        raise ValueError("artifact size needs at least one file")
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(f"artifact files are missing: {missing[:3]}")
+    return sum(path.stat().st_size for path in paths)
+
+
+def measure_route_latency(
+    route_one: RouteOne,
+    texts: list[str],
+    *,
+    decisions: int = 10_000,
+    warmup: int = 100,
+) -> LatencyMetric:
+    """Measure single-request routing against the frozen one-core latency gate."""
+    if not texts:
+        raise ValueError("latency measurement needs at least one prompt")
+    if decisions <= 0 or warmup < 0:
+        raise ValueError("latency decision and warmup counts are invalid")
+    for index in range(warmup):
+        route_one(texts[index % len(texts)])
+    elapsed = np.empty(decisions, dtype=np.float64)
+    for index in range(decisions):
+        started = time.perf_counter_ns()
+        route_one(texts[index % len(texts)])
+        elapsed[index] = (time.perf_counter_ns() - started) / 1_000_000.0
+    p50, p95 = np.quantile(elapsed, np.asarray([0.5, 0.95]))
+    return LatencyMetric(
+        decisions=decisions,
+        p50_ms=float(p50),
+        p95_ms=float(p95),
+        passed=bool(p50 < 5.0 and p95 < 20.0),
+    )
 
 
 def evaluate_choices(
