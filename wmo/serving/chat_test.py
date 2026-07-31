@@ -1369,7 +1369,8 @@ def test_routing_reads_the_user_turn_not_the_tool_result(tmp_path: Path) -> None
 
 
 def test_tools_on_a_pool_model_without_a_structured_backend(tmp_path: Path) -> None:
-    # _EchoProvider has complete/stream but no complete_chat, like the direct anthropic backend.
+    # _EchoProvider has complete/stream but no complete_chat: the text-only provider
+    # class this fallback path exists for.
     client, log_path = _client(tmp_path)
     response = client.post(
         "/v1/chat/completions",
@@ -3085,3 +3086,60 @@ def test_config_omits_pareto_for_artifacts_that_predate_it(tmp_path: Path) -> No
     body = client.get("/v1/endpoints/tau-bench/config").json()
 
     assert body["pareto"] is None
+
+
+def test_structured_usage_prices_the_anthropic_translators_emission() -> None:
+    """The Anthropic/Bedrock translators emit the OpenAI details shape plus the
+    Anthropic write field; serving must price both cache legs from it (missing
+    them measured a 5.8x overcharge on a 9k-cached agent turn)."""
+    from wmo.serving.chat import _structured_usage
+
+    response = ChatResponse.model_validate(
+        {
+            "model": "claude-sonnet-5",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 9600,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 9000},
+                "cache_read_input_tokens": 9000,
+                "cache_creation_input_tokens": 500,
+            },
+        }
+    )
+
+    usage = _structured_usage(response)
+
+    assert usage.cached_input_tokens == 9000
+    assert usage.cache_write_input_tokens == 500
+    assert usage.input_tokens == 9600  # totals unchanged: reads/writes are a SUBSET
+
+
+def test_structured_usage_still_prefers_the_openai_shape() -> None:
+    from wmo.serving.chat import _structured_usage
+
+    response = ChatResponse.model_validate(
+        {
+            "model": "gpt-5.5",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 40},
+            },
+        }
+    )
+
+    assert _structured_usage(response).cached_input_tokens == 40

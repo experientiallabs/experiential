@@ -4,11 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from wmo.providers import _anthropic_chat
+from wmo.providers._anthropic_chat import messages_request, messages_response
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
-    ChatRequest,
-    ChatResponse,
     Completion,
     Message,
     ProviderConfig,
@@ -23,6 +21,7 @@ if TYPE_CHECKING:
 
     from anthropic import Anthropic
     from anthropic.types import MessageParam
+    from llm_waterfall import ChatRequest, ChatResponse
 
 
 class AnthropicProvider:
@@ -66,6 +65,23 @@ class AnthropicProvider:
                 "variable holding it explicitly (a pool entry's `api_key_env` field)"
             )
 
+    def _refuse_dropped_effort(self, path: str) -> None:
+        """Refuse a config whose effort dial this path would silently drop.
+
+        `PoolEntry.reasoning_effort` exists so two entries differing only in
+        effort are two ARMS. Only `complete_chat` forwards the dial; a text or
+        streaming call would send byte-identical requests for both arms, so a
+        grid comparing them would measure sampling noise and report an effort
+        effect. Refusing loudly is the same posture Azure's streaming path
+        takes for the same gap.
+        """
+        if self.config.reasoning_effort is not None:
+            raise ValueError(
+                f"AnthropicProvider.{path} does not forward reasoning_effort="
+                f"{self.config.reasoning_effort!r}; only complete_chat does. Two pool arms "
+                "differing only in effort would silently collapse into one on this path."
+            )
+
     def complete(
         self,
         system: str,
@@ -76,19 +92,16 @@ class AnthropicProvider:
     ) -> Completion:
         # Opus 4.8 takes `system` as a top-level arg and rejects sampling params, so temperature
         # is intentionally not forwarded; adaptive thinking is the default.
+        self._refuse_dropped_effort("complete")
         api_messages = [
             cast("MessageParam", {"role": m.role, "content": m.content}) for m in messages
         ]
-        kwargs: dict[str, object] = {
-            "model": self.config.model,
-            "system": system,
-            "messages": api_messages,
-            "max_tokens": max_tokens,
-        }
-        if self.config.reasoning_effort is not None:
-            kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["output_config"] = {"effort": self.config.reasoning_effort}
-        response = cast("Any", self._get_client().messages).create(**kwargs)
+        response = self._get_client().messages.create(
+            model=self.config.model,
+            system=system,
+            messages=api_messages,
+            max_tokens=max_tokens,
+        )
         text = "".join(block.text for block in response.content if block.type == "text")
         # Anthropic reports cache reads and writes BESIDE input_tokens (input_tokens excludes
         # them); TokenUsage's contract is cached-as-subset, so normalize by summing.
@@ -103,13 +116,26 @@ class AnthropicProvider:
         return Completion(text=text, usage=usage)
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
-        """Run a structured agent turn through Anthropic's native Messages API."""
-        return _anthropic_chat.complete_chat(
-            self._get_client().messages,
-            self.config.model,
+        """Return one non-streaming structured chat completion (tools, tool results, usage).
+
+        Satisfies `wmo.providers.base.ToolCallingProvider`, which text-only callers (the world
+        model, the judge, GEPA) never need but agent runtimes do: without it an Anthropic
+        candidate cannot run a tool-calling harness at all, which is what made the serving
+        endpoint refuse Anthropic tool calls and what kept Claude out of real benchmark grids
+        whose harness is tool-based.
+
+        Prompt-cache breakpoints are placed by `messages_request`. Agent loops replay a growing
+        prefix every turn, so the alternative is paying full input price for the whole transcript
+        on every step; the translator's docstring states where the breakpoints land and why.
+        """
+        payload = messages_request(
             request,
+            self.config.model,
+            default_max_tokens=DEFAULT_MAX_TOKENS,
             reasoning_effort=self.config.reasoning_effort,
         )
+        response = self._get_client().messages.create(**cast("Any", payload))
+        return messages_response(response, self.config.model)
 
     def stream(
         self,
@@ -120,25 +146,22 @@ class AnthropicProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Iterator[StreamChunk]:
         """Stream a completion natively (raw SSE events; temperature not forwarded, as complete)."""
+        self._refuse_dropped_effort("stream")
         del temperature  # Claude 4.8+/5 reject sampling params; mirror complete()
         api_messages = [
             cast("MessageParam", {"role": m.role, "content": m.content}) for m in messages
         ]
         # The SDK's raw stream-event union stays behind this one boundary cast; the event loop
         # below narrows by the wire `type` tag (same pattern as the Responses provider).
-        kwargs: dict[str, object] = {
-            "model": self.config.model,
-            "system": system,
-            "messages": api_messages,
-            "max_tokens": max_tokens,
-            "stream": True,
-        }
-        if self.config.reasoning_effort is not None:
-            kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["output_config"] = {"effort": self.config.reasoning_effort}
         events = cast(
             "Iterator[Any]",
-            cast("Any", self._get_client().messages).create(**kwargs),
+            self._get_client().messages.create(
+                model=self.config.model,
+                system=system,
+                messages=api_messages,
+                max_tokens=max_tokens,
+                stream=True,
+            ),
         )
         usage = TokenUsage()
         try:

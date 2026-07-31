@@ -17,10 +17,15 @@ from real_episodes import (
     CANONICAL_MAX_TURNS,
     CANONICAL_TAU2_MAX_RETRIES,
     EVAL_SCENARIOS,
+    REASONING_OFF_CANDIDATES,
     UNLABELED_COHORT,
     ProtocolPins,
     RealEpisodeRow,
+    Tau2Message,
     Tau2Results,
+    Tau2RewardInfo,
+    Tau2Usage,
+    Tau2SimulationInfo,
     agent_llm_args,
     append_rows,
     batch_command,
@@ -293,8 +298,30 @@ def test_max_tokens_zero_omits_the_key_for_a_strict_deployment() -> None:
     # litellm rewrites max_tokens to max_completion_tokens only for reasoning models its table
     # knows; an unrecognized deployment rejects the key outright, and a grid that cannot start is
     # worse than a labelled second cohort.
-    assert agent_llm_args(ProtocolPins(max_tokens=0)) == "{}"
+    assert agent_llm_args(_AZURE_AI, ProtocolPins(max_tokens=0)) == "{}"
     assert ProtocolPins(max_tokens=0).label == "turns100-t1800-tok0-r0-sim-gpt-5.4-mini"
+
+
+def test_a_reasoning_off_candidate_gets_the_arg_that_lets_it_call_tools() -> None:
+    # These three refuse function tools on chat completions at any reasoning budget above none
+    # (measured, every episode, $0 spent). Reasoning off is the only way they run an episode.
+    pins = ProtocolPins()
+    for model in REASONING_OFF_CANDIDATES:
+        entry = _AZURE_AI.model_copy(update={"name": model, "model": model})
+        assert json.loads(agent_llm_args(entry, pins))["reasoning_effort"] == "none"
+        # The match keys off the runtime MODEL id, so an effort-suffixed arm handle
+        # ("gpt-5.6-sol@low") still gets the argument that lets it run at all.
+        suffixed = entry.model_copy(update={"name": f"{model}@low"})
+        assert json.loads(agent_llm_args(suffixed, pins))["reasoning_effort"] == "none"
+    # Every other candidate is untouched: the key is absent, not set to a default.
+    assert "reasoning_effort" not in json.loads(agent_llm_args(_AZURE_AI, pins))
+
+
+def test_reasoning_off_does_not_fork_the_cohort_label() -> None:
+    # It is a per-candidate serving constraint, not one of the five protocol pins, so rows for
+    # these candidates stay pairable with the rest of the cohort (same standing as temperature).
+    assert ProtocolPins().is_canonical
+    assert "reasoning" not in ProtocolPins().label
 
 
 def test_an_impossible_pin_is_refused_not_run(tmp_path: Path) -> None:
@@ -406,6 +433,155 @@ def test_unscored_episode_is_never_zeroed(tmp_path: Path) -> None:
     assert outcome.reward is None
     assert outcome.scored is False
     assert outcome.success is False
+
+
+def test_finished_episode_carries_no_error_signature(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.error is None
+    assert row.error_type is None
+
+
+def test_unscored_episode_carries_tau2s_failure_signature(tmp_path: Path) -> None:
+    # The signature observed on the real grid: the candidate answered with neither content nor a
+    # tool call, so tau2 refused the message and lost the episode. termination_reason alone cannot
+    # tell that apart from a 429, and the two are graded differently.
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(None)
+    payload.simulations[0].termination_reason = "infrastructure_error"
+    payload.simulations[0].info = Tau2SimulationInfo(
+        error="AssistantMessage must have either content or tool_calls. Got AssistantMessage",
+        error_type="ValueError",
+    )
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.reward is None
+    assert row.error_type == "ValueError"
+    assert row.error is not None
+    assert "must have either content or tool_calls" in row.error
+
+
+def test_a_giant_error_message_is_capped(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(None)
+    payload.simulations[0].info = Tau2SimulationInfo(error="x" * 5000, error_type="APIError")
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.error is not None
+    assert row.error.endswith("... [truncated]")
+    assert len(row.error) < 5000
+
+
+def test_error_signature_survives_the_rows_round_trip(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(None)
+    payload.simulations[0].info = Tau2SimulationInfo(error="boom", error_type="ValueError")
+    append_rows(
+        tmp_path / "rows.jsonl", rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    )
+    [reloaded] = load_rows(tmp_path / "rows.jsonl")
+    assert (reloaded.error, reloaded.error_type) == ("boom", "ValueError")
+
+
+def test_rows_written_before_the_error_field_still_load(tmp_path: Path) -> None:
+    # Rows already bought on this cohort have no error keys; refusing them would strand paid
+    # episodes.
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    legacy = row.model_dump()
+    del legacy["error"]
+    del legacy["error_type"]
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    [reloaded] = load_rows(path)
+    assert reloaded.error is None
+    assert reloaded.reward == 1.0
+
+
+def test_row_carries_the_reward_components_not_just_the_total(tmp_path: Path) -> None:
+    # The real shape of a correct-inaction airline task: the DB check passes because the database
+    # is unchanged, and COMMUNICATE contributes full credit while reporting it had nothing to
+    # evaluate. A 1.0 built this way is not the same measurement as a 1.0 a candidate had to act
+    # for, so the parts travel with the total.
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].reward_info = Tau2RewardInfo.model_validate(
+        {
+            "reward": 1.0,
+            "reward_basis": ["DB", "COMMUNICATE"],
+            "reward_breakdown": {"DB": 1.0, "COMMUNICATE": 1.0},
+            "info": {
+                "communicate": {"note": "No communicate_info to evaluate"},
+                "action": {"note": "No actions to evaluate"},
+                "env": None,
+            },
+        }
+    )
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.reward == 1.0
+    assert row.reward_basis == ["DB", "COMMUNICATE"]
+    assert row.reward_breakdown == {"DB": 1.0, "COMMUNICATE": 1.0}
+    assert row.vacuous_components == ["action", "communicate"]
+
+
+def test_a_fully_evaluated_episode_reports_no_vacuous_components(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(0.5)
+    payload.simulations[0].reward_info = Tau2RewardInfo.model_validate(
+        {"reward": 0.5, "reward_basis": ["DB"], "reward_breakdown": {"DB": 0.5}, "info": {}}
+    )
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.vacuous_components == []
+
+
+def test_row_carries_tau2s_own_clock(tmp_path: Path) -> None:
+    # `wmo runs backfill` stamps a replayed run with the timestamps its artifacts carry and
+    # infers nothing else, so an episode that does not record when it ran can only appear in the
+    # platform's history at the hour someone replayed it.
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].start_time = "2026-07-29T02:07:04.473281"
+    payload.simulations[0].end_time = "2026-07-29T02:07:47.001000"
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.started_at == "2026-07-29T02:07:04.473281"
+    assert row.ended_at == "2026-07-29T02:07:47.001000"
+
+
+def test_an_unclocked_episode_leaves_the_timestamps_absent(tmp_path: Path) -> None:
+    index = _scenario_index(tmp_path)
+    [row] = rows_from_results(_results_payload(1.0), _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.started_at is None
+    assert row.ended_at is None
+
+
+def test_steps_counts_billed_provider_calls_not_tool_calling_turns(tmp_path: Path) -> None:
+    """The program-wide step unit: what the cap enforces and what cost scales with.
+
+    tau2 opens every episode with a scripted greeting that carries no usage because no
+    completion was bought for it, and plenty of billed turns talk to the user without calling a
+    tool. Counting tool-calling turns undercounted real call volume by ~1.5x across the tau grid
+    and by 3x on conversational candidates.
+    """
+    index = _scenario_index(tmp_path)
+    payload = _results_payload(1.0)
+    payload.simulations[0].messages = [
+        # The scripted greeting: no usage, so no call was purchased.
+        Tau2Message(role="assistant", content="Hi! How can I help you today?"),
+        Tau2Message(role="user", content="cancel my reservation"),
+        # A billed turn that only talks.
+        Tau2Message(
+            role="assistant",
+            content="Let me check that for you.",
+            usage=Tau2Usage(prompt_tokens=1000, completion_tokens=20),
+        ),
+        # A billed turn that calls a tool.
+        Tau2Message(
+            role="assistant",
+            content="looking",
+            tool_calls=[{"name": "get_reservation_details"}],
+            usage=Tau2Usage(prompt_tokens=1200, completion_tokens=30),
+        ),
+    ]
+    [row] = rows_from_results(payload, _AZURE_AI, 0, index, _AZURE_OPENAI)
+    assert row.steps == 2, "two completions were purchased; one of them called no tool"
 
 
 def test_matrix_carries_cost_and_latency(tmp_path: Path) -> None:
@@ -797,3 +973,27 @@ def test_self_hosted_openai_endpoint_is_not_dropped(tmp_path: Path) -> None:
 def test_missing_pinned_split_says_how_to_regenerate(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="pin_scenarios.py"):
         load_pinned_scenarios(tmp_path, tmp_path / "absent.jsonl")
+
+
+def test_a_note_that_merely_contains_no_is_not_vacuous() -> None:
+    """The vacuous matcher is a tight heuristic, not a substring search.
+
+    A component tau2 genuinely evaluated whose note happens to contain the
+    word "no" ("no errors were found") must never be counted as credit the
+    task handed out; the corruption would silently inflate vacuous credit in
+    published tables with nothing failing.
+    """
+    info = Tau2RewardInfo.model_validate(
+        {
+            "reward": 1.0,
+            "reward_basis": ["DB"],
+            "reward_breakdown": {"DB": 1.0},
+            "info": {
+                "db": {"note": "no errors were found in the final database state"},
+                "action": {"note": "agent did no worse than the reference trajectory"},
+                "communicate": {"note": "No communicate_info to evaluate."},
+            },
+        }
+    )
+
+    assert info.vacuous_components() == ["communicate"]

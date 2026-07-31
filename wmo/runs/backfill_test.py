@@ -352,3 +352,45 @@ def test_an_empty_manifest_emits_nothing(tmp_path: Path) -> None:
     manifest.write_text(json.dumps({"version": 1, "world_model": MODEL, "stages": []}))
 
     assert optimize_events(manifest, model=MODEL) == []
+
+
+def test_a_cohort_can_name_the_endpoint_its_evidence_belongs_to(tmp_path: Path) -> None:
+    """A grid bought as an endpoint's evidence attaches to it, so the endpoint page has history.
+
+    The platform resolves `run.meta.endpoint` to an id already; the emitter simply never sent
+    one, which left a real-benchmark grid unattached in the admin panel with no way to reach it
+    from the product object it paid for.
+    """
+    live = tmp_path / GRID
+    (live / ARM).mkdir(parents=True)
+    (live / "cohort.json").write_text(
+        json.dumps(
+            {
+                "created": "2026-07-29T09:00:00+00:00",
+                "model_dir": "/x/swe-bench",
+                "endpoint": "swe-bench",
+            }
+        )
+    )
+    (live / "ledger.jsonl").write_text(json.dumps(_ledger(ARM, 0, "2026-07-29T09:01:00+00:00")))
+
+    events = grid_arm_events(live, arm=ARM, grid_relpath=GRID)
+
+    (meta,) = [event for event in events if event.type == RunEventType.RUN_META]
+    assert meta.payload["endpoint"] == "swe-bench"
+
+
+def test_a_cohort_without_an_endpoint_sends_no_endpoint_key(tmp_path: Path) -> None:
+    """Silence, not an empty string: the platform treats a named-but-missing endpoint as
+    unattached, and sending "" would make every unattached grid look like a failed lookup."""
+    live = tmp_path / GRID
+    (live / ARM).mkdir(parents=True)
+    (live / "cohort.json").write_text(
+        json.dumps({"created": "2026-07-29T09:00:00+00:00", "model_dir": "/x/swe-bench"})
+    )
+    (live / "ledger.jsonl").write_text(json.dumps(_ledger(ARM, 0, "2026-07-29T09:01:00+00:00")))
+
+    events = grid_arm_events(live, arm=ARM, grid_relpath=GRID)
+
+    (meta,) = [event for event in events if event.type == RunEventType.RUN_META]
+    assert "endpoint" not in meta.payload

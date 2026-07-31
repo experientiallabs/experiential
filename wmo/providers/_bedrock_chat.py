@@ -149,6 +149,9 @@ def converse_response(raw: object, model: str) -> ChatResponse:
                 + cache_write,
                 "completion_tokens": _token_count(usage_data.get("outputTokens")),
                 "prompt_tokens_details": {"cached_tokens": cache_read},
+                # Raw top-level read count alongside, mirroring the direct
+                # Anthropic translator, so both wire shapes carry the split.
+                "cache_read_input_tokens": cache_read,
                 "cache_creation_input_tokens": cache_write,
             },
         }

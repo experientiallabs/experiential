@@ -16,7 +16,7 @@ import asyncio
 import json
 import shlex
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -25,39 +25,27 @@ from rich.markup import escape
 from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 
-from wmo.agents.default import default_agent
-from wmo.agents.optimizer import optimizer_agent
-from wmo.agents.project import AgentProject
 from wmo.cli.consent import can_prompt, require_spend_consent
-from wmo.cli.model_roles import resolve_opt_in_model_provider, resolve_required_model_config
 from wmo.config import ARTIFACT_DIR, WorldModelStore
 from wmo.config.store import validate_name
 from wmo.core.types import JsonObject
-from wmo.engine import load_world_model
-from wmo.engine.world_model import WorldModel
-from wmo.evals.gold import GoldJudge
-from wmo.evals.tasks import TaskSpec, load_tasks
-from wmo.harness.create import ProposalRecord, create_harness
-from wmo.harness.doc import HarnessDoc
-from wmo.harness.e2b_sandbox import E2B_TEMPLATE_ENV, resolve_e2b_template
-from wmo.harness.population import (
-    CandidateProposer,
-    PopulationResult,
-    PopulationRunState,
-    SlotOutcome,
-    write_json_atomic,
-)
-from wmo.harness.population import (
-    optimize as optimize_population,
-)
-from wmo.harness.project_proposer import CandidateProject, ProjectCandidateProposer
-from wmo.harness.proposer import ProviderDeltaProposer
-from wmo.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
-from wmo.harness.scoring import RewardMode, Scorer, ScoreRequest
-from wmo.harness.source_tree import HarnessSourceTree
-from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
-from wmo.providers.base import Provider, ProviderConfig, ToolCallingProvider
-from wmo.providers.registry import get_provider
+
+if TYPE_CHECKING:
+    # Type-only: real imports are local to the commands and helpers that construct or inspect
+    # these values, so importing this module never pulls the agents/engine/evals/harness/
+    # providers bodies behind it.
+    from wmo.engine.world_model import WorldModel
+    from wmo.evals.tasks import TaskSpec
+    from wmo.harness.doc import HarnessDoc
+    from wmo.harness.population import CandidateProposer, PopulationResult
+    from wmo.harness.scoring import Scorer
+    from wmo.harness.source_tree import HarnessSourceTree
+    from wmo.harness.store import HarnessStore
+    from wmo.providers.base import Provider, ProviderConfig
+
+# `RewardMode` mirrors `wmo.harness.scoring.RewardMode`'s definition (a bare Literal, not a
+# class), so no import is needed for the `_HarborRunConfig` field below.
+RewardMode = Literal["raw", "positive-binary"]
 
 # The default agent seed's literal CLI name: `wmo optimize harness pi harbor ...` starts from the
 # built-in pi agent and publishes new versions under the store name "pi".
@@ -71,6 +59,8 @@ _HARBOR_EXTRA_HINT = (
     "the harbor environment needs the harbor extra; run `uv sync --extra harbor` "
     "(or `pip install 'world-model-optimizer[harbor]'`)"
 )
+# Literal mirror of `wmo.harness.e2b_sandbox.E2B_TEMPLATE_ENV`, needed at Option-definition time.
+_E2B_TEMPLATE_ENV = "WMO_E2B_TEMPLATE"
 
 harness_app = typer.Typer(
     help="Inspect and initialize named, versioned agent harnesses.",
@@ -82,6 +72,8 @@ _console = Console()
 @harness_app.command("list")
 def list_harnesses(root: str = typer.Option(ARTIFACT_DIR, help="Project dir.")) -> None:
     """List every harness with its versions and aliases."""
+    from wmo.harness.store import HarnessStore
+
     store = HarnessStore(root)
     names = store.list_names()
     if not names:
@@ -118,6 +110,8 @@ def show_harness(
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
 ) -> None:
     """Print one harness version's surfaces."""
+    from wmo.harness.store import HarnessStore
+
     base, _, ref = name.partition("@")
     try:
         validate_name(base, kind="harness")  # a bad name is a name error, not a missing ref
@@ -150,14 +144,31 @@ optimize_app = typer.Typer(
     no_args_is_help=True,
 )
 
-# Local import placement: route_app imports the optimize package and model_app imports this
-# module back; registering here keeps the whole optimizer family visible in one place.
-from wmo.cli.model_app import model_app  # noqa: E402
+# `route` and `distill` load their real Typer app only on first use, so `wmo --help` never pays
+# for the optimize/engine/distill import chains those modules pull in. `model` is registered
+# directly because `wmo.cli.optimize_model_app` is itself light at import time (its own heavy
+# imports are local to its functions), which keeps `optimize model --help` at full fidelity
+# without needing a signature-forwarding stub.
+from wmo.cli.defer import add_deferred_typer  # noqa: E402
 from wmo.cli.optimize_model_app import optimize_model  # noqa: E402
-from wmo.cli.route_app import route_app  # noqa: E402
 
-optimize_app.add_typer(route_app, name="route")
-optimize_app.add_typer(model_app, name="distill")
+add_deferred_typer(
+    optimize_app,
+    name="route",
+    module="wmo.cli.route_app",
+    attr="route_app",
+    help="Make models routable, measure them closed-loop, then fit, tune, and report policies.",
+    known_names=("student", "sweep", "fit", "tune", "report", "pin"),
+)
+add_deferred_typer(
+    optimize_app,
+    name="distill",
+    module="wmo.cli.model_app",
+    attr="model_app",
+    help="Train the agent model itself: distillation of a Tinker LoRA student from real "
+    "benchmark rollouts (harbor or tau2, config-selected), gated on held-out solve rates.",
+    known_names=("run", "probe", "report"),
+)
 optimize_app.command("model")(optimize_model)
 
 
@@ -200,7 +211,7 @@ def optimize(
     e2b_template: str | None = typer.Option(
         None,
         "--e2b-template",
-        envvar=E2B_TEMPLATE_ENV,
+        envvar=_E2B_TEMPLATE_ENV,
         help="Prebaked E2B sandbox template for --backend e2b (default: "
         "$WMO_E2B_TEMPLATE; without one, every sandbox bootstraps node + the pi runner deps).",
     ),
@@ -303,6 +314,12 @@ def optimize(
 
     To train the agent MODEL instead of its harness, use `wmo optimize distill run`.
     """
+    from wmo.cli.model_roles import resolve_opt_in_model_provider
+    from wmo.evals.gold import GoldJudge
+    from wmo.harness.create import ProposalRecord, create_harness
+    from wmo.harness.proposer import ProviderDeltaProposer
+    from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
+
     if model == _HARBOR_ENVIRONMENT:
         world_model_only = [
             flag
@@ -543,6 +560,8 @@ def optimize(
 
 
 def _load_task_file(path: str) -> list[TaskSpec]:
+    from wmo.evals.tasks import load_tasks
+
     try:
         return load_tasks(path)
     except (OSError, ValueError) as exc:
@@ -550,6 +569,8 @@ def _load_task_file(path: str) -> list[TaskSpec]:
 
 
 def _resolve_seed(store: HarnessStore, seed: str | None) -> HarnessDoc:
+    from wmo.harness.doc import HarnessDoc
+
     if seed is None:
         return HarnessDoc.baseline()
     base, _, ref = seed.partition("@")
@@ -561,6 +582,8 @@ def _resolve_seed(store: HarnessStore, seed: str | None) -> HarnessDoc:
 
 def _load_world_model(name: str | None, root: str) -> tuple[WorldModel, Provider, str]:
     """Resolve a world model by name (or the sole built one) and load it with its provider."""
+    from wmo.engine import load_world_model
+
     store = WorldModelStore(root)
     try:
         model_dir = store.resolve(name)
@@ -656,6 +679,10 @@ def _optimize_harbor(
     yes: bool,
 ) -> None:
     """Run the harbor population optimizer: fixed seed, sequential complete-source proposals."""
+    from wmo.cli.model_roles import resolve_required_model_config
+    from wmo.harness.e2b_sandbox import resolve_e2b_template
+    from wmo.harness.runtime import DEFAULT_EVAL_EPISODE_TIMEOUT_S
+
     if name is None:
         raise typer.BadParameter(
             "provide the seed agent NAME (the literal 'pi' is the built-in default agent): "
@@ -743,6 +770,9 @@ def _optimize_harbor(
     ):
         raise typer.Exit(0)
 
+    from wmo.harness.population import SlotOutcome, write_json_atomic
+    from wmo.harness.population import optimize as optimize_population
+
     scorer, task_pins = _build_harbor_scorer(config, run_dir=run_dir, provider_config=agent_config)
     if resume:
         if config.task_pins is not None and task_pins != config.task_pins:
@@ -801,6 +831,9 @@ def _publish_harbor_winner(
     resumed again re-prints that record instead of appending a duplicate store version and
     moving the champion alias a second time.
     """
+    from wmo.harness.population import write_json_atomic
+    from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
+
     published_path = run_dir / "published.json"
     if published_path.exists():
         record = json.loads(published_path.read_text(encoding="utf-8"))
@@ -842,6 +875,11 @@ def _resumed_harbor_seed(
     publication) resolve a different tree and brick a legitimate resume. Before the first
     boundary the seed is re-resolved from the PINNED version recorded at start.
     """
+    from wmo.agents.default import default_agent
+    from wmo.harness.population import PopulationRunState
+    from wmo.harness.source_tree import HarnessSourceTree
+    from wmo.harness.store import HarnessStore
+
     seed_name = config.agent.partition("@")[0]
     # load() only returns COMMITTED boundaries (state.json) and re-verifies each candidate's
     # doc hash, so a crash that left a partial candidate-0000/source dir cannot leak in.
@@ -878,6 +916,8 @@ def _resumed_harbor_config(
     agent_config: ProviderConfig,
 ) -> _HarborRunConfig:
     """Load the recorded run config, rejecting explicit CLI flags that conflict with it."""
+    from wmo.harness.e2b_sandbox import resolve_e2b_template
+
     if not config_path.is_file():
         raise typer.BadParameter(
             f"--resume found no run-config.json under {config_path.parent}; "
@@ -952,6 +992,10 @@ def _resolve_harbor_seed(root: str, agent_ref: str) -> tuple[str, HarnessSourceT
     the seed tree, and the resolved store version (None for the built-in seed) so a resume can
     pin exactly what this run started from.
     """
+    from wmo.agents.default import default_agent
+    from wmo.harness.source_tree import HarnessSourceTree
+    from wmo.harness.store import HarnessStore
+
     base, _, ref = agent_ref.partition("@")
     try:
         validate_name(base, kind="harness")
@@ -1001,6 +1045,8 @@ def _load_harbor_job_template(path: Path) -> JsonObject:
 
 def _load_harbor_task_ids(path: Path) -> tuple[str, ...]:
     """Load the exact ordered task-id list, validated by the canonical score request rules."""
+    from wmo.harness.scoring import ScoreRequest
+
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
@@ -1065,6 +1111,12 @@ def _build_harbor_proposer(
     optimizer persona needs a contained filesystem plus node for interface validation, and the
     pi worker template already ships both.
     """
+    from wmo.agents.optimizer import optimizer_agent
+    from wmo.agents.project import AgentProject
+    from wmo.harness.project_proposer import CandidateProject, ProjectCandidateProposer
+    from wmo.providers.base import ToolCallingProvider
+    from wmo.providers.registry import get_provider
+
     provider = get_provider(meta_config)
     if not isinstance(provider, ToolCallingProvider):
         raise typer.BadParameter(
@@ -1092,6 +1144,9 @@ def init_harness(
     root: str = typer.Option(ARTIFACT_DIR, help="Project dir."),
 ) -> None:
     """Write the baseline harness as v1 and point `champion` at it."""
+    from wmo.harness.doc import HarnessDoc
+    from wmo.harness.store import CHAMPION_ALIAS, HarnessStore
+
     store = HarnessStore(root)
     try:
         if store.exists(name):

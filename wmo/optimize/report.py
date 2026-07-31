@@ -154,6 +154,7 @@ def build_report(
     baseline: str,
     endpoint: str,
     generated_at: str,
+    scenario_label: str | None = None,
     built: Embedder | None = None,
 ) -> ImprovementReport:
     """Aggregate `matrix` into the endpoint's improvement report under `policy`.
@@ -168,6 +169,12 @@ def build_report(
     has no overlapping ids, so all of its scenarios remain eligible. Raises ValueError when no
     eligible scenario was scored on both sides: a matrix that measured nothing comparable has no
     honest report in it.
+
+    `scenario_label` is the customer-facing sentence describing WHAT was measured, and it defaults
+    to the world-model phrasing this report was written for. A matrix of real benchmark episodes
+    must pass its own: telling a customer their endpoint was measured on scenarios "reconstructed
+    from your traces" when it was measured on a pinned public benchmark is false on the one line
+    of the report a reader actually reads.
     """
     names = {entry.name: entry for entry in matrix.pool}
     if baseline not in names:
@@ -273,7 +280,8 @@ def build_report(
         generated_at=generated_at,
         scenario_count=total,
         scenario_ids=list(scenario_tasks),
-        scenario_label=f"on {total} held-out scenarios reconstructed from your traces",
+        scenario_label=scenario_label
+        or f"on {total} held-out scenarios reconstructed from your traces",
         baseline=_ref(baseline),
         headline=Headline(
             accuracy=routed_acc,

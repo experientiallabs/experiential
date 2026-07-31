@@ -8,7 +8,7 @@ import pytest
 
 from wmo.optimize.outcomes import OutcomeMatrix
 from wmo.reproduce.embedding import CachedTaskEmbedder
-from wmo.reproduce.manifest import Manifest
+from wmo.reproduce.manifest import Manifest, PublishedRow
 from wmo.reproduce.runner import run_reproduction
 
 _MODELS = [
@@ -242,3 +242,54 @@ def test_cached_embedder_refuses_duplicate_task_texts(tmp_path: Path) -> None:
     np.save(snapshot / "vectors.npy", np.zeros((4, 8)))
     with pytest.raises(ValueError, match="share task text"):
         CachedTaskEmbedder(OutcomeMatrix.load(snapshot / "matrix.json"), snapshot / "vectors.npy")
+
+
+def test_pin_manifest_replays_without_embeddings_and_reports_the_pin(tmp_path: Path) -> None:
+    """The bench-defaults protocol: a static pin needs no cache and no embedder.
+
+    The routed side of the report must be the pinned model's own rows - a pin
+    routes nothing - and the run must be bit-exact against its own re-measure.
+    """
+    snapshot = tmp_path / "data"
+    snapshot.mkdir()
+    (snapshot / "matrix.json").write_text(json.dumps(_matrix_dict()), encoding="utf-8")
+    manifest = Manifest.model_validate(
+        {
+            "name": "fixture-pin",
+            "title": "fixture pin benchmark",
+            "cookbook": "docs/cookbook/swe-bench.md",
+            "exactness": "bit-exact",
+            "kind": "matrix",
+            "data": {"hf_repo": "org/unused", "files": ["matrix.json"]},
+            "matrix": {
+                "matrix_file": "matrix.json",
+                "pin_model": "cheap",
+                "baselines": ["pricey"],
+            },
+            "published": [
+                {"label": "probe", "baseline": "pricey", "accuracy": 0.0, "cost_per_run_usd": 0.0}
+            ],
+        }
+    )
+    run_reproduction(manifest, out_dir=tmp_path / "probe", data_dir=snapshot)
+    headline = json.loads(
+        (tmp_path / "probe" / "report_vs_pricey.json").read_text(encoding="utf-8")
+    )["headline"]
+    # The pinned model's own numbers: reward 0.5 at $0.001/run against pricey's 1.0 at $0.01.
+    assert headline["accuracy"] == 0.5
+    assert headline["cost_per_run_usd"] == pytest.approx(0.001)
+
+    verified = manifest.model_copy(
+        update={
+            "published": [
+                PublishedRow(
+                    label="pin vs pricey",
+                    baseline="pricey",
+                    accuracy=headline["accuracy"],
+                    cost_per_run_usd=headline["cost_per_run_usd"],
+                )
+            ]
+        }
+    )
+    result = run_reproduction(verified, out_dir=tmp_path / "verify", data_dir=snapshot)
+    assert result.reproduced

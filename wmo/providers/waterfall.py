@@ -48,7 +48,6 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmo.providers.bedrock import resolve_region
 from wmo.providers.registry import get_provider
 
 # ProviderKinds with a REAL llm-waterfall adapter, mapped to the package's provider names
@@ -83,6 +82,8 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
         )
     region = config.region
     if config.kind is ProviderKind.BEDROCK:
+        from wmo.providers.bedrock import resolve_region
+
         region = resolve_region(region)
     return Backend(
         provider,

@@ -1,0 +1,31 @@
+name = "tau-bench-real"
+title = "tau2-bench, real episodes: the pinned sonnet-5 default measured on Sierra's actual benchmark"
+cookbook = "docs/cookbook/tau-bench.md"
+exactness = "bit-exact"
+kind = "matrix"
+
+notes = [
+  "594 real tau2 episodes: 20 pinned eval-split scenarios (airline 7 / retail 8 / telecom 5) x 15 candidates x 2 episodes, scored by tau2's own reward. Distinct from the `tau-bench` manifest, whose numbers are world-model simulated.",
+  "Offline and credential-free: the shipped default is a static pin, so the replay is arithmetic over the published matrix.",
+  "The measured winner on this matrix is glm-5.2 (-88% vs the anchor); the default pins sonnet-5 because glm-5.2 has no authoritative serving price. The matrix carries both, so the reproduction shows the gap.",
+  "The quality delta vs the anchor (-2.0pt) is UNRESOLVED at n=19 paired scenarios; the resolved claim is the cost saving. 6 of 600 cells never produced a row (batch deadline; 3 are the anchor's own), so paired comparisons run at n=19 of 20.",
+]
+
+[data]
+hf_repo = "experiential-labs/wmo-tau-bench-real"
+repo_type = "dataset"
+revision = "29237b0541596f042b522ca9b89270e7a6e22a6e"
+files = ["matrix.json"]
+
+[matrix]
+matrix_file = "matrix.json"
+scenario_label = "on the pinned tau2-bench eval split (20 scenarios, real benchmark episodes; quality delta unresolved at n=19 paired)"
+pin_model = "sonnet-5"
+baselines = ["fable-5"]
+
+[[published]]
+label = "pinned sonnet-5 (the shipped tau default) vs anchor (fable-5)"
+baseline = "fable-5"
+accuracy = 0.7368421052631579
+cost_per_run_usd = 0.36989368421052626
+latency_p50_ms = 2936.4647080074064
