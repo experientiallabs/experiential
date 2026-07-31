@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: static-frontier checkpoint reproduced in native WMO, task-routing gain not established
+Status: external task-selection gain established, DeepSWE cost-efficiency promotion not established
 
 ## Objective
 
@@ -210,6 +210,142 @@ The family gate is frozen before its fit:
 Only one mechanically selected candidate may open the DeepSWE artifact, and only if all four
 conditions pass. A metadata-only audit found zero task-id and zero normalized-text overlap between
 the 14,504 Open-SWE paired tasks and the 113 DeepSWE task metadata rows.
+
+The completed fit selected `profile-difficulty-pr-t0.05-p20`, but rejected the family.
+Aggregate out-of-fold uplift Spearman was -0.0731. Only two of five primary sources and
+two of five leave-source-out checks were positive, below the preregistered four-source
+minimum in both cases. No DeepSWE evaluation was opened for this family.
+
+## Moonshiner fast execution corpus
+
+The first execution-scored fast-development replacement used Moonshiner commit
+`da981ff7893de29004712c8f4b3f7a414737525e`. A remote preflight required every selected
+seed to fail before repair, pass after the reference repair, preserve protected files, avoid
+network requirements, and have zero exact task-id or normalized-prompt overlap with DeepSWE.
+It froze 96 tasks across 42 grouped families and eight language labels. The task artifact SHA-256
+is `080910137aa29ab7ddee25920e9c314e523d916b94f1c2d8f88627952ab11819`.
+
+All model calls used GPT-5.6 Luna with reasoning effort as the arm. The xhigh and max matrix
+ran 192 cells for a trace-derived estimated USD 7.5222. The low, medium, and high matrix ran
+288 cells for an estimated USD 6.8801. Including the valid smoke runs, measured trace-derived
+spend was USD 14.5822, plus two ungradeable failed calls with no valid accounting.
+
+One failed high-effort trace grew to 19.1 GB and filled the sandbox disk. Only that invalid raw
+trace and its exact managed workspace were removed. The deletion is not recoverable, but the
+failure log remains. The runner now enforces a 64 MB per-trace file limit and removes only its own
+managed workspace after each cell.
+
+This corpus was too easy and noisy for effort routing. Eighty-eight of 96 tasks passed at every
+effort. For xhigh to max, 93 tasks tied, two improved at max, and one regressed. The selected
+`latent-hash2048-a10` scorer had -0.0061 out-of-fold uplift Spearman, -0.00052 best advantage
+versus matched task-blind routing, and bootstrap interval
+[-0.01117, -0.00030, 0.01120]. The external gate failed and DeepSWE remained sealed.
+
+## BeyondSWE trace-burden transfer
+
+The next source used
+[`AweAI-Team/BeyondSWE`](https://huggingface.co/datasets/AweAI-Team/BeyondSWE) task commit
+`2dc9bab512c7dcb00397531da34e06572cf06674` and the repository's released GPT-5.4 XHigh
+Codex trajectories at commit `9e25d5a15857c90fd1b63b674972879072fb78b5`. The task and
+trajectory files each contain 500 rows. Two exception traces were excluded, leaving 498 rows.
+No task-id or normalized-prompt overlap with DeepSWE or the Open-SWE validation source was
+retained.
+
+The source release has complete rewards, steps, and token counts but no measured `cost_usd`.
+The freezer records that absence instead of imputing cost. It derives a dense trace-burden label
+from graded reward deficit, log steps, log prompt tokens, and log completion tokens. No foundation
+model or fitted model is persisted.
+
+A structural ExtraTrees scorer predicted BeyondSWE burden with repository-grouped out-of-fold
+Spearman 0.3756. Direct transfer to Open-SWE failed: uplift Spearman was -0.0071, the 20 percent
+strong-traffic advantage was +0.00098, and its repository bootstrap interval
+[-0.00188, 0.00096, 0.00352] crossed zero. DeepSWE remained sealed.
+
+Source hashes:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| BeyondSWE tasks | `83a0e16ada8b6c95c5634c3ace41c75360b22f31735926f45273ae57623d021f` |
+| Released Codex trajectories | `0211abac1057c218e71aee8d5cb162f472f4a4220fed22f2de359258950d9170` |
+| Clean 498-row source | `fb4ca25b78c723066024dbc0bc5ec65bcbc795e49ae5b0ce5f2ff9d57e87dc30` |
+
+## Zero-inflated Open-SWE uplift
+
+Open-SWE has 2,805 positive-uplift tasks, 10,501 ties, and 1,198 negative-uplift tasks. The next
+family therefore compared direct uplift, two-head, nonlinear structural, discordant-only ranking,
+and a zero-inflated hurdle model. BeyondSWE burden was a fixed auxiliary feature selected before
+Open-SWE labels were inspected.
+
+Candidate selection was nested inside repository-held-out outer folds. The combined outer test
+selected hybrid direct Ridge in three folds and the word sign ranker in two. It achieved:
+
+| External metric | Result |
+| --- | ---: |
+| Uplift Spearman | 0.0942614 |
+| Reward advantage at 20 percent strong traffic | +0.0084597 |
+| Repository bootstrap 95 percent interval | [0.0051586, 0.0083905, 0.0116796] |
+
+All external gates passed. Refit on the full external source selected
+`hybrid-ridge-direct-a10`, with 0.0910 out-of-fold uplift Spearman and +0.00893 reward advantage.
+The shuffled-label control reached only +0.00188.
+
+The first DeepSWE replay accidentally used only title plus one-sentence display description,
+while the external model was trained on the full runtime request. It is preserved as an invalid
+feature-adapter replay. It scored 0.92660 at USD 196.80 and was worse than matched random quality.
+
+The corrected replay built a label-free feature view from the full pre-inference task prompt,
+froze all scores, and only then accessed reward and cost. At the frozen 20 percent max traffic:
+
+| DeepSWE metric | Result |
+| --- | ---: |
+| Traffic | 88 Luna xhigh, 22 Luna max |
+| Router reward | 0.9342591 |
+| Router cost | USD 214.0205 |
+| Quality delta versus matched random mean | +0.0027164 |
+| Cost delta versus matched random mean | +USD 7.5256 |
+| Quality percentile | 81.275 percent |
+| Cost savings versus always max | 38.5734 percent |
+| Quality retention versus always max | 98.7974 percent |
+| Static dominators | 0 |
+
+This is a functioning task selector but not a confirmed cost-efficiency win. The preregistered
+95th quality-percentile and matched-random-cost requirements failed.
+
+## Trace-burden-aware cost ranking
+
+An adaptive external-only follow-up subtracts a fitted multiple of BeyondSWE trace burden from
+predicted Open-SWE uplift. The selection rule retains at least 90 percent of the best positive
+inner-fold reward advantage, then minimizes predicted trace burden. It froze penalty 0.05.
+
+The nested external result kept +0.0079886 reward advantage while reducing proxy burden by
+0.0191567 per task. Repository bootstrap intervals were [0.0054980, 0.0104944] for reward
+advantage and [-0.0221004, -0.0163907] for proxy burden. Every external quality and cost-proxy
+gate passed.
+
+The adaptive DeepSWE replay improved both axes relative to the unpenalized router:
+
+| DeepSWE metric | Cost-aware result |
+| --- | ---: |
+| Router reward | 0.9345432 |
+| Router cost | USD 211.5022 |
+| Quality delta versus matched random mean | +0.0030005 |
+| Cost delta versus matched random mean | +USD 5.0073 |
+| Quality percentile | 83.565 percent |
+| Cost savings versus always max | 39.2962 percent |
+| Quality retention versus always max | 98.8274 percent |
+| Static dominators | 0 |
+
+It still fails promotion because target cost is above the matched random mean and target quality
+is below the frozen 95th percentile. The penalty will not be tuned on DeepSWE.
+
+Compact report hashes:
+
+| Report | SHA-256 |
+| --- | --- |
+| Nested Open-SWE family gate | `b17e331d5d016bf9d1b9525e5b26a24f910d6aee7b04f77feb22913bfd1c583e` |
+| Corrected full-prompt DeepSWE replay | `ff28df8a32718e8cf8132a5c52dc6123ecb7ef45692571c7fe7815a8c0b9b8d0` |
+| Cost-aware external gate | `ac84740aed8918a5bb1e679a9567c9f9e97362acb58c04e6456f3b802942e1fd` |
+| Cost-aware DeepSWE replay | `d1f810fe96b457e51f48c11d11127f59a9cf250169ef8224a02489d53a6f4d6a` |
 
 ## Reproducibility anchors
 
