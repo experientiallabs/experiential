@@ -139,3 +139,34 @@ limit for exactly 1,600 confirmation cells. The frozen route advances only if:
 Only a passing untouched confirmation authorizes the one sealed DeepSWE
 transfer. A failure is final for this route and cannot be repaired with
 confirmation-dependent tuning.
+
+## Preregistered single DeepSWE transfer
+
+If and only if every confirmation condition passes, refit the exact frozen
+candidate on the 160 development tasks and score the 113-row label-free
+DeepSWE task view with SHA-256
+`35ad33855f63f147b1861b58b59ad635f8860677b5d0d5e902c421029d78637b`.
+Write and content-address all 113 effort decisions before opening any target
+outcome. The route-freeze phase cannot accept a target matrix and runs on a
+no-internet E2B worker. Its fitted Ridge heads remain ephemeral.
+
+Codeforces-only tests, time limits, memory limits, and C/D/E/F+ bucket fields
+do not exist on DeepSWE. The target adapter is therefore frozen before target
+evaluation: preserve the shared text length, line, formatting, keyword, and
+topic features, and set those seven unavailable source-only fields to zero.
+Neither the adapter nor any effort decision may change after target outcomes
+are opened.
+
+Evaluate the frozen decisions exactly once against the already content-addressed
+published DeepSWE matrix with SHA-256
+`2988742e48b1c9bfec8dc45d88af112c46c45367529d1936b709e4b4e549835f`.
+Use graded fail-to-pass reward and measured trial cost. Drop a target task
+across all five effort arms if any reward or cost cell is missing. Report every
+static effort, the router, and the matched task-blind mixture with identical
+effort counts. Bootstrap the router-minus-blind reward by repository.
+
+The transfer counts as positive task-routing evidence only if the repository
+bootstrap lower bound is above zero and no single static effort has at least
+the router reward for no greater cost. Regardless of the result, there is no
+second target evaluation and no target-dependent refit, threshold change,
+representation change, or arm change.
