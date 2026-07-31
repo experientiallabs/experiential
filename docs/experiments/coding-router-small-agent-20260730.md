@@ -45,6 +45,8 @@ The policy is now cache-aware when served live. It may reconsider the model on e
 
 This is deliberately conservative. The current profile artifact has task-level quality evidence, but not turn-level quality evidence, so cache economics control switching while quality remains protected by the fitted task profile. The 47.9% cost result above is task-level; turn-level savings require a conversation trace evaluation.
 
+A remote synthetic replay of 1,000 eight-turn conversations, using the actual DeepSWE task-length distribution, reduced prefill cost 53.5% versus staying on the first model and 95.7% versus cold-routing every turn. It switched 0.33 times per conversation on average. This validates the cache arithmetic only; it does not establish turn-level quality.
+
 ## Remote-compute and reproducibility notes
 
 The fitting sweep ran in an E2B sandbox. The laptop was used only to orchestrate the job, run small checks, and store artifacts. The report is at `.agents/reports/deepswe_profile_router_20260730.json`.

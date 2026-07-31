@@ -145,6 +145,35 @@ def _cluster_policy() -> RoutingPolicy:
     )
 
 
+def _cache_aware_profile_policy() -> RoutingPolicy:
+    pool = [
+        PoolEntry(
+            name="fable-5",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-fable-5",
+            input_per_mtok=10.0,
+            output_per_mtok=50.0,
+            cached_input_per_mtok=1.0,
+        ),
+        PoolEntry(
+            name="haiku-4-5",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-haiku-4-5",
+            input_per_mtok=1.0,
+            output_per_mtok=5.0,
+            cached_input_per_mtok=0.1,
+        ),
+    ]
+    return RoutingPolicy(
+        kind="profile",
+        default_model="fable-5",
+        pool=pool,
+        cache_aware=True,
+        profile_bins=[20.0],
+        profile_models=["haiku-4-5", "fable-5"],
+    )
+
+
 def _client(tmp_path: Path, policy: RoutingPolicy | None = None) -> tuple[TestClient, Path]:
     log_path = tmp_path / "requests.jsonl"
     runtime = EndpointRuntime(
@@ -231,6 +260,32 @@ def test_cluster_routing_and_affinity(tmp_path: Path) -> None:
         },
     )
     assert second.headers["x-wmo-routed-model"] == "fable-5"
+
+
+def test_cache_aware_profile_switches_on_a_later_turn(tmp_path: Path) -> None:
+    client, log_path = _client(tmp_path, policy=_cache_aware_profile_policy())
+    first = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "x" * 50}],
+        },
+    )
+    assert first.headers["x-wmo-routed-model"] == "fable-5"
+    reply = first.json()["choices"][0]["message"]["content"]
+    second = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [
+                {"role": "user", "content": "x" * 50},
+                {"role": "assistant", "content": reply},
+                {"role": "user", "content": "short"},
+            ],
+        },
+    )
+    assert second.headers["x-wmo-routed-model"] == "haiku-4-5"
+    assert "cache-aware profile: switched" in _rows(log_path)[1]["routing_reason"]
 
 
 def test_unknown_endpoint_404s_with_available(tmp_path: Path) -> None:

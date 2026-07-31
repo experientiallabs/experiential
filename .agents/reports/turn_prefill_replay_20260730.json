@@ -1,0 +1,15 @@
+{
+  "compute": "E2B remote sandbox",
+  "replay_type": "synthetic turn economics",
+  "source_distribution": "113 DeepSWE 1.1 task-description lengths",
+  "conversations": 1000,
+  "turns_per_conversation": 8,
+  "mean_sticky_prefill_usd": 0.00343883795,
+  "mean_cache_aware_prefill_usd": 0.00160060125,
+  "mean_fresh_profile_prefill_usd": 0.0369412695,
+  "cache_aware_vs_sticky_savings": 0.5345517080849942,
+  "cache_aware_vs_fresh_savings": 0.9566717313274792,
+  "mean_switches": 0.334,
+  "mean_kept_for_cache": 2.244,
+  "quality_evaluation": "not measured; the source matrix has task-level, not turn-level, outcomes"
+}
