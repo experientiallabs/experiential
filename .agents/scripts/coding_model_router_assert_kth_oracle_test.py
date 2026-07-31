@@ -63,6 +63,32 @@ def test_overlap_uses_id_and_embedded_normalized_problem_text() -> None:
     assert not module._overlaps(task, set(), {"fix a different widget"})
 
 
+def test_target_feature_view_must_be_label_free(tmp_path: Path) -> None:
+    path = tmp_path / "target-features.json"
+    path.write_text(
+        module.json.dumps(
+            {
+                "rows": [{"id": "target-1", "text": "Fix the widget"}],
+                "target_reward_fields_accessed": False,
+                "target_cost_fields_accessed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert module._target_feature_rows(path) == [
+        {"id": "target-1", "text": "Fix the widget"}
+    ]
+    payload = module.json.loads(path.read_text(encoding="utf-8"))
+    payload["target_reward_fields_accessed"] = True
+    path.write_text(module.json.dumps(payload), encoding="utf-8")
+    try:
+        module._target_feature_rows(path)
+    except ValueError as error:
+        assert "not label-free" in str(error)
+    else:
+        raise AssertionError("target feature view with rewards should fail")
+
+
 def test_heldout_oracle_recovers_repeatable_complementarity() -> None:
     np = module.np
     rewards = np.zeros((8, 2, 10), dtype=np.float64)

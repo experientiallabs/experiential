@@ -172,6 +172,22 @@ def _target_rows(path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def _target_feature_rows(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("target_reward_fields_accessed") is not False
+        or payload.get("target_cost_fields_accessed") is not False
+        or not isinstance(payload.get("rows"), list)
+    ):
+        raise ValueError("target feature view is not label-free")
+    return [
+        cast(dict[str, Any], row)
+        for row in cast(list[Any], payload["rows"])
+        if isinstance(row, dict)
+    ]
+
+
 def _target_texts(rows: list[dict[str, Any]]) -> set[str]:
     texts: set[str] = set()
     for row in rows:
@@ -220,9 +236,12 @@ def _load_tasks(cache: Path) -> dict[str, Task]:
 def _load_matrix(
     cache: Path,
     target_path: Path,
+    target_feature_view_path: Path,
 ) -> tuple[Matrix, dict[str, Any]]:
     tasks = _load_tasks(cache / "swe-bench-verified.parquet")
-    target = _target_rows(target_path)
+    target_metadata = _target_rows(target_path)
+    target_features = _target_feature_rows(target_feature_view_path)
+    target = target_metadata + target_features
     target_ids = {str(row.get("id", row.get("instance_id", ""))) for row in target}
     target_texts = _target_texts(target)
     by_arm: dict[str, list[dict[str, float]]] = {}
@@ -359,12 +378,17 @@ def _headroom(
 
 def run(
     target_path: Path,
+    target_feature_view_path: Path,
     output: Path,
     *,
     seed: int,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
-    matrix, audit = _load_matrix(output / "cache", target_path)
+    matrix, audit = _load_matrix(
+        output / "cache",
+        target_path,
+        target_feature_view_path,
+    )
     oracle = _headroom(matrix, seed=seed)
     interval = cast(list[float], oracle["heldout_oracle_headroom_95ci"])
     gates = {
@@ -426,10 +450,16 @@ def run(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--target-tasks", type=Path, required=True)
+    parser.add_argument("--target-feature-view", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260731)
     args = parser.parse_args()
-    run(args.target_tasks, args.output, seed=args.seed)
+    run(
+        args.target_tasks,
+        args.target_feature_view,
+        args.output,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":
