@@ -15,20 +15,28 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
+import numpy as np
 from coding_model_router_bigcodebench_fit import (
+    ARMS,
     FitData,
+    PolicyValue,
     canonical_candidate_config,
+    cost_only_choices,
+    evaluate_choices,
     fit_selected_static,
     load_fit_data,
     outer_splits,
+    random_choices,
     seed_split_provenance,
     select_fit_candidate,
+    shuffled_task_rewards,
 )
 from coding_model_router_bigcodebench_select import (
     CandidateSpec,
     CandidateValidation,
     KnnCandidateSpec,
     candidate_grid,
+    evaluate_candidate_oof,
     knn_candidate_grid,
     select_knn_candidate,
     select_knn_economic_refinement,
@@ -39,6 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from wmo.core.files import write_text_atomic
 
 logger = logging.getLogger(__name__)
+ControlKind = Literal["static", "matched-task-blind", "random", "cost-only", "shuffled-label"]
 
 
 class CandidateRecord(BaseModel):
@@ -71,6 +80,26 @@ class CandidateRecord(BaseModel):
         return self
 
 
+class ControlRecord(BaseModel):
+    """One fit-only negative or static control evaluated on the same rows."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: ControlKind
+    name: str = Field(min_length=1)
+    reward: float = Field(ge=0.0, le=1.0)
+    cost_usd: float = Field(ge=0.0)
+    arm_counts: dict[str, int]
+
+    @model_validator(mode="after")
+    def _complete_nonnegative_traffic(self) -> ControlRecord:
+        if set(self.arm_counts) != set(ARMS):
+            raise ValueError("control traffic must contain every frozen effort arm")
+        if any(count < 0 for count in self.arm_counts.values()):
+            raise ValueError("control traffic counts must be nonnegative")
+        return self
+
+
 class SeedFitReport(BaseModel):
     """Immutable output of one outer seed's fit-only nested selection."""
 
@@ -91,6 +120,7 @@ class SeedFitReport(BaseModel):
     baseline_fit_reward: float = Field(ge=0.0, le=1.0)
     baseline_fit_cost_usd: float = Field(ge=0.0)
     candidates: list[CandidateRecord] = Field(min_length=1_028, max_length=1_028)
+    controls: list[ControlRecord] = Field(min_length=9, max_length=9)
     selected_name: str = Field(min_length=1)
     latency_audit_pending: Literal[True] = True
     target_outcomes_used: Literal[False] = False
@@ -103,6 +133,17 @@ class SeedFitReport(BaseModel):
             raise ValueError("seed fit report contains duplicate candidate identities")
         if self.selected_name not in names:
             raise ValueError("selected candidate is absent from the fit report")
+        expected_controls = {f"static-{arm}" for arm in ARMS} | {
+            "selected-matched-task-blind",
+            "seeded-uniform-random",
+            "fit-cost-only",
+            "selected-shuffled-labels",
+        }
+        control_names = [control.name for control in self.controls]
+        if set(control_names) != expected_controls or len(control_names) != len(set(control_names)):
+            raise ValueError("seed fit report does not contain the exact frozen controls")
+        if any(sum(control.arm_counts.values()) != self.fit_tasks for control in self.controls):
+            raise ValueError("control traffic counts do not cover every fit task")
         return self
 
 
@@ -171,6 +212,98 @@ def select_family_winner(
     return non_knn if metric.name == non_knn.metric.name else knn
 
 
+def _control(kind: ControlKind, name: str, value: PolicyValue) -> ControlRecord:
+    """Convert one observed policy value into a durable control row."""
+    return ControlRecord(
+        kind=kind,
+        name=name,
+        reward=value.reward,
+        cost_usd=value.cost_usd,
+        arm_counts=value.arm_counts,
+    )
+
+
+def fit_controls(
+    data: FitData,
+    outer_fit: np.ndarray,
+    selected: CandidateValidation,
+    *,
+    seed: int,
+    work_dir: Path,
+) -> list[ControlRecord]:
+    """Evaluate nine frozen fit-only controls, including label destruction."""
+    indices = np.asarray(outer_fit, dtype=np.int64)
+    rewards = data.rewards[indices].mean(axis=2)
+    costs = data.costs[indices].mean(axis=2)
+    controls = [
+        _control(
+            "static",
+            f"static-{arm}",
+            evaluate_choices(
+                rewards,
+                costs,
+                np.full(len(indices), arm_index, dtype=np.int64),
+            ),
+        )
+        for arm_index, arm in enumerate(ARMS)
+    ]
+    controls.append(
+        ControlRecord(
+            kind="matched-task-blind",
+            name="selected-matched-task-blind",
+            reward=selected.value.matched_blind_reward,
+            cost_usd=selected.value.matched_blind_cost_usd,
+            arm_counts=selected.value.arm_counts,
+        )
+    )
+    controls.append(
+        _control(
+            "random",
+            "seeded-uniform-random",
+            evaluate_choices(rewards, costs, random_choices(len(indices), seed=10_000 + seed)),
+        )
+    )
+    controls.append(
+        _control(
+            "cost-only",
+            "fit-cost-only",
+            evaluate_choices(rewards, costs, cost_only_choices(costs)),
+        )
+    )
+    shuffled_values = data.rewards.copy()
+    shuffled_values[indices] = shuffled_task_rewards(
+        data.rewards[indices],
+        seed=20_000 + seed,
+    )
+    shuffled = FitData(
+        task_ids=data.task_ids,
+        groups=data.groups,
+        texts=data.texts,
+        is_hard=data.is_hard,
+        rewards=shuffled_values,
+        costs=data.costs,
+    )
+    if isinstance(selected.spec, KnnCandidateSpec):
+        shuffled_result, _ = select_knn_candidate(
+            shuffled,
+            indices,
+            [selected.spec],
+            seed=30_000 + seed,
+            work_dir=work_dir / "shuffled-label-knn",
+            evaluation_data=data,
+        )
+    else:
+        shuffled_result = evaluate_candidate_oof(
+            shuffled,
+            indices,
+            selected.spec,
+            seed=30_000 + seed,
+            evaluation_data=data,
+        )
+    controls.append(_control("shuffled-label", "selected-shuffled-labels", shuffled_result.value))
+    return controls
+
+
 def run_seed_selection(
     root: Path,
     *,
@@ -206,6 +339,13 @@ def run_seed_selection(
         work_dir=work_dir / "knn-economic",
     )
     selected = select_family_winner(non_knn_selected, knn_selected)
+    controls = fit_controls(
+        data,
+        split.train_indices,
+        selected,
+        seed=seed,
+        work_dir=work_dir / "controls",
+    )
     fit_ids_sha256, heldout_ids_sha256 = seed_split_provenance(data, split)
     all_results = [*non_knn_results, *knn_results, *economic_results]
     report = SeedFitReport(
@@ -223,6 +363,7 @@ def run_seed_selection(
         baseline_fit_reward=baseline.reward,
         baseline_fit_cost_usd=baseline.cost_usd,
         candidates=[candidate_record(result) for result in all_results],
+        controls=controls,
         selected_name=selected.spec.name,
     )
     write_text_atomic(output, report.model_dump_json(indent=2) + "\n")

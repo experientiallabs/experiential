@@ -62,6 +62,26 @@ def _candidate(index: int) -> object:
     )
 
 
+def _controls(fit_tasks: int = 240) -> list[object]:
+    kinds_and_names = [
+        *(("static", f"static-{arm}") for arm in fit.ARMS),
+        ("matched-task-blind", "selected-matched-task-blind"),
+        ("random", "seeded-uniform-random"),
+        ("cost-only", "fit-cost-only"),
+        ("shuffled-label", "selected-shuffled-labels"),
+    ]
+    return [
+        run.ControlRecord(
+            kind=kind,
+            name=name,
+            reward=0.7,
+            cost_usd=0.3,
+            arm_counts={arm: fit_tasks if arm == fit.ARMS[0] else 0 for arm in fit.ARMS},
+        )
+        for kind, name in kinds_and_names
+    ]
+
+
 def _evidence(root: Path, evidence: Path) -> tuple[list[Path], list[Path]]:
     candidates = [_candidate(index) for index in range(1_028)]
     reports: list[Path] = []
@@ -82,6 +102,7 @@ def _evidence(root: Path, evidence: Path) -> tuple[list[Path], list[Path]]:
             baseline_fit_reward=0.82,
             baseline_fit_cost_usd=1.0,
             candidates=candidates,
+            controls=_controls(),
             selected_name=candidates[seed].name,
         )
         report_path = evidence / f"seed-{seed}.json"

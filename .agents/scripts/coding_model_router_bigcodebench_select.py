@@ -387,8 +387,9 @@ def evaluate_candidate_oof(
     *,
     seed: int,
     feature_cache: dict[tuple[int, tuple[int, ...]], sparse.csr_matrix] | None = None,
+    evaluation_data: FitData | None = None,
 ) -> CandidateValidation:
-    """Evaluate one candidate by five inner library-grouped fit-only folds."""
+    """Fit one candidate in grouped folds and evaluate its routes on declared outcomes."""
     indices = np.asarray(outer_fit, dtype=np.int64)
     if indices.size == 0 or len(set(indices.tolist())) != len(indices):
         raise ValueError("outer fit indices are empty or duplicated")
@@ -414,8 +415,11 @@ def evaluate_candidate_oof(
             seed=seed * 100 + fold,
         )
         baseline_choices[test_relative] = ARMS.index(fit_selected_static(data, train).name)
-    rewards = data.rewards[indices].mean(axis=2)
-    costs = data.costs[indices].mean(axis=2)
+    observed = evaluation_data or data
+    if observed.task_ids != data.task_ids:
+        raise ValueError("candidate evaluation data has different task identities")
+    rewards = observed.rewards[indices].mean(axis=2)
+    costs = observed.costs[indices].mean(axis=2)
     value = evaluate_choices(rewards, costs, choices)
     baseline = evaluate_choices(rewards, costs, baseline_choices)
     metric = CandidateMetric(
@@ -468,6 +472,7 @@ def _evaluate_knn_candidates(
     *,
     seed: int,
     work_dir: Path,
+    evaluation_data: FitData | None = None,
 ) -> list[CandidateValidation]:
     """Evaluate WMO kNN points using five grouped outer-fit folds and shared banks."""
     if not candidates:
@@ -530,8 +535,11 @@ def _evaluate_knn_candidates(
                     [ARMS.index(model) for model in decisions],
                     dtype=np.int64,
                 )
-    rewards = data.rewards[indices].mean(axis=2)
-    costs = data.costs[indices].mean(axis=2)
+    observed = evaluation_data or data
+    if observed.task_ids != data.task_ids:
+        raise ValueError("kNN evaluation data has different task identities")
+    rewards = observed.rewards[indices].mean(axis=2)
+    costs = observed.costs[indices].mean(axis=2)
     baseline_value = evaluate_choices(rewards, costs, baseline_choices)
     results: list[CandidateValidation] = []
     for candidate in candidates:
@@ -561,6 +569,7 @@ def select_knn_candidate(
     *,
     seed: int,
     work_dir: Path,
+    evaluation_data: FitData | None = None,
 ) -> tuple[CandidateValidation, list[CandidateValidation]]:
     """Select one WMO kNN point using five grouped outer-fit folds and shared banks."""
     results = _evaluate_knn_candidates(
@@ -569,6 +578,7 @@ def select_knn_candidate(
         candidates,
         seed=seed,
         work_dir=work_dir,
+        evaluation_data=evaluation_data,
     )
     selected_metric = select_fit_candidate(
         [result.metric for result in results],
