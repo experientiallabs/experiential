@@ -547,3 +547,9 @@ The later external-trace DeepSWE work, native linear policy, corrected source we
 matched task-blind control are recorded in
 `coding-model-router-external-autoresearch-20260730.md`. That control is now required before a
 task router can be called a gain over effort mixing.
+
+The current-model BigCodeBench reasoning-effort study is recorded in
+`coding-model-router-bigcodebench-effort-20260731.md`. Its corrected held-out-attempt oracle
+failed the frozen headroom gate, so no BigCodeBench router was fit. The next external-only study
+is preregistered in `coding-model-router-swe-smith-broad-20260731.md`. DeepSWE remains sealed
+until that study earns a positive external promotion.

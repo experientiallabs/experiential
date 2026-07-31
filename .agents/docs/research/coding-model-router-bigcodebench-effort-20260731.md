@@ -2,7 +2,34 @@
 
 Date: 2026-07-31
 
-Status: preregistered, current-model outcomes unopened
+Status: complete negative result, router fitting forbidden by the frozen oracle gate
+
+## Result
+
+Official BigCodeBench v0.2.4 scoring completed all 7,500 cells across 300 tasks, five
+`gpt-5.6-luna` reasoning efforts, and five attempts. The matrix remained dense, and no target
+outcome was used. Per-arm official pass rates were:
+
+| Effort | Passes | Attempts | Reward |
+|---|---:|---:|---:|
+| low | 644 | 1,500 | 0.4293 |
+| medium | 665 | 1,500 | 0.4433 |
+| high | 709 | 1,500 | 0.4727 |
+| xhigh | 697 | 1,500 | 0.4647 |
+| max | 716 | 1,500 | 0.4773 |
+
+The corrected held-out-attempt oracle averaged all ten exact two-fit and three-held-out attempt
+splits within each of 2,000 shared task-family bootstrap samples. Mean held-out oracle headroom
+over the fit-selected static effort was 0.01656. Its 95 percent interval was
+`[0.00734, 0.02742]`. This failed both frozen gates, mean headroom at least 0.10 and lower bound
+above 0.05. No router was fit and DeepSWE remained sealed.
+
+The trace-derived generation estimate was USD 119.96865. This is an operational estimate rather
+than provider billing evidence. The official scores SHA-256 is
+`630f9452dfc302e4ffbca0066775fd286ba7a96d3306a6ff7767c96cc1554d23`, the official raw result
+SHA-256 is `6706c2b233bfe8c8174fdf79bd5f05f5ce7e4f4aafe69bff6415da4065274b88`, and the corrected
+oracle report SHA-256 is
+`40acd5e60f026339b0312b4ee17f5a151adca6dc803a24aa9aa2fd1ef26eb269`.
 
 ## Question
 
