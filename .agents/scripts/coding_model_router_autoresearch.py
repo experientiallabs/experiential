@@ -967,6 +967,7 @@ def _fit(args: argparse.Namespace) -> None:
         )
     )
     candidate_specs = _candidate_space(args.candidate_family)
+    hashing_features: dict[int, np.ndarray] = {}
     leaderboard: list[dict[str, object]] = []
     for spec in candidate_specs:
         oof = np.empty(len(combined.task_ids), dtype=np.float64)
@@ -980,15 +981,23 @@ def _fit(args: argparse.Namespace) -> None:
                 )
                 logger.info("candidate=%s fold=%d/%d complete", spec.name, fold_index + 1, FOLDS)
                 continue
-            transformer = _features(spec)
-            train_features = np.asarray(
-                transformer.fit_transform([combined.texts[index] for index in train]),
-                dtype=np.float64,
-            )
-            heldout_features = np.asarray(
-                transformer.transform([combined.texts[index] for index in heldout]),
-                dtype=np.float64,
-            )
+            if spec.analyzer == "hashing":
+                full_hashing = hashing_features.get(spec.components)
+                if full_hashing is None:
+                    full_hashing = _features(spec).fit_transform(combined.texts)
+                    hashing_features[spec.components] = full_hashing
+                train_features = full_hashing[train]
+                heldout_features = full_hashing[heldout]
+            else:
+                transformer = _features(spec)
+                train_features = np.asarray(
+                    transformer.fit_transform([combined.texts[index] for index in train]),
+                    dtype=np.float64,
+                )
+                heldout_features = np.asarray(
+                    transformer.transform([combined.texts[index] for index in heldout]),
+                    dtype=np.float64,
+                )
             train_weak, train_strong = _training_outcomes(
                 spec,
                 combined.weak[train],
@@ -1060,7 +1069,11 @@ def _fit(args: argparse.Namespace) -> None:
     )
     selected_spec = next(spec for spec in candidate_specs if spec.name == selected_name)
     transformer = _features(selected_spec)
-    full_features = np.asarray(transformer.fit_transform(combined.texts), dtype=np.float64)
+    full_features = (
+        hashing_features[selected_spec.components]
+        if selected_spec.analyzer == "hashing"
+        else np.asarray(transformer.fit_transform(combined.texts), dtype=np.float64)
+    )
     estimators = _fit_estimators(
         selected_spec,
         full_features,
