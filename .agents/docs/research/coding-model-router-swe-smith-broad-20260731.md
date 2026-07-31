@@ -2,7 +2,7 @@
 
 Date: 2026-07-31
 
-Status: preregistered, per-task source outcomes unopened
+Status: oracle and five fit-only searches complete, outer heldout and DeepSWE outcomes unopened
 
 ## Question
 
@@ -121,6 +121,12 @@ Proceed only when every condition passes:
 
 If the oracle fails, preserve the negative result and do not fit or replay DeepSWE.
 
+The oracle passed after the protocol commit. It retained 538 tasks across 72 repositories. The
+strong-minus-weak reward difference was 0.17530 with a 95 percent interval of
+`[0.12306, 0.23631]`. Mean cross-format oracle headroom was 0.04931 with a 95 percent interval of
+`[0.02356, 0.07321]`. The paired source SHA-256 is
+`3ebc3cbf2ee69e6220b9751193b7c148e6f65d7dca2588df4943b9a66f722553`.
+
 ## Frozen router search
 
 If the oracle passes, evaluate this union of previously implemented CPU candidate families:
@@ -154,6 +160,23 @@ held-out replay. The audit reloads the artifact, proves route parity, proves zer
 and measures at least 10,000 decisions on one E2B CPU core. Required latency is below 5 ms p50 and
 20 ms p95.
 
+The five fit-only searches ran from commit
+`ed0cd24df9d8db58a3639e84de099d2fe392ded1` on isolated, internet-disabled E2B CPU workers. Each
+report contains 459 rows: 455 eligible candidates and four ineligible negative controls. The
+per-seed mechanical winners were:
+
+| Seed | Winner | Strong traffic | Reward | Strong reward | Retention | Report SHA-256 |
+|---:|---|---:|---:|---:|---:|---|
+| 0 | `hash512-ridge-heads-a1` | 0.7443 | 0.4310 | 0.4519 | 0.9537 | `2026d83b4e1b6c5e9299972d8028d278b11089f500eb0090cb792443e19dbbf1` |
+| 1 | `hash512-ridge-heads-a1` | 0.7444 | 0.4774 | 0.5024 | 0.9503 | `a9a802cb7e30a82469ed2bbc2cbc7815e6338e8ecdf682ab951a40b5c710268c` |
+| 2 | `hash512-ridge-heads-a0.1` | 0.7921 | 0.4405 | 0.4632 | 0.9510 | `092b9fd8d08ff2fa3f48572a82fb4bc8c2340f54afcb3a61543583fcdedfc5f3` |
+| 3 | `hash512-ridge-heads-a1` | 0.7601 | 0.4313 | 0.4537 | 0.9506 | `d46504e967c34dabcba26526ed4786c8798487d25945d2790194ab665a68ff19` |
+| 4 | `hash512-ridge-heads-a1` | 0.7292 | 0.4892 | 0.5133 | 0.9530 | `32df145cb603917d7ca63a3e075977476da71c75557496ac6ad1ce85e3a51129` |
+
+All five selected artifacts passed independent-refit route parity and internet-disabled serving
+audits over 10,000 decisions. Observed p50 latency was 1.18 to 2.34 ms and p95 was 3.75 to 5.67 ms.
+The fit-only consensus lock must still complete before any outer-heldout source file is opened.
+
 ## External promotion
 
 Replay each locked seed once on its outer-heldout repositories. Promotion requires:
@@ -173,6 +196,16 @@ Use 10,000 deterministic canonical-repository bootstrap resamples with seed `202
 matched task-blind control samples strong routes without replacement inside each seed at exactly
 the router's held-out strong count. It is not allowed to use target labels or target traffic to
 set a threshold.
+
+Before outer-heldout replay, the exact negative-control randomness is frozen as follows. The
+matched task-blind subset orders task ids by
+`sha256("swe-smith-broad-task-blind-v1:<seed>:<instance_id>")` and takes exactly the router's
+strong-route count. Uniform random routing uses the leading digest byte from
+`sha256("swe-smith-broad-random-v1:<seed>:<instance_id>")` with a threshold of 128. The selected
+shuffled-label numeric control is refit after jointly permuting weak and strong outcome pairs
+inside each fit repository with NumPy seed `30000 + outer_seed`. Bootstrap resampling draws the
+same number of repositories with replacement independently inside each outer seed, then pools
+the retained task rows. These settings cannot change after the first outer-heldout file is read.
 
 Only one fit-selected consensus may advance. A candidate is consensus-feasible only when its
 inner-fold point retains 0.95 strong quality in every seed. Among feasible candidates, choose the

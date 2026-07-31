@@ -87,3 +87,37 @@ def test_candidate_summary_requires_every_seed_to_retain_quality() -> None:
     assert summary["minimum_retention"] == 0.94
     assert summary["fit_quality_feasible"] is False
     assert len(module._canonical_order()) == 455
+
+
+def test_outcome_blind_controls_have_frozen_route_counts() -> None:
+    module = _module()
+    task_ids = [f"task-{index}" for index in range(21)]
+    first = module._hashed_exact_count(task_ids, 7, "matched")
+    second = module._hashed_exact_count(task_ids, 7, "matched")
+    assert first.tolist() == second.tolist()
+    assert int(np.sum(first)) == 7
+    uniform = module._hashed_uniform(task_ids, "uniform")
+    assert uniform.tolist() == module._hashed_uniform(task_ids, "uniform").tolist()
+
+
+def test_repository_bootstrap_is_seed_balanced_and_deterministic() -> None:
+    module = _module()
+    rows = [
+        {
+            "seed": seed,
+            "repo": f"repo-{repo}",
+            "router_reward": 1.0,
+            "strong_reward": 1.0,
+            "weak_reward": 0.0,
+            "task_blind_reward": 0.0,
+            "shuffled_reward": 0.0,
+            "random_reward": 0.0,
+        }
+        for seed in range(5)
+        for repo in range(3)
+    ]
+    first = module._bootstrap_sample(rows, np.random.default_rng(20260731))
+    second = module._bootstrap_sample(rows, np.random.default_rng(20260731))
+    assert first == second
+    assert len(first) == len(rows)
+    assert {row["seed"] for row in first} == set(range(5))

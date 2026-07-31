@@ -470,6 +470,356 @@ def _lock(args: argparse.Namespace) -> None:
     )
 
 
+def _hashed_exact_count(task_ids: list[str], count: int, salt: str) -> np.ndarray:
+    """Choose an outcome-blind deterministic subset with an exact route count."""
+    if count < 0 or count > len(task_ids):
+        raise ValueError("requested route count is outside the task inventory")
+    order = sorted(
+        range(len(task_ids)),
+        key=lambda index: hashlib.sha256(f"{salt}:{task_ids[index]}".encode()).digest(),
+    )
+    routes = np.zeros(len(task_ids), dtype=np.bool_)
+    routes[order[:count]] = True
+    return routes
+
+
+def _hashed_uniform(task_ids: list[str], salt: str) -> np.ndarray:
+    """Return deterministic outcome-blind Bernoulli one-half routes."""
+    return np.asarray(
+        [hashlib.sha256(f"{salt}:{task_id}".encode()).digest()[0] < 128 for task_id in task_ids],
+        dtype=np.bool_,
+    )
+
+
+def _selected_shuffled_control(report: dict[str, object]) -> dict[str, object]:
+    """Choose one fit-only shuffled-label control by the primary selection rule."""
+    order = {spec.name: index for index, spec in enumerate(selection._control_specs())}
+    controls = [
+        row
+        for row in cast(list[dict[str, object]], report["leaderboard"])
+        if bool(row["is_control"])
+        and cast(dict[str, object], row["config"]).get("label_mode") == "shuffled"
+    ]
+    if not controls:
+        raise ValueError("fit report has no shuffled-label controls")
+    controls.sort(
+        key=lambda row: (
+            _as_float(cast(dict[str, object], row["primary"])["strong_traffic"]),
+            -_as_float(cast(dict[str, object], row["primary"])["router_reward"]),
+            order[str(row["name"])],
+        )
+    )
+    return controls[0]
+
+
+def _fit_shuffled_control(
+    candidate: dict[str, object],
+    texts: list[str],
+    groups: list[str],
+    weak: np.ndarray,
+    strong: np.ndarray,
+    path: Path,
+    *,
+    seed: int,
+) -> None:
+    """Fit one deterministic within-repository shuffled-label control."""
+    spec = _spec({"spec": candidate["config"]})
+    if spec.label_mode != "shuffled":
+        raise ValueError("requested negative control is not shuffled")
+    shuffled_weak, shuffled_strong = selection._shuffle_within_groups(
+        weak,
+        strong,
+        groups,
+        seed=seed,
+    )
+    transformer = autoresearch._features(spec)
+    features = np.asarray(transformer.fit_transform(texts), dtype=np.float64)
+    estimators = autoresearch._fit_estimators(
+        spec,
+        features,
+        shuffled_weak,
+        shuffled_strong,
+        np.ones(len(texts), dtype=np.float64),
+    )
+    primary = cast(dict[str, object], candidate["primary"])
+    payload = {
+        "schema": "swe-smith-broad-shuffled-control-artifact-v1",
+        "family": "numeric",
+        "spec": candidate["config"],
+        "transformer": transformer,
+        "estimators": estimators,
+        "threshold": _as_float(primary["threshold"]),
+        "shuffle_seed": seed,
+        "heldout_outcomes_used": False,
+        "target_outcomes_used": False,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(payload, path, compress=3)
+
+
+def _reward(routes: np.ndarray, weak: np.ndarray, strong: np.ndarray) -> np.ndarray:
+    """Apply two-arm route decisions to paired source rewards."""
+    return np.where(routes, strong, weak)
+
+
+def _seed_metrics(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize one outer seed's immutable heldout task rows."""
+    router = np.asarray([_as_float(row["router_reward"]) for row in rows])
+    strong = np.asarray([_as_float(row["strong_reward"]) for row in rows])
+    router_mean = float(np.mean(router))
+    strong_mean = float(np.mean(strong))
+    return {
+        "tasks": len(rows),
+        "repositories": len({str(row["repo"]) for row in rows}),
+        "router_reward": router_mean,
+        "strong_reward": strong_mean,
+        "retention": router_mean / strong_mean if strong_mean else 1.0,
+        "strong_traffic": float(np.mean([bool(row["router_use_strong"]) for row in rows])),
+        "task_blind_reward": float(np.mean([_as_float(row["task_blind_reward"]) for row in rows])),
+        "shuffled_reward": float(np.mean([_as_float(row["shuffled_reward"]) for row in rows])),
+        "random_reward": float(np.mean([_as_float(row["random_reward"]) for row in rows])),
+        "weak_reward": float(np.mean([_as_float(row["weak_reward"]) for row in rows])),
+    }
+
+
+def _evaluate(args: argparse.Namespace) -> None:
+    """Replay one locked consensus exactly once on external outer-heldout tasks."""
+    output = args.output.resolve()
+    if output.exists():
+        raise FileExistsError(f"outer-heldout evaluation already exists: {output}")
+    lock_path = args.lock.resolve()
+    lock = _read_object(lock_path)
+    if lock.get("consensus_feasible") is not True:
+        raise ValueError("fit-only consensus is infeasible, so heldout replay is forbidden")
+    if lock.get("outer_heldout_evaluated") is not False:
+        raise ValueError("selection lock does not prove heldout remained sealed")
+    split_manifest_path = args.split_manifest.resolve()
+    split_manifest = _read_object(split_manifest_path)
+    raw_seed_manifest = cast(list[dict[str, object]], split_manifest["seeds"])
+    seed_manifest = {_as_int(row["seed"]): row for row in raw_seed_manifest}
+    all_rows: list[dict[str, object]] = []
+    controls: list[dict[str, object]] = []
+    for seed in range(5):
+        fit_source = args.sources_dir.resolve() / f"seed-{seed}-fit.json"
+        heldout_source = args.sources_dir.resolve() / f"seed-{seed}-heldout.json"
+        if _sha256_file(fit_source) != str(seed_manifest[seed]["fit_sha256"]):
+            raise ValueError(f"seed {seed} fit source differs from the split manifest")
+        if _sha256_file(heldout_source) != str(seed_manifest[seed]["heldout_sha256"]):
+            raise ValueError(f"seed {seed} heldout source differs from the split manifest")
+        report = _read_object(args.reports_dir.resolve() / f"seed-{seed}.json")
+        consensus_report_path = args.consensus_dir.resolve() / f"seed-{seed}.json"
+        consensus_report = _read_object(consensus_report_path)
+        audit = _read_object(args.audits_dir.resolve() / f"seed-{seed}.json")
+        if (
+            consensus_report.get("consensus_name") != lock["consensus_name"]
+            or audit.get("passed") is not True
+            or audit.get("report_sha256") != _sha256_file(consensus_report_path)
+        ):
+            raise ValueError(f"seed {seed} consensus artifact is not locked and audited")
+        artifact_path = args.consensus_dir.resolve() / f"seed-{seed}.joblib"
+        if audit.get("artifact_sha256") != _sha256_file(artifact_path):
+            raise ValueError(f"seed {seed} consensus artifact differs from its audit")
+        heldout_rows = _read_rows(heldout_source)
+        task_ids, groups, texts, weak, strong = _arrays(heldout_rows)
+        artifact = cast(dict[str, object], joblib.load(artifact_path))
+        router_routes = _artifact_routes(artifact, texts)
+        strong_count = int(np.sum(router_routes))
+        task_blind_routes = _hashed_exact_count(
+            task_ids,
+            strong_count,
+            f"swe-smith-broad-task-blind-v1:{seed}",
+        )
+        random_routes = _hashed_uniform(task_ids, f"swe-smith-broad-random-v1:{seed}")
+        shuffled_candidate = _selected_shuffled_control(report)
+        fit_rows = _read_rows(fit_source)
+        _, fit_groups, fit_texts, fit_weak, fit_strong = _arrays(fit_rows)
+        control_artifact = args.control_artifact_dir.resolve() / f"seed-{seed}.joblib"
+        shuffle_seed = 30_000 + seed
+        _fit_shuffled_control(
+            shuffled_candidate,
+            fit_texts,
+            fit_groups,
+            fit_weak,
+            fit_strong,
+            control_artifact,
+            seed=shuffle_seed,
+        )
+        shuffled_payload = cast(dict[str, object], joblib.load(control_artifact))
+        shuffled_routes = _artifact_routes(shuffled_payload, texts)
+        router_reward = _reward(router_routes, weak, strong)
+        task_blind_reward = _reward(task_blind_routes, weak, strong)
+        random_reward = _reward(random_routes, weak, strong)
+        shuffled_reward = _reward(shuffled_routes, weak, strong)
+        for index, task_id in enumerate(task_ids):
+            all_rows.append(
+                {
+                    "seed": seed,
+                    "instance_id": task_id,
+                    "repo": groups[index],
+                    "weak_reward": float(weak[index]),
+                    "strong_reward": float(strong[index]),
+                    "router_use_strong": bool(router_routes[index]),
+                    "router_reward": float(router_reward[index]),
+                    "task_blind_use_strong": bool(task_blind_routes[index]),
+                    "task_blind_reward": float(task_blind_reward[index]),
+                    "shuffled_use_strong": bool(shuffled_routes[index]),
+                    "shuffled_reward": float(shuffled_reward[index]),
+                    "random_use_strong": bool(random_routes[index]),
+                    "random_reward": float(random_reward[index]),
+                }
+            )
+        controls.append(
+            {
+                "seed": seed,
+                "shuffled_candidate": shuffled_candidate["name"],
+                "shuffle_seed": shuffle_seed,
+                "shuffled_artifact_sha256": _sha256_file(control_artifact),
+            }
+        )
+    seed_metrics = [
+        {"seed": seed, **_seed_metrics([row for row in all_rows if row["seed"] == seed])}
+        for seed in range(5)
+    ]
+    result = {
+        "schema": "swe-smith-broad-outer-heldout-v1",
+        "selection_lock_sha256": _sha256_file(lock_path),
+        "split_manifest_sha256": _sha256_file(split_manifest_path),
+        "consensus_name": lock["consensus_name"],
+        "outer_heldout_replay_count": 1,
+        "seed_metrics": seed_metrics,
+        "controls": controls,
+        "rows": all_rows,
+        "target_outcomes_used": False,
+    }
+    _write_json(output, result)
+    logger.info("outer-heldout replay complete rows=%d", len(all_rows))
+
+
+def _bootstrap_sample(
+    rows: list[dict[str, object]], rng: np.random.Generator
+) -> list[dict[str, object]]:
+    """Resample repository clusters independently inside each outer seed."""
+    sampled: list[dict[str, object]] = []
+    for seed in range(5):
+        seed_rows = [row for row in rows if row["seed"] == seed]
+        by_repo: dict[str, list[dict[str, object]]] = {}
+        for row in seed_rows:
+            by_repo.setdefault(str(row["repo"]), []).append(row)
+        repos = sorted(by_repo)
+        for index in rng.integers(0, len(repos), size=len(repos)):
+            sampled.extend(by_repo[repos[int(index)]])
+    return sampled
+
+
+def _comparison(rows: list[dict[str, object]], control: str) -> float:
+    """Return mean router reward minus one paired control reward."""
+    return float(
+        np.mean(
+            [_as_float(row["router_reward"]) - _as_float(row[f"{control}_reward"]) for row in rows]
+        )
+    )
+
+
+def _retention(rows: list[dict[str, object]]) -> float:
+    """Return pooled router quality retention against strong static."""
+    router = float(np.mean([_as_float(row["router_reward"]) for row in rows]))
+    strong = float(np.mean([_as_float(row["strong_reward"]) for row in rows]))
+    return router / strong if strong else 1.0
+
+
+def _interval(values: np.ndarray) -> dict[str, float]:
+    """Return a deterministic percentile interval."""
+    return {
+        "mean": float(np.mean(values)),
+        "lower_95": float(np.quantile(values, 0.025)),
+        "upper_95": float(np.quantile(values, 0.975)),
+    }
+
+
+def _promote(args: argparse.Namespace) -> None:
+    """Apply every frozen external-promotion gate to immutable heldout rows."""
+    evaluation_path = args.evaluation.resolve()
+    evaluation = _read_object(evaluation_path)
+    lock_path = args.lock.resolve()
+    lock = _read_object(lock_path)
+    if evaluation.get("selection_lock_sha256") != _sha256_file(lock_path):
+        raise ValueError("heldout evaluation differs from the selection lock")
+    rows = cast(list[dict[str, object]], evaluation["rows"])
+    seed_metrics = cast(list[dict[str, object]], evaluation["seed_metrics"])
+    if evaluation.get("outer_heldout_replay_count") != 1:
+        raise ValueError("external heldout was not replayed exactly once")
+    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    retention_samples = np.empty(BOOTSTRAP_SAMPLES, dtype=np.float64)
+    comparison_samples = {
+        name: np.empty(BOOTSTRAP_SAMPLES, dtype=np.float64)
+        for name in ("task_blind", "shuffled", "random", "weak")
+    }
+    for index in range(BOOTSTRAP_SAMPLES):
+        sample = _bootstrap_sample(rows, rng)
+        retention_samples[index] = _retention(sample)
+        for name, values in comparison_samples.items():
+            values[index] = _comparison(sample, name)
+    retention_interval = _interval(retention_samples)
+    comparison_intervals = {name: _interval(values) for name, values in comparison_samples.items()}
+    catastrophes: list[dict[str, object]] = []
+    for seed in range(5):
+        seed_rows = [row for row in rows if row["seed"] == seed]
+        repos = sorted({str(row["repo"]) for row in seed_rows})
+        for repo in repos:
+            repo_rows = [row for row in seed_rows if row["repo"] == repo]
+            if len(repo_rows) < 5:
+                continue
+            loss = float(
+                np.mean(
+                    [
+                        _as_float(row["strong_reward"]) - _as_float(row["router_reward"])
+                        for row in repo_rows
+                    ]
+                )
+            )
+            if loss > 0.10:
+                catastrophes.append(
+                    {"seed": seed, "repo": repo, "tasks": len(repo_rows), "loss": loss}
+                )
+    audit_passes = []
+    for seed in range(5):
+        audit = _read_object(args.audits_dir.resolve() / f"seed-{seed}.json")
+        audit_passes.append(audit.get("passed") is True)
+    gates = {
+        "each_seed_retention_at_least_0_95": all(
+            _as_float(metric["retention"]) >= 0.95 for metric in seed_metrics
+        ),
+        "each_seed_strong_traffic_at_most_0_80": all(
+            _as_float(metric["strong_traffic"]) <= 0.80 for metric in seed_metrics
+        ),
+        "pooled_retention_lower_at_least_0_95": retention_interval["lower_95"] >= 0.95,
+        "beats_matched_task_blind_lower": comparison_intervals["task_blind"]["lower_95"] > 0.0,
+        "beats_shuffled_lower": comparison_intervals["shuffled"]["lower_95"] > 0.0,
+        "beats_random_lower": comparison_intervals["random"]["lower_95"] > 0.0,
+        "beats_weak_static_lower": comparison_intervals["weak"]["lower_95"] > 0.0,
+        "no_repository_catastrophe": not catastrophes,
+        "all_consensus_artifacts_audited": all(audit_passes),
+        "fit_consensus_feasible": lock.get("consensus_feasible") is True,
+        "target_outcomes_unused": evaluation.get("target_outcomes_used") is False,
+    }
+    result = {
+        "schema": "swe-smith-broad-external-promotion-v1",
+        "selection_lock_sha256": _sha256_file(lock_path),
+        "evaluation_sha256": _sha256_file(evaluation_path),
+        "bootstrap_samples": BOOTSTRAP_SAMPLES,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "seed_metrics": seed_metrics,
+        "retention_interval": retention_interval,
+        "comparison_intervals": comparison_intervals,
+        "repository_catastrophes": catastrophes,
+        "gates": gates,
+        "promoted": all(gates.values()),
+        "target_outcomes_used": False,
+    }
+    _write_json(args.output.resolve(), result)
+    logger.info("external promotion complete promoted=%s", result["promoted"])
+
+
 def _parser() -> argparse.ArgumentParser:
     """Build the postfit command parser."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -486,6 +836,20 @@ def _parser() -> argparse.ArgumentParser:
     lock.add_argument("--audits-dir", type=Path, required=True)
     lock.add_argument("--artifact-dir", type=Path, required=True)
     lock.add_argument("--output", type=Path, required=True)
+    evaluate = subparsers.add_parser("evaluate")
+    evaluate.add_argument("--lock", type=Path, required=True)
+    evaluate.add_argument("--split-manifest", type=Path, required=True)
+    evaluate.add_argument("--sources-dir", type=Path, required=True)
+    evaluate.add_argument("--reports-dir", type=Path, required=True)
+    evaluate.add_argument("--consensus-dir", type=Path, required=True)
+    evaluate.add_argument("--audits-dir", type=Path, required=True)
+    evaluate.add_argument("--control-artifact-dir", type=Path, required=True)
+    evaluate.add_argument("--output", type=Path, required=True)
+    promote = subparsers.add_parser("promote")
+    promote.add_argument("--lock", type=Path, required=True)
+    promote.add_argument("--evaluation", type=Path, required=True)
+    promote.add_argument("--audits-dir", type=Path, required=True)
+    promote.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -494,8 +858,12 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "audit":
         _audit(args)
-    else:
+    elif args.command == "lock":
         _lock(args)
+    elif args.command == "evaluate":
+        _evaluate(args)
+    else:
+        _promote(args)
 
 
 if __name__ == "__main__":
