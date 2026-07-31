@@ -111,6 +111,18 @@ def test_three_level_route_is_monotone_in_predicted_uplift() -> None:
     assert decisions.tolist() == [0, 1, 2]
 
 
+def test_two_level_threshold_uses_the_requested_frozen_quality_floor() -> None:
+    module = _module()
+    thresholds = {
+        "0.95": {"threshold": 0.1},
+        "0.97": {"threshold": 0.2},
+        "0.99": {"threshold": 0.3},
+    }
+    assert module._thresholds(thresholds, 2, "0.95") == [0.1]
+    assert module._thresholds(thresholds, 2, "0.97") == [0.2]
+    assert module._thresholds(thresholds, 2, "0.99") == [0.3]
+
+
 def test_combine_deduplicates_exact_normalized_text() -> None:
     module = _module()
     source = module.SourceData(

@@ -1112,10 +1112,15 @@ def _ladder_indices(target: TargetData, ladder: tuple[str, ...]) -> np.ndarray:
 def _thresholds(
     operating_points: dict[str, dict[str, float]],
     ladder_size: int,
+    quality_floor: str | None = None,
 ) -> list[float]:
     if ladder_size == 2:
-        return [operating_points["0.95"]["threshold"]]
+        if quality_floor not in {str(value) for value in QUALITY_FLOORS}:
+            raise ValueError(f"two-arm ladder requires a frozen quality floor, got {quality_floor}")
+        return [operating_points[quality_floor]["threshold"]]
     if ladder_size == 3:
+        if quality_floor is not None:
+            raise ValueError("three-arm ladder uses the frozen tiered operating point")
         return [
             operating_points["0.99"]["threshold"],
             operating_points["0.95"]["threshold"],
@@ -1232,106 +1237,116 @@ def _evaluate(args: argparse.Namespace) -> None:
         scores = _candidate_score(output / f"{name}.joblib", target.texts)
         operating_points = cast(dict[str, dict[str, float]], untyped["operating_points"])
         for ladder_name, ladder in TARGET_LADDERS.items():
-            arm_indices = _ladder_indices(target, ladder)
-            thresholds = _thresholds(operating_points, len(ladder))
-            decisions = _route_indices(scores, thresholds, len(ladder))
-            columns = np.arange(len(target.task_ids), dtype=np.int64)
-            selected_arms = arm_indices[decisions]
-            routed_reward = target.rewards[selected_arms, columns]
-            routed_cost = target.costs[selected_arms, columns]
-            router_reward = float(routed_reward.mean())
-            router_cost = float(routed_cost.sum())
-            dominating = [
-                row
-                for row in static
-                if row["reward"] >= router_reward and row["cost_usd"] <= router_cost
-            ]
-            comparable = [
-                row for row in static if row["reward"] >= router_reward
-            ]
-            matched_static = (
-                min(comparable, key=lambda row: row["cost_usd"])
-                if comparable
-                else best_quality
+            operating_labels: tuple[str | None, ...] = (
+                tuple(str(value) for value in QUALITY_FLOORS)
+                if len(ladder) == 2
+                else (None,)
             )
-            baseline_index = target.arms.index(str(matched_static["arm"]))
-            best_static_index = target.arms.index(str(best_quality["arm"]))
-            matched_bootstrap = _bootstrap(
-                routed_reward,
-                routed_cost,
-                target.rewards[baseline_index],
-                target.costs[baseline_index],
-                target.groups,
-            )
-            best_static_bootstrap = _bootstrap(
-                routed_reward,
-                routed_cost,
-                target.rewards[best_static_index],
-                target.costs[best_static_index],
-                target.groups,
-            )
-            counts = collections.Counter(int(value) for value in decisions)
-            row: dict[str, object] = {
-                "candidate": name,
-                "ladder": ladder_name,
-                "arms": list(ladder),
-                "thresholds": thresholds,
-                "tasks": len(target.task_ids),
-                "repositories": len(set(target.groups)),
-                "router_reward": router_reward,
-                "router_cost_usd": router_cost,
-                "quality_retention_vs_best_static": (
-                    router_reward / best_quality["reward"]
-                    if best_quality["reward"]
-                    else 0.0
-                ),
-                "best_static_quality_arm": best_quality,
-                "matched_static": matched_static,
-                "cost_ratio_vs_matched_static": (
-                    matched_static["cost_usd"] / router_cost
-                    if router_cost
-                    else math.inf
-                ),
-                "cost_ratio_vs_best_static": (
-                    best_quality["cost_usd"] / router_cost
-                    if router_cost
-                    else math.inf
-                ),
-                "cost_savings_vs_best_static": (
-                    1.0 - router_cost / best_quality["cost_usd"]
-                    if best_quality["cost_usd"]
-                    else -math.inf
-                ),
-                "dominated_by_static": bool(dominating),
-                "dominating_static_arms": dominating,
-                "traffic": {
-                    ladder[index]: counts.get(index, 0) for index in range(len(ladder))
-                },
-                "target_labels_used_for_fit": False,
-                "target_labels_used_for_thresholds": False,
-                "target_static_aggregates_used_for_ladder_design": True,
-                "quality_delta_95ci": matched_bootstrap["quality_delta_95ci"],
-                "cost_ratio_95ci": matched_bootstrap["cost_ratio_95ci"],
-                "best_static_quality_delta_95ci": best_static_bootstrap[
-                    "quality_delta_95ci"
-                ],
-                "best_static_cost_ratio_95ci": best_static_bootstrap[
-                    "cost_ratio_95ci"
-                ],
-                "promotion": _promotion_decision(
-                    router_reward,
-                    router_cost,
-                    best_quality,
-                    best_static_bootstrap["quality_delta_95ci"],
-                ),
-            }
-            rows.append(row)
-            _append_jsonl(output / "target-trials.jsonl", row)
+            for quality_floor in operating_labels:
+                arm_indices = _ladder_indices(target, ladder)
+                thresholds = _thresholds(operating_points, len(ladder), quality_floor)
+                decisions = _route_indices(scores, thresholds, len(ladder))
+                columns = np.arange(len(target.task_ids), dtype=np.int64)
+                selected_arms = arm_indices[decisions]
+                routed_reward = target.rewards[selected_arms, columns]
+                routed_cost = target.costs[selected_arms, columns]
+                router_reward = float(routed_reward.mean())
+                router_cost = float(routed_cost.sum())
+                dominating = [
+                    row
+                    for row in static
+                    if row["reward"] >= router_reward and row["cost_usd"] <= router_cost
+                ]
+                comparable = [row for row in static if row["reward"] >= router_reward]
+                matched_static = (
+                    min(comparable, key=lambda row: row["cost_usd"])
+                    if comparable
+                    else best_quality
+                )
+                baseline_index = target.arms.index(str(matched_static["arm"]))
+                best_static_index = target.arms.index(str(best_quality["arm"]))
+                matched_bootstrap = _bootstrap(
+                    routed_reward,
+                    routed_cost,
+                    target.rewards[baseline_index],
+                    target.costs[baseline_index],
+                    target.groups,
+                )
+                best_static_bootstrap = _bootstrap(
+                    routed_reward,
+                    routed_cost,
+                    target.rewards[best_static_index],
+                    target.costs[best_static_index],
+                    target.groups,
+                )
+                counts = collections.Counter(int(value) for value in decisions)
+                row = {
+                    "candidate": name,
+                    "ladder": ladder_name,
+                    "operating_point": (
+                        f"external-quality-{quality_floor}"
+                        if quality_floor is not None
+                        else "external-tiered-0.99-0.95"
+                    ),
+                    "arms": list(ladder),
+                    "thresholds": thresholds,
+                    "tasks": len(target.task_ids),
+                    "repositories": len(set(target.groups)),
+                    "router_reward": router_reward,
+                    "router_cost_usd": router_cost,
+                    "quality_retention_vs_best_static": (
+                        router_reward / best_quality["reward"]
+                        if best_quality["reward"]
+                        else 0.0
+                    ),
+                    "best_static_quality_arm": best_quality,
+                    "matched_static": matched_static,
+                    "cost_ratio_vs_matched_static": (
+                        matched_static["cost_usd"] / router_cost
+                        if router_cost
+                        else math.inf
+                    ),
+                    "cost_ratio_vs_best_static": (
+                        best_quality["cost_usd"] / router_cost
+                        if router_cost
+                        else math.inf
+                    ),
+                    "cost_savings_vs_best_static": (
+                        1.0 - router_cost / best_quality["cost_usd"]
+                        if best_quality["cost_usd"]
+                        else -math.inf
+                    ),
+                    "dominated_by_static": bool(dominating),
+                    "dominating_static_arms": dominating,
+                    "traffic": {
+                        ladder[index]: counts.get(index, 0) for index in range(len(ladder))
+                    },
+                    "target_labels_used_for_fit": False,
+                    "target_labels_used_for_thresholds": False,
+                    "target_static_aggregates_used_for_ladder_design": True,
+                    "quality_delta_95ci": matched_bootstrap["quality_delta_95ci"],
+                    "cost_ratio_95ci": matched_bootstrap["cost_ratio_95ci"],
+                    "best_static_quality_delta_95ci": best_static_bootstrap[
+                        "quality_delta_95ci"
+                    ],
+                    "best_static_cost_ratio_95ci": best_static_bootstrap[
+                        "cost_ratio_95ci"
+                    ],
+                    "promotion": _promotion_decision(
+                        router_reward,
+                        router_cost,
+                        best_quality,
+                        best_static_bootstrap["quality_delta_95ci"],
+                    ),
+                }
+                rows.append(row)
+                _append_jsonl(output / "target-trials.jsonl", row)
     rows.sort(
         key=lambda row: (
-            bool(row["dominated_by_static"]),
+            not bool(cast(dict[str, object], row["promotion"])["passed"]),
+            float(row["router_cost_usd"]),
             -float(row["quality_retention_vs_best_static"]),
-            -float(row["cost_ratio_vs_matched_static"]),
+            bool(row["dominated_by_static"]),
         )
     )
     _write_json(
