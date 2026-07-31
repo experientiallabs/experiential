@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import concurrent.futures as cf
 import dataclasses
 import hashlib
 import json
@@ -16,6 +17,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import tomllib
 import uuid
@@ -55,6 +57,10 @@ BASH_SCHEMA = {
 }
 BASH_DESC = "Run a bash command in the repository at /app and return its combined output."
 REWARD_RE = re.compile(r"\{.*?\"f2p_total\".*?\}", re.S)
+LIVE_FAILURE_RE = re.compile(
+    r"(?:\[exit code [1-9]\d*\]|\bexit=[1-9]\d*\b|traceback|test[s]? failed|\bfailed\b|\berror\b|exception)",
+    re.I,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,12 +123,15 @@ class SpendGuard:
             raise ValueError(f"--cap-usd must be in (0, {HARD_CAP_USD:g}]")
         self.cap_usd = cap_usd
         self.spent_usd = 0.0
+        self._lock = threading.Lock()
 
     def may_start_turn(self) -> bool:
-        return self.spent_usd < self.cap_usd
+        with self._lock:
+            return self.spent_usd < self.cap_usd
 
     def add(self, amount: float) -> None:
-        self.spent_usd += max(0.0, amount)
+        with self._lock:
+            self.spent_usd += max(0.0, amount)
 
 
 class RemoteContainer:
@@ -226,23 +235,74 @@ def _profile_model(policy: dict[str, Any], text_chars: int) -> str:
     return str(policy["profile_models"][bucket])
 
 
+def _task_model(policy: dict[str, Any], task_id: str, route_chars: int) -> str:
+    """Choose the source-transfer task rung, falling back to the old text profile."""
+    routes = policy.get("task_routes") or {}
+    value = routes.get(task_id)
+    if isinstance(value, dict):
+        value = value.get("base_model") or value.get("model")
+    if value:
+        return str(value)
+    return _profile_model(policy, route_chars)
+
+
+def _live_failure(steps: list[Step]) -> bool:
+    """Return true when the last tool turn contains a concrete failure signal."""
+    if not steps or not steps[-1].results:
+        return False
+    return bool(LIVE_FAILURE_RE.search("\n".join(steps[-1].results)))
+
+
+def _route_rank(policy: dict[str, Any], model: str) -> int:
+    order = [str(value) for value in policy.get("escalation_order", [])]
+    return order.index(model) if model in order else 0
+
+
 def _route(
     policy: dict[str, Any], arms: dict[str, Arm], *, mode: Literal["task", "transcript"],
-    route_chars: int, incumbent: str | None,
+    task_id: str, route_chars: int, incumbent: str | None, steps: list[Step],
 ) -> tuple[str, str, str]:
-    desired = _profile_model(policy, route_chars)
+    desired = _task_model(policy, task_id, route_chars)
     if incumbent is None:
         return desired, "cold-start", "not-applicable"
     if mode == "task":
         return incumbent, "sticky-task-route", "not-applicable"
+    # A successful cheap rung stays cheap. A rung reached after a failure is sticky so
+    # the router cannot oscillate back down and throw away the recovery context.
+    if _route_rank(policy, incumbent) > _route_rank(policy, desired):
+        desired = incumbent
+    if policy.get("escalate_on_failure") and _live_failure(steps):
+        order = [str(value) for value in policy.get("escalation_order", [])]
+        if incumbent in order:
+            next_i = order.index(incumbent) + 1
+            if next_i < len(order):
+                desired = order[next_i]
+                failure_reason = "live-failure-escalation"
+            else:
+                failure_reason = "live-failure-at-top-rung"
+        else:
+            failure_reason = "live-failure-unlisted-rung"
+    else:
+        failure_reason = ""
     if desired == incumbent:
-        return desired, "profile-kept-incumbent", "not-needed"
+        return desired, failure_reason or "profile-kept-incumbent", "not-needed"
     current, candidate = arms[incumbent], arms[desired]
     warm = (route_chars / CHARS_PER_TOKEN) * current.cached_input_per_mtok / 1_000_000
-    cold = (route_chars / CHARS_PER_TOKEN) * candidate.input_per_mtok / 1_000_000
-    if warm <= 0.0 or cold <= PREFILL_SWITCH_RATIO * warm:
-        return desired, f"cache-aware-switch ${cold:.6f} <= {PREFILL_SWITCH_RATIO:g}x ${warm:.6f}", "passed"
-    return incumbent, f"cache-aware-keep ${cold:.6f} > {PREFILL_SWITCH_RATIO:g}x ${warm:.6f}", "reverted"
+    # Reasoning-effort changes on the same provider/model reuse the same prompt cache key;
+    # a cross-model switch is genuinely cold. This keeps prefill economics in the decision
+    # without treating Luna low -> Luna max as a completely new context.
+    candidate_prefill_rate = (
+        candidate.cached_input_per_mtok
+        if (candidate.provider, candidate.model) == (current.provider, current.model)
+        else candidate.input_per_mtok
+    )
+    cold = (route_chars / CHARS_PER_TOKEN) * candidate_prefill_rate / 1_000_000
+    ratio = float(policy.get("prefill_switch_ratio", PREFILL_SWITCH_RATIO))
+    if warm <= 0.0 or cold <= ratio * warm:
+        prefix = f"{failure_reason}; " if failure_reason else ""
+        return desired, f"{prefix}cache-aware-switch ${cold:.6f} <= {ratio:g}x ${warm:.6f}", "passed"
+    prefix = f"{failure_reason}; " if failure_reason else ""
+    return incumbent, f"{prefix}cache-aware-keep ${cold:.6f} > {ratio:g}x ${warm:.6f}", "reverted"
 
 
 def _transcript_text(prompt: str, steps: list[Step]) -> str:
@@ -298,6 +358,8 @@ def _select_tasks(all_tasks: list[dict[str, Any]], args: argparse.Namespace) -> 
                     f"{args.sample_seed}|deepswe-holdout|{task['task_id']}".encode()
                 ).hexdigest(),
             )[:args.n_tasks]
+    elif args.all_tasks:
+        selected = list(all_tasks)
     else:
         ordered = sorted(all_tasks, key=lambda task: hashlib.sha256(
             f"{args.sample_seed}|deepswe|{task['task_id']}".encode()).hexdigest())
@@ -450,7 +512,8 @@ def _run_episode(
             else:
                 chosen, reason, gate = _route(
                     policy, arms, mode="task" if strategy == "per-task" else "transcript",
-                    route_chars=len(route_text), incumbent=incumbent,
+                    task_id=task["task_id"], route_chars=len(route_text), incumbent=incumbent,
+                    steps=steps,
                 )
             switched = incumbent is not None and chosen != incumbent
             result = clients.setdefault(chosen, TurnClient(arms[chosen], max_output_tokens)).call(
@@ -534,10 +597,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--holdout", action="store_true")
     parser.add_argument("--n-tasks", type=int)
     parser.add_argument("--max-tasks", type=int, default=DEFAULT_MAX_TASKS)
+    parser.add_argument("--all-tasks", action="store_true",
+                        help="evaluate every eligible DeepSWE task; requires --max-tasks")
     parser.add_argument("--sample-seed", type=int, default=0)
     parser.add_argument("--cap-usd", type=float, default=HARD_CAP_USD)
     parser.add_argument("--max-turns", type=int, default=MAX_TURNS)
     parser.add_argument("--max-output-tokens", type=int, default=MAX_OUTPUT_TOKENS)
+    parser.add_argument("--workers", type=int, default=4,
+                        help="parallel DeepSWE task episodes on the remote Docker host")
+    parser.add_argument("--baseline-model",
+                        help="override policy default_model for a baseline-only run")
     parser.add_argument("--strategy", action="append", choices=("baseline", "per-task", "per-turn"))
     return parser
 
@@ -548,12 +617,21 @@ def main() -> None:
         raise ValueError("--max-tasks must be positive")
     if args.max_turns < 1 or args.max_output_tokens < 1:
         raise ValueError("--max-turns and --max-output-tokens must be positive")
+    if args.workers < 1:
+        raise ValueError("--workers must be positive")
     _load_credentials(args.env_file)
     args.artifact_root.mkdir(parents=True, exist_ok=True)
     arms, policy = _arms(args.policy.resolve())
     tasks = _select_tasks(_tasks(args.task_root.resolve()), args)
     if not tasks:
         raise ValueError("no tasks selected")
+    if args.all_tasks and args.max_tasks < len(tasks):
+        raise ValueError(f"--all-tasks selected {len(tasks)} tasks but --max-tasks={args.max_tasks}")
+    if args.baseline_model:
+        if args.baseline_model not in arms:
+            raise ValueError(f"--baseline-model is not in policy pool: {args.baseline_model}")
+        policy = dict(policy)
+        policy["default_model"] = args.baseline_model
     strategies = args.strategy or ["baseline", "per-task", "per-turn"]
     guard = SpendGuard(args.cap_usd)
     manifest = {
@@ -561,20 +639,22 @@ def main() -> None:
         "task_count": len(tasks),
         "task_ids": [task["task_id"] for task in tasks],
         "baseline": policy["default_model"],
+        "full_benchmark": args.all_tasks and len(tasks) == len(_tasks(args.task_root.resolve())),
         "policy_path": str(args.policy.resolve()),
         "cache_aware": True,
         "cache_switch_prefill_ratio": PREFILL_SWITCH_RATIO,
         "strategies": strategies,
         "cap_usd": args.cap_usd,
+        "workers": args.workers,
         "docker_host": os.environ.get("DOCKER_HOST", "local-default"),
         "timestamp": time.time(),
     }
     (args.artifact_root / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     results: list[dict[str, Any]] = []
     for strategy in strategies:
-        for task in tasks:
+        def run_one(task: dict[str, Any]) -> dict[str, Any] | None:
             if not guard.may_start_turn():
-                break
+                return None
             print(f"starting strategy={strategy} task={task['task_id']} spent=${guard.spent_usd:.3f}", flush=True)
             route_path = args.artifact_root / f"{strategy}-{task['task_id']}-route.json"
             run, patch = _run_episode(
@@ -588,12 +668,19 @@ def main() -> None:
                 "verifier_ok": grade.get("verifier_ok", False), "verifier_tail": grade.get("tail"),
                 "route_log": str(route_path), "spent_after": guard.spent_usd,
             })
-            results.append(run)
             print(
                 f"completed strategy={strategy} task={task['task_id']} graded={run['graded']} "
                 f"binary={run['reward_binary']} cost=${run['cost_usd']:.3f} switches={run['switches']}",
                 flush=True,
             )
+            return run
+
+        with cf.ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [executor.submit(run_one, task) for task in tasks]
+            for future in cf.as_completed(futures):
+                run = future.result()
+                if run is not None:
+                    results.append(run)
     summary = {"manifest": manifest, "results": results, "spent_usd": guard.spent_usd}
     (args.artifact_root / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
