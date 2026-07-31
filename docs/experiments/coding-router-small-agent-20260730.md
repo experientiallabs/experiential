@@ -1,6 +1,6 @@
 # DeepSWE coding-model router
 
-Status: the profile router clears the evaluation gate against Luna @ max on grouped DeepSWE cross-validation. The result is a frozen-matrix replay, not a fresh set of model calls.
+Status: the profile router clears the evaluation gate against Luna @ max on grouped DeepSWE cross-validation. A fresh remote quality check now covers three held-out DeepSWE tasks with the same 16k output budget for both routers and the baseline.
 
 ## Headline scorecard
 
@@ -21,7 +21,19 @@ For turn-level prefill economics, the E2B replay used 1,000 synthetic eight-turn
 | Per-turn profile, cache-aware | $0.000200 | Opus low 6.6%, Luna xhigh 93.4% | 0.33 |
 | Per-turn profile, cold every turn | $0.004618 | Opus low 34.6%, Luna xhigh 65.4% | 3.2 |
 
-The cache-aware per-turn router is within 2.2% of the Luna @ max prefill baseline and is 95.7% cheaper than cold re-routing. Turn-level quality remains unmeasured because the source data contains task-level outcomes, not conversation-turn outcomes.
+The cache-aware per-turn router is within 2.2% of the Luna @ max prefill baseline and is 95.7% cheaper than cold re-routing. The fresh check below measures end-to-end task quality for both routing modes; it does not assign a separate quality label to each individual turn.
+
+## Fresh matched quality check
+
+This was a direct model-call evaluation on three held-out DeepSWE 1.1 tasks: actionlint, arktype, and boa. All six router runs and the three Luna @ max baselines ran on Azure Docker with the repository's provider credentials, 60 turns maximum, and 16,384 output tokens maximum. The grader reported zero unscored tasks and every verifier completed successfully.
+
+| Method | Graded quality | Required tests passed | Cost per task | Cost vs Luna @ max |
+| --- | ---: | ---: | ---: | ---: |
+| Luna @ max, every task | 0.627 | 77 / 97 | $1.152 | baseline |
+| Per-task cache-aware router | 1.000 | 97 / 97 | $0.952 | 17.4% lower |
+| Per-turn cache-aware router | 0.973 | 95 / 97 | $0.984 | 14.5% lower |
+
+On this small matched sample, per-task is the strongest result. Per-turn is 2.7 quality points below per-task and 3.4% more expensive. All three long tasks selected Luna xhigh on every turn, so this sample did not exercise a model switch. A separate short-task switch probe did: per-turn switched once from Opus low to Luna xhigh, retained 1.000 quality, and cost $0.742 versus $1.401 for per-task Opus low.
 
 ## What was trained and what was evaluated
 
@@ -64,7 +76,7 @@ The policy is now cache-aware when served live. It may reconsider the model on e
 - Otherwise it keeps the warm incumbent.
 - The decision log records the cache credit and whether the switch passed or was reverted.
 
-This is deliberately conservative. The current profile artifact has task-level quality evidence, but not turn-level quality evidence, so cache economics control switching while quality remains protected by the fitted task profile. The 47.9% cost result above is task-level; turn-level savings require a conversation trace evaluation.
+This is deliberately conservative. The current profile artifact has task-level quality evidence, while the fresh check measures final task quality after a full multi-turn run. Cache economics control switching while quality remains protected by the fitted task profile. The 47.9% cost result above is task-level cross-validation; the fresh matched quality check is a three-task direct-call sample.
 
 A remote synthetic replay of 1,000 eight-turn conversations, using the actual DeepSWE task-length distribution, reduced prefill cost 53.5% versus staying on the first model and 95.7% versus cold-routing every turn. It switched 0.33 times per conversation on average. This validates the cache arithmetic only; it does not establish turn-level quality.
 
@@ -72,4 +84,4 @@ A remote synthetic replay of 1,000 eight-turn conversations, using the actual De
 
 The fitting sweep ran in an E2B sandbox. The laptop was used only to orchestrate the job, run small checks, and store artifacts. The report is at `.agents/reports/deepswe_profile_router_20260730.json`.
 
-This is not a claim that the models were freshly rerun. It evaluates routing choices against the frozen 13-arm DeepSWE measurement matrix, so the next promotion step is a fresh matched DeepSWE execution using the repository's OpenAI and Anthropic credentials.
+The grouped cross-validation result evaluates routing choices against the frozen 13-arm DeepSWE measurement matrix. The fresh matched quality check is the direct-call promotion check using the repository's OpenAI and Anthropic credentials.

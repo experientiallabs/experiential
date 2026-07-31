@@ -1,0 +1,72 @@
+{
+  "benchmark": "DeepSWE 1.1",
+  "evaluation": {
+    "tasks": [
+      "actionlint-action-pinning-lint",
+      "arktype-json-schema-refs-dependencies",
+      "boa-hierarchical-evaluation-cancellation"
+    ],
+    "task_count": 3,
+    "compute": "Azure Docker",
+    "max_turns": 60,
+    "max_output_tokens": 16384,
+    "verifier_ok": true,
+    "unscored_tasks": 0
+  },
+  "matched_results": {
+    "luna_max_baseline": {
+      "graded_quality_macro": 0.6266666666666667,
+      "f2p_passed": 77,
+      "f2p_total": 97,
+      "f2p_quality_micro": 0.7938144329896907,
+      "cost_per_task_usd": 1.1517686,
+      "total_cost_usd": 3.4553058,
+      "mean_turns": 60.0,
+      "switches": 0
+    },
+    "per_task_cache_aware": {
+      "graded_quality_macro": 1.0,
+      "f2p_passed": 97,
+      "f2p_total": 97,
+      "f2p_quality_micro": 1.0,
+      "cost_per_task_usd": 0.9515211666666668,
+      "total_cost_usd": 2.8545635,
+      "mean_turns": 55.0,
+      "switches": 0,
+      "cost_savings_vs_luna_max": 0.17386066143332795
+    },
+    "per_turn_cache_aware": {
+      "graded_quality_macro": 0.9733333333333334,
+      "f2p_passed": 95,
+      "f2p_total": 97,
+      "f2p_quality_micro": 0.979381443298969,
+      "cost_per_task_usd": 0.9843149666666667,
+      "total_cost_usd": 2.9529449,
+      "mean_turns": 60.0,
+      "switches": 0,
+      "cost_savings_vs_luna_max": 0.14538532291379772
+    }
+  },
+  "short_task_switch_probe": {
+    "task": "cattrs-partial-structuring-recovery",
+    "per_task": {
+      "graded_quality": 1.0,
+      "cost_usd": 1.4014,
+      "turns": 18,
+      "switches": 0,
+      "model_mix": {"claude-opus-5__low": 18}
+    },
+    "per_turn": {
+      "graded_quality": 1.0,
+      "cost_usd": 0.7423339,
+      "turns": 53,
+      "switches": 1,
+      "model_mix": {
+        "claude-opus-5__low": 1,
+        "gpt-5.6-luna__xhigh": 52
+      },
+      "route": "turn 1 Opus low; turn 2 switched to Luna xhigh; turn 3 retained Luna xhigh"
+    }
+  },
+  "interpretation": "The three-task matched sample favors per-task. The short-task probe confirms that cache-aware per-turn switching executes and can lower cost when the task begins in the short-task arm."
+}
