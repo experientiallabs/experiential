@@ -277,7 +277,7 @@ def _choose(
     order = np.lexsort((np.arange(fit.shape[1]), -global_means))
     rank = np.empty(fit.shape[1], dtype=np.int64)
     rank[order] = np.arange(fit.shape[1])
-    adjusted = fit - rank[np.newaxis, :] * 1e-12
+    adjusted = fit[indices] - rank[np.newaxis, :] * 1e-12
     chosen = np.argmax(adjusted, axis=1)
     return chosen, int(order[0])
 

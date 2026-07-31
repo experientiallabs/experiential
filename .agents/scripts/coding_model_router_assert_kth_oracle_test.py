@@ -84,6 +84,22 @@ def test_heldout_oracle_recovers_repeatable_complementarity() -> None:
     assert report["naive_same_attempt_headroom"] == 0.5
 
 
+def test_choose_returns_one_arm_for_each_resampled_task() -> None:
+    np = module.np
+    fit = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    sampled = np.asarray([0, 0, 3], dtype=np.int64)
+    chosen, _ = module._choose(fit, sampled)
+    assert chosen.tolist() == [0, 0, 1]
+
+
 def test_heldout_oracle_rejects_task_blind_arm_ordering() -> None:
     np = module.np
     rewards = np.zeros((6, 2, 10), dtype=np.float64)
