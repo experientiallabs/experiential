@@ -126,6 +126,45 @@ percentile and its cost is at the 88.92nd percentile. The 0.99 point is statisti
 indistinguishable from the matched mixture. Both tested lexical feature families therefore fail
 to establish task-selection value.
 
+## Open-SWE external transfer
+
+The next source uses
+[`nvidia/Open-SWE-Traces`](https://huggingface.co/datasets/nvidia/Open-SWE-Traces) outcomes joined
+by external task id to issue text from
+[`nebius/SWE-rebench-V2`](https://huggingface.co/datasets/nebius/SWE-rebench-V2). A projected
+parquet scan reads identity and outcome columns instead of downloading the 18.3 GB trajectory
+payload. The compact paired dataset stays in E2B.
+
+Within each agent scaffold, the preparation rule selects the two model modes with the largest
+external mean-reward gap. It selected OpenHands with Qwen3.5-122B as weak and MiniMax-M2.5
+thinking as strong. After joining text there are 14,504 paired tasks across 2,251 repositories
+and nine languages. Their mean task rewards are 0.3230 and 0.3957. The fit receives no DeepSWE
+path.
+
+The first family uses 27 deterministic issue-shape features. Its IRT variants predict task
+easiness, calibrate weak and strong ability offsets, and assign stronger effort to the
+middle-difficulty band. The IRT hypothesis failed externally: every observed IRT variant had
+negative out-of-fold uplift Spearman. The preregistered family instead selected a two-head Ridge
+baseline with 0.0529 out-of-fold uplift Spearman.
+
+The selected external 0.97 point is directionally better than its matched task-blind DeepSWE
+control but is not significant:
+
+| Field | Structural two-head result |
+| --- | ---: |
+| Target traffic | 26 xhigh, 84 max |
+| Router quality | 0.9430970943 |
+| Router cost | USD 304.1929 |
+| Matched task-blind expected quality | 0.9414687144 |
+| Quality delta vs task-blind mean | +0.0016283799 |
+| Matched task-blind expected cost | USD 306.4853 |
+| Cost delta vs task-blind mean | -USD 2.2924 |
+| Router quality percentile | 68.35 percent |
+| Router cost percentile | 37.05 percent |
+
+The external 0.99 point reaches the 96.71st quality percentile but costs USD 5.9150 more than the
+matched task-blind mean. This is weak task-selection evidence, not a promotable result.
+
 ## Reproducibility anchors
 
 First external fit commit: `bbbaa609aa7f8b9e6a35aab311920ad11ef17266`
@@ -167,3 +206,16 @@ Matched task-blind control report SHA256:
 
 Original word-router task-blind control report SHA256:
 `5dc64e22fbab0ebf10e8b62f5cbb81b90251ff4cc219b6992b2af119b402492c`
+
+Open-SWE source preparation commit: `da8b1f8e`
+
+Structural IRT family commit: `bd7f8f82`
+
+Open-SWE compact source SHA256:
+`179d9801507b514ec30eb279cf44235ee4b6634bf38b06cee741a1018c391d55`
+
+Structural frozen candidates SHA256:
+`4ca5cf101a358551fa077124a9f874854625ae9c00b5ef2e757546ac160f4efa`
+
+Structural DeepSWE report SHA256:
+`47ab1efc7e4556f6fd31b4af858073132a80fd569f5a65b2e11b31e094de3b4d`
