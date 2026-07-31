@@ -180,6 +180,22 @@ ordered held-out task ids, one id per line with a trailing newline:
 | 3 | 240 | 60 | 42 | `0d1ae009fe32a42f63c648d74189bf208802e48af7a2892e1137a0209804a5a4` |
 | 4 | 241 | 59 | 45 | `24a30930a802192f3ecd4aa584b60b7016b95c0879d13486ae93fbcde7638255` |
 
+After the oracle passes, launch one clean remote worktree per outer seed. Each job runs exactly:
+
+```bash
+uv run python .agents/scripts/coding_model_router_bigcodebench_select_run.py \
+  --root /remote/artifacts/bigcodebench \
+  --seed <0..4> \
+  --work-dir /remote/artifacts/bigcodebench/fit/seed-<seed> \
+  --output /remote/artifacts/bigcodebench/fit/seed-<seed>.json
+```
+
+Each immutable seed report contains all 1,028 grouped fit-only candidate values, canonical config
+digests, matrix and split fingerprints, the clean source commit, and the mechanical family winner.
+It explicitly records that latency audit is pending and cannot itself authorize held-out replay.
+The later one-core latency and artifact audit must enrich all five winners before the immutable
+selection lock is assembled.
+
 Primary references:
 
 - RouteLLM: `https://arxiv.org/abs/2406.18665`
