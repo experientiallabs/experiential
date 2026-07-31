@@ -166,6 +166,15 @@ def test_outcome_matrix_preserves_every_attempt() -> None:
     assert {outcome.model for outcome in matrix.outcomes} == set(module.ARMS)
 
 
+def test_feature_scaling_uses_only_declared_fit_rows() -> None:
+    data = _knn_data()
+    baseline = module.feature_matrix(data, dim=512, scale_indices=np.arange(10))
+    changed = _knn_data()
+    changed.texts[19] = changed.texts[19] * 1_000
+    shifted = module.feature_matrix(changed, dim=512, scale_indices=np.arange(10))
+    assert np.array_equal(baseline[:10].toarray(), shifted[:10].toarray())
+
+
 def test_native_knn_replay_matches_tensor_value(tmp_path: Path) -> None:
     data = _knn_data()
     replay = module.fit_native_knn_replay(

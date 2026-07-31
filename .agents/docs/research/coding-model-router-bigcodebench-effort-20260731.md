@@ -147,6 +147,10 @@ The preregistered candidate families are:
    Posterior lower bounds use z 0, 0.5, 1.0, or 1.645 and revert to the fit-selected static effort
    when no effort clears the fit-only quality floor.
 
+The Cartesian grids contain 432 guarded kNN points and 576 non-kNN points, for 1,008 candidates
+per outer seed before negative controls. Candidate identities and frozen ordering are generated
+without reading a reward row.
+
 All fitting and hyperparameter search runs remotely. The five outer seeds are 0 through 4. For
 each seed, complete library signatures are ordered by
 `sha256("bigcodebench-outer-v1:<seed>:<group>")`. The held-out partition is the shortest prefix

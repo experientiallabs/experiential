@@ -381,8 +381,13 @@ def _structural_row(text: str, *, is_hard: bool) -> list[float]:
     ]
 
 
-def feature_matrix(data: FitData, *, dim: int) -> sparse.csr_matrix:
-    """Build deterministic local prompt and structural features."""
+def feature_matrix(
+    data: FitData,
+    *,
+    dim: int,
+    scale_indices: np.ndarray | None = None,
+) -> sparse.csr_matrix:
+    """Build prompt features with structural scaling learned on fit tasks only."""
     if dim not in {512, 2_048, 8_192}:
         raise ValueError("hash dimension is outside the frozen search space")
     vectorizer = HashingVectorizer(
@@ -400,7 +405,14 @@ def feature_matrix(data: FitData, *, dim: int) -> sparse.csr_matrix:
         ],
         dtype=np.float64,
     )
-    scale = np.maximum(np.std(structural, axis=0), 1.0)
+    if scale_indices is None:
+        scale_rows = np.arange(len(data.task_ids))
+    else:
+        scale_rows = np.asarray(
+            _indices(data, scale_indices, label="feature scale"),
+            dtype=np.int64,
+        )
+    scale = np.maximum(np.std(structural[scale_rows], axis=0), 1.0)
     structural /= scale
     return sparse.hstack([text, sparse.csr_matrix(structural)], format="csr")
 
