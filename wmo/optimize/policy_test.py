@@ -32,6 +32,7 @@ from wmo.optimize.policy import (
     cache_credit_usd,
     embedder_provenance,
     knn_decision,
+    linear_decision,
     probe_embedder,
     rank_decision,
     resolve_embedder,
@@ -118,6 +119,24 @@ def _rank_policy(top_k_clusters: int = 1) -> RoutingPolicy:
     )
 
 
+def _linear_policy() -> RoutingPolicy:
+    embedder = EmbedderSpec(dim=8)
+    query = np.asarray(embedder.build().embed(["route this coding task"])[0])
+    return RoutingPolicy(
+        kind="linear",
+        default_model="fable-5",
+        pool=_pool(),
+        embedder=embedder,
+        linear_weak_model="haiku-4-5",
+        linear_strong_model="fable-5",
+        linear_weak_weights=[0.0] * 8,
+        linear_strong_weights=query.tolist(),
+        linear_weak_bias=0.4,
+        linear_strong_bias=0.4,
+        linear_threshold=0.5,
+    )
+
+
 def test_static_policy_routes_to_default() -> None:
     decision = select_model(_static(), "anything at all")
     assert decision.model == "haiku-4-5"
@@ -142,6 +161,39 @@ def test_rank_policy_soft_mixing_follows_the_closer_cluster() -> None:
     policy = _rank_policy(top_k_clusters=2)
     assert select_model(policy, "SELECT count(*) FROM superheroes").model == "fable-5"
     assert select_model(policy, "write a friendly email").model == "haiku-4-5"
+
+
+def test_linear_policy_routes_on_predicted_uplift() -> None:
+    policy = _linear_policy()
+    strong = select_model(policy, "route this coding task")
+    assert strong.model == "fable-5"
+    assert "predicted uplift" in strong.reason
+
+    weak = policy.model_copy(update={"linear_threshold": 0.7})
+    assert select_model(weak, "route this coding task").model == "haiku-4-5"
+
+
+def test_linear_decision_normalizes_query_and_falls_back_on_empty() -> None:
+    policy = _linear_policy()
+    query = np.asarray(policy.embedder.build().embed(["route this coding task"])[0])
+    assert linear_decision(policy, query) == linear_decision(policy, query * 13.0)
+    empty = linear_decision(policy, np.zeros(policy.embedder.dim))
+    assert empty.model == policy.default_model
+    assert "empty embedding" in empty.reason
+
+
+def test_linear_policy_validates_models_weights_and_finite_values() -> None:
+    valid = _linear_policy().model_dump()
+    for update, match in (
+        ({"linear_strong_model": None}, "weak and strong"),
+        ({"linear_strong_model": "haiku-4-5"}, "distinct"),
+        ({"linear_strong_model": "missing"}, "not in the policy pool"),
+        ({"linear_weak_weights": [0.0]}, "embedder dim"),
+        ({"linear_strong_weights": [float("nan")] * 8}, "finite"),
+        ({"linear_threshold": float("inf")}, "finite"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            RoutingPolicy.model_validate({**valid, **update})
 
 
 def test_models_missing_from_rankings_score_default_rank() -> None:
@@ -215,6 +267,15 @@ def test_policy_round_trips_through_json(tmp_path: Path) -> None:
     path = tmp_path / "policy.json"
     policy.save(path)
     assert RoutingPolicy.load(path) == policy
+
+
+def test_linear_policy_round_trips_through_json(tmp_path: Path) -> None:
+    policy = _linear_policy()
+    path = tmp_path / "linear-policy.json"
+    policy.save(path)
+    loaded = RoutingPolicy.load(path)
+    assert loaded == policy
+    assert select_model(loaded, "route this coding task").model == "fable-5"
 
 
 def test_openrouter_candidate_keeps_the_price_it_was_fitted_under(

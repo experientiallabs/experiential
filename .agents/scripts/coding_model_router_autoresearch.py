@@ -40,6 +40,8 @@ from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from wmo.retrieval.embedders import HashingEmbedder
+
 logger = logging.getLogger("coding-model_router_autoresearch")
 
 QUALITY_FLOORS = (0.95, 0.97, 0.99)
@@ -101,6 +103,27 @@ class FittedRegressor(Protocol):
     def predict(self, features: np.ndarray) -> np.ndarray: ...
 
 
+class FeatureTransformer(Protocol):
+    """Feature transform surface shared by sklearn and the native hashing transform."""
+
+    def fit_transform(self, texts: list[str]) -> np.ndarray: ...
+
+    def transform(self, texts: list[str]) -> np.ndarray: ...
+
+
+class HashingFeatureTransformer:
+    """Stateless adapter around WMO's deterministic serve-time hashing embedder."""
+
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def fit_transform(self, texts: list[str]) -> np.ndarray:
+        return self.transform(texts)
+
+    def transform(self, texts: list[str]) -> np.ndarray:
+        return np.asarray(HashingEmbedder(dim=self.dim).embed(texts), dtype=np.float64)
+
+
 class StaticRow(TypedDict):
     """One DeepSWE static-arm aggregate."""
 
@@ -141,7 +164,7 @@ class CandidateSpec:
     """One mechanically searchable static-text estimator."""
 
     name: str
-    analyzer: Literal["word", "char"]
+    analyzer: Literal["word", "char", "hashing"]
     components: int
     estimator: Literal["ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"]
     alpha: float = 1.0
@@ -383,9 +406,7 @@ def _load_coderouter(root: Path) -> SourceData:
     )
     return SourceData(
         name="coderouterbench-ood176",
-        task_ids=[
-            str(tasks[task_id].get("original_task_id", task_id)) for task_id in task_ids
-        ],
+        task_ids=[str(tasks[task_id].get("original_task_id", task_id)) for task_id in task_ids],
         groups=[_coderouter_group(tasks[task_id]) for task_id in task_ids],
         texts=[str(tasks[task_id]["prompt"]) for task_id in task_ids],
         weak=np.asarray([cells[(requested[0], task_id)] for task_id in task_ids]),
@@ -422,9 +443,7 @@ def _load_swebench(matrix_path: Path, task_path: Path) -> SourceData:
     if not isinstance(raw, dict):
         raise ValueError(f"{matrix_path} must contain one JSON object")
     submissions = cast(dict[str, dict[str, object]], raw)
-    missing = [
-        arm for arm in (SWEBENCH_WEAK_ARM, SWEBENCH_STRONG_ARM) if arm not in submissions
-    ]
+    missing = [arm for arm in (SWEBENCH_WEAK_ARM, SWEBENCH_STRONG_ARM) if arm not in submissions]
     if missing:
         raise ValueError(f"{matrix_path} is missing effort-pair submissions: {missing}")
 
@@ -438,9 +457,7 @@ def _load_swebench(matrix_path: Path, task_path: Path) -> SourceData:
             continue
         valid_arms.append(arm)
         details_by_arm[arm] = details
-    task_ids = sorted(
-        set.intersection(*(set(details_by_arm[arm]) for arm in valid_arms))
-    )
+    task_ids = sorted(set.intersection(*(set(details_by_arm[arm]) for arm in valid_arms)))
     metadata_table = pq.read_table(
         task_path,
         columns=["instance_id", "repo", "problem_statement"],
@@ -457,10 +474,7 @@ def _load_swebench(matrix_path: Path, task_path: Path) -> SourceData:
     task_ids = [task_id for task_id in task_ids if task_id in metadata]
     outcomes = np.asarray(
         [
-            [
-                float(bool(details_by_arm[arm][task_id].get("resolved")))
-                for task_id in task_ids
-            ]
+            [float(bool(details_by_arm[arm][task_id].get("resolved"))) for task_id in task_ids]
             for arm in valid_arms
         ],
         dtype=np.float64,
@@ -542,7 +556,36 @@ def _combine(sources: list[SourceData]) -> CombinedData:
     )
 
 
-def _candidate_space() -> list[CandidateSpec]:
+def _candidate_space(family: Literal["full", "native-linear"] = "full") -> list[CandidateSpec]:
+    if family == "native-linear":
+        return [
+            CandidateSpec(
+                "task-blind-uplift",
+                "word",
+                1,
+                "ridge-uplift",
+                label_mode="task-blind",
+            ),
+            CandidateSpec(
+                "hash2048-ridge-heads-shuffled-a1",
+                "hashing",
+                2048,
+                "ridge-heads",
+                alpha=1.0,
+                label_mode="shuffled",
+            ),
+            *[
+                CandidateSpec(
+                    f"hash{dim}-ridge-heads-a{alpha:g}",
+                    "hashing",
+                    dim,
+                    "ridge-heads",
+                    alpha=alpha,
+                )
+                for dim in (512, 2048, 8192)
+                for alpha in (0.1, 1.0, 10.0)
+            ],
+        ]
     return [
         CandidateSpec(
             "task-blind-uplift",
@@ -597,7 +640,9 @@ def _training_outcomes(
     return shuffled_weak, shuffled_strong
 
 
-def _features(spec: CandidateSpec) -> Pipeline:
+def _features(spec: CandidateSpec) -> FeatureTransformer:
+    if spec.analyzer == "hashing":
+        return HashingFeatureTransformer(spec.components)
     if spec.analyzer == "word":
         vectorizer = TfidfVectorizer(
             analyzer="word",
@@ -616,12 +661,15 @@ def _features(spec: CandidateSpec) -> Pipeline:
             max_features=60_000,
             sublinear_tf=True,
         )
-    return Pipeline(
-        [
-            ("tfidf", vectorizer),
-            ("svd", TruncatedSVD(n_components=spec.components, random_state=17)),
-            ("scale", StandardScaler()),
-        ]
+    return cast(
+        FeatureTransformer,
+        Pipeline(
+            [
+                ("tfidf", vectorizer),
+                ("svd", TruncatedSVD(n_components=spec.components, random_state=17)),
+                ("scale", StandardScaler()),
+            ]
+        ),
     )
 
 
@@ -696,6 +744,35 @@ def _predict_score(
     weak = np.clip(np.asarray(first.predict(features), dtype=np.float64), 0.0, 1.0)
     strong = np.clip(np.asarray(second.predict(features), dtype=np.float64), 0.0, 1.0)
     return strong - weak
+
+
+def _native_linear_heads(
+    spec: CandidateSpec,
+    estimators: tuple[FittedRegressor, FittedRegressor | None],
+    operating_points: dict[str, dict[str, float]],
+) -> dict[str, object]:
+    """Serialize a hashing plus Ridge scorer as plain numeric WMO policy inputs."""
+    if spec.analyzer != "hashing" or spec.estimator != "ridge-heads":
+        raise ValueError("native linear heads require a hashing ridge-heads candidate")
+    weak, strong = estimators
+    if strong is None or not isinstance(weak, Ridge) or not isinstance(strong, Ridge):
+        raise TypeError("native linear heads require two fitted Ridge estimators")
+    weak_weights = np.asarray(weak.coef_, dtype=np.float64).reshape(-1)
+    strong_weights = np.asarray(strong.coef_, dtype=np.float64).reshape(-1)
+    if weak_weights.size != spec.components or strong_weights.size != spec.components:
+        raise ValueError("native linear head dimensions do not match the hashing embedder")
+    return {
+        "schema": "wmo-linear-heads-v1",
+        "candidate": dataclasses.asdict(spec),
+        "embedder": {"kind": "hashing", "dim": spec.components},
+        "weak_weights": weak_weights.tolist(),
+        "strong_weights": strong_weights.tolist(),
+        "weak_bias": float(np.asarray(weak.intercept_).reshape(-1)[0]),
+        "strong_bias": float(np.asarray(strong.intercept_).reshape(-1)[0]),
+        "operating_points": operating_points,
+        "target_outcomes_used": False,
+        "target_embeddings_used": False,
+    }
 
 
 def _operating_point(
@@ -872,7 +949,7 @@ def _fit(args: argparse.Namespace) -> None:
             groups=np.asarray(combined.groups, dtype=object),
         )
     )
-    candidate_specs = _candidate_space()
+    candidate_specs = _candidate_space(args.candidate_family)
     leaderboard: list[dict[str, object]] = []
     for spec in candidate_specs:
         oof = np.empty(len(combined.task_ids), dtype=np.float64)
@@ -947,9 +1024,7 @@ def _fit(args: argparse.Namespace) -> None:
     leaderboard.sort(
         key=lambda row: (
             bool(row["is_control"]),
-            cast(dict[str, dict[str, float]], row["operating_points"])["0.95"][
-                "strong_traffic"
-            ],
+            cast(dict[str, dict[str, float]], row["operating_points"])["0.95"]["strong_traffic"],
             -float(row["external_oof_uplift_spearman"]),
         )
     )
@@ -979,13 +1054,27 @@ def _fit(args: argparse.Namespace) -> None:
     joblib.dump(
         {
             "spec": dataclasses.asdict(selected_spec),
-            "transformer": transformer,
+            "transformer": transformer if selected_spec.analyzer != "hashing" else None,
             "weak_estimator": estimators[0],
             "strong_estimator": estimators[1],
         },
         output / f"{selected_spec.name}.joblib",
         compress=3,
     )
+    selected_row = next(
+        row
+        for row in leaderboard
+        if cast(dict[str, object], row["candidate"])["name"] == selected_name
+    )
+    if selected_spec.analyzer == "hashing":
+        _write_json(
+            output / "native-linear-heads.json",
+            _native_linear_heads(
+                selected_spec,
+                estimators,
+                cast(dict[str, dict[str, float]], selected_row["operating_points"]),
+            ),
+        )
     _write_json(
         output / "frozen-candidates.json",
         {
@@ -1004,6 +1093,8 @@ def _fit(args: argparse.Namespace) -> None:
                     "word128-ridge-heads-a1",
                 ],
                 "target_candidate_count": 1,
+                "candidate_family": args.candidate_family,
+                "post_target_family_adaptation": args.candidate_family == "native-linear",
                 "selection": "minimum_source_balanced_strong_traffic_then_uplift_spearman",
             },
             "leaderboard": leaderboard,
@@ -1073,13 +1164,13 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
     raw_spec = cast(dict[str, object], fitted["spec"])
     analyzer = str(raw_spec["analyzer"])
     estimator = str(raw_spec["estimator"])
-    if analyzer not in ("word", "char"):
+    if analyzer not in ("word", "char", "hashing"):
         raise ValueError(f"invalid frozen analyzer {analyzer!r}")
     if estimator not in ("ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"):
         raise ValueError(f"invalid frozen estimator {estimator!r}")
     spec = CandidateSpec(
         name=str(raw_spec["name"]),
-        analyzer=cast(Literal["word", "char"], analyzer),
+        analyzer=cast(Literal["word", "char", "hashing"], analyzer),
         components=int(_as_float(raw_spec["components"])),
         estimator=cast(
             Literal["ridge-uplift", "ridge-heads", "extra-heads", "hist-heads"],
@@ -1092,7 +1183,11 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
             str(raw_spec.get("label_mode", "observed")),
         ),
     )
-    transformer = cast(Pipeline, fitted["transformer"])
+    transformer = (
+        _features(spec)
+        if analyzer == "hashing"
+        else cast(FeatureTransformer, fitted["transformer"])
+    )
     features = np.asarray(transformer.transform(texts), dtype=np.float64)
     estimators = (
         cast(FittedRegressor, fitted["weak_estimator"]),
@@ -1151,22 +1246,14 @@ def _bootstrap(
     for sample in range(BOOTSTRAP_SAMPLES):
         selected_groups = rng.choice(unique, size=len(unique), replace=True)
         selected = np.concatenate([by_group[str(group)] for group in selected_groups])
-        deltas[sample] = float(
-            router_reward[selected].mean() - baseline_reward[selected].mean()
-        )
+        deltas[sample] = float(router_reward[selected].mean() - baseline_reward[selected].mean())
         router_total = float(router_cost[selected].sum())
         ratios[sample] = (
-            float(baseline_cost[selected].sum() / router_total)
-            if router_total
-            else math.inf
+            float(baseline_cost[selected].sum() / router_total) if router_total else math.inf
         )
     return {
-        "quality_delta_95ci": [
-            float(value) for value in np.quantile(deltas, [0.025, 0.975])
-        ],
-        "cost_ratio_95ci": [
-            float(value) for value in np.quantile(ratios, [0.025, 0.975])
-        ],
+        "quality_delta_95ci": [float(value) for value in np.quantile(deltas, [0.025, 0.975])],
+        "cost_ratio_95ci": [float(value) for value in np.quantile(ratios, [0.025, 0.975])],
     }
 
 
@@ -1213,6 +1300,8 @@ def _evaluate(args: argparse.Namespace) -> None:
     frozen_object = {str(key): value for key, value in frozen.items()}
     if not isinstance(frozen_object.get("leaderboard"), list):
         raise ValueError("frozen-candidates.json is absent or invalid")
+    protocol = cast(dict[str, object], frozen_object.get("protocol", {}))
+    post_target_adaptation = protocol.get("post_target_family_adaptation") is True
     target = _load_target(args.deep_matrix.resolve(), args.deep_tasks.resolve())
     static = _static_rows(target)
     best_quality = max(static, key=lambda row: float(row["reward"]))
@@ -1238,9 +1327,7 @@ def _evaluate(args: argparse.Namespace) -> None:
         operating_points = cast(dict[str, dict[str, float]], untyped["operating_points"])
         for ladder_name, ladder in TARGET_LADDERS.items():
             operating_labels: tuple[str | None, ...] = (
-                tuple(str(value) for value in QUALITY_FLOORS)
-                if len(ladder) == 2
-                else (None,)
+                tuple(str(value) for value in QUALITY_FLOORS) if len(ladder) == 2 else (None,)
             )
             for quality_floor in operating_labels:
                 arm_indices = _ladder_indices(target, ladder)
@@ -1259,9 +1346,7 @@ def _evaluate(args: argparse.Namespace) -> None:
                 ]
                 comparable = [row for row in static if row["reward"] >= router_reward]
                 matched_static = (
-                    min(comparable, key=lambda row: row["cost_usd"])
-                    if comparable
-                    else best_quality
+                    min(comparable, key=lambda row: row["cost_usd"]) if comparable else best_quality
                 )
                 baseline_index = target.arms.index(str(matched_static["arm"]))
                 best_static_index = target.arms.index(str(best_quality["arm"]))
@@ -1280,7 +1365,7 @@ def _evaluate(args: argparse.Namespace) -> None:
                     target.groups,
                 )
                 counts = collections.Counter(int(value) for value in decisions)
-                row = {
+                row: dict[str, object] = {
                     "candidate": name,
                     "ladder": ladder_name,
                     "operating_point": (
@@ -1295,21 +1380,15 @@ def _evaluate(args: argparse.Namespace) -> None:
                     "router_reward": router_reward,
                     "router_cost_usd": router_cost,
                     "quality_retention_vs_best_static": (
-                        router_reward / best_quality["reward"]
-                        if best_quality["reward"]
-                        else 0.0
+                        router_reward / best_quality["reward"] if best_quality["reward"] else 0.0
                     ),
                     "best_static_quality_arm": best_quality,
                     "matched_static": matched_static,
                     "cost_ratio_vs_matched_static": (
-                        matched_static["cost_usd"] / router_cost
-                        if router_cost
-                        else math.inf
+                        matched_static["cost_usd"] / router_cost if router_cost else math.inf
                     ),
                     "cost_ratio_vs_best_static": (
-                        best_quality["cost_usd"] / router_cost
-                        if router_cost
-                        else math.inf
+                        best_quality["cost_usd"] / router_cost if router_cost else math.inf
                     ),
                     "cost_savings_vs_best_static": (
                         1.0 - router_cost / best_quality["cost_usd"]
@@ -1324,14 +1403,11 @@ def _evaluate(args: argparse.Namespace) -> None:
                     "target_labels_used_for_fit": False,
                     "target_labels_used_for_thresholds": False,
                     "target_static_aggregates_used_for_ladder_design": True,
+                    "post_target_family_adaptation": post_target_adaptation,
                     "quality_delta_95ci": matched_bootstrap["quality_delta_95ci"],
                     "cost_ratio_95ci": matched_bootstrap["cost_ratio_95ci"],
-                    "best_static_quality_delta_95ci": best_static_bootstrap[
-                        "quality_delta_95ci"
-                    ],
-                    "best_static_cost_ratio_95ci": best_static_bootstrap[
-                        "cost_ratio_95ci"
-                    ],
+                    "best_static_quality_delta_95ci": best_static_bootstrap["quality_delta_95ci"],
+                    "best_static_cost_ratio_95ci": best_static_bootstrap["cost_ratio_95ci"],
                     "promotion": _promotion_decision(
                         router_reward,
                         router_cost,
@@ -1360,9 +1436,18 @@ def _evaluate(args: argparse.Namespace) -> None:
             "target_labels_used_for_fit": False,
             "target_labels_used_for_thresholds": False,
             "research_adaptation_note": (
-                "The external candidate grid and thresholds were frozen before this phase. "
-                "The target ladders use previously known DeepSWE static aggregate results, so "
-                "this is deployment calibration rather than untouched confirmation."
+                (
+                    "This policy family was chosen after inspecting an earlier DeepSWE result. "
+                    "Its candidate grid and thresholds were then fitted and frozen using only "
+                    "external data before this evaluation, so this is an adaptive engineering "
+                    "checkpoint, not untouched confirmation."
+                )
+                if post_target_adaptation
+                else (
+                    "The external candidate grid and thresholds were frozen before this phase. "
+                    "The target ladders use previously known DeepSWE static aggregate results, "
+                    "so this is deployment calibration rather than untouched confirmation."
+                )
             ),
         },
     )
@@ -1385,6 +1470,11 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--coderouter-root", type=Path, required=True)
     fit.add_argument("--swebench-matrix", type=Path)
     fit.add_argument("--swebench-tasks", type=Path)
+    fit.add_argument(
+        "--candidate-family",
+        choices=("full", "native-linear"),
+        default="full",
+    )
     fit.add_argument("--output", type=Path, required=True)
     evaluate = subparsers.add_parser("evaluate")
     evaluate.add_argument("--deep-matrix", type=Path, required=True)

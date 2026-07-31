@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import io
 import importlib.util
+import io
 import json
 import sys
 import tarfile
@@ -99,6 +99,48 @@ def test_operating_point_uses_strong_only_where_score_is_high() -> None:
     )
     assert point["strong_traffic"] == 0.5
     assert point["mean_retention"] == 1.0
+
+
+def test_native_candidate_family_uses_servable_hashing_features() -> None:
+    module = _module()
+    candidates = module._candidate_space("native-linear")
+    observed = [candidate for candidate in candidates if candidate.label_mode == "observed"]
+    assert len(observed) == 9
+    assert {candidate.analyzer for candidate in observed} == {"hashing"}
+    assert {candidate.components for candidate in observed} == {512, 2048, 8192}
+
+    transformer = module._features(observed[0])
+    first = transformer.fit_transform(["same task", "different task"])
+    second = transformer.transform(["same task", "different task"])
+    assert np.array_equal(first, second)
+    assert first.shape == (2, 512)
+
+
+def test_native_linear_heads_are_plain_numeric_artifact() -> None:
+    module = _module()
+    spec = module.CandidateSpec(
+        "hash8-ridge-heads-a1",
+        "hashing",
+        8,
+        "ridge-heads",
+    )
+    features = module._features(spec).fit_transform(["first task", "second task"])
+    estimators = module._fit_estimators(
+        spec,
+        features,
+        np.asarray([0.0, 1.0]),
+        np.asarray([1.0, 1.0]),
+        np.ones(2),
+    )
+    artifact = module._native_linear_heads(
+        spec,
+        estimators,
+        {"0.95": {"threshold": 0.1}},
+    )
+    assert artifact["schema"] == "wmo-linear-heads-v1"
+    assert len(artifact["weak_weights"]) == 8
+    assert len(artifact["strong_weights"]) == 8
+    assert artifact["target_outcomes_used"] is False
 
 
 def test_three_level_route_is_monotone_in_predicted_uplift() -> None:
