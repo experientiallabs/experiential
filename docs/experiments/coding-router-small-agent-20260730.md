@@ -2,6 +2,27 @@
 
 Status: the profile router clears the evaluation gate against Luna @ max on grouped DeepSWE cross-validation. The result is a frozen-matrix replay, not a fresh set of model calls.
 
+## Headline scorecard
+
+| Router or baseline | Quality | Cost per task | Quality vs Luna @ max | Cost saving |
+| --- | ---: | ---: | ---: | ---: |
+| Luna @ max, every task | 0.958 | $3.00 | 100% | 0% |
+| Per-task profile router, cache-aware serving | 0.932 | $1.57 | 97.3% average, 95.1% worst split | 47.9% average, 30.4% worst split |
+| Fable @ xhigh, static baseline | 0.957 | $13.04 | 99.9% of Luna | -334.3% vs Luna |
+
+The per-task result is the grouped DeepSWE result. Cache awareness is enabled, but a single-task evaluation has no prior prefix, so cache awareness cannot change that number.
+
+For turn-level prefill economics, the E2B replay used 1,000 synthetic eight-turn conversations sampled from the DeepSWE task-length distribution:
+
+| Serving mode | Prefill per turn | Traffic mix | Switches per conversation |
+| --- | ---: | --- | ---: |
+| Luna @ max, sticky | $0.000196 | Luna max 100% | 0 |
+| Per-task profile, sticky cache | $0.000462 | Opus low 34.6%, Luna xhigh 65.4% | 0 |
+| Per-turn profile, cache-aware | $0.000200 | Opus low 6.6%, Luna xhigh 93.4% | 0.33 |
+| Per-turn profile, cold every turn | $0.004618 | Opus low 34.6%, Luna xhigh 65.4% | 3.2 |
+
+The cache-aware per-turn router is within 2.2% of the Luna @ max prefill baseline and is 95.7% cheaper than cold re-routing. Turn-level quality remains unmeasured because the source data contains task-level outcomes, not conversation-turn outcomes.
+
 ## What was trained and what was evaluated
 
 The data contained 113 DeepSWE 1.1 tasks from 92 repositories. Each task had measured results for 13 model-and-reasoning-effort arms. The score was the graded fraction `f2p_passed / f2p_total`, with measured `cost_usd` for cost.

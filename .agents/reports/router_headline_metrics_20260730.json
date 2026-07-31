@@ -1,0 +1,61 @@
+{
+  "task_level_grouped_cv": {
+    "baseline_luna_max": {
+      "quality": 0.957901255588016,
+      "cost_per_task_usd": 3.002981195747899,
+      "quality_retention": 1.0,
+      "cost_savings": 0.0
+    },
+    "per_task_profile_cache_aware": {
+      "quality": 0.9318685894162946,
+      "cost_per_task_usd": 1.5693219017542017,
+      "quality_retention": 0.9730565710149757,
+      "worst_quality_retention": 0.9512929622976906,
+      "cost_savings": 0.4788373041784517,
+      "worst_cost_savings": 0.30399636049818235
+    },
+    "baseline_fable_xhigh": {
+      "quality": 0.9566185714654719,
+      "cost_per_task_usd": 13.041785605756303,
+      "quality_vs_luna_max": 0.9986632471471597,
+      "cost_savings_vs_luna_max": -3.343422638403686,
+      "coverage_note": "112 tasks with a scored Fable xhigh cell"
+    }
+  },
+  "turn_level_prefill_replay": {
+    "compute": "E2B remote sandbox",
+    "conversations": 1000,
+    "turns_per_conversation": 8,
+    "source_distribution": "113 DeepSWE task-description lengths",
+    "baseline_luna_max_sticky": {
+      "prefill_per_turn_usd": 0.00019574633125,
+      "traffic": {"gpt-5.6-luna__max": 1.0}
+    },
+    "per_task_profile_cache_sticky": {
+      "prefill_per_turn_usd": 0.00046176586875,
+      "traffic": {
+        "claude-opus-5__low": 0.34625,
+        "gpt-5.6-luna__xhigh": 0.65375
+      },
+      "switches_per_conversation": 0.0
+    },
+    "per_turn_profile_cache_aware": {
+      "prefill_per_turn_usd": 0.00020007515625,
+      "savings_vs_luna_max_sticky": -0.02211446300095088,
+      "traffic": {
+        "claude-opus-5__low": 0.06575,
+        "gpt-5.6-luna__xhigh": 0.93425
+      },
+      "switches_per_conversation": 0.334,
+      "turns_kept_for_cache_per_conversation": 2.244
+    },
+    "per_turn_profile_cold_no_cache": {
+      "prefill_per_turn_usd": 0.0046176586875,
+      "traffic": {
+        "claude-opus-5__low": 0.34625,
+        "gpt-5.6-luna__xhigh": 0.65375
+      }
+    },
+    "quality_note": "Turn-level quality is unavailable because the DeepSWE source matrix has task-level outcomes only."
+  }
+}
