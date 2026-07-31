@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -63,3 +64,16 @@ def test_candidate_ignores_generation_and_freezes_tests() -> None:
 def test_output_comparison_uses_tokens() -> None:
     assert module._output_matches("1  2\n3\n", "1 2 3")
     assert not module._output_matches("1 2", "1 3")
+
+
+def test_excluded_task_ids_require_unique_valid_rows(tmp_path: Path) -> None:
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({"tasks": [{"task_id": "1/C"}, {"task_id": "2/D"}]}))
+    assert module._excluded_task_ids(path) == {"1/C", "2/D"}
+    path.write_text(json.dumps({"tasks": [{"task_id": "1/C"}, {"task_id": "1/C"}]}))
+    try:
+        module._excluded_task_ids(path)
+    except ValueError as error:
+        assert "invalid or duplicate" in str(error)
+    else:
+        raise AssertionError("duplicate task IDs should be rejected")

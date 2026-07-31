@@ -58,6 +58,33 @@ def test_value_builds_exact_matched_blind_control() -> None:
     assert value["advantage"] == 0.5
 
 
+def test_delta_heads_score_without_refitting() -> None:
+    features = module.sparse.csr_matrix(
+        np.asarray(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ]
+        )
+    )
+    deltas = np.asarray(
+        [
+            [0.2, 0.1, 0.0, -0.1, -0.2],
+            [0.3, 0.2, 0.0, -0.2, -0.3],
+            [0.4, 0.3, 0.0, -0.3, -0.4],
+        ]
+    )
+    indices = np.arange(3)
+    models = module._fit_delta_models(features, deltas, indices, alpha=1.0)
+    predictions = module._score_delta_models(features, indices, models)
+    assert predictions.shape == (3, len(module.ARMS))
+    assert np.all(predictions[:, module.HIGH_INDEX] == 0.0)
+    assert all(
+        model is not None for index, model in enumerate(models) if index != module.HIGH_INDEX
+    )
+
+
 def test_spearman_handles_ties_and_order() -> None:
     assert module._spearman(np.asarray([1.0, 2.0, 3.0]), np.asarray([4.0, 5.0, 6.0])) == 1.0
     assert module._spearman(np.zeros(3), np.arange(3)) == 0.0

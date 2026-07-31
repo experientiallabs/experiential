@@ -209,12 +209,41 @@ def _predict_deltas(
     features = _features(data, candidate.dim, train)
     labels = data.rewards if label_rewards is None else label_rewards
     deltas = labels - labels[:, [HIGH_INDEX]]
-    predictions = np.zeros((len(test), len(ARMS)), dtype=np.float64)
+    models = _fit_delta_models(features, deltas, train, alpha=candidate.alpha)
+    return _score_delta_models(features, test, models)
+
+
+def _fit_delta_models(
+    features: sparse.csr_matrix,
+    deltas: np.ndarray,
+    train: np.ndarray,
+    *,
+    alpha: float,
+) -> tuple[Ridge | None, ...]:
+    """Fit the ephemeral per-arm delta heads used by one route policy."""
+    models: list[Ridge | None] = []
     for arm_index in range(len(ARMS)):
         if arm_index == HIGH_INDEX:
+            models.append(None)
             continue
-        model = Ridge(alpha=candidate.alpha)
+        model = Ridge(alpha=alpha)
         model.fit(features[train], deltas[train, arm_index])
+        models.append(model)
+    return tuple(models)
+
+
+def _score_delta_models(
+    features: sparse.csr_matrix,
+    test: np.ndarray,
+    models: tuple[Ridge | None, ...],
+) -> np.ndarray:
+    """Score fitted delta heads without fitting or persisting model state."""
+    if len(models) != len(ARMS):
+        raise ValueError("delta head count does not match the arm count")
+    predictions = np.zeros((len(test), len(ARMS)), dtype=np.float64)
+    for arm_index, model in enumerate(models):
+        if model is None:
+            continue
         predictions[:, arm_index] = model.predict(features[test])
     return predictions
 
@@ -495,7 +524,29 @@ def fit(
             data.costs.mean(axis=0),
             threshold=consensus_candidate.threshold,
         )
-    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000 / 100
+    decision_batch_ms = (time.perf_counter_ns() - started) / 1_000_000 / 100
+    full_features = _features(data, consensus_candidate.dim, all_indices)
+    full_deltas = data.rewards - data.rewards[:, [HIGH_INDEX]]
+    full_models = _fit_delta_models(
+        full_features,
+        full_deltas,
+        all_indices,
+        alpha=consensus_candidate.alpha,
+    )
+    started = time.perf_counter_ns()
+    for _ in range(100):
+        inference_features = _features(data, consensus_candidate.dim, all_indices)
+        inference_predictions = _score_delta_models(
+            inference_features,
+            all_indices,
+            full_models,
+        )
+        _choose(
+            inference_predictions,
+            data.costs.mean(axis=0),
+            threshold=consensus_candidate.threshold,
+        )
+    inference_batch_ms = (time.perf_counter_ns() - started) / 1_000_000 / 100
     report = {
         "protocol": "codeforces-nested-contest-grouped-fit-v1",
         "tasks": len(data.task_ids),
@@ -523,9 +574,12 @@ def fit(
             "passed_primary_advantage_gate": shuffled_gate,
         },
         "deployment_consensus_candidate": consensus,
-        "route_batch_160_mean_ms": elapsed_ms,
+        "route_decision_batch_160_mean_ms": decision_batch_ms,
+        "pre_inference_batch_160_mean_ms": inference_batch_ms,
         "external_gate": gate,
-        "deep_swe_evaluation_authorized": bool(gate["passed"]),
+        "confirmation_authorized": bool(gate["passed"]),
+        "deep_swe_evaluation_authorized": False,
+        "no_persisted_fitted_model": True,
         "target_outcomes_used": False,
         "target_embeddings_used": False,
         "inputs": {

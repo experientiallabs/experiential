@@ -1,6 +1,6 @@
 # Codeforces long-context effort development protocol
 
-Status: frozen before provider execution on 2026-07-31.
+Status: development complete; confirmation frozen before provider execution on 2026-07-31.
 
 ## Objective
 
@@ -71,3 +71,71 @@ matched task-blind advantage. The development report cannot authorize
 DeepSWE. If its grouped gate passes, the consensus rule is frozen and evaluated
 once on the already required untouched 160-task Codeforces confirmation cohort.
 No fitted numeric model is persisted.
+
+## Corrected development evidence
+
+The corrected matrix completed all 1,600 cells. Its combined outcomes have
+SHA-256 `da1491fa7c1da93124e9ab14ac14c026e257d8baf85815e4499b4ec27446e2a9`.
+The five static effort arms measured as follows:
+
+| Effort | Mean reward | Total cost, USD |
+| --- | ---: | ---: |
+| low | 0.80854 | 1.5436 |
+| medium | 0.87030 | 2.6149 |
+| high | 0.92390 | 6.8878 |
+| xhigh | 0.95406 | 11.8876 |
+| max | 0.97813 | 21.1883 |
+
+Three development families were evaluated with contest-grouped outer folds:
+
+- Native kNN failed because its shuffled-label control also had a positive
+  contest-bootstrap lower bound.
+- The RADAR-inspired IRT route improved over its matched task-blind mixture,
+  but failed its frozen uplift-correlation condition.
+- The direct sparse effort route passed all development conditions. Its
+  outer-heldout reward was 0.97016 at USD 15.7504, compared with 0.95210 for
+  the matched task-blind arm mixture. The advantage was 0.01806 with a
+  contest-bootstrap 95 percent interval of `[0.00749, 0.01801, 0.02908]`.
+  Its shuffled control failed, and no static arm dominated it.
+
+The corrected direct report has SHA-256
+`ba57bc38ab0dafe500654014e22627c6916347513022729cbde738cfb0dd07dc`.
+It authorizes confirmation only and explicitly leaves DeepSWE unauthorized.
+The full task-text hashing, structural scaling, four Ridge heads, and arm
+selection path took 462.45 ms per 160-task batch on the E2B reference worker,
+or about 2.89 ms per task. No fitted model was persisted.
+
+## Frozen confirmation rule and cohort
+
+The exact confirmation route is `direct-hash512-a10-t0`: signed character
+3-to-5-gram hashing with 512 features, the frozen structural features, four
+Ridge delta heads with alpha 10 relative to `luna-high`, threshold zero, and
+the cheapest-arm tie break. It is fit only on the complete corrected
+development matrix. No confirmation outcome may change its representation,
+regularization, threshold, arm roster, or tie break.
+
+The untouched confirmation cohort was then selected from the same pinned
+`open-r1/codeforces-cots` revision. It contains 160 previously unused tasks,
+140 contest groups, and exactly 40 tasks in each of C, D, E, and F+.
+Its task artifact has SHA-256
+`16746ede6cd2b853da0d11889e4edbb1d08262ffe7aebb98aa344215f045cf59`;
+its manifest has SHA-256
+`b187986bd517b003ec8c7769ead9922e5d3c6b4a1ae8d45fee0cdf97597d8dfa`.
+The manifest proves zero development-task overlap, zero normalized DeepSWE
+prompt overlap, no published-generation access, and no target-outcome access.
+
+Run the same five effort arms, two attempts, verifier, and 131,072 output-token
+limit for exactly 1,600 confirmation cells. The frozen route advances only if:
+
+1. every cell is gradeable and target sealed;
+2. route reward minus the matched task-blind mixture with the same arm counts
+   is positive and its contest-bootstrap 95 percent lower bound is above zero;
+3. no single static effort has at least the route reward at no greater cost;
+4. the same route fit after a fixed development-label permutation fails the
+   primary matched-blind advantage gate; and
+5. the full pre-inference path remains below 5 ms per task on the reference
+   E2B worker.
+
+Only a passing untouched confirmation authorizes the one sealed DeepSWE
+transfer. A failure is final for this route and cannot be repaired with
+confirmation-dependent tuning.

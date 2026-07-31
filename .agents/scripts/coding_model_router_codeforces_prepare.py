@@ -225,16 +225,35 @@ def _target_prompts(path: Path | None) -> set[str]:
     return prompts
 
 
+def _excluded_task_ids(path: Path | None) -> set[str]:
+    if path is None:
+        return set()
+    value = json.loads(path.read_text(encoding="utf-8"))
+    rows = value.get("tasks") if isinstance(value, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError(f"{path} has no tasks")
+    task_ids = {
+        str(row["task_id"])
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("task_id"), str)
+    }
+    if len(task_ids) != len(rows):
+        raise ValueError(f"{path} contains invalid or duplicate task IDs")
+    return task_ids
+
+
 def prepare(
     shards: list[Path],
     output: Path,
     *,
     target_tasks: Path | None,
+    exclude_tasks: Path | None,
     tasks_per_bucket: int,
     seed: int,
     workers: int,
 ) -> None:
     target_prompts = _target_prompts(target_tasks)
+    excluded_task_ids = _excluded_task_ids(exclude_tasks)
     columns = [
         "id",
         "contest_id",
@@ -257,7 +276,11 @@ def prepare(
             for raw in batch.to_pylist():
                 row = {str(key): item for key, item in raw.items()}
                 candidate = _candidate(row, seed=seed)
-                if candidate is None or _normalize(candidate.prompt) in target_prompts:
+                if (
+                    candidate is None
+                    or candidate.task_id in excluded_task_ids
+                    or _normalize(candidate.prompt) in target_prompts
+                ):
                     continue
                 by_id.setdefault(candidate.task_id, candidate)
     buckets: dict[str, list[Candidate]] = defaultdict(list)
@@ -349,6 +372,8 @@ def prepare(
         "bucket_mix": dict(Counter(row.bucket for row in selected)),
         "contest_groups": len({row.contest_id for row in selected}),
         "target_normalized_prompt_overlap": 0,
+        "excluded_task_ids": len(excluded_task_ids),
+        "excluded_task_overlap": len({row.task_id for row in selected} & excluded_task_ids),
         "target_outcomes_used": False,
         "published_generations_loaded": False,
         "tasks_sha256": _sha256(corpus_path),
@@ -364,6 +389,7 @@ def main() -> None:
     parser.add_argument("--shard", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-tasks", type=Path)
+    parser.add_argument("--exclude-tasks", type=Path)
     parser.add_argument("--tasks-per-bucket", type=int, default=40)
     parser.add_argument("--seed", type=int, default=20260731)
     parser.add_argument("--workers", type=int, default=8)
@@ -372,6 +398,7 @@ def main() -> None:
         args.shard,
         args.output,
         target_tasks=args.target_tasks,
+        exclude_tasks=args.exclude_tasks,
         tasks_per_bucket=args.tasks_per_bucket,
         seed=args.seed,
         workers=args.workers,
