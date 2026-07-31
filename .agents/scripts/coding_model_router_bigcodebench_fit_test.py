@@ -68,6 +68,25 @@ def _locked_candidate() -> object:
     )
 
 
+def _deployment_consensus() -> object:
+    config, digest = module.canonical_candidate_config(
+        {"alpha": 1.0, "dim": 512, "estimator": "ridge"}
+    )
+    return module.DeploymentConsensus(
+        family="ordinal",
+        name="ordinal-ridge",
+        order=0,
+        config_json=config,
+        config_sha256=digest,
+        mean_fit_reward=0.95,
+        mean_fit_cost_usd=0.01,
+        mean_matched_blind_reward=0.90,
+        mean_baseline_reward=0.96,
+        minimum_seed_retention=0.95 / 0.96,
+        fit_quality_feasible=True,
+    )
+
+
 def _selection_lock(tmp_path: Path) -> tuple[Path, object]:
     root = tmp_path / "root"
     root.mkdir()
@@ -105,6 +124,7 @@ def _selection_lock(tmp_path: Path) -> tuple[Path, object]:
             )
             for seed in module.OUTER_SEEDS
         ],
+        deployment_consensus=_deployment_consensus(),
     )
     return root, lock
 

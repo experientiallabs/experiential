@@ -156,6 +156,42 @@ class SeedSelection(BaseModel):
     selected: LockedCandidate
 
 
+class DeploymentConsensus(BaseModel):
+    """Single fit-only configuration frozen for later full-source refitting."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    protocol: Literal["bigcodebench-five-seed-fit-consensus-v1"] = (
+        "bigcodebench-five-seed-fit-consensus-v1"
+    )
+    family: Literal["knn", "ordinal", "doubly-robust", "empirical-bayes"]
+    name: str = Field(min_length=1)
+    order: int = Field(ge=0)
+    config_json: str = Field(min_length=2)
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mean_fit_reward: float = Field(ge=0.0, le=1.0)
+    mean_fit_cost_usd: float = Field(ge=0.0)
+    mean_matched_blind_reward: float = Field(ge=0.0, le=1.0)
+    mean_baseline_reward: float = Field(gt=0.0, le=1.0)
+    minimum_seed_retention: float = Field(ge=0.0)
+    fit_quality_feasible: bool
+    target_outcomes_used: Literal[False] = False
+    outer_heldout_evaluated: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _canonical_config_matches_digest(self) -> DeploymentConsensus:
+        value = json.loads(self.config_json)
+        if not isinstance(value, dict):
+            raise ValueError("deployment consensus config must be one JSON object")
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if canonical != self.config_json:
+            raise ValueError("deployment consensus config is not canonical JSON")
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        if digest != self.config_sha256:
+            raise ValueError("deployment consensus config digest differs")
+        return self
+
+
 class SelectionLock(BaseModel):
     """Immutable fit-only boundary required before outer-heldout replay."""
 
@@ -170,6 +206,7 @@ class SelectionLock(BaseModel):
     target_outcomes_used: Literal[False] = False
     outer_heldout_evaluated: Literal[False] = False
     seeds: list[SeedSelection] = Field(min_length=5, max_length=5)
+    deployment_consensus: DeploymentConsensus
 
     @model_validator(mode="after")
     def _five_exact_outer_seeds(self) -> SelectionLock:

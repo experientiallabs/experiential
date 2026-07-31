@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from coding_model_router_bigcodebench_fit import (
+    DeploymentConsensus,
     LockedCandidate,
     SeedSelection,
     SelectionLock,
@@ -74,6 +75,70 @@ def _selected(report: SeedFitReport) -> CandidateRecord:
     """Return the exact candidate named by one validated seed report."""
     return next(
         candidate for candidate in report.candidates if candidate.name == report.selected_name
+    )
+
+
+def fit_only_deployment_consensus(reports: list[SeedFitReport]) -> DeploymentConsensus:
+    """Select one configuration from five complete fit-only candidate inventories."""
+    ordered = sorted(reports, key=lambda report: report.seed)
+    if [report.seed for report in ordered] != list(range(5)):
+        raise ValueError("deployment consensus requires seeds 0 through 4")
+    reference = {candidate.name: candidate for candidate in ordered[0].candidates}
+    if len(reference) != 1_028:
+        raise ValueError("deployment consensus requires the frozen candidate inventory")
+    candidates_by_seed: list[dict[str, CandidateRecord]] = []
+    for report in ordered:
+        candidates = {candidate.name: candidate for candidate in report.candidates}
+        if set(candidates) != set(reference):
+            raise ValueError("fit reports contain different candidate inventories")
+        for name, candidate in candidates.items():
+            expected = reference[name]
+            if (
+                candidate.family != expected.family
+                or candidate.order != expected.order
+                or candidate.config_json != expected.config_json
+                or candidate.config_sha256 != expected.config_sha256
+            ):
+                raise ValueError(f"fit reports disagree on candidate identity {name}")
+        candidates_by_seed.append(candidates)
+    summaries: list[tuple[CandidateRecord, float, float, float, float, bool]] = []
+    for name, candidate in reference.items():
+        records = [candidates[name] for candidates in candidates_by_seed]
+        retentions = [
+            record.fit_reward / report.baseline_fit_reward
+            for record, report in zip(records, ordered, strict=True)
+        ]
+        summaries.append(
+            (
+                candidate,
+                sum(record.fit_reward for record in records) / 5.0,
+                sum(record.fit_cost_usd for record in records) / 5.0,
+                sum(record.matched_blind_reward for record in records) / 5.0,
+                min(retentions),
+                all(retention >= 0.95 for retention in retentions),
+            )
+        )
+    feasible = [summary for summary in summaries if summary[-1]]
+    if feasible:
+        selected = min(feasible, key=lambda summary: (summary[2], summary[0].order))
+    else:
+        selected = min(
+            summaries,
+            key=lambda summary: (-summary[4], -summary[1], summary[2], summary[0].order),
+        )
+    candidate, mean_reward, mean_cost, mean_blind_reward, min_retention, is_feasible = selected
+    return DeploymentConsensus(
+        family=candidate.family,
+        name=candidate.name,
+        order=candidate.order,
+        config_json=candidate.config_json,
+        config_sha256=candidate.config_sha256,
+        mean_fit_reward=mean_reward,
+        mean_fit_cost_usd=mean_cost,
+        mean_matched_blind_reward=mean_blind_reward,
+        mean_baseline_reward=sum(report.baseline_fit_reward for report in ordered) / 5.0,
+        minimum_seed_retention=min_retention,
+        fit_quality_feasible=is_feasible,
     )
 
 
@@ -160,6 +225,7 @@ def assemble_selection_lock(
         **current,
         code_commit=next(iter(commits)),
         seeds=seeds,
+        deployment_consensus=fit_only_deployment_consensus(reports),
     )
     write_selection_lock(output, lock)
     return require_selection_lock(root, output)

@@ -139,6 +139,25 @@ def test_assembly_requires_audited_exact_winners(tmp_path: Path) -> None:
     )
     assert len(lock.seeds) == 5
     assert all(seed.selected.latency_p95_ms == 2.0 for seed in lock.seeds)
+    assert lock.deployment_consensus.name == "candidate-0"
+    assert lock.deployment_consensus.fit_quality_feasible is True
+
+
+def test_consensus_rejects_different_candidate_inventories(tmp_path: Path) -> None:
+    root = _root(tmp_path / "root")
+    reports, _ = _evidence(root, tmp_path / "evidence")
+    report = run.SeedFitReport.model_validate_json(reports[0].read_text(encoding="utf-8"))
+    candidates = list(report.candidates)
+    candidates[-1] = candidates[-1].model_copy(update={"name": "different-candidate"})
+    reports[0].write_text(
+        report.model_copy(update={"candidates": candidates}).model_dump_json(),
+        encoding="utf-8",
+    )
+    values = [
+        run.SeedFitReport.model_validate_json(path.read_text(encoding="utf-8")) for path in reports
+    ]
+    with pytest.raises(ValueError, match="different candidate inventories"):
+        module.fit_only_deployment_consensus(values)
 
 
 def test_assembly_rejects_an_audit_for_a_different_report(tmp_path: Path) -> None:

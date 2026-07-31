@@ -218,6 +218,14 @@ uv run python .agents/scripts/coding_model_router_bigcodebench_lock.py \
 
 The assembler rechecks the report hashes, exact selected config, source commit, all matrix
 fingerprints, 10,000-decision latency gates, zero-call serving contract, and target-safe flags.
+It also proves that all five reports contain the same 1,028 canonical candidate identities and
+freezes one deployment consensus before any outer-heldout replay. A consensus candidate is fit
+quality feasible only when it retains at least 95 percent of that seed's fit-selected static
+baseline in every seed. Among feasible candidates, the lock chooses the lowest mean fit cost,
+then frozen candidate order. If none is feasible, it records the candidate with the best minimum
+seed retention, then mean reward, lower mean cost, and frozen order, but marks the consensus
+infeasible and forbids target transfer. The eventual deployable artifact refits this exact locked
+configuration on all external rows only after the external heldout promotion gates pass.
 
 Primary references:
 
