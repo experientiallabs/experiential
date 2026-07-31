@@ -146,6 +146,22 @@ def _cluster_policy() -> RoutingPolicy:
     )
 
 
+def _linear_policy() -> RoutingPolicy:
+    spec = EmbedderSpec(dim=32)
+    query = spec.build().embed(["route this coding task"])[0]
+    return RoutingPolicy(
+        kind="linear",
+        default_model="fable-5",
+        pool=_pool(),
+        embedder=spec,
+        linear_weak_model="haiku-4-5",
+        linear_strong_model="fable-5",
+        linear_weak_weights=[0.0] * spec.dim,
+        linear_strong_weights=query,
+        linear_threshold=0.5,
+    )
+
+
 def _client(tmp_path: Path, policy: RoutingPolicy | None = None) -> tuple[TestClient, Path]:
     log_path = tmp_path / "requests.jsonl"
     runtime = EndpointRuntime(
@@ -178,6 +194,23 @@ def test_completion_matches_openai_shape(tmp_path: Path) -> None:
         "prompt_tokens_details": {"cached_tokens": 0},
     }
     assert response.headers["x-wmo-routed-model"] == "haiku-4-5"
+
+
+def test_linear_policy_routes_through_the_serving_endpoint(tmp_path: Path) -> None:
+    client, log_path = _client(tmp_path, policy=_linear_policy())
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "tau-bench",
+            "messages": [{"role": "user", "content": "route this coding task"}],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["x-wmo-routed-model"] == "fable-5"
+    assert response.json()["choices"][0]["message"]["content"] == "served by fable-5"
+    row = _rows(log_path)[0]
+    assert row["model"] == "fable-5"
+    assert "linear router: predicted uplift" in str(row["routing_reason"])
 
 
 def test_streaming_emits_openai_chunks(tmp_path: Path) -> None:
