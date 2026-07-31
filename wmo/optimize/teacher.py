@@ -309,12 +309,6 @@ def _list_price(entry: PoolEntry) -> float | None:
     return price.input_per_mtok + price.output_per_mtok
 
 
-def _ladder_key(name: str, prices: dict[str, float | None]) -> tuple[bool, float, str]:
-    """Ascending price, unpriced models last, name as the deterministic tie-break."""
-    price = prices.get(name)
-    return (price is None, price if price is not None else 0.0, name)
-
-
 def _resolve_student(
     student: str | None,
     *,

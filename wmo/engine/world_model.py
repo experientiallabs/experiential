@@ -42,6 +42,15 @@ class _StepUsage:
 
 
 class WorldModel:
+    """A learned environment an agent can act in: stateful sessions over a serving provider.
+
+    Construct from a built artifact with `load` (the usual path) or wire the pieces directly.
+    `new_session` opens a task, `step` returns the predicted `Observation` for an action,
+    `score_session` judges task success, and `session_usage` reports what a session spent. The
+    optional agentic extras (knowledge, reasoning, grounding, verification, confidence) are off
+    by default, so a bare instance is pure retrieval-augmented prediction.
+    """
+
     def __init__(
         self,
         provider: Provider,

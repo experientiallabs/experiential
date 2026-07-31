@@ -12,6 +12,8 @@ from wmo.utils.waterfall import ChatMaxTokensField, ChatRequest, ChatResponse
 
 
 class ProviderKind(StrEnum):
+    """Which backend serves a provider's completions."""
+
     ANTHROPIC = "anthropic"  # Opus 4.8 direct
     BEDROCK = "bedrock"  # Claude 4.8 via AWS
     AZURE_OPENAI = "azure"  # GPT 5.5 via the Azure OpenAI service
@@ -45,11 +47,15 @@ Role = Literal["user", "assistant"]
 
 
 class Message(BaseModel):
+    """One turn of a completion request."""
+
     role: Role
     content: str
 
 
 class TokenUsage(BaseModel):
+    """Tokens one call billed, with the cache-read and cache-write subsets broken out."""
+
     input_tokens: int = 0
     output_tokens: int = 0
     # Prompt tokens served from the provider's cache (a SUBSET of input_tokens, never in
@@ -69,6 +75,8 @@ class TokenUsage(BaseModel):
 
 
 class Completion(BaseModel):
+    """One completion: its text, what it cost in tokens, and which model served it."""
+
     text: str
     usage: TokenUsage = Field(default_factory=TokenUsage)
     # The model that actually served, when the provider is a failover chain and a fallback took
@@ -81,6 +89,8 @@ DEFAULT_MAX_TOKENS = 8192
 
 
 class VerifyResult(BaseModel):
+    """Outcome of a provider credential/reachability check, per `wmo providers verify`."""
+
     ok: bool
     kind: ProviderKind
     model: str

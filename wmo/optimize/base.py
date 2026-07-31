@@ -131,6 +131,8 @@ class OptimizeMetrics(BaseModel):
 
 
 class OptimizeResult(BaseModel):
+    """What one optimizer run produced: the winning prompt, its frontier, metrics, artifacts."""
+
     prompt: str  # winning specialized env prompt ("" for optimizers that don't evolve prompts)
     frontier: list[str] = Field(default_factory=list)  # Pareto candidates
     metrics: OptimizeMetrics = Field(default_factory=OptimizeMetrics)
@@ -139,6 +141,8 @@ class OptimizeResult(BaseModel):
 
 @runtime_checkable
 class Optimizer(Protocol):
+    """The seam every optimizer implements: train/test traces and a budget in, a result out."""
+
     def optimize(
         self,
         train: list[Trace],

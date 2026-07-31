@@ -23,6 +23,8 @@ from wmo.providers.base import Message, Provider
 
 
 class Outcome(StrEnum):
+    """How a trace ended, as facet extraction read it."""
+
     SUCCESS = "success"
     FAILURE = "failure"
     UNKNOWN = "unknown"

@@ -16,6 +16,8 @@ JsonObject = dict[str, JsonValue]
 
 
 class ActionKind(StrEnum):
+    """What an `Action` is: a tool invocation, or free text to the user."""
+
     TOOL_CALL = "tool_call"
     MESSAGE = "message"
 

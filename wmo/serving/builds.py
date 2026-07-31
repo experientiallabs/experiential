@@ -66,6 +66,8 @@ class BuildRouteRequest(BaseModel):
 
 
 class BuildStatus(StrEnum):
+    """Lifecycle of one background build."""
+
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
