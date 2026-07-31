@@ -92,3 +92,54 @@ def test_matched_task_blind_control_preserves_arm_mix() -> None:
         "luna-xhigh": 0,
         "luna-max": 0,
     }
+
+
+def test_doubly_robust_dense_targets_equal_observed_arm_means() -> None:
+    rewards = np.zeros((3, len(module.ARMS), module.ATTEMPTS), dtype=np.float64)
+    rewards[0, 0, :] = 1.0
+    rewards[1, 2, :3] = 1.0
+    rewards[2, 4, 0] = 1.0
+    direct = np.full((3, len(module.ARMS)), 0.37, dtype=np.float64)
+    pseudo = module.doubly_robust_pseudo_values(rewards, direct)
+    assert np.allclose(pseudo, rewards.mean(axis=2))
+
+
+def test_empirical_bayes_uses_loo_and_unseen_global_fallback() -> None:
+    rewards = np.zeros((3, len(module.ARMS), module.ATTEMPTS), dtype=np.float64)
+    rewards[0, 0, :] = 1.0
+    rewards[1, 0, :] = 1.0
+    rewards[2, 1, :] = 1.0
+    train_base, test_base = module.empirical_bayes_family_predictions(
+        ["shared", "shared", "solo"],
+        ["shared", "unseen"],
+        rewards,
+        prior_strength=5.0,
+    )
+    global_mean = rewards.mean(axis=(0, 2))
+    expected_shared = (np.asarray([10.0, 0.0, 0.0, 0.0, 0.0]) + 5.0 * global_mean) / 15.0
+    assert np.allclose(train_base[0], (rewards[1].sum(axis=1) + 5.0 * global_mean) / 10.0)
+    assert np.allclose(train_base[2], global_mean)
+    assert np.allclose(test_base[0], expected_shared)
+    assert np.allclose(test_base[1], global_mean)
+
+
+def test_empirical_bayes_residual_predictions_are_monotone() -> None:
+    train_features = sparse.csr_matrix(np.eye(4, dtype=np.float64))
+    test_features = sparse.csr_matrix(np.eye(4, dtype=np.float64)[:2])
+    rewards = np.zeros((4, len(module.ARMS), module.ATTEMPTS), dtype=np.float64)
+    rewards[0, 0:2, :] = 1.0
+    rewards[1, 0:3, :] = 1.0
+    rewards[2, 0:4, :] = 1.0
+    rewards[3, :, :] = 1.0
+    predicted = module.empirical_bayes_ridge_predictions(
+        train_features,
+        test_features,
+        ["a", "a", "b", "b"],
+        ["a", "new"],
+        rewards,
+        prior_strength=5.0,
+        alpha=1.0,
+    )
+    assert predicted.shape == (2, len(module.ARMS))
+    assert np.all((0.0 <= predicted) & (predicted <= 1.0))
+    assert np.all(np.diff(predicted, axis=1) >= 0.0)

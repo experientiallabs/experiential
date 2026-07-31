@@ -261,6 +261,126 @@ def ordinal_ridge_predictions(
     return np.maximum.accumulate(np.clip(absolute, 0.0, 1.0), axis=1)
 
 
+def doubly_robust_pseudo_values(
+    rewards: np.ndarray,
+    direct_predictions: np.ndarray,
+    *,
+    propensity: float = 1.0 / len(ARMS),
+) -> np.ndarray:
+    """Build multi-action AIPW targets from the dense randomized effort matrix."""
+    if rewards.ndim != 3 or rewards.shape[1:] != (len(ARMS), ATTEMPTS):
+        raise ValueError("doubly robust rewards have the wrong shape")
+    if direct_predictions.shape != rewards.shape[:2]:
+        raise ValueError("direct predictions do not match doubly robust rewards")
+    if not 0.0 < propensity <= 1.0:
+        raise ValueError("propensity must be in (0, 1]")
+    tasks = rewards.shape[0]
+    pseudo = np.empty((tasks, len(ARMS)), dtype=np.float64)
+    for target_arm in range(len(ARMS)):
+        values = np.broadcast_to(
+            direct_predictions[:, target_arm, None, None],
+            (tasks, len(ARMS), ATTEMPTS),
+        ).copy()
+        residual = (
+            rewards[:, target_arm, :] - direct_predictions[:, target_arm, None]
+        ) / propensity
+        values[:, target_arm, :] += residual
+        pseudo[:, target_arm] = values.mean(axis=(1, 2))
+    return pseudo
+
+
+def _family_posterior(
+    successes: np.ndarray,
+    trials: float,
+    global_mean: np.ndarray,
+    *,
+    prior_strength: float,
+) -> np.ndarray:
+    return (successes + prior_strength * global_mean) / (trials + prior_strength)
+
+
+def empirical_bayes_family_predictions(
+    train_groups: list[str],
+    test_groups: list[str],
+    train_rewards: np.ndarray,
+    *,
+    prior_strength: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return leave-one-task-out train and heldout family posterior means."""
+    if train_rewards.ndim != 3 or train_rewards.shape[1:] != (len(ARMS), ATTEMPTS):
+        raise ValueError("empirical-Bayes rewards have the wrong shape")
+    if len(train_groups) != train_rewards.shape[0]:
+        raise ValueError("empirical-Bayes groups do not match rewards")
+    if prior_strength <= 0.0:
+        raise ValueError("prior strength must be positive")
+    global_mean = train_rewards.mean(axis=(0, 2))
+    family_successes: dict[str, np.ndarray] = {}
+    family_trials: dict[str, float] = {}
+    for index, group in enumerate(train_groups):
+        family_successes.setdefault(group, np.zeros(len(ARMS), dtype=np.float64))
+        family_successes[group] += train_rewards[index].sum(axis=1)
+        family_trials[group] = family_trials.get(group, 0.0) + ATTEMPTS
+
+    train_base = np.empty((len(train_groups), len(ARMS)), dtype=np.float64)
+    for index, group in enumerate(train_groups):
+        successes = family_successes[group] - train_rewards[index].sum(axis=1)
+        trials = family_trials[group] - ATTEMPTS
+        train_base[index] = _family_posterior(
+            successes,
+            trials,
+            global_mean,
+            prior_strength=prior_strength,
+        )
+    test_base = np.empty((len(test_groups), len(ARMS)), dtype=np.float64)
+    for index, group in enumerate(test_groups):
+        successes = family_successes.get(group, np.zeros(len(ARMS), dtype=np.float64))
+        trials = family_trials.get(group, 0.0)
+        test_base[index] = _family_posterior(
+            successes,
+            trials,
+            global_mean,
+            prior_strength=prior_strength,
+        )
+    return train_base, test_base
+
+
+def empirical_bayes_ridge_predictions(
+    train_features: sparse.csr_matrix,
+    test_features: sparse.csr_matrix,
+    train_groups: list[str],
+    test_groups: list[str],
+    train_rewards: np.ndarray,
+    *,
+    prior_strength: float,
+    alpha: float,
+) -> np.ndarray:
+    """Add local adjacent-effort residual heads to family-shrunk posteriors."""
+    train_base, test_base = empirical_bayes_family_predictions(
+        train_groups,
+        test_groups,
+        train_rewards,
+        prior_strength=prior_strength,
+    )
+    observed = train_rewards.mean(axis=2)
+    observed_parts = np.column_stack([observed[:, 0], np.diff(observed, axis=1)])
+    base_parts = np.column_stack([train_base[:, 0], np.diff(train_base, axis=1)])
+    residual_parts: list[np.ndarray] = []
+    for column in range(observed_parts.shape[1]):
+        model = Ridge(alpha=alpha)
+        model.fit(train_features, observed_parts[:, column] - base_parts[:, column])
+        residual_parts.append(np.asarray(model.predict(test_features), dtype=np.float64))
+    test_parts = np.column_stack([test_base[:, 0], np.diff(test_base, axis=1)]) + np.column_stack(
+        residual_parts
+    )
+    absolute = np.column_stack(
+        [
+            test_parts[:, 0],
+            test_parts[:, 0, None] + np.cumsum(test_parts[:, 1:], axis=1),
+        ]
+    )
+    return np.maximum.accumulate(np.clip(absolute, 0.0, 1.0), axis=1)
+
+
 def evaluate_choices(
     rewards: np.ndarray,
     costs: np.ndarray,
