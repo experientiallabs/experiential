@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import importlib.util
 import sys
@@ -121,3 +122,143 @@ def test_repository_bootstrap_is_seed_balanced_and_deterministic() -> None:
     assert first == second
     assert len(first) == len(rows)
     assert {row["seed"] for row in first} == set(range(5))
+
+
+def test_external_replay_and_promotion_integrate_on_synthetic_rows(tmp_path: Path) -> None:
+    module = _module()
+    sources = tmp_path / "sources"
+    reports = tmp_path / "reports"
+    consensus = tmp_path / "consensus"
+    audits = tmp_path / "audits"
+    controls = tmp_path / "controls"
+    for directory in (sources, reports, consensus, audits):
+        directory.mkdir()
+    candidate = next(
+        spec
+        for spec in module.selection._candidate_specs()
+        if spec.name == "hash512-ridge-heads-a1"
+    )
+    shuffled = next(
+        spec
+        for spec in module.selection._control_specs()
+        if spec.name == "hash2048-ridge-heads-shuffled-a1"
+    )
+    winner = {
+        "name": candidate.name,
+        "family": "numeric",
+        "is_control": False,
+        "config": dataclasses.asdict(candidate),
+        "primary": {
+            "threshold": 0.0,
+            "retention": 1.0,
+            "strong_traffic": 1.0,
+            "router_reward": 1.0,
+        },
+    }
+    shuffled_row = {
+        "name": shuffled.name,
+        "family": "numeric-control",
+        "is_control": True,
+        "config": dataclasses.asdict(shuffled),
+        "primary": {
+            "threshold": 0.0,
+            "retention": 1.0,
+            "strong_traffic": 1.0,
+            "router_reward": 1.0,
+        },
+    }
+    manifest_rows = []
+    for seed in range(5):
+        fit_rows = [
+            {
+                "instance_id": f"fit-{seed}-{index}",
+                "repo": f"fit-repo-{index // 2}",
+                "text": f"fix fit issue {index}",
+                "cheap_reward": 0.0,
+                "strong_reward": float(index % 2 == 0),
+            }
+            for index in range(10)
+        ]
+        heldout_rows = [
+            {
+                "instance_id": f"heldout-{seed}-{index}",
+                "repo": f"heldout-repo-{index // 2}",
+                "text": f"fix heldout issue {index}",
+                "cheap_reward": 0.0,
+                "strong_reward": float(index % 2 == 0),
+            }
+            for index in range(10)
+        ]
+        fit_path = sources / f"seed-{seed}-fit.json"
+        heldout_path = sources / f"seed-{seed}-heldout.json"
+        module._write_json(fit_path, fit_rows)
+        module._write_json(heldout_path, heldout_rows)
+        manifest_rows.append(
+            {
+                "seed": seed,
+                "fit_sha256": module._sha256_file(fit_path),
+                "heldout_sha256": module._sha256_file(heldout_path),
+            }
+        )
+        fit_texts = [str(row["text"]) for row in fit_rows]
+        weak = np.asarray([float(row["cheap_reward"]) for row in fit_rows])
+        strong = np.asarray([float(row["strong_reward"]) for row in fit_rows])
+        artifact_path = consensus / f"seed-{seed}.joblib"
+        module.selection._fit_artifact(winner, fit_texts, weak, strong, artifact_path)
+        consensus_report_path = consensus / f"seed-{seed}.json"
+        module._write_json(
+            consensus_report_path,
+            {"seed": seed, "consensus_name": candidate.name, "winner": winner},
+        )
+        module._write_json(
+            audits / f"seed-{seed}.json",
+            {
+                "passed": True,
+                "report_sha256": module._sha256_file(consensus_report_path),
+                "artifact_sha256": module._sha256_file(artifact_path),
+            },
+        )
+        module._write_json(
+            reports / f"seed-{seed}.json",
+            {"seed": seed, "leaderboard": [winner, shuffled_row]},
+        )
+    split_manifest = tmp_path / "split-manifest.json"
+    module._write_json(split_manifest, {"seeds": manifest_rows})
+    lock = tmp_path / "selection-lock.json"
+    module._write_json(
+        lock,
+        {
+            "consensus_feasible": True,
+            "consensus_name": candidate.name,
+            "outer_heldout_evaluated": False,
+        },
+    )
+    evaluation = tmp_path / "evaluation.json"
+    module._evaluate(
+        argparse.Namespace(
+            output=evaluation,
+            lock=lock,
+            split_manifest=split_manifest,
+            sources_dir=sources,
+            reports_dir=reports,
+            consensus_dir=consensus,
+            audits_dir=audits,
+            control_artifact_dir=controls,
+        )
+    )
+    evaluated = module._read_object(evaluation)
+    assert evaluated["outer_heldout_replay_count"] == 1
+    assert len(evaluated["rows"]) == 50
+    module.BOOTSTRAP_SAMPLES = 50
+    promotion = tmp_path / "promotion.json"
+    module._promote(
+        argparse.Namespace(
+            evaluation=evaluation,
+            lock=lock,
+            audits_dir=audits,
+            output=promotion,
+        )
+    )
+    promoted = module._read_object(promotion)
+    assert promoted["bootstrap_samples"] == 50
+    assert promoted["target_outcomes_used"] is False
