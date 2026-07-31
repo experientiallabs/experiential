@@ -71,10 +71,7 @@ from typing import TYPE_CHECKING, Literal
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator, model_validator
-
-from wmo.utils.waterfall.types import ChatChoice, ChatRequest, ChatResponse, ChatTool, ChatToolCall
-from wmo.utils.waterfall.types import ChatMessage as ProviderChatMessage
+from pydantic import BaseModel, Field, JsonValue, field_validator, model_validator
 from starlette.background import BackgroundTask
 
 from wmo.optimize.compression import (

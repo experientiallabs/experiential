@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
     from anthropic import Anthropic
     from anthropic.types import MessageParam
+
     from wmo.utils.waterfall import ChatRequest, ChatResponse
 
 

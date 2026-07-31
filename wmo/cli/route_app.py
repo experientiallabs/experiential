@@ -42,13 +42,12 @@ if TYPE_CHECKING:
     # Type-only: real imports are local to the commands and helpers that construct or inspect
     # these values, so importing this module never pulls the optimize/engine/env/distill/pool
     # bodies behind it.
-    from wmo.utils.waterfall import ChatMaxTokensField
-
     from wmo.optimize.knn import DialResult, KnnFitOutcome
     from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
     from wmo.optimize.policy import RoutingPolicy
     from wmo.optimize.sweep import CandidateCoverage, DeferredRisk, SweepPlan, SweepRun
     from wmo.providers.pool import PoolEntry
+    from wmo.utils.waterfall import ChatMaxTokensField
 
 # The two output-budget parameter names any OpenAI-compatible backend accepts.
 _MAX_TOKENS_FIELDS: tuple[ChatMaxTokensField, ...] = ("max_tokens", "max_completion_tokens")

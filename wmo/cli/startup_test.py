@@ -15,8 +15,6 @@ def _run(code: str) -> None:
     subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
 
 
-
-
 def test_cli_import_stays_free_of_heavy_third_parties() -> None:
     _run(
         """

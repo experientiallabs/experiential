@@ -1191,9 +1191,7 @@ def test_world_model_loop_rejects_detach(monkeypatch: pytest.MonkeyPatch) -> Non
 
     lines = iter([":detach", ":quit"])
     monkeypatch.setattr(mod._console, "input", lambda *_a, **_k: next(lines))
-    driver = mod.RemoteWorldModelDriver(
-        cast("PlatformClient", _Client()), "wm-1", "Model", None
-    )
+    driver = mod.RemoteWorldModelDriver(cast("PlatformClient", _Client()), "wm-1", "Model", None)
 
     driver._loop("sess-1")
 

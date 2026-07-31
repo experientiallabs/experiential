@@ -5,13 +5,12 @@ from __future__ import annotations
 import json
 from typing import cast
 
-from wmo.utils.waterfall import ChatRequest
-
 from wmo.providers._anthropic_chat import (
     CACHE_CONTROL_EPHEMERAL,
     messages_request,
     messages_response,
 )
+from wmo.utils.waterfall import ChatRequest
 
 
 def _messages(payload: dict[str, object]) -> list[dict[str, object]]:
