@@ -59,6 +59,7 @@ from wmo.core.types import JsonObject
 from wmo.ingest.adapter import VendorPull, register_adapter
 from wmo.ingest.base import BaseTraceAdapter
 from wmo.ingest.normalize import (
+    SpanEmitter,
     SpanRecord,
     as_text,
     iso_to_ordinal,
@@ -209,30 +210,12 @@ class LangfuseAdapter(BaseTraceAdapter):
         indexed = list(enumerate(obs_list))
         indexed.sort(key=lambda pair: (_start_ordinal(pair[1], pair[0]), pair[0]))
 
-        spans: list[SpanRecord] = []
-        ordinal = 0
-
-        def emit(attrs: JsonObject, *, tool: bool, error: bool = False) -> None:
-            nonlocal ordinal
-            if ordinal == 0:
-                if task is not None:
-                    attrs.setdefault("gen_ai.prompt", as_text(task))
-                if meta_obj:
-                    attrs.setdefault("wmo.trace.metadata", json.dumps(meta_obj))
-            spans.append(
-                SpanRecord(
-                    trace_id=trace_id,
-                    span_id=f"{trace_id[:12]}{ordinal:06x}{'t' if tool else 'a'}",
-                    name="execute_tool" if tool else "chat",
-                    start_nano=ordinal,
-                    attributes={
-                        "gen_ai.operation.name": "execute_tool" if tool else "chat",
-                        **attrs,
-                    },
-                    status_error=error,
-                )
-            )
-            ordinal += 1
+        first_attributes: JsonObject = {}
+        if task is not None:
+            first_attributes["gen_ai.prompt"] = as_text(task)
+        if meta_obj:
+            first_attributes["wmo.trace.metadata"] = json.dumps(meta_obj)
+        emitter = SpanEmitter(trace_id, first_attributes)
 
         for _, obs in indexed:
             otype = _as_str(obs.get("type")).upper()
@@ -244,7 +227,7 @@ class LangfuseAdapter(BaseTraceAdapter):
                 # the nearest following execute_tool span), so we do NOT synthesize a result here.
                 for tool_call in calls:
                     name, args = openai_call_name_args(tool_call)
-                    emit(
+                    emitter.emit(
                         {"gen_ai.tool.name": name, "gen_ai.tool.call.arguments": args},
                         tool=False,
                         error=error,
@@ -254,7 +237,7 @@ class LangfuseAdapter(BaseTraceAdapter):
                 # `output` is the observation; the normalizer pairs it with the preceding action
                 # span (the GENERATION's tool call), backfilling name/args from here if the action
                 # lacked them. We carry name/args too so a standalone TOOL (no GENERATION) pairs.
-                emit(
+                emitter.emit(
                     {
                         "gen_ai.tool.name": _observation_tool_name(obs),
                         "gen_ai.tool.call.arguments": as_text(obs.get("input")),
@@ -265,9 +248,11 @@ class LangfuseAdapter(BaseTraceAdapter):
                 )
             elif otype == "GENERATION":
                 # A plain LLM turn (no tool call): a message action, no observation.
-                emit({"gen_ai.completion": as_text(obs.get("output"))}, tool=False, error=error)
+                emitter.emit(
+                    {"gen_ai.completion": as_text(obs.get("output"))}, tool=False, error=error
+                )
             # EVENT (and other non-actionable) observations are ignored.
-        return spans
+        return emitter.spans
 
     def _span_is_tool(self, observation: JsonObject) -> bool:
         """A SPAN observation is a tool execution when it has output or a tool name/field."""

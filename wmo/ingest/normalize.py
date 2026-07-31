@@ -127,6 +127,45 @@ class SpanRecord(BaseModel):
     status_error: bool = False
 
 
+class SpanEmitter:
+    """Ordered `SpanRecord` builder for one trace, shared by the row-shaped adapters.
+
+    Providers that log rows rather than OTLP spans (Langfuse, LangSmith, Braintrust, Mastra,
+    PostHog) all synthesize spans in the GenAI vocabulary the same way: a per-trace ordinal that
+    is both the span id suffix and the start-time sort key, `chat` for an action span and
+    `execute_tool` for a tool-result span, and trace-level attributes seeded onto the first span
+    only. This class owns that shape so the adapters keep only their own row mapping.
+
+    Args:
+        trace_id: Trace every emitted span belongs to.
+        first_attributes: Attributes seeded onto the first span emitted (the trace task and
+            metadata). Seeded with `setdefault`, so a span carrying its own value keeps it.
+    """
+
+    def __init__(self, trace_id: str, first_attributes: JsonObject | None = None) -> None:
+        self.trace_id = trace_id
+        self.spans: list[SpanRecord] = []
+        self._first_attributes = first_attributes or {}
+
+    def emit(self, attrs: JsonObject, *, tool: bool, error: bool = False) -> None:
+        """Append one span for this trace: `execute_tool` when `tool`, else `chat`."""
+        ordinal = len(self.spans)
+        if ordinal == 0:
+            for key, value in self._first_attributes.items():
+                attrs.setdefault(key, value)
+        name = "execute_tool" if tool else "chat"
+        self.spans.append(
+            SpanRecord(
+                trace_id=self.trace_id,
+                span_id=f"{self.trace_id[:12]}{ordinal:06x}{'t' if tool else 'a'}",
+                name=name,
+                start_nano=ordinal,
+                attributes={"gen_ai.operation.name": name, **attrs},
+                status_error=error,
+            )
+        )
+
+
 # --- value coercion ---------------------------------------------------------------------------
 
 

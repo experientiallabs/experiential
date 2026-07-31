@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from wmo.core.types import ErrorClass, StepAttribution
 from wmo.ingest.normalize import (
+    SpanEmitter,
     SpanRecord,
     iso_to_ordinal,
     openai_call_name_args,
@@ -189,3 +190,33 @@ def test_step_attribution_captures_request_config() -> None:
     assert attribution.config == {"temperature": 0.2, "max_tokens": 512, "top_p": 0.9}
     # The model key is attribution.model, never duplicated into config.
     assert "model" not in attribution.config
+
+
+def test_span_emitter_orders_spans_and_seeds_only_the_first() -> None:
+    """The shape the row adapters share: ordinal ids/sort keys, first-span-only trace attributes."""
+    emitter = SpanEmitter("trace-abcdefghijkl", {"gen_ai.prompt": "do it"})
+    emitter.emit({"gen_ai.tool.name": "search"}, tool=False)
+    emitter.emit({"gen_ai.tool.message": "found"}, tool=True, error=True)
+
+    action, observation = emitter.spans
+    assert action.name == "chat"
+    assert action.attributes["gen_ai.operation.name"] == "chat"
+    assert action.attributes["gen_ai.prompt"] == "do it"
+    assert (action.span_id, action.start_nano) == ("trace-abcdef000000a", 0)
+    assert not action.status_error
+    assert observation.name == "execute_tool"
+    assert observation.attributes["gen_ai.operation.name"] == "execute_tool"
+    # Trace-level attributes are seeded once, onto the first span only.
+    assert "gen_ai.prompt" not in observation.attributes
+    assert (observation.span_id, observation.start_nano) == ("trace-abcdef000001t", 1)
+    assert observation.status_error
+
+
+def test_span_emitter_keeps_a_span_own_value_and_needs_no_trace_attributes() -> None:
+    emitter = SpanEmitter("t1", {"gen_ai.prompt": "seeded"})
+    emitter.emit({"gen_ai.prompt": "own"}, tool=False)
+    assert emitter.spans[0].attributes["gen_ai.prompt"] == "own"
+
+    bare = SpanEmitter("t2")
+    bare.emit({"gen_ai.completion": "hi"}, tool=False)
+    assert bare.spans[0].attributes == {"gen_ai.operation.name": "chat", "gen_ai.completion": "hi"}
