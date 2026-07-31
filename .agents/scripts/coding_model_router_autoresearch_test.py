@@ -257,6 +257,40 @@ def test_combine_deduplicates_exact_normalized_text() -> None:
     assert combined.task_ids == ["a", "b"]
 
 
+def test_combine_keeps_distinct_variants_with_shared_id_and_balances_sources() -> None:
+    module = _module()
+    variants = module.SourceData(
+        name="variants",
+        task_ids=["shared", "shared"],
+        groups=["repo", "repo"],
+        texts=["original prompt", "perturbed prompt"],
+        weak=np.asarray([0.0, 0.0]),
+        strong=np.asarray([1.0, 1.0]),
+        weak_attempts=np.ones(2),
+        strong_attempts=np.ones(2),
+    )
+    singleton = module.SourceData(
+        name="singleton",
+        task_ids=["other"],
+        groups=["repo-2"],
+        texts=["another task"],
+        weak=np.asarray([0.0]),
+        strong=np.asarray([1.0]),
+        weak_attempts=np.ones(1),
+        strong_attempts=np.ones(1),
+    )
+    combined = module._combine([variants, singleton])
+    assert len(combined.task_ids) == 3
+    assert len(set(combined.task_ids)) == 3
+    totals = {
+        source: float(
+            combined.sample_weight[np.asarray(combined.source_names, dtype=object) == source].sum()
+        )
+        for source in set(combined.source_names)
+    }
+    assert totals["variants"] == totals["singleton"]
+
+
 def test_empirical_bayes_rate_preserves_source_mean_and_arm_order() -> None:
     module = _module()
     weak_mean = 0.075

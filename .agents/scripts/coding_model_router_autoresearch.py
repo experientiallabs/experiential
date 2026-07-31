@@ -535,31 +535,34 @@ def _load_swebench(matrix_path: Path, task_path: Path) -> SourceData:
 
 
 def _combine(sources: list[SourceData]) -> CombinedData:
-    counts = {source.name: len(source.task_ids) for source in sources}
     seen_text: set[str] = set()
-    seen_task_ids: set[str] = set()
+    assigned_task_ids: set[str] = set()
     source_names: list[str] = []
     task_ids: list[str] = []
     groups: list[str] = []
     texts: list[str] = []
     weak: list[float] = []
     strong: list[float] = []
-    weights: list[float] = []
     for source in sources:
         for index, text in enumerate(source.texts):
             digest = hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
-            task_id = source.task_ids[index].strip().lower()
-            if digest in seen_text or task_id in seen_task_ids:
+            if digest in seen_text:
                 continue
             seen_text.add(digest)
-            seen_task_ids.add(task_id)
+            task_id = source.task_ids[index]
+            if task_id in assigned_task_ids:
+                task_id = f"{source.name}:{task_id}:{digest[:12]}"
+            if task_id in assigned_task_ids:
+                raise ValueError(f"combined task id collision after namespacing: {task_id}")
+            assigned_task_ids.add(task_id)
             source_names.append(source.name)
-            task_ids.append(source.task_ids[index])
+            task_ids.append(task_id)
             groups.append(source.groups[index])
             texts.append(text)
             weak.append(float(source.weak[index]))
             strong.append(float(source.strong[index]))
-            weights.append(1.0 / counts[source.name])
+    retained = collections.Counter(source_names)
+    weights = [1.0 / retained[source] for source in source_names]
     weight_array = np.asarray(weights, dtype=np.float64)
     weight_array *= len(weight_array) / weight_array.sum()
     return CombinedData(
