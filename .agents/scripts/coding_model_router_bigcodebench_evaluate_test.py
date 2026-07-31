@@ -165,3 +165,55 @@ def test_economic_knn_candidate_round_trips_from_lock() -> None:
         order=candidate.order,
     )
     assert rebuilt == candidate
+
+
+def test_seed_report_contains_exact_heldout_controls(tmp_path: Path) -> None:
+    data = _data()
+    train, heldout = _split()
+    split = fit.TaskSplit(seed=0, train_indices=train, test_indices=heldout)
+    spec = select.CandidateSpec("ordinal", "ridge", 512, 0, alpha=1.0)
+    _, config_sha256 = fit.canonical_candidate_config(spec.config())
+    report = module.seed_heldout_report(
+        data,
+        split,
+        spec,
+        code_commit="a" * 40,
+        selection_lock_sha256="b" * 64,
+        seed_fit_report_sha256="c" * 64,
+        winner_audit_sha256="d" * 64,
+        candidate_config_sha256=config_sha256,
+        work_dir=tmp_path,
+    )
+    assert report.heldout_tasks == len(heldout)
+    assert len(report.controls) == 9
+    assert {control.kind for control in report.controls} == {
+        "static",
+        "matched-task-blind",
+        "random",
+        "cost-only",
+        "shuffled-label",
+    }
+    assert all(sum(control.arm_counts.values()) == len(heldout) for control in report.controls)
+
+
+def test_seed_report_rejects_missing_control(tmp_path: Path) -> None:
+    data = _data()
+    train, heldout = _split()
+    split = fit.TaskSplit(seed=0, train_indices=train, test_indices=heldout)
+    spec = select.CandidateSpec("ordinal", "ridge", 512, 0, alpha=1.0)
+    _, config_sha256 = fit.canonical_candidate_config(spec.config())
+    report = module.seed_heldout_report(
+        data,
+        split,
+        spec,
+        code_commit="a" * 40,
+        selection_lock_sha256="b" * 64,
+        seed_fit_report_sha256="c" * 64,
+        winner_audit_sha256="d" * 64,
+        candidate_config_sha256=config_sha256,
+        work_dir=tmp_path,
+    )
+    value = report.model_dump()
+    value["controls"] = value["controls"][:-1]
+    with pytest.raises(ValueError, match="at least 9 items"):
+        module.SeedHeldoutReport.model_validate(value)

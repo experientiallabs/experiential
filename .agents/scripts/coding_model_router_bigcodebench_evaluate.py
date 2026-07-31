@@ -7,6 +7,7 @@ the original heldout outcomes. DeepSWE artifacts are outside this module.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,10 +19,15 @@ from coding_model_router_bigcodebench_fit import (
     CandidateMetric,
     FitData,
     PolicyValue,
+    TaskSplit,
+    cost_only_choices,
     evaluate_choices,
     feature_matrix,
     fit_native_knn_replay,
     fit_selected_static,
+    random_choices,
+    seed_split_provenance,
+    shuffled_task_rewards,
 )
 from coding_model_router_bigcodebench_select import (
     CandidateSpec,
@@ -30,6 +36,9 @@ from coding_model_router_bigcodebench_select import (
     KnnCandidateSpec,
     _candidate_choices,
 )
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+ControlKind = Literal["static", "matched-task-blind", "random", "cost-only", "shuffled-label"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +50,111 @@ class HeldoutReplay:
     value: PolicyValue
     baseline: PolicyValue
     metric: CandidateMetric
+
+
+class ValueRecord(BaseModel):
+    """Observed reward, cost, and effort traffic for one heldout policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reward: float = Field(ge=0.0, le=1.0)
+    cost_usd: float = Field(ge=0.0)
+    arm_counts: dict[str, int]
+
+    @model_validator(mode="after")
+    def _complete_nonnegative_traffic(self) -> ValueRecord:
+        if set(self.arm_counts) != set(ARMS):
+            raise ValueError("heldout traffic must contain every frozen effort arm")
+        if any(count < 0 for count in self.arm_counts.values()):
+            raise ValueError("heldout traffic counts must be nonnegative")
+        return self
+
+
+class HeldoutControlRecord(ValueRecord):
+    """One preregistered outer-heldout negative or static control."""
+
+    kind: ControlKind
+    name: str = Field(min_length=1)
+
+
+class HeldoutTaskRecord(BaseModel):
+    """Paired task-level evidence retained for grouped promotion statistics."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    task_id: str = Field(min_length=1)
+    group: str = Field(min_length=1)
+    arm_rewards: dict[str, float]
+    arm_costs_usd: dict[str, float]
+    router_arm: str
+    baseline_arm: str
+    random_arm: str
+    cost_only_arm: str
+    shuffled_label_arm: str
+
+    @model_validator(mode="after")
+    def _complete_valid_effort_rows(self) -> HeldoutTaskRecord:
+        if set(self.arm_rewards) != set(ARMS) or set(self.arm_costs_usd) != set(ARMS):
+            raise ValueError("heldout task row must contain every frozen effort arm")
+        if any(not 0.0 <= reward <= 1.0 for reward in self.arm_rewards.values()):
+            raise ValueError("heldout task row contains an invalid reward")
+        if any(cost < 0.0 or not np.isfinite(cost) for cost in self.arm_costs_usd.values()):
+            raise ValueError("heldout task row contains an invalid cost")
+        choices = (
+            self.router_arm,
+            self.baseline_arm,
+            self.random_arm,
+            self.cost_only_arm,
+            self.shuffled_label_arm,
+        )
+        if any(choice not in ARMS for choice in choices):
+            raise ValueError("heldout task row selected an unknown effort arm")
+        return self
+
+
+class SeedHeldoutReport(BaseModel):
+    """Immutable result of one locked candidate's single outer replay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    protocol: Literal["bigcodebench-outer-heldout-seed-v1"] = "bigcodebench-outer-heldout-seed-v1"
+    seed: int = Field(ge=0, le=4)
+    code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    selection_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    seed_fit_report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    winner_audit_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fit_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    heldout_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fit_tasks: int = Field(gt=0)
+    heldout_tasks: int = Field(gt=0)
+    candidate_family: str = Field(min_length=1)
+    candidate_name: str = Field(min_length=1)
+    candidate_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    router: ValueRecord
+    baseline: ValueRecord
+    controls: list[HeldoutControlRecord] = Field(min_length=9, max_length=9)
+    tasks: list[HeldoutTaskRecord] = Field(min_length=1)
+    target_outcomes_used: Literal[False] = False
+    outer_heldout_evaluated: Literal[True] = True
+
+    @model_validator(mode="after")
+    def _exact_controls_and_traffic(self) -> SeedHeldoutReport:
+        expected = {f"static-{arm}" for arm in ARMS} | {
+            "selected-matched-task-blind",
+            "seeded-uniform-random",
+            "fit-cost-only",
+            "selected-shuffled-labels",
+        }
+        names = [control.name for control in self.controls]
+        if set(names) != expected or len(names) != len(set(names)):
+            raise ValueError("heldout report does not contain the exact frozen controls")
+        values: list[ValueRecord] = [self.router, self.baseline, *self.controls]
+        if any(sum(value.arm_counts.values()) != self.heldout_tasks for value in values):
+            raise ValueError("heldout policy traffic does not cover every heldout task")
+        task_ids = [task.task_id for task in self.tasks]
+        if len(self.tasks) != self.heldout_tasks or len(task_ids) != len(set(task_ids)):
+            raise ValueError("heldout task evidence does not match the heldout task count")
+        return self
 
 
 def _number(config: dict[str, object], key: str) -> float:
@@ -127,6 +241,168 @@ def candidate_spec_from_lock(
     if canonical != config_json or spec.name != name:
         raise ValueError("locked candidate config does not reproduce its identity")
     return spec
+
+
+def _value_record(value: PolicyValue) -> ValueRecord:
+    """Convert one in-memory policy value to a durable report row."""
+    return ValueRecord(
+        reward=value.reward,
+        cost_usd=value.cost_usd,
+        arm_counts=value.arm_counts,
+    )
+
+
+def _control_record(
+    kind: ControlKind,
+    name: str,
+    value: PolicyValue,
+) -> HeldoutControlRecord:
+    """Convert one in-memory control value to a durable report row."""
+    return HeldoutControlRecord(
+        kind=kind,
+        name=name,
+        reward=value.reward,
+        cost_usd=value.cost_usd,
+        arm_counts=value.arm_counts,
+    )
+
+
+def seed_heldout_report(
+    data: FitData,
+    split: TaskSplit,
+    spec: CandidateSpec | KnnCandidateSpec,
+    *,
+    code_commit: str,
+    selection_lock_sha256: str,
+    seed_fit_report_sha256: str,
+    winner_audit_sha256: str,
+    candidate_config_sha256: str,
+    work_dir: Path,
+) -> SeedHeldoutReport:
+    """Run one outer replay and all nine preregistered heldout controls."""
+    canonical_config = json.dumps(spec.config(), sort_keys=True, separators=(",", ":"))
+    if hashlib.sha256(canonical_config.encode()).hexdigest() != candidate_config_sha256:
+        raise ValueError("heldout candidate config differs from the locked digest")
+    fit = split.train_indices
+    heldout = split.test_indices
+    replay = replay_outer_heldout(
+        data,
+        fit,
+        heldout,
+        spec,
+        seed=split.seed,
+        work_dir=work_dir / "router",
+    )
+    rewards = data.rewards[heldout].mean(axis=2)
+    costs = data.costs[heldout].mean(axis=2)
+    controls = [
+        _control_record(
+            "static",
+            f"static-{arm}",
+            evaluate_choices(
+                rewards,
+                costs,
+                np.full(len(heldout), arm_index, dtype=np.int64),
+            ),
+        )
+        for arm_index, arm in enumerate(ARMS)
+    ]
+    controls.append(
+        HeldoutControlRecord(
+            kind="matched-task-blind",
+            name="selected-matched-task-blind",
+            reward=replay.value.matched_blind_reward,
+            cost_usd=replay.value.matched_blind_cost_usd,
+            arm_counts=replay.value.arm_counts,
+        )
+    )
+    random_assignment = random_choices(len(heldout), seed=40_000 + split.seed)
+    controls.append(
+        _control_record(
+            "random",
+            "seeded-uniform-random",
+            evaluate_choices(rewards, costs, random_assignment),
+        )
+    )
+    fit_costs = data.costs[fit].mean(axis=2)
+    cost_only_arm = int(cost_only_choices(fit_costs)[0])
+    controls.append(
+        _control_record(
+            "cost-only",
+            "fit-cost-only",
+            evaluate_choices(
+                rewards,
+                costs,
+                np.full(len(heldout), cost_only_arm, dtype=np.int64),
+            ),
+        )
+    )
+    shuffled_rewards = data.rewards.copy()
+    shuffled_rewards[fit] = shuffled_task_rewards(
+        data.rewards[fit],
+        seed=50_000 + split.seed,
+    )
+    shuffled = FitData(
+        task_ids=data.task_ids,
+        groups=data.groups,
+        texts=data.texts,
+        is_hard=data.is_hard,
+        rewards=shuffled_rewards,
+        costs=data.costs,
+    )
+    shuffled_replay = replay_outer_heldout(
+        shuffled,
+        fit,
+        heldout,
+        spec,
+        seed=60_000 + split.seed,
+        work_dir=work_dir / "shuffled-label",
+        evaluation_data=data,
+    )
+    controls.append(
+        _control_record(
+            "shuffled-label",
+            "selected-shuffled-labels",
+            shuffled_replay.value,
+        )
+    )
+    fit_ids_sha256, heldout_ids_sha256 = seed_split_provenance(data, split)
+    family = "knn" if isinstance(spec, KnnCandidateSpec) else spec.family
+    baseline_arm = next(
+        arm for arm, count in replay.baseline.arm_counts.items() if count == len(heldout)
+    )
+    task_rows = [
+        HeldoutTaskRecord(
+            task_id=data.task_ids[int(task_index)],
+            group=data.groups[int(task_index)],
+            arm_rewards={arm: float(rewards[row, index]) for index, arm in enumerate(ARMS)},
+            arm_costs_usd={arm: float(costs[row, index]) for index, arm in enumerate(ARMS)},
+            router_arm=ARMS[int(replay.choices[row])],
+            baseline_arm=baseline_arm,
+            random_arm=ARMS[int(random_assignment[row])],
+            cost_only_arm=ARMS[cost_only_arm],
+            shuffled_label_arm=ARMS[int(shuffled_replay.choices[row])],
+        )
+        for row, task_index in enumerate(heldout)
+    ]
+    return SeedHeldoutReport(
+        seed=split.seed,
+        code_commit=code_commit,
+        selection_lock_sha256=selection_lock_sha256,
+        seed_fit_report_sha256=seed_fit_report_sha256,
+        winner_audit_sha256=winner_audit_sha256,
+        fit_ids_sha256=fit_ids_sha256,
+        heldout_ids_sha256=heldout_ids_sha256,
+        fit_tasks=len(fit),
+        heldout_tasks=len(heldout),
+        candidate_family=family,
+        candidate_name=spec.name,
+        candidate_config_sha256=candidate_config_sha256,
+        router=_value_record(replay.value),
+        baseline=_value_record(replay.baseline),
+        controls=controls,
+        tasks=task_rows,
+    )
 
 
 def _partitions(
