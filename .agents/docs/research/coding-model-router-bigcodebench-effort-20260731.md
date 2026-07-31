@@ -143,13 +143,31 @@ The preregistered candidate families are:
    10, 20, or 50 effective trials. Posterior lower bounds use z 0, 0.5, 1.0, or 1.645 and revert to
    the fit-selected static effort when a family is unseen.
 
-All fitting and hyperparameter search runs remotely. Outer folds group the complete library
-signature, and all five attempts for a task stay in one fold. Inner folds select the least-cost
-point satisfying the 95 percent quality floor. The outer comparison includes every static effort,
+All fitting and hyperparameter search runs remotely. The five outer seeds are 0 through 4. For
+each seed, complete library signatures are ordered by
+`sha256("bigcodebench-outer-v1:<seed>:<group>")`. The held-out partition is the shortest prefix
+whose task count is closest to 20 percent, comparing the counts immediately before and after the
+target and choosing the longer prefix on an exact tie. The remainder is fit data. This split uses
+task identities and library signatures only, before any reward access. All five attempts for a
+task stay in one fold. Inner folds select the
+least-cost point satisfying the 95 percent quality floor. When no point clears the floor, the
+fallback maximizes fit-only quality, then prefers lower cost, lower latency, smaller artifact, and
+frozen candidate order. The outer comparison includes every static effort,
 matched task-blind effort mixtures, shuffled-label policies, cost-only routing, random routing,
 unguarded versions of each family, and the held-out-attempt oracle. Candidate selection uses the
 mean across five deterministic outer seeds, with ties resolved by lower cost, lower route latency,
 smaller artifact, and then the order above.
+
+The frozen task manifest produces the following outer partitions. Each digest is SHA-256 of the
+ordered held-out task ids, one id per line with a trailing newline:
+
+| Seed | Fit tasks | Held-out tasks | Held-out groups | Held-out digest |
+|---:|---:|---:|---:|---|
+| 0 | 240 | 60 | 41 | `ab6debce045572f312cb0d7ff65d2ce5db6ab1c1b1d3e58c549fbf1d98b75ee4` |
+| 1 | 240 | 60 | 44 | `33c72cf3fafe6834ab721c932e5a73770b5e554c0c194b3578d22b99102abcdf` |
+| 2 | 240 | 60 | 50 | `1755c92a082b0fc7759638e187adbfefb27a983c19663f4fae553dac833e31dc` |
+| 3 | 240 | 60 | 42 | `0d1ae009fe32a42f63c648d74189bf208802e48af7a2892e1137a0209804a5a4` |
+| 4 | 241 | 59 | 45 | `24a30930a802192f3ecd4aa584b60b7016b95c0879d13486ae93fbcde7638255` |
 
 Primary references:
 

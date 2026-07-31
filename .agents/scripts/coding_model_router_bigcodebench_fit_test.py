@@ -51,6 +51,19 @@ def test_grouped_folds_have_zero_family_overlap() -> None:
         assert {groups[index] for index in train}.isdisjoint({groups[index] for index in test})
 
 
+def test_seeded_outer_splits_are_distinct_and_grouped() -> None:
+    groups = [f"family-{index // 2}" for index in range(40)]
+    splits = module.outer_splits(groups)
+    assert [split.seed for split in splits] == list(module.OUTER_SEEDS)
+    assert len({tuple(split.test_indices.tolist()) for split in splits}) == 5
+    for split in splits:
+        assert sorted([*split.train_indices, *split.test_indices]) == list(range(40))
+        assert 6 <= len(split.test_indices) <= 10
+        assert {groups[index] for index in split.train_indices}.isdisjoint(
+            {groups[index] for index in split.test_indices}
+        )
+
+
 def _knn_data() -> object:
     texts = [
         *(f"sql query select join table {index}" for index in range(10)),
@@ -124,6 +137,32 @@ def test_native_knn_refuses_overlapping_split(tmp_path: Path) -> None:
             pick_lam=0.0,
             guard_mode="symmetric",
         )
+
+
+def test_fit_selected_static_uses_fit_only_quality_then_cost() -> None:
+    data = _knn_data()
+    data.rewards[:, 3:, :] = 1.0
+    selected = module.fit_selected_static(data, np.arange(20))
+    assert selected.name == "luna-xhigh"
+    assert selected.reward == 1.0
+    assert selected.cost_usd == pytest.approx(0.004)
+
+
+def test_fit_candidate_selects_cheapest_quality_feasible_point() -> None:
+    candidates = [
+        module.CandidateMetric("best", 1.0, 1.0, 0.2, 100, 0),
+        module.CandidateMetric("cheap", 0.95, 0.4, 0.3, 80, 1),
+        module.CandidateMetric("too-low", 0.94, 0.1, 0.1, 20, 2),
+    ]
+    assert module.select_fit_candidate(candidates, baseline_reward=1.0).name == "cheap"
+
+
+def test_fit_candidate_fallback_maximizes_quality() -> None:
+    candidates = [
+        module.CandidateMetric("less", 0.7, 0.1, 0.1, 10, 0),
+        module.CandidateMetric("more", 0.8, 0.2, 0.2, 20, 1),
+    ]
+    assert module.select_fit_candidate(candidates, baseline_reward=1.0).name == "more"
 
 
 def test_ordinal_predictions_are_bounded_and_monotone() -> None:

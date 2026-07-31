@@ -31,6 +31,8 @@ ARMS = ("luna-low", "luna-medium", "luna-high", "luna-xhigh", "luna-max")
 ATTEMPTS = 5
 EXPECTED_TASKS = 300
 EXPECTED_CELLS = EXPECTED_TASKS * len(ARMS) * ATTEMPTS
+OUTER_SEEDS = (0, 1, 2, 3, 4)
+OUTER_TEST_FRACTION = 0.2
 
 
 @dataclass(frozen=True)
@@ -64,6 +66,27 @@ class NativeKnnReplay:
     choices: np.ndarray
     value: PolicyValue
     bank_path: Path
+
+
+@dataclass(frozen=True)
+class TaskSplit:
+    """One deterministic library-grouped outer split."""
+
+    seed: int
+    train_indices: np.ndarray
+    test_indices: np.ndarray
+
+
+@dataclass(frozen=True)
+class CandidateMetric:
+    """Fit-only quality, cost, and serving-footprint summary."""
+
+    name: str
+    reward: float
+    cost_usd: float
+    latency_p95_ms: float
+    artifact_bytes: int
+    order: int
 
 
 def _read_object(path: Path) -> dict[str, object]:
@@ -257,6 +280,58 @@ def grouped_folds(groups: list[str], *, splits: int = 5) -> list[tuple[np.ndarra
     return result
 
 
+def seeded_outer_split(groups: list[str], *, seed: int) -> TaskSplit:
+    """Assign a near-20-percent heldout prefix of deterministically hashed groups."""
+    if seed not in OUTER_SEEDS:
+        raise ValueError("outer seed is outside the frozen five-seed set")
+    if len(groups) < 2 or len(set(groups)) < 2:
+        raise ValueError("an outer split needs at least two task-family groups")
+    members: dict[str, list[int]] = {}
+    for index, group in enumerate(groups):
+        members.setdefault(group, []).append(index)
+    ranked = sorted(
+        members,
+        key=lambda group: (
+            hashlib.sha256(f"bigcodebench-outer-v1:{seed}:{group}".encode()).digest(),
+            group,
+        ),
+    )
+    target = round(len(groups) * OUTER_TEST_FRACTION)
+    selected: list[str] = []
+    selected_count = 0
+    for group in ranked:
+        next_count = selected_count + len(members[group])
+        if selected and abs(selected_count - target) < abs(next_count - target):
+            break
+        selected.append(group)
+        selected_count = next_count
+        if selected_count >= target:
+            break
+    test_groups = set(selected)
+    test = np.asarray(
+        [index for index, group in enumerate(groups) if group in test_groups],
+        dtype=np.int64,
+    )
+    train = np.asarray(
+        [index for index, group in enumerate(groups) if group not in test_groups],
+        dtype=np.int64,
+    )
+    if train.size == 0 or test.size == 0:
+        raise ValueError("outer split produced an empty partition")
+    if {groups[index] for index in train} & {groups[index] for index in test}:
+        raise AssertionError("task-family group crossed an outer boundary")
+    return TaskSplit(seed=seed, train_indices=train, test_indices=test)
+
+
+def outer_splits(groups: list[str]) -> list[TaskSplit]:
+    """Return all five preregistered deterministic outer splits."""
+    splits = [seeded_outer_split(groups, seed=seed) for seed in OUTER_SEEDS]
+    heldout_sets = {tuple(split.test_indices.tolist()) for split in splits}
+    if len(heldout_sets) != len(OUTER_SEEDS):
+        raise ValueError("outer seeds did not produce five distinct heldout sets")
+    return splits
+
+
 def _indices(data: FitData, values: np.ndarray, *, label: str) -> list[int]:
     indices = [int(value) for value in np.asarray(values).tolist()]
     if len(indices) != len(set(indices)):
@@ -266,6 +341,72 @@ def _indices(data: FitData, values: np.ndarray, *, label: str) -> list[int]:
     if not indices:
         raise ValueError(f"{label} indices are empty")
     return indices
+
+
+def static_metrics(data: FitData, indices: np.ndarray) -> list[CandidateMetric]:
+    """Measure every static effort using only the supplied fit tasks."""
+    selected = _indices(data, indices, label="static fit")
+    rewards = data.rewards[selected].mean(axis=(0, 2))
+    costs = data.costs[selected].mean(axis=(0, 2))
+    return [
+        CandidateMetric(
+            name=arm,
+            reward=float(rewards[index]),
+            cost_usd=float(costs[index]),
+            latency_p95_ms=0.0,
+            artifact_bytes=0,
+            order=index,
+        )
+        for index, arm in enumerate(ARMS)
+    ]
+
+
+def fit_selected_static(data: FitData, indices: np.ndarray) -> CandidateMetric:
+    """Select the strongest static effort on fit, breaking ties toward lower cost."""
+    return min(
+        static_metrics(data, indices),
+        key=lambda metric: (-metric.reward, metric.cost_usd, metric.order),
+    )
+
+
+def select_fit_candidate(
+    candidates: list[CandidateMetric],
+    *,
+    baseline_reward: float,
+    quality_retention: float = 0.95,
+) -> CandidateMetric:
+    """Pick the least-cost fit-only point that clears the frozen quality floor."""
+    if not candidates:
+        raise ValueError("fit-only selection received no candidates")
+    if baseline_reward <= 0.0:
+        raise ValueError("fit-only baseline reward must be positive")
+    if not 0.0 < quality_retention <= 1.0:
+        raise ValueError("quality retention must be in (0, 1]")
+    feasible = [
+        candidate
+        for candidate in candidates
+        if candidate.reward >= quality_retention * baseline_reward
+    ]
+    if feasible:
+        return min(
+            feasible,
+            key=lambda metric: (
+                metric.cost_usd,
+                metric.latency_p95_ms,
+                metric.artifact_bytes,
+                metric.order,
+            ),
+        )
+    return min(
+        candidates,
+        key=lambda metric: (
+            -metric.reward,
+            metric.cost_usd,
+            metric.latency_p95_ms,
+            metric.artifact_bytes,
+            metric.order,
+        ),
+    )
 
 
 def effort_pool() -> list[PoolEntry]:
