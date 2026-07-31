@@ -35,6 +35,16 @@ The full-data policy is saved at `.agents/policies/coding_router_deepswe_profile
 
 The policy keeps Luna @ max as its pinned guard and fallback. The held-out evaluation is the meaningful result; the full-data policy is the artifact to serve after an external fresh validation.
 
+## Turn-level cache and prefill behavior
+
+The policy is now cache-aware when served live. It may reconsider the model on every turn. When a conversation has a known incumbent, the router compares the incumbent's warm cached-prefix prefill cost with the candidate's cold full-prefix prefill cost:
+
+- It allows a cold prefill up to 4x the warm incumbent prefill when the profile points to a different arm.
+- Otherwise it keeps the warm incumbent.
+- The decision log records the cache credit and whether the switch passed or was reverted.
+
+This is deliberately conservative. The current profile artifact has task-level quality evidence, but not turn-level quality evidence, so cache economics control switching while quality remains protected by the fitted task profile. The 47.9% cost result above is task-level; turn-level savings require a conversation trace evaluation.
+
 ## Remote-compute and reproducibility notes
 
 The fitting sweep ran in an E2B sandbox. The laptop was used only to orchestrate the job, run small checks, and store artifacts. The report is at `.agents/reports/deepswe_profile_router_20260730.json`.

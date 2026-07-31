@@ -165,6 +165,76 @@ def test_incumbent_sticks_by_default() -> None:
     assert "sticky" in decision.reason
 
 
+def _profile_policy(*, cache_aware: bool) -> RoutingPolicy:
+    pool = [
+        PoolEntry(
+            name="fable-5",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-fable-5",
+            input_per_mtok=10.0,
+            output_per_mtok=50.0,
+            cached_input_per_mtok=1.0,
+        ),
+        PoolEntry(
+            name="haiku-4-5",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-haiku-4-5",
+            input_per_mtok=1.0,
+            output_per_mtok=5.0,
+            cached_input_per_mtok=0.1,
+        ),
+    ]
+    return RoutingPolicy(
+        kind="profile",
+        default_model="fable-5",
+        pool=pool,
+        sticky=True,
+        cache_aware=cache_aware,
+        profile_bins=[100.0],
+        profile_models=["haiku-4-5", "fable-5"],
+    )
+
+
+def test_profile_policy_switches_when_cold_prefill_is_cheaper() -> None:
+    policy = _profile_policy(cache_aware=True)
+    decision = select_model(
+        policy,
+        "short",
+        incumbent="fable-5",
+        conversation_chars=4000,
+    )
+    assert decision.model == "haiku-4-5"
+    assert "switched" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "passed"
+    assert decision.evidence.cache_credit_usd == pytest.approx(0.009)
+
+
+def test_profile_policy_keeps_warm_incumbent_when_switch_prefill_is_pricier() -> None:
+    policy = _profile_policy(cache_aware=True)
+    decision = select_model(
+        policy,
+        "x" * 200,
+        incumbent="haiku-4-5",
+        conversation_chars=4000,
+    )
+    assert decision.model == "haiku-4-5"
+    assert "kept" in decision.reason
+    assert decision.evidence is not None
+    assert decision.evidence.gate == "reverted"
+
+
+def test_profile_policy_remains_sticky_when_cache_awareness_is_off() -> None:
+    decision = select_model(
+        _profile_policy(cache_aware=False),
+        "short",
+        incumbent="fable-5",
+        conversation_chars=4000,
+    )
+    assert decision.model == "fable-5"
+    assert decision.reason == "sticky: conversation affinity"
+
+
 def test_retired_incumbent_reroutes() -> None:
     decision = select_model(_rank_policy(), "SELECT 1", incumbent="gone-model")
     assert decision.model == "fable-5"

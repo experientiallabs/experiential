@@ -11,6 +11,8 @@
   },
   "router": {
     "type": "text-length profile",
+    "cache_aware_turn_switching": true,
+    "switch_rule": "switch when candidate cold prefill is no more expensive than incumbent warm cached prefill",
     "bins": [1675.6666666666665, 2608.0],
     "quality_tolerance": 0.02,
     "full_fit_models": [

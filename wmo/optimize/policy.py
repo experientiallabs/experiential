@@ -444,6 +444,11 @@ class RoutingPolicy(BaseModel):
     profile_feature: Literal["text_length"] = "text_length"
     profile_bins: list[float] = Field(default_factory=list)
     profile_models: list[str] = Field(default_factory=list)
+    # Cache-aware profile switching is allowed to pay a bounded cold-prefill premium when the
+    # profile says the new arm is appropriate. A value of 1.0 means switches must be no more
+    # expensive than the warm incumbent prefill; 4.0 is the default hysteresis used by the first
+    # turn-level profile policy.
+    cache_switch_prefill_ratio: float = Field(default=4.0, ge=1.0)
 
     # kNN policies only (see module docstring and `wmo.optimize.knn`). The fitter records the
     # bank it actually wrote (`knn_bank_path_for(<policy path>)`), so serving resolves the
@@ -726,6 +731,29 @@ def cache_credit_usd(policy: RoutingPolicy, incumbent: str, prefix_chars: int) -
     return (prefix_chars / CHARS_PER_TOKEN) * saving_per_mtok / 1_000_000
 
 
+def prefill_cost_usd(
+    policy: RoutingPolicy, model: str, prefix_chars: int, *, cached: bool
+) -> float:
+    """Estimate the input-prefill cost for one model on the current transcript prefix.
+
+    A switch pays the candidate's full input rate. Staying on the incumbent can use the provider
+    cache-read rate. This deliberately prices only prefill: completion cost is not known until
+    the model answers, and routing must not pretend otherwise.
+    """
+    if prefix_chars <= 0:
+        return 0.0
+    entry = next((candidate for candidate in policy.pool if candidate.name == model), None)
+    if entry is None:
+        return 0.0
+    price = entry.price()
+    rate = price.input_per_mtok
+    if cached:
+        rate = entry.cached_input_per_mtok
+        if rate is None:
+            rate = price.cache_read_per_mtok or price.input_per_mtok
+    return (prefix_chars / CHARS_PER_TOKEN) * rate / 1_000_000
+
+
 def select_model(
     policy: RoutingPolicy,
     text: str,
@@ -747,25 +775,37 @@ def select_model(
     bank (knn) are meaningless. Default None builds it from the spec per call.
 
     `conversation_chars` is the length of the transcript the affinity fingerprint matched (0
-    when there is none); a cache-aware knn policy turns it into the incumbent's cache credit
-    (`cache_credit_usd`). It is ignored everywhere else, so passing it is always safe.
+    when there is none). Cache-aware kNN and profile policies use it to price the incumbent's
+    warm prefill against a candidate's cold prefill; it is ignored by other policy kinds.
     """
     names = {entry.name for entry in policy.pool}
-    cache_aware_knn = policy.cache_aware and policy.kind == "knn" and incumbent in names
-    if incumbent is not None and incumbent in names and policy.sticky and not cache_aware_knn:
+    cache_aware_route = (
+        policy.cache_aware and policy.kind in {"knn", "profile"} and incumbent in names
+    )
+    if incumbent is not None and incumbent in names and policy.sticky and not cache_aware_route:
         return RoutingDecision(model=incumbent, reason="sticky: conversation affinity")
     if policy.kind == "static":
         return RoutingDecision(model=policy.default_model, reason="static policy")
     if policy.kind == "profile":
-        return profile_decision(policy, text)
+        return profile_decision(
+            policy,
+            text,
+            incumbent=incumbent if cache_aware_route else None,
+            conversation_chars=conversation_chars,
+            cache_aware=cache_aware_route,
+        )
 
     query = np.asarray((embedder or policy.embedder.build()).embed([text])[0])
     if policy.kind == "knn":
-        credit = cache_credit_usd(policy, incumbent, conversation_chars) if cache_aware_knn else 0.0
+        credit = (
+            cache_credit_usd(policy, incumbent, conversation_chars)
+            if cache_aware_route
+            else 0.0
+        )
         decision = knn_decision(
             policy,
             query,
-            incumbent=incumbent if cache_aware_knn else None,
+            incumbent=incumbent if cache_aware_route else None,
             cache_credit=credit,
         )
     else:
@@ -778,16 +818,66 @@ def select_model(
     return decision
 
 
-def profile_decision(policy: RoutingPolicy, text: str) -> RoutingDecision:
+def profile_decision(
+    policy: RoutingPolicy,
+    text: str,
+    *,
+    incumbent: str | None = None,
+    conversation_chars: int = 0,
+    cache_aware: bool = False,
+) -> RoutingDecision:
     """Select the persisted arm for the request's text-length profile bin."""
     if policy.kind != "profile":
         raise ValueError(f"profile_decision needs a profile policy, got kind='{policy.kind}'")
     bucket = bisect_right(policy.profile_bins, float(len(text)))
     model = policy.profile_models[bucket]
+    if not cache_aware or incumbent is None or incumbent == model:
+        return RoutingDecision(
+            model=model,
+            reason=(
+                f"profile router: text length {len(text)} in bin {bucket}, serving {model}"
+            ),
+        )
+    names = {entry.name for entry in policy.pool}
+    if incumbent not in names or conversation_chars <= 0:
+        return RoutingDecision(
+            model=model,
+            reason=(
+                f"profile router: text length {len(text)} in bin {bucket}, serving {model}"
+            ),
+        )
+    cache_credit = cache_credit_usd(policy, incumbent, conversation_chars)
+    incumbent_prefill = prefill_cost_usd(
+        policy, incumbent, conversation_chars, cached=True
+    )
+    candidate_prefill = prefill_cost_usd(
+        policy, model, conversation_chars, cached=False
+    )
+    prefill_limit = incumbent_prefill * policy.cache_switch_prefill_ratio
+    if incumbent_prefill <= 0.0 or candidate_prefill <= prefill_limit:
+        return RoutingDecision(
+            model=model,
+            reason=(
+                f"cache-aware profile: switched {incumbent} -> {model}; cold prefill "
+                f"${candidate_prefill:.6f} <= {policy.cache_switch_prefill_ratio:g}x warm "
+                f"prefill limit ${prefill_limit:.6f}"
+            ),
+            evidence=RoutingEvidence(
+                gate="passed",
+                propensity="greedy",
+                cache_credit_usd=cache_credit or None,
+            ),
+        )
     return RoutingDecision(
-        model=model,
+        model=incumbent,
         reason=(
-            f"profile router: text length {len(text)} in bin {bucket}, serving {model}"
+            f"cache-aware profile: kept {incumbent}; switching to {model} would pay cold "
+            f"prefill ${candidate_prefill:.6f} vs warm ${incumbent_prefill:.6f}"
+        ),
+        evidence=RoutingEvidence(
+            gate="reverted",
+            propensity="fallback-forced",
+            cache_credit_usd=cache_credit or None,
         ),
     )
 
