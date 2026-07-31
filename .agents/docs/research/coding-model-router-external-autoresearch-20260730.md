@@ -118,6 +118,14 @@ benefit is effort mixing, not learned task routing. It must not be promoted as a
 algorithm. The next algorithm must beat a matched task-blind mixture, not only discrete static
 arms.
 
+The same control rejects the original word plus SVD router. At its selected external 0.97 point,
+the router sends 84 of 110 tasks to max effort. A 10,000-sample task-blind control with the same
+traffic has expected quality 0.9414687 and expected cost USD 306.4853. The router is 0.0022500
+lower quality and USD 9.6808 more expensive than the random mean. Its quality is at the 23.26th
+percentile and its cost is at the 88.92nd percentile. The 0.99 point is statistically
+indistinguishable from the matched mixture. Both tested lexical feature families therefore fail
+to establish task-selection value.
+
 ## Reproducibility anchors
 
 First external fit commit: `bbbaa609aa7f8b9e6a35aab311920ad11ef17266`
@@ -156,3 +164,6 @@ Serving parity report SHA256:
 
 Matched task-blind control report SHA256:
 `7aaa55de211b5f1deb63c9437acf5440344a39a931fcb295b6018d5e285d86cc`
+
+Original word-router task-blind control report SHA256:
+`5dc64e22fbab0ebf10e8b62f5cbb81b90251ff4cc219b6992b2af119b402492c`
