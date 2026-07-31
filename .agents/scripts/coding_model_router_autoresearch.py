@@ -1502,9 +1502,12 @@ def _export_linear(args: argparse.Namespace) -> None:
         raise ValueError(f"native heads have no quality floor {quality_floor}")
 
     raw_matrix = _read_json(args.matrix.resolve())
-    if not isinstance(raw_matrix, dict) or not isinstance(raw_matrix.get("pool"), list):
+    if not isinstance(raw_matrix, dict):
         raise ValueError("the matrix must contain a pool snapshot")
-    matrix_pool = cast(list[object], raw_matrix["pool"])
+    raw_pool = raw_matrix.get("pool")
+    if not isinstance(raw_pool, list):
+        raise ValueError("the matrix must contain a pool snapshot")
+    matrix_pool = cast(list[object], raw_pool)
     requested = {args.weak_model, args.strong_model}
     pool = [
         PoolEntry.model_validate(row)
