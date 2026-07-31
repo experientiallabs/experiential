@@ -52,3 +52,22 @@ mixture, a positive contest-cluster bootstrap lower bound, no static-arm
 dominance, a failed shuffled-label control, complete grading, and no target
 leakage. Only a passing untouched confirmation can authorize the single
 DeepSWE transfer.
+
+## RADAR-inspired development candidate
+
+During the corrected development matrix, a primary-literature review identified
+RADAR (`arXiv:2509.25426`) as a direct match for the observed model x reasoning
+effort structure. This is an adaptive development candidate, not a new holdout
+claim. It fits a regularized two-parameter item-response model to the graded
+test-pass fractions, predicts task difficulty and discrimination from signed
+character hashes plus the frozen structural features, and routes with the
+paper's linear or Chebyshev performance-cost scalarization.
+
+The nested contest-grouped grid is fixed at hash dimensions 512 and 2,048,
+Ridge alphas 1 and 10, scalarization weights 0.70, 0.80, 0.90, 0.95, 0.98, and
+0.99, and both scalarization families. Selection minimizes cost among points
+within 0.5 reward points of the fold-selected static arm and requires positive
+matched task-blind advantage. The development report cannot authorize
+DeepSWE. If its grouped gate passes, the consensus rule is frozen and evaluated
+once on the already required untouched 160-task Codeforces confirmation cohort.
+No fitted numeric model is persisted.
