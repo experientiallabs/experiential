@@ -99,6 +99,66 @@ when every condition passes:
 
 If this gate fails, preserve the negative result and do not fit a router or open DeepSWE outcomes.
 
+## Frozen latency-neutral router search
+
+This search space is frozen before any current-model BigCodeBench reward is computed. It borrows
+the efficient prompt-only supervision idea from RouteLLM, the task-profile prior from TRouter,
+the counterfactual objective from doubly robust policy learning, and the locality and feature
+weighting ideas behind guarded kNN and adaptive clustering. ACRouter's execution-feedback loop is
+excluded because it adds calls and changes the single-call serving contract.
+
+Every candidate receives only data available before inference:
+
+- signed character n-gram hashes at 512, 2,048, and 8,192 dimensions;
+- deterministic prompt-shape features such as length, lines, imports, type annotations, examples,
+  tests, exceptions, recursion, and library count;
+- the frozen BigCodeBench library signature and hard-subset indicator;
+- prompt-family centroids and statistics fitted only inside the current training fold.
+
+External embedding APIs, language-model classifiers, generated task descriptions, response
+probes, self-consistency samples, cascades, verifier feedback, and target outcomes are forbidden.
+The served artifact may contain only deterministic feature parameters and small fitted numeric
+arrays. It must make no network call, persist no foundation-model weights, and route in less than
+5 ms p50 and 20 ms p95 on one E2B CPU core over at least 10,000 repeated decisions.
+
+The preregistered candidate families are:
+
+1. **Guarded local kNN.** WMO reward-profile kNN over each frozen representation. Search 8, 16,
+   32, and 64 neighbors; relative similarity 0.90, 0.95, and 0.98; guard z 0, 0.5, 1.0, and
+   1.645; and minimum paired support 8, 16, and 32. Weak or novel neighborhoods revert to the
+   fit-selected static effort.
+2. **Ordinal adjacent-effort uplift.** Cross-fitted Ridge and ExtraTrees heads predict the four
+   adjacent gains from low through max. Ridge alpha is 0.1, 1, 10, or 100. ExtraTrees uses 200 or
+   500 trees, leaf size 5, 10, or 20, and at most square-root or one-third of features per split.
+   Isotonic projection makes predicted cumulative reward nondecreasing in effort. The policy picks
+   the cheapest effort whose lower confidence bound clears the fit-selected quality floor.
+3. **Multi-action doubly robust policy.** Group-cross-fitted direct reward heads and known uniform
+   arm propensities form augmented inverse-propensity pseudo-values for all five efforts. The
+   policy learner is Ridge or histogram gradient boosting with maximum leaf nodes 7, 15, or 31,
+   learning rate 0.03 or 0.10, and minimum leaf size 10 or 20. A fit-only shadow price chooses
+   reward minus lambda times cost from lambda 0, 0.0025, 0.005, 0.01, 0.02, and 0.04.
+4. **Empirical-Bayes family shrinkage.** Beta-binomial task and library-family effects shrink
+   repeated binary executions toward global and hard-subset priors. A Ridge residual head predicts
+   remaining adjacent-effort uplift from the same frozen representations. Prior strength is 2, 5,
+   10, 20, or 50 effective trials. Posterior lower bounds use z 0, 0.5, 1.0, or 1.645 and revert to
+   the fit-selected static effort when a family is unseen.
+
+All fitting and hyperparameter search runs remotely. Outer folds group the complete library
+signature, and all five attempts for a task stay in one fold. Inner folds select the least-cost
+point satisfying the 95 percent quality floor. The outer comparison includes every static effort,
+matched task-blind effort mixtures, shuffled-label policies, cost-only routing, random routing,
+unguarded versions of each family, and the held-out-attempt oracle. Candidate selection uses the
+mean across five deterministic outer seeds, with ties resolved by lower cost, lower route latency,
+smaller artifact, and then the order above.
+
+Primary references:
+
+- RouteLLM: `https://arxiv.org/abs/2406.18665`
+- Doubly Robust Policy Evaluation and Learning: `https://arxiv.org/abs/1103.4601`
+- TRouter: `https://arxiv.org/abs/2604.09377`
+- Adaptive Clustering router: `https://arxiv.org/abs/2502.15315`
+- ACRouter and CodeRouterBench: `https://arxiv.org/abs/2606.22902`
+
 ## Router promotion gate
 
 If the oracle passes, fit and tune only on external outcomes using nested family-grouped
