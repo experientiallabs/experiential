@@ -398,7 +398,7 @@ def _fit_burden(
     *,
     alpha: float,
 ) -> np.ndarray:
-    model = Ridge(alpha=alpha, solver="lsqr")
+    model = Ridge(alpha=alpha, solver="lsqr", max_iter=300, tol=1e-3)
     model.fit(features[train], burden[train])
     return np.asarray(model.predict(features[test]), dtype=np.float64)
 
@@ -486,8 +486,8 @@ def _fit_reward_heads(
     *,
     alpha: float,
 ) -> np.ndarray:
-    cheap_head = Ridge(alpha=alpha, solver="lsqr")
-    strong_head = Ridge(alpha=alpha, solver="lsqr")
+    cheap_head = Ridge(alpha=alpha, solver="lsqr", max_iter=300, tol=1e-3)
+    strong_head = Ridge(alpha=alpha, solver="lsqr", max_iter=300, tol=1e-3)
     cheap_head.fit(features[train], cheap[train], sample_weight=cheap_attempts[train])
     strong_head.fit(features[train], strong[train], sample_weight=strong_attempts[train])
     return np.asarray(
