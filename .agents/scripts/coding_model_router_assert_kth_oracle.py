@@ -134,18 +134,27 @@ def _result_paths(arm: str) -> dict[int, str]:
 def _outcomes(payload: dict[str, Any]) -> dict[str, float]:
     submitted_untyped = payload.get("submitted_ids")
     resolved_untyped = payload.get("resolved_ids")
-    if not isinstance(submitted_untyped, list) or not isinstance(resolved_untyped, list):
+    incomplete_untyped = payload.get("incomplete_ids", [])
+    if (
+        not isinstance(submitted_untyped, list)
+        or not isinstance(resolved_untyped, list)
+        or not isinstance(incomplete_untyped, list)
+    ):
         raise ValueError("official result is missing submitted_ids or resolved_ids")
     submitted = [str(value) for value in submitted_untyped]
+    incomplete = [str(value) for value in incomplete_untyped]
+    gradeable = submitted + incomplete
     resolved = {str(value) for value in resolved_untyped}
-    if len(submitted) != len(set(submitted)):
-        raise ValueError("official result has duplicate submitted task ids")
+    if len(gradeable) != len(set(gradeable)):
+        raise ValueError("official result has duplicate submitted or incomplete task ids")
     if not resolved <= set(submitted):
         raise ValueError("resolved ids are not a subset of submitted ids")
     total = payload.get("total_instances")
-    if not isinstance(total, int) or total != len(submitted):
-        raise ValueError("official result total_instances disagrees with submitted_ids")
-    return {task_id: float(task_id in resolved) for task_id in submitted}
+    if not isinstance(total, int) or total != len(gradeable):
+        raise ValueError(
+            "official result total_instances disagrees with submitted plus incomplete ids"
+        )
+    return {task_id: float(task_id in resolved) for task_id in gradeable}
 
 
 def _normalize(text: str) -> str:

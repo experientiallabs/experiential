@@ -46,13 +46,14 @@ def test_result_classifier_accepts_evaluator_provenance_with_preds_name() -> Non
 def test_outcomes_score_every_nonresolved_submission_zero() -> None:
     outcomes = module._outcomes(
         {
-            "total_instances": 3,
+            "total_instances": 4,
             "submitted_ids": ["a", "b", "c"],
+            "incomplete_ids": ["d"],
             "resolved_ids": ["b"],
             "error_ids": ["c"],
         }
     )
-    assert outcomes == {"a": 0.0, "b": 1.0, "c": 0.0}
+    assert outcomes == {"a": 0.0, "b": 1.0, "c": 0.0, "d": 0.0}
 
 
 def test_overlap_uses_id_and_embedded_normalized_problem_text() -> None:
