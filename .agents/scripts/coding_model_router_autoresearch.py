@@ -1640,6 +1640,58 @@ def _export_linear(args: argparse.Namespace) -> None:
     )
 
 
+def _verify_linear(args: argparse.Namespace) -> None:
+    """Prove the WMO policy selects exactly the same arms as the fitted scorer."""
+    from wmo.optimize.policy import RoutingPolicy, select_model
+
+    policy_path = args.policy.resolve()
+    policy = RoutingPolicy.load(policy_path)
+    if policy.kind != "linear":
+        raise ValueError(f"{policy_path} is not a linear policy")
+    target = _load_target(args.deep_matrix.resolve(), args.deep_tasks.resolve())
+    scores = _candidate_score(args.joblib.resolve(), target.texts)
+    reference = (scores >= policy.linear_threshold).astype(np.int64)
+    served_names = [select_model(policy, text).model for text in target.texts]
+    model_indices = {
+        policy.linear_weak_model: 0,
+        policy.linear_strong_model: 1,
+    }
+    served = np.asarray(
+        [model_indices.get(name, -1) for name in served_names],
+        dtype=np.int64,
+    )
+    mismatches = np.flatnonzero(reference != served)
+    _write_json(
+        args.output.resolve(),
+        {
+            "policy_sha256": _sha256_file(policy_path),
+            "heads_provenance": policy.fitted_from,
+            "tasks": len(target.task_ids),
+            "weak_model": policy.linear_weak_model,
+            "strong_model": policy.linear_strong_model,
+            "threshold": policy.linear_threshold,
+            "reference_traffic": {
+                "weak": int(np.sum(reference == 0)),
+                "strong": int(np.sum(reference == 1)),
+            },
+            "served_traffic": {
+                "weak": int(np.sum(served == 0)),
+                "strong": int(np.sum(served == 1)),
+                "unknown": int(np.sum(served == -1)),
+            },
+            "mismatches": int(len(mismatches)),
+            "first_mismatch_task": (
+                target.task_ids[int(mismatches[0])] if len(mismatches) else None
+            ),
+            "target_outcomes_used_for_selection": False,
+            "target_text_used_for_parity_replay": True,
+        },
+    )
+    if len(mismatches):
+        raise ValueError(f"WMO linear policy disagrees on {len(mismatches)} target tasks")
+    logger.info("linear policy parity passed tasks=%d", len(target.task_ids))
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1674,6 +1726,12 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("--strong-model", required=True)
     export.add_argument("--quality-floor", choices=("0.95", "0.97", "0.99"), required=True)
     export.add_argument("--output", type=Path, required=True)
+    verify = subparsers.add_parser("verify-linear")
+    verify.add_argument("--policy", type=Path, required=True)
+    verify.add_argument("--joblib", type=Path, required=True)
+    verify.add_argument("--deep-matrix", type=Path, required=True)
+    verify.add_argument("--deep-tasks", type=Path, required=True)
+    verify.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -1683,8 +1741,10 @@ def main() -> None:
         _fit(args)
     elif args.command == "evaluate":
         _evaluate(args)
-    else:
+    elif args.command == "export-linear":
         _export_linear(args)
+    else:
+        _verify_linear(args)
 
 
 if __name__ == "__main__":
