@@ -1478,6 +1478,78 @@ def _evaluate(args: argparse.Namespace) -> None:
     )
 
 
+def _export_linear(args: argparse.Namespace) -> None:
+    """Build a validated WMO linear policy from remotely fitted plain numeric heads."""
+    from wmo.optimize.policy import EmbedderSpec, RoutingPolicy
+    from wmo.providers.pool import PoolEntry
+
+    heads_path = args.heads.resolve()
+    raw_heads = _read_json(heads_path)
+    if not isinstance(raw_heads, dict):
+        raise ValueError(f"{heads_path} must contain one JSON object")
+    heads = {str(key): value for key, value in raw_heads.items()}
+    if heads.get("schema") != "wmo-linear-heads-v1":
+        raise ValueError("native heads use an unsupported schema")
+    if (
+        heads.get("target_outcomes_used") is not False
+        or heads.get("target_embeddings_used") is not False
+    ):
+        raise ValueError("native heads do not prove an external-only fit")
+    embedder = cast(dict[str, object], heads["embedder"])
+    operating_points = cast(dict[str, dict[str, float]], heads["operating_points"])
+    quality_floor = str(args.quality_floor)
+    if quality_floor not in operating_points:
+        raise ValueError(f"native heads have no quality floor {quality_floor}")
+
+    raw_matrix = _read_json(args.matrix.resolve())
+    if not isinstance(raw_matrix, dict) or not isinstance(raw_matrix.get("pool"), list):
+        raise ValueError("the matrix must contain a pool snapshot")
+    matrix_pool = cast(list[object], raw_matrix["pool"])
+    requested = {args.weak_model, args.strong_model}
+    pool = [
+        PoolEntry.model_validate(row)
+        for row in matrix_pool
+        if isinstance(row, dict) and row.get("name") in requested
+    ]
+    if {entry.name for entry in pool} != requested:
+        raise ValueError("the matrix pool does not contain both requested linear arms")
+
+    policy = RoutingPolicy(
+        kind="linear",
+        default_model=args.strong_model,
+        pool=pool,
+        embedder=EmbedderSpec(
+            kind="hashing",
+            dim=int(_as_float(embedder["dim"])),
+        ),
+        linear_weak_model=args.weak_model,
+        linear_strong_model=args.strong_model,
+        linear_weak_weights=cast(list[float], heads["weak_weights"]),
+        linear_strong_weights=cast(list[float], heads["strong_weights"]),
+        linear_weak_bias=_as_float(heads["weak_bias"]),
+        linear_strong_bias=_as_float(heads["strong_bias"]),
+        linear_threshold=_as_float(operating_points[quality_floor]["threshold"]),
+        fitted_from=f"external-native-heads-sha256:{_sha256_file(heads_path)}",
+    )
+    policy.save(args.output.resolve())
+    logger.info(
+        "exported linear policy weak=%s strong=%s quality_floor=%s dim=%d path=%s",
+        args.weak_model,
+        args.strong_model,
+        quality_floor,
+        policy.embedder.dim,
+        args.output,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1497,6 +1569,13 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--deep-matrix", type=Path, required=True)
     evaluate.add_argument("--deep-tasks", type=Path, required=True)
     evaluate.add_argument("--output", type=Path, required=True)
+    export = subparsers.add_parser("export-linear")
+    export.add_argument("--heads", type=Path, required=True)
+    export.add_argument("--matrix", type=Path, required=True)
+    export.add_argument("--weak-model", required=True)
+    export.add_argument("--strong-model", required=True)
+    export.add_argument("--quality-floor", choices=("0.95", "0.97", "0.99"), required=True)
+    export.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -1504,8 +1583,10 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "fit":
         _fit(args)
-    else:
+    elif args.command == "evaluate":
         _evaluate(args)
+    else:
+        _export_linear(args)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from wmo.optimize.policy import RoutingPolicy, select_model
 from wmo.retrieval.embedders import HashingEmbedder
 
 
@@ -144,6 +145,68 @@ def test_native_linear_heads_are_plain_numeric_artifact() -> None:
     assert len(artifact["weak_weights"]) == 8
     assert len(artifact["strong_weights"]) == 8
     assert artifact["target_outcomes_used"] is False
+
+
+def test_export_linear_writes_valid_two_arm_policy(tmp_path: Path) -> None:
+    module = _module()
+    heads = tmp_path / "heads.json"
+    matrix = tmp_path / "matrix.json"
+    output = tmp_path / "policy.json"
+    heads.write_text(
+        json.dumps(
+            {
+                "schema": "wmo-linear-heads-v1",
+                "embedder": {"kind": "hashing", "dim": 8},
+                "weak_weights": [0.0] * 8,
+                "strong_weights": [0.0] * 8,
+                "weak_bias": 0.2,
+                "strong_bias": 0.8,
+                "operating_points": {"0.97": {"threshold": 0.1}},
+                "target_outcomes_used": False,
+                "target_embeddings_used": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    matrix.write_text(
+        json.dumps(
+            {
+                "pool": [
+                    {
+                        "name": name,
+                        "kind": "openai",
+                        "model": name,
+                        "input_per_mtok": 1.0,
+                        "output_per_mtok": 2.0,
+                    }
+                    for name in ("weak", "strong")
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = module._parser().parse_args(
+        [
+            "export-linear",
+            "--heads",
+            str(heads),
+            "--matrix",
+            str(matrix),
+            "--weak-model",
+            "weak",
+            "--strong-model",
+            "strong",
+            "--quality-floor",
+            "0.97",
+            "--output",
+            str(output),
+        ]
+    )
+    module._export_linear(args)
+    policy = RoutingPolicy.load(output)
+    assert [entry.name for entry in policy.pool] == ["weak", "strong"]
+    assert policy.linear_threshold == 0.1
+    assert select_model(policy, "coding task").model == "strong"
 
 
 def test_three_level_route_is_monotone_in_predicted_uplift() -> None:
