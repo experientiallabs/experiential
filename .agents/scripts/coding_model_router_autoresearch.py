@@ -959,6 +959,14 @@ def _fit(args: argparse.Namespace) -> None:
             "deduplicated_tasks_by_source": dict(
                 sorted(collections.Counter(combined.source_names).items())
             ),
+            "source_weight_totals": {
+                source: float(
+                    combined.sample_weight[
+                        np.asarray(combined.source_names, dtype=object) == source
+                    ].sum()
+                )
+                for source in sorted(set(combined.source_names))
+            },
             "deduplicated_groups": len(set(combined.groups)),
             "deep_swe_labels_read": False,
         },
