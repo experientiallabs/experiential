@@ -2,13 +2,33 @@
 
 Date: 2026-07-30
 
-Status: external task-selection gain established, DeepSWE cost-efficiency promotion not established
+Status: lane stopped; external Open-SWE signal established, DeepSWE routing value not established
 
 ## Objective
 
 Improve DeepSWE v1.1 cost efficiency without fitting any parameter, feature transform, or
 threshold on DeepSWE outcomes. The routing action is model plus reasoning effort. The deployed
 router must run before inference without another language model call or feedback loop.
+
+## Authoritative ceiling correction
+
+The DeepSWE parent lane retracted the naive same-attempt per-task oracle after this work began.
+The corrected held-out oracle chooses each task's arm on two attempts and scores it on two
+different attempts over 107 tasks and nine arms. It reports:
+
+| Quantity | Graded reward | 95 percent interval |
+| --- | ---: | --- |
+| Held-out per-task oracle | 0.9598 | [0.9458, 0.9712] |
+| Best static arm | 0.9480 | not applicable |
+| Honest headroom | +1.18 points | [-0.52, +3.28] points |
+
+The headroom interval includes zero. DeepSWE 1.1 is too saturated to justify another routing
+feature family or another target replay. The static-frontier pass labels below are retained only
+as historical audit results. They are not promotion evidence after this correction.
+
+No further DeepSWE feature search, threshold tuning, cost-penalty tuning, or target replay is
+permitted in this lane. A future router experiment must first establish materially positive
+static-to-oracle headroom on a non-saturated benchmark or expert pool, using held-out attempts.
 
 ## External fit protocol
 
@@ -37,7 +57,7 @@ The target replay used 110 fully scored tasks across 88 repositories and graded
 `f2p_passed / f2p_total` reward. Static comparisons span 41 model and reasoning-effort arms.
 Repository bootstrap resamples repositories, not individual tasks.
 
-The least-cost preregistered point that passed the promotion rule was:
+The least-cost preregistered point that passed the original static-frontier rule was:
 
 | Field | Result |
 | --- | ---: |
@@ -53,14 +73,14 @@ The least-cost preregistered point that passed the promotion rule was:
 | Paired quality delta 95 percent CI | [-0.0437750, 0.0091836] |
 | Allowed quality delta | -0.0477164 |
 | Static dominated | no |
-| Promotion | pass |
+| Original static-frontier gate | pass, now audit-only |
 
-The external 0.99 point also passed at 99.0667 percent quality retention and 50.1149 percent
-cost savings. The selection rule chose the cheaper passing point.
+The external 0.99 point also passed that legacy rule at 99.0667 percent quality retention and
+50.1149 percent cost savings. The selection rule chose the cheaper passing point.
 
 This is deployment calibration, not untouched confirmation. The ladder came from previously
 known DeepSWE aggregate arm results, even though target task labels did not enter the fit or
-thresholds.
+thresholds. The authoritative ceiling correction above supersedes the promotion interpretation.
 
 ## Weighting audit correction
 
@@ -308,8 +328,9 @@ froze all scores, and only then accessed reward and cost. At the frozen 20 perce
 | Quality retention versus always max | 98.7974 percent |
 | Static dominators | 0 |
 
-This is a functioning task selector but not a confirmed cost-efficiency win. The preregistered
-95th quality-percentile and matched-random-cost requirements failed.
+This is a functioning external Open-SWE selector, but it does not establish DeepSWE task-selection
+value or a cost-efficiency win. The preregistered 95th quality-percentile and
+matched-random-cost requirements failed.
 
 ## Trace-burden-aware cost ranking
 
@@ -337,6 +358,18 @@ The adaptive DeepSWE replay improved both axes relative to the unpenalized route
 
 It still fails promotion because target cost is above the matched random mean and target quality
 is below the frozen 95th percentile. The penalty will not be tuned on DeepSWE.
+
+## Final decision
+
+Stop this lane. The strongest valid finding is a repository-held-out Open-SWE selection signal,
+not established DeepSWE routing value. Valid trace-derived model spend was USD 14.5822, plus two
+ungradeable failed calls without valid accounting. External fitting added no provider inference
+spend.
+
+The next experiment must compute a held-out oracle before building a router. A per-repository
+expert pool is a plausible direction because repository identity is available before inference
+and specialization may create real headroom. It may proceed only after its static-to-oracle gap
+is clearly positive and materially large on held-out attempts.
 
 Compact report hashes:
 
