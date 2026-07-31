@@ -97,6 +97,16 @@ def _run_number(path: str) -> int:
     return int(matches[-1])
 
 
+def _is_result_item(row: dict[str, Any]) -> bool:
+    path = str(row.get("path", ""))
+    size = int(row.get("size", 0) or 0)
+    return (
+        row.get("type") == "file"
+        and path.endswith(".json")
+        and 10_000 <= size <= 200_000
+    )
+
+
 def _result_paths(arm: str) -> dict[int, str]:
     rows = _json(_tree_url(arm))
     if not isinstance(rows, list):
@@ -107,14 +117,7 @@ def _result_paths(arm: str) -> dict[int, str]:
             continue
         row = cast(dict[str, Any], untyped)
         path = str(row.get("path", ""))
-        size = int(row.get("size", 0) or 0)
-        name = path.rsplit("/", 1)[-1].lower()
-        if (
-            row.get("type") != "file"
-            or not path.endswith(".json")
-            or "preds" in name
-            or not 10_000 <= size <= 200_000
-        ):
+        if not _is_result_item(row):
             continue
         run = _run_number(path)
         if run in paths:

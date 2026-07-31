@@ -26,6 +26,23 @@ def test_run_number_uses_last_run_marker() -> None:
     assert module._run_number(path) == 7
 
 
+def test_result_classifier_accepts_evaluator_provenance_with_preds_name() -> None:
+    assert module._is_result_item(
+        {
+            "type": "file",
+            "path": "arm/run_0/model.run_0__preds.jsonl__hash.json",
+            "size": 46_537,
+        }
+    )
+    assert not module._is_result_item(
+        {
+            "type": "file",
+            "path": "arm/run_0/trajectory_summary.json",
+            "size": 3_088_697,
+        }
+    )
+
+
 def test_outcomes_score_every_nonresolved_submission_zero() -> None:
     outcomes = module._outcomes(
         {
