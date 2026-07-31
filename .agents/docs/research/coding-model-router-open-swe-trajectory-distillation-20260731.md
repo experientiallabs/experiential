@@ -64,6 +64,15 @@ DeepSWE rewards, costs, traces, verifier output, embeddings, and arm outcomes re
 label-free DeepSWE view may be used only to remove exact task-id and normalized-request overlap.
 The report must record the overlap counts and prove `target_outcomes_used: false`.
 
+Before fitting, a completeness audit found that the earlier full-prompt target
+view covered 110 of 113 tasks. The label-free seal was therefore rebuilt from
+those 110 requests plus the three missing public `instruction.md` files in the
+pinned DeepSWE task archive. The resulting 113-row view has SHA-256
+`35ad33855f63f147b1861b58b59ad635f8860677b5d0d5e902c421029d78637b`.
+Every row contains exactly task id, repository, and request text. Its explicit
+cost- and reward-access flags are false. This amendment happened during the
+trace-only source scan, before any trajectory fit or new target evaluation.
+
 Repository identity groups every split. A repository may not cross train and validation within
 an outer or inner fold. Duplicate task ids and normalized requests stay in one group and receive
 one task weight regardless of trajectory count.
