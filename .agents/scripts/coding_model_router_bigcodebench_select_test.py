@@ -58,6 +58,11 @@ def test_candidate_grid_is_complete_and_unique() -> None:
     knn = module.knn_candidate_grid()
     assert len(knn) == 432
     assert len({candidate.name for candidate in knn}) == 432
+    economic = module.knn_economic_grid(knn[0])
+    assert len(economic) == 20
+    assert len({candidate.name for candidate in economic}) == 20
+    assert {candidate.guard_model for candidate in economic} == set(fit.ARMS)
+    assert {candidate.pick_lam for candidate in economic} == {0.0, 0.01, 0.02, 0.03}
 
 
 def test_grouped_oof_candidate_has_no_unfilled_routes() -> None:
@@ -115,3 +120,24 @@ def test_small_knn_search_reuses_one_bank_per_fold(tmp_path: Path) -> None:
     assert len(results) == 2
     assert selected in results
     assert len(list(tmp_path.rglob("*.bank.npz"))) == 5
+
+
+def test_knn_economic_refinement_is_fit_only_and_keeps_base_feasible(tmp_path: Path) -> None:
+    base, _ = module.select_knn_candidate(
+        _data(),
+        np.arange(30),
+        [module.KnnCandidateSpec(512, 8, 0.9, 0.0, 8, 576)],
+        seed=1,
+        work_dir=tmp_path / "base",
+    )
+    selected, refinements = module.select_knn_economic_refinement(
+        _data(),
+        np.arange(30),
+        base,
+        seed=1,
+        work_dir=tmp_path / "economic",
+    )
+    assert len(refinements) == 20
+    assert selected in [base, *refinements]
+    assert selected.value.reward >= 0.95 * selected.baseline.reward
+    assert len(list((tmp_path / "economic").rglob("*.bank.npz"))) == 5

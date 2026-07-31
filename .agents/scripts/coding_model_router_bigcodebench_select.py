@@ -123,14 +123,20 @@ class KnnCandidateSpec:
     z: float
     min_pairs: int
     order: int
+    guard_model: str | None = None
+    guard_mode: Literal["symmetric", "asymmetric"] = "symmetric"
+    pick_lam: float = 0.0
 
     @property
     def name(self) -> str:
         """Return the stable grid identity."""
-        return (
+        identity = (
             f"knn-d{self.dim}-k{self.rag_num}-thres{self.rag_thres:g}"
             f"-z{self.z:g}-pairs{self.min_pairs}"
         )
+        if self.guard_model is not None:
+            identity += f"-guard-{self.guard_model}-{self.guard_mode}-lam{self.pick_lam:g}"
+        return identity
 
     def config(self) -> dict[str, str | int | float | bool]:
         """Return the complete canonicalizable kNN configuration."""
@@ -141,9 +147,10 @@ class KnnCandidateSpec:
             "rag_thres": self.rag_thres,
             "z": self.z,
             "min_pairs": self.min_pairs,
-            "guard_strategy": "fit-best",
-            "guard_mode": "symmetric",
-            "pick_lam": 0.0,
+            "guard_strategy": "fixed-arm" if self.guard_model is not None else "fit-best",
+            "guard_model": self.guard_model or "fit-best",
+            "guard_mode": self.guard_mode,
+            "pick_lam": self.pick_lam,
         }
 
 
@@ -228,6 +235,29 @@ def knn_candidate_grid() -> list[KnnCandidateSpec]:
     ]
     if len(candidates) != 432 or len({candidate.name for candidate in candidates}) != 432:
         raise AssertionError("kNN candidate grid is incomplete or has duplicate identities")
+    return candidates
+
+
+def knn_economic_grid(base: KnnCandidateSpec) -> list[KnnCandidateSpec]:
+    """Enumerate 20 economic refinements around one selected kNN base point."""
+    candidates = [
+        KnnCandidateSpec(
+            dim=base.dim,
+            rag_num=base.rag_num,
+            rag_thres=base.rag_thres,
+            z=base.z,
+            min_pairs=base.min_pairs,
+            order=1_008 + index,
+            guard_model=guard_model,
+            guard_mode="asymmetric",
+            pick_lam=pick_lam,
+        )
+        for index, (guard_model, pick_lam) in enumerate(
+            (guard_model, pick_lam) for guard_model in ARMS for pick_lam in (0.0, 0.01, 0.02, 0.03)
+        )
+    ]
+    if len(candidates) != 20 or len({candidate.name for candidate in candidates}) != 20:
+        raise AssertionError("kNN economic grid is incomplete or has duplicate identities")
     return candidates
 
 
@@ -431,15 +461,15 @@ def select_non_knn_candidate(
     return selected, results
 
 
-def select_knn_candidate(
+def _evaluate_knn_candidates(
     data: FitData,
     outer_fit: np.ndarray,
     candidates: list[KnnCandidateSpec],
     *,
     seed: int,
     work_dir: Path,
-) -> tuple[CandidateValidation, list[CandidateValidation]]:
-    """Select one WMO kNN point using five grouped outer-fit folds and shared banks."""
+) -> list[CandidateValidation]:
+    """Evaluate WMO kNN points using five grouped outer-fit folds and shared banks."""
     if not candidates:
         raise ValueError("kNN selection received no candidates")
     indices = np.asarray(outer_fit, dtype=np.int64)
@@ -482,12 +512,17 @@ def select_knn_candidate(
             )
             vectors = np.asarray(embedder.build().embed(test_texts), dtype=np.float64)
             for candidate in dimensional_candidates:
+                guard_model = candidate.guard_model or baseline.name
                 tuned = policy.model_copy(
                     update={
+                        "default_model": guard_model,
+                        "guard_model": guard_model,
                         "rag_num": candidate.rag_num,
                         "rag_thres": candidate.rag_thres,
                         "knn_z": candidate.z,
                         "knn_min_pairs": candidate.min_pairs,
+                        "guard_mode": candidate.guard_mode,
+                        "pick_lam": candidate.pick_lam,
                     }
                 )
                 decisions = [knn_decision(tuned, vector).model for vector in vectors]
@@ -516,9 +551,58 @@ def select_knn_candidate(
                 ),
             )
         )
+    return results
+
+
+def select_knn_candidate(
+    data: FitData,
+    outer_fit: np.ndarray,
+    candidates: list[KnnCandidateSpec],
+    *,
+    seed: int,
+    work_dir: Path,
+) -> tuple[CandidateValidation, list[CandidateValidation]]:
+    """Select one WMO kNN point using five grouped outer-fit folds and shared banks."""
+    results = _evaluate_knn_candidates(
+        data,
+        outer_fit,
+        candidates,
+        seed=seed,
+        work_dir=work_dir,
+    )
     selected_metric = select_fit_candidate(
         [result.metric for result in results],
-        baseline_reward=baseline_value.reward,
+        baseline_reward=results[0].baseline.reward,
     )
     selected = next(result for result in results if result.metric.name == selected_metric.name)
     return selected, results
+
+
+def select_knn_economic_refinement(
+    data: FitData,
+    outer_fit: np.ndarray,
+    base: CandidateValidation,
+    *,
+    seed: int,
+    work_dir: Path,
+) -> tuple[CandidateValidation, list[CandidateValidation]]:
+    """Select the base or one of its 20 fit-only kNN economic refinements."""
+    if not isinstance(base.spec, KnnCandidateSpec):
+        raise TypeError("kNN economic refinement requires a selected kNN base")
+    refinements = _evaluate_knn_candidates(
+        data,
+        outer_fit,
+        knn_economic_grid(base.spec),
+        seed=seed,
+        work_dir=work_dir,
+    )
+    baseline_reward = base.baseline.reward
+    if any(not math.isclose(result.baseline.reward, baseline_reward) for result in refinements):
+        raise AssertionError("economic refinements used a different fit-only baseline")
+    options = [base, *refinements]
+    selected_metric = select_fit_candidate(
+        [result.metric for result in options],
+        baseline_reward=baseline_reward,
+    )
+    selected = next(result for result in options if result.metric.name == selected_metric.name)
+    return selected, refinements
