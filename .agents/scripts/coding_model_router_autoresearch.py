@@ -1430,12 +1430,14 @@ def _fit(args: argparse.Namespace) -> None:
                 )
             )
     combined = _combine(sources)
+    raw_profile_teacher: ProfileTeacherData | None = None
     profile_teacher: ProfileTeacherData | None = None
     if args.candidate_family == "task-profile":
         if args.profile_teacher_tasks is None:
             raise ValueError("--candidate-family task-profile requires --profile-teacher-tasks")
+        raw_profile_teacher = _load_profile_teacher(args.profile_teacher_tasks.resolve())
         profile_teacher = _disjoint_profile_teacher(
-            _load_profile_teacher(args.profile_teacher_tasks.resolve()),
+            raw_profile_teacher,
             combined,
         )
     _write_json(
@@ -1467,8 +1469,30 @@ def _fit(args: argparse.Namespace) -> None:
             "profile_teacher_tasks": (
                 len(profile_teacher.task_ids) if profile_teacher is not None else 0
             ),
+            "raw_profile_teacher_tasks": (
+                len(raw_profile_teacher.task_ids) if raw_profile_teacher is not None else 0
+            ),
+            "profile_teacher_rows_removed_for_outcome_overlap": (
+                len(raw_profile_teacher.task_ids) - len(profile_teacher.task_ids)
+                if raw_profile_teacher is not None and profile_teacher is not None
+                else 0
+            ),
             "profile_teacher_outcome_identity_overlap": (
                 len(set(profile_teacher.task_ids) & set(combined.task_ids))
+                if profile_teacher is not None
+                else 0
+            ),
+            "profile_teacher_outcome_normalized_text_overlap": (
+                len(
+                    {
+                        hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
+                        for text in profile_teacher.texts
+                    }
+                    & {
+                        hashlib.sha256(" ".join(text.split()).encode()).hexdigest()
+                        for text in combined.texts
+                    }
+                )
                 if profile_teacher is not None
                 else 0
             ),
