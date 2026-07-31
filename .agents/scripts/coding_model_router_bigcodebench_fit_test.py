@@ -51,6 +51,78 @@ def test_grouped_folds_have_zero_family_overlap() -> None:
         assert {groups[index] for index in train}.isdisjoint({groups[index] for index in test})
 
 
+def _locked_candidate() -> object:
+    config, digest = module.canonical_candidate_config(
+        {"alpha": 1.0, "dim": 512, "estimator": "ridge"}
+    )
+    return module.LockedCandidate(
+        family="ordinal",
+        name="ordinal-ridge",
+        config_json=config,
+        config_sha256=digest,
+        fit_reward=0.95,
+        fit_cost_usd=0.01,
+        matched_blind_reward=0.90,
+        latency_p95_ms=1.0,
+        artifact_bytes=100,
+    )
+
+
+def _selection_lock(tmp_path: Path) -> tuple[Path, object]:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "tasks.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "scores.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "outcomes.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "oracle-report.json").write_text(
+        json.dumps({"passed": True, "protocol": {"target_outcomes_used": False}}),
+        encoding="utf-8",
+    )
+    digests = {
+        name: module._sha256(root / filename)
+        for name, filename in {
+            "tasks_sha256": "tasks.jsonl",
+            "scores_sha256": "scores.jsonl",
+            "outcomes_sha256": "outcomes.jsonl",
+            "oracle_report_sha256": "oracle-report.json",
+        }.items()
+    }
+    lock = module.SelectionLock(
+        protocol="bigcodebench-fit-only-selection-v1",
+        **digests,
+        code_commit="a" * 40,
+        seeds=[
+            module.SeedSelection(
+                seed=seed,
+                fit_tasks=240,
+                heldout_tasks=60,
+                fit_ids_sha256=str(seed) * 64,
+                heldout_ids_sha256=str(seed + 1) * 64,
+                baseline_arm="luna-max",
+                baseline_fit_reward=0.96,
+                baseline_fit_cost_usd=0.02,
+                selected=_locked_candidate(),
+            )
+            for seed in module.OUTER_SEEDS
+        ],
+    )
+    return root, lock
+
+
+def test_selection_lock_round_trip_and_matrix_fingerprint(tmp_path: Path) -> None:
+    root, lock = _selection_lock(tmp_path)
+    path = tmp_path / "selection-lock.json"
+    module.write_selection_lock(path, lock)
+    loaded = module.require_selection_lock(root, path)
+    assert loaded == lock
+    with pytest.raises(FileExistsError):
+        module.write_selection_lock(path, lock)
+
+    (root / "scores.jsonl").write_text('{"changed":true}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="scores_sha256"):
+        module.require_selection_lock(root, path)
+
+
 def test_seeded_outer_splits_are_distinct_and_grouped() -> None:
     groups = [f"family-{index // 2}" for index in range(40)]
     splits = module.outer_splits(groups)

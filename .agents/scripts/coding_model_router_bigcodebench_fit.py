@@ -16,12 +16,14 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from scipy import sparse
 from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import GroupKFold
 
+from wmo.core.files import write_text_atomic
 from wmo.optimize.knn import fit_knn_policy
 from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
 from wmo.optimize.policy import EmbedderSpec, RoutingPolicy
@@ -109,6 +111,73 @@ class RouteOne(Protocol):
         ...
 
 
+class LockedCandidate(BaseModel):
+    """One fit-only selected policy point with canonical configuration provenance."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    family: Literal["knn", "ordinal", "doubly-robust", "empirical-bayes"]
+    name: str = Field(min_length=1)
+    config_json: str = Field(min_length=2)
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    fit_reward: float = Field(ge=0.0, le=1.0)
+    fit_cost_usd: float = Field(ge=0.0)
+    matched_blind_reward: float = Field(ge=0.0, le=1.0)
+    latency_p95_ms: float = Field(ge=0.0)
+    artifact_bytes: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _canonical_config_matches_digest(self) -> LockedCandidate:
+        value = json.loads(self.config_json)
+        if not isinstance(value, dict):
+            raise ValueError("locked candidate config must be one JSON object")
+        canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if canonical != self.config_json:
+            raise ValueError("locked candidate config is not canonical JSON")
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        if digest != self.config_sha256:
+            raise ValueError("locked candidate config digest differs")
+        return self
+
+
+class SeedSelection(BaseModel):
+    """Fit-only decision and split provenance for one outer seed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    seed: int
+    fit_tasks: int = Field(gt=0)
+    heldout_tasks: int = Field(gt=0)
+    fit_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    heldout_ids_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    baseline_arm: str
+    baseline_fit_reward: float = Field(ge=0.0, le=1.0)
+    baseline_fit_cost_usd: float = Field(ge=0.0)
+    selected: LockedCandidate
+
+
+class SelectionLock(BaseModel):
+    """Immutable fit-only boundary required before outer-heldout replay."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    protocol: Literal["bigcodebench-fit-only-selection-v1"]
+    tasks_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    scores_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcomes_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    oracle_report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    code_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    target_outcomes_used: Literal[False] = False
+    outer_heldout_evaluated: Literal[False] = False
+    seeds: list[SeedSelection] = Field(min_length=5, max_length=5)
+
+    @model_validator(mode="after")
+    def _five_exact_outer_seeds(self) -> SelectionLock:
+        if sorted(selection.seed for selection in self.seeds) != list(OUTER_SEEDS):
+            raise ValueError("selection lock must contain outer seeds 0 through 4 exactly once")
+        return self
+
+
 def _read_object(path: Path) -> dict[str, object]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -130,6 +199,57 @@ def _read_rows(path: Path) -> list[dict[str, object]]:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def canonical_candidate_config(value: dict[str, str | int | float | bool]) -> tuple[str, str]:
+    """Return canonical JSON and SHA-256 for one frozen candidate configuration."""
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return canonical, hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _ordered_id_digest(task_ids: list[str], indices: np.ndarray) -> str:
+    payload = "".join(f"{task_ids[int(index)]}\n" for index in indices)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def seed_split_provenance(data: FitData, split: TaskSplit) -> tuple[str, str]:
+    """Return ordered fit and heldout task-id digests for one outer split."""
+    return (
+        _ordered_id_digest(data.task_ids, split.train_indices),
+        _ordered_id_digest(data.task_ids, split.test_indices),
+    )
+
+
+def write_selection_lock(path: Path, lock: SelectionLock) -> None:
+    """Atomically publish a fit-only lock before any outer-heldout evaluation."""
+    if path.exists():
+        raise FileExistsError(f"selection lock already exists: {path}")
+    write_text_atomic(path, lock.model_dump_json(indent=2) + "\n")
+
+
+def require_selection_lock(root: Path, path: Path) -> SelectionLock:
+    """Load a selection lock and prove it still names the exact scored matrix."""
+    lock = SelectionLock.model_validate_json(path.read_text(encoding="utf-8"))
+    current = {
+        "tasks_sha256": _sha256(root / "tasks.jsonl"),
+        "scores_sha256": _sha256(root / "scores.jsonl"),
+        "outcomes_sha256": _sha256(root / "outcomes.jsonl"),
+        "oracle_report_sha256": _sha256(root / "oracle-report.json"),
+    }
+    for field, digest in current.items():
+        if getattr(lock, field) != digest:
+            raise ValueError(f"selection lock {field} does not match the current artifact")
+    oracle = _read_object(root / "oracle-report.json")
+    if oracle.get("passed") is not True:
+        raise ValueError("selection lock cannot authorize evaluation after a failed oracle")
+    protocol = oracle.get("protocol")
+    if not isinstance(protocol, dict):
+        raise ValueError("oracle report has no protocol")
+    _require_target_safe(
+        {str(key): item for key, item in protocol.items()},
+        label="oracle report",
+    )
+    return lock
 
 
 def _task_id(row: dict[str, object]) -> str:
