@@ -14,6 +14,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from wmo.retrieval.embedders import HashingEmbedder
+
 
 def _module() -> ModuleType:
     path = Path(__file__).with_name("coding_model_router_autoresearch.py")
@@ -114,6 +116,7 @@ def test_native_candidate_family_uses_servable_hashing_features() -> None:
     second = transformer.transform(["same task", "different task"])
     assert np.array_equal(first, second)
     assert first.shape == (2, 512)
+    assert first.tolist() == HashingEmbedder(dim=512).embed(["same task", "different task"])
 
 
 def test_native_linear_heads_are_plain_numeric_artifact() -> None:

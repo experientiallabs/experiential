@@ -40,8 +40,6 @@ from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from wmo.retrieval.embedders import HashingEmbedder
-
 logger = logging.getLogger("coding-model_router_autoresearch")
 
 QUALITY_FLOORS = (0.95, 0.97, 0.99)
@@ -121,7 +119,26 @@ class HashingFeatureTransformer:
         return self.transform(texts)
 
     def transform(self, texts: list[str]) -> np.ndarray:
-        return np.asarray(HashingEmbedder(dim=self.dim).embed(texts), dtype=np.float64)
+        return np.asarray([_hashing_vector(text, self.dim) for text in texts], dtype=np.float64)
+
+
+def _hashing_vector(text: str, dim: int) -> list[float]:
+    """Mirror WMO HashingEmbedder without importing the package on remote fit workers."""
+    if dim <= 0:
+        raise ValueError(f"embedding dim must be positive, got {dim}")
+    vector = np.zeros(dim, dtype=np.float64)
+    normalized = text.lower()
+    if len(normalized) < 3:
+        normalized = normalized.ljust(3)
+    for index in range(len(normalized) - 2):
+        gram = normalized[index : index + 3]
+        digest = hashlib.blake2b(gram.encode("utf-8"), digest_size=8).digest()
+        bucket = int.from_bytes(digest, "big") % dim
+        vector[bucket] += 1.0 if digest[0] & 1 else -1.0
+    norm = float(np.linalg.norm(vector))
+    if norm > 0.0:
+        vector /= norm
+    return vector.tolist()
 
 
 class StaticRow(TypedDict):
