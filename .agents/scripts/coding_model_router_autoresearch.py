@@ -803,8 +803,9 @@ def _fit(args: argparse.Namespace) -> None:
             groups=np.asarray(combined.groups, dtype=object),
         )
     )
+    candidate_specs = _candidate_space()
     leaderboard: list[dict[str, object]] = []
-    for spec in _candidate_space():
+    for spec in candidate_specs:
         oof = np.empty(len(combined.task_ids), dtype=np.float64)
         for fold_index, (train, heldout) in enumerate(folds):
             if spec.label_mode == "task-blind":
@@ -874,28 +875,6 @@ def _fit(args: argparse.Namespace) -> None:
             row["leave_source_out_metrics"] = _leave_source_out_metrics(spec, combined)
         leaderboard.append(row)
         _append_jsonl(output / "trials.jsonl", row)
-
-        if _is_control(spec):
-            continue
-        transformer = _features(spec)
-        full_features = np.asarray(transformer.fit_transform(combined.texts), dtype=np.float64)
-        estimators = _fit_estimators(
-            spec,
-            full_features,
-            combined.weak,
-            combined.strong,
-            combined.sample_weight,
-        )
-        joblib.dump(
-            {
-                "spec": dataclasses.asdict(spec),
-                "transformer": transformer,
-                "weak_estimator": estimators[0],
-                "strong_estimator": estimators[1],
-            },
-            output / f"{spec.name}.joblib",
-            compress=3,
-        )
     leaderboard.sort(
         key=lambda row: (
             bool(row["is_control"]),
@@ -904,6 +883,39 @@ def _fit(args: argparse.Namespace) -> None:
             ],
             -float(row["external_oof_uplift_spearman"]),
         )
+    )
+    selected_name = str(cast(dict[str, object], leaderboard[0]["candidate"])["name"])
+    for row in leaderboard:
+        candidate = cast(dict[str, object], row["candidate"])
+        row["selected_for_target_evaluation"] = candidate["name"] == selected_name
+    _append_jsonl(
+        output / "trials.jsonl",
+        {
+            "event": "external-selection",
+            "candidate": selected_name,
+            "target_candidate_count": 1,
+            "deep_swe_labels_read": False,
+        },
+    )
+    selected_spec = next(spec for spec in candidate_specs if spec.name == selected_name)
+    transformer = _features(selected_spec)
+    full_features = np.asarray(transformer.fit_transform(combined.texts), dtype=np.float64)
+    estimators = _fit_estimators(
+        selected_spec,
+        full_features,
+        combined.weak,
+        combined.strong,
+        combined.sample_weight,
+    )
+    joblib.dump(
+        {
+            "spec": dataclasses.asdict(selected_spec),
+            "transformer": transformer,
+            "weak_estimator": estimators[0],
+            "strong_estimator": estimators[1],
+        },
+        output / f"{selected_spec.name}.joblib",
+        compress=3,
     )
     _write_json(
         output / "frozen-candidates.json",
@@ -922,6 +934,7 @@ def _fit(args: argparse.Namespace) -> None:
                     "word128-ridge-uplift-a10",
                     "word128-ridge-heads-a1",
                 ],
+                "target_candidate_count": 1,
                 "selection": "minimum_source_balanced_strong_traffic_then_uplift_spearman",
             },
             "leaderboard": leaderboard,
@@ -1105,10 +1118,22 @@ def _evaluate(args: argparse.Namespace) -> None:
     target = _load_target(args.deep_matrix.resolve(), args.deep_tasks.resolve())
     static = _static_rows(target)
     best_quality = max(static, key=lambda row: float(row["reward"]))
+    selected_rows = [
+        row
+        for row in cast(list[dict[str, object]], frozen_object["leaderboard"])
+        if row.get("selected_for_target_evaluation") is True
+    ]
+    if len(selected_rows) != 1:
+        raise ValueError(
+            "frozen external fit must select exactly one candidate for target evaluation"
+        )
     rows: list[dict[str, object]] = []
-    for untyped in cast(list[dict[str, object]], frozen_object["leaderboard"]):
+    for untyped in selected_rows:
         candidate = cast(dict[str, object], untyped["candidate"])
-        if str(candidate.get("label_mode", "observed")) != "observed":
+        if (
+            str(candidate.get("label_mode", "observed")) != "observed"
+            or untyped.get("selected_for_target_evaluation") is not True
+        ):
             continue
         name = str(candidate["name"])
         scores = _candidate_score(output / f"{name}.joblib", target.texts)
