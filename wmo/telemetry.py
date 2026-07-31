@@ -29,6 +29,8 @@ _CLIENTS: dict[tuple[str, str], Posthog] = {}
 
 @dataclass
 class BuildTelemetryStats:
+    """Corpus and split sizes a build reported, accumulated for one telemetry event."""
+
     input_trace_count: int = 0
     input_step_count: int = 0
     train_trace_count: int = 0
@@ -38,6 +40,8 @@ class BuildTelemetryStats:
 
 
 class TelemetryBuildReporter:
+    """A `BuildReporter` that records the counts it forwards into `BuildTelemetryStats`."""
+
     def __init__(self, inner: BuildReporter, stats: BuildTelemetryStats) -> None:
         self._inner = inner
         self._stats = stats

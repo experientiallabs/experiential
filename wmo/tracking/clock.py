@@ -12,6 +12,8 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class Clock(Protocol):
+    """The time source durations are measured against; injectable so tests can pin it."""
+
     def monotonic(self) -> float:
         """Seconds from an arbitrary epoch; only differences are meaningful (for durations)."""
         ...

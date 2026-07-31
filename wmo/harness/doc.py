@@ -85,6 +85,8 @@ def code_surface_id(relpath: str) -> str:
 
 
 class SurfaceKind(StrEnum):
+    """What a surface holds, which decides how it renders and how an optimizer may edit it."""
+
     PROMPT = "prompt"  # a section of the system prompt (joined in id order)
     SKILL = "skill"  # one skill: frontmatter (name, description) + body
     TOOL_POLICY = "tool_policy"  # the tool list, one tool name per line

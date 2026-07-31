@@ -66,20 +66,28 @@ _MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
 class NewSessionRequest(BaseModel):
+    """Session-open body: the task to run, optionally seeded with a starting state."""
+
     task: str | None = None
     seed_state: EnvState | None = None
 
 
 class NewSessionResponse(BaseModel):
+    """Session-open reply: the new session id and its initial state."""
+
     session_id: str
     state: EnvState
 
 
 class StepRequest(BaseModel):
+    """Step body: the action to simulate."""
+
     action: Action
 
 
 class StepResponse(BaseModel):
+    """Step reply: the predicted observation and the state it left behind."""
+
     observation: Observation
     # The env state after this step, so clients can render scratchpad/structured state without a
     # follow-up GET of the whole (linearly growing) session on every step.
@@ -87,16 +95,22 @@ class StepResponse(BaseModel):
 
 
 class ModelCardEntry(BaseModel):
+    """One served world model, with its card when the artifact has one."""
+
     name: str
     card: ModelCard | None = None
 
 
 class ModelsResponse(BaseModel):
+    """World-model listing reply."""
+
     world_models: list[str]  # names-only shape, kept for existing clients
     models: list[ModelCardEntry]
 
 
 class NewBuildResponse(BaseModel):
+    """Build-start reply: the id to poll for build events."""
+
     build_id: str
 
 
@@ -108,10 +122,14 @@ class KnowledgeResponse(BaseModel):
 
 
 class KnowledgeFileRequest(BaseModel):
+    """Knowledge-file write body: the markdown to store."""
+
     content: str
 
 
 class UploadResponse(BaseModel):
+    """Trace-upload reply: the stored path of the uploaded file."""
+
     file: str
 
 

@@ -113,6 +113,8 @@ Respond with ONLY a JSON object, no prose:
 
 
 class JudgeResult(BaseModel):
+    """One fidelity verdict: headline score, per-dimension scores, and the critique behind them."""
+
     score: float  # 0..1 headline fidelity: weighted mean of the rubric dimensions
     critique: str  # natural-language feedback; feeds GEPA reflection
     dimensions: dict[str, float] = Field(default_factory=dict)  # per-dimension scores (0..1)
@@ -123,6 +125,8 @@ class JudgeResult(BaseModel):
 
 @runtime_checkable
 class Judge(Protocol):
+    """The fidelity-scoring seam: rate a predicted observation against the actual one."""
+
     def score(self, predicted: Observation, actual: Observation, context: Step) -> JudgeResult: ...
 
 
