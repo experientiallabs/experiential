@@ -140,10 +140,12 @@ The preregistered candidate families are:
    This gives lambda units of reward points per average call, matching WMO's `pick_lam` scale.
    Lambda is 0, 0.0025, 0.005, 0.01, 0.02, or 0.04.
 4. **Empirical-Bayes family shrinkage.** Beta-binomial task and library-family effects shrink
-   repeated binary executions toward global and hard-subset priors. A Ridge residual head predicts
-   remaining adjacent-effort uplift from the same frozen representations. Prior strength is 2, 5,
-   10, 20, or 50 effective trials. Posterior lower bounds use z 0, 0.5, 1.0, or 1.645 and revert to
-   the fit-selected static effort when a family is unseen.
+   repeated binary executions toward global and hard-subset priors. Global arm means receive
+   Jeffreys smoothing before they define the empirical prior, preventing zero posterior variance
+   on all-pass or all-fail arms. A Ridge residual head predicts remaining adjacent-effort uplift
+   from the same frozen representations. Prior strength is 2, 5, 10, 20, or 50 effective trials.
+   Posterior lower bounds use z 0, 0.5, 1.0, or 1.645 and revert to the fit-selected static effort
+   when no effort clears the fit-only quality floor.
 
 All fitting and hyperparameter search runs remotely. The five outer seeds are 0 through 4. For
 each seed, complete library signatures are ordered by

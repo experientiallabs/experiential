@@ -291,12 +291,27 @@ def test_empirical_bayes_uses_loo_and_unseen_global_fallback() -> None:
         rewards,
         prior_strength=5.0,
     )
-    global_mean = rewards.mean(axis=(0, 2))
+    global_mean = (rewards.sum(axis=(0, 2)) + 0.5) / (rewards.shape[0] * module.ATTEMPTS + 1.0)
     expected_shared = (np.asarray([10.0, 0.0, 0.0, 0.0, 0.0]) + 5.0 * global_mean) / 15.0
     assert np.allclose(train_base[0], (rewards[1].sum(axis=1) + 5.0 * global_mean) / 10.0)
     assert np.allclose(train_base[2], global_mean)
     assert np.allclose(test_base[0], expected_shared)
     assert np.allclose(test_base[1], global_mean)
+
+
+def test_empirical_bayes_moments_are_finite_for_extreme_arms() -> None:
+    rewards = np.zeros((2, len(module.ARMS), module.ATTEMPTS), dtype=np.float64)
+    rewards[:, -1, :] = 1.0
+    _, train_se, _, test_se = module.empirical_bayes_family_moments(
+        ["a", "b"],
+        ["unseen"],
+        rewards,
+        prior_strength=2.0,
+    )
+    assert np.isfinite(train_se).all()
+    assert np.isfinite(test_se).all()
+    assert np.all(train_se > 0.0)
+    assert np.all(test_se > 0.0)
 
 
 def test_empirical_bayes_residual_predictions_are_monotone() -> None:
@@ -319,3 +334,23 @@ def test_empirical_bayes_residual_predictions_are_monotone() -> None:
     assert predicted.shape == (2, len(module.ARMS))
     assert np.all((0.0 <= predicted) & (predicted <= 1.0))
     assert np.all(np.diff(predicted, axis=1) >= 0.0)
+
+
+def test_lower_bound_choice_uses_cheapest_feasible_or_fallback() -> None:
+    predicted = np.asarray(
+        [
+            [0.96, 0.97, 0.98, 0.99, 1.0],
+            [0.70, 0.75, 0.80, 0.85, 0.90],
+        ]
+    )
+    standard_errors = np.full_like(predicted, 0.01)
+    costs = np.asarray([1.0, 2.0, 3.0, 4.0, 5.0])
+    choices = module.lower_bound_choices(
+        predicted,
+        standard_errors,
+        costs,
+        quality_floor=0.95,
+        fallback_arm=4,
+        z=0.5,
+    )
+    assert choices.tolist() == [0, 4]

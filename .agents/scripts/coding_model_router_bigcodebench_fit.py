@@ -684,14 +684,68 @@ def shadow_price_choices(
     return np.argmax(predicted_rewards - lam * normalized_cost[None, :], axis=1).astype(np.int64)
 
 
-def _family_posterior(
+def _family_posterior_moments(
     successes: np.ndarray,
     trials: float,
     global_mean: np.ndarray,
     *,
     prior_strength: float,
-) -> np.ndarray:
-    return (successes + prior_strength * global_mean) / (trials + prior_strength)
+) -> tuple[np.ndarray, np.ndarray]:
+    alpha = successes + prior_strength * global_mean
+    beta = trials - successes + prior_strength * (1.0 - global_mean)
+    total = alpha + beta
+    mean = alpha / total
+    variance = alpha * beta / (total**2 * (total + 1.0))
+    return mean, np.sqrt(np.maximum(variance, 0.0))
+
+
+def empirical_bayes_family_moments(
+    train_groups: list[str],
+    test_groups: list[str],
+    train_rewards: np.ndarray,
+    *,
+    prior_strength: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return LOO train and heldout beta-binomial means and standard errors."""
+    if train_rewards.ndim != 3 or train_rewards.shape[1:] != (len(ARMS), ATTEMPTS):
+        raise ValueError("empirical-Bayes rewards have the wrong shape")
+    if len(train_groups) != train_rewards.shape[0]:
+        raise ValueError("empirical-Bayes groups do not match rewards")
+    if prior_strength <= 0.0:
+        raise ValueError("prior strength must be positive")
+    global_successes = train_rewards.sum(axis=(0, 2))
+    global_trials = float(train_rewards.shape[0] * ATTEMPTS)
+    global_mean = (global_successes + 0.5) / (global_trials + 1.0)
+    family_successes: dict[str, np.ndarray] = {}
+    family_trials: dict[str, float] = {}
+    for index, group in enumerate(train_groups):
+        family_successes.setdefault(group, np.zeros(len(ARMS), dtype=np.float64))
+        family_successes[group] += train_rewards[index].sum(axis=1)
+        family_trials[group] = family_trials.get(group, 0.0) + ATTEMPTS
+
+    train_mean = np.empty((len(train_groups), len(ARMS)), dtype=np.float64)
+    train_se = np.empty_like(train_mean)
+    for index, group in enumerate(train_groups):
+        successes = family_successes[group] - train_rewards[index].sum(axis=1)
+        trials = family_trials[group] - ATTEMPTS
+        train_mean[index], train_se[index] = _family_posterior_moments(
+            successes,
+            trials,
+            global_mean,
+            prior_strength=prior_strength,
+        )
+    test_mean = np.empty((len(test_groups), len(ARMS)), dtype=np.float64)
+    test_se = np.empty_like(test_mean)
+    for index, group in enumerate(test_groups):
+        successes = family_successes.get(group, np.zeros(len(ARMS), dtype=np.float64))
+        trials = family_trials.get(group, 0.0)
+        test_mean[index], test_se[index] = _family_posterior_moments(
+            successes,
+            trials,
+            global_mean,
+            prior_strength=prior_strength,
+        )
+    return train_mean, train_se, test_mean, test_se
 
 
 def empirical_bayes_family_predictions(
@@ -702,41 +756,13 @@ def empirical_bayes_family_predictions(
     prior_strength: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return leave-one-task-out train and heldout family posterior means."""
-    if train_rewards.ndim != 3 or train_rewards.shape[1:] != (len(ARMS), ATTEMPTS):
-        raise ValueError("empirical-Bayes rewards have the wrong shape")
-    if len(train_groups) != train_rewards.shape[0]:
-        raise ValueError("empirical-Bayes groups do not match rewards")
-    if prior_strength <= 0.0:
-        raise ValueError("prior strength must be positive")
-    global_mean = train_rewards.mean(axis=(0, 2))
-    family_successes: dict[str, np.ndarray] = {}
-    family_trials: dict[str, float] = {}
-    for index, group in enumerate(train_groups):
-        family_successes.setdefault(group, np.zeros(len(ARMS), dtype=np.float64))
-        family_successes[group] += train_rewards[index].sum(axis=1)
-        family_trials[group] = family_trials.get(group, 0.0) + ATTEMPTS
-
-    train_base = np.empty((len(train_groups), len(ARMS)), dtype=np.float64)
-    for index, group in enumerate(train_groups):
-        successes = family_successes[group] - train_rewards[index].sum(axis=1)
-        trials = family_trials[group] - ATTEMPTS
-        train_base[index] = _family_posterior(
-            successes,
-            trials,
-            global_mean,
-            prior_strength=prior_strength,
-        )
-    test_base = np.empty((len(test_groups), len(ARMS)), dtype=np.float64)
-    for index, group in enumerate(test_groups):
-        successes = family_successes.get(group, np.zeros(len(ARMS), dtype=np.float64))
-        trials = family_trials.get(group, 0.0)
-        test_base[index] = _family_posterior(
-            successes,
-            trials,
-            global_mean,
-            prior_strength=prior_strength,
-        )
-    return train_base, test_base
+    train_mean, _, test_mean, _ = empirical_bayes_family_moments(
+        train_groups,
+        test_groups,
+        train_rewards,
+        prior_strength=prior_strength,
+    )
+    return train_mean, test_mean
 
 
 def empirical_bayes_ridge_predictions(
@@ -774,6 +800,42 @@ def empirical_bayes_ridge_predictions(
         ]
     )
     return np.maximum.accumulate(np.clip(absolute, 0.0, 1.0), axis=1)
+
+
+def lower_bound_choices(
+    predicted_rewards: np.ndarray,
+    standard_errors: np.ndarray,
+    arm_costs: np.ndarray,
+    *,
+    quality_floor: float,
+    fallback_arm: int,
+    z: float,
+) -> np.ndarray:
+    """Choose the cheapest arm whose lower bound clears a fit-only quality floor."""
+    if predicted_rewards.shape != standard_errors.shape or predicted_rewards.ndim != 2:
+        raise ValueError("lower-bound means and standard errors differ")
+    if predicted_rewards.shape[1] != len(ARMS) or arm_costs.shape != (len(ARMS),):
+        raise ValueError("lower-bound inputs have the wrong effort shape")
+    if not np.isfinite(arm_costs).all() or np.any(arm_costs < 0.0):
+        raise ValueError("lower-bound arm costs must be finite and nonnegative")
+    if not 0.0 <= quality_floor <= 1.0:
+        raise ValueError("quality floor must be in [0, 1]")
+    if not 0 <= fallback_arm < len(ARMS):
+        raise ValueError("fallback arm is outside the frozen effort roster")
+    if z not in {0.0, 0.5, 1.0, 1.645}:
+        raise ValueError("lower-bound z is outside the frozen search space")
+    if np.any(standard_errors < 0.0) or not np.isfinite(standard_errors).all():
+        raise ValueError("standard errors must be finite and nonnegative")
+    order = np.argsort(arm_costs, kind="stable")
+    lower = predicted_rewards - z * standard_errors
+    choices = np.full(predicted_rewards.shape[0], fallback_arm, dtype=np.int64)
+    for row_index in range(predicted_rewards.shape[0]):
+        feasible = [
+            arm_index for arm_index in order if lower[row_index, arm_index] >= quality_floor
+        ]
+        if feasible:
+            choices[row_index] = feasible[0]
+    return choices
 
 
 def evaluate_choices(
