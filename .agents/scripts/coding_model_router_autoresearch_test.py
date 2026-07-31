@@ -219,6 +219,48 @@ def test_three_level_route_is_monotone_in_predicted_uplift() -> None:
     assert decisions.tolist() == [0, 1, 2]
 
 
+def test_task_blind_control_matches_router_traffic_and_analytic_mean() -> None:
+    module = _module()
+    target = module.TargetData(
+        task_ids=["a", "b", "c", "d"],
+        texts=["a", "b", "c", "d"],
+        groups=["g1", "g2", "g3", "g4"],
+        arms=["weak", "strong"],
+        rewards=np.asarray(
+            [
+                [0.0, 0.2, 0.4, 0.6],
+                [1.0, 0.8, 0.6, 0.4],
+            ]
+        ),
+        costs=np.asarray(
+            [
+                [1.0, 1.0, 1.0, 1.0],
+                [3.0, 3.0, 3.0, 3.0],
+            ]
+        ),
+    )
+    decisions = np.asarray([0, 1, 1, 0])
+    columns = np.arange(4)
+    routed_reward = target.rewards[decisions, columns]
+    routed_cost = target.costs[decisions, columns]
+
+    control = module._matched_task_blind_control(
+        target,
+        np.asarray([0, 1]),
+        decisions,
+        routed_reward,
+        routed_cost,
+        seed=7,
+        samples=1_000,
+    )
+
+    assert control is not None
+    assert control["traffic_matched"] == {"weak": 2, "strong": 2}
+    assert np.isclose(control["expected_reward"], 0.5)
+    assert np.isclose(control["expected_cost_usd"], 8.0)
+    assert np.isclose(control["router_cost_delta_vs_random_mean_usd"], 0.0)
+
+
 def test_two_level_threshold_uses_the_requested_frozen_quality_floor() -> None:
     module = _module()
     thresholds = {

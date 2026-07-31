@@ -1271,6 +1271,63 @@ def _route_indices(scores: np.ndarray, thresholds: list[float], ladder_size: int
     return np.where(scores >= upper, 2, np.where(scores >= lower, 1, 0)).astype(np.int64)
 
 
+def _matched_task_blind_control(
+    target: TargetData,
+    arm_indices: np.ndarray,
+    decisions: np.ndarray,
+    routed_reward: np.ndarray,
+    routed_cost: np.ndarray,
+    *,
+    seed: int,
+    samples: int = BOOTSTRAP_SAMPLES,
+) -> dict[str, object] | None:
+    """Compare a two-arm router with random task-blind assignments at identical traffic."""
+    if len(arm_indices) != 2:
+        return None
+    tasks = len(target.task_ids)
+    strong_count = int(np.sum(decisions == 1))
+    strong_probability = strong_count / tasks
+    weak_reward = target.rewards[arm_indices[0]]
+    strong_reward = target.rewards[arm_indices[1]]
+    weak_cost = target.costs[arm_indices[0]]
+    strong_cost = target.costs[arm_indices[1]]
+    expected_reward = float(
+        np.mean((1.0 - strong_probability) * weak_reward + strong_probability * strong_reward)
+    )
+    expected_cost = float(
+        np.sum((1.0 - strong_probability) * weak_cost + strong_probability * strong_cost)
+    )
+
+    rng = np.random.default_rng(seed)
+    random_rewards = np.empty(samples, dtype=np.float64)
+    random_costs = np.empty(samples, dtype=np.float64)
+    for sample in range(samples):
+        strong_rows = rng.choice(tasks, size=strong_count, replace=False)
+        reward = weak_reward.copy()
+        cost = weak_cost.copy()
+        reward[strong_rows] = strong_reward[strong_rows]
+        cost[strong_rows] = strong_cost[strong_rows]
+        random_rewards[sample] = float(reward.mean())
+        random_costs[sample] = float(cost.sum())
+    router_reward = float(routed_reward.mean())
+    router_cost = float(routed_cost.sum())
+    return {
+        "traffic_matched": {"weak": tasks - strong_count, "strong": strong_count},
+        "expected_reward": expected_reward,
+        "reward_95ci": [
+            float(value) for value in np.quantile(random_rewards, [0.025, 0.975])
+        ],
+        "expected_cost_usd": expected_cost,
+        "cost_95ci_usd": [
+            float(value) for value in np.quantile(random_costs, [0.025, 0.975])
+        ],
+        "router_reward_delta_vs_random_mean": router_reward - expected_reward,
+        "router_cost_delta_vs_random_mean_usd": router_cost - expected_cost,
+        "router_quality_percentile": float(np.mean(random_rewards <= router_reward)),
+        "router_cost_percentile": float(np.mean(random_costs <= router_cost)),
+    }
+
+
 def _bootstrap(
     router_reward: np.ndarray,
     router_cost: np.ndarray,
@@ -1406,6 +1463,12 @@ def _evaluate(args: argparse.Namespace) -> None:
                     target.groups,
                 )
                 counts = collections.Counter(int(value) for value in decisions)
+                blind_seed = int.from_bytes(
+                    hashlib.sha256(
+                        f"{name}:{ladder_name}:{quality_floor}".encode()
+                    ).digest()[:8],
+                    "big",
+                )
                 row: dict[str, object] = {
                     "candidate": name,
                     "ladder": ladder_name,
@@ -1441,6 +1504,14 @@ def _evaluate(args: argparse.Namespace) -> None:
                     "traffic": {
                         ladder[index]: counts.get(index, 0) for index in range(len(ladder))
                     },
+                    "matched_task_blind_control": _matched_task_blind_control(
+                        target,
+                        arm_indices,
+                        decisions,
+                        routed_reward,
+                        routed_cost,
+                        seed=blind_seed,
+                    ),
                     "target_labels_used_for_fit": False,
                     "target_labels_used_for_thresholds": False,
                     "target_static_aggregates_used_for_ladder_design": True,
