@@ -7,8 +7,10 @@ the original heldout outcomes. DeepSWE artifacts are outside this module.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 import numpy as np
 from coding_model_router_bigcodebench_fit import (
@@ -23,6 +25,8 @@ from coding_model_router_bigcodebench_fit import (
 )
 from coding_model_router_bigcodebench_select import (
     CandidateSpec,
+    Estimator,
+    Family,
     KnnCandidateSpec,
     _candidate_choices,
 )
@@ -37,6 +41,92 @@ class HeldoutReplay:
     value: PolicyValue
     baseline: PolicyValue
     metric: CandidateMetric
+
+
+def _number(config: dict[str, object], key: str) -> float:
+    """Read one finite numeric candidate field without accepting booleans."""
+    value = config.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"candidate config field {key} is not numeric")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"candidate config field {key} is not finite")
+    return result
+
+
+def _integer(config: dict[str, object], key: str) -> int:
+    """Read one exact integer candidate field."""
+    value = _number(config, key)
+    if not value.is_integer():
+        raise ValueError(f"candidate config field {key} is not an integer")
+    return int(value)
+
+
+def candidate_spec_from_lock(
+    family: str,
+    config_json: str,
+    *,
+    name: str,
+    order: int,
+) -> CandidateSpec | KnnCandidateSpec:
+    """Rebuild one exact frozen candidate from canonical lock fields."""
+    raw = json.loads(config_json)
+    if not isinstance(raw, dict):
+        raise ValueError("locked candidate config must be one JSON object")
+    config = {str(key): value for key, value in raw.items()}
+    if family == "knn":
+        guard_value = config.get("guard_model")
+        if guard_value == "fit-best":
+            guard_model = None
+        elif isinstance(guard_value, str) and guard_value in ARMS:
+            guard_model = guard_value
+        else:
+            raise ValueError("locked kNN candidate has an invalid guard model")
+        guard_mode = config.get("guard_mode")
+        if guard_mode not in {"symmetric", "asymmetric"}:
+            raise ValueError("locked kNN candidate has an invalid guard mode")
+        spec: CandidateSpec | KnnCandidateSpec = KnnCandidateSpec(
+            dim=_integer(config, "dim"),
+            rag_num=_integer(config, "rag_num"),
+            rag_thres=_number(config, "rag_thres"),
+            z=_number(config, "z"),
+            min_pairs=_integer(config, "min_pairs"),
+            order=order,
+            guard_model=guard_model,
+            guard_mode=cast(Literal["symmetric", "asymmetric"], guard_mode),
+            pick_lam=_number(config, "pick_lam"),
+        )
+    else:
+        candidate_family = config.get("family")
+        estimator = config.get("estimator")
+        max_features = config.get("max_features")
+        if candidate_family not in {"ordinal", "doubly-robust", "empirical-bayes"}:
+            raise ValueError("locked candidate has an invalid non-kNN family")
+        if candidate_family != family:
+            raise ValueError("locked candidate family differs from its config")
+        if estimator not in {"ridge", "extra-trees", "histogram"}:
+            raise ValueError("locked candidate has an invalid estimator")
+        if max_features not in {"", "sqrt", "third"}:
+            raise ValueError("locked candidate has invalid max_features")
+        spec = CandidateSpec(
+            family=cast(Family, candidate_family),
+            estimator=cast(Estimator, estimator),
+            dim=_integer(config, "dim"),
+            order=order,
+            alpha=_number(config, "alpha"),
+            n_estimators=_integer(config, "n_estimators"),
+            min_samples_leaf=_integer(config, "min_samples_leaf"),
+            max_features=cast(Literal["", "sqrt", "third"], max_features),
+            max_leaf_nodes=_integer(config, "max_leaf_nodes"),
+            learning_rate=_number(config, "learning_rate"),
+            lam=_number(config, "lam"),
+            prior_strength=_number(config, "prior_strength"),
+            z=_number(config, "z"),
+        )
+    canonical = json.dumps(spec.config(), sort_keys=True, separators=(",", ":"))
+    if canonical != config_json or spec.name != name:
+        raise ValueError("locked candidate config does not reproduce its identity")
+    return spec
 
 
 def _partitions(

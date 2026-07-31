@@ -130,3 +130,38 @@ def test_outer_replay_rejects_group_overlap(tmp_path: Path) -> None:
             seed=7,
             work_dir=tmp_path,
         )
+
+
+def test_every_frozen_base_candidate_round_trips_from_lock() -> None:
+    candidates = [*select.candidate_grid(), *select.knn_candidate_grid()]
+    for candidate in candidates:
+        config_json, _ = fit.canonical_candidate_config(candidate.config())
+        rebuilt = module.candidate_spec_from_lock(
+            "knn" if isinstance(candidate, select.KnnCandidateSpec) else candidate.family,
+            config_json,
+            name=candidate.name,
+            order=candidate.order,
+        )
+        assert rebuilt == candidate
+
+
+def test_economic_knn_candidate_round_trips_from_lock() -> None:
+    candidate = select.KnnCandidateSpec(
+        2_048,
+        32,
+        0.95,
+        1.0,
+        16,
+        1_027,
+        guard_model="luna-low",
+        guard_mode="asymmetric",
+        pick_lam=0.03,
+    )
+    config_json, _ = fit.canonical_candidate_config(candidate.config())
+    rebuilt = module.candidate_spec_from_lock(
+        "knn",
+        config_json,
+        name=candidate.name,
+        order=candidate.order,
+    )
+    assert rebuilt == candidate
