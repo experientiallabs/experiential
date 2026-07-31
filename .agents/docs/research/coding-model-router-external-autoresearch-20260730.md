@@ -165,6 +165,12 @@ control but is not significant:
 The external 0.99 point reaches the 96.71st quality percentile but costs USD 5.9150 more than the
 matched task-blind mean. This is weak task-selection evidence, not a promotable result.
 
+An Open-SWE-only native hashing follow-up is a negative result. It selected
+`hash8192-ridge-heads-a10` with 0.0812 external out-of-fold uplift Spearman, but the external 0.97
+point is 0.0012465 lower quality and USD 11.0395 more expensive than matched task-blind assignment
+on DeepSWE. Its quality and cost percentiles are 33.26 and 94.12. Stronger source-domain
+correlation therefore did not improve target transfer.
+
 ## Reproducibility anchors
 
 First external fit commit: `bbbaa609aa7f8b9e6a35aab311920ad11ef17266`
@@ -219,3 +225,9 @@ Structural frozen candidates SHA256:
 
 Structural DeepSWE report SHA256:
 `47ab1efc7e4556f6fd31b4af858073132a80fd569f5a65b2e11b31e094de3b4d`
+
+Open-SWE native frozen candidates SHA256:
+`919b60a85635629818ed67938abd594c5091839f8f64031669c2aa98f2800bee`
+
+Open-SWE native DeepSWE report SHA256:
+`ff4babf624c98f3fa6a5907a6d58f78666d73c674b7a7f7567508230794be46b`
