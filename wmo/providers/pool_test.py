@@ -1331,6 +1331,18 @@ def test_pool_entry_threads_reasoning_effort_into_the_provider_config() -> None:
     )
 
 
+def test_pool_entry_preserves_openai_xhigh_reasoning_effort() -> None:
+    entry = PoolEntry(
+        name="gpt-5.4@xhigh",
+        kind=ProviderKind.OPENAI,
+        model="gpt-5.4",
+        reasoning_effort="xhigh",
+    )
+
+    assert entry.provider_config().reasoning_effort == "xhigh"
+    assert entry.model_dump()["reasoning_effort"] == "xhigh"
+
+
 def test_reasoning_effort_validates_at_load_not_first_request() -> None:
     """A bad effort value or a Bedrock effort entry must fail when the pool loads."""
     with pytest.raises(ValidationError, match="reasoning_effort"):
@@ -1349,4 +1361,11 @@ def test_reasoning_effort_validates_at_load_not_first_request() -> None:
             kind=ProviderKind.BEDROCK,
             model="us.anthropic.claude-opus-4-8",
             reasoning_effort="max",
+        )
+    with pytest.raises(ValidationError, match="supports effort through max"):
+        PoolEntry(
+            name="sonnet-5@xhigh",
+            kind=ProviderKind.ANTHROPIC,
+            model="claude-sonnet-5",
+            reasoning_effort="xhigh",
         )

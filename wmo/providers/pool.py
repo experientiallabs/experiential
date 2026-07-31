@@ -59,6 +59,7 @@ POOL_LOCK_TIMEOUT_S = DEFAULT_LOCK_TIMEOUT_S
 # D-REPORT ModelRef vocabulary: "frontier" anchors the improvement report's comparison; "open"
 # models carry the run-10x-more-for-the-same-budget story.
 Tier = Literal["frontier", "open"]
+ReasoningEffort = Literal["none", "low", "medium", "high", "max", "xhigh"]
 
 
 class PoolEntry(BaseModel):
@@ -86,7 +87,6 @@ class PoolEntry(BaseModel):
     deployment: str | None = None  # Azure deployment name
     deployment_env: str | None = None
     api_version: str | None = None  # Azure api-version
-    reasoning_effort: str | None = None
     region: str | None = None  # AWS Bedrock region (bedrock entries only)
     api_key_env: str | None = None  # env var holding this entry's API key (multi-account pools)
     tier: Tier = "frontier"
@@ -99,9 +99,9 @@ class PoolEntry(BaseModel):
     # One effort dial across vendors: OpenAI-family backends forward it as
     # `reasoning.effort` (dispatching through their Responses client), Anthropic as
     # adaptive thinking's `output_config.effort` (low|medium|high|max, probed live
-    # 2026-07-29). Two entries differing only in effort are two ARMS with one runtime
-    # model id - the router-vs-router comparison's whole premise.
-    reasoning_effort: Literal["none", "low", "medium", "high", "max"] | None = None
+    # 2026-07-29). OpenAI reasoning models may also expose xhigh. Two entries differing only
+    # in effort are two ARMS with one runtime model id, which is the router comparison's premise.
+    reasoning_effort: ReasoningEffort | None = None
     input_per_mtok: float | None = None
     output_per_mtok: float | None = None
     cached_input_per_mtok: float | None = None  # provider cache-read price, USD per 1M tokens
@@ -117,6 +117,12 @@ class PoolEntry(BaseModel):
                 f"pool entry {self.name!r}: reasoning_effort is not supported on bedrock "
                 "(Converse has no effort dial); route effort-dialed Claude through the "
                 "direct anthropic kind instead"
+            )
+        if self.reasoning_effort == "xhigh" and self.kind == ProviderKind.ANTHROPIC:
+            raise ValueError(
+                f"pool entry {self.name!r}: Anthropic adaptive thinking supports effort through "
+                "max, not xhigh; use max or route an xhigh-capable model through its OpenAI "
+                "compatible provider"
             )
         return self
 
