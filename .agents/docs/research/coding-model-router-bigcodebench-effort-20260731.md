@@ -250,6 +250,20 @@ selection rule is the least expensive policy that, across five deterministic out
 Only one externally selected policy and operating point may advance. Freeze its feature transform,
 fitter, hyperparameters, cost-quality dial, and artifact hash before reading target outcomes.
 
+The external promotion arithmetic is frozen before any source held-out reward is replayed. Pool
+the five immutable outer reports and run 10,000 deterministic task-family cluster bootstrap
+resamples with seed `20260731`. Each outer seed must independently retain at least 95 percent of
+its fit-selected static baseline while saving at least 40 percent cost, and the pooled retention
+interval lower bound must remain at or above 0.95. A zero-reward baseline is handled by the
+equivalent absolute inequality `router_reward >= 0.95 * baseline_reward`; a nonpositive baseline
+cost is invalid. The router's paired reward advantage must have a strictly positive interval lower
+bound against the matched task-blind mixture, selected shuffled-label policy, seeded uniform
+random policy, and fit-cost-only policy. Families with three or four unique tasks may lose at most
+0.25 absolute reward, and families with at least five unique tasks may lose at most 0.10. The
+fit-only deployment consensus must also be quality feasible. Every aggregate is recomputed from
+the immutable task rows before these gates are evaluated, and the report records that no DeepSWE
+outcome was used.
+
 ## DeepSWE transfer
 
 DeepSWE v1.1 remains evaluation-only. If the external promotion gate passes:
