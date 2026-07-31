@@ -9,6 +9,7 @@ from types import ModuleType
 
 import numpy as np
 import pytest
+from scipy import sparse
 
 
 def _module() -> ModuleType:
@@ -96,3 +97,32 @@ def test_target_metadata_loader_rejects_outcomes(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="label-free"):
         module._load_target_metadata(path)
+
+
+def test_all_candidate_families_produce_grouped_finite_predictions() -> None:
+    module = _module()
+    rng = np.random.default_rng(7)
+    tasks = 100
+    data = module.Data(
+        task_ids=[str(index) for index in range(tasks)],
+        repos=np.asarray([f"repo-{index // 5}" for index in range(tasks)], dtype=object),
+        texts=["task"] * tasks,
+        cheap=rng.random(tasks),
+        strong=rng.random(tasks),
+        cheap_attempts=np.ones(tasks),
+        strong_attempts=np.ones(tasks),
+        burden=rng.random((tasks, 6)),
+        attempt_rows={},
+        overlap_audit={},
+    )
+    features = sparse.random(tasks, 64, density=0.2, random_state=7, format="csr")
+    indices = np.arange(tasks)
+    train, test = module._group_splits(indices, data.repos, 5)[0]
+    for family in ("direct", "distilled", "concat"):
+        candidate = module.Candidate(family, 2_048, 1.0, 1.0)
+        out_of_fold = module._candidate_oof(data, features, indices, candidate)
+        heldout = module._fit_candidate(data, features, train, test, candidate)
+        assert out_of_fold.shape == (tasks,)
+        assert heldout.shape == (len(test),)
+        assert np.all(np.isfinite(out_of_fold))
+        assert np.all(np.isfinite(heldout))
