@@ -142,6 +142,69 @@ def test_structural_irt_family_uses_deterministic_pre_inference_features() -> No
     assert first.shape == (2, 27)
 
 
+def test_task_profile_family_uses_disjoint_static_taxonomy_classifier() -> None:
+    module = _module()
+    candidates = module._candidate_space("task-profile")
+    observed = [candidate for candidate in candidates if candidate.label_mode == "observed"]
+    assert len(observed) == 8
+    assert {candidate.analyzer for candidate in observed} == {"hashing"}
+    assert {candidate.estimator for candidate in observed} == {"profile-uplift"}
+
+    teacher = module.ProfileTeacherData(
+        task_ids=["e1", "e2", "h1", "h2"],
+        groups=["r1", "r2", "r3", "r4"],
+        texts=["small typo", "simple rename", "complex failure", "distributed deadlock"],
+        difficulty=["easy", "easy", "hard", "hard"],
+        intent_completeness=["complete"] * 4,
+        pr_categories=[["minor_bug"], ["minor_bug"], ["core_feat"], ["core_feat"]],
+    )
+    spec = module.CandidateSpec(
+        "profile-test",
+        "hashing",
+        64,
+        "profile-uplift",
+        profile_mode="difficulty",
+        profile_temperature=0.1,
+        profile_prior_strength=0.0,
+        min_profile_tasks=1,
+    )
+    features = module._features(spec).fit_transform(teacher.texts)
+    classifier = module._fit_profile_classifier(spec, teacher, features)
+    model = module._fit_profile_uplift(
+        spec,
+        classifier,
+        features,
+        np.zeros(4),
+        np.asarray([0.1, 0.1, 0.9, 0.9]),
+        np.ones(4),
+    )
+    scores = model.predict(features)
+    assert float(scores[2:].mean()) > float(scores[:2].mean())
+
+
+def test_profile_teacher_filter_removes_outcome_identity_and_text_overlap() -> None:
+    module = _module()
+    teacher = module.ProfileTeacherData(
+        task_ids=["same-id", "other-id", "kept"],
+        groups=["r1", "r2", "r3"],
+        texts=["first", "same normalized text", "unique teacher"],
+        difficulty=["easy", "medium", "hard"],
+        intent_completeness=["complete"] * 3,
+        pr_categories=[[], [], []],
+    )
+    combined = module.CombinedData(
+        source_names=["source", "source"],
+        task_ids=["same-id", "outcome-2"],
+        groups=["g1", "g2"],
+        texts=["different", "same   normalized text"],
+        weak=np.zeros(2),
+        strong=np.ones(2),
+        sample_weight=np.ones(2),
+    )
+    filtered = module._disjoint_profile_teacher(teacher, combined, minimum_rows=1)
+    assert filtered.task_ids == ["kept"]
+
+
 def test_irt_uplift_is_largest_for_middle_difficulty() -> None:
     module = _module()
     easiness = np.asarray([-4.0, 0.0, 4.0])

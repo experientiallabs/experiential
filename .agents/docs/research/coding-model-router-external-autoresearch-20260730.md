@@ -171,6 +171,46 @@ point is 0.0012465 lower quality and USD 11.0395 more expensive than matched tas
 on DeepSWE. Its quality and cost percentiles are 33.26 and 94.12. Stronger source-domain
 correlation therefore did not improve target transfer.
 
+## Five-source structural transfer gate
+
+The structural family was then refit across all five external sources with equal source weight.
+This screen read no DeepSWE path. The selected `structural-irt-a100` candidate used 59.36 percent
+strong traffic at the external 0.95 point, but its aggregate out-of-fold uplift Spearman was
+-0.0167. Four sources had positive within-source uplift correlation and R2E Gym had -0.2766.
+
+The preregistered cross-domain gate required positive aggregate uplift, better traffic than the
+controls, and positive source-specific uplift on at least four of five sources. The negative
+aggregate result rejects the family. No DeepSWE evaluation was run.
+
+The frozen artifact has SHA-256
+`e11b5fec3bfd72c7df1ba1496835b494f594b76275b5e113bd6a37e2a9c4ec52`.
+Its selected research joblib is only 895 bytes and has SHA-256
+`dedaff4f94efd55d6e1fd3eaff8784043744ab28732767870c1ca44a6d170e3c`.
+
+## Latent task-profile follow-up
+
+The next family adapts the task-type prior from TRouter without its inference-time language-model
+classifier. SWE-rebench V2 provides external taxonomy supervision for difficulty, intent
+completeness, and PR category. The profile teacher is a separate subset with no selected
+Open-SWE paired outcome. Exact task identity and normalized prompt overlap are removed against all
+five outcome sources before fitting.
+
+A deterministic character-hashing classifier maps the request to soft profile centroids. A
+source-balanced, shrunk table then estimates the marginal gain of the strong effort arm for each
+profile. Serve time needs one local hash, centroid similarities, and a table lookup. It makes no
+network call and persists no foundation model.
+
+The family gate is frozen before its fit:
+
+1. aggregate external out-of-fold uplift Spearman must be positive;
+2. source-specific out-of-fold uplift must be positive on at least four of five sources;
+3. leave-one-source-out uplift must be positive on at least four of five sources;
+4. strong traffic at the external 0.95 point must be lower than both negative controls.
+
+Only one mechanically selected candidate may open the DeepSWE artifact, and only if all four
+conditions pass. A metadata-only audit found zero task-id and zero normalized-text overlap between
+the 14,504 Open-SWE paired tasks and the 113 DeepSWE task metadata rows.
+
 ## Reproducibility anchors
 
 First external fit commit: `bbbaa609aa7f8b9e6a35aab311920ad11ef17266`

@@ -82,6 +82,18 @@ class ExternalTaskRow(TypedDict):
     strong_attempts: int
 
 
+class ProfileTeacherRow(TypedDict):
+    """One external task-profile supervision row without model outcomes."""
+
+    instance_id: str
+    repo: str
+    language: str
+    text: str
+    difficulty: str
+    intent_completeness: str
+    pr_categories: list[str]
+
+
 class JsonObject(Protocol):
     """Protocol for JSON mappings used by the one-off runner."""
 
@@ -168,6 +180,34 @@ class IrtDifficultyRegressor:
         weak = _sigmoid(easiness + self.weak_offset)
         strong = _sigmoid(easiness + self.strong_offset)
         return strong - weak
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskProfileClassifier:
+    """Frozen centroid classifier distilled from disjoint external task metadata."""
+
+    labels: tuple[str, ...]
+    centroids: np.ndarray
+    temperature: float
+
+    def probabilities(self, features: np.ndarray) -> np.ndarray:
+        logits = np.asarray(features @ self.centroids.T, dtype=np.float64)
+        logits /= self.temperature
+        logits -= logits.max(axis=1, keepdims=True)
+        probabilities = np.exp(logits)
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        return probabilities
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskProfileUpliftRegressor:
+    """Estimate marginal strong-arm gain through a latent task-profile prior."""
+
+    classifier: TaskProfileClassifier
+    profile_uplift: np.ndarray
+
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        return self.classifier.probabilities(features) @ self.profile_uplift
 
 
 def _hashing_vector(text: str, dim: int) -> list[float]:
@@ -260,6 +300,18 @@ class SourceData:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProfileTeacherData:
+    """Disjoint external prompt-to-taxonomy supervision with no model outcomes."""
+
+    task_ids: list[str]
+    groups: list[str]
+    texts: list[str]
+    difficulty: list[str]
+    intent_completeness: list[str]
+    pr_categories: list[list[str]]
+
+
+@dataclasses.dataclass(frozen=True)
 class CombinedData:
     """Deduplicated external task rows and source-balanced sample weights."""
 
@@ -285,10 +337,22 @@ class CandidateSpec:
         "extra-heads",
         "hist-heads",
         "irt-difficulty",
+        "profile-uplift",
     ]
     alpha: float = 1.0
     min_leaf: int = 10
     label_mode: Literal["observed", "shuffled", "task-blind"] = "observed"
+    profile_mode: Literal[
+        "none",
+        "difficulty",
+        "intent",
+        "pr-category",
+        "difficulty-intent",
+        "difficulty-pr-category",
+    ] = "none"
+    profile_temperature: float = 0.1
+    profile_prior_strength: float = 50.0
+    min_profile_tasks: int = 25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -397,6 +461,34 @@ def _load_paired_json(path: Path, *, name: str) -> SourceData:
 
 def _load_nebius(path: Path) -> SourceData:
     return _load_paired_json(path, name="nebius-swe-agent-8b-70b")
+
+
+def _load_profile_teacher(path: Path) -> ProfileTeacherData:
+    """Load disjoint external task taxonomy rows without outcome labels."""
+    raw = _read_json(path)
+    if not isinstance(raw, list):
+        raise ValueError(f"{path} must contain a JSON list")
+    rows = [cast(ProfileTeacherRow, item) for item in raw if isinstance(item, dict)]
+    if not rows:
+        raise ValueError(f"{path} has no task-profile teacher rows")
+    task_ids = [row["instance_id"] for row in rows]
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError(f"{path} contains duplicate task-profile instance ids")
+    return ProfileTeacherData(
+        task_ids=task_ids,
+        groups=[_canonical_group(row["repo"]) for row in rows],
+        texts=[row["text"] for row in rows],
+        difficulty=[row["difficulty"].strip().lower() or "unknown" for row in rows],
+        intent_completeness=[
+            row["intent_completeness"].strip().lower() or "unknown" for row in rows
+        ],
+        pr_categories=[
+            sorted(
+                {category.strip().lower() for category in row["pr_categories"] if category.strip()}
+            )
+            for row in rows
+        ],
+    )
 
 
 def _r2e_string_set(path: Path, column: str) -> set[str]:
@@ -702,8 +794,71 @@ def _combine(sources: list[SourceData]) -> CombinedData:
 
 
 def _candidate_space(
-    family: Literal["full", "native-linear", "structural-irt"] = "full",
+    family: Literal["full", "native-linear", "structural-irt", "task-profile"] = "full",
 ) -> list[CandidateSpec]:
+    if family == "task-profile":
+        return [
+            CandidateSpec(
+                "task-blind-uplift",
+                "hashing",
+                512,
+                "ridge-uplift",
+                label_mode="task-blind",
+            ),
+            CandidateSpec(
+                "profile-difficulty-pr-shuffled-t0.1-p50",
+                "hashing",
+                512,
+                "profile-uplift",
+                label_mode="shuffled",
+                profile_mode="difficulty-pr-category",
+            ),
+            CandidateSpec(
+                "profile-difficulty-t0.1-p50",
+                "hashing",
+                512,
+                "profile-uplift",
+                profile_mode="difficulty",
+            ),
+            CandidateSpec(
+                "profile-intent-t0.1-p50",
+                "hashing",
+                512,
+                "profile-uplift",
+                profile_mode="intent",
+            ),
+            CandidateSpec(
+                "profile-pr-category-t0.1-p50",
+                "hashing",
+                512,
+                "profile-uplift",
+                profile_mode="pr-category",
+            ),
+            CandidateSpec(
+                "profile-difficulty-intent-t0.1-p50",
+                "hashing",
+                512,
+                "profile-uplift",
+                profile_mode="difficulty-intent",
+            ),
+            *[
+                CandidateSpec(
+                    f"profile-difficulty-pr-t{temperature:g}-p{prior:g}",
+                    "hashing",
+                    512,
+                    "profile-uplift",
+                    profile_mode="difficulty-pr-category",
+                    profile_temperature=temperature,
+                    profile_prior_strength=prior,
+                )
+                for temperature, prior in (
+                    (0.05, 20.0),
+                    (0.1, 20.0),
+                    (0.1, 100.0),
+                    (0.25, 100.0),
+                )
+            ],
+        ]
     if family == "structural-irt":
         return [
             CandidateSpec(
@@ -862,7 +1017,84 @@ def _features(spec: CandidateSpec) -> FeatureTransformer:
     )
 
 
+def _profile_labels(spec: CandidateSpec, teacher: ProfileTeacherData) -> list[str]:
+    """Build the frozen task taxonomy for one task-profile candidate."""
+    if spec.profile_mode == "none":
+        raise ValueError(f"{spec.name} has no task-profile mode")
+    raw: list[str] = []
+    for index in range(len(teacher.task_ids)):
+        difficulty = teacher.difficulty[index]
+        intent = teacher.intent_completeness[index]
+        categories = teacher.pr_categories[index]
+        category = categories[0] if categories else "uncategorized"
+        if spec.profile_mode == "difficulty":
+            label = difficulty
+        elif spec.profile_mode == "intent":
+            label = intent
+        elif spec.profile_mode == "pr-category":
+            label = category
+        elif spec.profile_mode == "difficulty-intent":
+            label = f"{difficulty}|{intent}"
+        else:
+            label = f"{difficulty}|{category}"
+        raw.append(label)
+    counts = collections.Counter(raw)
+    return [label if counts[label] >= spec.min_profile_tasks else "other" for label in raw]
+
+
+def _fit_profile_classifier(
+    spec: CandidateSpec,
+    teacher: ProfileTeacherData,
+    teacher_features: np.ndarray,
+) -> TaskProfileClassifier:
+    if spec.profile_temperature <= 0.0:
+        raise ValueError(f"{spec.name} profile temperature must be positive")
+    labels = _profile_labels(spec, teacher)
+    vocabulary = tuple(sorted(set(labels)))
+    if len(vocabulary) < 2:
+        raise ValueError(f"{spec.name} task taxonomy collapsed to fewer than two profiles")
+    centroids = np.zeros((len(vocabulary), teacher_features.shape[1]), dtype=np.float64)
+    labels_array = np.asarray(labels, dtype=object)
+    for index, label in enumerate(vocabulary):
+        centroid = np.asarray(
+            teacher_features[labels_array == label].mean(axis=0), dtype=np.float64
+        )
+        norm = float(np.linalg.norm(centroid))
+        if norm > 0.0:
+            centroid /= norm
+        centroids[index] = centroid
+    return TaskProfileClassifier(
+        labels=vocabulary,
+        centroids=centroids,
+        temperature=spec.profile_temperature,
+    )
+
+
+def _fit_profile_uplift(
+    spec: CandidateSpec,
+    classifier: TaskProfileClassifier,
+    features: np.ndarray,
+    weak: np.ndarray,
+    strong: np.ndarray,
+    weights: np.ndarray,
+) -> TaskProfileUpliftRegressor:
+    probabilities = classifier.probabilities(features)
+    uplift = strong - weak
+    global_uplift = float(np.average(uplift, weights=weights))
+    weighted_probabilities = probabilities * weights[:, None]
+    denominators = weighted_probabilities.sum(axis=0)
+    numerators = weighted_probabilities.T @ uplift
+    prior = spec.profile_prior_strength
+    effects = (numerators + prior * global_uplift) / (denominators + prior)
+    return TaskProfileUpliftRegressor(
+        classifier=classifier,
+        profile_uplift=np.asarray(effects, dtype=np.float64),
+    )
+
+
 def _estimators(spec: CandidateSpec) -> tuple[FittedRegressor, FittedRegressor | None]:
+    if spec.estimator == "profile-uplift":
+        raise ValueError("task-profile estimators require the external taxonomy fitter")
     if spec.estimator == "irt-difficulty":
         return cast(FittedRegressor, IrtDifficultyRegressor(spec.alpha)), None
     if spec.estimator in ("ridge-uplift", "ridge-heads"):
@@ -1091,12 +1323,74 @@ def _leave_source_out_metrics(
     return result
 
 
+def _leave_source_out_profile_metrics(
+    spec: CandidateSpec,
+    classifier: TaskProfileClassifier,
+    features: np.ndarray,
+    combined: CombinedData,
+) -> dict[str, dict[str, float]]:
+    """Measure task-profile uplift transfer when every outcome source is held out."""
+    source_array = np.asarray(combined.source_names, dtype=object)
+    result: dict[str, dict[str, float]] = {}
+    for source in sorted(set(combined.source_names)):
+        heldout = np.flatnonzero(source_array == source)
+        train = np.flatnonzero(source_array != source)
+        model = _fit_profile_uplift(
+            spec,
+            classifier,
+            features[train],
+            combined.weak[train],
+            combined.strong[train],
+            combined.sample_weight[train],
+        )
+        scores = model.predict(features[heldout])
+        uplift = (combined.strong - combined.weak)[heldout]
+        result[source] = {
+            "tasks": int(len(heldout)),
+            "uplift_spearman": _spearman(scores, uplift),
+            "score_mean": float(scores.mean()),
+            "score_std": float(scores.std()),
+        }
+        logger.info("candidate=%s leave-source-out=%s complete", spec.name, source)
+    return result
+
+
 def _spearman(left: np.ndarray, right: np.ndarray) -> float:
     if len(left) < 2 or np.all(left == left[0]) or np.all(right == right[0]):
         return 0.0
     left_rank = np.argsort(np.argsort(left, kind="stable"), kind="stable").astype(np.float64)
     right_rank = np.argsort(np.argsort(right, kind="stable"), kind="stable").astype(np.float64)
     return float(np.corrcoef(left_rank, right_rank)[0, 1])
+
+
+def _disjoint_profile_teacher(
+    teacher: ProfileTeacherData,
+    combined: CombinedData,
+    *,
+    minimum_rows: int = 100,
+) -> ProfileTeacherData:
+    """Remove exact outcome-task identity and prompt overlap from taxonomy supervision."""
+    outcome_ids = set(combined.task_ids)
+    outcome_texts = {
+        hashlib.sha256(" ".join(text.split()).encode()).hexdigest() for text in combined.texts
+    }
+    keep = [
+        index
+        for index, task_id in enumerate(teacher.task_ids)
+        if task_id not in outcome_ids
+        and hashlib.sha256(" ".join(teacher.texts[index].split()).encode()).hexdigest()
+        not in outcome_texts
+    ]
+    if len(keep) < minimum_rows:
+        raise ValueError(f"fewer than {minimum_rows} disjoint task-profile teacher rows remain")
+    return ProfileTeacherData(
+        task_ids=[teacher.task_ids[index] for index in keep],
+        groups=[teacher.groups[index] for index in keep],
+        texts=[teacher.texts[index] for index in keep],
+        difficulty=[teacher.difficulty[index] for index in keep],
+        intent_completeness=[teacher.intent_completeness[index] for index in keep],
+        pr_categories=[teacher.pr_categories[index] for index in keep],
+    )
 
 
 def _fit(args: argparse.Namespace) -> None:
@@ -1136,6 +1430,14 @@ def _fit(args: argparse.Namespace) -> None:
                 )
             )
     combined = _combine(sources)
+    profile_teacher: ProfileTeacherData | None = None
+    if args.candidate_family == "task-profile":
+        if args.profile_teacher_tasks is None:
+            raise ValueError("--candidate-family task-profile requires --profile-teacher-tasks")
+        profile_teacher = _disjoint_profile_teacher(
+            _load_profile_teacher(args.profile_teacher_tasks.resolve()),
+            combined,
+        )
     _write_json(
         output / "external-sources.json",
         {
@@ -1162,6 +1464,14 @@ def _fit(args: argparse.Namespace) -> None:
                 for source in sorted(set(combined.source_names))
             },
             "deduplicated_groups": len(set(combined.groups)),
+            "profile_teacher_tasks": (
+                len(profile_teacher.task_ids) if profile_teacher is not None else 0
+            ),
+            "profile_teacher_outcome_identity_overlap": (
+                len(set(profile_teacher.task_ids) & set(combined.task_ids))
+                if profile_teacher is not None
+                else 0
+            ),
             "deep_swe_labels_read": False,
         },
     )
@@ -1173,9 +1483,25 @@ def _fit(args: argparse.Namespace) -> None:
     )
     candidate_specs = _candidate_space(args.candidate_family)
     hashing_features: dict[int, np.ndarray] = {}
+    teacher_hashing_features: dict[int, np.ndarray] = {}
+    profile_classifiers: dict[str, TaskProfileClassifier] = {}
     leaderboard: list[dict[str, object]] = []
     for spec in candidate_specs:
         oof = np.empty(len(combined.task_ids), dtype=np.float64)
+        profile_classifier: TaskProfileClassifier | None = None
+        if spec.estimator == "profile-uplift":
+            if profile_teacher is None:
+                raise AssertionError("task-profile candidate has no taxonomy teacher")
+            teacher_features = teacher_hashing_features.get(spec.components)
+            if teacher_features is None:
+                teacher_features = _features(spec).fit_transform(profile_teacher.texts)
+                teacher_hashing_features[spec.components] = teacher_features
+            profile_classifier = _fit_profile_classifier(
+                spec,
+                profile_teacher,
+                teacher_features,
+            )
+            profile_classifiers[spec.name] = profile_classifier
         for fold_index, (train, heldout) in enumerate(folds):
             if spec.label_mode == "task-blind":
                 oof[heldout] = float(
@@ -1210,14 +1536,27 @@ def _fit(args: argparse.Namespace) -> None:
                 [combined.source_names[index] for index in train],
                 seed=10_000 + fold_index,
             )
-            estimators = _fit_estimators(
-                spec,
-                train_features,
-                train_weak,
-                train_strong,
-                combined.sample_weight[train],
-            )
-            oof[heldout] = _predict_score(spec, estimators, heldout_features)
+            if spec.estimator == "profile-uplift":
+                if profile_classifier is None:
+                    raise AssertionError(f"{spec.name} has no fitted task-profile classifier")
+                profile_model = _fit_profile_uplift(
+                    spec,
+                    profile_classifier,
+                    train_features,
+                    train_weak,
+                    train_strong,
+                    combined.sample_weight[train],
+                )
+                oof[heldout] = profile_model.predict(heldout_features)
+            else:
+                estimators = _fit_estimators(
+                    spec,
+                    train_features,
+                    train_weak,
+                    train_strong,
+                    combined.sample_weight[train],
+                )
+                oof[heldout] = _predict_score(spec, estimators, heldout_features)
             logger.info("candidate=%s fold=%d/%d complete", spec.name, fold_index + 1, FOLDS)
         operating_points = {
             str(floor): _operating_point(
@@ -1250,11 +1589,66 @@ def _fit(args: argparse.Namespace) -> None:
         }
         if spec.name in {"word128-ridge-uplift-a10", "word128-ridge-heads-a1"}:
             row["leave_source_out_metrics"] = _leave_source_out_metrics(spec, combined)
+        if spec.estimator == "profile-uplift" and profile_classifier is not None:
+            row["leave_source_out_metrics"] = _leave_source_out_profile_metrics(
+                spec,
+                profile_classifier,
+                hashing_features[spec.components],
+                combined,
+            )
         leaderboard.append(row)
+    if args.candidate_family == "task-profile":
+        control_traffic = min(
+            cast(dict[str, dict[str, float]], row["operating_points"])["0.95"]["strong_traffic"]
+            for row in leaderboard
+            if bool(row["is_control"])
+        )
+        for row in leaderboard:
+            primary_metrics = cast(
+                dict[str, dict[str, float]],
+                row["primary_source_metrics"],
+            )
+            leave_source_out = cast(
+                dict[str, dict[str, float]],
+                row.get("leave_source_out_metrics", {}),
+            )
+            positive_primary = sum(
+                metric["uplift_spearman"] > 0.0 for metric in primary_metrics.values()
+            )
+            positive_leave_source_out = sum(
+                metric["uplift_spearman"] > 0.0 for metric in leave_source_out.values()
+            )
+            strong_traffic = cast(
+                dict[str, dict[str, float]],
+                row["operating_points"],
+            )["0.95"]["strong_traffic"]
+            row["predeclared_cross_source_gate"] = {
+                "aggregate_oof_uplift_positive": (float(row["external_oof_uplift_spearman"]) > 0.0),
+                "primary_positive_sources": positive_primary,
+                "primary_required_positive_sources": 4,
+                "leave_source_out_positive_sources": positive_leave_source_out,
+                "leave_source_out_required_positive_sources": 4,
+                "strong_traffic": strong_traffic,
+                "best_control_strong_traffic": control_traffic,
+                "traffic_better_than_controls": strong_traffic < control_traffic,
+                "passed": (
+                    not bool(row["is_control"])
+                    and float(row["external_oof_uplift_spearman"]) > 0.0
+                    and positive_primary >= 4
+                    and positive_leave_source_out >= 4
+                    and strong_traffic < control_traffic
+                ),
+            }
+    for row in leaderboard:
         _append_jsonl(output / "trials.jsonl", row)
     leaderboard.sort(
         key=lambda row: (
             bool(row["is_control"]),
+            (
+                not bool(cast(dict[str, object], row["predeclared_cross_source_gate"])["passed"])
+                if args.candidate_family == "task-profile"
+                else False
+            ),
             cast(dict[str, dict[str, float]], row["operating_points"])["0.95"]["strong_traffic"],
             -float(row["external_oof_uplift_spearman"]),
         )
@@ -1279,20 +1673,37 @@ def _fit(args: argparse.Namespace) -> None:
         if selected_spec.analyzer == "hashing"
         else np.asarray(transformer.fit_transform(combined.texts), dtype=np.float64)
     )
-    estimators = _fit_estimators(
-        selected_spec,
-        full_features,
-        combined.weak,
-        combined.strong,
-        combined.sample_weight,
-    )
-    joblib.dump(
-        {
+    estimators: tuple[FittedRegressor, FittedRegressor | None] | None = None
+    if selected_spec.estimator == "profile-uplift":
+        profile_model = _fit_profile_uplift(
+            selected_spec,
+            profile_classifiers[selected_spec.name],
+            full_features,
+            combined.weak,
+            combined.strong,
+            combined.sample_weight,
+        )
+        joblib_payload = {
+            "spec": dataclasses.asdict(selected_spec),
+            "transformer": None,
+            "profile_model": profile_model,
+        }
+    else:
+        estimators = _fit_estimators(
+            selected_spec,
+            full_features,
+            combined.weak,
+            combined.strong,
+            combined.sample_weight,
+        )
+        joblib_payload = {
             "spec": dataclasses.asdict(selected_spec),
             "transformer": transformer if selected_spec.analyzer != "hashing" else None,
             "weak_estimator": estimators[0],
             "strong_estimator": estimators[1],
-        },
+        }
+    joblib.dump(
+        joblib_payload,
         output / f"{selected_spec.name}.joblib",
         compress=3,
     )
@@ -1301,7 +1712,11 @@ def _fit(args: argparse.Namespace) -> None:
         for row in leaderboard
         if cast(dict[str, object], row["candidate"])["name"] == selected_name
     )
-    if selected_spec.analyzer == "hashing":
+    if (
+        selected_spec.analyzer == "hashing"
+        and selected_spec.estimator == "ridge-heads"
+        and estimators is not None
+    ):
         _write_json(
             output / "native-linear-heads.json",
             _native_linear_heads(
@@ -1327,11 +1742,33 @@ def _fit(args: argparse.Namespace) -> None:
                     "word128-ridge-uplift-a10",
                     "word128-ridge-heads-a1",
                 ],
+                "profile_teacher_source": (
+                    "disjoint-swe-rebench-v2-task-taxonomy" if profile_teacher is not None else None
+                ),
+                "profile_teacher_tasks": (
+                    len(profile_teacher.task_ids) if profile_teacher is not None else 0
+                ),
+                "profile_serving": (
+                    "local-hashing-centroids-plus-shrunk-uplift-table"
+                    if args.candidate_family == "task-profile"
+                    else None
+                ),
+                "predeclared_task_profile_gate": (
+                    "positive aggregate OOF uplift, positive source OOF and leave-source-out "
+                    "uplift on at least four of five sources, and lower strong traffic than "
+                    "both negative controls"
+                    if args.candidate_family == "task-profile"
+                    else None
+                ),
                 "target_candidate_count": 1,
                 "candidate_family": args.candidate_family,
                 "source_set": args.source_set,
                 "post_target_family_adaptation": args.candidate_family != "full",
-                "selection": "minimum_source_balanced_strong_traffic_then_uplift_spearman",
+                "selection": (
+                    "passed_cross_source_gate_then_minimum_strong_traffic_then_uplift"
+                    if args.candidate_family == "task-profile"
+                    else "minimum_source_balanced_strong_traffic_then_uplift_spearman"
+                ),
             },
             "leaderboard": leaderboard,
         },
@@ -1408,6 +1845,7 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
         "extra-heads",
         "hist-heads",
         "irt-difficulty",
+        "profile-uplift",
     ):
         raise ValueError(f"invalid frozen estimator {estimator!r}")
     spec = CandidateSpec(
@@ -1421,6 +1859,7 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
                 "extra-heads",
                 "hist-heads",
                 "irt-difficulty",
+                "profile-uplift",
             ],
             estimator,
         ),
@@ -1430,6 +1869,20 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
             Literal["observed", "shuffled", "task-blind"],
             str(raw_spec.get("label_mode", "observed")),
         ),
+        profile_mode=cast(
+            Literal[
+                "none",
+                "difficulty",
+                "intent",
+                "pr-category",
+                "difficulty-intent",
+                "difficulty-pr-category",
+            ],
+            str(raw_spec.get("profile_mode", "none")),
+        ),
+        profile_temperature=_as_float(raw_spec.get("profile_temperature", 0.1)),
+        profile_prior_strength=_as_float(raw_spec.get("profile_prior_strength", 50.0)),
+        min_profile_tasks=int(_as_float(raw_spec.get("min_profile_tasks", 25))),
     )
     transformer = (
         _features(spec)
@@ -1437,6 +1890,9 @@ def _candidate_score(path: Path, texts: list[str]) -> np.ndarray:
         else cast(FeatureTransformer, fitted["transformer"])
     )
     features = np.asarray(transformer.transform(texts), dtype=np.float64)
+    if estimator == "profile-uplift":
+        profile_model = cast(TaskProfileUpliftRegressor, fitted["profile_model"])
+        return profile_model.predict(features)
     estimators = (
         cast(FittedRegressor, fitted["weak_estimator"]),
         cast(FittedRegressor | None, fitted["strong_estimator"]),
@@ -1911,6 +2367,7 @@ def _parser() -> argparse.ArgumentParser:
     fit.add_argument("--swebench-matrix", type=Path)
     fit.add_argument("--swebench-tasks", type=Path)
     fit.add_argument("--open-swe-tasks", type=Path)
+    fit.add_argument("--profile-teacher-tasks", type=Path)
     fit.add_argument(
         "--source-set",
         choices=("legacy", "legacy-plus-open-swe", "open-swe-only"),
@@ -1918,7 +2375,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     fit.add_argument(
         "--candidate-family",
-        choices=("full", "native-linear", "structural-irt"),
+        choices=("full", "native-linear", "structural-irt", "task-profile"),
         default="full",
     )
     fit.add_argument("--output", type=Path, required=True)

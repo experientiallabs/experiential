@@ -192,7 +192,10 @@ def _load_task_text(
             instance_id,
             any_value(repo) AS repo,
             any_value(language) AS language,
-            any_value(problem_statement) AS problem_statement
+            any_value(problem_statement) AS problem_statement,
+            any_value(meta.llm_metadata.difficulty) AS difficulty,
+            any_value(meta.llm_metadata.intent_completeness) AS intent_completeness,
+            any_value(meta.llm_metadata.pr_categories) AS pr_categories
         FROM read_parquet(?, union_by_name = true)
         GROUP BY instance_id
         """,
@@ -262,6 +265,72 @@ def _write_compact_source(
     }
 
 
+def _write_profile_teacher_source(
+    connection: duckdb.DuckDBPyConnection,
+    pair: dict[str, object],
+    output: Path,
+) -> dict[str, object]:
+    """Write task-profile supervision disjoint from the paired outcome source."""
+    rows = connection.execute(
+        """
+        SELECT
+            tasks.instance_id,
+            tasks.repo,
+            tasks.language,
+            tasks.problem_statement,
+            tasks.difficulty,
+            tasks.intent_completeness,
+            tasks.pr_categories
+        FROM tasks
+        WHERE length(trim(tasks.problem_statement)) > 0
+          AND tasks.difficulty IS NOT NULL
+          AND tasks.intent_completeness IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM outcomes AS weak
+              JOIN outcomes AS strong
+                ON strong.instance_id = weak.instance_id
+               AND strong.scaffold = weak.scaffold
+              WHERE weak.instance_id = tasks.instance_id
+                AND weak.scaffold = ?
+                AND weak.model_mode = ?
+                AND strong.model_mode = ?
+          )
+        ORDER BY tasks.instance_id
+        """,
+        [
+            pair["scaffold"],
+            pair["weak_model_mode"],
+            pair["strong_model_mode"],
+        ],
+    ).fetchall()
+    if not rows:
+        raise ValueError("SWE-rebench has no disjoint task-profile teacher rows")
+    teacher = [
+        {
+            "instance_id": str(row[0]),
+            "repo": str(row[1]),
+            "language": str(row[2]),
+            "text": str(row[3]),
+            "difficulty": str(row[4]),
+            "intent_completeness": str(row[5]),
+            "pr_categories": [str(value) for value in (row[6] or [])],
+        }
+        for row in rows
+    ]
+    _write_json(output, teacher)
+    return {
+        "tasks": len(teacher),
+        "repositories": len({str(row[1]) for row in rows}),
+        "languages": len({str(row[2]) for row in rows}),
+        "difficulties": sorted({str(row[4]) for row in rows}),
+        "intent_completeness": sorted({str(row[5]) for row in rows}),
+        "pr_categories": sorted(
+            {str(category) for row in rows for category in cast(list[object] | None, row[6]) or []}
+        ),
+    }
+
+
 def main() -> None:
     args = _parser().parse_args()
     output = args.output.resolve()
@@ -275,10 +344,15 @@ def main() -> None:
     pair = _select_pair(arm_stats)
     _load_task_text(connection, rebench_files)
     source_stats = _write_compact_source(connection, pair, output)
+    teacher_stats = _write_profile_teacher_source(
+        connection,
+        pair,
+        args.profile_teacher_output.resolve(),
+    )
     _write_json(
         args.manifest.resolve(),
         {
-            "schema": "open-swe-paired-source-v1",
+            "schema": "open-swe-paired-source-v2",
             "source_dataset": OPEN_SWE_DATASET,
             "task_dataset": REBENCH_DATASET,
             "target_data_read": False,
@@ -286,6 +360,8 @@ def main() -> None:
             "arm_stats": arm_stats,
             "selected_pair": pair,
             "source_stats": source_stats,
+            "profile_teacher_stats": teacher_stats,
+            "profile_teacher_outcome_overlap": 0,
             "open_swe_parquet_files": len(open_swe_files),
             "rebench_parquet_files": len(rebench_files),
         },
@@ -302,6 +378,7 @@ def main() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile-teacher-output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--database", type=Path, required=True)
     return parser
