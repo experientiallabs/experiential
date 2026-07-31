@@ -152,8 +152,9 @@ class _ToolFakeProvider(_FakeProvider):
 def live_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """A real uvicorn server on an ephemeral port, serving two static endpoints.
 
-    `tau-bench`'s pool model is text-only (no `complete_chat`, like the direct anthropic
-    backend); `tools-bench`'s speaks the structured contract. Both are needed to prove the two
+    `tau-bench`'s pool model is text-only (its injected fake has no `complete_chat`,
+    the shape of a provider that never grew the structured seam); `tools-bench`'s speaks
+    the structured contract. Both are needed to prove the two
     halves of the tool surface: a real round trip, and the honest error when the routed model
     cannot make one.
     """

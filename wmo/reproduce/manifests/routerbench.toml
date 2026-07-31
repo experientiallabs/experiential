@@ -1,0 +1,44 @@
+name = "routerbench"
+title = "RouterBench (ours9): guarded kNN routing on a precomputed 9-model matrix"
+cookbook = "docs/cookbook/routerbench.md"
+exactness = "bit-exact"
+kind = "matrix"
+
+notes = [
+  "1199 RouterBench-derived prompts over this project's own 9-model pool (ours9), not the published RouterBench model grid.",
+  "Offline and credential-free: the fit and report replay the recorded text-embedding-3-large vectors from the published cache. The cached-vector protocol is the canonical one: re-embedding live reproduces accuracy exactly but moves cost/latency ~1% through embedding-API nondeterminism on near-tie neighbors.",
+  "Fit on 839 scenarios, reported on the 360 the fit never saw (deterministic 70/30 scenario-hash split).",
+  "The pool's models score within a few points of each other, the regime most favorable to a cost knob; see docs/cookbook/routerbench.md for the full caveats.",
+]
+
+[data]
+hf_repo = "experiential-labs/wmo-routerbench-ours9"
+revision = "a216fff0ed11b80e35faf7107601bc41a382c226"
+repo_type = "dataset"
+files = ["matrix.json", "task_embeddings.npy"]
+
+[matrix]
+matrix_file = "matrix.json"
+embedding_cache_file = "task_embeddings.npy"
+embedder_kind = "azure"
+embedder_dim = 3072
+embedder_deployment = "text-embedding-3-large"
+embedder_endpoint = "https://google-sheets.openai.azure.com"
+fallback = "gpt-5.5"
+cost_quality = 0.25
+baselines = ["gpt-5.5", "fable-5"]
+
+[[published]]
+label = "routed (frontier-pinned) vs best single (gpt-5.5)"
+baseline = "gpt-5.5"
+accuracy = 0.9776536312849162
+cost_per_run_usd = 0.0023483871675977655
+latency_p50_ms = 1772.6483329897746
+
+[[published]]
+label = "routed (frontier-pinned) vs anchor (fable-5)"
+baseline = "fable-5"
+accuracy = 0.9777777777777777
+cost_per_run_usd = 0.002362840572222222
+latency_p50_ms = 1775.907582952641
+

@@ -227,6 +227,7 @@ def compute_savings(
                     input_tokens=record.input_tokens,
                     output_tokens=record.output_tokens,
                     cached_input_tokens=record.cached_tokens,
+                    cache_write_input_tokens=record.cache_write_tokens,
                 )
             )
             for record in served

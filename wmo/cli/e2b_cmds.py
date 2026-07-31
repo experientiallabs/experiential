@@ -8,21 +8,14 @@ kill is destructive and one wrong id is somebody's running trial.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from wmo.harness.e2b_ledger import read_ledger_files
-from wmo.harness.e2b_reap import (
-    AliveSandbox,
-    ReapCandidate,
-    execute_reap,
-    kill_sandbox,
-    list_alive_sandboxes,
-    plan_reap,
-    sandbox_cap,
-)
+if TYPE_CHECKING:
+    from wmo.harness.e2b_reap import AliveSandbox, ReapCandidate
 
 _console = Console()
 
@@ -80,6 +73,15 @@ def reap(
     The default is a dry run that prints the candidates and changes nothing. Pass `--yes` to
     kill them.
     """
+    from wmo.harness.e2b_ledger import read_ledger_files
+    from wmo.harness.e2b_reap import (
+        execute_reap,
+        kill_sandbox,
+        list_alive_sandboxes,
+        plan_reap,
+        sandbox_cap,
+    )
+
     try:
         cap = sandbox_cap()
     except ValueError as error:

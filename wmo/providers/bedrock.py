@@ -256,6 +256,21 @@ class BedrockProvider:
             return
         raise ValueError(NO_REGION_ERROR)
 
+    def _refuse_dropped_effort(self, path: str) -> None:
+        """Refuse a config whose effort dial Bedrock would silently drop.
+
+        Converse carries no effort dial at all, so unlike the direct Anthropic
+        backend there is no path here that honors `reasoning_effort`; an
+        effort-carrying entry pointed at Bedrock is a mis-mapped arm, and two
+        entries differing only in effort would collapse into one.
+        """
+        if self.config.reasoning_effort is not None:
+            raise ValueError(
+                f"BedrockProvider.{path} does not forward reasoning_effort="
+                f"{self.config.reasoning_effort!r} (Converse has no effort dial); route "
+                "effort-dialed Claude entries through the direct Anthropic backend instead."
+            )
+
     def complete(
         self,
         system: str,
@@ -264,6 +279,7 @@ class BedrockProvider:
         temperature: float = 0.7,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Completion:
+        self._refuse_dropped_effort("complete")
         if _is_nova(self.config.model):
             return self._complete_nova(
                 system, messages, temperature=temperature, max_tokens=max_tokens
@@ -297,6 +313,7 @@ class BedrockProvider:
 
     def complete_chat(self, request: ChatRequest) -> ChatResponse:
         """Run a full structured agent request through Bedrock Converse."""
+        self._refuse_dropped_effort("complete_chat")
         normalized = normalize_chat_temperature(
             request,
             forward_temperature=self._forward_temperature,
@@ -317,6 +334,7 @@ class BedrockProvider:
         Temperature is forwarded only when the model catalog says the model samples (Claude 4.8+
         rejects sampling params), matching the non-streaming paths.
         """
+        self._refuse_dropped_effort("stream")
         inference_config: dict[str, JsonValue] = {"maxTokens": max_tokens}
         if self._forward_temperature:
             inference_config["temperature"] = temperature

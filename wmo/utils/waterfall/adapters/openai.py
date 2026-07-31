@@ -87,8 +87,15 @@ class OpenAIAdapter:
             raise ValueError(f"{model} returned no choices")
         text = response.choices[0].message.content or ""
         usage = response.usage
+        details = getattr(usage, "prompt_tokens_details", None) if usage is not None else None
+        cached = int(getattr(details, "cached_tokens", 0) or 0)
         token_usage = (
-            TokenUsage(input_tokens=usage.prompt_tokens, output_tokens=usage.completion_tokens)
+            TokenUsage(
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                # OpenAI's prompt_tokens already includes the cached subset.
+                cached_input_tokens=min(cached, max(usage.prompt_tokens, 0)),
+            )
             if usage is not None
             else TokenUsage()
         )

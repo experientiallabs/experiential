@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import json
+import sys
 from collections import Counter
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from filelock import FileLock
 from rich.console import Console
 from typer.testing import CliRunner, Result
 
+import wmo.env as env_module
 from wmo.cli import consent as consent_module
 from wmo.cli.app import app
 from wmo.config import HarnessConfig, save_config
@@ -158,6 +160,83 @@ def test_route_fit_and_report(tmp_path: Path) -> None:
     assert set(policy.fit_scenario_ids).isdisjoint(report["scenario_ids"])
     assert len(policy.fit_scenario_ids) + report["scenario_count"] == 4
     assert report["cost_assumptions"]
+
+
+def _fit_then_report(tmp_path: Path, *extra: str) -> tuple[Result, Path]:
+    """Fit a knn policy, then report over the same matrix with `extra` report flags.
+
+    knn because only a dialable policy produces routed detents, and so a curve at all.
+    """
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = tmp_path / "policy.json"
+    fit = runner.invoke(
+        app,
+        [
+            *("optimize", "route", "fit", str(matrix_file)),
+            *("--kind", "knn", "--fallback", "a", "--out", str(policy_file)),
+            *("--z", "0.5", "--rag-num", "3", "--min-pairs", "2"),
+        ],
+    )
+    assert fit.exit_code == 0, fit.output
+    report_file = tmp_path / "report.json"
+    result = runner.invoke(
+        app,
+        [
+            *("optimize", "route", "report", str(matrix_file), str(policy_file)),
+            *("--baseline", "a", "--out", str(report_file)),
+            *extra,
+        ],
+    )
+    return result, report_file.parent / "pareto.json"
+
+
+def test_the_curve_defaults_to_the_world_model_labels(tmp_path: Path) -> None:
+    # Unchanged behavior for every existing caller: a sweep's matrix was scored by the world
+    # model's own verifier.
+    result, pareto = _fit_then_report(tmp_path)
+    assert result.exit_code == 0, result.output
+    curve = json.loads(pareto.read_text())
+    assert curve["provenance"] == "wm_simulated"
+    assert curve["judge"] == "world-model verifier"
+
+
+def test_a_real_benchmark_matrix_can_label_its_own_curve(tmp_path: Path) -> None:
+    # The bench-defaults case: the rewards are real tau2 episodes, and a curve claiming they came
+    # out of a world model would present a measurement as a simulation. ParetoCurve.provenance
+    # exists to stop exactly that, and until now the CLI hardcoded it.
+    result, pareto = _fit_then_report(
+        tmp_path, "--provenance", "real_episode", "--judge", "tau2 reward"
+    )
+    assert result.exit_code == 0, result.output
+    curve = json.loads(pareto.read_text())
+    assert curve["provenance"] == "real_episode"
+    assert curve["judge"] == "tau2 reward"
+
+
+def test_a_misspelled_provenance_is_refused_not_written(tmp_path: Path) -> None:
+    result, pareto = _fit_then_report(tmp_path, "--provenance", "real")
+    assert result.exit_code != 0
+    assert "real_episode" in result.output
+    assert not pareto.exists()
+
+
+def test_the_report_label_defaults_to_the_world_model_phrasing(tmp_path: Path) -> None:
+    result, pareto = _fit_then_report(tmp_path)
+    assert result.exit_code == 0, result.output
+    report = json.loads((pareto.parent / "report.json").read_text())
+    assert "reconstructed from your traces" in report["scenario_label"]
+
+
+def test_a_real_benchmark_report_can_say_what_it_measured(tmp_path: Path) -> None:
+    # scenario_label is the one line of the report a customer actually reads. Telling them their
+    # endpoint was measured on scenarios "reconstructed from your traces" when it was measured on
+    # a pinned public benchmark is false, and until now the phrasing was hardcoded.
+    result, pareto = _fit_then_report(
+        tmp_path, "--scenario-label", "on the 20 pinned tau2-bench eval tasks"
+    )
+    assert result.exit_code == 0, result.output
+    report = json.loads((pareto.parent / "report.json").read_text())
+    assert report["scenario_label"] == "on the 20 pinned tau2-bench eval tasks"
 
 
 def test_route_fit_rejects_unknown_embedder(tmp_path: Path) -> None:
@@ -531,6 +610,10 @@ def test_route_tune_refuses_a_snapshot_after_the_matrix_was_rebuilt_in_place(
     assert RoutingPolicy.load(policy_file).cost_quality is None  # the refit is untouched
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Windows rejects '|' in path components used by this regression fixture",
+)
 def test_route_tune_survives_a_matrix_path_that_looks_like_a_dial_suffix(tmp_path: Path) -> None:
     """An operator-supplied path must not be able to truncate the fit identity it opens.
 
@@ -809,6 +892,42 @@ def test_route_pin_writes_a_serveable_static_policy(tmp_path: Path) -> None:
     assert [entry.name for entry in policy.pool] == ["student"]
     assert policy.fitted_from is not None
     assert "no outcome matrix" in policy.fitted_from  # provenance says it measured nothing
+
+
+def test_route_pin_warns_when_out_bypasses_the_model_dir(tmp_path: Path) -> None:
+    """A scratch --out succeeds but serving never sees it; the pin must say so.
+
+    Both bench-defaults lanes shipped an endpoint whose model dir still held
+    the OLD policy because `pin --out /tmp/...` printed the same success line
+    as an in-place pin (2026-07-29).
+    """
+    pool_file = tmp_path / "pool.toml"
+    assert _add_student(tmp_path, pool_file).exit_code == 0
+    _built_model(tmp_path)
+    scratch = tmp_path / "scratch" / "policy-pin.json"
+    scratch.parent.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "pin",
+            "support",
+            "--model",
+            "student",
+            "--pool",
+            str(pool_file),
+            "--root",
+            str(tmp_path),
+            "--out",
+            str(scratch),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert scratch.is_file()  # the pin still lands where asked
+    assert "does NOT update" in result.output  # but the operator is told serving will not see it
 
 
 def test_route_pin_serves_through_the_endpoint_it_installed(tmp_path: Path) -> None:
@@ -1305,12 +1424,12 @@ def _patch_seams(
             _ScriptedCandidate(config, seams.systems, throttled=throttled),
         )
 
-    monkeypatch.setattr(route_module, "load_world_model", _load)
+    monkeypatch.setattr("wmo.engine.load_world_model", _load)
     monkeypatch.setattr("wmo.providers.pool.get_provider", _get_provider)
     if no_scoring:
-        real = route_module.WorldModelEnv
+        real = env_module.WorldModelEnv
         monkeypatch.setattr(
-            route_module,
+            env_module,
             "WorldModelEnv",
             lambda world_model, *, score_on_close=False: real(world_model),
         )
@@ -1457,7 +1576,7 @@ def test_route_sweep_resumes_the_cells_an_interrupted_run_already_bought(
     """
     seams = _patch_seams(monkeypatch)
     root = _project(tmp_path, traces=_corpus())
-    real_env = route_module.WorldModelEnv
+    real_env = env_module.WorldModelEnv
     cells = itertools.count(1)
 
     class _DiesOnTheFourthCell:
@@ -1473,14 +1592,14 @@ def test_route_sweep_resumes_the_cells_an_interrupted_run_already_bought(
         def __getattr__(self, name: str) -> object:
             return getattr(self._inner, name)
 
-    monkeypatch.setattr(route_module, "WorldModelEnv", _DiesOnTheFourthCell)
+    monkeypatch.setattr(env_module, "WorldModelEnv", _DiesOnTheFourthCell)
     out, first = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
     assert first.exit_code != 0
     assert not out.exists()  # no matrix: the sweep never finished
     sidecar = out.with_name(out.name + ".partial.jsonl")
     assert len(sidecar.read_text(encoding="utf-8").splitlines()) == 4  # header + 3 paid cells
 
-    monkeypatch.setattr(route_module, "WorldModelEnv", real_env)
+    monkeypatch.setattr(env_module, "WorldModelEnv", real_env)
     scored_before = len(seams.world_model.scored)
     _, second = _sweep(tmp_path, root, "support", "--scenarios", "3", "--yes")
     assert second.exit_code == 0, second.output
@@ -2540,7 +2659,8 @@ def test_route_fit_refuses_compressed_rewards_under_a_raw_fit(tmp_path: Path) ->
         ],
     )
     assert result.exit_code != 0
-    assert "would stamp raw text" in result.output
+    flat = "".join(ch for ch in result.output if not ch.isspace() and ch not in "│┌┐└┘─╔╗╚╝║═")
+    assert "wouldstamprawtext" in flat
 
 
 def test_route_sweep_rejects_an_unservable_compressor_before_spending(tmp_path: Path) -> None:
@@ -3172,3 +3292,170 @@ def test_route_student_replacement_keeps_a_disabled_entry_disabled(tmp_path: Pat
     entries = load_pool(pool_file).models
     assert len(entries) == 1
     assert entries[0].enabled is False
+
+
+def _fitted_knn_policy(tmp_path: Path) -> Path:
+    """Fit a real knn policy + sidecar through the CLI, returning the policy path."""
+    matrix_file = _knn_matrix_file(tmp_path)
+    policy_file = tmp_path / "policy.json"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "fit",
+            str(matrix_file),
+            "--kind",
+            "knn",
+            "--fallback",
+            "a",
+            "--z",
+            "0.5",
+            "--rag-num",
+            "3",
+            "--min-pairs",
+            "2",
+            "--out",
+            str(policy_file),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    return policy_file
+
+
+class _FakeClient:
+    """Records the install call instead of making it."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Path, Path | None, Path | None]] = []
+
+    def install_endpoint_policy(
+        self,
+        org_id: str,
+        endpoint: str,
+        policy_path: Path,
+        bank_path: Path | None,
+        report_path: Path | None = None,
+    ) -> dict[str, str]:
+        self.calls.append((org_id, endpoint, policy_path, bank_path, report_path))
+        return {"name": endpoint}
+
+
+@contextmanager
+def _connected_to(client: _FakeClient) -> Iterator[None]:
+    """Stand in for a platform login for the duration of one command.
+
+    Patches `platform_cmds`, which is where `push` resolves the connection from, so
+    the command runs its real body against a client that records instead of calling.
+    """
+    import wmo.cli.platform_cmds as platform_module
+
+    @contextmanager
+    def _fake_connected(_credentials: object, _headline: str) -> Iterator[_FakeClient]:
+        yield client
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(platform_module, "_connected", _fake_connected)
+        patch.setattr(platform_module, "_require_connection", lambda _org: (None, "org-1"))
+        yield
+
+
+def test_route_push_sends_the_policy_and_its_sidecar(tmp_path: Path) -> None:
+    """Push sends BOTH artifacts: a knn policy alone would store an unservable row."""
+    policy_file = _fitted_knn_policy(tmp_path)
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app,
+            ["optimize", "route", "push", str(policy_file), "--endpoint", "support-prod"],
+        )
+    assert result.exit_code == 0, result.output
+    assert len(client.calls) == 1
+    _org, endpoint, sent_policy, sent_bank, sent_report = client.calls[0]
+    assert endpoint == "support-prod"
+    assert sent_policy == policy_file
+    # Resolved from the policy's own knn_bank_path, not guessed from the policy name.
+    assert sent_bank == RoutingPolicy.load(policy_file).bank_path()
+    assert sent_bank is not None and sent_bank.is_file()
+    assert sent_report is None
+    assert _says(result.output, "installed knn policy")
+
+
+def test_route_push_refuses_a_knn_policy_whose_sidecar_is_missing(tmp_path: Path) -> None:
+    """A knn policy without its bank fails locally, before any upload."""
+    # The pair is broken on this machine, so pushing would only turn a local mistake
+    # into a server refusal after sending a policy the server must reject.
+    policy_file = _fitted_knn_policy(tmp_path)
+    RoutingPolicy.load(policy_file).bank_path().unlink()
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app,
+            ["optimize", "route", "push", str(policy_file), "--endpoint", "support-prod"],
+        )
+    assert result.exit_code != 0
+    assert _says(result.output, "evidence bank is missing")
+    assert client.calls == []
+
+
+def test_route_push_refuses_a_path_that_is_not_a_policy(tmp_path: Path) -> None:
+    """A file that is not a routing policy is refused without contacting the platform."""
+    junk = tmp_path / "policy.json"
+    junk.write_text('{"kind": "not-a-kind"}', encoding="utf-8")
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app, ["optimize", "route", "push", str(junk), "--endpoint", "support-prod"]
+        )
+    assert result.exit_code != 0
+    assert _says(result.output, "not a routing policy")
+    assert client.calls == []
+
+
+def test_route_push_sends_no_bank_for_a_static_policy(tmp_path: Path) -> None:
+    """A static policy has no sidecar, so none is sent and none is required."""
+    policy_file = tmp_path / "policy.json"
+    RoutingPolicy(
+        kind="static",
+        default_model="a",
+        pool=[
+            PoolEntry(
+                name="a",
+                kind=ProviderKind.OPENAI,
+                model="a",
+                input_per_mtok=1.0,
+                output_per_mtok=1.0,
+            )
+        ],
+    ).save(policy_file)
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app, ["optimize", "route", "push", str(policy_file), "--endpoint", "support-prod"]
+        )
+    assert result.exit_code == 0, result.output
+    assert client.calls[0][3] is None
+
+
+def test_route_push_sends_the_report_when_given_one(tmp_path: Path) -> None:
+    """--report rides through to the install, so the endpoint gains its evidence."""
+    policy_file = _fitted_knn_policy(tmp_path)
+    report_file = tmp_path / "report.json"
+    report_file.write_text('{"headline": {}}', encoding="utf-8")
+    client = _FakeClient()
+    with _connected_to(client):
+        result = runner.invoke(
+            app,
+            [
+                "optimize",
+                "route",
+                "push",
+                str(policy_file),
+                "--endpoint",
+                "support-prod",
+                "--report",
+                str(report_file),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert client.calls[0][4] == report_file

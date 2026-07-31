@@ -2,10 +2,13 @@
 
 A pushed bundle is byte-compatible with the bundles the platform's own build
 pipeline produces: a gzipped tarball of the model directory with
-archive-relative member paths. Packing is an include-list — the model's
-`config.toml`, `metrics.json`, `card.json`, `prompts/`, and `index/` — so
-local `runs/` cost records and raw `traces/` (customer data) never leave the
-machine.
+archive-relative member paths. Packing is an include-list - the model's
+`config.toml`, `metrics.json`, `card.json`, `auto_fidelity.json`, `prompts/`,
+`index/`, and `knowledge/` - so local `runs/` cost records and raw `traces/`
+(customer data) never leave the machine. The privacy line to be explicit
+about: `knowledge/` is DISTILLED from traces (`wmo knowledge`), so pushing a
+model uploads that distilled text while the raw traces stay local; a model
+whose knowledge must not leave the machine should not be pushed.
 
 Bundles can reach the platform's 1GB cap, so packing and unpacking are
 file-based: bytes stream between disk and the network without ever being held
@@ -14,6 +17,7 @@ in memory whole.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
@@ -27,8 +31,14 @@ from pydantic import BaseModel
 from wmo.config.config import HarnessConfig
 from wmo.core.types import JsonValue
 
-_INCLUDED_FILES = ("config.toml", "metrics.json", "card.json")
-_INCLUDED_DIRS = ("prompts", "index")
+# auto_fidelity.json rides along because it names the model's measured-best
+# runtime configuration; knowledge/ because that configuration may BE
+# knowledge-backed (winner_label "reason+kb"). Excluding either made the
+# hosted copy a different simulation than the local one: it could not serve
+# the very configuration its own fidelity search selected (bench-defaults/swe
+# round-trip finding, 2026-07-29).
+_INCLUDED_FILES = ("config.toml", "metrics.json", "card.json", "auto_fidelity.json")
+_INCLUDED_DIRS = ("prompts", "index", "knowledge")
 
 _HASH_CHUNK_BYTES = 1024 * 1024
 
@@ -54,6 +64,22 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _scrub_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Normalize the metadata that varies between packs of identical content.
+
+    Mode included: the same directory packed under umask 022 and 002 differs
+    only in st_mode, and a digest that moves with the packing machine's umask
+    is not content-addressed.
+    """
+    member.mtime = 0
+    member.uid = 0
+    member.gid = 0
+    member.uname = ""
+    member.gname = ""
+    member.mode = 0o755 if member.isdir() else 0o644
+    return member
+
+
 def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
     """Pack a model directory into the platform's bundle format at ``dest``.
 
@@ -62,8 +88,10 @@ def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
         dest: Where to write the gzipped tarball (parent must exist).
 
     Returns:
-        The bundle file plus integrity metadata; member order is sorted so
-        identical inputs produce identical archives.
+        The bundle file plus integrity metadata; member order is sorted and
+        all timestamps/ownership are zeroed (tar members and the gzip header),
+        so identical inputs produce byte-identical archives and the sha256
+        addresses the content, not the upload.
 
     Raises:
         BundleFormatError: If the directory is missing or has no config.toml.
@@ -86,9 +114,18 @@ def pack_model_dir(directory: Path, dest: Path) -> PackedModelBundle:
             members.extend(sorted(path for path in root.rglob("*")))
             members.append(root)
 
-    with tarfile.open(dest, mode="w:gz") as tar:
+    with (
+        dest.open("wb") as raw,
+        gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz,
+        tarfile.open(fileobj=gz, mode="w") as tar,
+    ):
         for path in sorted(set(members)):
-            tar.add(path, arcname=str(path.relative_to(directory)), recursive=False)
+            tar.add(
+                path,
+                arcname=str(path.relative_to(directory)),
+                recursive=False,
+                filter=_scrub_member,
+            )
     return PackedModelBundle(
         path=dest,
         sha256=sha256_file(dest),

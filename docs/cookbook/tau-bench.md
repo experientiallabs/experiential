@@ -596,3 +596,65 @@ Worth stating plainly, because the numbers are persuasive and the caveats are no
 The reproducible part is the protocol: the exact commands above, the pins in
 `.wmo/models/<name>/config.toml`, and the matrix the sweep wrote. Re-measure on your own corpus
 before repeating any figure as yours.
+
+## Measured results on this benchmark
+
+The walk above was run in full on 2026-07-28. The evidence grid: 20 held-out test-band
+scenarios x 11 pool candidates x 2 episodes (440 cells, all scored), judged by rubric-v2
+pinned on opus-4-8, world-model simulated (the simulator's ranking was validated against 720
+real tau2 episodes, per-scenario Spearman +0.639, erring pessimistic). The policy was fitted
+on 14 scenarios and reported on the 6 the fit never saw. Anchor: fable-5. Provenance label
+on every number: `measured, wm_simulated`.
+
+| Dial | Traffic mix | Quality vs anchor | Effective cost vs anchor | p50 latency |
+|---|---|---|---|---|
+| Balanced (default) | opus-5 100% | 0.521 vs 0.396 (+12.5 pt) | $0.126 vs $0.220 (-42.8%) | 3.2s vs 4.7s (-33%) |
+| Max savings | opus-5 83.3%, kimi-k2.6 16.7% | 0.458 vs 0.396 (+6.3 pt) | $0.122 (-44.5%) | 3.75s (-20%) |
+
+What the numbers teach, beyond their size. At the balanced dial the guarded router sends
+every request to one model: the evidence says opus-5 dominates this workload, and the
+router's worst case is its fallback by construction, so it refuses to trade that quality
+away. The savings against the anchor come from model selection; savings against the best
+single model are zero here, honestly. At max savings the dial buys two more points of
+savings for six points of quality: this pool's only cheaper substitute is genuinely worse,
+and the dial saturating is a measurement, not a malfunction. Compression arms were measured
+on the same grid and RAISED effective cost per completed task for the strong models (the
+truncation control confirms it is not the compressor's fault alone); on this workload the
+honest compression verdict is "measured tradeoff, not recommendation".
+
+Caveats that travel with the table: the report band is 6 scenarios, so the paired quality
+CI is wide; routed p95 latency is WORSE than the anchor's; the corpus mix is ~85% telecom;
+7 of the 20 test scenarios include tau2's own natural-language judge in their reward basis.
+
+## Reproduce it with one command
+
+```bash
+uv run wmo reproduce run tau-bench --yes
+```
+
+Downloads the public trace corpus, builds the world model, buys the 440-cell sweep against
+live providers on a pinned public-route pool, fits, reports, and compares against the
+published row within stated tolerances. This is the PROTOCOL-exact reproduction: it spends
+real money (estimated ~$110; the command states it and refuses without `--yes`), providers
+are nondeterministic, and public prices drift - which is exactly what the tolerances in the
+shipped manifest encode. `wmo reproduce list` shows both reproduction classes.
+
+## The real-episode leg, reproduced free
+
+The walk above measures inside the world model. The product's `tau-bench` default was
+re-measured on Sierra's actual benchmark - 594 real tau2 episodes, 15 candidates, tau2's
+own reward - and ships as a pinned sonnet-5 at 63.8% savings against the fable-5 anchor
+(quality −2.0pt, unresolved at n=19 paired scenarios). The measured winner on that matrix
+is glm-5.2 at −88%, unserveable until it has an authoritative price; the published matrix
+carries both, so the reproduction shows the gap. That leg is bit-exact and free to replay:
+
+```bash
+uv run wmo reproduce run tau-bench-real
+```
+
+Offline and credential-free (a static pin routes nothing, so the replay is arithmetic over
+the matrix published at
+[`experiential-labs/wmo-tau-bench-real`](https://huggingface.co/datasets/experiential-labs/wmo-tau-bench-real)).
+The two tau manifests are deliberately separate: `tau-bench` reproduces the world-model
+protocol against live providers; `tau-bench-real` reproduces the real-benchmark numbers
+from recorded evidence. Their provenances differ and their numbers are never blended.

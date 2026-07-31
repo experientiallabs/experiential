@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+import sys
 import tarfile
 import threading
 from pathlib import Path
@@ -19,11 +20,12 @@ import wmo.cli.agent_session as mod
 import wmo.cli.hosted_session as hosted_mod
 from wmo.cli import app
 from wmo.cli.session_state import DetachedSessionState, SessionStateError, SessionStateStore
-from wmo.cli.workspace_sync import snapshot_from_archive
+from wmo.cli.workspace_sync import snapshot_from_archive, snapshot_workspace
 from wmo.config.settings import ModelRole, ModelsSettings, ProjectSettings, save_settings
-from wmo.harness.live_session import SessionEvent
+from wmo.harness.doc import HarnessDoc
+from wmo.harness.live_session import LiveSession, SessionEvent
 from wmo.harness.workspace_patch import build_workspace_patch
-from wmo.platform.client import PlatformError
+from wmo.platform.client import PlatformClient, PlatformError
 from wmo.platform.credentials import PlatformCredentials
 from wmo.providers.base import ProviderKind
 from wmo.utils.waterfall.types import ChatChoice, ChatMessage, ChatRequest, ChatResponse, ChatUsage
@@ -59,6 +61,7 @@ def test_executor_reads_writes_and_jails(tmp_path: Path) -> None:
     assert absolute.is_error
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="LocalToolExecutor bash needs a Unix shell")
 def test_executor_bash_runs_in_jail_and_reports_exit(tmp_path: Path) -> None:
     """bash runs in the jail root, streams output, and surfaces a non-zero exit."""
     executor = mod.LocalToolExecutor(tmp_path)
@@ -153,12 +156,12 @@ class _FakeClient:
 
 
 def _patch_local_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mod, "get_provider", lambda _config: _FakeProvider())
+    monkeypatch.setattr("wmo.providers.registry.get_provider", lambda _config: _FakeProvider())
 
 
 def test_build_driver_not_logged_in_runs_baseline_local(monkeypatch: pytest.MonkeyPatch) -> None:
     """No login + no agent: a pi-node baseline runs locally, unrecorded."""
-    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", PlatformCredentials)
     _patch_local_provider(monkeypatch)
 
     driver = mod._build_driver(
@@ -185,14 +188,14 @@ def test_build_driver_uses_configured_local_worker(
         ),
         tmp_path / ".wmo",
     )
-    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", PlatformCredentials)
     configs = []
 
     def get_provider(config: object) -> _FakeProvider:
         configs.append(config)
         return _FakeProvider()
 
-    monkeypatch.setattr(mod, "get_provider", get_provider)
+    monkeypatch.setattr("wmo.providers.registry.get_provider", get_provider)
 
     driver = mod._build_driver(
         target=None,
@@ -220,7 +223,7 @@ def test_build_driver_names_the_worker_it_picked(
 ) -> None:
     """A bare `wmo run` with nothing configured says which model it silently defaulted to."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", PlatformCredentials)
     _patch_local_provider(monkeypatch)
     console = Console(file=io.StringIO(), width=200)
     monkeypatch.setattr(mod, "_console", console)
@@ -241,8 +244,11 @@ def test_build_driver_preflights_the_worker_before_the_harness_boots(
     fails on a provider the user never chose, with nothing pointing at `wmo providers set`.
     """
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
-    monkeypatch.setattr(mod, "get_provider", lambda _config: _UnpreparedProvider())
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", PlatformCredentials)
+    monkeypatch.setattr(
+        "wmo.providers.registry.get_provider",
+        lambda _config: _UnpreparedProvider(),
+    )
     monkeypatch.setattr(mod, "_console", Console(file=io.StringIO(), width=200))
 
     with pytest.raises(typer.BadParameter) as caught:
@@ -259,9 +265,9 @@ def test_build_driver_logged_in_agent_uses_hosted_e2b_without_local_workspace(
 ) -> None:
     """Logged in + agent defaults to platform-owned E2B without local files."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     driver = mod._build_driver(
         target="a1",
@@ -301,9 +307,9 @@ def test_run_upload_dir_is_explicit_opt_in(tmp_path: Path, monkeypatch: pytest.M
 def test_build_driver_logged_in_builtin_pi_uses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Logged-in bare run needs no local provider credentials."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test", default_org="org-1")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     driver = mod._build_driver(
         target=None,
@@ -327,9 +333,9 @@ def test_platform_target_rejects_local_provider_before_creating_session(
 ) -> None:
     """Provider overrides never create an orphan platform run."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     with pytest.raises(typer.BadParameter, match="platform credentials"):
         mod._build_driver(
@@ -346,9 +352,9 @@ def test_hosted_agent_does_not_prompt_for_local_execution(
 ) -> None:
     """The E2B agent path never presents the bare harness's local-shell warning."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     prompted: list[bool] = []
     driver = mod._build_driver(
@@ -367,10 +373,10 @@ def test_hosted_agent_does_not_prompt_for_local_execution(
 def test_build_driver_world_model_uses_hosted_session(monkeypatch: pytest.MonkeyPatch) -> None:
     """A resolved world-model id never boots a local agent process."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
     client.target_kind = "world_model"
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     driver = mod._build_driver(
         target="wm-1",
@@ -384,7 +390,7 @@ def test_build_driver_world_model_uses_hosted_session(monkeypatch: pytest.Monkey
 
 def test_build_driver_target_without_login_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     """Naming any platform target while logged out is a clear parameter error."""
-    monkeypatch.setattr(mod, "load_credentials", PlatformCredentials)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", PlatformCredentials)
     with pytest.raises(typer.BadParameter):
         mod._build_driver(
             target="a1",
@@ -456,8 +462,8 @@ class _FakeReader:
 
 
 def _patch_driver_boundaries(monkeypatch: pytest.MonkeyPatch, channel: _FakeChannel) -> None:
-    monkeypatch.setattr(mod, "start_local_live_runner", lambda: channel)
-    monkeypatch.setattr(mod, "LiveSession", _FakeLiveSession)
+    monkeypatch.setattr("wmo.harness.pi_local.start_local_live_runner", lambda: channel)
+    monkeypatch.setattr("wmo.harness.live_session.LiveSession", _FakeLiveSession)
     monkeypatch.setattr(mod, "StdinCommandReader", _FakeReader)
 
 
@@ -468,7 +474,7 @@ def test_driver_boots_loops_and_closes_local_process(monkeypatch: pytest.MonkeyP
 
     mod.LocalLiveDriver(
         jail_root=Path.cwd(),
-        doc=mod.HarnessDoc.baseline("t"),
+        doc=HarnessDoc.baseline("t"),
         provider=_FakeProvider(),
         worker_fn=None,
         recorder=None,
@@ -495,7 +501,7 @@ def test_driver_reports_finish_to_recorder(monkeypatch: pytest.MonkeyPatch) -> N
 
     mod.LocalLiveDriver(
         jail_root=Path.cwd(),
-        doc=mod.HarnessDoc.baseline("t"),
+        doc=HarnessDoc.baseline("t"),
         provider=_FakeProvider(),
         worker_fn=None,
         recorder=cast("mod.RunRecorder", _Recorder()),
@@ -520,7 +526,7 @@ def test_stdin_eof_is_reported_without_aborting_the_opening_task(
             self.ended += 1
 
     local_session = _Session()
-    local_reader = mod.StdinCommandReader(cast("mod.LiveSession", local_session))
+    local_reader = mod.StdinCommandReader(cast("LiveSession", local_session))
     local_reader.run()
     assert local_reader.eof.is_set()
     assert local_session.ended == 0
@@ -536,7 +542,7 @@ def test_stdin_eof_is_reported_without_aborting_the_opening_task(
 
     client = _Client()
     remote_reader = mod.RemoteAgentCommandReader(
-        cast("mod.PlatformClient", client), "agent-1", "session-1"
+        cast("PlatformClient", client), "agent-1", "session-1"
     )
     remote_reader.run()
     assert remote_reader.eof.is_set()
@@ -559,14 +565,14 @@ def test_local_driver_returns_nonzero_when_the_runner_fails(
             self._closed = True
             return False
 
-    monkeypatch.setattr(mod, "start_local_live_runner", lambda: channel)
-    monkeypatch.setattr(mod, "LiveSession", _FailedSession)
+    monkeypatch.setattr("wmo.harness.pi_local.start_local_live_runner", lambda: channel)
+    monkeypatch.setattr("wmo.harness.live_session.LiveSession", _FailedSession)
     monkeypatch.setattr(mod, "StdinCommandReader", _FakeReader)
 
     with pytest.raises(typer.Exit) as raised:
         mod.LocalLiveDriver(
             jail_root=Path.cwd(),
-            doc=mod.HarnessDoc.baseline("t"),
+            doc=HarnessDoc.baseline("t"),
             provider=_FakeProvider(),
             worker_fn=None,
             recorder=None,
@@ -635,7 +641,7 @@ def test_remote_agent_driver_syncs_final_e2b_workspace(
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
 
     mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client),
+        cast("PlatformClient", client),
         "agent-1",
         "Agent",
         tmp_path,
@@ -654,7 +660,7 @@ def test_failed_hosted_session_is_not_hidden_by_workspace_conflicts(
 ) -> None:
     """Session failure remains the primary exit even when final sync needs recovery."""
     (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
-    final = mod.snapshot_workspace(tmp_path).archive
+    final = snapshot_workspace(tmp_path).archive
 
     class _HostedClient:
         def __init__(self) -> None:
@@ -698,7 +704,7 @@ def test_failed_hosted_session_is_not_hidden_by_workspace_conflicts(
 
     with pytest.raises(typer.Exit) as raised:
         mod.RemoteAgentDriver(
-            cast("mod.PlatformClient", client),
+            cast("PlatformClient", client),
             "agent-1",
             "Agent",
             tmp_path,
@@ -759,7 +765,7 @@ def test_remote_agent_driver_without_upload_never_reads_local_workspace(
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
 
     mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client),
+        cast("PlatformClient", client),
         "agent-1",
         "Agent",
         None,
@@ -777,7 +783,7 @@ def test_remote_agent_driver_applies_live_workspace_patch(
 ) -> None:
     """A workspace_patch event updates the local directory before session end."""
     (tmp_path / "answer.txt").write_text("before", encoding="utf-8")
-    initial = mod.snapshot_workspace(tmp_path)
+    initial = snapshot_workspace(tmp_path)
     final_buffer = io.BytesIO()
     with tarfile.open(fileobj=final_buffer, mode="w:gz") as archive:
         body = b"during"
@@ -838,7 +844,7 @@ def test_remote_agent_driver_applies_live_workspace_patch(
     monkeypatch.setattr(mod, "RemoteAgentCommandReader", _NoReader)
 
     mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client),
+        cast("PlatformClient", client),
         "agent-1",
         "Agent",
         tmp_path,
@@ -917,9 +923,9 @@ def test_run_dispatches_session_commands(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_build_driver_detach_returns_start_driver(monkeypatch: pytest.MonkeyPatch) -> None:
     """--detach on an agent id builds the detached start driver, not the streamer."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     driver = mod._build_driver(
         target="a1",
@@ -936,10 +942,10 @@ def test_build_driver_detach_returns_start_driver(monkeypatch: pytest.MonkeyPatc
 def test_build_driver_detach_rejects_world_models(monkeypatch: pytest.MonkeyPatch) -> None:
     """World-model sessions are interactive only; --detach names agents."""
     creds = PlatformCredentials(api_url="https://api.test", token="xpl_test")
-    monkeypatch.setattr(mod, "load_credentials", lambda: creds)
+    monkeypatch.setattr("wmo.platform.credentials.load_credentials", lambda: creds)
     client = _FakeClient()
     client.target_kind = "world_model"
-    monkeypatch.setattr(mod, "PlatformClient", lambda *_a, **_k: client)
+    monkeypatch.setattr("wmo.platform.client.PlatformClient", lambda *_a, **_k: client)
 
     with pytest.raises(typer.BadParameter, match="agent"):
         mod._build_driver(
@@ -977,7 +983,7 @@ def _plain_driver(
     """A plain hosted driver wired to an injectable session-state store."""
     store = SessionStateStore(tmp_path / "state")
     driver = mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", client),
+        cast("PlatformClient", client),
         "agent-1",
         "Agent",
         jail_root,
@@ -1006,7 +1012,7 @@ def test_reader_detach_skips_eof_end_and_guards_unknown_commands(
 
     monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":detach\n"))
     client = _Client()
-    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+    reader = mod.RemoteAgentCommandReader(cast("PlatformClient", client), "a", "s")
     reader.run()
     assert reader.detach.is_set()
     assert not reader.eof.is_set()
@@ -1014,7 +1020,7 @@ def test_reader_detach_skips_eof_end_and_guards_unknown_commands(
 
     monkeypatch.setattr(mod.sys, "stdin", io.StringIO(":frob\nhello\n:end\n"))
     client = _Client()
-    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+    reader = mod.RemoteAgentCommandReader(cast("PlatformClient", client), "a", "s")
     reader.run()
     assert client.posted == [("user_message", "hello"), ("end", None)]
     assert not reader.detach.is_set()
@@ -1074,7 +1080,7 @@ def test_plain_run_detach_with_workspace_checkpoints_without_final_sync(
     root = tmp_path / "work"
     root.mkdir()
     (root / "answer.txt").write_text("before", encoding="utf-8")
-    base = mod.snapshot_workspace(root)
+    base = snapshot_workspace(root)
     remote = io.BytesIO()
     with tarfile.open(fileobj=remote, mode="w:gz") as archive:
         body = b"during"
@@ -1132,7 +1138,10 @@ def test_plain_run_detach_with_workspace_checkpoints_without_final_sync(
     assert state.workspace is not None
     assert state.workspace.root == str(root)
     checkpoint = snapshot_from_archive(store.load_base_archive(state))
-    assert checkpoint.files == mod.snapshot_workspace(root).files
+    # Compare content digests; Windows file modes often differ from the archived Unix mode.
+    assert {path: state.sha256 for path, state in checkpoint.files.items()} == {
+        path: state.sha256 for path, state in snapshot_workspace(root).files.items()
+    }
 
 
 def test_plain_run_detach_state_failure_names_the_session(
@@ -1157,7 +1166,7 @@ def test_plain_run_detach_state_failure_names_the_session(
             pass
 
     driver = mod.RemoteAgentDriver(
-        cast("mod.PlatformClient", _Client()),
+        cast("PlatformClient", _Client()),
         "agent-1",
         "Agent",
         None,
@@ -1183,7 +1192,7 @@ def test_world_model_loop_rejects_detach(monkeypatch: pytest.MonkeyPatch) -> Non
     lines = iter([":detach", ":quit"])
     monkeypatch.setattr(mod._console, "input", lambda *_a, **_k: next(lines))
     driver = mod.RemoteWorldModelDriver(
-        cast("mod.PlatformClient", _Client()), "wm-1", "Model", None
+        cast("PlatformClient", _Client()), "wm-1", "Model", None
     )
 
     driver._loop("sess-1")
@@ -1209,7 +1218,7 @@ def test_reader_keeps_reading_after_a_failed_steer_post(
 
     monkeypatch.setattr(mod.sys, "stdin", io.StringIO("hello\n:stop\n"))
     client = _FlakyClient()
-    reader = mod.RemoteAgentCommandReader(cast("mod.PlatformClient", client), "a", "s")
+    reader = mod.RemoteAgentCommandReader(cast("PlatformClient", client), "a", "s")
 
     reader.run()
 
@@ -1282,7 +1291,7 @@ def test_plain_run_interrupt_around_a_patch_ack_promotes_a_fresh_cursor(
     root = tmp_path / "work"
     root.mkdir()
     (root / "answer.txt").write_text("before", encoding="utf-8")
-    base = mod.snapshot_workspace(root)
+    base = snapshot_workspace(root)
     remote = io.BytesIO()
     with tarfile.open(fileobj=remote, mode="w:gz") as archive:
         body = b"during"

@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 Role = Literal["user", "assistant"]
 ChatMaxTokensField = Literal["max_completion_tokens", "max_tokens"]
@@ -82,10 +82,18 @@ class RetryPolicy:
 
 
 class TokenUsage(BaseModel):
-    """Raw token counts for one call (pricing converts to USD per 1M tokens)."""
+    """Raw token counts for one call (pricing converts to USD per 1M tokens).
+
+    The cache legs are SUBSETS of `input_tokens` (the total always counts every
+    input token): providers report them separately because reads bill at a
+    discount and writes at a premium, and dropping the split silently re-prices
+    cached traffic at the full input rate.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
 
 
 AttemptOutcome = Literal["ok", "capacity_error", "client_error", "unsupported"]
@@ -201,6 +209,20 @@ class ChatRequest(BaseModel):
         return payload
 
 
+class ChatPromptTokensDetails(BaseModel):
+    """OpenAI-compatible prompt-token breakdown (`prompt_tokens_details`).
+
+    ``cached_tokens`` is Optional to match openai-python, whose model_dump
+    emits explicit nulls; a None (or an absent key) reads as "no cached
+    split", never as a validation failure — usage shape must not be able to
+    fail a request.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    cached_tokens: int | None = None
+
+
 class ChatUsage(BaseModel):
     """OpenAI-compatible structured completion usage."""
 
@@ -208,6 +230,21 @@ class ChatUsage(BaseModel):
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    prompt_tokens_details: ChatPromptTokensDetails | None = None
+    # Anthropic-style cache-write count (OpenAI has no wire shape for writes;
+    # Anthropic-family backends report it under this name). A SUBSET of
+    # prompt_tokens, like the cached read count. Optional so an explicit null
+    # from an SDK dump parses, and so exclude_none keeps it OFF the wire for
+    # the (majority) responses that never had one.
+    cache_creation_input_tokens: int | None = None
+
+    @field_validator("prompt_tokens_details", mode="before")
+    @classmethod
+    def _tolerate_unreadable_details(cls, value: object) -> object:
+        """An unparseable details blob costs the response its cached split, not the request."""
+        if value is None or isinstance(value, dict | ChatPromptTokensDetails):
+            return value
+        return None
 
 
 class ChatChoice(BaseModel):
@@ -233,9 +270,17 @@ class ChatResponse(BaseModel):
         """Project provider usage onto the waterfall's canonical counters."""
         if self.usage is None:
             return TokenUsage()
+        details = self.usage.prompt_tokens_details
+        cached = (details.cached_tokens if details is not None else None) or 0
+        total = max(self.usage.prompt_tokens, 0)
+        # OpenAI semantics: prompt_tokens already includes both cache subsets.
+        read = min(max(cached, 0), total)
+        write = min(max(self.usage.cache_creation_input_tokens or 0, 0), total - read)
         return TokenUsage(
             input_tokens=self.usage.prompt_tokens,
             output_tokens=self.usage.completion_tokens,
+            cached_input_tokens=read,
+            cache_write_input_tokens=write,
         )
 
     def wire_payload(self) -> JsonObject:

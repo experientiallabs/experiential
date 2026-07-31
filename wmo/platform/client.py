@@ -573,6 +573,183 @@ class PlatformClient:
         self._raise_for_error(finalize)
         return RemoteWorldModel.model_validate(_decode_json(finalize))
 
+    def get_endpoint(self, org_id: str, name: str) -> JsonObject | None:
+        """One endpoint's detail, or ``None`` when the org has no endpoint by that name.
+
+        A 404 is an answer here, not a failure: the push flow asks this question
+        to decide between creating the endpoint and updating it in place.
+        """
+        response = self._client.get(f"/api/orgs/{org_id}/endpoints/{name}")
+        if response.status_code == 404:
+            return None
+        self._raise_for_error(response)
+        decoded = _decode_json(response)
+        if not isinstance(decoded, dict):
+            msg = f"endpoint detail returned a {type(decoded).__name__}, expected an object"
+            raise PlatformError(msg)
+        return decoded
+
+    def create_endpoint(
+        self,
+        org_id: str,
+        name: str,
+        *,
+        world_model_id: str | None = None,
+        model: str | None = None,
+    ) -> JsonObject:
+        """Create one endpoint, optionally tied to a world model.
+
+        Args:
+            org_id: Organization to create under.
+            name: Endpoint slug.
+            world_model_id: Simulation the endpoint links to, or ``None`` for an
+                endpoint whose evidence comes from a real benchmark.
+            model: Pool entry name for the day-one static policy; the platform
+                default serves when omitted. Deployments differ in which models
+                they hold credentials for, so the platform's refusal names the
+                serveable set when this pick (or its default) cannot serve.
+
+        Returns:
+            The created endpoint summary.
+        """
+        body: dict[str, JsonValue] = {"name": name, "world_model_id": world_model_id}
+        if model is not None:
+            body["model"] = model
+        response = self._client.post(f"/api/orgs/{org_id}/endpoints", json=body)
+        self._raise_for_error(response)
+        decoded = _decode_json(response)
+        if not isinstance(decoded, dict):
+            msg = f"endpoint create returned a {type(decoded).__name__}, expected an object"
+            raise PlatformError(msg)
+        return decoded
+
+    def install_endpoint_artifacts(
+        self, org_id: str, name: str, *, policy: JsonObject, report: JsonObject
+    ) -> JsonObject:
+        """Install a measured policy and its improvement report on an endpoint.
+
+        The JSON body twin of :meth:`install_endpoint_policy`, for policies with
+        no evidence bank (static, rank): the pair replaces the endpoint's day-one
+        policy and null report wholesale. A knn policy is two artifacts and must
+        go through the multipart installer instead; the platform refuses it here.
+
+        Returns:
+            The endpoint detail the platform returns.
+        """
+        response = self._client.put(
+            f"/api/orgs/{org_id}/endpoints/{name}/artifacts",
+            json={"policy": policy, "report": report},
+        )
+        self._raise_for_error(response)
+        decoded = _decode_json(response)
+        if not isinstance(decoded, dict):
+            msg = f"artifacts install returned a {type(decoded).__name__}, expected an object"
+            raise PlatformError(msg)
+        return decoded
+
+    def install_endpoint_policy(
+        self,
+        org_id: str,
+        endpoint: str,
+        policy_path: Path,
+        bank_path: Path | None,
+        report_path: Path | None = None,
+    ) -> JsonValue:
+        """Install a fitted routing policy on a hosted endpoint.
+
+        Multipart rather than a signed-URL handoff like `push_model_bundle`: a policy
+        bank is a few hundred KB to a few MB, not a whole model bundle, and the server
+        has to validate the bank AGAINST the policy before storing it. Splitting them
+        across two requests would mean accepting bytes it cannot yet check.
+
+        Args:
+            org_id: Organization that owns the endpoint.
+            endpoint: Endpoint slug (the `model` a customer's client sends).
+            policy_path: Fitted `policy.json`.
+            bank_path: The `.npz` evidence sidecar; required for a knn policy, and
+                ``None`` for static or rank, which have none.
+            report_path: Optional improvement-report JSON to publish alongside.
+
+        Returns:
+            The endpoint summary the platform returns.
+        """
+        # File reads are this client's own failure surface: a path that vanished or
+        # became unreadable between the CLI's validation and this call must surface
+        # as the PlatformError every caller already renders, not a raw traceback.
+        try:
+            files: dict[str, tuple[str, bytes, str]] = {}
+            if bank_path is not None:
+                files["bank"] = (
+                    bank_path.name,
+                    bank_path.read_bytes(),
+                    "application/octet-stream",
+                )
+            data = {"policy": policy_path.read_text(encoding="utf-8")}
+            if report_path is not None:
+                data["report"] = report_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            msg = f"could not read the policy artifacts to install: {error}"
+            raise PlatformError(msg) from error
+        response = self._client.put(
+            f"/api/orgs/{org_id}/endpoints/{endpoint}/policy",
+            data=data,
+            files=files or None,
+        )
+        self._raise_for_error(response)
+        return _decode_json(response)
+
+    def download_endpoint_policy(
+        self, org_id: str, name: str, *, bank_dest: Path | None = None
+    ) -> JsonObject | None:
+        """The endpoint's CURRENT policy and report, streaming its knn bank when asked.
+
+        The pull half of the publish surface (D-LOCAL-PULL): the platform
+        returns the policy the endpoint serves NOW - a hosted optimizer's fit
+        included - beside its improvement report. ``None`` when the org has no
+        endpoint by that name (a 404 is an answer here, exactly like
+        :meth:`get_endpoint`). When the policy carries an evidence bank and
+        ``bank_dest`` is given, the bank bytes stream from the signed URL to
+        that path and are digest-verified; a policy with no bank leaves the
+        path unwritten.
+
+        Returns:
+            The response payload (``policy``, ``report``, ``bank`` metadata),
+            or ``None`` for an absent endpoint.
+        """
+        response = self._client.get(f"/api/orgs/{org_id}/endpoints/{name}/policy")
+        if response.status_code == 404:
+            return None
+        self._raise_for_error(response)
+        payload = _decode_json(response)
+        if not isinstance(payload.get("policy"), dict):
+            msg = f"policy download for {name} returned no policy object"
+            raise PlatformError(msg)
+        bank = payload.get("bank")
+        if bank is not None and not (
+            isinstance(bank, dict) and isinstance(bank.get("url"), str) and "sha256" in bank
+        ):
+            msg = f"policy download for {name} returned an unusable bank reference"
+            raise PlatformError(msg)
+        if bank_dest is not None and isinstance(bank, dict):
+            declared = str(bank["sha256"])
+            digest = hashlib.sha256()
+            part_path = bank_dest.with_name(f"{bank_dest.name}.part")
+            with self._transfer.stream("GET", str(bank["url"])) as stream:
+                if not stream.is_success:
+                    msg = f"policy bank download failed with HTTP {stream.status_code}"
+                    raise PlatformError(msg, status_code=stream.status_code)
+                with part_path.open("wb") as fh:
+                    for chunk in stream.iter_bytes():
+                        digest.update(chunk)
+                        fh.write(chunk)
+            actual = digest.hexdigest()
+            if actual != declared:
+                part_path.unlink(missing_ok=True)
+                msg = f"policy bank digest mismatch for {name}: expected {declared}, got {actual}"
+                raise PlatformError(msg)
+            part_path.replace(bank_dest)
+        return payload
+
     def download_model_bundle(self, org_id: str, name: str, dest: Path) -> str:
         """Stream a model's bundle from storage to ``dest``, verifying its digest.
 

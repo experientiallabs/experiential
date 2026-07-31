@@ -1027,11 +1027,14 @@ class PipelineEmitter(_Reporter):
         )
         self._flush()
 
-    def stage_completed(self, record: StageRecord, *, lifetime_spend_usd: float) -> None:
+    def stage_completed(
+        self, record: StageRecord, *, lifetime_candidate_usd: float, lifetime_wm_usd: float
+    ) -> None:
         """A stage finished, with the fingerprint and artifact identity it recorded.
 
         Takes the `StageRecord` the manifest just persisted, so the event and the manifest cannot
-        disagree about what the stage produced or what it cost.
+        disagree about what the stage produced or what it cost. The lifetime figures are the
+        manifest's `lifetime_split` legs.
         """
         self._stages_done += 1
         self._emit(
@@ -1054,13 +1057,23 @@ class PipelineEmitter(_Reporter):
                 },
             },
         )
-        self.heartbeat(stage=record.stage, lifetime_spend_usd=lifetime_spend_usd)
+        self.heartbeat(
+            stage=record.stage,
+            lifetime_candidate_usd=lifetime_candidate_usd,
+            lifetime_wm_usd=lifetime_wm_usd,
+        )
 
-    def heartbeat(self, *, stage: Stage | None, lifetime_spend_usd: float) -> None:
+    def heartbeat(
+        self, *, stage: Stage | None, lifetime_candidate_usd: float, lifetime_wm_usd: float
+    ) -> None:
         """Where the pipeline is and what it has spent, at a stage boundary.
 
-        The spend is the manifest's LIFETIME total, both sides together, which is the number the
-        run's own cap is checked against (`SpendLedger`).
+        The spend is the manifest's LIFETIME total — the number the run's own cap is checked
+        against (`SpendLedger`) — reported as its two legs. The platform's run row stores the
+        legs exactly as reported and totals them (`candidate_usd + wm_usd`), so folding both
+        sides into `candidate_usd` (as an earlier version did) inflated the candidate leg,
+        rendered the world-model leg as unreported, and made the panel's cells-vs-ledger
+        reconciliation fire on every pipeline run.
         """
         self._emit(
             RUN_LEVEL_BAND,
@@ -1072,7 +1085,10 @@ class PipelineEmitter(_Reporter):
                     "total": None,
                     "stage": stage.value if stage is not None else None,
                 },
-                "spend": {"candidate_usd": lifetime_spend_usd},
+                "spend": {
+                    "candidate_usd": lifetime_candidate_usd,
+                    "wm_usd": lifetime_wm_usd,
+                },
             },
         )
         self._flush()

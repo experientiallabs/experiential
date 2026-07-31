@@ -35,7 +35,6 @@ from wmo.providers.base import (
     TokenUsage,
     VerifyResult,
 )
-from wmo.providers.bedrock import resolve_region
 from wmo.providers.registry import get_provider
 from wmo.utils.waterfall import (
     Backend,
@@ -83,6 +82,8 @@ def to_backend(config: ProviderConfig, *, profile: str | None = None) -> Backend
         )
     region = config.region
     if config.kind is ProviderKind.BEDROCK:
+        from wmo.providers.bedrock import resolve_region
+
         region = resolve_region(region)
     return Backend(
         provider,
@@ -166,6 +167,10 @@ class WaterfallProvider:
             usage=TokenUsage(
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
+                # The cache split rides through so cached traffic prices at the
+                # cache tiers instead of the full input rate.
+                cached_input_tokens=result.usage.cached_input_tokens,
+                cache_write_input_tokens=result.usage.cache_write_input_tokens,
             ),
             model=result.model_used,  # true attribution even when a fallback served
         )

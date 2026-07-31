@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tarfile
 from pathlib import Path
 
@@ -100,3 +101,43 @@ def test_extract_push_meta_includes_serve_model_when_configured(tmp_path: Path) 
     meta = extract_push_meta(directory)
 
     assert meta["serve_model"] == "claude-sonnet-4-5"
+
+
+def test_bundle_carries_the_knowledge_base_and_fidelity_winner(tmp_path: Path) -> None:
+    """The hosted copy must be the SAME simulation the local dir serves.
+
+    auto_fidelity.json names the measured-best runtime configuration and
+    knowledge/ is what a "reason+kb" winner runs on; a bundle without them
+    serves a configuration the model's own search rejected.
+    """
+    directory = _model_dir(tmp_path)
+    (directory / "auto_fidelity.json").write_text('{"winner_label": "reason+kb"}')
+    (directory / "knowledge").mkdir()
+    (directory / "knowledge" / "facts.md").write_text("the env fact serving needs")
+
+    bundle = pack_model_dir(directory, tmp_path / "out.tar.gz")
+
+    import tarfile
+
+    with tarfile.open(bundle.path) as archive:
+        names = set(archive.getnames())
+    assert any(name.endswith("auto_fidelity.json") for name in names)
+    assert any("knowledge" in name and name.endswith("facts.md") for name in names)
+
+
+def test_repacking_identical_content_is_byte_reproducible(tmp_path: Path) -> None:
+    """The sha256 must address the content, not the upload.
+
+    Timestamps are the classic leak: tar records member mtimes and gzip
+    records a compression time, so the same directory packed twice minutes
+    apart would digest differently unless both are zeroed.
+    """
+    directory = _model_dir(tmp_path)
+
+    first = pack_model_dir(directory, tmp_path / "first.tar.gz")
+    for path in directory.rglob("*"):
+        os.utime(path, (0, 0))
+    second = pack_model_dir(directory, tmp_path / "second.tar.gz")
+
+    assert first.sha256 == second.sha256
+    assert first.byte_size == second.byte_size

@@ -2,28 +2,49 @@
 
 `get_provider` is the single constructor the rest of the harness uses; nothing imports a concrete
 backend directly. `verify_all` powers `wmo providers verify`.
+
+Backends are imported only when their `ProviderKind` is requested, so a CLI that never talks to
+Tinker (or Anthropic, …) never pays for those modules.
 """
 
 from __future__ import annotations
 
-from wmo.providers.anthropic import AnthropicProvider
-from wmo.providers.azure_openai import AzureOpenAIProvider
-from wmo.providers.base import Provider, ProviderConfig, ProviderKind, VerifyResult
-from wmo.providers.bedrock import BedrockProvider
-from wmo.providers.openai import OpenAIProvider
-from wmo.providers.openai_responses import OpenAIResponsesProvider
-from wmo.providers.openrouter import OpenRouterProvider
-from wmo.providers.tinker import TinkerChatProvider
+import importlib
+from typing import TYPE_CHECKING
 
-_BACKENDS = {
-    ProviderKind.ANTHROPIC: AnthropicProvider,
-    ProviderKind.BEDROCK: BedrockProvider,
-    ProviderKind.AZURE_OPENAI: AzureOpenAIProvider,
-    ProviderKind.OPENAI: OpenAIProvider,
-    ProviderKind.OPENAI_RESPONSES: OpenAIResponsesProvider,
-    ProviderKind.OPENROUTER: OpenRouterProvider,
-    ProviderKind.TINKER: TinkerChatProvider,
+from wmo.providers.base import Provider, ProviderConfig, ProviderKind, VerifyResult
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# kind -> "module.path:ClassName". Resolved on first get_provider call for that kind only.
+_BACKEND_PATHS: dict[ProviderKind, str] = {
+    ProviderKind.ANTHROPIC: "wmo.providers.anthropic:AnthropicProvider",
+    ProviderKind.BEDROCK: "wmo.providers.bedrock:BedrockProvider",
+    ProviderKind.AZURE_OPENAI: "wmo.providers.azure_openai:AzureOpenAIProvider",
+    ProviderKind.OPENAI: "wmo.providers.openai:OpenAIProvider",
+    ProviderKind.OPENAI_RESPONSES: "wmo.providers.openai_responses:OpenAIResponsesProvider",
+    ProviderKind.OPENROUTER: "wmo.providers.openrouter:OpenRouterProvider",
+    ProviderKind.TINKER: "wmo.providers.tinker:TinkerChatProvider",
 }
+
+_backend_cache: dict[ProviderKind, Callable[..., Provider]] = {}
+
+
+def _load_backend(kind: ProviderKind) -> Callable[..., Provider]:
+    """Import and cache the constructor for `kind`."""
+    cached = _backend_cache.get(kind)
+    if cached is not None:
+        return cached
+    try:
+        path = _BACKEND_PATHS[kind]
+    except KeyError:  # pragma: no cover - exhaustive over the enum
+        raise ValueError(f"unknown provider kind: {kind}") from None
+    module_path, _, class_name = path.partition(":")
+    module = importlib.import_module(module_path)
+    backend = getattr(module, class_name)
+    _backend_cache[kind] = backend
+    return backend
 
 
 def get_provider(config: ProviderConfig, *, api_key: str | None = None) -> Provider:
@@ -33,10 +54,7 @@ def get_provider(config: ProviderConfig, *, api_key: str | None = None) -> Provi
     model pool, tests) can pass it, so untrusted bundle config can never choose a credential.
     When set, the backend authenticates with exactly this key instead of its default env vars.
     """
-    try:
-        backend = _BACKENDS[config.kind]
-    except KeyError:  # pragma: no cover - exhaustive over the enum
-        raise ValueError(f"unknown provider kind: {config.kind}") from None
+    backend = _load_backend(config.kind)
     if api_key is None:
         return backend(config)
     return backend(config, api_key=api_key)

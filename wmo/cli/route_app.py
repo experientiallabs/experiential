@@ -21,11 +21,12 @@ customer copy never says router.
 from __future__ import annotations
 
 import itertools
+import json
 from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import typer
 from pydantic import ValidationError
@@ -36,68 +37,18 @@ from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
 from wmo.config import ARTIFACT_DIR, WorldModelStore
-from wmo.core.locks import FileLockTimeout
-from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
-from wmo.engine import load_world_model
-from wmo.env import WorldModelEnv
-from wmo.env.llm_agent import DEFAULT_HISTORY_CHARS
-from wmo.optimize.compression import (
-    CompressingEmbedder,
-    compression_signature,
-    registered_compressor_ids,
-    resolve_compression,
-    same_compression,
-)
-from wmo.optimize.knn import (
-    COST_QUALITY_ANCHORS,
-    DialResult,
-    KnnFitOutcome,
-    fit_knn_artifact,
-    tune_policy_dial,
-)
-from wmo.optimize.outcomes import (
-    ROUTER_SPLIT_VERSION,
-    OutcomeMatrix,
-    ScenarioOutcome,
-    load_matrix_with_digest,
-    split_router_scenarios,
-)
-from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
-from wmo.optimize.policy import (
-    AZURE_EMBEDDER_DIM,
-    AZURE_EMBEDDER_ENV,
-    HASHING_EMBEDDER_DIM,
-    POLICY_FILENAME,
-    RoutingPolicy,
-    embedder_provenance,
-    probe_embedder,
-    resolve_embedder,
-    write_artifact_atomically,
-)
-from wmo.optimize.report import build_report
-from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
-from wmo.optimize.sweep import (
-    CandidateCoverage,
-    DeferredRisk,
-    SweepError,
-    SweepPlan,
-    SweepRun,
-    Unevenness,
-    coverage,
-    execute_sweep,
-    plan_sweep,
-    preflight_pool,
-    resolve_config,
-    resumable_cells,
-    unevenness,
-)
-from wmo.providers.pool import (
-    DEFAULT_POOL_PATH,
-    PoolEntry,
-    load_pool,
-    upsert_pool_entry,
-)
-from wmo.utils.waterfall import ChatMaxTokensField
+
+if TYPE_CHECKING:
+    # Type-only: real imports are local to the commands and helpers that construct or inspect
+    # these values, so importing this module never pulls the optimize/engine/env/distill/pool
+    # bodies behind it.
+    from wmo.utils.waterfall import ChatMaxTokensField
+
+    from wmo.optimize.knn import DialResult, KnnFitOutcome
+    from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome
+    from wmo.optimize.policy import RoutingPolicy
+    from wmo.optimize.sweep import CandidateCoverage, DeferredRisk, SweepPlan, SweepRun
+    from wmo.providers.pool import PoolEntry
 
 # The two output-budget parameter names any OpenAI-compatible backend accepts.
 _MAX_TOKENS_FIELDS: tuple[ChatMaxTokensField, ...] = ("max_tokens", "max_completion_tokens")
@@ -112,8 +63,23 @@ _console = Console()
 DEFAULT_MATRIX_FILENAME = "matrix.json"
 """Default `sweep --out`: the outcome matrix `fit` takes as its argument."""
 
-COMPRESSOR_IDS_HELP = " | ".join(registered_compressor_ids())
-"""What `--compressor` accepts, rendered from the registry so the help cannot go stale."""
+# Literal mirrors of constants that otherwise live behind a heavy import
+# (`wmo.optimize.compression`, `wmo.optimize.policy`, `wmo.env.llm_agent`, `wmo.providers.pool`).
+# Typer evaluates Option defaults and f-string help text at command-definition time, so these
+# have to be values, not names imported from those modules; the real constants are re-imported
+# inside the command bodies that need their behavior.
+_DEFAULT_HISTORY_CHARS = 2000
+_DEFAULT_POOL_PATH = ".wmo/pool.toml"
+_POLICY_FILENAME = "policy.json"
+_HASHING_EMBEDDER_DIM = 512
+_AZURE_EMBEDDER_DIM = 3072
+_AZURE_EMBEDDER_ENV = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT")
+_WM_SIMULATED = "wm_simulated"
+_REAL_EPISODE = "real_episode"
+_DEFAULT_WM_JUDGE = "world-model verifier"
+
+COMPRESSOR_IDS_HELP = "identity | llmlingua2-endpoint | truncate"
+"""What `--compressor` accepts. Mirrors `wmo.optimize.compression.registered_compressor_ids()`."""
 
 _MATRIX_DIGEST_MARK = "sha256="
 """How `load_matrix_with_digest` spells the digest inside a policy's `fitted_from`."""
@@ -125,7 +91,7 @@ def sweep(
         None, help="World model to measure against (default: the only one built under --root)."
     ),
     pool_file: str = typer.Option(
-        str(DEFAULT_POOL_PATH),
+        _DEFAULT_POOL_PATH,
         "--pool",
         # The doubled brackets are escaped: typer renders help through rich markup, which
         # otherwise swallows them and prints an empty pair.
@@ -162,7 +128,7 @@ def sweep(
         "into throttling errors instead of results.",
     ),
     history_chars: int = typer.Option(
-        DEFAULT_HISTORY_CHARS,
+        _DEFAULT_HISTORY_CHARS,
         "--history-chars",
         min=1,
         help="Characters of each observation the agent sees on later turns. Raise it for an "
@@ -289,6 +255,19 @@ def sweep(
     without `--allow-uneven-coverage`. `sweep && fit` in a script then stops instead of fitting on
     it, and the matrix is written either way.
     """
+    from wmo.engine import load_world_model
+    from wmo.env import WorldModelEnv
+    from wmo.optimize.compression import resolve_compression
+    from wmo.optimize.sweep import (
+        SweepError,
+        coverage,
+        execute_sweep,
+        plan_sweep,
+        preflight_pool,
+        resolve_config,
+        resumable_cells,
+    )
+
     out_path = Path(out)
     if compressor is None and aggressiveness > 0.0:
         raise typer.BadParameter("--aggressiveness needs --compressor to apply it")
@@ -502,6 +481,8 @@ def uneven_warning(rows: list[CandidateCoverage]) -> str | None:
     SETS, and candidates ranked on the same scenarios with different numbers of surviving EPISODES.
     Both bias a fit; naming which one happened is what makes the message actionable.
     """
+    from wmo.optimize.sweep import Unevenness, unevenness
+
     counts = ", ".join(f"{escape(row.candidate)} {row.scored}" for row in rows)
     match unevenness(rows):
         case Unevenness.EVEN:
@@ -680,7 +661,7 @@ def student(
         "student", "--name", help="Pool handle: what policy artifacts and request logs call it."
     ),
     pool: str = typer.Option(
-        str(DEFAULT_POOL_PATH), "--pool", help="Candidate pool TOML to add the entry to."
+        _DEFAULT_POOL_PATH, "--pool", help="Candidate pool TOML to add the entry to."
     ),
     endpoint: str = typer.Option(
         None,
@@ -722,6 +703,10 @@ def student(
     `wmo optimize route pin <world-model> --model student`; to have the router CHOOSE between the
     student and the rest of the roster, run `wmo optimize route fit` on a matrix that covers both.
     """
+    from wmo.core.locks import FileLockTimeout
+    from wmo.distill.store import MODEL_CARD_FILE, DistillModelCard, student_pool_entry
+    from wmo.providers.pool import upsert_pool_entry
+
     card_path = Path(card_dir) / MODEL_CARD_FILE
     if not card_path.is_file():
         raise typer.BadParameter(
@@ -814,6 +799,8 @@ def _credential_note(entry: PoolEntry) -> str:
 
 def _pool_has(path: Path, name: str) -> bool:
     """Whether `path` already carries an entry called `name` (False when there is no pool yet)."""
+    from wmo.providers.pool import load_pool
+
     if not path.is_file():
         return False
     try:
@@ -826,6 +813,8 @@ def _pool_has(path: Path, name: str) -> bool:
 
 def _pool_disabled(path: Path, name: str) -> bool:
     """Whether `path` carries an entry called `name` with `enabled = false` (else False)."""
+    from wmo.providers.pool import load_pool
+
     if not path.is_file():
         return False
     try:
@@ -860,6 +849,8 @@ def _reads_as(model: type[OutcomeMatrix] | type[RoutingPolicy], path: Path) -> b
 
 def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
     """The outcome matrix at `matrix_file`, with the digest provenance a fit stamps."""
+    from wmo.optimize.outcomes import load_matrix_with_digest
+
     path = Path(matrix_file)
     try:
         return load_matrix_with_digest(path)
@@ -871,6 +862,8 @@ def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
     except OSError as exc:
         raise typer.BadParameter(f"cannot read the outcome matrix at {path}: {exc}") from exc
     except ValidationError as exc:
+        from wmo.optimize.policy import RoutingPolicy
+
         if _reads_as(RoutingPolicy, path):
             raise typer.BadParameter(
                 f"{path} holds a fitted policy, not an outcome matrix. The matrix is what "
@@ -882,6 +875,8 @@ def _load_matrix(matrix_file: str) -> tuple[OutcomeMatrix, str]:
 
 def _load_policy(policy_file: str) -> RoutingPolicy:
     """The fitted policy at `policy_file`."""
+    from wmo.optimize.policy import RoutingPolicy
+
     path = Path(policy_file)
     try:
         return RoutingPolicy.load(path)
@@ -898,6 +893,8 @@ def _load_policy(policy_file: str) -> RoutingPolicy:
         # as a ValidationError.
         raise typer.BadParameter(f"cannot read the policy at {path}: {exc}") from exc
     except ValidationError as exc:
+        from wmo.optimize.outcomes import OutcomeMatrix
+
         if _reads_as(OutcomeMatrix, path):
             raise typer.BadParameter(
                 f"{path} holds an outcome matrix, not a fitted policy. The policy is what "
@@ -917,7 +914,7 @@ def fit(
         "`sweep`'s handoff and the docs all assume) | rank (Avengers cluster ranks).",
     ),
     out: str = typer.Option(
-        POLICY_FILENAME, "--out", help="Where to write the fitted policy JSON."
+        _POLICY_FILENAME, "--out", help="Where to write the fitted policy JSON."
     ),
     fallback: str = typer.Option(
         None,
@@ -973,7 +970,7 @@ def fit(
         "auto",
         "--embedder",
         help="auto | hashing | azure. auto uses the Azure text-embedding-3-large deployment when "
-        f"{' and '.join(AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; either way it says "
+        f"{' and '.join(_AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; either way it says "
         "which one it picked. Resolving to azure means this fit CALLS A PAID EMBEDDING API "
         "(billed to that resource); --embedder hashing keeps it offline and free.",
     ),
@@ -982,7 +979,7 @@ def fit(
         "--dim",
         min=1,
         help="Embedding dimension, sent as the request's `dimensions`. Default: the resolved "
-        f"model's native width ({HASHING_EMBEDDER_DIM} hashing, {AZURE_EMBEDDER_DIM} "
+        f"model's native width ({_HASHING_EMBEDDER_DIM} hashing, {_AZURE_EMBEDDER_DIM} "
         "text-embedding-3-large). Set it only to reduce a model's output deliberately.",
     ),
     deployment: str = typer.Option(None, "--deployment", help="(azure) embedding deployment."),
@@ -1013,6 +1010,17 @@ def fit(
     staged pipeline never fits it and no served endpoint carries one, so choose it only to
     measure against the champion.
     """
+    from wmo.optimize.compression import (
+        CompressingEmbedder,
+        compression_signature,
+        resolve_compression,
+        same_compression,
+    )
+    from wmo.optimize.knn import fit_knn_artifact
+    from wmo.optimize.outcomes import ROUTER_SPLIT_VERSION, split_router_scenarios
+    from wmo.optimize.policy import embedder_provenance, probe_embedder, resolve_embedder
+    from wmo.optimize.routing import evaluate_policy, fit_rank_policy, rerank_policy
+
     if kind not in ("rank", "knn"):
         raise typer.BadParameter(f"unknown kind '{kind}'; use knn or rank")
     matrix, source = _load_matrix(matrix_file)
@@ -1170,7 +1178,7 @@ def pin(
         help="Pool entry every request goes to (a `wmo optimize route student` name).",
     ),
     pool: str = typer.Option(
-        str(DEFAULT_POOL_PATH), "--pool", help="Candidate pool TOML to snapshot into the policy."
+        _DEFAULT_POOL_PATH, "--pool", help="Candidate pool TOML to snapshot into the policy."
     ),
     root: str = typer.Option(ARTIFACT_DIR, "--root", help="Project dir holding the built models."),
     out: str = typer.Option(
@@ -1195,6 +1203,9 @@ def pin(
     say so. Replace it with `wmo optimize route fit` on a real outcome matrix to let the router
     choose per request.
     """
+    from wmo.optimize.policy import RoutingPolicy
+    from wmo.providers.pool import load_pool
+
     store = WorldModelStore(root)
     try:
         model_dir = store.resolve(world_model)
@@ -1226,7 +1237,19 @@ def pin(
         raise typer.BadParameter(
             f"no pool model named '{model}' in {pool_path}; available: {available}"
         )
-    out_path = Path(out) if out else model_dir / POLICY_FILENAME
+    out_path = Path(out) if out else model_dir / _POLICY_FILENAME
+    if out and out_path.resolve() != (model_dir / _POLICY_FILENAME).resolve():
+        # The foot-gun that bit both bench-defaults lanes (2026-07-29): an --out
+        # anywhere but <model dir>/policy.json succeeds, prints the same cheerful
+        # line, and leaves the file serving actually reads holding whatever policy
+        # it held before (a different FILENAME in the right dir misses identically).
+        # The pin still lands where asked; the operator is told serving will not
+        # see it.
+        _console.print(
+            f"[yellow]![/yellow] --out is outside {model_dir}; `wmo serve --name "
+            f"{model_dir.name}` and GET /config read {model_dir / _POLICY_FILENAME}, "
+            "which this pin does NOT update"
+        )
     if out_path.is_file() and not yes and not _confirm_overwrite(out_path):
         _console.print(f"left {out_path} in place")
         raise typer.Exit(0)
@@ -1265,7 +1288,7 @@ def _confirm_overwrite(path: Path) -> bool:
 
 @route_app.command("tune")
 def tune(
-    policy_file: str = typer.Argument(POLICY_FILENAME, help="Fitted knn policy JSON to re-tune."),
+    policy_file: str = typer.Argument(_POLICY_FILENAME, help="Fitted knn policy JSON to re-tune."),
     cost_quality: float = typer.Option(
         ...,
         "--cost-quality",
@@ -1292,6 +1315,8 @@ def tune(
     The evidence bank is untouched, so this is instant. A served endpoint can be dialed without
     touching files at all: `PUT /v1/endpoints/{name}/config`.
     """
+    from wmo.optimize.knn import tune_policy_dial
+
     try:
         dialed = tune_policy_dial(Path(policy_file), cost_quality)
     except ValueError as exc:
@@ -1301,6 +1326,8 @@ def tune(
 
 def print_dial(console: Console, dialed: DialResult) -> None:
     """Report an applied dial position against the frontier that was actually measured."""
+    from wmo.optimize.knn import COST_QUALITY_ANCHORS
+
     knobs = dialed.knobs
     console.print(
         f"[green]✓[/green] cost_quality={dialed.cost_quality:g} "
@@ -1333,8 +1360,44 @@ def report(
     ),
     endpoint: str = typer.Option("endpoint", "--endpoint", help="Endpoint id for the report."),
     out: str = typer.Option("report.json", "--out", help="Where to write the report JSON."),
+    provenance: str = typer.Option(
+        _WM_SIMULATED,
+        "--provenance",
+        help=f"How this matrix's rewards were produced: {_WM_SIMULATED} (closed-loop against a "
+        f"world model, the default) or {_REAL_EPISODE} (episodes of the real benchmark). It rides "
+        "on the pareto curve and must never be wrong: consumers refuse to blend the two.",
+    ),
+    judge: str = typer.Option(
+        _DEFAULT_WM_JUDGE,
+        "--judge",
+        help="What scored the episodes, printed beside every rendering of the curve. Pass the "
+        "real scorer for a real-benchmark matrix (for example \\[tau2 reward]).",
+    ),
+    scenario_label: str = typer.Option(
+        "",
+        "--scenario-label",
+        help="The report's customer-facing sentence describing WHAT was measured. Defaults to the "
+        "world-model phrasing ('reconstructed from your traces'), which is false for a real "
+        "benchmark, so pass the truth there (for example 'on the 20 pinned tau2-bench eval "
+        "tasks').",
+    ),
 ) -> None:
     """Build the improvement report for a fitted policy over a matrix."""
+    from wmo.optimize.pareto import (
+        PARETO_FILENAME,
+        REAL_EPISODE,
+        WM_SIMULATED,
+        held_out_curve,
+    )
+    from wmo.optimize.policy import write_artifact_atomically
+    from wmo.optimize.report import build_report
+
+    if provenance not in {WM_SIMULATED, REAL_EPISODE}:
+        # A typo here would silently label real measurements as simulated, which is the one
+        # mistake the curve's provenance field exists to prevent.
+        raise typer.BadParameter(
+            f"--provenance must be {WM_SIMULATED} or {REAL_EPISODE}, not {provenance!r}"
+        )
     matrix, matrix_source = _load_matrix(matrix_file)
     policy = _load_policy(policy_file)
     try:
@@ -1344,6 +1407,7 @@ def report(
             baseline=baseline,
             endpoint=endpoint,
             generated_at=datetime.now(tz=UTC).isoformat(),
+            scenario_label=scenario_label or None,
         )
     except KeyError as exc:
         # `--baseline` is a pool entry handle; the KeyError already lists the ones this matrix
@@ -1364,10 +1428,19 @@ def report(
     # The measured cost/quality curve rides beside every report (D-PARETO): GET /config
     # serves it from the model dir so the platform's graph renders this workload's frontier.
     try:
-        curve = held_out_curve(matrix, policy, judge="world-model verifier")
+        curve = held_out_curve(matrix, policy, judge=judge, provenance=provenance)
         pareto_out = Path(out).parent / PARETO_FILENAME
         write_artifact_atomically(pareto_out, curve.model_dump_json(indent=2).encode("utf-8"))
         _console.print(f"[green]✓[/green] pareto curve -> {pareto_out}")
+        # Same foot-gun as `pin --out`: serving loads policy.json and pareto.json from ONE
+        # model dir, so a curve written apart from the policy it describes is a curve
+        # `wmo serve` and GET /config never show. Succeeding silently here is what hid it.
+        if Path(policy_file).resolve().parent != pareto_out.resolve().parent:
+            _console.print(
+                f"[yellow]![/yellow] the curve landed apart from {policy_file}; serving reads "
+                "pareto.json from the same directory as the policy it mounts, so point --out "
+                "there for the endpoint to show this curve"
+            )
     except (ValueError, FileNotFoundError) as exc:
         _console.print(f"[yellow]![/yellow] pareto curve skipped: {exc}")
     headline = improvement.headline
@@ -1421,4 +1494,97 @@ def _in_sample_warning(policy: RoutingPolicy, matrix_source: str) -> str | None:
         f"({_MATRIX_DIGEST_MARK}{digest}) and records no fit split, so these numbers are "
         "IN-SAMPLE, not held out: every request retrieves its own row. Sweep a second matrix "
         "over scenarios the fit never saw and report against that one."
+    )
+
+
+@route_app.command("push")
+def push(
+    policy_file: str = typer.Argument(_POLICY_FILENAME, help="Fitted policy JSON to install."),
+    endpoint: str = typer.Option(
+        ...,
+        "--endpoint",
+        help="Hosted endpoint slug to install onto (the `model` a customer's client sends).",
+    ),
+    org: str | None = typer.Option(
+        None,
+        "--org",
+        help="Organization id (default: the login's, or $WMO_PLATFORM_ORG).",
+    ),
+    report_file: str | None = typer.Option(
+        None,
+        "--report",
+        help="Improvement report JSON to publish with the policy (see `route report`).",
+    ),
+) -> None:
+    """Install a fitted policy on a hosted endpoint, so serving actually uses it.
+
+    The last link in the chain. `fit` writes a policy that only this machine can see;
+    an endpoint created on the platform serves a `static` policy until something
+    replaces it. This is that something:
+
+        wmo optimize route push models/support/policy.json --endpoint support-prod
+
+    A knn policy is TWO artifacts, and this sends both: the JSON plus the `.npz`
+    evidence bank beside it, resolved from the policy's own `knn_bank_path` rather
+    than guessed, so a renamed sidecar is a local error instead of a server refusal.
+    Sending the policy alone would store a row that validates and cannot serve.
+
+    The endpoint keeps its id, name, and URL, so a customer's client is unaffected by
+    the swap, and live pods pick the new policy up on their own.
+    """
+    from wmo.optimize.policy import RoutingPolicy
+
+    policy_path = Path(policy_file)
+    if not policy_path.is_file():
+        raise typer.BadParameter(
+            f"no policy at {policy_path} (`wmo optimize route fit` writes one)"
+        )
+    try:
+        policy = RoutingPolicy.load(policy_path)
+    except (OSError, ValidationError, ValueError) as exc:
+        raise typer.BadParameter(f"{policy_path} is not a routing policy: {exc}") from exc
+
+    bank_path: Path | None = None
+    if policy.kind == "knn":
+        bank_path = policy.bank_path()
+        if not bank_path.is_file():
+            # Checked here, not left to the server: the policy names its own sidecar,
+            # so a missing one means the local artifact pair is broken and pushing
+            # would only turn that into a 400 after uploading nothing useful.
+            raise typer.BadParameter(
+                f"{policy_path} is a knn policy whose evidence bank is missing at "
+                f"{bank_path}; a knn policy is served together with its sidecar, so "
+                "copy it beside the policy or refit with `wmo optimize route fit --kind knn`"
+            )
+    report_path = Path(report_file) if report_file is not None else None
+    if report_path is not None:
+        if not report_path.is_file():
+            raise typer.BadParameter(
+                f"no report at {report_path} (`wmo optimize route report` writes one)"
+            )
+        try:
+            json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            # Same rule as the sidecar check: a broken local artifact fails here,
+            # not as a server refusal after the upload already happened.
+            raise typer.BadParameter(f"{report_path} is not readable JSON: {exc}") from exc
+
+    # Imported here, not at module scope: `platform_cmds` builds its own command
+    # surface at import time, and pulling that in for one command changed behavior
+    # in unrelated `route` commands (15 of this module's tests went red).
+    from wmo.cli.platform_cmds import _connected, _require_connection
+
+    # Sized before the install: a stat after a SUCCESSFUL install would make the
+    # whole command read as failed if anything removed the local file meanwhile.
+    size = f", bank {bank_path.stat().st_size / 1024:.0f}KiB" if bank_path is not None else ""
+
+    credentials, org_id = _require_connection(org)
+    with _connected(credentials, "Could not install the policy") as client:
+        client.install_endpoint_policy(org_id, endpoint, policy_path, bank_path, report_path)
+
+    _console.print(
+        f"[green]✓[/green] installed {policy.kind} policy on [bold]{endpoint}[/bold]{size}\n"
+        f"  from: {policy_path}\n"
+        f"  serving picks it up without a restart; `wmo runs` and the endpoint's "
+        f"telemetry show what it routes."
     )

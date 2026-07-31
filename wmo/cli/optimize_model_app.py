@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -34,92 +35,27 @@ from rich.markup import escape
 from rich.table import Table
 
 from wmo.cli.consent import require_spend_consent
-from wmo.cli.route_app import (
-    BIAS_ACCEPTED_NOTE,
-    NO_EVIDENCE_WARNING,
-    _compressor_note,
-    cell_progress,
-    print_coverage,
-    print_deferred_risks,
-    print_tiny_corpus_note,
-    print_world_model_spend,
-    uneven_warning,
-)
 from wmo.config import ARTIFACT_DIR, WorldModelStore
-from wmo.engine import load_world_model
-from wmo.env import WorldModelEnv
-from wmo.env.closed_loop import scenario_id
-from wmo.optimize.compression import (
-    CompressionConfig,
-    compression_signature,
-    resolve_compression,
-)
-from wmo.optimize.knn import (
-    COST_QUALITY_BALANCED,
-    DEFAULT_KNN_MIN_PAIRS,
-    DEFAULT_RAG_NUM,
-    DEFAULT_RAG_THRES,
-    cost_quality_named_point,
-    fit_knn_artifact,
-    fit_provenance,
-    tune_policy_dial,
-)
-from wmo.optimize.outcomes import (
-    ROUTER_SPLIT_VERSION,
-    OutcomeMatrix,
-    load_matrix_with_digest,
-    split_router_scenarios,
-)
-from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
-from wmo.optimize.pipeline import (
-    BUILT_STAGES,
-    CONFIGURED_STAGES,
-    MANIFEST_DIRNAME,
-    MANIFEST_FILENAME,
-    MATRIX_FILENAME,
-    REPORT_FILENAME,
-    RESERVED_STAGES,
-    BudgetExceeded,
-    RunManifest,
-    SpendLedger,
-    Stage,
-    StageDecision,
-    StageRecord,
-    StageStatus,
-    SweepSpendProjection,
-    decide_stage,
-    file_sha256,
-    forced_stages,
-    load_manifest,
-    planned_stages,
-    project_sweep_spend,
-)
-from wmo.optimize.policy import (
-    AZURE_EMBEDDER_DEPLOYMENT,
-    AZURE_EMBEDDER_ENV,
-    DEFAULT_KNN_Z,
-    POLICY_FILENAME,
-    EmbedderSpec,
-    RoutingPolicy,
-    embedder_provenance,
-    probe_embedder,
-    resolve_embedder,
-)
-from wmo.optimize.report import ImprovementReport, build_report
-from wmo.optimize.sweep import (
-    SweepError,
-    SweepPlan,
-    coverage,
-    execute_sweep,
-    plan_sweep,
-    resolve_config,
-    resumable_cells,
-)
-from wmo.optimize.sweep import preflight_pool as run_preflight
-from wmo.optimize.teacher import TeacherSearchVerdict, select_teacher
-from wmo.providers.pool import DEFAULT_POOL_PATH, load_pool
-from wmo.runs.hooks import PipelineEmitter
-from wmo.runs.schema import RunStatus
+
+if TYPE_CHECKING:
+    # Type-only: real imports are local to the functions that construct or inspect these values,
+    # so importing this module never pulls the optimize/env/engine/runs bodies behind it.
+    from wmo.optimize.compression import CompressionConfig
+    from wmo.optimize.outcomes import OutcomeMatrix
+    from wmo.optimize.pipeline import (
+        BudgetExceeded,
+        RunManifest,
+        SpendLedger,
+        Stage,
+        StageDecision,
+        StageRecord,
+        SweepSpendProjection,
+    )
+    from wmo.optimize.policy import EmbedderSpec, RoutingPolicy
+    from wmo.optimize.report import ImprovementReport
+    from wmo.optimize.sweep import SweepPlan
+    from wmo.optimize.teacher import TeacherSearchVerdict
+    from wmo.runs.hooks import PipelineEmitter
 
 _console = Console()
 
@@ -132,9 +68,22 @@ DEFAULT_MAX_STEPS = 20
 ASSUMED_INPUT_TOKENS = 2000
 ASSUMED_OUTPUT_TOKENS = 250
 
+# Literal mirrors of constants that otherwise live behind a heavy import (`wmo.optimize.knn`,
+# `wmo.optimize.outcomes`, `wmo.optimize.policy`, `wmo.providers.pool`). Typer evaluates Option
+# defaults at command-definition time and `_KNN_KNOBS` is built at module import time, so these
+# have to be values, not names imported from those modules; the real constants are re-imported
+# inside the function bodies that need their behavior.
+_DEFAULT_POOL_PATH = ".wmo/pool.toml"
+_COST_QUALITY_BALANCED = 0.25
+_DEFAULT_KNN_Z = 0.5
+_DEFAULT_RAG_NUM = 50
+_DEFAULT_RAG_THRES = 0.95
+_DEFAULT_KNN_MIN_PAIRS = 8
+_ROUTER_SPLIT_VERSION = "scenario-hash-70-30-v1"
+
 _KNN_KNOBS = (
-    f"z={DEFAULT_KNN_Z:g} k={DEFAULT_RAG_NUM} thres={DEFAULT_RAG_THRES:g} "
-    f"pairs={DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05 split={ROUTER_SPLIT_VERSION}"
+    f"z={_DEFAULT_KNN_Z:g} k={_DEFAULT_RAG_NUM} thres={_DEFAULT_RAG_THRES:g} "
+    f"pairs={_DEFAULT_KNN_MIN_PAIRS} se_floor=True q=0.05 split={_ROUTER_SPLIT_VERSION}"
 )
 """The knn fit this command performs. Fixed: the validated champion, dialed after the fact."""
 
@@ -144,7 +93,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         None, help="Built world model to optimize (default: the only one under --root)."
     ),
     pool_file: str = typer.Option(
-        str(DEFAULT_POOL_PATH),
+        _DEFAULT_POOL_PATH,
         "--pool",
         # The doubled brackets are escaped: typer renders help through rich markup, which
         # otherwise swallows them and prints an empty pair.
@@ -184,7 +133,7 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
         "calls all come out of ONE account's bucket.",
     ),
     cost_quality: float = typer.Option(
-        COST_QUALITY_BALANCED,
+        _COST_QUALITY_BALANCED,
         "--cost-quality",
         min=0.0,
         max=1.0,
@@ -311,6 +260,28 @@ def optimize_model(  # noqa: PLR0913 - each flag is one decision a user owns (se
     model's own directory where `wmo serve` reads it, and the outcome matrix, report, and run
     manifest under `<model>/optimize/`. Deleting that directory resets resume and breaks nothing.
     """
+    from wmo.cli.route_app import print_deferred_risks, print_tiny_corpus_note
+    from wmo.env.closed_loop import scenario_id
+    from wmo.optimize.compression import resolve_compression
+    from wmo.optimize.outcomes import split_router_scenarios
+    from wmo.optimize.pipeline import (
+        MANIFEST_DIRNAME,
+        MANIFEST_FILENAME,
+        MATRIX_FILENAME,
+        REPORT_FILENAME,
+        BudgetExceeded,
+        SpendLedger,
+        Stage,
+        load_manifest,
+        planned_stages,
+        project_sweep_spend,
+    )
+    from wmo.optimize.policy import POLICY_FILENAME, probe_embedder
+    from wmo.optimize.sweep import SweepError, plan_sweep, resolve_config, resumable_cells
+    from wmo.optimize.sweep import preflight_pool as run_preflight
+    from wmo.runs.hooks import PipelineEmitter
+    from wmo.runs.schema import RunStatus
+
     if distill is not None:
         raise typer.BadParameter(_distill_reserved_message(world_model=world_model, root=root))
     if compressor is None and aggressiveness > 0.0:
@@ -552,6 +523,8 @@ def _is_disabled_in(pool_file: Path, name: str) -> bool:
     Best-effort for an error message: the pool already loaded once through preflight, so a
     second read here cannot fail in a new way, and any surprise reads as plain "not a model".
     """
+    from wmo.providers.pool import load_pool
+
     try:
         return any(
             entry.name == name and not entry.enabled for entry in load_pool(pool_file).models
@@ -594,6 +567,10 @@ def _teacher_verdict(
     *, world_model: str | None, root: str
 ) -> tuple[Path, TeacherSearchVerdict] | None:
     """This model's teacher search over the matrix already on disk, or None when unavailable."""
+    from wmo.optimize.outcomes import OutcomeMatrix
+    from wmo.optimize.pipeline import MANIFEST_DIRNAME, MATRIX_FILENAME
+    from wmo.optimize.teacher import select_teacher
+
     try:
         model_dir = WorldModelStore(root).resolve(world_model)
     except (FileNotFoundError, ValueError):
@@ -621,6 +598,12 @@ def _resolve_embedder_choice(choice: str) -> tuple[EmbedderSpec, str]:
     Raises:
         ValueError: An unknown choice, or `azure` with nothing in the environment to point it at.
     """
+    from wmo.optimize.policy import (
+        AZURE_EMBEDDER_DEPLOYMENT,
+        AZURE_EMBEDDER_ENV,
+        resolve_embedder,
+    )
+
     endpoint = os.environ.get(AZURE_EMBEDDER_ENV[1])
     if choice == "azure" and not endpoint:
         raise ValueError(
@@ -641,6 +624,14 @@ def _resolve_embedder_choice(choice: str) -> tuple[EmbedderSpec, str]:
 
 def _parse_force_from(force_from: str | None, *, compacting: bool) -> frozenset[Stage]:
     """`--force-from` as the set of stages it invalidates, or a usage error naming the choices."""
+    from wmo.optimize.pipeline import (
+        BUILT_STAGES,
+        CONFIGURED_STAGES,
+        RESERVED_STAGES,
+        Stage,
+        forced_stages,
+    )
+
     if force_from is None:
         return frozenset()
     redoable = [stage for stage in BUILT_STAGES if stage is not Stage.PREFLIGHT]
@@ -707,6 +698,14 @@ def _plan_stages(
     dirties what follows: the fit embeds its bank through the compressor, so a changed arm is a
     changed fit.
     """
+    from wmo.optimize.pipeline import (
+        CONFIGURED_STAGES,
+        Stage,
+        StageDecision,
+        StageStatus,
+        decide_stage,
+    )
+
     decisions: list[StageDecision] = []
     running: Stage | None = None
     for stage in stages:
@@ -772,6 +771,8 @@ def _compact_fingerprint(compression: CompressionConfig | None) -> dict[str, str
     only decides whether the compact ROW reads as run or skipped, and sharing the rendering is what
     keeps the two from ever describing different arms.
     """
+    from wmo.optimize.compression import compression_signature
+
     return {"compression": compression_signature(compression)}
 
 
@@ -791,6 +792,10 @@ def _fit_fingerprint(
     value meaning "no compression", which is exactly what the key's absence already says. Both
     directions still rerun the fit, since an added key and a removed one are each a difference.
     """
+    from wmo.optimize.compression import compression_signature
+    from wmo.optimize.pipeline import file_sha256
+    from wmo.optimize.policy import embedder_provenance
+
     fingerprint = {
         "matrix": file_sha256(matrix),
         "kind": "knn",
@@ -824,6 +829,9 @@ def _live_inputs(
     allow_uneven: bool,
 ) -> _StageInputs:
     """What `stage` would consume and produce right now, read off the filesystem."""
+    from wmo.optimize.compression import compression_signature
+    from wmo.optimize.pipeline import Stage, file_sha256
+
     match stage:
         case Stage.SWEEP:
             return _StageInputs(
@@ -892,6 +900,8 @@ def _report_anchor(policy_path: Path, *, baseline: str | None, fallback: str | N
     anchor that did not match the recorded one would make the report look changed on every
     resume, and re-run forever.
     """
+    from wmo.optimize.policy import RoutingPolicy
+
     if baseline is not None:
         return baseline
     if policy_path.is_file():
@@ -905,6 +915,8 @@ def _report_anchor(policy_path: Path, *, baseline: str | None, fallback: str | N
 
 def _scenario_identity(plan: SweepPlan) -> str:
     """The scenario SET the sweep will measure, as an id list a change is visible in."""
+    from wmo.env.closed_loop import scenario_id
+
     return ",".join(scenario_id(scenario) for scenario in plan.scenarios)
 
 
@@ -915,6 +927,9 @@ def _policy_fit_identity(policy_path: Path) -> str:
     would rerun on every resume. `fit_provenance` strips the dial suffix, so this changes when
     someone refits (by hand or otherwise) and not when the dial moves.
     """
+    from wmo.optimize.knn import fit_provenance
+    from wmo.optimize.policy import RoutingPolicy
+
     if not policy_path.is_file():
         return "missing"
     try:
@@ -938,6 +953,12 @@ def _stage_plan_text(
     already_measured: int = 0,
 ) -> str:
     """One line saying what this stage will actually do, in the operator's terms."""
+    from wmo.env.closed_loop import scenario_id
+    from wmo.optimize.compression import compression_signature
+    from wmo.optimize.knn import cost_quality_named_point
+    from wmo.optimize.outcomes import split_router_scenarios
+    from wmo.optimize.pipeline import Stage
+
     router_split = split_router_scenarios([scenario_id(scenario) for scenario in plan.scenarios])
     match stage:
         case Stage.PREFLIGHT:
@@ -981,6 +1002,8 @@ def _report_estimate(policy_path: Path, fitting_with: EmbedderSpec) -> str:
     and the policy on disk came from a manual `route fit --embedder azure`: quoting this run's
     hashing spec would then print "free" for a stage about to embed every scenario for money.
     """
+    from wmo.optimize.policy import RoutingPolicy
+
     spec = fitting_with
     if policy_path.is_file():
         try:
@@ -1014,6 +1037,8 @@ def _print_plan(
     Every estimate names itself a projection. The preflight row reads `ok` rather than `will run`
     because it already has: it is what priced the sweep row above it.
     """
+    from wmo.optimize.pipeline import Stage
+
     console.print(
         f"\n[bold]optimize model: {escape(name)}[/bold]    "
         f"pool: {pool_size} candidate(s) ({escape(str(pool_file))})\n"
@@ -1086,6 +1111,8 @@ def _print_budget_stop(name: str, exc: BudgetExceeded) -> None:
 
 def _will_sweep(decisions: list[StageDecision]) -> bool:
     """Whether this run will buy cells, which is the only thing that costs candidate money."""
+    from wmo.optimize.pipeline import Stage
+
     return any(decision.stage is Stage.SWEEP and decision.will_run for decision in decisions)
 
 
@@ -1127,6 +1154,8 @@ def _estimate_text(
     stage: Stage, *, plan: SweepPlan, embedder: EmbedderSpec, paths: _RunPaths
 ) -> str:
     """One stage's `est. cost` cell: a projection, `free`, or why neither can be honest."""
+    from wmo.optimize.pipeline import Stage
+
     match stage:
         case Stage.SWEEP:
             return f"~${plan.total_usd:.2f}"
@@ -1144,6 +1173,8 @@ def _estimate_text(
 
 def _projected_total(decisions: list[StageDecision], plan: SweepPlan) -> float:
     """What the running stages are projected to spend. Only the sweep has a priced projection."""
+    from wmo.optimize.pipeline import Stage
+
     return sum(
         plan.total_usd
         for decision in decisions
@@ -1153,6 +1184,8 @@ def _projected_total(decisions: list[StageDecision], plan: SweepPlan) -> float:
 
 def _status_text(decision: StageDecision) -> str:
     """One stage's `status` cell, carrying the reason on both the skip and the run path."""
+    from wmo.optimize.pipeline import StageStatus
+
     if decision.status is StageStatus.SKIP:
         return f"[dim]SKIP ({escape(decision.reason)})[/dim]"
     return f"will run [dim]({escape(decision.reason)})[/dim]"
@@ -1222,6 +1255,8 @@ def _run_stages(
     is saved, so what the panel shows is a fact already on disk rather than a claim about a stage
     whose record could still be lost.
     """
+    from wmo.optimize.pipeline import Stage
+
     # The loop saves after every stage, which is what makes a rejected sweep survive: the
     # coverage gate lives in the FIT iteration, so the SWEEP iteration's save has already run by
     # the time the gate can stop the run.
@@ -1263,7 +1298,12 @@ def _run_stages(
                 record = _stage_report(paths, model_dir=model_dir, baseline=baseline)
         manifest = manifest.with_record(record)
         manifest.save(paths.manifest)
-        emitter.stage_completed(record, lifetime_spend_usd=manifest.lifetime_spend_usd)
+        lifetime_candidate_usd, lifetime_wm_usd = manifest.lifetime_split
+        emitter.stage_completed(
+            record,
+            lifetime_candidate_usd=lifetime_candidate_usd,
+            lifetime_wm_usd=lifetime_wm_usd,
+        )
     return manifest
 
 
@@ -1287,6 +1327,13 @@ def _stage_sweep(
     were paid for, their `error` fields are the diagnosis, and re-running after fixing the cause
     must not buy them a second time.
     """
+    from wmo.cli.route_app import _compressor_note, cell_progress, print_world_model_spend
+    from wmo.engine import load_world_model
+    from wmo.env import WorldModelEnv
+    from wmo.optimize.compression import compression_signature
+    from wmo.optimize.pipeline import Stage, StageRecord, file_sha256
+    from wmo.optimize.sweep import execute_sweep
+
     world_model, _serve_provider = load_world_model(model_dir)
     run = execute_sweep(
         plan,
@@ -1337,6 +1384,9 @@ def _stage_compact(compression: CompressionConfig | None) -> StageRecord:
     metered inside the sweep and reported as the compressor's share of that stage's candidate
     spend (`StageRecord.compressor_spend_usd`).
     """
+    from wmo.optimize.compression import compression_signature
+    from wmo.optimize.pipeline import Stage, StageRecord
+
     signature = compression_signature(compression)
     _console.print(
         f"  [green]✓[/green] configured {escape(signature)}\n"
@@ -1368,6 +1418,15 @@ def _enforce_coverage(matrix_path: Path, *, allow_uneven: bool) -> None:
     Raises:
         typer.Exit: The matrix is not fit-ready (exit code 1).
     """
+    from wmo.cli.route_app import (
+        BIAS_ACCEPTED_NOTE,
+        NO_EVIDENCE_WARNING,
+        print_coverage,
+        uneven_warning,
+    )
+    from wmo.optimize.outcomes import OutcomeMatrix
+    from wmo.optimize.sweep import coverage
+
     matrix = OutcomeMatrix.load(matrix_path)
     rows = coverage(matrix)
     print_coverage(_console, rows)
@@ -1405,6 +1464,10 @@ def _stage_fit(
     configured the sweep and the sweep re-measures whenever it moves (the arm is in its
     fingerprint).
     """
+    from wmo.optimize.knn import fit_knn_artifact, fit_provenance
+    from wmo.optimize.outcomes import load_matrix_with_digest, split_router_scenarios
+    from wmo.optimize.pipeline import Stage, StageRecord
+
     matrix, source = load_matrix_with_digest(paths.matrix)
     try:
         router_split = split_router_scenarios(matrix.scenario_ids())
@@ -1464,6 +1527,9 @@ def _rebaseline_dial_snapshot(policy_path: Path, fitted: RoutingPolicy) -> None:
     Only ever removes a snapshot of a SUPERSEDED fit. A snapshot that still matches (a redo that
     reproduced the same fit) is left exactly where it is, so the dial keeps re-applying from it.
     """
+    from wmo.optimize.knn import fit_provenance
+    from wmo.optimize.policy import RoutingPolicy
+
     base_path = policy_path.with_name(f"{policy_path.stem}.base{policy_path.suffix}")
     if not base_path.is_file():
         return
@@ -1483,6 +1549,9 @@ def _rebaseline_dial_snapshot(policy_path: Path, fitted: RoutingPolicy) -> None:
 
 def _stage_tune(paths: _RunPaths, *, cost_quality: float) -> StageRecord:
     """Set the endpoint's dial, preserving `route tune`'s as-fitted snapshot semantics."""
+    from wmo.optimize.knn import tune_policy_dial
+    from wmo.optimize.pipeline import Stage, StageRecord, file_sha256
+
     fit_identity = _policy_fit_identity(paths.policy)
     try:
         dialed = tune_policy_dial(paths.policy, cost_quality)
@@ -1508,6 +1577,11 @@ def _stage_tune(paths: _RunPaths, *, cost_quality: float) -> StageRecord:
 
 def _stage_report(paths: _RunPaths, *, model_dir: Path, baseline: str | None) -> StageRecord:
     """Score the tuned policy against its anchor on the same held-out scenarios."""
+    from wmo.optimize.outcomes import OutcomeMatrix
+    from wmo.optimize.pareto import PARETO_FILENAME, held_out_curve
+    from wmo.optimize.pipeline import Stage, StageRecord, file_sha256
+    from wmo.optimize.policy import RoutingPolicy
+
     matrix = OutcomeMatrix.load(paths.matrix)
     policy = RoutingPolicy.load(paths.policy)
     anchor = baseline or policy.default_model
@@ -1571,6 +1645,8 @@ def build_endpoint_scorecard(
     yet build. When that happens only the body of this function changes: the stage, the manifest
     fingerprints, and the ending that renders the result all stay as they are.
     """
+    from wmo.optimize.report import build_report
+
     return build_report(matrix, policy, baseline=baseline, endpoint=endpoint, generated_at=_now())
 
 
@@ -1583,6 +1659,10 @@ def _print_payoff(console: Console, name: str, *, paths: _RunPaths, cost_quality
     Three objectives, each against the same named anchor over the same scenarios, each carrying
     where its number came from. A number that cannot honestly be computed prints its reason.
     """
+    from wmo.optimize.knn import cost_quality_named_point
+    from wmo.optimize.policy import RoutingPolicy
+    from wmo.optimize.report import ImprovementReport
+
     report = ImprovementReport.model_validate_json(paths.report.read_text(encoding="utf-8"))
     policy = RoutingPolicy.load(paths.policy)
     head = report.headline

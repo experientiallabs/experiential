@@ -468,19 +468,23 @@ def grid_arm_events(
     created = _as_str(cohort["created"], field="cohort.created")
     model_name = Path(_as_str(cohort["model_dir"], field="cohort.model_dir")).name
 
-    walker.emit(
-        RUN_LEVEL_BAND,
-        RunEventType.RUN_META,
-        created,
-        {
-            "kind": RunKind.GRID_ARM.value,
-            "benchmark": model_name,
-            "arm": arm,
-            "world_model": model_name,
-            "config": cohort,
-            "started_at": created,
-        },
-    )
+    meta: JsonObject = {
+        "kind": RunKind.GRID_ARM.value,
+        "benchmark": model_name,
+        "arm": arm,
+        "world_model": model_name,
+        "config": cohort,
+        "started_at": created,
+    }
+    # A grid that was bought AS an endpoint's evidence can say so, and then the endpoint's own
+    # page carries its run history instead of the run sitting unattached in the admin panel. The
+    # platform already resolves this name to an id (`_resolve_attachment`); only the emitter never
+    # sent one. Optional and name-based, like `world_model`: a cohort that names no endpoint, or
+    # names one the org does not have, attaches to nothing and still lands.
+    endpoint = cohort.get("endpoint")
+    if isinstance(endpoint, str) and endpoint:
+        meta["endpoint"] = endpoint
+    walker.emit(RUN_LEVEL_BAND, RunEventType.RUN_META, created, meta)
 
     arm_dir = artifacts / arm
     for line in arm_lines:

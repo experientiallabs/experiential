@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
-from wmo.providers.base import Completion, Message, ProviderConfig, ProviderKind, TokenUsage
+from collections.abc import Generator, Iterator
+
+from wmo.providers.base import (
+    Completion,
+    Message,
+    ProviderConfig,
+    ProviderKind,
+    StreamChunk,
+    TokenUsage,
+)
 from wmo.tracking.metered import MeteredProvider, classify_build_call
 from wmo.tracking.tracker import Phase, RunTracker
 
@@ -128,3 +137,120 @@ def test_cost_attributed_to_serving_model_not_primary() -> None:
     (event,) = tracker._events
     assert event.model == "claude-haiku-4-5"
     assert event.cost_usd == (100 * 1.0 + 20 * 5.0) / 1_000_000
+
+
+class FakeStreamingProvider(FakeProvider):
+    """Streams three deltas, then a terminal chunk carrying exact usage."""
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Iterator[StreamChunk]:
+        yield StreamChunk(delta="aaaa")
+        yield StreamChunk(delta="bbbb")
+        yield StreamChunk(delta="cccc")
+        yield StreamChunk(done=True, usage=TokenUsage(input_tokens=100, output_tokens=3))
+
+
+def test_stream_records_the_terminal_usage_once() -> None:
+    """A stream consumed to the end records exactly the provider's own counts."""
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(FakeStreamingProvider(), tracker, base_phase=Phase.SERVE)
+
+    chunks = list(provider.stream("sys", [Message(role="user", content="hi")]))
+
+    assert chunks[-1].done
+    assert len(tracker.events) == 1
+    assert tracker.events[0].usage.input_tokens == 100
+    assert tracker.events[0].usage.output_tokens == 3
+
+
+def test_abandoned_stream_records_a_chars_over_four_estimate() -> None:
+    """Closing the stream before its terminal chunk records the documented estimate.
+
+    The provider reports exact counts only in the chunk the consumer never took; the old
+    behavior recorded nothing, billing the whole partial generation as free.
+    """
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(FakeStreamingProvider(), tracker, base_phase=Phase.SERVE)
+
+    stream = provider.stream("sysprompt", [Message(role="user", content="x" * 39)])
+    assert next(stream).delta == "aaaa"
+    assert next(stream).delta == "bbbb"
+    # The metered wrapper is a generator; closing it is how an abandoning
+    # consumer (or GC) ends it, which is the path under test.
+    assert isinstance(stream, Generator)
+    stream.close()
+
+    assert len(tracker.events) == 1
+    event = tracker.events[0]
+    # input: (9 system chars + 39 message chars) // 4; output: 8 streamed chars // 4.
+    assert event.usage.input_tokens == 12
+    assert event.usage.output_tokens == 2
+
+
+class FailingStreamProvider(FakeProvider):
+    """Streams one delta then raises, like a throttled upstream."""
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Iterator[StreamChunk]:
+        yield StreamChunk(delta="partial")
+        msg = "ThrottlingException"
+        raise RuntimeError(msg)
+
+
+def test_upstream_stream_failure_records_nothing() -> None:
+    """An upstream failure must not book a full-prompt phantom estimate.
+
+    The tracker's total feeds spend caps; a throttled retry loop estimating
+    the whole prompt each attempt would trip a cap on money never spent.
+    Only consumer abandonment (GeneratorExit) estimates.
+    """
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(FailingStreamProvider(), tracker, base_phase=Phase.SERVE)
+
+    stream = provider.stream("s" * 400_000, [Message(role="user", content="hi")])
+    assert next(stream).delta == "partial"
+    try:
+        next(stream)
+        raise AssertionError("expected the upstream failure to propagate")
+    except RuntimeError:
+        pass
+
+    assert tracker.events == []
+
+
+class UsagelessStreamProvider(FakeProvider):
+    """Finishes normally but its terminal chunk carries no usage."""
+
+    def stream(
+        self,
+        system: str,
+        messages: list[Message],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+    ) -> Iterator[StreamChunk]:
+        yield StreamChunk(delta="hello")
+        yield StreamChunk(done=True)
+
+
+def test_fully_consumed_stream_without_usage_records_nothing() -> None:
+    """Normal exhaustion without a usage chunk stays unrecorded, not estimated."""
+    tracker = RunTracker(run_id="r", kind="test")
+    provider = MeteredProvider(UsagelessStreamProvider(), tracker, base_phase=Phase.SERVE)
+
+    chunks = list(provider.stream("sys", [Message(role="user", content="hi")]))
+
+    assert chunks[-1].done
+    assert tracker.events == []
