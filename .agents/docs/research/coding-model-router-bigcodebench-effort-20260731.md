@@ -263,6 +263,27 @@ uv run python .agents/scripts/coding_model_router_bigcodebench_promote.py \
   --output /remote/artifacts/bigcodebench/external-promotion.json
 ```
 
+Only a positive external promotion may refit the locked deployment consensus on all source rows:
+
+```bash
+uv run python .agents/scripts/coding_model_router_bigcodebench_deploy.py \
+  --root /remote/artifacts/bigcodebench \
+  --lock /remote/artifacts/bigcodebench/selection-lock.json \
+  --promotion /remote/artifacts/bigcodebench/external-promotion.json \
+  --reports-dir /remote/artifacts/bigcodebench/fit \
+  --audits-dir /remote/artifacts/bigcodebench/audits \
+  --artifact-dir /remote/artifacts/bigcodebench/deployment \
+  --output /remote/artifacts/bigcodebench/deployment-report.json
+```
+
+The builder verifies the promotion and lock digests, binds every seed inventory to its winner
+audit, reconstructs the exact consensus config, and chooses the deployment guard by majority of
+the five fit-selected baselines. A count tie uses mean fit-only static quality, then cost and
+frozen effort order. It refits only on the 300 external source tasks, reloads the persisted
+artifact, proves exact numeric routes when applicable, and reruns the 10,000-decision latency
+gate. The report records that source outer heldout was evaluated but target outcomes remain
+unused.
+
 Primary references:
 
 - RouteLLM: `https://arxiv.org/abs/2406.18665`
