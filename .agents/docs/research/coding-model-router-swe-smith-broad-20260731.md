@@ -2,7 +2,35 @@
 
 Date: 2026-07-31
 
-Status: oracle and five fit-only searches complete, outer heldout and DeepSWE outcomes unopened
+Status: complete negative external result, DeepSWE outcomes unopened
+
+## Result
+
+The fit-only consensus was `hash512-ridge-heads-a1`, a 512-dimensional signed hashing transform
+with two Ridge reward heads. It was feasible on all five fit partitions, with mean fit retention
+0.9519 and mean strong traffic 0.7684. All five consensus artifacts passed independent-refit route
+parity, zero-network, and 10,000-decision latency audits. Artifact size was 8.8 KB. Observed p50
+latency was 1.19 to 2.33 ms and p95 was 3.74 to 5.79 ms.
+
+The single frozen outer-heldout replay did not promote. Per-seed retention was 0.9388, 0.9614,
+0.9363, 0.9845, and 0.9351. Strong traffic was 0.4792, 0.5000, 0.7333, 0.6667, and 0.6038, so the
+traffic gate passed but the retention gate failed in seeds 0, 2, and 4. Pooled retention was
+0.9537 with a repository-bootstrap 95 percent interval of `[0.9161, 0.9921]`, whose lower bound
+failed the 0.95 gate.
+
+The router beat matched task-blind mixing by 0.0281 reward with a 95 percent interval of
+`[0.0067, 0.0560]`. It beat uniform random and weak static too, but did not beat the selected
+shuffled-label controls: the router-minus-shuffled interval was `[-0.0082, 0.0205]`. Three
+repository catastrophes also failed the frozen safety gate: `conan-io/conan` lost 0.1250,
+`facebookresearch/hydra` lost 0.1331, and `pydicom/pydicom` lost 0.1567 against strong static.
+
+The selection lock SHA-256 is
+`e838c39eed0298fa484e80c30ea4bc17fc7cdbb63730278875b6b5e9a96776a8`. The immutable heldout
+rows SHA-256 is `2f087b25e2da9fa44928ece6fb04ed63603af8748d0434332a184b6a8d37c6da`, and the promotion
+report SHA-256 is `78c5a02b1d63f329e8d665f35d31f05339bedf71d6fcb3b23eae505c28277915`.
+The promotion report proves `target_outcomes_used: false`. Per the frozen protocol, this negative
+result forbids a DeepSWE replay and cannot be repaired by tuning against the opened source
+heldout rows.
 
 ## Question
 
