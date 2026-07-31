@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import io
 import importlib.util
+import json
 import sys
+import tarfile
 from pathlib import Path
 from types import ModuleType
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 def _module() -> ModuleType:
@@ -19,6 +24,65 @@ def _module() -> ModuleType:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _r2e_bundle(text: str, repo: str) -> bytes:
+    target = io.BytesIO()
+    with tarfile.open(fileobj=target, mode="w:gz") as archive:
+        for name, payload in (
+            ("instruction.md", text.encode()),
+            (
+                "environment/workspace/metadata.json",
+                json.dumps({"repo_name": repo}).encode(),
+            ),
+        ):
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    return target.getvalue()
+
+
+def _write_r2e_fixture(root: Path) -> None:
+    tasks = [f"r2egym-{index:04d}" for index in range(4)]
+    pq.write_table(
+        pa.table(
+            {
+                "path": tasks,
+                "task_binary": [
+                    _r2e_bundle(f"task {index}", f"repo-{index % 2}") for index in range(4)
+                ],
+            }
+        ),
+        root / "dcagent_tasks.parquet",
+    )
+    pq.write_table(
+        pa.table({"task": tasks, "episode": ["episode"] * 4, "date": ["date"] * 4}),
+        root / "gpt5_codex_attempted.parquet",
+    )
+    pq.write_table(
+        pa.table({"path": [tasks[0]]}),
+        root / "gpt5_codex_solved.parquet",
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "task": tasks,
+                "result": ["1.0", "1.0", "0.0", "AgentTimeoutError"],
+            }
+        ),
+        root / "kimi25_outcomes.parquet",
+    )
+
+
+def test_r2e_loader_reads_paired_gradeable_outcomes_from_artifacts(tmp_path: Path) -> None:
+    module = _module()
+    _write_r2e_fixture(tmp_path)
+    source = module._load_r2e(tmp_path)
+    assert source.task_ids == ["r2egym-0000", "r2egym-0001", "r2egym-0002"]
+    assert source.texts == ["task 0", "task 1", "task 2"]
+    assert source.groups == ["repo-0", "repo-1", "repo-0"]
+    assert source.weak.tolist() == [1.0, 0.0, 0.0]
+    assert source.strong.tolist() == [1.0, 1.0, 0.0]
 
 
 def test_operating_point_uses_strong_only_where_score_is_high() -> None:

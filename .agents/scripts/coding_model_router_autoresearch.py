@@ -19,12 +19,12 @@ import collections
 import csv
 import dataclasses
 import hashlib
-import importlib.util
+import io
 import json
 import logging
 import math
 import os
-import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
@@ -252,36 +252,105 @@ def _load_nebius(path: Path) -> SourceData:
     )
 
 
-def _load_r2e(loader_path: Path) -> SourceData:
-    spec = importlib.util.spec_from_file_location("external_r2e_loader", loader_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load R2E loader from {loader_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    loaded = cast(dict[str, object], module.load())  # type: ignore[attr-defined]
-    tasks = cast(list[str], loaded["tasks"])
-    arms = cast(list[str], loaded["arms"])
-    scores = np.asarray(loaded["score_binary"], dtype=np.float64)
-    means = np.nanmean(scores, axis=1)
-    strong_index = int(np.nanargmax(means))
-    weak_index = int(np.nanargmin(means))
-    texts = cast(dict[str, str], loaded["text"])
-    groups = cast(dict[str, str], loaded["group"])
+def _r2e_string_set(path: Path, column: str) -> set[str]:
+    values = pq.read_table(path, columns=[column])[column].to_pylist()
+    strings = [str(value) for value in values]
+    if len(strings) != len(set(strings)):
+        raise ValueError(f"{path.name} contains duplicate {column} values")
+    return set(strings)
+
+
+def _read_r2e_task_bundle(task_id: str, payload: bytes) -> tuple[str, str]:
+    """Read pre-call text and repository from one compressed R2E task bundle."""
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        instruction_member = archive.getmember("instruction.md")
+        metadata_member = archive.getmember("environment/workspace/metadata.json")
+        if instruction_member.size > 2_000_000 or metadata_member.size > 2_000_000:
+            raise ValueError(f"R2E task {task_id} contains an oversized metadata member")
+        instruction_file = archive.extractfile(instruction_member)
+        metadata_file = archive.extractfile(metadata_member)
+        if instruction_file is None or metadata_file is None:
+            raise ValueError(f"R2E task {task_id} is missing task metadata")
+        text = instruction_file.read().decode("utf-8")
+        metadata = json.loads(metadata_file.read())
+    if not isinstance(metadata, dict):
+        raise TypeError(f"R2E task {task_id} metadata must be a JSON object")
+    repo = metadata.get("repo_name")
+    if not isinstance(repo, str) or not repo.strip():
+        raise ValueError(f"R2E task {task_id} has no repository name")
+    return text, repo
+
+
+def _load_r2e(root: Path) -> SourceData:
+    """Load paired, gradeable GPT-5 Codex and Kimi 2.5 R2E-Gym outcomes."""
+    attempted = _r2e_string_set(root / "gpt5_codex_attempted.parquet", "task")
+    solved = _r2e_string_set(root / "gpt5_codex_solved.parquet", "path")
+    if not solved <= attempted:
+        raise ValueError("R2E solved tasks must be a subset of attempted tasks")
+
+    kimi_rows = pq.read_table(
+        root / "kimi25_outcomes.parquet",
+        columns=["task", "result"],
+    ).to_pylist()
+    kimi: dict[str, float] = {}
+    excluded_kimi = 0
+    for row in kimi_rows:
+        task_id = str(row["task"])
+        result = str(row["result"])
+        if task_id in kimi:
+            raise ValueError(f"duplicate R2E Kimi outcome for {task_id}")
+        if result in {"0.0", "1.0"}:
+            kimi[task_id] = float(result)
+        else:
+            excluded_kimi += 1
+
+    tasks = sorted(attempted & kimi.keys())
+    if not tasks:
+        raise ValueError("R2E has no paired gradeable outcomes")
+    task_set = set(tasks)
+    task_table = pq.read_table(
+        root / "dcagent_tasks.parquet",
+        columns=["path", "task_binary"],
+    )
+    bundles: dict[str, bytes] = {}
+    for row in task_table.to_pylist():
+        task_id = str(row["path"])
+        if task_id not in task_set:
+            continue
+        payload = row["task_binary"]
+        if task_id in bundles:
+            raise ValueError(f"duplicate R2E task bundle for {task_id}")
+        if not isinstance(payload, bytes):
+            raise TypeError(f"R2E task {task_id} bundle must be bytes")
+        bundles[task_id] = payload
+    missing = sorted(task_set - bundles.keys())
+    if missing:
+        raise ValueError(f"R2E is missing {len(missing)} task bundles, first={missing[0]}")
+
+    texts: list[str] = []
+    groups: list[str] = []
+    for task_id in tasks:
+        text, repo = _read_r2e_task_bundle(task_id, bundles[task_id])
+        texts.append(text)
+        groups.append(_canonical_group(repo))
+    weak = np.asarray([float(task_id in solved) for task_id in tasks], dtype=np.float64)
+    strong = np.asarray([kimi[task_id] for task_id in tasks], dtype=np.float64)
     logger.info(
-        "R2E normalized with weak=%s mean=%.4f strong=%s mean=%.4f",
-        arms[weak_index],
-        means[weak_index],
-        arms[strong_index],
-        means[strong_index],
+        "R2E normalized tasks=%d groups=%d excluded_kimi=%d "
+        "weak=gpt-5-codex/terminus-2 mean=%.4f strong=kimi-2.5/terminus-2 mean=%.4f",
+        len(tasks),
+        len(set(groups)),
+        excluded_kimi,
+        weak.mean(),
+        strong.mean(),
     )
     return SourceData(
         name="r2e-gym-terminus",
         task_ids=tasks,
-        groups=[_canonical_group(groups[task_id]) for task_id in tasks],
-        texts=[texts[task_id] for task_id in tasks],
-        weak=scores[weak_index],
-        strong=scores[strong_index],
+        groups=groups,
+        texts=texts,
+        weak=weak,
+        strong=strong,
         weak_attempts=np.ones(len(tasks), dtype=np.float64),
         strong_attempts=np.ones(len(tasks), dtype=np.float64),
     )
@@ -763,7 +832,7 @@ def _fit(args: argparse.Namespace) -> None:
     output.mkdir(parents=True, exist_ok=True)
     sources = [
         _load_nebius(args.nebius_tasks.resolve()),
-        _load_r2e(args.r2e_loader.resolve()),
+        _load_r2e(args.r2e_root.resolve()),
     ]
     if (args.swebench_matrix is None) != (args.swebench_tasks is None):
         raise ValueError("--swebench-matrix and --swebench-tasks must be supplied together")
@@ -1241,7 +1310,7 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     fit = subparsers.add_parser("fit")
     fit.add_argument("--nebius-tasks", type=Path, required=True)
-    fit.add_argument("--r2e-loader", type=Path, required=True)
+    fit.add_argument("--r2e-root", type=Path, required=True)
     fit.add_argument("--coderouter-root", type=Path, required=True)
     fit.add_argument("--swebench-matrix", type=Path)
     fit.add_argument("--swebench-tasks", type=Path)
