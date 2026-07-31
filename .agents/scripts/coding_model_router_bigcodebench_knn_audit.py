@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import cast
 
@@ -12,14 +14,20 @@ from coding_model_router_bigcodebench_fit import (
     FitData,
     LatencyMetric,
     artifact_size,
+    load_fit_data,
     measure_route_latency,
     outcome_matrix,
+    outer_splits,
 )
-from coding_model_router_bigcodebench_select_run import CandidateRecord
+from coding_model_router_bigcodebench_lock import SeedWinnerAudit
+from coding_model_router_bigcodebench_select_run import CandidateRecord, SeedFitReport
 from pydantic import BaseModel, ConfigDict, Field
 
+from wmo.core.files import write_text_atomic
 from wmo.optimize.knn import fit_knn_policy
 from wmo.optimize.policy import EmbedderSpec, RoutingPolicy, knn_decision
+
+logger = logging.getLogger(__name__)
 
 
 class KnnArtifactAudit(BaseModel):
@@ -156,3 +164,84 @@ def audit_knn_winner(
         latency_p95_ms=latency.p95_ms,
         latency_passed=latency.passed,
     )
+
+
+def audit_seed_knn_winner(
+    root: Path,
+    *,
+    report_path: Path,
+    artifact_dir: Path,
+    output: Path,
+    decisions: int = 10_000,
+) -> SeedWinnerAudit:
+    """Audit one seed's selected kNN winner and write lock-compatible evidence."""
+    if output.exists():
+        raise FileExistsError(f"winner audit already exists: {output}")
+    report = SeedFitReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+    record = next(
+        candidate for candidate in report.candidates if candidate.name == report.selected_name
+    )
+    if record.family != "knn":
+        raise ValueError(f"seed {report.seed} selected non-kNN family {record.family}")
+    data = load_fit_data(root)
+    split = next(split for split in outer_splits(data.groups) if split.seed == report.seed)
+    audit = audit_knn_winner(
+        data,
+        split.train_indices,
+        record,
+        baseline_arm=report.baseline_arm,
+        artifact_dir=artifact_dir,
+        decisions=decisions,
+    )
+    if not audit.latency_passed:
+        raise ValueError(f"seed {report.seed} kNN winner failed the frozen one-core latency gate")
+    winner = SeedWinnerAudit(
+        seed=report.seed,
+        seed_report_sha256=_sha256(report_path),
+        candidate_name=record.name,
+        config_sha256=record.config_sha256,
+        artifact_kind="wmo-knn",
+        artifact_sha256=audit.policy_sha256,
+        sidecar_sha256=audit.bank_sha256,
+        artifact_bytes=audit.artifact_bytes,
+        decisions=audit.decisions,
+        latency_p50_ms=audit.latency_p50_ms,
+        latency_p95_ms=audit.latency_p95_ms,
+        latency_passed=True,
+    )
+    write_text_atomic(output, winner.model_dump_json(indent=2) + "\n")
+    logger.info(
+        "seed=%d audited kNN winner=%s p50_ms=%.6f p95_ms=%.6f bytes=%d",
+        report.seed,
+        record.name,
+        winner.latency_p50_ms,
+        winner.latency_p95_ms,
+        winner.artifact_bytes,
+    )
+    return winner
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the remote kNN winner-audit command line."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> None:
+    """Build and audit one fit-selected kNN winner on the remote CPU."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
+    audit_seed_knn_winner(
+        args.root.resolve(),
+        report_path=args.report.resolve(),
+        artifact_dir=args.artifact_dir.resolve(),
+        output=args.output.resolve(),
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -75,3 +75,21 @@ def test_knn_winner_builds_small_native_artifact_and_routes(tmp_path: Path) -> N
     assert not audit.foundation_model_weights_persisted
     assert (tmp_path / "artifact" / "policy.json").is_file()
     assert (tmp_path / "artifact" / "knn-bank.npz").is_file()
+
+
+def test_lock_audit_rejects_latency_below_required_decision_count() -> None:
+    with np.testing.assert_raises(ValueError):
+        module.SeedWinnerAudit(
+            seed=0,
+            seed_report_sha256="a" * 64,
+            candidate_name="candidate",
+            config_sha256="b" * 64,
+            artifact_kind="wmo-knn",
+            artifact_sha256="c" * 64,
+            sidecar_sha256="d" * 64,
+            artifact_bytes=1_024,
+            decisions=9_999,
+            latency_p50_ms=1.0,
+            latency_p95_ms=2.0,
+            latency_passed=True,
+        )
