@@ -124,6 +124,21 @@ and applies `.agents/scripts/coding_model_router_verifiers_luna_adapter.py`.
 That adapter preserves the same 32,768-token limit and changes only its wire
 field name for the frozen model.
 
+The next pre-inference request established that Luna does not support function
+tools plus reasoning effort on Chat Completions. Mini-swe-agent 2.4.5 already
+ships a `litellm_response` model class, and the pinned verifiers proxy already
+ships a native Responses dialect that maps `max_tokens` to
+`max_output_tokens`, maps reasoning effort to `reasoning.effort`, and preserves
+encrypted reasoning state. The final runtime therefore verifies the pinned
+mini-swe-agent harness source hash
+`5c898dbf5fb3eb350290e193f90341ea80da705e2ea506cc5f37450c86314a78` and
+applies `.agents/scripts/coding_model_router_verifiers_responses_adapter.py`.
+It changes only the harness model class from `litellm` to
+`litellm_response`; the agent version, prompt, tools, turn limits, runtime,
+model, effort, token limit, and verifier remain frozen. The prior Chat
+Completions token adapter is retained only as evidence for the failed transport
+probe and is not required by the final Responses runtime.
+
 ## Smoke and matrix launch
 
 Run exactly four cells first: the first two development tasks by frozen task
