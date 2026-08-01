@@ -11,9 +11,8 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from e2b import CommandResult, Sandbox, Template
 
@@ -51,8 +50,7 @@ IMAGE_PATTERN = re.compile(r"^docker\.io/swerebenchv2/[A-Za-z0-9_.-]+:[A-Za-z0-9
 STATE_LOCK = threading.Lock()
 
 
-@dataclass(frozen=True)
-class ExecutionPhase:
+class ExecutionPhase(NamedTuple):
     """Frozen execution differences between development and confirmation."""
 
     name: str

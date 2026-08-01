@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -244,6 +245,15 @@ def test_confirmation_never_reuses_development_smoke_cells() -> None:
     task_id = next(iter(execute.REUSED_TASKS))
     assert execute._new_rollouts(task_id, "xhigh") == (1, 1)
     assert execute._new_rollouts(task_id, "xhigh", reuse_smoke=False) == (2, 0)
+
+
+def test_recovery_helpers_can_load_executor_without_sys_modules_registration() -> None:
+    path = Path(execute.__file__)
+    spec = importlib.util.spec_from_file_location("detached_swerebench_execute", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.DEVELOPMENT_PHASE.protocol == execute.PROTOCOL
 
 
 def test_confirmation_authorization_is_content_addressed(

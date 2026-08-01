@@ -347,6 +347,14 @@ matched task-blind mixture, and bootstrap router-minus-blind reward by
 repository. There is no second target evaluation and no target-dependent
 refit, threshold, representation, or arm change regardless of the result.
 
+The two phases use
+`coding_model_router_swerebench_deepswe_transfer.py`. Target routing consumes
+only the existing `deepswe-label-free-task-feature-view-v2` fields. It retains
+the label-free language when present and otherwise uses the literal `unknown`;
+it never infers language from target outcomes. The source-only refit and route
+freeze run ephemerally on E2B, persist decisions and audits only, and must
+finish before the hash-pinned matrix is supplied to the one-shot evaluator.
+
 ## Budget and stopping
 
 Trace-derived experiment spend after the valid smoke is approximately USD
