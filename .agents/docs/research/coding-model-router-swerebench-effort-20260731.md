@@ -112,6 +112,18 @@ The adapter output hash was
 The exact probe sandbox `ia52cg7dc80uxregp3qr6` was terminated after artifact
 sync. Resume must use the same four task, effort, and attempt identities.
 
+The repaired smoke then exposed a pinned verifiers v1 client incompatibility
+before inference: its Chat Completions proxy serialized the configured output
+limit as `max_tokens`, which `gpt-5.6-luna` rejects in favor of
+`max_completion_tokens`. All requests returned HTTP 400 with no inference and
+consumed no scientific attempt. The exact owned eval process was terminated
+and its sandbox retained for recovery. Before resuming, the runtime verifies
+the pinned `verifiers/v1/dialects/chat.py` source hash
+`47fa2daa2e4dd2c9c1d5054a21896835e2c747d91cece988d3a1d88358abfcbc`
+and applies `.agents/scripts/coding_model_router_verifiers_luna_adapter.py`.
+That adapter preserves the same 32,768-token limit and changes only its wire
+field name for the frozen model.
+
 ## Smoke and matrix launch
 
 Run exactly four cells first: the first two development tasks by frozen task
