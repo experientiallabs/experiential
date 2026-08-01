@@ -30,6 +30,17 @@ class BinomialIrtFit:
     iterations: int
 
 
+@dataclass(frozen=True)
+class FeatureBinomialIrtFit:
+    """One ephemeral feature-conditioned multidimensional item-response fit."""
+
+    abilities: np.ndarray
+    difficulty_weights: np.ndarray
+    discrimination_weights: np.ndarray
+    loss: float
+    iterations: int
+
+
 def _validate_counts(passed: np.ndarray, total: np.ndarray) -> None:
     """Validate a dense task-by-arm matrix of exact binomial counts."""
     if passed.ndim != 2 or total.ndim != 2 or passed.shape != total.shape:
@@ -46,6 +57,146 @@ def _logit(values: np.ndarray) -> np.ndarray:
     """Return a numerically bounded logit."""
     clipped = np.clip(values, 1e-4, 1.0 - 1e-4)
     return np.log(clipped / (1.0 - clipped))
+
+
+def _validate_features(features: np.ndarray, task_count: int) -> None:
+    """Validate a dense pre-call feature matrix."""
+    if (
+        task_count < 1
+        or features.ndim != 2
+        or features.shape[0] != task_count
+        or features.shape[1] < 1
+    ):
+        raise ValueError("features must be a task-by-feature matrix aligned with counts")
+    if not np.isfinite(features).all():
+        raise ValueError("task features must be finite")
+
+
+def _feature_parameter_shapes(
+    arm_count: int,
+    feature_count: int,
+    latent_dimension: int,
+) -> tuple[int, int, int]:
+    """Return feature-conditioned parameter block sizes, including intercepts."""
+    if arm_count < 2 or feature_count < 1 or latent_dimension < 1:
+        raise ValueError("feature IRT dimensions require two arms, features, and latent dimensions")
+    augmented_feature_count = feature_count + 1
+    return (
+        arm_count * latent_dimension,
+        augmented_feature_count,
+        augmented_feature_count * latent_dimension,
+    )
+
+
+def _unpack_feature_parameters(
+    parameters: np.ndarray,
+    arm_count: int,
+    feature_count: int,
+    latent_dimension: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """View one feature-conditioned optimizer vector as its three parameter blocks."""
+    ability_size, difficulty_size, discrimination_size = _feature_parameter_shapes(
+        arm_count,
+        feature_count,
+        latent_dimension,
+    )
+    if parameters.shape != (ability_size + difficulty_size + discrimination_size,):
+        raise ValueError("feature IRT parameter vector has the wrong length")
+    ability_end = ability_size
+    difficulty_end = ability_end + difficulty_size
+    abilities = parameters[:ability_end].reshape(arm_count, latent_dimension)
+    difficulty_weights = parameters[ability_end:difficulty_end]
+    discrimination_weights = parameters[difficulty_end:].reshape(
+        feature_count + 1,
+        latent_dimension,
+    )
+    return abilities, difficulty_weights, discrimination_weights
+
+
+def _augment_features(features: np.ndarray) -> np.ndarray:
+    """Append a deterministic intercept column to pre-call features."""
+    return np.column_stack([features, np.ones(len(features), dtype=np.float64)])
+
+
+def _softplus(values: np.ndarray) -> np.ndarray:
+    """Return a stable positive discrimination transform."""
+    return np.logaddexp(0.0, values) + 1e-6
+
+
+def _tilted_distribution(
+    values: np.ndarray,
+    weights: np.ndarray,
+    temperature: float,
+) -> tuple[np.ndarray, float]:
+    """Return the exponential lower-tail tilt and its forward KL divergence."""
+    if temperature <= 0.0:
+        raise ValueError("KL tilt temperature must be positive")
+    scaled = -(values - float(np.min(values))) / temperature
+    unnormalized = weights * np.exp(scaled)
+    distribution = unnormalized / np.sum(unnormalized)
+    positive = distribution > 0.0
+    divergence = float(
+        np.sum(
+            distribution[positive]
+            * np.log(distribution[positive] / weights[positive])
+        )
+    )
+    return distribution, divergence
+
+
+def kl_robust_lower_bound(
+    values: np.ndarray,
+    radius: float,
+    weights: np.ndarray | None = None,
+) -> float:
+    """Minimize expected reward over a forward-KL ball around repository weights.
+
+    Args:
+        values: One reward estimate per repository.
+        radius: Nonnegative KL radius.
+        weights: Optional strictly positive nominal repository probabilities.
+
+    Returns:
+        The worst-case expected reward under ``KL(q || weights) <= radius``.
+    """
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+        raise ValueError("KL robust values must be a nonempty finite vector")
+    if not np.isfinite(radius) or radius < 0.0:
+        raise ValueError("KL radius must be finite and nonnegative")
+    if weights is None:
+        nominal = np.full(len(values), 1.0 / len(values), dtype=np.float64)
+    else:
+        if weights.shape != values.shape or not np.isfinite(weights).all():
+            raise ValueError("KL weights must be finite and aligned with values")
+        if np.any(weights <= 0.0):
+            raise ValueError("KL weights must be strictly positive")
+        weight_sum = float(np.sum(weights))
+        if not np.isfinite(weight_sum):
+            raise ValueError("KL weight sum must be finite")
+        nominal = weights / weight_sum
+    if radius == 0.0 or np.all(values == values[0]):
+        return float(nominal @ values)
+
+    minimum = float(np.min(values))
+    minimum_mass = float(np.sum(nominal[values == minimum]))
+    if radius >= -np.log(minimum_mass):
+        return minimum
+
+    upper = max(float(np.ptp(values)), 1e-6)
+    _, divergence = _tilted_distribution(values, nominal, upper)
+    while divergence > radius:
+        upper *= 2.0
+        _, divergence = _tilted_distribution(values, nominal, upper)
+    lower = 0.0
+    for _ in range(100):
+        temperature = (lower + upper) / 2.0
+        _, divergence = _tilted_distribution(values, nominal, temperature)
+        if divergence > radius:
+            lower = temperature
+        else:
+            upper = temperature
+    distribution, _ = _tilted_distribution(values, nominal, upper)
+    return float(distribution @ values)
 
 
 def _parameter_shapes(
@@ -137,6 +288,106 @@ def binomial_irt_loss_and_gradient(
     )
 
 
+def feature_binomial_irt_loss_and_gradient(
+    parameters: np.ndarray,
+    features: np.ndarray,
+    passed: np.ndarray,
+    total: np.ndarray,
+    latent_dimension: int,
+    *,
+    ability_l2: float = DEFAULT_ABILITY_L2,
+    feature_l2: float = DEFAULT_DIFFICULTY_L2,
+    discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
+) -> tuple[float, np.ndarray]:
+    """Return exact binomial loss for a feature-conditioned IRT model.
+
+    Difficulty and nonnegative discrimination are functions only of pre-call features. This
+    permits grouped out-of-fold predictions for unseen repositories without retaining task-level
+    fitted state.
+    """
+    _validate_counts(passed, total)
+    _validate_features(features, len(passed))
+    if min(ability_l2, feature_l2, discrimination_l2) < 0.0:
+        raise ValueError("feature IRT regularization strengths must be nonnegative")
+    _, arm_count = passed.shape
+    abilities, difficulty_weights, discrimination_weights = _unpack_feature_parameters(
+        parameters,
+        arm_count,
+        features.shape[1],
+        latent_dimension,
+    )
+    augmented = _augment_features(features)
+    difficulties = augmented @ difficulty_weights
+    discrimination_linear = augmented @ discrimination_weights
+    discriminations = _softplus(discrimination_linear)
+    logits = discriminations @ abilities.T - difficulties[:, None]
+    assertion_count = float(np.sum(total))
+    loss = float(np.sum(total * np.logaddexp(0.0, logits) - passed * logits) / assertion_count)
+    loss += ability_l2 * float(np.mean(abilities**2))
+    loss += feature_l2 * float(np.mean(difficulty_weights**2))
+    loss += discrimination_l2 * float(np.mean(discrimination_weights**2))
+
+    error = (total * expit(logits) - passed) / assertion_count
+    ability_gradient = error.T @ discriminations
+    ability_gradient += 2.0 * ability_l2 * abilities / abilities.size
+    difficulty_gradient = augmented.T @ (-np.sum(error, axis=1))
+    difficulty_gradient += 2.0 * feature_l2 * difficulty_weights / difficulty_weights.size
+    discrimination_linear_gradient = (error @ abilities) * expit(discrimination_linear)
+    discrimination_gradient = augmented.T @ discrimination_linear_gradient
+    discrimination_gradient += (
+        2.0
+        * discrimination_l2
+        * discrimination_weights
+        / discrimination_weights.size
+    )
+    return loss, np.concatenate(
+        [
+            ability_gradient.ravel(),
+            difficulty_gradient,
+            discrimination_gradient.ravel(),
+        ]
+    )
+
+
+def _initial_feature_parameters(
+    features: np.ndarray,
+    passed: np.ndarray,
+    total: np.ndarray,
+    latent_dimension: int,
+) -> np.ndarray:
+    """Build a deterministic initializer without fitting per-task parameters."""
+    _validate_counts(passed, total)
+    _validate_features(features, len(passed))
+    _, arm_count = passed.shape
+    feature_count = features.shape[1]
+    arm_rates = np.sum(passed, axis=0) / np.sum(total, axis=0)
+    arm_logits = _logit(arm_rates)
+    arm_logits -= np.mean(arm_logits)
+    abilities = np.zeros((arm_count, latent_dimension), dtype=np.float64)
+    abilities[:, 0] = arm_logits
+    if latent_dimension > 1:
+        offsets = np.linspace(-0.01, 0.01, arm_count, dtype=np.float64)
+        for dimension in range(1, latent_dimension):
+            abilities[:, dimension] = offsets * (dimension / latent_dimension)
+
+    difficulty_weights = np.zeros(feature_count + 1, dtype=np.float64)
+    task_rates = np.sum(passed, axis=1) / np.sum(total, axis=1)
+    difficulty_weights[-1] = float(np.mean(-_logit(task_rates)))
+    discrimination_weights = np.zeros(
+        (feature_count + 1, latent_dimension),
+        dtype=np.float64,
+    )
+    initial_discrimination = 1.0 / np.sqrt(float(latent_dimension))
+    discrimination_weights[-1] = np.log(np.expm1(initial_discrimination))
+    return np.concatenate(
+        [
+            abilities.ravel(),
+            difficulty_weights,
+            discrimination_weights.ravel(),
+        ]
+    )
+
+
 def _initial_parameters(
     passed: np.ndarray,
     total: np.ndarray,
@@ -222,6 +473,69 @@ def fit_binomial_irt(
     )
 
 
+def fit_feature_binomial_irt(
+    features: np.ndarray,
+    passed: np.ndarray,
+    total: np.ndarray,
+    latent_dimension: int,
+    *,
+    ability_l2: float = DEFAULT_ABILITY_L2,
+    feature_l2: float = DEFAULT_DIFFICULTY_L2,
+    discrimination_l2: float = DEFAULT_DISCRIMINATION_L2,
+) -> FeatureBinomialIrtFit:
+    """Fit a feature-conditioned model for ephemeral grouped evaluation."""
+    _validate_counts(passed, total)
+    _validate_features(features, len(passed))
+    _, arm_count = passed.shape
+    feature_count = features.shape[1]
+    initial = _initial_feature_parameters(
+        features,
+        passed,
+        total,
+        latent_dimension,
+    )
+    ability_size, difficulty_size, discrimination_size = _feature_parameter_shapes(
+        arm_count,
+        feature_count,
+        latent_dimension,
+    )
+    bounds = (
+        [(-8.0, 8.0)] * ability_size
+        + [(-8.0, 8.0)] * difficulty_size
+        + [(-4.0, 4.0)] * discrimination_size
+    )
+    objective = partial(
+        feature_binomial_irt_loss_and_gradient,
+        ability_l2=ability_l2,
+        feature_l2=feature_l2,
+        discrimination_l2=discrimination_l2,
+    )
+    result = minimize(
+        objective,
+        initial,
+        args=(features, passed, total, latent_dimension),
+        method="L-BFGS-B",
+        jac=True,
+        bounds=bounds,
+        options={"maxiter": 1_000, "ftol": 1e-10, "gtol": 1e-7},
+    )
+    if not result.success or not np.isfinite(result.fun):
+        raise RuntimeError(f"feature binomial IRT optimization failed: {result.message}")
+    abilities, difficulty_weights, discrimination_weights = _unpack_feature_parameters(
+        np.asarray(result.x, dtype=np.float64),
+        arm_count,
+        feature_count,
+        latent_dimension,
+    )
+    return FeatureBinomialIrtFit(
+        abilities=abilities.copy(),
+        difficulty_weights=difficulty_weights.copy(),
+        discrimination_weights=discrimination_weights.copy(),
+        loss=float(result.fun),
+        iterations=int(result.nit),
+    )
+
+
 def predict_probabilities(fit: BinomialIrtFit) -> np.ndarray:
     """Predict fitted task-by-arm pass probabilities without serializing fit state."""
     if fit.abilities.ndim != 2 or fit.log_discriminations.ndim != 2:
@@ -232,3 +546,27 @@ def predict_probabilities(fit: BinomialIrtFit) -> np.ndarray:
         raise ValueError("IRT latent dimensions do not match")
     discriminations = np.exp(fit.log_discriminations)
     return expit(discriminations @ fit.abilities.T - fit.difficulties[:, None])
+
+
+def predict_feature_probabilities(
+    fit: FeatureBinomialIrtFit,
+    features: np.ndarray,
+) -> np.ndarray:
+    """Predict arm probabilities for unseen tasks from pre-call features only."""
+    if fit.abilities.ndim != 2 or fit.discrimination_weights.ndim != 2:
+        raise ValueError("feature IRT abilities and discrimination weights must be matrices")
+    if fit.difficulty_weights.ndim != 1:
+        raise ValueError("feature IRT difficulty weights must be a vector")
+    expected_feature_count = len(fit.difficulty_weights) - 1
+    _validate_features(features, len(features))
+    if features.shape[1] != expected_feature_count:
+        raise ValueError("prediction features do not match fitted feature count")
+    if fit.discrimination_weights.shape != (
+        expected_feature_count + 1,
+        fit.abilities.shape[1],
+    ):
+        raise ValueError("feature IRT fitted dimensions do not match")
+    augmented = _augment_features(features)
+    difficulties = augmented @ fit.difficulty_weights
+    discriminations = _softplus(augmented @ fit.discrimination_weights)
+    return expit(discriminations @ fit.abilities.T - difficulties[:, None])
