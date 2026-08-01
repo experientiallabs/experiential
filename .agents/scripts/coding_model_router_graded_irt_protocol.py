@@ -1,8 +1,8 @@
 """Pure protocol helpers for the conditional graded IRT router study.
 
 The helpers in this module operate only on group identities and in-memory arrays. They provide
-seeded repository-disjoint folds and the within-repository shuffled-label control without loading
-outcomes, fitting a model, or persisting state.
+seeded repository-disjoint folds, a pre-call feature graph, and the within-repository
+shuffled-label control without loading outcomes, fitting a model, or persisting state.
 """
 
 from __future__ import annotations
@@ -35,6 +35,37 @@ def _seeded_digest(seed: int, *parts: str) -> bytes:
     """Return a stable seed-sensitive digest for protocol ordering."""
     value = ":".join([str(seed), *parts])
     return hashlib.sha256(value.encode()).digest()
+
+
+def cosine_knn_laplacian(features: np.ndarray, *, neighbors: int = 8) -> np.ndarray:
+    """Build the frozen symmetric cosine kNN graph Laplacian.
+
+    Each feature row is L2 normalized. Directed neighbors use descending cosine similarity with
+    stable task-index tie breaks. Edge weights are shifted cosine values in ``[0, 1]`` and the
+    directed graph is converted to an undirected union by taking the maximum weight.
+    """
+    if features.ndim != 2 or features.shape[0] < 2 or features.shape[1] < 1:
+        raise ValueError("graph features must contain at least two task rows and one column")
+    if not np.isfinite(features).all():
+        raise ValueError("graph features must be finite")
+    task_count = features.shape[0]
+    if not 1 <= neighbors < task_count:
+        raise ValueError("graph neighbor count must be between one and task_count minus one")
+    norms = np.linalg.norm(features, axis=1)
+    if np.any(norms <= 0.0):
+        raise ValueError("graph feature rows must have positive norm")
+    normalized = features / norms[:, None]
+    similarities = np.clip(normalized @ normalized.T, -1.0, 1.0)
+    np.fill_diagonal(similarities, -np.inf)
+    nearest = np.argsort(-similarities, axis=1, kind="stable")[:, :neighbors]
+    adjacency = np.zeros((task_count, task_count), dtype=np.float64)
+    rows = np.repeat(np.arange(task_count, dtype=np.int64), neighbors)
+    columns = nearest.ravel()
+    weights = np.maximum((similarities[rows, columns] + 1.0) / 2.0, 1e-12)
+    adjacency[rows, columns] = weights
+    adjacency = np.maximum(adjacency, adjacency.T)
+    np.fill_diagonal(adjacency, 0.0)
+    return np.diag(np.sum(adjacency, axis=1)) - adjacency
 
 
 def repository_grouped_folds(

@@ -57,10 +57,13 @@ Regularization strengths are 0.1, 1, 10, and 100. Compare unconstrained arm abil
 variant whose Luna capacity coordinate is monotone from low through max. The Sol guard remains a
 separate arm and receives no ordinal constraint.
 
-The graph ablation constructs a fit-only task similarity graph from the same pre-call features,
-propagates latent difficulty with graph Laplacian penalties 0.01, 0.1, and 1, and changes no online
-feature contract. Repository identity, model output, patch, tests, verifier details, and future
-trajectory content remain forbidden features.
+The graph ablation constructs a fit-only task similarity graph from the same pre-call features.
+Feature rows are L2 normalized, each task selects its eight nearest tasks by descending cosine
+similarity with stable task-index tie breaks, edge weights use shifted cosine `(1 + cosine) / 2`,
+and the directed graph becomes an undirected union by taking the maximum edge weight. The resulting
+combinatorial Laplacian propagates latent difficulty with penalties 0.01, 0.1, and 1 and changes no
+online feature contract. Repository identity, model output, patch, tests, verifier details, and
+future trajectory content remain forbidden features.
 
 ## Implementation starting point
 
@@ -96,10 +99,11 @@ wiring. The module has no filesystem or serialization surface. It remains condit
 infrastructure and does not activate this lane.
 
 The pure protocol helpers in `.agents/scripts/coding_model_router_graded_irt_protocol.py` implement
-seed-sensitive repository-disjoint folds with exact one-fold task coverage and a shuffled-label
-control that permutes complete outcome rows only within repositories. These replace the older
-Codeforces implementation's unseeded folds and corpus-wide shuffle. They load no outcomes, fit no
-model, and persist no state, so preparing them does not activate this lane.
+seed-sensitive repository-disjoint folds with exact one-fold task coverage, the frozen cosine kNN
+graph construction, and a shuffled-label control that permutes complete outcome rows only within
+repositories. These replace the older Codeforces implementation's unseeded folds and corpus-wide
+shuffle. They load no outcomes, fit no model, and persist no state, so preparing them does not
+activate this lane.
 
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or

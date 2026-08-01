@@ -5,9 +5,51 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from coding_model_router_graded_irt_protocol import (
+    cosine_knn_laplacian,
     repository_grouped_folds,
     shuffle_within_repositories,
 )
+
+
+def test_cosine_knn_laplacian_is_symmetric_and_deterministic() -> None:
+    features = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [0.0, 1.0],
+            [0.1, 0.9],
+        ],
+        dtype=np.float64,
+    )
+    first = cosine_knn_laplacian(features, neighbors=1)
+    repeated = cosine_knn_laplacian(features, neighbors=1)
+    np.testing.assert_array_equal(first, repeated)
+    np.testing.assert_allclose(first, first.T)
+    np.testing.assert_allclose(np.sum(first, axis=1), 0.0)
+    assert np.all(np.diag(first) > 0.0)
+    off_diagonal = first.copy()
+    np.fill_diagonal(off_diagonal, 0.0)
+    assert np.all(off_diagonal <= 0.0)
+    assert first[0, 1] < 0.0
+    assert first[2, 3] < 0.0
+    assert first[0, 2] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("features", "neighbors"),
+    [
+        (np.asarray([[1.0], [0.0]]), 1),
+        (np.asarray([[1.0], [np.nan]]), 1),
+        (np.asarray([[1.0], [2.0]]), 0),
+        (np.asarray([[1.0], [2.0]]), 2),
+    ],
+)
+def test_cosine_knn_laplacian_rejects_invalid_inputs(
+    features: np.ndarray,
+    neighbors: int,
+) -> None:
+    with pytest.raises(ValueError):
+        cosine_knn_laplacian(features, neighbors=neighbors)
 
 
 def test_repository_grouped_folds_are_seeded_disjoint_and_complete() -> None:
