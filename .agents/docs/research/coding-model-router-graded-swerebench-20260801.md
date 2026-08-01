@@ -212,6 +212,13 @@ worker recorded no Docker identity, scientific command, or provider call. It joi
 fresh-sandbox infrastructure retry, bringing that queue to sixteen tasks without changing the
 scientific attempt count.
 
+A third stale HTTP/2 wave affected one arm each for `ecadlabs__taquito-2781`,
+`equinor__design-system-3803`, `fyne-io__fyne-5862`, `moov-io__customers-246`,
+`ross-rotordynamics__ross-822`, `sage__carbon-7273`, `veryl-lang__veryl-1498`, and
+`yamatoiizuka__palt-typesetting-77`. Every failed worker again recorded no Docker identity,
+scientific command, or provider call. All eight join the one fresh-sandbox retry, bringing the
+queue to twenty-four tasks without changing the scientific attempt count.
+
 The installed E2B SDK creates a thread-local HTTP/2 transport with a 300-second keepalive cache.
 That reuse matches the observed stale closed-connection error. The single frozen retry pass will
 therefore run with `E2B_MAX_KEEPALIVE_CONNECTIONS=0` and operational concurrency 20. This changes
