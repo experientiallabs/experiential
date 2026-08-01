@@ -29,7 +29,13 @@ def _run_validator(tmp_path: Path, trace: dict[str, object]) -> subprocess.Compl
     traces = tmp_path / "traces.jsonl"
     report = tmp_path / "report.json"
     validator.write_text(execute.REMOTE_VALIDATOR, encoding="utf-8")
-    traces.write_text(json.dumps({"ok": False, "errors": [], "traces": [trace]}) + "\n")
+    traces.write_text(
+        json.dumps(
+            {"ok": False, "errors": [], "traces": [trace]},
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -91,3 +97,38 @@ def test_validator_rejects_unrecognized_unscored_error(tmp_path: Path) -> None:
     result = _run_validator(tmp_path, trace)
     assert result.returncode != 0
     assert "lacks an official binary reward" in result.stderr
+
+
+def test_validator_preserves_unicode_line_separator_inside_patch(tmp_path: Path) -> None:
+    trace = {
+        "task": {"data": {"name": "owner__repo-1"}},
+        "verifiers": {"commit": "f6e420b9908ae14d625f079881f13c15011ee1c9"},
+        "rewards": {"solved": {"score": 1.0}},
+        "timing": {"scoring": {"start": 1.0, "end": 2.0}},
+        "calls": [_call()],
+        "info": {"patch": "before\u2028after"},
+        "ok": True,
+        "errors": [],
+        "stop_condition": "agent_completed",
+    }
+    result = _run_validator(tmp_path, trace)
+    assert result.returncode == 0, result.stderr
+
+
+def test_whole_task_exclusion_requires_audited_zero_reruns() -> None:
+    state = {
+        "stage": "excluded-infrastructure",
+        "exclusion": {
+            "scope": "whole-task",
+            "effort": "low",
+            "reason": "official verifier scoring timeout after completed inference",
+            "evidence_sha256": "a" * 64,
+            "usage": {},
+            "provider_calls": 2,
+            "observed_scientific_cells": 2,
+            "scientific_cells_rerun": 0,
+        },
+    }
+    assert execute._task_excluded(state)
+    state["exclusion"]["scientific_cells_rerun"] = 1
+    assert not execute._task_excluded(state)

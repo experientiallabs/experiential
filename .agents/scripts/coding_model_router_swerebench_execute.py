@@ -59,7 +59,11 @@ parser.add_argument("--attempt-offset", type=int, required=True)
 parser.add_argument("--output", type=Path, required=True)
 args = parser.parse_args()
 
-records = [json.loads(line) for line in args.traces.read_text().splitlines() if line.strip()]
+records = [
+    json.loads(line)
+    for line in args.traces.read_bytes().split(b"\n")
+    if line.strip()
+]
 if len(records) != args.expected:
     raise SystemExit(f"expected {args.expected} outer rows, found {len(records)}")
 cells = []
@@ -354,6 +358,23 @@ def _task_complete(task_dir: Path, state: dict[str, Any]) -> bool:
     )
 
 
+def _task_excluded(state: dict[str, Any]) -> bool:
+    """Return whether a task has an audited infrastructure-cell exclusion."""
+    exclusion = state.get("exclusion")
+    return (
+        state.get("stage") == "excluded-infrastructure"
+        and isinstance(exclusion, dict)
+        and exclusion.get("scope") == "whole-task"
+        and isinstance(exclusion.get("effort"), str)
+        and isinstance(exclusion.get("reason"), str)
+        and isinstance(exclusion.get("evidence_sha256"), str)
+        and isinstance(exclusion.get("usage"), dict)
+        and isinstance(exclusion.get("provider_calls"), int)
+        and isinstance(exclusion.get("observed_scientific_cells"), int)
+        and exclusion.get("scientific_cells_rerun") == 0
+    )
+
+
 def _update_summary(root: Path, total_tasks: int) -> None:
     with STATE_LOCK:
         states = list((root / "tasks").glob("*/state.json"))
@@ -361,6 +382,7 @@ def _update_summary(root: Path, total_tasks: int) -> None:
         completed_new_cells = 0
         reused_cells = 0
         complete_tasks = 0
+        excluded_tasks = 0
         failed_tasks = 0
         provider_calls = 0
         usage = {
@@ -384,8 +406,17 @@ def _update_summary(root: Path, total_tasks: int) -> None:
                     if isinstance(payload_usage, dict):
                         for field in usage:
                             usage[field] += int(payload_usage.get(field, 0))
+            if _task_excluded(state):
+                exclusion = state["exclusion"]
+                excluded_usage = exclusion["usage"]
+                completed_new_cells += int(exclusion["observed_scientific_cells"])
+                provider_calls += int(exclusion["provider_calls"])
+                for field in usage:
+                    usage[field] += int(excluded_usage.get(field, 0))
             if state.get("stage") == "complete":
                 complete_tasks += 1
+            if _task_excluded(state):
+                excluded_tasks += 1
             if state.get("stage") == "failed":
                 failed_tasks += 1
         cost = (
@@ -400,6 +431,8 @@ def _update_summary(root: Path, total_tasks: int) -> None:
                 "total_tasks": total_tasks,
                 "expected_cells": total_tasks * 10,
                 "complete_tasks": complete_tasks,
+                "excluded_tasks": excluded_tasks,
+                "retained_task_coverage": (total_tasks - excluded_tasks) / total_tasks,
                 "failed_tasks": failed_tasks,
                 "completed_efforts": completed_efforts,
                 "completed_new_cells": completed_new_cells,
@@ -429,6 +462,8 @@ def _run_task(
         state = _read_object(state_path)
         if state.get("task_id") != task_id or state.get("image") != image:
             raise ValueError(f"task state identity drift at {task_dir}")
+        if _task_excluded(state):
+            return
         if _task_complete(task_dir, state):
             return
     else:
@@ -668,9 +703,19 @@ def execute(
         "deep_swe_outcomes_accessed": False,
         "model_persisted": False,
     }
-    if launch_path.is_file() and _read_object(launch_path) != launch:
-        raise ValueError("resume launch manifest differs from the frozen launch")
-    _write_json(launch_path, launch)
+    if launch_path.is_file():
+        prior_launch = _read_object(launch_path)
+        operational = {"active_e2b_before", "concurrency"}
+        frozen_prior = {
+            key: value for key, value in prior_launch.items() if key not in operational
+        }
+        frozen_resume = {
+            key: value for key, value in launch.items() if key not in operational
+        }
+        if frozen_prior != frozen_resume:
+            raise ValueError("resume launch manifest differs from the frozen experiment")
+    else:
+        _write_json(launch_path, launch)
     _update_summary(root, len(selected))
     errors: list[Exception] = []
     with ThreadPoolExecutor(max_workers=concurrency) as executor:

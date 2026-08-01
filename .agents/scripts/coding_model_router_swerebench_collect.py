@@ -12,10 +12,12 @@ from typing import Any
 
 logger = logging.getLogger("coding-router-swerebench-collect")
 
-PROTOCOL = "coding-router-swerebench-development-collection-v1"
+PROTOCOL = "coding-router-swerebench-development-collection-v2"
 CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1"
 SMOKE_REPORT_SHA256 = "ee76a57040cbe7aaef692d2fc3f3df66d7a556cbf6dda74119e0802cb4230e13"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+SOURCE_TASKS = 200
+MIN_RETAINED_TASKS = 190
 USAGE_FIELDS = (
     "prompt_tokens",
     "cached_input_tokens",
@@ -134,29 +136,95 @@ def _outcome(
 
 
 def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path) -> None:
-    """Validate every completed effort report and write exactly 2,000 outcomes."""
+    """Validate retained task reports and drop whole infrastructure-missing tasks."""
     if _sha256(corpus_path) != CORPUS_SHA256:
         raise ValueError("development corpus hash mismatch")
     progress = _read_object(root / "progress.json")
+    complete_tasks = progress.get("complete_tasks")
+    excluded_count = progress.get("excluded_tasks", 0)
     if (
-        progress.get("complete_tasks") != 200
-        or progress.get("completed_scientific_cells") != 2_000
+        not isinstance(complete_tasks, int)
+        or not isinstance(excluded_count, int)
+        or complete_tasks + excluded_count != SOURCE_TASKS
+        or complete_tasks < MIN_RETAINED_TASKS
         or progress.get("failed_tasks") != 0
     ):
         raise ValueError("development matrix is not complete and failure-free")
     corpus = _read_object(corpus_path)
     raw_tasks = corpus.get("tasks")
-    if not isinstance(raw_tasks, list) or len(raw_tasks) != 200:
+    if not isinstance(raw_tasks, list) or len(raw_tasks) != SOURCE_TASKS:
         raise ValueError("development corpus does not contain 200 tasks")
     tasks = [_object(task, f"corpus task {index}") for index, task in enumerate(raw_tasks)]
     reused = _smoke_cells(smoke_report_path)
     outcomes: list[dict[str, object]] = []
     input_hashes: dict[str, dict[str, str]] = {}
+    exclusions: list[dict[str, object]] = []
+    reused_cells = 0
+    excluded_infrastructure_cost = 0.0
     for index, task in enumerate(tasks):
         task_id = str(task["task_id"])
         task_dir = root / "tasks" / f"{index:04d}"
         state_path = task_dir / "state.json"
         state = _read_object(state_path)
+        if state.get("task_id") != task_id:
+            raise ValueError(f"task {index} state identity changed")
+        if state.get("stage") == "excluded-infrastructure":
+            exclusion = _object(state.get("exclusion"), f"task {index} exclusion")
+            if (
+                exclusion.get("scope") != "whole-task"
+                or exclusion.get("effort") not in EFFORTS
+                or not isinstance(exclusion.get("reason"), str)
+                or not isinstance(exclusion.get("evidence_sha256"), str)
+                or len(exclusion["evidence_sha256"]) != 64
+                or not isinstance(exclusion.get("usage"), dict)
+                or not isinstance(exclusion.get("provider_calls"), int)
+                or not isinstance(exclusion.get("observed_scientific_cells"), int)
+                or exclusion.get("scientific_cells_rerun") != 0
+            ):
+                raise ValueError(f"task {index} has an invalid exclusion")
+            effort = str(exclusion["effort"])
+            exclusion_report = task_dir / f"{effort}.infrastructure-missing.json"
+            exclusion_archive = task_dir / f"{effort}.infrastructure-missing.tar.gz"
+            if (
+                _sha256(exclusion_report) != exclusion.get("report_sha256")
+                or _sha256(exclusion_archive) != exclusion.get("evidence_sha256")
+            ):
+                raise ValueError(f"task {index} exclusion evidence hash mismatch")
+            exclusion_usage = _usage(
+                exclusion.get("usage"), f"task {index} exclusion usage"
+            )
+            excluded_infrastructure_cost += _cost(exclusion_usage)
+            excluded_efforts = _object(
+                state.get("efforts"), f"task {index} completed excluded efforts"
+            )
+            for completed_effort, raw_payload in excluded_efforts.items():
+                payload = _object(
+                    raw_payload,
+                    f"task {index} completed excluded effort {completed_effort}",
+                )
+                excluded_infrastructure_cost += _cost(
+                    _usage(
+                        payload.get("usage"),
+                        f"task {index} completed excluded effort usage",
+                    )
+                )
+            exclusions.append(
+                {
+                    "task_id": task_id,
+                    "task_index": index,
+                    "scope": "whole-task",
+                    "effort": exclusion["effort"],
+                    "reason": exclusion["reason"],
+                    "evidence_sha256": exclusion.get("evidence_sha256"),
+                    "scientific_cells_rerun": 0,
+                }
+            )
+            input_hashes[task_id] = {
+                "state": _sha256(state_path),
+                "exclusion_report": _sha256(exclusion_report),
+                "exclusion_archive": _sha256(exclusion_archive),
+            }
+            continue
         if state.get("stage") != "complete" or state.get("task_id") != task_id:
             raise ValueError(f"task {index} is not complete with frozen identity")
         efforts = _object(state.get("efforts"), f"task {index} efforts")
@@ -212,15 +280,21 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
                         provenance=provenance,
                     )
                 )
+                if smoke_cell is not None and attempt == 0:
+                    reused_cells += 1
             input_hashes[task_id][f"{effort}_report"] = report_sha
             input_hashes[task_id][f"{effort}_archive"] = archive_sha
-    if len(outcomes) != 2_000:
-        raise ValueError(f"expected 2,000 outcomes, found {len(outcomes)}")
+    retained_tasks = SOURCE_TASKS - len(exclusions)
+    expected_cells = retained_tasks * len(EFFORTS) * 2
+    if retained_tasks < MIN_RETAINED_TASKS or len(exclusions) != excluded_count:
+        raise ValueError("task exclusions violate the frozen coverage gate")
+    if len(outcomes) != expected_cells:
+        raise ValueError(f"expected {expected_cells} outcomes, found {len(outcomes)}")
     identities = {
         (row["task_id"], row["reasoning_effort"], row["attempt_number"])
         for row in outcomes
     }
-    if len(identities) != 2_000:
+    if len(identities) != expected_cells:
         raise ValueError("collected outcome identities are not unique")
     output.mkdir(parents=True, exist_ok=False)
     outcomes_path = output / "outcomes.jsonl"
@@ -237,17 +311,26 @@ def collect(root: Path, corpus_path: Path, smoke_report_path: Path, output: Path
     audit = {
         "protocol": PROTOCOL,
         "valid": True,
-        "tasks": 200,
+        "source_tasks": SOURCE_TASKS,
+        "tasks": retained_tasks,
+        "retained_task_coverage": retained_tasks / SOURCE_TASKS,
+        "excluded_tasks": exclusions,
         "efforts": list(EFFORTS),
         "attempts_per_effort": 2,
-        "cells": 2_000,
+        "cells": expected_cells,
         "unique_cell_identities": len(identities),
-        "reused_smoke_cells": 4,
-        "new_matrix_cells": 1_996,
+        "reused_smoke_cells": reused_cells,
+        "new_matrix_cells": expected_cells - reused_cells,
         "outcome_cost_usd": total_cost,
         "reused_smoke_cost_usd": reused_cost,
         "new_matrix_cost_usd": total_cost - reused_cost,
-        "rough_cumulative_experiment_spend_usd": 405.7678502 + total_cost - reused_cost,
+        "excluded_infrastructure_cost_usd": excluded_infrastructure_cost,
+        "spent_matrix_cost_usd": total_cost - reused_cost
+        + excluded_infrastructure_cost,
+        "rough_cumulative_experiment_spend_usd": 405.7678502
+        + total_cost
+        - reused_cost
+        + excluded_infrastructure_cost,
         "target_outcomes_used": False,
         "deep_swe_outcomes_accessed": False,
         "outcomes_sha256": _sha256(outcomes_path),

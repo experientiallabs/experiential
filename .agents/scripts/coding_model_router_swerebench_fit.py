@@ -47,6 +47,7 @@ PROTOCOL = "coding-router-swerebench-fit-only-selection-v1"
 DEVELOPMENT_CORPUS_SHA256 = "7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1"
 CONFIRMATION_CORPUS_SHA256 = "9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7"
 TASKS = 200
+MIN_RETAINED_TASKS = 190
 ATTEMPTS = 2
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 HASH_DIMS = (512, 2_048, 8_192)
@@ -211,13 +212,21 @@ def _structural(task: dict[str, Any]) -> list[float]:
 
 
 def load_source(corpus_path: Path, outcomes_path: Path, audit_path: Path) -> SourceData:
-    """Load and prove the dense external development matrix."""
+    """Load the dense retained-task matrix after whole-task exclusions."""
     if _sha256(corpus_path) != DEVELOPMENT_CORPUS_SHA256:
         raise ValueError("development corpus hash changed")
     audit = _read_object(audit_path)
+    retained_tasks = audit.get("tasks")
+    exclusions = audit.get("excluded_tasks")
     if (
         audit.get("valid") is not True
-        or audit.get("cells") != TASKS * len(ARMS) * ATTEMPTS
+        or audit.get("source_tasks") != TASKS
+        or not isinstance(retained_tasks, int)
+        or not MIN_RETAINED_TASKS <= retained_tasks <= TASKS
+        or not isinstance(exclusions, list)
+        or len(exclusions) != TASKS - retained_tasks
+        or audit.get("retained_task_coverage") != retained_tasks / TASKS
+        or audit.get("cells") != retained_tasks * len(ARMS) * ATTEMPTS
         or audit.get("target_outcomes_used") is not False
         or audit.get("deep_swe_outcomes_accessed") is not False
         or audit.get("outcomes_sha256") != _sha256(outcomes_path)
@@ -234,12 +243,30 @@ def load_source(corpus_path: Path, outcomes_path: Path, audit_path: Path) -> Sou
     ]
     if len(tasks) != TASKS:
         raise ValueError("development corpus contains a non-object task")
-    task_ids = [str(task["task_id"]) for task in tasks]
-    if len(set(task_ids)) != TASKS:
+    source_task_ids = [str(task["task_id"]) for task in tasks]
+    if len(set(source_task_ids)) != TASKS:
         raise ValueError("development corpus contains duplicate task IDs")
+    excluded_ids: set[str] = set()
+    for raw_exclusion in exclusions:
+        if not isinstance(raw_exclusion, dict):
+            raise ValueError("development exclusion is not an object")
+        task_id = raw_exclusion.get("task_id")
+        if (
+            not isinstance(task_id, str)
+            or task_id not in source_task_ids
+            or task_id in excluded_ids
+            or raw_exclusion.get("scope") != "whole-task"
+            or raw_exclusion.get("scientific_cells_rerun") != 0
+        ):
+            raise ValueError("development exclusion is invalid")
+        excluded_ids.add(task_id)
+    tasks = [task for task in tasks if str(task["task_id"]) not in excluded_ids]
+    if len(tasks) != retained_tasks:
+        raise ValueError("retained development task count does not match the audit")
+    task_ids = [str(task["task_id"]) for task in tasks]
     task_index = {task_id: index for index, task_id in enumerate(task_ids)}
     arm_index = {arm: index for index, arm in enumerate(ARMS)}
-    rewards = np.full((TASKS, len(ARMS), ATTEMPTS), np.nan)
+    rewards = np.full((retained_tasks, len(ARMS), ATTEMPTS), np.nan)
     costs = np.full_like(rewards, np.nan)
     observed: set[tuple[str, str, int]] = set()
     for row in _read_rows(outcomes_path):
@@ -273,7 +300,7 @@ def load_source(corpus_path: Path, outcomes_path: Path, audit_path: Path) -> Sou
         rewards[index] = float(reward)
         costs[index] = float(cost)
         observed.add(identity)
-    if len(observed) != TASKS * len(ARMS) * ATTEMPTS:
+    if len(observed) != retained_tasks * len(ARMS) * ATTEMPTS:
         raise ValueError("development outcome matrix is incomplete")
     if not np.isfinite(rewards).all() or not np.isfinite(costs).all():
         raise ValueError("development outcome matrix is not finite and dense")
@@ -997,7 +1024,10 @@ def fit(
     ]
     report: dict[str, object] = {
         "protocol": PROTOCOL,
-        "tasks": TASKS,
+        "source_tasks": TASKS,
+        "tasks": len(source.data.task_ids),
+        "retained_task_coverage": len(source.data.task_ids) / TASKS,
+        "excluded_tasks": TASKS - len(source.data.task_ids),
         "repositories": len(set(source.data.groups)),
         "candidate_count": len(results),
         "selection_rule": (

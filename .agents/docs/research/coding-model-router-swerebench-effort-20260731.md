@@ -192,6 +192,13 @@ gradeable outcomes. Each effort archive and compact audit report is synced and
 hashed before its task state advances. A worker failure leaves completed
 efforts immutable and resumes only missing scientific cells.
 
+If inference completes but the official verifier has a genuine infrastructure
+failure, such as a scoring timeout, archive and hash the raw evidence and drop
+the whole task from every arm. Never rerun that cell and never retain the other
+arms for that task. Development fitting requires at least 190 of 200 tasks and
+records every excluded task, reason, evidence hash, attempted-cell usage, and a
+zero-rerun assertion in the collection audit.
+
 The development validator initially required token usage on every provider
 attempt. Four otherwise gradeable task-effort artifacts each included one
 recorded OpenAI 503 attempt with null usage, followed by additional successful
@@ -269,7 +276,7 @@ development outcome rows for the shuffled-label control.
 
 Classical fitting runs in the model-free E2B template
 `deepswe-router-fit-v1`, template ID `u5ltefskx4nubvoxd1gc`, successful build
-ID `8d9dbaaf-4f84-48e5-843c-9ebeae1ae36e`. It provides 8 CPUs and 8,192 MiB,
+ID `b0b8e9b8-e4a8-4cac-8d2d-642b09c71671`. It provides 8 CPUs and 8,192 MiB,
 pins SciPy 1.18.0 and scikit-learn 1.9.0, and contains source code only. It
 contains no experiment outcomes, fitted router state, or foundation-model
 weights.

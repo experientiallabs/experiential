@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import coding_model_router_swerebench_fit as fit
 import numpy as np
+import pytest
 from coding_model_router_codeforces_fit import ARMS, Data
 
 
@@ -53,6 +57,69 @@ def test_grouped_folds_have_zero_repository_overlap() -> None:
         assert set(np.asarray(source.data.groups)[train]).isdisjoint(
             set(np.asarray(source.data.groups)[test])
         )
+
+
+def test_load_source_drops_whole_infrastructure_missing_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    corpus_path = tmp_path / "corpus.json"
+    outcomes_path = tmp_path / "outcomes.jsonl"
+    audit_path = tmp_path / "audit.json"
+    tasks = [
+        {
+            "task_id": f"task-{index}",
+            "repository": f"repo-{index}",
+            "language": "Python",
+            "prompt": f"fix bug {index}",
+        }
+        for index in range(fit.TASKS)
+    ]
+    corpus_path.write_text(json.dumps({"tasks": tasks}), encoding="utf-8")
+    monkeypatch.setattr(
+        fit,
+        "DEVELOPMENT_CORPUS_SHA256",
+        fit._sha256(corpus_path),
+    )
+    rows = [
+        {
+            "task_id": task["task_id"],
+            "arm": arm,
+            "attempt_number": attempt,
+            "model": "gpt-5.6-luna",
+            "reward": float(arm_index >= 2),
+            "cost_usd": 0.01 * (arm_index + 1),
+            "target_outcomes_used": False,
+        }
+        for task in tasks[1:]
+        for arm_index, arm in enumerate(ARMS)
+        for attempt in range(fit.ATTEMPTS)
+    ]
+    outcomes_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    audit = {
+        "valid": True,
+        "source_tasks": fit.TASKS,
+        "tasks": fit.TASKS - 1,
+        "retained_task_coverage": (fit.TASKS - 1) / fit.TASKS,
+        "excluded_tasks": [
+            {
+                "task_id": "task-0",
+                "scope": "whole-task",
+                "scientific_cells_rerun": 0,
+            }
+        ],
+        "cells": len(rows),
+        "target_outcomes_used": False,
+        "deep_swe_outcomes_accessed": False,
+        "outcomes_sha256": fit._sha256(outcomes_path),
+    }
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+    source = fit.load_source(corpus_path, outcomes_path, audit_path)
+    assert len(source.data.task_ids) == fit.TASKS - 1
+    assert "task-0" not in source.data.task_ids
+    assert source.raw_rewards.shape == (fit.TASKS - 1, len(ARMS), fit.ATTEMPTS)
 
 
 def test_direct_full_fit_router_returns_a_frozen_effort() -> None:
