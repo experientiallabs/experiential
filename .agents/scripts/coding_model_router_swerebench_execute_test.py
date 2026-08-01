@@ -79,6 +79,10 @@ def test_validator_accepts_post_execution_agent_timeout_as_zero(tmp_path: Path) 
     assert cell["official_verifier_reached"] is False
     assert cell["patch_sha256"] is None
     assert cell["scoring_seconds"] is None
+    max_turns = _timeout_trace()
+    max_turns["stop_condition"] = "max_turns"
+    result = _run_validator(tmp_path, max_turns)
+    assert result.returncode == 0, result.stderr
 
 
 def test_validator_rejects_unrecognized_unscored_error(tmp_path: Path) -> None:

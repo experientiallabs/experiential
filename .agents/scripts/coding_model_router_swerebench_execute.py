@@ -84,7 +84,7 @@ for index, outer in enumerate(records):
         reward is None
         and trace.get("ok") is False
         and outer.get("ok") is False
-        and trace.get("stop_condition") == "error"
+        and trace.get("stop_condition") in {"error", "max_turns"}
         and trace.get("info", {}).get("patch") is None
         and isinstance(trace_errors, list)
         and any(

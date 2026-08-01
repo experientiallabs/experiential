@@ -212,7 +212,10 @@ no reward. Per the frozen outcome rule above, this is a gradeable
 post-execution agent-failure zero, not retryable infrastructure. The validator
 accepts only that explicit agent-timeout shape, records reward provenance and
 that the official verifier was not reached, and continues to reject every
-other unrecognized unscored trace.
+other unrecognized unscored trace. The pinned harness has emitted the same
+timeout with both `error` and `max_turns` stop labels, so the explicit timeout
+error record, absent patch, failed trace status, and completed provider usage
+are the canonical classification fields rather than the stop label alone.
 
 ## Target-compatible candidate families
 
@@ -262,6 +265,13 @@ persisted; no fitted Ridge, item-response, kNN bank, or foundation-model state
 is retained. Before confirmation outcomes are generated, the same frozen
 fitter also writes decisions from a fixed within-repository permutation of the
 development outcome rows for the shuffled-label control.
+
+Classical fitting runs in the model-free E2B template
+`deepswe-router-fit-v1`, template ID `u5ltefskx4nubvoxd1gc`, successful build
+ID `8d9dbaaf-4f84-48e5-843c-9ebeae1ae36e`. It provides 8 CPUs and 8,192 MiB,
+pins SciPy 1.18.0 and scikit-learn 1.9.0, and contains source code only. It
+contains no experiment outcomes, fitted router state, or foundation-model
+weights.
 
 ## Confirmation gates
 
