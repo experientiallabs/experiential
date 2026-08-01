@@ -99,6 +99,14 @@ draw resamples confirmation repositories with replacement and computes mean
 clusters. Its 2.5th percentile must be nonnegative. This exact interval is frozen before any
 confirmation outcome is collected.
 
+The protocol's existing matched task-blind requirement is also applied mechanically on
+confirmation. For each task, the control reward is the router's aggregate model traffic dotted
+with that task's six arm rewards. A second 10,000-draw repository-cluster bootstrap with seed
+20260802 estimates `router reward - identical-traffic task-blind reward`; its 2.5th percentile must
+be strictly positive. The confirmation report includes all 15 pair oracles as well as the full
+oracle. These checks were implemented while confirmation remained sealed and do not change the
+development search or selected route.
+
 ## Compute, persistence, and spend
 
 All cohort transformation, fitting, and analysis run on E2B or Azure. The Mac only orchestrates,

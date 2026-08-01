@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import math
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ ARMS = (
 QUALITY_RETENTION = 0.95
 MIN_SAVINGS = 0.40
 BOOTSTRAP_SEED = 20260801
+MATCHED_BLIND_BOOTSTRAP_SEED = 20260802
 BOOTSTRAP_DRAWS = 10_000
 MAX_ROUTE_P95_MS = 5.0
 
@@ -95,38 +97,74 @@ def _metrics(
     }
 
 
-def _bootstrap_margin(
+def _cluster_bootstrap(
     repositories: list[str],
-    router_rewards: np.ndarray,
-    baseline_rewards: np.ndarray,
+    differences: np.ndarray,
+    *,
+    seed: int,
+    estimand: str,
 ) -> dict[str, Any]:
-    """Repository-cluster bootstrap of router minus 95 percent static quality."""
+    """Return a repository-cluster bootstrap interval for paired differences."""
+    if differences.shape != (len(repositories),) or not np.isfinite(differences).all():
+        raise ValueError("bootstrap differences must align with repositories and be finite")
     unique = sorted(set(repositories))
+    if not unique:
+        raise ValueError("repository bootstrap requires at least one repository")
+    repository_array = np.asarray(repositories)
     cluster_values = []
     cluster_counts = []
-    margin = router_rewards - QUALITY_RETENTION * baseline_rewards
     for repository in unique:
-        indices = np.flatnonzero(np.asarray(repositories) == repository)
-        cluster_values.append(float(np.sum(margin[indices])))
+        indices = np.flatnonzero(repository_array == repository)
+        cluster_values.append(float(np.sum(differences[indices])))
         cluster_counts.append(len(indices))
     values = np.asarray(cluster_values)
     counts = np.asarray(cluster_counts)
-    rng = np.random.default_rng(BOOTSTRAP_SEED)
+    rng = np.random.default_rng(seed)
     draws = np.empty(BOOTSTRAP_DRAWS)
     for draw in range(BOOTSTRAP_DRAWS):
         sampled = rng.integers(0, len(unique), size=len(unique))
         draws[draw] = float(values[sampled].sum() / counts[sampled].sum())
     interval = np.quantile(draws, [0.025, 0.5, 0.975])
     return {
-        "seed": BOOTSTRAP_SEED,
+        "seed": seed,
         "draws": BOOTSTRAP_DRAWS,
         "repositories": len(unique),
-        "estimand": "mean router reward minus 0.95 times fit-selected static reward",
+        "estimand": estimand,
         "lower_95": float(interval[0]),
         "median": float(interval[1]),
         "upper_95": float(interval[2]),
         "passed": bool(interval[0] >= 0.0),
     }
+
+
+def _bootstrap_margin(
+    repositories: list[str],
+    router_rewards: np.ndarray,
+    baseline_rewards: np.ndarray,
+) -> dict[str, Any]:
+    """Bootstrap router reward minus 95 percent of fit-selected static reward."""
+    return _cluster_bootstrap(
+        repositories,
+        router_rewards - QUALITY_RETENTION * baseline_rewards,
+        seed=BOOTSTRAP_SEED,
+        estimand="mean router reward minus 0.95 times fit-selected static reward",
+    )
+
+
+def _bootstrap_matched_blind(
+    repositories: list[str],
+    router_rewards: np.ndarray,
+    blind_rewards: np.ndarray,
+) -> dict[str, Any]:
+    """Bootstrap router reward minus identical-traffic task-blind mixing."""
+    result = _cluster_bootstrap(
+        repositories,
+        router_rewards - blind_rewards,
+        seed=MATCHED_BLIND_BOOTSTRAP_SEED,
+        estimand="mean router reward minus identical-traffic task-blind reward",
+    )
+    result["passed"] = float(result["lower_95"]) > 0.0
+    return result
 
 
 def analyze(args: argparse.Namespace) -> None:
@@ -225,13 +263,24 @@ def analyze(args: argparse.Namespace) -> None:
     }
     if len(route_by_id) != 320 or any(task_id not in route_by_id for task_id in task_ids):
         raise ValueError("frozen confirmation routes are incomplete")
-    choices = np.asarray([arm_index[route_by_id[task_id]] for task_id in task_ids])
+    choices = np.asarray(
+        [arm_index[route_by_id[task_id]] for task_id in task_ids],
+        dtype=np.int64,
+    )
     metrics = _metrics(rewards, costs, choices, baseline)
     row_indices = np.arange(len(tasks))
+    repositories = [str(task["repository"]) for task in tasks]
+    router_rewards = rewards[row_indices, choices]
     bootstrap = _bootstrap_margin(
-        [str(task["repository"]) for task in tasks],
-        rewards[row_indices, choices],
+        repositories,
+        router_rewards,
         rewards[:, baseline],
+    )
+    traffic = np.bincount(choices, minlength=len(ARMS)).astype(float) / len(choices)
+    matched_blind_bootstrap = _bootstrap_matched_blind(
+        repositories,
+        router_rewards,
+        rewards @ traffic,
     )
     static = [
         {
@@ -251,12 +300,31 @@ def analyze(args: argparse.Namespace) -> None:
             for index in row_indices
         ]
     )
+    pair_oracles = []
+    for left, right in combinations(range(len(ARMS)), 2):
+        pair_choices = np.where(
+            rewards[:, right] > rewards[:, left],
+            right,
+            np.where(
+                rewards[:, left] > rewards[:, right],
+                left,
+                np.where(costs[:, right] < costs[:, left], right, left),
+            ),
+        )
+        pair_oracles.append(
+            {
+                "pair": [ARMS[left], ARMS[right]],
+                **_metrics(rewards, costs, pair_choices, baseline),
+            }
+        )
     route_latency = routes.get("route_decision_latency_ms", {})
     latency_p95 = route_latency.get("p95") if isinstance(route_latency, dict) else None
     gates = {
         "quality_retention": metrics["quality_retention"] >= QUALITY_RETENTION,
         "cost_savings": metrics["cost_savings"] >= MIN_SAVINGS,
         "paired_repository_bootstrap": bootstrap["passed"],
+        "positive_matched_blind_point": metrics["matched_blind_advantage"] > 0.0,
+        "positive_matched_blind_bootstrap": matched_blind_bootstrap["passed"],
         "not_dominated_by_static": not metrics["dominated_by_static"],
         "route_latency": isinstance(latency_p95, (int, float))
         and float(latency_p95) < MAX_ROUTE_P95_MS,
@@ -271,10 +339,12 @@ def analyze(args: argparse.Namespace) -> None:
         "excluded_tasks": sorted(excluded),
         "router": metrics,
         "repository_bootstrap": bootstrap,
+        "matched_blind_repository_bootstrap": matched_blind_bootstrap,
         "route_decision_latency_ms": route_latency,
         "gates": gates,
         "static": static,
         "oracle": _metrics(rewards, costs, oracle_choices, baseline),
+        "pair_oracles": pair_oracles,
         "rough_cumulative_spend_usd": audit["rough_cumulative_experiment_spend_usd"],
         "target_outcomes_used": False,
         "deep_swe_outcomes_accessed": False,
