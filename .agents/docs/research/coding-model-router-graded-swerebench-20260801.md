@@ -179,13 +179,13 @@ cells and provider usage were irrecoverable. Both tasks are permanently excluded
 arms with zero reruns. The maximum retained development cohort is now 656 of 673, or 97.5 percent,
 still above the frozen requirement.
 
-A second E2B HTTP/2 control-plane wave then affected nine workers for
+A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
-`moment__luxon-1685`, `tailwindlabs__tailwindcss-jit-69`,
+`moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,
 `open-telemetry__opentelemetry-go-contrib-3041`, `swc-project__swc-8703`,
 `solid__community-server-347`, and `pyca__cryptography-12342`. Every affected attempt terminated
 before recording a Docker image, scientific command, or provider call. Together with the five
-earlier transport failures, these fourteen tasks remain eligible for exactly one fresh-sandbox
+earlier transport failures, these fifteen tasks remain eligible for exactly one fresh-sandbox
 infrastructure retry after the initial controller finishes.
 
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
