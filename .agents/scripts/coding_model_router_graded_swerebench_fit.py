@@ -328,6 +328,10 @@ def _static_baseline(data: Data) -> int:
 
 
 def _metrics(data: Data, choices: np.ndarray) -> dict[str, Any]:
+    if choices.shape != (len(data.task_ids),) or np.any(
+        (choices < 0) | (choices >= len(ARMS))
+    ):
+        raise ValueError("routing choices must cover every task with a known arm")
     rows = np.arange(len(choices))
     reward = float(np.mean(data.rewards[rows, choices]))
     cost = float(np.mean(data.costs[rows, choices]))
@@ -358,6 +362,17 @@ def _metrics(data: Data, choices: np.ndarray) -> dict[str, Any]:
         },
         "dominated_by_static": dominated,
     }
+
+
+def _passes_development_gates(seed_metrics: list[dict[str, Any]]) -> bool:
+    """Apply every frozen promotion gate independently to every split seed."""
+    return (
+        len(seed_metrics) == len(SEEDS)
+        and all(float(row["quality_retention"]) >= QUALITY_RETENTION for row in seed_metrics)
+        and all(float(row["cost_savings"]) >= MIN_SAVINGS for row in seed_metrics)
+        and all(float(row["matched_blind_advantage"]) > 0.0 for row in seed_metrics)
+        and all(not row["dominated_by_static"] for row in seed_metrics)
+    )
 
 
 def _frontiers(data: Data) -> dict[str, Any]:
@@ -524,13 +539,7 @@ def _crossfit(data: Data, vectors: np.ndarray) -> tuple[Candidate | None, dict[s
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
         seed_metrics = [_metrics(data, routes[(seed, candidate.key)]) for seed in SEEDS]
-        passed = (
-            all(float(row["quality_retention"]) >= QUALITY_RETENTION for row in seed_metrics)
-            and all(float(row["cost_savings"]) >= MIN_SAVINGS for row in seed_metrics)
-            and float(np.mean([float(row["matched_blind_advantage"]) for row in seed_metrics]))
-            > 0.0
-            and all(not row["dominated_by_static"] for row in seed_metrics)
-        )
+        passed = _passes_development_gates(seed_metrics)
         item = {
             "candidate": candidate.key,
             "configuration": asdict(candidate),

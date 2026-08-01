@@ -33,10 +33,10 @@ def test_metrics_use_fit_selected_baseline() -> None:
     rewards = np.asarray([[0.2, 0.4], [0.3, 0.5]])
     costs = np.asarray([[1.0, 3.0], [1.0, 3.0]])
     original = module.ARMS
-    module.ARMS = ("cheap", "guard")
+    vars(module)["ARMS"] = ("cheap", "guard")
     try:
         metrics = module._metrics(rewards, costs, np.asarray([0, 1]), baseline=1)
     finally:
-        module.ARMS = original
+        vars(module)["ARMS"] = original
     assert metrics["quality_retention"] == 0.35 / 0.45
     assert metrics["cost_savings"] > 0.0

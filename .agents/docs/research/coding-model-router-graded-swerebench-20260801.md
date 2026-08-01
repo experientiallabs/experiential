@@ -145,3 +145,11 @@ scientific command started and remain eligible for the single frozen infrastruct
 the transport failed and its sandbox was terminated. Neither scientific cell can be recovered or
 rerun. Both tasks are permanently excluded whole-task. The resulting 661 of 673 maximum
 development coverage is 98.2 percent, above the frozen requirement.
+
+A pre-fit code audit found that the implementation required positive matched task-blind advantage
+only after averaging the five split seeds. The frozen rule requires a positive advantage in every
+seed. The fitter now applies all four development gates independently to each seed and fails on an
+incomplete route vector. This correction happened before development collection or fitting and
+before any confirmation outcome was accessed. The remote fit manifest also records successful
+sandbox termination only after termination completes, so it cannot claim destruction of fitted
+state early. Neither correction changes the frozen candidate grid or selection order.

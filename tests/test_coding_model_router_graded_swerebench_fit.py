@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 SCRIPTS = Path(__file__).parents[1] / ".agents" / "scripts"
 SPEC = importlib.util.spec_from_file_location(
@@ -54,6 +55,27 @@ def test_metrics_include_task_blind_control_and_static_dominance() -> None:
     assert "matched_blind_advantage" in metrics
     assert "dominated_by_static" in metrics
     assert metrics["quality_retention"] > 0.0
+
+
+def test_metrics_reject_incomplete_routes() -> None:
+    with pytest.raises(ValueError, match="cover every task"):
+        module._metrics(_data(), np.asarray([0, -1]))
+
+
+def test_development_gate_requires_positive_blind_advantage_in_every_seed() -> None:
+    rows = [
+        {
+            "quality_retention": 0.96,
+            "cost_savings": 0.5,
+            "matched_blind_advantage": 0.02,
+            "dominated_by_static": [],
+        }
+        for _ in module.SEEDS
+    ]
+    assert module._passes_development_gates(rows)
+    rows[0]["matched_blind_advantage"] = -0.001
+    rows[1]["matched_blind_advantage"] = 0.1
+    assert not module._passes_development_gates(rows)
 
 
 def test_repository_folds_have_zero_overlap() -> None:
