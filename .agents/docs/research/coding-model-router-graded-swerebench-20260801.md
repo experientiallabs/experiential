@@ -185,6 +185,12 @@ and provider usage were irrecoverable. The task is permanently excluded across a
 zero reruns. The maximum retained development cohort is now 655 of 673, or 97.3 percent, still
 above the frozen requirement.
 
+The first `luna-max` command for `bitburner-official__bitburner-src-754` also completed
+successfully but produced no official graded reward. The worker had terminated and its provider
+usage could not be recovered. The task is permanently excluded across all six arms with zero
+reruns. The maximum retained development cohort is now 654 of 673, or 97.2 percent, still above
+the frozen requirement.
+
 A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
 `moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,
@@ -193,6 +199,12 @@ A second E2B HTTP/2 control-plane wave then affected ten workers for
 before recording a Docker image, scientific command, or provider call. Together with the five
 earlier transport failures, these fifteen tasks remain eligible for exactly one fresh-sandbox
 infrastructure retry after the initial controller finishes.
+
+A later stale HTTP/2 connection affected the `luna-low` worker for
+`swiftlang__swift-syntax-2475` after four other arms had completed with valid artifacts. The failed
+worker recorded no Docker identity, scientific command, or provider call. It joins the same single
+fresh-sandbox infrastructure retry, bringing that queue to sixteen tasks without changing the
+scientific attempt count.
 
 The installed E2B SDK creates a thread-local HTTP/2 transport with a 300-second keepalive cache.
 That reuse matches the observed stale closed-connection error. The single frozen retry pass will
