@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from wmo.providers._anthropic_chat import messages_request, messages_response
+from wmo.providers._anthropic_chat import effort_fields, messages_request, messages_response
 from wmo.providers.base import (
     DEFAULT_MAX_TOKENS,
     Completion,
@@ -65,22 +65,18 @@ class AnthropicProvider:
                 "variable holding it explicitly (a pool entry's `api_key_env` field)"
             )
 
-    def _refuse_dropped_effort(self, path: str) -> None:
-        """Refuse a config whose effort dial this path would silently drop.
+    def _effort_kwargs(self) -> dict[str, object]:
+        """The config's effort dial as extra Messages-API kwargs; empty when undialed.
 
         `PoolEntry.reasoning_effort` exists so two entries differing only in
-        effort are two ARMS. Only `complete_chat` forwards the dial; a text or
-        streaming call would send byte-identical requests for both arms, so a
-        grid comparing them would measure sampling noise and report an effort
-        effect. Refusing loudly is the same posture Azure's streaming path
-        takes for the same gap.
+        effort are two ARMS, and every call path must keep them two arms:
+        `complete_chat` forwards the dial through `messages_request`, and the
+        text and streaming paths splat exactly the same fields here. One wire
+        shape, one owner (`effort_fields`).
         """
-        if self.config.reasoning_effort is not None:
-            raise ValueError(
-                f"AnthropicProvider.{path} does not forward reasoning_effort="
-                f"{self.config.reasoning_effort!r}; only complete_chat does. Two pool arms "
-                "differing only in effort would silently collapse into one on this path."
-            )
+        if self.config.reasoning_effort is None:
+            return {}
+        return effort_fields(self.config.reasoning_effort)
 
     def complete(
         self,
@@ -92,7 +88,6 @@ class AnthropicProvider:
     ) -> Completion:
         # Opus 4.8 takes `system` as a top-level arg and rejects sampling params, so temperature
         # is intentionally not forwarded; adaptive thinking is the default.
-        self._refuse_dropped_effort("complete")
         api_messages = [
             cast("MessageParam", {"role": m.role, "content": m.content}) for m in messages
         ]
@@ -101,6 +96,7 @@ class AnthropicProvider:
             system=system,
             messages=api_messages,
             max_tokens=max_tokens,
+            **cast("Any", self._effort_kwargs()),
         )
         text = "".join(block.text for block in response.content if block.type == "text")
         # Anthropic reports cache reads and writes BESIDE input_tokens (input_tokens excludes
@@ -146,7 +142,6 @@ class AnthropicProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> Iterator[StreamChunk]:
         """Stream a completion natively (raw SSE events; temperature not forwarded, as complete)."""
-        self._refuse_dropped_effort("stream")
         del temperature  # Claude 4.8+/5 reject sampling params; mirror complete()
         api_messages = [
             cast("MessageParam", {"role": m.role, "content": m.content}) for m in messages
@@ -161,6 +156,7 @@ class AnthropicProvider:
                 messages=api_messages,
                 max_tokens=max_tokens,
                 stream=True,
+                **cast("Any", self._effort_kwargs()),
             ),
         )
         usage = TokenUsage()

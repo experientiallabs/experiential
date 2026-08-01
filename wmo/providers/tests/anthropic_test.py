@@ -152,13 +152,69 @@ def test_complete_chat_wires_the_configs_reasoning_effort_to_the_wire(
     assert response.choices[0].message.content == "ok"
 
 
-def test_text_paths_refuse_a_config_whose_effort_they_would_drop() -> None:
-    """Two arms differing only in effort must never silently collapse into one."""
+def test_complete_forwards_the_configs_effort_dial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two arms differing only in effort must stay two arms on the text path.
+
+    The sweep's agent measures candidates through `complete`, so this is the
+    line that lets an effort-dialed Claude arm be MEASURED at all; before it,
+    the path refused the dial and Claude arms could not sweep.
+    """
+    fake = _FakeClient(_FakeResponse([_FakeTextBlock("ok")], _FakeUsage(3, 2)))
+    provider = AnthropicProvider(
+        ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-fable-5", reasoning_effort="high")
+    )
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    provider.complete("system", [Message(role="user", content="hi")])
+
+    assert fake.messages.last_kwargs["thinking"] == {"type": "adaptive"}
+    assert fake.messages.last_kwargs["output_config"] == {"effort": "high"}
+
+
+def test_complete_sends_no_thinking_fields_when_undialed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An undialed config keeps the request byte-identical to before the dial existed."""
+    fake = _FakeClient(_FakeResponse([_FakeTextBlock("ok")], _FakeUsage(3, 2)))
+    provider = AnthropicProvider(_config())
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
+
+    provider.complete("system", [Message(role="user", content="hi")])
+
+    assert "thinking" not in fake.messages.last_kwargs
+    assert "output_config" not in fake.messages.last_kwargs
+
+
+def test_stream_forwards_the_configs_effort_dial(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The streaming path sends the same wire fields as complete and complete_chat."""
+
+    class _FakeStream:
+        def __iter__(self) -> object:
+            return iter(())
+
+        def close(self) -> None:
+            return None
+
+    class _FakeStreamMessages:
+        def __init__(self) -> None:
+            self.last_kwargs: dict[str, object] = {}
+
+        def create(self, **kwargs: object) -> _FakeStream:
+            self.last_kwargs = kwargs
+            return _FakeStream()
+
+    class _FakeStreamClient:
+        def __init__(self) -> None:
+            self.messages = _FakeStreamMessages()
+
+    fake = _FakeStreamClient()
     provider = AnthropicProvider(
         ProviderConfig(kind=ProviderKind.ANTHROPIC, model="claude-fable-5", reasoning_effort="max")
     )
+    monkeypatch.setattr(provider, "_get_client", lambda: fake)
 
-    with pytest.raises(ValueError, match="does not forward reasoning_effort"):
-        provider.complete("system", [Message(role="user", content="hi")])
-    with pytest.raises(ValueError, match="does not forward reasoning_effort"):
-        next(provider.stream("system", [Message(role="user", content="hi")]))
+    list(provider.stream("system", [Message(role="user", content="hi")]))
+
+    assert fake.messages.last_kwargs["stream"] is True
+    assert fake.messages.last_kwargs["thinking"] == {"type": "adaptive"}
+    assert fake.messages.last_kwargs["output_config"] == {"effort": "max"}
