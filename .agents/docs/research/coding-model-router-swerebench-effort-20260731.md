@@ -235,6 +235,17 @@ not as a fitted feature.
    64, asymmetric guard, `knn_z` in 0, 0.5, 1, 1.645, and 2, and `pick_lam` in
    0, 0.01, 0.02, and 0.03. No absolute similarity floor is allowed.
 
+The complete pre-outcome grid uses hash dimensions 512, 2,048, and 8,192 and
+Ridge alphas 1, 10, and 100. Direct-delta, monotone-ordinal, and pairwise-uplift
+heads select the cheapest arm within predicted reward 0, 0.02, 0.05, 0.10, or
+0.20 of their predicted best. The two-parameter item-response model uses linear
+quality weights 0.70, 0.80, 0.90, 0.95, 0.98, and 0.99 against min-max
+normalized fit-only arm cost. kNN crosses all three hash dimensions, all five
+fixed guard arms, the registered `k`, `knn_z`, and `pick_lam` values, fixes
+`min_pairs=8`, enables the standard-error floor, and sets both the absolute
+similarity threshold and floor quantile to zero. This is 1,389 candidate
+points. No candidate is added after the development matrix is complete.
+
 Within five development outer folds grouped by repository, fit-only selection
 chooses the least costly point within 0.5 reward points of the fold's strongest
 eligible quality point, then breaks ties by higher reward, lower route latency,
@@ -244,6 +255,13 @@ static reward in every outer fold, and avoid static dominance. Development is
 adaptive within these families, but it may freeze only one confirmation rule.
 No confirmation result may change its features, hyperparameters, thresholds,
 guard, arm roster, or tie breaks.
+
+The selected fitter is refit ephemerally on development outcomes on E2B. Only
+its canonical configuration, audits, and label-free confirmation decisions are
+persisted; no fitted Ridge, item-response, kNN bank, or foundation-model state
+is retained. Before confirmation outcomes are generated, the same frozen
+fitter also writes decisions from a fixed within-repository permutation of the
+development outcome rows for the shuffled-label control.
 
 ## Confirmation gates
 
