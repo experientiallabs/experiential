@@ -320,6 +320,15 @@ def candidate_grid(rewards: np.ndarray, costs: np.ndarray) -> tuple[Candidate, .
     return result
 
 
+def _static_baseline(data: Data) -> int:
+    rewards = data.rewards.mean(axis=0)
+    costs = data.costs.mean(axis=0)
+    return min(
+        range(len(ARMS)),
+        key=lambda arm: (-rewards[arm], costs[arm], arm),
+    )
+
+
 def _neighbors(
     features: sparse.csr_matrix,
     folds: np.ndarray,
@@ -490,6 +499,7 @@ def _crossfit(data: Data) -> tuple[Candidate, dict[str, object]] | None:
         "selected_order": selected.order,
         "selected_family": selected.family,
         "selected_pair": [ARMS[selected.cheap], ARMS[selected.expensive]],
+        "development_static_baseline": ARMS[_static_baseline(data)],
         "selected_seed_metrics": [
             {"seed": seed, **_metric_json(metric)}
             for seed, metric in zip(SEEDS, selected_metrics, strict=True)
@@ -680,6 +690,7 @@ def fit(
         "valid": True,
         "selected_candidate": selected.key,
         "selected_pair": [ARMS[selected.cheap], ARMS[selected.expensive]],
+        "development_static_baseline": selection["development_static_baseline"],
         "selected_config": {
             "family": selected.family,
             "dim": selected.dim,

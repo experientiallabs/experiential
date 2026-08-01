@@ -65,12 +65,14 @@ def authorize(
     prefix = MODELS[model][0]
     arm = f"{prefix}-{effort}"
     selected_pair = report.get("selected_pair")
+    baseline = report.get("development_static_baseline")
     if (
         report.get("valid") is not True
         or report.get("development_passed") is not True
         or report.get("confirmation_authorized") is not True
         or not isinstance(selected_pair, list)
         or len(selected_pair) != 2
+        or baseline not in selected_pair
         or arm not in selected_pair
         or report.get("target_outcomes_used") is not False
         or report.get("deep_swe_outcomes_accessed") is not False
@@ -80,6 +82,7 @@ def authorize(
     if (
         lock.get("valid") is not True
         or lock.get("selected_pair") != selected_pair
+        or lock.get("development_static_baseline") != baseline
         or lock.get("selected_candidate") != report.get("selected_candidate")
         or lock.get("null_count") != 128
         or lock.get("null_unique_route_hashes") != 128
@@ -130,6 +133,7 @@ def authorize(
     return float(spend), {
         "selected_candidate": report["selected_candidate"],
         "selected_pair": selected_pair,
+        "development_static_baseline": baseline,
         "selection_report_sha256": runner._sha256(report_path),
         "selection_lock_sha256": runner._sha256(lock_path),
         "confirmation_routes_sha256": runner._sha256(routes_path),
