@@ -25,6 +25,10 @@ import pytest
             "excluded-ungradeable-scientific-cell",
             "scientific artifact became irrecoverable after E2B transport loss",
         ),
+        (
+            "excluded-ungradeable-scientific-cell",
+            "official graded trace became irrecoverable after missing usage audit failure",
+        ),
     ],
 )
 def test_permanent_whole_task_exclusion(module: ModuleType, stage: str, reason: str) -> None:

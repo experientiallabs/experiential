@@ -197,6 +197,23 @@ reward. The worker had terminated and its provider usage could not be recovered.
 permanently excluded across all six arms with zero reruns. The maximum retained development cohort
 is now 653 of 673, or 97.0 percent, still above the frozen requirement.
 
+The first `sol-max` command for `google__starlark-go-567` completed and reached an official graded
+reward, but one provider trace row lacked usage counters. The validator still treated that missing
+metering as ungradeable, contrary to the user's frozen allowance for labeled estimates. The worker
+had terminated before the audit failure was classified, so the trace and scientific cell became
+irrecoverable. The task is permanently excluded across all six arms with zero reruns. The validator
+now preserves an official reward when counters are absent: provider rejections retain zero usage,
+while other missing rows receive a deterministic conservative estimate from the serialized trace
+plus the frozen 4,096-token allowance. The report labels mixed exact and estimated provenance. This
+changes cost accounting only and does not alter rewards, prompts, arms, attempts, or the verifier.
+The healthy controller was not restarted. A second zero-provider watcher waits for the original
+audit watcher to finish each sandbox, then writes the metering-tolerant validator last. Its ignored
+launch source SHA-256 is
+`6aae5e0872bb9193f1a5a15cfa3f850b99f25f8377898beab9655b1af75d40c5`; its append-only log
+records each sandbox update and suppresses sandboxes proven terminated.
+The maximum retained development cohort is now 652 of 673, or 96.9 percent, still above the frozen
+requirement.
+
 A second E2B HTTP/2 control-plane wave then affected ten workers for
 `joernio__joern-5591`, `shazow__whatsabi-174`, `pymodbus-dev__pymodbus-2593`,
 `moment__luxon-1685`, `icssc__antalmanac-912`, `tailwindlabs__tailwindcss-jit-69`,

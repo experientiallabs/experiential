@@ -171,6 +171,7 @@ usage = {field: 0 for field in (
     "prompt_tokens", "cached_input_tokens", "completion_tokens", "reasoning_tokens"
 )}
 provider_errors = []
+estimated_usage_calls = []
 for call_index, call in enumerate(calls):
     if call.get("model") != args.model:
         raise SystemExit(f"call {call_index} has a different model")
@@ -182,16 +183,23 @@ for call_index, call in enumerate(calls):
     call_usage = call.get("usage")
     if call_usage is None:
         error = call.get("error")
-        if not isinstance(error, dict):
-            raise SystemExit(f"call {call_index} lacks usage and error")
-        status = error.get("status_code")
-        if not isinstance(status, int) or not 429 <= status <= 599:
-            raise SystemExit(f"call {call_index} has ungradeable missing usage")
-        provider_errors.append({
+        status = error.get("status_code") if isinstance(error, dict) else None
+        if isinstance(status, int) and 400 <= status <= 599:
+            provider_errors.append({
+                "call_index": call_index,
+                "type": error.get("type"),
+                "status_code": status,
+                "usage_charge": "zero; provider rejected the request before inference",
+            })
+            continue
+        serialized = json.dumps(call, sort_keys=True, separators=(",", ":"))
+        estimated_input = 4096 + max(1, (len(serialized.encode()) + 3) // 4)
+        usage["prompt_tokens"] += estimated_input
+        estimated_usage_calls.append({
             "call_index": call_index,
-            "type": error.get("type"),
-            "status_code": status,
-            "usage_charge": "zero; provider returned no inference usage",
+            "input_tokens": estimated_input,
+            "output_tokens": 0,
+            "method": "4096 token allowance plus serialized trace bytes divided by four",
         })
         continue
     if not isinstance(call_usage, dict):
@@ -238,6 +246,7 @@ report = {
     "provider_calls": len(calls),
     "provider_inference_calls": inference_calls,
     "provider_errors": provider_errors,
+    "estimated_usage_calls": estimated_usage_calls,
     "stop_condition": trace.get("stop_condition"),
     "trace_ok": trace.get("ok"),
     "outer_ok": outer.get("ok"),
@@ -248,7 +257,11 @@ report = {
     "patch_provenance": patch_provenance,
     "scoring_seconds": scoring_seconds,
     "usage": usage,
-    "usage_provenance": "exact token counts from pinned verifier Responses trace",
+    "usage_provenance": (
+        "mixed exact and conservative trace-derived token estimate"
+        if estimated_usage_calls
+        else "exact token counts from pinned verifier Responses trace"
+    ),
 }
 args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
 '''
@@ -383,6 +396,10 @@ def _excluded(state: dict[str, Any]) -> bool:
             (
                 "excluded-ungradeable-scientific-cell",
                 "scientific artifact became irrecoverable after E2B transport loss",
+            ),
+            (
+                "excluded-ungradeable-scientific-cell",
+                "official graded trace became irrecoverable after missing usage audit failure",
             ),
         }
         and exclusion.get("scope") == "whole-task"
