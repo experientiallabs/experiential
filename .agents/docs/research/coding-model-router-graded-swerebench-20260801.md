@@ -121,4 +121,13 @@ experiment-owned sandboxes without changing any scientific evaluation, and a zer
 keeps that correction in newly created workers from the already-running controller. Six cells
 completed before their validator was updated and their remote traces were lost on worker
 termination. Those six tasks are permanently excluded whole-task with zero reruns. The resulting
-667 of 673 maximum development coverage is 99.1 percent, above the frozen 95 percent requirement.
+667 of 673 initial maximum development coverage was 99.1 percent.
+
+The first watcher revision could write before the controller's startup validator write and then be
+overwritten. It also raced one controller write, producing an invalid audit script. Three more
+scientifically completed cells lost only their local audit artifacts: `prestashop__prestashop-27425`,
+`neurodatawithoutborders__pynwb-439`, and `prestashop__prestashop-37692`. All three tasks are
+permanently excluded whole-task with zero scientific reruns. The watcher now waits until the
+controller persists the pulled Docker image identity, which occurs after the controller validator
+write, before installing the corrected audit-only validator. The resulting 664 of 673 maximum
+development coverage is 98.7 percent, above the frozen 95 percent requirement.
