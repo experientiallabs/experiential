@@ -166,6 +166,12 @@ and provider usage were irrecoverable. The task is permanently excluded across a
 zero reruns. The maximum retained development cohort is now 659 of 673, or 97.9 percent, still
 above the frozen requirement.
 
+After four valid arms, the `luna-medium` command for
+`gardener__machine-controller-manager-995` completed successfully but its official trace contained
+no graded reward. The worker had terminated and the missing cell was irrecoverable. The task is
+permanently excluded across all six arms with zero reruns. The maximum retained development cohort
+is now 658 of 673, or 97.8 percent, still above the frozen requirement.
+
 A pre-fit code audit found that the implementation required positive matched task-blind advantage
 only after averaging the five split seeds. The frozen rule requires a positive advantage in every
 seed. The fitter now applies all four development gates independently to each seed and fails on an
