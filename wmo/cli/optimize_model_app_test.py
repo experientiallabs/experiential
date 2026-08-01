@@ -73,6 +73,17 @@ from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 
 runner = CliRunner()
 
+
+@pytest.fixture(autouse=True)
+def _local_model_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin `--embedder auto` off its local leg for every test in this module.
+
+    Auto prefers the in-process local model when its weights happen to be in THIS machine's
+    Hugging Face cache; these tests assert the azure and hashing legs, and must observe the
+    same resolution on a machine with the cache warm as on CI without it.
+    """
+    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
+
 optimize_module = importlib.import_module("wmo.cli.optimize_model_app")
 route_module = importlib.import_module("wmo.cli.route_app")
 
@@ -1524,7 +1535,7 @@ def test_an_unknown_embedder_lists_the_real_ones(
     root = _project(tmp_path)
     result = _run(tmp_path, root, "--yes", "--embedder", "word2vec")
     assert result.exit_code != 0
-    assert _says(result.output, "unknown embedder 'word2vec'; use auto, hashing or azure")
+    assert _says(result.output, "unknown embedder 'word2vec'; use auto, hashing, azure or local")
 
 
 def test_auto_takes_the_semantic_embedder_when_the_resource_is_configured(

@@ -1,0 +1,36 @@
+name = "deepswe-coding113"
+title = "DeepSWE v1.1 (coding113): guarded kNN routing on published long-horizon SWE trials"
+cookbook = "docs/cookbook/deepswe.md"
+exactness = "bit-exact"
+kind = "matrix"
+
+notes = [
+  "Converted from DeepSWE v1.1's published per-trial artifacts (deepswe.datacurve.ai): 41 priced OpenAI/Anthropic-family arms x 113 long-horizon SWE tasks on the one mini-swe-agent scaffold, ~18.4k scored trials with graded fail-to-pass rewards and measured USD costs. The conversion refuses to write unless every published config's pass@1 reproduces from the raw trials (`wmo optimize route convert-deepswe`).",
+  "Offline and credential-free: fit and report replay the recorded Qwen3-Embedding-0.6B vectors (the LOCAL embedder's default model, produced via its validated MLX 4-bit conversion) from the published cache. No embedding API is in the loop; re-embedding live reproduces the neighbor structure but not the exact bits.",
+  "The fit/report split is REPO-GROUPED (81 fit / 32 report tasks; no repository straddles the split), because DeepSWE tasks from one repository share code and an ungrouped split inflates coding-router evals with same-repo leakage.",
+  "The published row is the QUALITY-PARITY point: the guarded champion holds the strongest single arm's quality at slightly lower cost. Cost savings live on the dial; the pre-split lab's cheapest-arm-above-threshold rule measured a 3.18x median cost ratio on this same matrix under its own 80/20 protocol. See the cookbook for that comparison and `wmo research deepswe-holdout` to re-measure both.",
+]
+
+[data]
+hf_repo = "experiential-labs/wmo-deepswe-coding113"
+repo_type = "dataset"
+revision = "1fa083679befc2bb96b2e40300e4b2cbbd932105"
+files = ["matrix.json", "task_embeddings.npy", "scenario_groups.json"]
+
+[matrix]
+matrix_file = "matrix.json"
+embedding_cache_file = "task_embeddings.npy"
+embedder_kind = "local"
+embedder_dim = 1024
+embedder_model = "Qwen/Qwen3-Embedding-0.6B"
+split_groups_file = "scenario_groups.json"
+fallback = "claude-opus-5@high"
+cost_quality = 0.25
+scenario_label = "on held-out DeepSWE tasks from repositories the fit never saw"
+baselines = ["claude-opus-5@high"]
+
+[[published]]
+label = "routed (guard pinned) vs best single (claude-opus-5@high), repo-grouped holdout"
+baseline = "claude-opus-5@high"
+accuracy = 0.975470341235432
+cost_per_run_usd = 5.040801486328125

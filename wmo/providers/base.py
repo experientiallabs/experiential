@@ -23,20 +23,25 @@ class ProviderKind(StrEnum):
 class EmbedderKind(StrEnum):
     """Which embedder supplies phi for retrieval.
 
-    `HASHING` is the offline, zero-config default (no creds, no network). The other three map 1:1 to
-    the same-named `ProviderKind` and use that backend's embeddings API. Anthropic is intentionally
-    absent — it has no embeddings API; configure `BEDROCK`/`OPENAI`/`AZURE_OPENAI` (or `HASHING`).
+    `HASHING` is the offline, zero-config default (no creds, no network). `LOCAL` runs a small
+    embedding model in-process (Qwen3-Embedding-0.6B by default; MLX on Apple silicon, torch on
+    CUDA or CPU elsewhere): weights download from Hugging Face on first use, after which it is
+    as offline and credential-free as `HASHING` while being semantic (`wmo.providers.local_embed`).
+    The other three map 1:1 to the same-named `ProviderKind` and use that backend's embeddings
+    API. Anthropic is intentionally absent (it has no embeddings API); configure
+    `BEDROCK`/`OPENAI`/`AZURE_OPENAI`, or `HASHING`/`LOCAL` for the no-API paths.
     """
 
     HASHING = "hashing"  # offline HashingEmbedder (default)
+    LOCAL = "local"  # in-process Qwen3 embeddings via MLX or torch (no API)
     BEDROCK = "bedrock"  # Titan on AWS Bedrock
     OPENAI = "openai"  # OpenAI embeddings
     AZURE_OPENAI = "azure"  # Azure OpenAI embedding deployment
 
     def provider_kind(self) -> ProviderKind:
-        """The ProviderKind backing this embedder. Raises for `HASHING` (no provider)."""
-        if self is EmbedderKind.HASHING:
-            raise ValueError("HASHING is the offline embedder; it has no backing provider")
+        """The ProviderKind backing this embedder. Raises for `HASHING`/`LOCAL` (no provider)."""
+        if self in (EmbedderKind.HASHING, EmbedderKind.LOCAL):
+            raise ValueError(f"{self.value} embeds in-process; it has no backing provider")
         return ProviderKind(self.value)
 
 

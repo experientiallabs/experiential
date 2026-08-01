@@ -71,6 +71,13 @@ from wmo.optimize.compression import (
     servable_compressor,
 )
 from wmo.providers.base import Embedder, ProviderConfig, ProviderKind
+from wmo.providers.local_embed import (
+    DEFAULT_LOCAL_EMBED_MODEL,
+    LOCAL_EMBED_DIM,
+    LocalEmbedder,
+    default_model_cached,
+    pick_backend,
+)
 from wmo.providers.pool import PoolEntry
 from wmo.providers.registry import get_provider
 from wmo.retrieval.embedders import BatchedEmbedder, HashingEmbedder
@@ -142,29 +149,39 @@ class EmbedderSpec(BaseModel):
     """How to reproduce the policy's embedding function at serve time.
 
     `hashing` is deterministic, offline, and credential-free, so a policy file is fully
-    self-contained. `azure` uses an Azure embedding deployment (per-entry credential
-    conventions matching the model pool: `api_key_env` names the env var); the fitter records
-    whichever the fit actually used, and serving reconstructs the identical function.
+    self-contained. `local` runs a small embedding model in-process (Qwen3-Embedding-0.6B by
+    default, via MLX or torch: `wmo.providers.local_embed`): credential-free like hashing but
+    semantic, at the price of a one-time weights download. `azure` uses an Azure embedding
+    deployment (per-entry credential conventions matching the model pool: `api_key_env` names
+    the env var); the fitter records whichever the fit actually used, and serving reconstructs
+    the identical function.
     """
 
-    kind: Literal["hashing", "azure"] = "hashing"
+    kind: Literal["hashing", "azure", "local"] = "hashing"
     # gt=0 because a zero-width embedding is not a smaller embedding, it is no embedding: it
     # would reach the provider as `dimensions=0` and build a bank of empty rows.
     dim: int = Field(default=512, gt=0)
     deployment: str | None = None  # azure embedding deployment name
     endpoint: str | None = None
     api_key_env: str | None = None
+    model: str | None = None  # local: Hugging Face model id; None = the Qwen3 default
     batch: int = 256  # provider embeds are chunked to this many texts per request
 
     @model_validator(mode="after")
     def _validate_backend(self) -> EmbedderSpec:
         if self.kind == "azure" and not (self.deployment and self.endpoint):
             raise ValueError("an azure embedder spec needs deployment and endpoint")
+        if self.kind == "local" and "dim" not in self.model_fields_set:
+            # The hashing default (512) is not a property of the local model; unless the caller
+            # sized the spec deliberately, record the default model's native width.
+            self.dim = LOCAL_EMBED_DIM
         return self
 
     def build(self) -> Embedder:
         if self.kind == "hashing":
             return HashingEmbedder(dim=self.dim)
+        if self.kind == "local":
+            return LocalEmbedder(self.model, dim=self.dim, batch=self.batch)
         api_key = None
         if self.api_key_env:
             api_key = os.environ.get(self.api_key_env)
@@ -195,10 +212,16 @@ def embedder_provenance(spec: EmbedderSpec) -> str:
     identity and not just the deployment name: two accounts routinely hold a deployment of the
     same name and dimension, their embeddings are not interchangeable, and a refit that only
     repointed the endpoint therefore has to read as a different fit. The credential variable is
-    left out on purpose: renaming it does not move a single vector.
+    left out on purpose: renaming it does not move a single vector. A local spec's identity is
+    its model id (the backend that computed a vector is not: mlx and torch serve the same
+    geometry, and the bit-exactness question belongs to recorded-vector reproductions).
     """
     tag = f"{spec.kind}-{spec.dim}"
-    return tag if spec.kind == "hashing" else f"{tag}/{spec.deployment}@{spec.endpoint}"
+    if spec.kind == "hashing":
+        return tag
+    if spec.kind == "local":
+        return f"{tag}/{spec.model or DEFAULT_LOCAL_EMBED_MODEL}"
+    return f"{tag}/{spec.deployment}@{spec.endpoint}"
 
 
 @dataclass(frozen=True)
@@ -1131,46 +1154,81 @@ def resolve_embedder(
     deployment: str | None,
     endpoint: str | None,
     api_key_env: str | None,
+    model: str | None = None,
 ) -> tuple[EmbedderSpec, str]:
     """Turn `--embedder` into the spec to fit with, plus the one line explaining the choice.
 
-    `auto` is the default because the two backends are not equivalent and the difference is not
+    `auto` is the default because the backends are not equivalent and the difference is not
     visible in the artifact: a policy fitted on hashed features routes on lexical overlap, and one
-    fitted on `text-embedding-3-large` routes on meaning. An operator who has already configured
-    an Azure resource should get the better one without having to know that, and one who has not
-    should be told what they are getting instead. So the resolution is ALWAYS printed, and the
-    downgrade quotes the measured gap rather than a vague warning.
+    fitted on semantic vectors routes on meaning. Auto prefers, in order: the LOCAL in-process
+    model when its weights are already in the Hugging Face cache (semantic, credential-free, and
+    no API in the loop; auto never triggers the first-use download itself, an explicit
+    `--embedder local` opts into that once), then an Azure deployment when its env variables are
+    set, then hashing. The resolution is ALWAYS printed, and a downgrade quotes the measured gap
+    rather than a vague warning.
 
     Resolving to azure makes the fit BILL an embedding API, which is spend nobody typed a flag
     for, so the resolution line says so. It also makes the fit depend on that resource actually
     hosting an embedding deployment, which the env variables do not promise; `probe_embedder`
     is what turns that from a mid-fit traceback into a usage error.
 
-    `--dim` defaults to the RESOLVED backend's native width on every path: 512 for hashing, and
-    the embedding model's own width for azure (see `_native_dim`). It used to default to 512
-    everywhere, which meant `--embedder azure --deployment text-embedding-3-large` silently
-    requested 512-dimensional vectors from a 3072-dimensional model and fitted the policy on the
-    truncation. An explicit `--dim` is still honored verbatim, including a deliberate reduction.
+    `--dim` defaults to the RESOLVED backend's native width on every path: 512 for hashing, 1024
+    for the local Qwen3 model, and the embedding model's own width for azure (see `_native_dim`).
+    It used to default to 512 everywhere, which meant `--embedder azure --deployment
+    text-embedding-3-large` silently requested 512-dimensional vectors from a 3072-dimensional
+    model and fitted the policy on the truncation. An explicit `--dim` is still honored verbatim,
+    including a deliberate reduction.
 
     Returns:
         The `EmbedderSpec` to fit with, and the resolution line to print.
 
     Raises:
-        ValueError: An unknown `--embedder`, or an explicit azure spec missing a flag.
+        ValueError: An unknown `--embedder`, an explicit azure spec missing a flag, or an
+            explicit local spec on a machine with no local backend installed.
             `route fit` re-raises these as `typer.BadParameter`.
     """
-    if choice not in ("auto", "hashing", "azure"):
-        raise ValueError(f"unknown embedder '{choice}'; use auto, hashing or azure")
+    if choice not in ("auto", "hashing", "azure", "local"):
+        raise ValueError(f"unknown embedder '{choice}'; use auto, hashing, azure or local")
+
+    if choice == "local":
+        try:
+            backend = pick_backend()
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+        if dim is None:
+            spec = EmbedderSpec(kind="local", model=model)
+        else:
+            spec = EmbedderSpec(kind="local", model=model, dim=dim)
+        cached = default_model_cached(backend)
+        fetch = "weights cached" if cached else "downloads weights from Hugging Face on first use"
+        return spec, (
+            f"embedder: local {spec.model or DEFAULT_LOCAL_EMBED_MODEL} ({spec.dim}d) in-process "
+            f"via {backend} (explicit; {fetch}). No embedding API in the loop."
+        )
 
     if choice == "auto":
+        if model is not None:
+            raise ValueError("--embed-model applies to --embedder local; name the backend")
+        if default_model_cached():
+            if dim is None:
+                spec = EmbedderSpec(kind="local")
+            else:
+                spec = EmbedderSpec(kind="local", dim=dim)
+            return spec, (
+                f"embedder: local {DEFAULT_LOCAL_EMBED_MODEL} ({spec.dim}d) in-process via "
+                f"{pick_backend()} (auto; weights cached). Semantic, credential-free, no "
+                "embedding API in the loop."
+            )
         present = all(os.environ.get(name) for name in AZURE_EMBEDDER_ENV)
         if not present:
             missing = [name for name in AZURE_EMBEDDER_ENV if not os.environ.get(name)]
             spec = EmbedderSpec(dim=HASHING_EMBEDDER_DIM if dim is None else dim)
             return spec, (
-                f"embedder: hashing-{spec.dim} (auto; {', '.join(missing)} unset). "
-                f"[yellow]{HASHING_DOWNGRADE_NOTICE}[/yellow]. Set "
-                f"{' and '.join(AZURE_EMBEDDER_ENV)} to fit on semantic embeddings instead."
+                f"embedder: hashing-{spec.dim} (auto; {', '.join(missing)} unset, local model "
+                "not cached). "
+                f"[yellow]{HASHING_DOWNGRADE_NOTICE}[/yellow]. Run once with --embedder local "
+                f"(downloads {DEFAULT_LOCAL_EMBED_MODEL}, then auto keeps using it), or set "
+                f"{' and '.join(AZURE_EMBEDDER_ENV)}, to fit on semantic embeddings instead."
             )
         resolved_endpoint = endpoint or os.environ["AZURE_OPENAI_ENDPOINT"]
         resolved_deployment = deployment or AZURE_EMBEDDER_DEPLOYMENT
@@ -1266,6 +1324,14 @@ def _probe_failure(spec: EmbedderSpec, detail: str) -> str:
     """What to tell an operator whose embedder does not work, in the vocabulary they typed."""
     if spec.kind == "hashing":
         return f"the hashing embedder failed to embed a probe text: {detail}"
+    if spec.kind == "local":
+        return (
+            f"the local embedder ({spec.model or DEFAULT_LOCAL_EMBED_MODEL}) could not embed a "
+            f"probe text: {detail}. First use downloads the weights from Hugging Face, so check "
+            "network and disk; a custom --embed-model must be a text-embedding model whose "
+            f"output width matches --dim ({spec.dim} here). --embedder hashing needs no model "
+            "at all, at the accuracy cost this command printed above."
+        )
     return (
         f"embedding deployment '{spec.deployment}' at {spec.endpoint} could not embed a probe "
         f"text: {detail}. That resource may serve chat models without hosting an embedding "

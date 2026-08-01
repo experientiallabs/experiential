@@ -72,6 +72,7 @@ _DEFAULT_HISTORY_CHARS = 2000
 _DEFAULT_POOL_PATH = ".wmo/pool.toml"
 _POLICY_FILENAME = "policy.json"
 _HASHING_EMBEDDER_DIM = 512
+_LOCAL_EMBEDDER_DIM = 1024
 _AZURE_EMBEDDER_DIM = 3072
 _AZURE_EMBEDDER_ENV = ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT")
 _WM_SIMULATED = "wm_simulated"
@@ -904,6 +905,57 @@ def _load_policy(policy_file: str) -> RoutingPolicy:
         raise typer.BadParameter(f"{path} is not a readable routing policy: {exc}") from exc
 
 
+@route_app.command("convert-deepswe")
+def convert_deepswe_cmd(
+    source: str = typer.Argument(
+        ...,
+        help="Directory holding the published DeepSWE v1.1 artifacts: trials.json, tasks.json, "
+        "leaderboard-live.json, and the extracted deep-swe-main/tasks/<id>/instruction.md texts.",
+    ),
+    embedding_cache: str = typer.Option(
+        ...,
+        "--embedding-cache",
+        help="JSON of task id -> recorded embedding vector (Qwen3-Embedding-0.6B, the local "
+        "embedder's default model); must cover every task.",
+    ),
+    out: str = typer.Option(
+        "deepswe-bundle",
+        "--out",
+        help="Directory for the bundle: matrix.json + task_embeddings.npy + "
+        "scenario_groups.json (heavy build outputs; published to Hugging Face, never to git).",
+    ),
+) -> None:
+    """Convert published DeepSWE v1.1 trials into an OutcomeMatrix bundle (research adapter).
+
+    The sweep-shaped producer for a benchmark someone else already paid for: 41 priced
+    OpenAI/Anthropic-family arms x 113 long-horizon SWE tasks with graded rewards and measured
+    USD costs, plus the recorded local-model embeddings and the repository grouping the honest
+    split needs. Refuses to write anything unless every published config's pass@1 reproduces
+    from the raw trials. `fit` and `report` consume the bundle unchanged;
+    `wmo research deepswe-holdout` runs the grouped holdout protocol on it.
+    """
+    from wmo.optimize.deepswe import convert_deepswe, top_arm
+    from wmo.optimize.outcomes import OutcomeMatrix
+
+    try:
+        result = convert_deepswe(
+            Path(source), embedding_cache=Path(embedding_cache), out=Path(out)
+        )
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    top = top_arm(OutcomeMatrix.load(result.matrix_path))
+    _console.print(
+        f"[green]✓[/green] converted {result.models} arms x {result.scenarios} tasks "
+        f"({result.scored_outcomes} scored trials, {result.unscored_outcomes} unscored) -> {out}\n"
+        f"  integrity gate: {result.crosscheck}\n"
+        f"  dropped (unpriced vendors): {len(result.dropped_configs)} configs\n"
+        f"  strongest arm {top.name}: graded {top.graded:.3f}, pass@1 {top.pass_at_1:.3f}, "
+        f"${top.cost_per_task:.2f}/task over {top.tasks} tasks\n"
+        f"  next: `wmo optimize route fit {result.matrix_path} --kind knn "
+        f"--fallback {top.name} --embedder local`"
+    )
+
+
 @route_app.command("fit")
 def fit(
     matrix_file: str = typer.Argument(..., help="OutcomeMatrix JSON (closed-loop eval output)."),
@@ -969,23 +1021,32 @@ def fit(
     embedder: str = typer.Option(
         "auto",
         "--embedder",
-        help="auto | hashing | azure. auto uses the Azure text-embedding-3-large deployment when "
-        f"{' and '.join(_AZURE_EMBEDDER_ENV)} are set, and hashing otherwise; either way it says "
-        "which one it picked. Resolving to azure means this fit CALLS A PAID EMBEDDING API "
-        "(billed to that resource); --embedder hashing keeps it offline and free.",
+        help="auto | local | hashing | azure. auto prefers the in-process local model "
+        "(Qwen3-Embedding-0.6B) when its weights are already cached, then the Azure "
+        f"text-embedding-3-large deployment when {' and '.join(_AZURE_EMBEDDER_ENV)} are set, "
+        "and hashing otherwise; either way it says which one it picked. --embedder local runs "
+        "with NO embedding API in the loop (first ever use downloads the weights from Hugging "
+        "Face); resolving to azure means this fit CALLS A PAID EMBEDDING API (billed to that "
+        "resource); --embedder hashing keeps it offline, free, and lexical.",
     ),
     dim: int = typer.Option(
         None,
         "--dim",
         min=1,
         help="Embedding dimension, sent as the request's `dimensions`. Default: the resolved "
-        f"model's native width ({_HASHING_EMBEDDER_DIM} hashing, {_AZURE_EMBEDDER_DIM} "
-        "text-embedding-3-large). Set it only to reduce a model's output deliberately.",
+        f"model's native width ({_HASHING_EMBEDDER_DIM} hashing, {_LOCAL_EMBEDDER_DIM} local, "
+        f"{_AZURE_EMBEDDER_DIM} text-embedding-3-large). Set it only to reduce a model's "
+        "output deliberately.",
     ),
     deployment: str = typer.Option(None, "--deployment", help="(azure) embedding deployment."),
     endpoint: str = typer.Option(None, "--endpoint", help="(azure) resource endpoint."),
     api_key_env: str = typer.Option(
         None, "--api-key-env", help="(azure) env var holding the account key."
+    ),
+    embed_model: str = typer.Option(
+        None,
+        "--embed-model",
+        help="(local) Hugging Face embedding model id; default Qwen/Qwen3-Embedding-0.6B.",
     ),
     compressor: str = typer.Option(
         None,
@@ -1035,7 +1096,12 @@ def fit(
         )
     try:
         spec, resolution = resolve_embedder(
-            embedder, dim=dim, deployment=deployment, endpoint=endpoint, api_key_env=api_key_env
+            embedder,
+            dim=dim,
+            deployment=deployment,
+            endpoint=endpoint,
+            api_key_env=api_key_env,
+            model=embed_model,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc

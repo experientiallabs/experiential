@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from wmo.optimize.outcomes import OutcomeMatrix, ScenarioOutcome, split_router_scenarios
+from wmo.optimize.outcomes import (
+    OutcomeMatrix,
+    ScenarioOutcome,
+    split_router_scenarios,
+    split_router_scenarios_grouped,
+)
 from wmo.providers.base import ProviderKind, TokenUsage
 from wmo.providers.pool import PoolEntry
 
@@ -199,3 +204,75 @@ def test_an_unscored_row_does_not_decide_the_arm() -> None:
         ],
     )
     assert matrix.measured_compression() is None
+
+
+# --- grouped router split ------------------------------------------------------------------
+def test_grouped_split_never_lets_a_group_straddle_fit_and_report() -> None:
+    ids = [f"repo{i % 5}::t{i}" for i in range(20)]
+    groups = {sid: sid.split("::")[0] for sid in ids}
+    split = split_router_scenarios_grouped(ids, groups)
+    fit_groups = {groups[sid] for sid in split.fit_ids}
+    report_groups = {groups[sid] for sid in split.report_ids}
+    assert fit_groups.isdisjoint(report_groups)
+    assert split.fit_ids and split.report_ids
+    assert sorted(split.fit_ids + split.report_ids) == sorted(ids)
+
+
+def test_grouped_split_is_deterministic_and_order_preserving() -> None:
+    ids = [f"g{i % 7}-{i}" for i in range(28)]
+    groups = {sid: sid.split("-")[0] for sid in ids}
+    first = split_router_scenarios_grouped(ids, groups)
+    again = split_router_scenarios_grouped(list(reversed(ids)), groups)
+    # Same membership regardless of row order; each call preserves ITS caller's order.
+    assert set(first.fit_ids) == set(again.fit_ids)
+    assert list(first.fit_ids) == [sid for sid in ids if sid in set(first.fit_ids)]
+    assert list(again.fit_ids) == [sid for sid in reversed(ids) if sid in set(first.fit_ids)]
+
+
+def test_grouped_split_targets_the_fit_fraction_by_scenario_count() -> None:
+    ids = [f"g{i % 10}-{i}" for i in range(100)]
+    groups = {sid: sid.split("-")[0] for sid in ids}
+    split = split_router_scenarios_grouped(ids, groups)
+    # Groups are 10 scenarios each, so the fit side lands exactly on the 70% target here.
+    assert len(split.fit_ids) == 70
+
+
+def test_grouped_split_salt_changes_membership_deterministically() -> None:
+    ids = [f"g{i % 6}-{i}" for i in range(30)]
+    groups = {sid: sid.split("-")[0] for sid in ids}
+    plain = split_router_scenarios_grouped(ids, groups)
+    salted = [split_router_scenarios_grouped(ids, groups, salt=str(s)) for s in range(4)]
+    assert all(
+        set(one.fit_ids) == set(two.fit_ids)
+        for one, two in zip(
+            salted,
+            [split_router_scenarios_grouped(ids, groups, salt=str(s)) for s in range(4)],
+            strict=True,
+        )
+    )
+    # At least one salt must move the partition, or salting buys no independent splits.
+    assert any(set(one.fit_ids) != set(plain.fit_ids) for one in salted)
+
+
+def test_grouped_split_keeps_a_report_side_even_when_one_group_dominates() -> None:
+    ids = [f"big-{i}" for i in range(30)] + ["small-a", "small-b"]
+    groups = {sid: sid.split("-")[0] for sid in ids}
+    split = split_router_scenarios_grouped(ids, groups)
+    assert split.fit_ids and split.report_ids
+    fit_groups = {groups[sid] for sid in split.fit_ids}
+    assert fit_groups.isdisjoint({groups[sid] for sid in split.report_ids})
+
+
+def test_grouped_split_requires_a_group_for_every_scenario() -> None:
+    with pytest.raises(ValueError, match="no group"):
+        split_router_scenarios_grouped(["a", "b"], {"a": "g1"})
+
+
+def test_grouped_split_refuses_a_single_group() -> None:
+    with pytest.raises(ValueError, match="at least 2 groups"):
+        split_router_scenarios_grouped(["a", "b"], {"a": "g", "b": "g"})
+
+
+def test_grouped_split_refuses_duplicate_ids() -> None:
+    with pytest.raises(ValueError, match="unique"):
+        split_router_scenarios_grouped(["a", "a"], {"a": "g"})

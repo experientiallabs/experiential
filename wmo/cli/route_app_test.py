@@ -58,6 +58,17 @@ from wmo.tracking import Phase, RunRecord, UsageTotals, load_runs
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _local_model_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin `--embedder auto` off its local leg for every test in this module.
+
+    Auto prefers the in-process local model when its weights happen to be in THIS machine's
+    Hugging Face cache; the fit tests here assert the hashing and azure legs, and must observe
+    the same resolution on a machine with the cache warm as on CI without it.
+    """
+    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
+
+
 def _arm(compression: CompressionConfig | None) -> tuple[str, str, float]:
     """The D-COMPRESS fields an episode measured under `compression` would carry.
 
@@ -245,7 +256,7 @@ def test_route_fit_rejects_unknown_embedder(tmp_path: Path) -> None:
         ["optimize", "route", "fit", str(_matrix_file(tmp_path)), "--embedder", "vibes"],
     )
     assert result.exit_code != 0
-    assert "hashing or azure" in result.output
+    assert "hashing, azure or local" in result.output
 
 
 def _knn_matrix_file(
@@ -3459,3 +3470,145 @@ def test_route_push_sends_the_report_when_given_one(tmp_path: Path) -> None:
         )
     assert result.exit_code == 0, result.output
     assert client.calls[0][4] == report_file
+
+
+# --- convert-deepswe + the grouped research holdout ----------------------------------------
+def _deepswe_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    """A tiny publisher-shaped DeepSWE source directory plus its embedding cache."""
+    import numpy as np
+
+    from wmo.optimize.deepswe import PROMPT_BOILERPLATE
+
+    source = tmp_path / "deepswe-source"
+    trials: list[dict[str, object]] = []
+    tasks = ["alpha", "beta", "gamma"]
+    (source / "deep-swe-main" / "tasks").mkdir(parents=True)
+    for task in tasks:
+        task_dir = source / "deep-swe-main" / "tasks" / task
+        task_dir.mkdir()
+        (task_dir / "instruction.md").write_text(
+            f"Fix the {task} bug.{PROMPT_BOILERPLATE}", encoding="utf-8"
+        )
+        for index in range(2):
+            for config, model, effort, f2p, passed, cost in (
+                ("mini_swe_agent_claude_opus_5_high", "claude-opus-5", "high", 1.0, True, 2.0),
+                ("mini_swe_agent_gpt_5_6_sol_medium", "gpt-5-6-sol", "medium", 0.5, False, 1.0),
+            ):
+                trials.append(
+                    {
+                        "config": config,
+                        "task_name": task,
+                        "trial_name": f"{config}-{task}-{index}",
+                        "included_in_score": True,
+                        "model": model,
+                        "reasoning_effort": effort,
+                        "f2p": f2p,
+                        "passed": passed,
+                        "cost_usd": cost,
+                        "outcome": "pass" if passed else "fail",
+                        "n_agent_steps": 5,
+                        "n_input_tokens": 1000,
+                        "n_output_tokens": 100,
+                        "n_cache_tokens": 500,
+                    }
+                )
+    (source / "trials.json").write_text(
+        json.dumps({"n_trials": len(trials), "rows": trials}), encoding="utf-8"
+    )
+    (source / "tasks.json").write_text(
+        json.dumps(
+            {
+                "n_tasks": len(tasks),
+                "rows": [{"id": task, "repository": f"org/{task}"} for task in tasks],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "leaderboard-live.json").write_text(
+        json.dumps(
+            {
+                "rows": [
+                    {"config": "mini_swe_agent_claude_opus_5_high", "pass_at_1": 1.0},
+                    {"config": "mini_swe_agent_gpt_5_6_sol_medium", "pass_at_1": 0.0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cache = tmp_path / "embeddings.json"
+    rng = np.random.default_rng(11)
+    cache.write_text(
+        json.dumps({task: rng.normal(size=16).tolist() for task in tasks}), encoding="utf-8"
+    )
+    return source, cache
+
+
+def test_route_convert_deepswe_writes_the_bundle_and_states_the_gate(tmp_path: Path) -> None:
+    source, cache = _deepswe_fixture(tmp_path)
+    bundle = tmp_path / "bundle"
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "convert-deepswe",
+            str(source),
+            "--embedding-cache",
+            str(cache),
+            "--out",
+            str(bundle),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "configs reproduce published pass@1" in result.output
+    for name in ("matrix.json", "task_embeddings.npy", "scenario_groups.json"):
+        assert (bundle / name).is_file()
+    assert "claude-opus-5@high" in result.output
+
+
+def test_route_convert_deepswe_refuses_contradicted_leaderboard(tmp_path: Path) -> None:
+    source, cache = _deepswe_fixture(tmp_path)
+    lied = json.loads((source / "leaderboard-live.json").read_text(encoding="utf-8"))
+    lied["rows"][0]["pass_at_1"] = 0.5
+    (source / "leaderboard-live.json").write_text(json.dumps(lied), encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "optimize",
+            "route",
+            "convert-deepswe",
+            str(source),
+            "--embedding-cache",
+            str(cache),
+            "--out",
+            str(tmp_path / "bundle"),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "published pass@1" in result.output
+    assert not (tmp_path / "bundle" / "matrix.json").exists()  # the gate writes nothing
+
+
+def test_research_deepswe_holdout_reports_grouped_medians(tmp_path: Path) -> None:
+    from wmo.optimize.deepswe import convert_deepswe
+
+    source, cache = _deepswe_fixture(tmp_path)
+    bundle = tmp_path / "bundle"
+    convert_deepswe(source, embedding_cache=cache, out=bundle)
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "deepswe-holdout",
+            str(bundle),
+            "--splits",
+            "2",
+            "--fallback",
+            "claude-opus-5@high",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "median over 2 grouped splits" in result.output
+    assert "cost ratio" in result.output
+    # The framing must never present the lab reference as this run's own measurement.
+    assert "pre-split lab reference" in result.output

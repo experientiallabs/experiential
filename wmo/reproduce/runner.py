@@ -24,7 +24,11 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from wmo.optimize.knn import fit_knn_artifact, tune_policy_dial
-from wmo.optimize.outcomes import OutcomeMatrix, split_router_scenarios
+from wmo.optimize.outcomes import (
+    OutcomeMatrix,
+    split_router_scenarios,
+    split_router_scenarios_grouped,
+)
 from wmo.optimize.policy import EmbedderSpec, RoutingPolicy
 from wmo.optimize.report import build_report
 from wmo.reproduce.embedding import CachedTaskEmbedder
@@ -183,10 +187,20 @@ def _run_matrix(manifest: Manifest, snapshot: Path, out_dir: Path) -> dict[str, 
             dim=protocol.embedder_dim,
             deployment=protocol.embedder_deployment,
             endpoint=protocol.embedder_endpoint,
+            model=protocol.embedder_model,
         )
-        # The same deterministic 70/30 scenario split the CLI fit computes, so the manifest
-        # reproduces the shipped protocol rather than a private variant of it.
-        split = split_router_scenarios(matrix.scenario_ids())
+        if protocol.split_groups_file is not None:
+            # The grouped protocol: the manifest ships a scenario -> group map (a coding task's
+            # repository), and no group straddles fit and report. Same determinism discipline
+            # as the scenario split, so the reproduction is still one exact partition.
+            groups = json.loads(
+                (snapshot / protocol.split_groups_file).read_text(encoding="utf-8")
+            )
+            split = split_router_scenarios_grouped(matrix.scenario_ids(), groups)
+        else:
+            # The same deterministic 70/30 scenario split the CLI fit computes, so the manifest
+            # reproduces the shipped protocol rather than a private variant of it.
+            split = split_router_scenarios(matrix.scenario_ids())
         fit_knn_artifact(
             matrix,
             out_path=policy_path,

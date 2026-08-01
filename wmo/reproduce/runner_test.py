@@ -293,3 +293,44 @@ def test_pin_manifest_replays_without_embeddings_and_reports_the_pin(tmp_path: P
     )
     result = run_reproduction(verified, out_dir=tmp_path / "verify", data_dir=snapshot)
     assert result.reproduced
+
+
+def test_matrix_reproduction_supports_grouped_split_and_local_identity(tmp_path: Path) -> None:
+    """The deepswe-shaped protocol: repo-grouped fit/report split, local embedder identity."""
+    snapshot = _snapshot(tmp_path)
+    groups = {f"s{index}": ("repo-a" if index < 4 else "repo-b") for index in range(8)}
+    (snapshot / "groups.json").write_text(json.dumps(groups), encoding="utf-8")
+    manifest = Manifest.model_validate(
+        {
+            "name": "fixture-grouped",
+            "title": "fixture benchmark, grouped",
+            "cookbook": "docs/cookbook/deepswe.md",
+            "exactness": "bit-exact",
+            "kind": "matrix",
+            "data": {
+                "hf_repo": "org/unused",
+                "files": ["matrix.json", "vectors.npy", "groups.json"],
+            },
+            "matrix": {
+                "matrix_file": "matrix.json",
+                "embedding_cache_file": "vectors.npy",
+                "embedder_kind": "local",
+                "embedder_dim": 16,
+                "split_groups_file": "groups.json",
+                "fallback": "pricey",
+                "baselines": ["pricey"],
+            },
+            "published": [
+                {"label": "probe", "baseline": "pricey", "accuracy": 0.0, "cost_per_run_usd": 0.0}
+            ],
+        }
+    )
+    run_reproduction(manifest, out_dir=tmp_path / "probe", data_dir=snapshot)
+    policy = json.loads((tmp_path / "probe" / "policy.json").read_text(encoding="utf-8"))
+    # The artifact records the local identity the recorded vectors belong to...
+    assert policy["embedder"]["kind"] == "local"
+    assert policy["embedder"]["dim"] == 16
+    # ...and the fit side is whole groups: every fit scenario shares one repository here,
+    # and the report side holds the other one entirely.
+    fit_groups = {groups[sid] for sid in policy["fit_scenario_ids"]}
+    assert len(fit_groups) == 1

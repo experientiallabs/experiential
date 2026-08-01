@@ -503,10 +503,11 @@ def providers_verify(
         )
         return
 
-    # Verify each distinct provider-backed embed path (skip the offline hashing embedder).
+    # Verify each distinct provider-backed embed path (skip the in-process embedders: hashing
+    # and local have no provider to verify).
     embed_seen: set[str] = set()
     for model_name, config in zip(names, configs, strict=True):
-        if config.embed_provider is EmbedderKind.HASHING:
+        if config.embed_provider in (EmbedderKind.HASHING, EmbedderKind.LOCAL):
             continue
         embed_config = config.embed_provider_config()
         key = embed_config.model_dump_json()
@@ -909,7 +910,11 @@ def build(
             f"unknown embed provider {params.embed_provider!r}; choose one of: {kinds}"
         ) from None
     # A provider-backed embedder needs an embeddings model; fail fast, not deep inside embed().
-    if embed_kind is not EmbedderKind.HASHING and not params.embed_model:
+    # The in-process kinds need none: hashing has no model, local carries its own default.
+    if (
+        embed_kind not in (EmbedderKind.HASHING, EmbedderKind.LOCAL)
+        and not params.embed_model
+    ):
         raise typer.BadParameter(
             f"--embed-provider {embed_kind.value} requires --embed-model "
             "(the embeddings model id / Azure embedding deployment)"
@@ -1078,7 +1083,7 @@ def _verify_or_abort(config: HarnessConfig, chain: str | None = None) -> None:
     from wmo.providers import verify_all, verify_embedder
     from wmo.providers.base import EmbedderKind
     checks = [(config.serve_provider_config(), False)]
-    if config.embed_provider is not EmbedderKind.HASHING:
+    if config.embed_provider not in (EmbedderKind.HASHING, EmbedderKind.LOCAL):
         checks.append((config.embed_provider_config(), True))
 
     failed = False
@@ -2288,9 +2293,10 @@ def scenarios_build(
     embed_provider: str = typer.Option(
         "hashing",
         help=(
-            "Facet embedder: hashing (offline but lexical-only — clusters by wording, not "
-            "meaning; prefer a semantic embedder for real corpora) | bedrock | openai | "
-            "azure."
+            "Facet embedder: hashing (offline but lexical-only; clusters by wording, not "
+            "meaning; prefer a semantic embedder for real corpora) | local (in-process "
+            "Qwen3, semantic and credential-free; pass --embed-dim 1024) | bedrock | "
+            "openai | azure."
         ),
     ),
     embed_model: str = typer.Option(None, help="Embeddings model id / Azure deployment."),
@@ -2665,6 +2671,10 @@ def _resolve_scenario_embedder(
         ) from None
     if kind is EmbedderKind.HASHING:
         return HashingEmbedder(dim=embed_dim)
+    if kind is EmbedderKind.LOCAL:
+        from wmo.providers.local_embed import LocalEmbedder
+
+        return LocalEmbedder(embed_model, dim=embed_dim)
     if not embed_model:
         raise typer.BadParameter(
             f"--embed-provider {kind.value} requires --embed-model "
@@ -3360,6 +3370,147 @@ def research_plot_concurrency_combined(
     except (ValueError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     _console.print(f"wrote figures -> {speedup_path}, {cost_path}")
+
+
+# The pre-split coding-router lab's own numbers on this matrix, quoted beside the wmo protocol's
+# so a reader sees the decision-rule difference instead of hunting for it: its router picked the
+# CHEAPEST arm whose predicted solve odds cleared a threshold (cost first, quality as the
+# constraint), measured over 6 seeded 80/20 repo splits.
+_DEEPSWE_LAB_REFERENCE = (
+    "cost ratio median 3.18x (range 0.90-5.25), graded delta median -0.015"
+)
+
+
+@research_app.command("deepswe-holdout")
+def research_deepswe_holdout(
+    bundle: str = typer.Argument(
+        ...,
+        help="Converted DeepSWE bundle dir: matrix.json + task_embeddings.npy + "
+        "scenario_groups.json (written by `wmo optimize route convert-deepswe`).",
+    ),
+    fallback: str = typer.Option(
+        "claude-opus-5@high",
+        "--fallback",
+        help="Baseline pool arm the guard pins (the matrix's strongest single arm).",
+    ),
+    splits: int = typer.Option(
+        6,
+        "--splits",
+        min=1,
+        help="Independent repo-grouped fit/report splits (deterministic, salted 0..n-1); the "
+        "median over them is the headline, since one 30% holdout of ~90 repos can be lucky.",
+    ),
+    cost_quality: float = typer.Option(
+        0.25,
+        "--cost-quality",
+        min=0.0,
+        max=1.0,
+        help="Dial position to evaluate (0.25 = the shipped default; 1.0 = max savings). The "
+        "champion optimizes quality first, so cost movement lives on this dial.",
+    ),
+) -> None:
+    """Repo-grouped router holdout on the converted DeepSWE matrix, offline and credential-free.
+
+    The honesty protocol this benchmark needs: DeepSWE tasks from one repository share code, so
+    fit and report sides split by REPOSITORY (`split_router_scenarios_grouped`), never by row.
+    Per split: fit wmo's champion kNN on the fit repos (recorded local-model vectors, guard
+    pinned to `--fallback`), set the dial, and report the held-out paired headline against
+    always-`--fallback`. Prints per-split rows, the medians, and the pre-split lab's reference
+    numbers for the same matrix under its different (cheapest-arm-above-threshold) decision
+    rule; a gap against that reference is a finding about the rules, not noise.
+    """
+    import tempfile
+    from datetime import UTC, datetime
+    from statistics import median
+
+    from rich.table import Table
+
+    from wmo.optimize.knn import apply_cost_quality, fit_knn_artifact
+    from wmo.optimize.outcomes import OutcomeMatrix, split_router_scenarios_grouped
+    from wmo.optimize.policy import EmbedderSpec
+    from wmo.optimize.report import build_report
+    from wmo.reproduce.embedding import CachedTaskEmbedder
+
+    root = Path(bundle)
+    for name in ("matrix.json", "task_embeddings.npy", "scenario_groups.json"):
+        if not (root / name).is_file():
+            raise typer.BadParameter(
+                f"{root / name} is missing; point at a bundle written by "
+                "`wmo optimize route convert-deepswe` (or the downloaded published bundle)"
+            )
+    matrix = OutcomeMatrix.load(root / "matrix.json")
+    groups: dict[str, str] = json.loads(
+        (root / "scenario_groups.json").read_text(encoding="utf-8")
+    )
+    built = CachedTaskEmbedder(matrix, root / "task_embeddings.npy")
+    spec = EmbedderSpec(kind="local", dim=built.dim)
+
+    table = Table(show_header=True, title=f"DeepSWE repo-grouped holdout (dial {cost_quality:g})")
+    for column in ("split", "fit/report tasks", "repos", "base", "routed", "delta", "x cheaper"):
+        table.add_column(column, justify="right")
+    ratios: list[float] = []
+    deltas: list[float] = []
+    for index in range(splits):
+        salt = "" if index == 0 else str(index)
+        try:
+            split = split_router_scenarios_grouped(matrix.scenario_ids(), groups, salt=salt)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        with tempfile.TemporaryDirectory(prefix="deepswe-holdout-") as scratch:
+            try:
+                fitted = fit_knn_artifact(
+                    matrix,
+                    out_path=Path(scratch) / "policy.json",
+                    matrix_source=str(root / "matrix.json"),
+                    embedder=spec,
+                    fit_ids=list(split.fit_ids),
+                    fallback=fallback,
+                    built=built,
+                )
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            policy = apply_cost_quality(fitted.policy, cost_quality)
+            report = build_report(
+                matrix,
+                policy,
+                baseline=fallback,
+                endpoint="research-deepswe-holdout",
+                generated_at=datetime.now(UTC).isoformat(),
+                scenario_label="on held-out DeepSWE tasks from repositories the fit never saw",
+                built=built,
+            )
+        headline = report.headline
+        ratio = (
+            headline.baseline_cost_per_run_usd / headline.cost_per_run_usd
+            if headline.cost_per_run_usd > 0.0
+            else float("inf")
+        )
+        delta = headline.accuracy - headline.baseline_accuracy
+        ratios.append(ratio)
+        deltas.append(delta)
+        fit_repos = len({groups[sid] for sid in split.fit_ids})
+        report_repos = len({groups[sid] for sid in split.report_ids})
+        table.add_row(
+            salt or "0",
+            f"{len(split.fit_ids)}/{len(split.report_ids)}",
+            f"{fit_repos}/{report_repos}",
+            f"{headline.baseline_accuracy:.3f}",
+            f"{headline.accuracy:.3f}",
+            f"{delta:+.3f}",
+            f"{ratio:.2f}",
+        )
+    _console.print(table)
+    _console.print(
+        f"[bold]median over {splits} grouped splits[/bold]: cost ratio "
+        f"{median(ratios):.2f}x (range {min(ratios):.2f}-{max(ratios):.2f}), "
+        f"graded delta {median(deltas):+.3f}"
+    )
+    _console.print(
+        f"[dim]pre-split lab reference on this matrix, its cheapest-arm-above-threshold rule, "
+        f"6 seeded 80/20 repo splits: {_DEEPSWE_LAB_REFERENCE}. wmo's guarded champion leaves "
+        "the baseline only on paired quality evidence, so at low dial it buys parity rather "
+        "than savings; slide --cost-quality toward 1.0 for the savings end.[/dim]"
+    )
 
 
 def _short_error(exc: Exception) -> str:

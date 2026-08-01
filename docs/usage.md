@@ -26,6 +26,7 @@ Three optimizers, named for the artifact each produces.
 | `wmo optimize route report` | Build the three-objective improvement report for a policy over a matrix. | `report.json` (an `ImprovementReport`) |
 | `wmo optimize route pin` | Serve one pool model as an endpoint, with no matrix and no fit. | a `kind="static"` `policy.json` |
 | `wmo optimize route student` | Add a distilled student to the candidate pool as a priced entry. | a `[[model]]` entry in `pool.toml` |
+| `wmo optimize route convert-deepswe` | Convert DeepSWE v1.1's published trials into a fit-ready matrix bundle (the research-adapter producer; refuses unless every published pass@1 reproduces). | `matrix.json` + `task_embeddings.npy` + `scenario_groups.json` |
 | `wmo optimize harness` | Search the agent scaffold (prompts, skills, tool policy, loop params) against a world model or on harbor tasks. A non-interactive run needs `--yes` in either environment. | an immutable `vN` `HarnessDoc` in the store, `champion` alias moved, plus a delta archive |
 | `wmo optimize distill probe` | Ask a measured outcome matrix whether this workload has a teacher gap worth distilling at all, and which model is the cheapest sufficient teacher. Free. Exits 0 (distill), 3 (no gap), 4 (too thin to say). | nothing (prints) |
 | `wmo optimize distill run` | Train the agent model itself: on-policy distillation of a Tinker LoRA student from harbor rollouts, gated on held-out solve rates. A non-interactive run needs `--yes`. | a run dir (config snapshot, metrics, checkpoints, evals, `gate.json`) and, on an accepted gate, an adapter version |
@@ -93,5 +94,7 @@ champion harness in platform-managed sandboxes and need no local model or sandbo
 ## Research
 
 `wmo research` holds the experiment drivers behind the published studies (`concurrency`,
-`plot-concurrency`, and the rest). They write report JSONs and figures rather than serving
-artifacts; `wmo research --help` lists what is currently wired.
+`plot-concurrency`, `deepswe-holdout`, and the rest). They write report JSONs and figures (or
+print comparison tables) rather than serving artifacts; `wmo research --help` lists what is
+currently wired. `deepswe-holdout` runs the repo-grouped router holdout on a converted DeepSWE
+bundle and prints the per-split table, the medians, and the pre-split lab's reference numbers.

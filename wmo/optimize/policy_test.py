@@ -39,6 +39,7 @@ from wmo.optimize.policy import (
     write_artifact_atomically,
 )
 from wmo.providers.base import ProviderKind
+from wmo.providers.local_embed import DEFAULT_LOCAL_EMBED_MODEL, LOCAL_EMBED_DIM
 from wmo.providers.openrouter_pricing import CATALOG_PATH_ENV, PriceCatalog
 from wmo.providers.pool import PoolEntry
 from wmo.retrieval.embedders import HashingEmbedder
@@ -1052,9 +1053,19 @@ def test_a_static_policy_carries_no_evidence() -> None:
 # Moved here with the code it covers when `resolve_embedder`/`probe_embedder` left the CLI
 # (they are now used by two fit commands). They assert ValueError; that the CLI turns it into a
 # usage error is covered in `wmo/cli/route_app_test.py`.
+def _local_uncached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin `auto` off its local leg.
+
+    These tests assert the azure and hashing legs, and whether THIS machine happens to have the
+    local model's weights cached must not decide what they see.
+    """
+    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
+
+
 def test_embedder_auto_resolves_to_azure_when_the_standard_env_is_present(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _local_uncached(monkeypatch)
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
     spec, line = resolve_embedder(
@@ -1071,6 +1082,7 @@ def test_embedder_auto_resolves_to_azure_when_the_standard_env_is_present(
 def test_embedder_auto_falls_back_to_hashing_and_quotes_the_measured_gap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _local_uncached(monkeypatch)
     monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
     spec, line = resolve_embedder(
@@ -1081,6 +1093,8 @@ def test_embedder_auto_falls_back_to_hashing_and_quotes_the_measured_gap(
     # The downgrade is never silent, and it quotes the numbers rather than warning vaguely.
     assert HASHING_DOWNGRADE_NOTICE in line
     assert "AZURE_OPENAI_API_KEY" in line and "AZURE_OPENAI_ENDPOINT" in line
+    # And it names the credential-free way up: one explicit local fit, then auto keeps it.
+    assert "--embedder local" in line
 
 
 def test_embedder_auto_needs_both_variables_not_just_one(
@@ -1088,6 +1102,7 @@ def test_embedder_auto_needs_both_variables_not_just_one(
 ) -> None:
     # A key with no endpoint cannot embed anything; falling back is right, and the line says
     # which half is missing so the operator can finish the setup.
+    _local_uncached(monkeypatch)
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
     monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
     spec, line = resolve_embedder(
@@ -1095,6 +1110,71 @@ def test_embedder_auto_needs_both_variables_not_just_one(
     )
     assert spec.kind == "hashing"
     assert "AZURE_OPENAI_ENDPOINT unset" in line
+
+
+def test_embedder_auto_prefers_the_cached_local_model_over_azure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The local model is semantic AND credential-free, so once its weights are on disk it beats
+    # a configured Azure resource: no embedding API in the loop, nothing billed.
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
+    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: True)
+    monkeypatch.setattr("wmo.optimize.policy.pick_backend", lambda: "mlx")
+    spec, line = resolve_embedder(
+        "auto", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert (spec.kind, spec.dim, spec.model) == ("local", LOCAL_EMBED_DIM, None)
+    assert "in-process" in line and "weights cached" in line
+    assert DEFAULT_LOCAL_EMBED_MODEL in line
+
+
+def test_embedder_auto_never_triggers_the_first_local_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Uncached weights mean auto stays off the local leg entirely: a several-hundred-MB
+    # download is something an operator opts into once, with an explicit --embedder local.
+    _local_uncached(monkeypatch)
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("AZURE_OPENAI_ENDPOINT", raising=False)
+    spec, _ = resolve_embedder("auto", dim=None, deployment=None, endpoint=None, api_key_env=None)
+    assert spec.kind == "hashing"
+
+
+def test_explicit_local_resolves_the_backend_and_states_the_download(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("wmo.optimize.policy.pick_backend", lambda: "torch-cpu")
+    monkeypatch.setattr("wmo.optimize.policy.default_model_cached", lambda backend=None: False)
+    spec, line = resolve_embedder(
+        "local", dim=None, deployment=None, endpoint=None, api_key_env=None
+    )
+    assert (spec.kind, spec.dim, spec.model) == ("local", LOCAL_EMBED_DIM, None)
+    assert "torch-cpu" in line and "downloads weights" in line
+
+
+def test_explicit_local_without_any_backend_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _no_backend() -> str:
+        raise RuntimeError("no local embedding backend is available: install the `local` extra")
+
+    monkeypatch.setattr("wmo.optimize.policy.pick_backend", _no_backend)
+    with pytest.raises(ValueError, match="local"):
+        resolve_embedder("local", dim=None, deployment=None, endpoint=None, api_key_env=None)
+
+
+def test_local_spec_defaults_dim_to_the_models_native_width() -> None:
+    assert EmbedderSpec(kind="local").dim == LOCAL_EMBED_DIM
+    assert EmbedderSpec(kind="local", dim=64).dim == 64  # a deliberate size is honored
+
+
+def test_local_provenance_names_the_model_not_the_backend() -> None:
+    # mlx and torch serve the same geometry, so the backend is not part of the fit's identity.
+    assert (
+        embedder_provenance(EmbedderSpec(kind="local"))
+        == f"local-{LOCAL_EMBED_DIM}/{DEFAULT_LOCAL_EMBED_MODEL}"
+    )
 
 
 def test_explicit_hashing_is_unchanged_even_with_the_azure_env_set(
@@ -1174,6 +1254,7 @@ def test_an_explicit_dim_is_honored_verbatim_on_the_azure_path() -> None:
 def test_an_explicit_dim_wins_over_the_auto_resolved_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _local_uncached(monkeypatch)
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
     spec, _ = resolve_embedder("auto", dim=256, deployment=None, endpoint=None, api_key_env=None)
@@ -1189,13 +1270,14 @@ def test_explicit_azure_without_a_deployment_says_which_flag_is_missing() -> Non
 def test_an_unknown_embedder_is_a_usage_error() -> None:
     with pytest.raises(ValueError) as caught:
         resolve_embedder("word2vec", dim=None, deployment=None, endpoint=None, api_key_env=None)
-    assert "auto, hashing or azure" in str(caught.value)
+    assert "auto, hashing, azure or local" in str(caught.value)
 
 
 def test_the_azure_resolution_line_says_it_bills_an_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Resolving to azure is spend nobody typed a flag for, so it must be stated.
+    _local_uncached(monkeypatch)
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://sheets.openai.azure.com")
     _, line = resolve_embedder("auto", dim=None, deployment=None, endpoint=None, api_key_env=None)

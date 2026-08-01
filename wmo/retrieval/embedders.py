@@ -67,15 +67,22 @@ def get_embedder(config: HarnessConfig) -> Embedder:
     """Resolve the configured phi embedder from a `HarnessConfig`.
 
     `embed_provider == HASHING` (the default) returns the offline `HashingEmbedder` sized to
-    `config.embed_dim` — no credentials, no network. Any other kind constructs the matching backend
-    provider (via the registry) with `embed_dim` threaded through, so the provider requests vectors
-    of exactly the persisted dimension and the index/query vectors line up.
+    `config.embed_dim` (no credentials, no network). `LOCAL` runs the in-process Qwen3 model
+    (`wmo.providers.local_embed`), also credential-free; its `embed_dim` must be the model's
+    native width (1024 for the default), which the embedder checks on first use. Any other kind
+    constructs the matching backend provider (via the registry) with `embed_dim` threaded
+    through, so the provider requests vectors of exactly the persisted dimension and the
+    index/query vectors line up.
 
-    The registry import is deferred to keep `wmo.retrieval` free of a hard dependency on the
-    provider backends (retrieval only needs the `Embedder` protocol).
+    The registry and local-embedder imports are deferred to keep `wmo.retrieval` free of a hard
+    dependency on the provider backends (retrieval only needs the `Embedder` protocol).
     """
     if config.embed_provider is EmbedderKind.HASHING:
         return HashingEmbedder(dim=config.embed_dim)
+    if config.embed_provider is EmbedderKind.LOCAL:
+        from wmo.providers.local_embed import LocalEmbedder
+
+        return LocalEmbedder(dim=config.embed_dim)
 
     from wmo.providers import get_provider
 
