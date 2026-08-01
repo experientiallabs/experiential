@@ -65,6 +65,12 @@ combinatorial Laplacian propagates latent difficulty with penalties 0.01, 0.1, a
 online feature contract. Repository identity, model output, patch, tests, verifier details, and
 future trajectory content remain forbidden features.
 
+The graph and monotone variants are separate ablations, not a factorial cross. For each feature
+view, latent dimension, and regularization strength, the structural grid contains exactly five
+variants: unconstrained without a graph, monotone Luna capacity without a graph, and unconstrained
+with each of the three graph penalties. This produces 240 structural candidates before the 25
+cost-penalty and KL-radius operating points.
+
 ## Implementation starting point
 
 Reuse the tested optimizer and grouped-CV structure in
@@ -110,6 +116,12 @@ The pure robust-selection helpers in
 repository reward and cost aggregation, forward-KL worst-case metrics, and paired robust margins.
 They use only in-memory arrays and have no fitting, network, filesystem, or serialization surface.
 
+The in-memory nested orchestrator in
+`.agents/scripts/coding_model_router_graded_irt_nested.py` crosses the 240 structures with the 25
+operating points inside every seeded repository fold. It fits both the real and within-repository
+shuffled count rows, predicts each task out of fold exactly once, and retains only aggregate
+metrics. It has no filesystem or serialization surface and does not activate this lane.
+
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or
 fitted numeric router state is persisted. The remote worker may retain coefficients only for its
@@ -137,6 +149,11 @@ The robust score is the minimum expected repository margin over the forward-KL s
 Radius candidates are `0, 0.01, 0.03, 0.05, 0.1`. Radius and cost penalty are selected only from
 inner out-of-fold routes and outcomes.
 
+Radius zero is the required nominal ablation and cannot promote as the primary robust policy. A
+promoted policy must pass at radius 0.01 or greater. When otherwise identical routes have the same
+cost and pass at multiple radii, select the largest passing radius before applying the remaining
+tie breaks. This prevents the mechanically weakest radius from winning every identical-route tie.
+
 The mechanical winner minimizes cost subject to all of these fit-only conditions:
 
 1. at least 95 percent quality retention in every outer seed;
@@ -147,6 +164,12 @@ The mechanical winner minimizes cost subject to all of these fit-only conditions
 6. no repository with at least five tasks loses more than 0.10 absolute reward;
 7. route latency below 5 ms p50 and 20 ms p95 over 10,000 single-core decisions;
 8. zero inference-time network calls.
+
+The within-repository shuffled-label advantage is defined as mean actual routed reward from the
+real-label out-of-fold policy minus mean actual routed reward from the otherwise identical policy
+fit on complete count rows permuted within each repository. It must be strictly positive in every
+outer seed. The matched task-blind control remains separate and uses the real policy's exact arm
+traffic on every task.
 
 Tie breaks are higher worst-seed retention, higher matched-blind advantage, lower latency, smaller
 ephemeral coefficient count, lower latent dimension, and the frozen grid order.
