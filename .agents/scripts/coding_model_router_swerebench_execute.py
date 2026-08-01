@@ -87,7 +87,7 @@ for index, outer in enumerate(records):
     if not isinstance(start, (int, float)) or not isinstance(end, (int, float)) or end <= start:
         raise SystemExit(f"row {index} lacks official scoring timing")
     calls = trace.get("calls")
-    if not isinstance(calls, list) or not calls or len(calls) > 20:
+    if not isinstance(calls, list) or not calls or len(calls) > 40:
         raise SystemExit(f"row {index} has invalid provider calls")
     usage = {field: 0 for field in totals}
     provider_errors = []
@@ -124,6 +124,9 @@ for index, outer in enumerate(records):
             totals[field] += value
     if usage["reasoning_tokens"] > usage["completion_tokens"]:
         raise SystemExit(f"row {index} reasoning exceeds output tokens")
+    inference_calls = len(calls) - len(provider_errors)
+    if not 1 <= inference_calls <= 20:
+        raise SystemExit(f"row {index} has invalid provider inference calls")
     patch = trace.get("info", {}).get("patch")
     if not isinstance(patch, str):
         raise SystemExit(f"row {index} lacks a patch string")
@@ -131,7 +134,7 @@ for index, outer in enumerate(records):
         "attempt_number": args.attempt_offset + index,
         "reward": float(reward),
         "provider_calls": len(calls),
-        "provider_inference_calls": len(calls) - len(provider_errors),
+        "provider_inference_calls": inference_calls,
         "provider_errors": provider_errors,
         "stop_condition": trace.get("stop_condition"),
         "trace_ok": trace.get("ok"),
