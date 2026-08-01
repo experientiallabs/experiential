@@ -62,6 +62,25 @@ propagates latent difficulty with graph Laplacian penalties 0.01, 0.1, and 1, an
 feature contract. Repository identity, model output, patch, tests, verifier details, and future
 trajectory content remain forbidden features.
 
+## Implementation starting point
+
+Reuse the tested optimizer and grouped-CV structure in
+`.agents/scripts/coding_model_router_codeforces_irt.py`. Do not reuse its scientific assumptions
+unchanged. The graded SWE-rebench adaptation must:
+
+1. replace its equally weighted fractional cross-entropy with the exact binomial likelihood so a
+   1-of-1 score does not carry the same information as a 100-of-100 score;
+2. generalize the scalar difficulty and discrimination to the frozen latent dimensions above;
+3. replace direct linear or Chebyshev scalarization with the repository KL-robust selection rule;
+4. remove fitted arm abilities and all other coefficients from persisted reports;
+5. freeze only task identity, selected arm, input hashes, route provenance, and aggregate fit
+   diagnostics in a label-free route manifest;
+6. preserve its finite-difference gradient test, grouped split assertions, shuffled-label control,
+   and latency audit.
+
+The existing Codeforces implementation remains an historical experiment and is not modified by
+this follow-up.
+
 All fitting, cross-validation, bootstrapping, and latency measurement run on E2B or Azure. The Mac
 only orchestrates and validates bounded artifacts. No foundation model, task embedding bank, or
 fitted numeric router state is persisted. The remote worker may retain coefficients only for its
