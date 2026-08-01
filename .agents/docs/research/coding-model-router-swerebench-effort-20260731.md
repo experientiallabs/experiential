@@ -1,0 +1,177 @@
+# SWE-rebench V2 reasoning-effort routing protocol
+
+Status: frozen before provider execution on 2026-07-31; DeepSWE outcomes remain sealed.
+
+## Objective
+
+Learn a latency-neutral `gpt-5.6-luna` reasoning-effort router from verified
+repository tasks that are disjoint from DeepSWE, confirm exactly one frozen
+route on untouched repositories, and permit one DeepSWE transfer only if every
+external promotion gate passes.
+
+The router may use only deterministic label-free request metadata available on
+both corpora. It may not call a model, retrieve a demonstration, inspect a test,
+or scan a repository at inference time. No fitted foundation model is retained.
+
+## Source and target isolation
+
+The source is
+`PrimeIntellect/SWE-rebench-V2-Filtered-Verified` at revision
+`03cc767ee33126b7fc7890ad57047e9dd6914cca`. Its single Parquet shard has
+SHA-256 `7416e352008b35480c82610cf4f5edf160dd269ed6bf382a22bd4c17daed24b9`.
+Selection read only task identity, prompt, repository, language, base commit,
+creation time, and image identity. It did not read gold patches, test patches,
+test lists, verifier configuration, or LLM-authored metadata.
+
+The label-free DeepSWE task index has SHA-256
+`b0d25ec0e566c0391e4385a63343b92d5371b67f052e1c9062c9d226d9d18dd1`.
+The complete 113-task prompt view has SHA-256
+`35ad33855f63f147b1861b58b59ad635f8860677b5d0d5e902c421029d78637b`.
+No target reward or cost field was read.
+
+A deterministic SHA-256 ordering with seed `20260731` froze two 200-task
+cohorts. Each cohort contains 60 Go, 10 JavaScript, 60 Python, 10 Rust, and 60
+TypeScript tasks, with at most three tasks per repository. Development and
+confirmation each span 103 repositories. They have zero repository overlap
+with one another, zero repository overlap with DeepSWE, and zero normalized
+exact-prompt overlap with DeepSWE.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Development tasks | `7d846b5576d15e68fd18ac21bfe0610cc1614b3b35ec0ae0cb8cfae0b82962c1` |
+| Confirmation tasks | `9798dd1e58be0d13331d097307670dc3fc3760ad211da20e6367666523f080a7` |
+| Cohort manifest | `78452c079f399b7de9cf73720f516b93c0b988fb436e328325fd79d4d04c6eb2` |
+
+Confirmation tasks and outcomes remain unavailable to fitting until one
+development candidate and every confirmation gate are content-addressed.
+
+## Execution pins
+
+- Model: `gpt-5.6-luna`
+- Reasoning efforts: `low`, `medium`, `high`, `xhigh`, `max`
+- Attempts per task and effort: two
+- Development cells: 2,000
+- Confirmation cells if authorized: 2,000
+- Temperature: 1.0
+- Per-response output limit: 32,768 tokens
+- Per-agent limits: 20 model turns, 131,072 total output tokens, 900 seconds
+- Setup and official scoring limit: 900 seconds each
+- Harness: verifiers `mini_swe_agent` version 2.4.5
+- Verifiers commit: `f6e420b9908ae14d625f079881f13c15011ee1c9`
+- Official taskset commit: `a90fbd708de9ab18f85b5ffc3a0bdc60825dcc84`
+- Runtime: task-specific Docker image inside E2B template
+  `deepswe-router-docker-v1`, template ID `3v4ie6miz6uhlhhfeyea`, build ID
+  `95fa38ac-01fa-45b5-841d-72e17fce0819`
+- E2B account cap: 1,000 sandboxes
+
+The official `swerebench_v2_v1` taskset restores test files, applies the hidden
+test patch only at scoring time, runs the pinned test command, and returns one
+only when every fail-to-pass and pass-to-pass test passes. Empty patches,
+agent errors, provider truncations after model execution, and unresolved tasks
+are gradeable zero-reward model outcomes. Failures before model execution or
+before an official verifier result are infrastructure failures and may be
+resumed without changing the scientific attempt identity.
+
+The runtime must attest the requested model and reasoning effort on every
+provider turn. Exact usage telemetry is retained when available. Otherwise the
+ledger uses the existing trace-derived estimator and labels that provenance.
+Frozen list prices are USD 1.00 per million input tokens, USD 0.10 per million
+cached input tokens, and USD 6.00 per million output tokens.
+
+## Smoke and matrix launch
+
+Run exactly four cells first: the first two development tasks by frozen task
+order, at `xhigh` and `max`, attempt zero. The smoke must prove:
+
+1. Docker starts inside E2B and pulls both task images;
+2. the pinned taskset and mini-swe-agent harness load;
+3. all provider turns attest `gpt-5.6-luna` and the requested effort;
+4. each cell reaches the official verifier or a gradeable post-execution zero;
+5. traces, rewards, patches, usage provenance, and resume state persist;
+6. the exact E2B smoke sandboxes are terminated after artifact verification.
+
+If the smoke exposes an infrastructure defect, repair and resume only these
+four cells. Do not launch a replacement smoke. If the smoke is valid, run all
+2,000 development cells with bounded E2B concurrency. Reuse completed cells by
+content hash and never rerun a gradeable model outcome.
+
+## Target-compatible candidate families
+
+Development may compare the following lightweight families. All use only the
+problem statement, canonical repository string, language, and deterministic
+prompt-shape features. Base-commit identity may be retained for auditing but
+not as a fitted feature.
+
+1. Static effort arms and task-blind mixtures.
+2. Signed character 3-to-5-gram hashing with Ridge reward-delta heads relative
+   to high effort. Hash dimensions are 512, 2,048, and 8,192; Ridge alphas are
+   1, 10, and 100.
+3. Monotone ordinal reward heads on the same representations. Predicted reward
+   is isotonic across effort before cost-aware selection.
+4. Pairwise uplift heads for adjacent effort steps with repository-grouped
+   cross-fitting and inverse-variance shrinkage.
+5. A two-parameter item-response model whose task difficulty and discrimination
+   are predicted from the same representations.
+6. WMO guarded kNN using cached deterministic vectors, `k` in 8, 16, 32, and
+   64, asymmetric guard, `knn_z` in 0, 0.5, 1, 1.645, and 2, and `pick_lam` in
+   0, 0.01, 0.02, and 0.03. No absolute similarity floor is allowed.
+
+Within five development outer folds grouped by repository, fit-only selection
+chooses the least costly point within 0.5 reward points of the fold's strongest
+eligible quality point, then breaks ties by higher reward, lower route latency,
+and simpler family order above. A candidate must beat its matched task-blind
+mixture in aggregate, retain at least 95 percent of the strongest fit-selected
+static reward in every outer fold, and avoid static dominance. Development is
+adaptive within these families, but it may freeze only one confirmation rule.
+No confirmation result may change its features, hyperparameters, thresholds,
+guard, arm roster, or tie breaks.
+
+## Confirmation gates
+
+The frozen route advances only if the untouched 200-task confirmation matrix
+satisfies all of the following:
+
+1. every task-effort cell is gradeable after taskwise removal of any genuinely
+   missing infrastructure cell, and retained task coverage is at least 95
+   percent;
+2. route reward minus a matched task-blind mixture with identical effort counts
+   is positive and its 10,000-resample repository-bootstrap 95 percent lower
+   bound is above zero;
+3. no single static effort has at least the route reward at no greater cost;
+4. the same fitter with a fixed within-development-repository outcome
+   permutation fails the primary matched-blind gate;
+5. every development outer fold retains at least 95 percent of its strongest
+   static reward and the frozen family retains that condition on confirmation;
+6. the complete pre-inference route takes less than 5 ms per task on the E2B
+   reference worker; and
+7. the isolation audit still reports no target outcome access and no source to
+   target repository or exact-prompt overlap.
+
+A failed confirmation is final for the frozen route. Confirmation-dependent
+tuning or another confirmation cohort is prohibited.
+
+## Single sealed DeepSWE transfer
+
+Only a fully passing external confirmation can authorize one target transfer.
+Before target outcomes are opened, refit the exact frozen candidate on the
+development outcomes only, write all 113 effort decisions against the frozen
+label-free target view, and content-address the complete route file on a
+no-internet E2B worker. The fitted numeric state remains ephemeral.
+
+Then evaluate those frozen decisions exactly once against the existing
+DeepSWE matrix with SHA-256
+`2988742e48b1c9bfec8dc45d88af112c46c45367529d1936b709e4b4e549835f`.
+Use graded fail-to-pass reward and measured trial cost, remove a task across all
+five efforts if any required cell is missing, compare every static effort and a
+matched task-blind mixture, and bootstrap router-minus-blind reward by
+repository. There is no second target evaluation and no target-dependent
+refit, threshold, representation, or arm change regardless of the result.
+
+## Budget and stopping
+
+Prior trace-derived experiment spend is approximately USD 405.33. The user
+monitors provider billing externally and authorized a USD 20,000 hard ceiling.
+Exact metering is not a launch gate. Preserve exact telemetry where available,
+otherwise update a clearly labeled trace-derived estimate after the smoke and
+each completed tranche. Stop before any launch whose estimate would take total
+experiment spend above USD 20,000.

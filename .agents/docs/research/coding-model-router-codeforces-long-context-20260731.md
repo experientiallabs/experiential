@@ -1,6 +1,6 @@
 # Codeforces long-context effort development protocol
 
-Status: development complete; confirmation frozen before provider execution on 2026-07-31.
+Status: complete negative external confirmation on 2026-07-31; DeepSWE remains sealed.
 
 ## Objective
 
@@ -140,9 +140,40 @@ Only a passing untouched confirmation authorizes the one sealed DeepSWE
 transfer. A failure is final for this route and cannot be repaired with
 confirmation-dependent tuning.
 
+## Confirmation result
+
+The untouched matrix completed all 1,600 cells. Its combined outcomes have
+SHA-256 `fb2fec2c2e23a1c44867648fa622c0827bb1ea01c4b9c518df0abb8cf403b1e8`.
+Seven provider responses ended at the frozen 131,072 output-token limit and
+were retained as gradeable zero-reward model outcomes. The five effort arms
+measured as follows:
+
+| Effort | Mean reward | Total cost, USD |
+| --- | ---: | ---: |
+| low | 0.78719 | 3.0123 |
+| medium | 0.86141 | 5.9876 |
+| high | 0.91875 | 16.1243 |
+| xhigh | 0.95547 | 27.7140 |
+| max | 0.97125 | 48.4895 |
+
+The frozen `direct-hash512-a10-t0` route achieved reward 0.96078 at USD
+22.0005. Its matched task-blind mixture with identical arm counts achieved
+reward 0.95687 at USD 19.4351. The positive point advantage of 0.00392 did not
+survive contest-grouped resampling: the 95 percent interval was
+`[-0.01010, 0.00387, 0.01650]`. The route was not statically dominated, its
+shuffled-label control failed as required, and its full pre-inference path took
+466.45 ms per 160-task batch, or about 2.92 ms per task.
+
+The confirmation report has SHA-256
+`24da2239fdd6a279fdd20a018dec9aaa0108eebbf1b0e08df8fbc6282d8341c4`.
+The only failed gate was the required positive bootstrap lower bound. This
+failure is final for the frozen route. No DeepSWE route was frozen and no
+DeepSWE outcome was opened.
+
 ## Preregistered single DeepSWE transfer
 
-If and only if every confirmation condition passes, refit the exact frozen
+This section records the preregistered transfer that was not executed. If and
+only if every confirmation condition had passed, refit the exact frozen
 candidate on the 160 development tasks and score the 113-row label-free
 DeepSWE task view with SHA-256
 `35ad33855f63f147b1861b58b59ad635f8860677b5d0d5e902c421029d78637b`.
