@@ -42,6 +42,9 @@ KL_RADII = (0.0, 0.01, 0.03, 0.05, 0.1)
 QUALITY_FLOOR = 0.95
 MIN_SAVINGS = 0.40
 MAX_REPOSITORY_LOSS = 0.10
+MAX_ROUTE_P50_MS = 5.0
+MAX_ROUTE_P95_MS = 20.0
+MIN_ROUTE_DECISIONS = 10_000
 
 
 @dataclass(frozen=True)
@@ -130,6 +133,30 @@ class PolicyMetric:
     def key(self) -> str:
         """Return the joint structure and operating-point identity."""
         return f"{self.structure_key}__{self.operating_key}"
+
+
+@dataclass(frozen=True)
+class RouteLatencyMetric:
+    """One single-core online route audit with no inference-time network call."""
+
+    p50_ms: float
+    p95_ms: float
+    decisions: int
+    network_calls: int
+
+    @property
+    def eligible(self) -> bool:
+        """Return whether the frozen latency and network gates pass."""
+        return (
+            np.isfinite(self.p50_ms)
+            and np.isfinite(self.p95_ms)
+            and self.p50_ms >= 0.0
+            and self.p95_ms >= self.p50_ms
+            and self.p50_ms < MAX_ROUTE_P50_MS
+            and self.p95_ms < MAX_ROUTE_P95_MS
+            and self.decisions >= MIN_ROUTE_DECISIONS
+            and self.network_calls == 0
+        )
 
 
 @dataclass(frozen=True)
@@ -460,7 +487,7 @@ def select_nested_policy(
     structures: Sequence[IrtStructure] | None = None,
     operating_points: Sequence[OperatingPoint] | None = None,
     seeds: Sequence[int] = OUTER_SEEDS,
-    route_latency_ms: Mapping[str, float] | None = None,
+    route_latency: Mapping[str, RouteLatencyMetric] | None = None,
 ) -> NestedSelectionResult:
     """Run the full fit-only nested search and select one common five-seed winner."""
     selected_structures = (
@@ -493,7 +520,7 @@ def select_nested_policy(
         structures=selected_structures,
         operating_points=selected_points,
         seeds=selected_seeds,
-        route_latency_ms=route_latency_ms,
+        route_latency=route_latency,
     )
 
 
@@ -556,7 +583,7 @@ def select_nested_metrics(
     structures: Sequence[IrtStructure] | None = None,
     operating_points: Sequence[OperatingPoint] | None = None,
     seeds: Sequence[int] = OUTER_SEEDS,
-    route_latency_ms: Mapping[str, float] | None = None,
+    route_latency: Mapping[str, RouteLatencyMetric] | None = None,
 ) -> NestedSelectionResult:
     """Select from complete aggregate seed shards without any fitted numeric state."""
     selected_structures = (
@@ -591,17 +618,22 @@ def select_nested_metrics(
         for values in by_key.values()
         if all(value.eligible for value in values)
     ]
-    latency = route_latency_ms or {}
+    latency = route_latency or {}
+    latency_eligible = [
+        values
+        for values in eligible
+        if values[0].key in latency and latency[values[0].key].eligible
+    ]
     winner = None
-    if eligible:
+    if latency_eligible:
         winner = min(
-            eligible,
+            latency_eligible,
             key=lambda values: (
                 float(np.mean([value.cost_per_task for value in values])),
                 -min(value.quality_retention for value in values),
                 -min(value.matched_blind_advantage for value in values),
                 -values[0].kl_radius,
-                latency.get(values[0].key, float("inf")),
+                latency[values[0].key].p95_ms,
                 values[0].coefficient_count,
                 values[0].latent_dimension,
                 values[0].structure_order,

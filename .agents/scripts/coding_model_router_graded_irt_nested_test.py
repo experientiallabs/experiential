@@ -9,6 +9,7 @@ from coding_model_router_graded_irt_nested import (
     CrossfitPredictions,
     IrtStructure,
     OperatingPoint,
+    RouteLatencyMetric,
     evaluate_nested_seed,
     evaluate_policy,
     frozen_operating_points,
@@ -31,6 +32,15 @@ def _structure() -> IrtStructure:
 
 def _operating_point() -> OperatingPoint:
     return OperatingPoint(order=0, cost_penalty=0.03, kl_radius=0.01)
+
+
+def _latency() -> RouteLatencyMetric:
+    return RouteLatencyMetric(
+        p50_ms=0.5,
+        p95_ms=1.0,
+        decisions=10_000,
+        network_calls=0,
+    )
 
 
 def _fixture() -> tuple[
@@ -242,6 +252,10 @@ def test_nested_selection_requires_one_policy_to_pass_every_seed(
         repositories,
         structures=(_structure(),),
         operating_points=(_operating_point(), stronger_radius),
+        route_latency={
+            f"{_structure().key}__{_operating_point().key}": _latency(),
+            f"{_structure().key}__{stronger_radius.key}": _latency(),
+        },
     )
     assert result.selected_key == f"{_structure().key}__{stronger_radius.key}"
     assert result.eligible_count == 2
@@ -292,6 +306,9 @@ def test_one_failed_seed_prevents_selection(monkeypatch: pytest.MonkeyPatch) -> 
         repositories,
         structures=(_structure(),),
         operating_points=(_operating_point(),),
+        route_latency={
+            f"{_structure().key}__{_operating_point().key}": _latency(),
+        },
     )
     assert result.selected_key is None
     assert result.eligible_count == 0
@@ -329,6 +346,9 @@ def test_complete_seed_shards_select_without_fitted_state(
         structures=(_structure(),),
         operating_points=(_operating_point(),),
         seeds=seeds,
+        route_latency={
+            f"{_structure().key}__{_operating_point().key}": _latency(),
+        },
     )
     assert result.selected_key == f"{_structure().key}__{_operating_point().key}"
     assert result.eligible_count == 1
@@ -362,3 +382,51 @@ def test_seed_shard_selection_rejects_missing_metrics(
             operating_points=(_operating_point(),),
             seeds=(11, 23),
         )
+
+
+def test_nested_selection_requires_a_complete_latency_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crossfit, passed, total, costs, repositories = _fixture()
+
+    def fake_crossfit(*args: object, **kwargs: object) -> CrossfitPredictions:
+        del args, kwargs
+        return crossfit
+
+    monkeypatch.setattr(nested, "crossfit_structure", fake_crossfit)
+    key = f"{_structure().key}__{_operating_point().key}"
+
+    def select(
+        route_latency: dict[str, RouteLatencyMetric] | None = None,
+    ) -> nested.NestedSelectionResult:
+        return select_nested_policy(
+            {"signed-hash-512": np.ones((10, 2), dtype=np.float64)},
+            passed,
+            total,
+            costs,
+            repositories,
+            structures=(_structure(),),
+            operating_points=(_operating_point(),),
+            seeds=(11,),
+            route_latency=route_latency,
+        )
+
+    missing = select()
+    assert missing.eligible_count == 1
+    assert missing.selected_key is None
+
+    slow = select(
+        {
+            key: RouteLatencyMetric(
+                p50_ms=5.0,
+                p95_ms=20.0,
+                decisions=10_000,
+                network_calls=0,
+            )
+        },
+    )
+    assert slow.eligible_count == 1
+    assert slow.selected_key is None
+
+    measured = select({key: _latency()})
+    assert measured.selected_key == key

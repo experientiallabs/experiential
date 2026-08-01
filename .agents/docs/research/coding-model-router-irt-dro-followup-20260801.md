@@ -140,7 +140,10 @@ The same module exposes one-seed aggregate evaluation and a separate final selec
 frozen seeds can run in independent remote workers. The selector reconstructs the exact frozen
 structure by operating-point grid and rejects missing, duplicated, or unexpected seed metrics
 before it can promote a policy. No cross-fit probability, coefficient, or task embedding crosses
-the worker boundary.
+the worker boundary. A scientifically eligible candidate still cannot promote until its separate
+single-core audit records at least 10,000 decisions, zero network calls, p50 below 5 ms, and p95
+below 20 ms. Missing latency evidence is a failed promotion gate, not an implicit infinity used
+only for tie breaking.
 
 Synthetic E2B performance preflight used 524 fit tasks, six arms, exact count likelihood, no
 provider calls, no target outcomes, and no persisted fitted state. The original 512-feature,
