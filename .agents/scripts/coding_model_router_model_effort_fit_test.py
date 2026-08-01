@@ -17,11 +17,17 @@ def test_grouped_folds_have_zero_repository_overlap() -> None:
 
 def test_candidate_grid_keeps_model_and_effort_in_arm_identity() -> None:
     costs = np.tile(np.arange(1, len(fit.ARMS) + 1, dtype=np.float64), (20, 1))
-    candidates = fit.candidate_grid(costs)
-    assert len(candidates) == 11_970
+    rewards = np.zeros_like(costs)
+    rewards[:, -1] = 1.0
+    candidates = fit.candidate_grid(rewards, costs)
+    assert len(candidates) == 1_596
     assert candidates[0].cheap == 0
-    assert candidates[0].expensive == 1
+    assert candidates[0].expensive == len(fit.ARMS) - 1
     assert fit.ARMS[candidates[-1].expensive] == "sol-max"
+    assert all(
+        len(fit.ARMS) - 1 in {candidate.cheap, candidate.expensive}
+        for candidate in candidates
+    )
 
 
 def test_metrics_matches_task_blind_traffic_exactly() -> None:

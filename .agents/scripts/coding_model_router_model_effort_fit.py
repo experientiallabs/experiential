@@ -274,11 +274,18 @@ def grouped_folds(groups: list[str], seed: int) -> np.ndarray:
     return result
 
 
-def candidate_grid(costs: np.ndarray) -> tuple[Candidate, ...]:
-    """Enumerate the preregistered pair, family, and parameter grid."""
+def candidate_grid(rewards: np.ndarray, costs: np.ndarray) -> tuple[Candidate, ...]:
+    """Enumerate every baseline-guard pair and frozen parameter setting."""
+    mean_rewards = rewards.mean(axis=0)
     mean_costs = costs.mean(axis=0)
+    baseline = min(
+        range(len(ARMS)),
+        key=lambda arm: (-mean_rewards[arm], mean_costs[arm], arm),
+    )
     values: list[Candidate] = []
     for left, right in combinations(range(len(ARMS)), 2):
+        if baseline not in {left, right}:
+            continue
         cheap, expensive = sorted((left, right), key=lambda arm: (mean_costs[arm], arm))
         for dim in HASH_DIMS:
             for alpha in RIDGE_ALPHAS:
@@ -308,7 +315,7 @@ def candidate_grid(costs: np.ndarray) -> tuple[Candidate, ...]:
                         )
                     )
     result = tuple(values)
-    if len(result) != 11_970 or len({candidate.key for candidate in result}) != len(result):
+    if len(result) != 1_596 or len({candidate.key for candidate in result}) != len(result):
         raise AssertionError("candidate grid is incomplete or duplicated")
     return result
 
@@ -391,7 +398,7 @@ def _metric_json(metrics: Metrics) -> dict[str, object]:
 
 def _crossfit(data: Data) -> tuple[Candidate, dict[str, object]] | None:
     features = {dim: _vectorizer(dim).transform(data.texts).tocsr() for dim in HASH_DIMS}
-    candidates = candidate_grid(data.costs)
+    candidates = candidate_grid(data.rewards, data.costs)
     choices: dict[tuple[int, str], np.ndarray] = {}
     for seed in SEEDS:
         folds = grouped_folds(data.repositories, seed)

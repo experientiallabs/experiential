@@ -32,9 +32,11 @@ Terra and Sol run as new isolated E2B matrices. Arm identity is always model plu
 ## Frozen search and promotion gates
 
 Development uses five repeated repository-grouped five-fold evaluations with seeds 11, 23, 37,
-41, and 59. It compares every static arm and every unordered pair of arms. Dynamic pair policies
+41, and 59. It compares every static arm, selects the strongest static arm on development as the
+guard, then evaluates all 14 pairs between that guard and one alternate arm. Dynamic pair policies
 route only between the cheaper and more expensive member, which bounds confirmation to two dense
-arms. The frozen families are paired reward-uplift Ridge on signed character 3-to-5-gram hashing
+arms while ensuring the quality baseline is directly gradeable. The frozen families are paired
+reward-uplift Ridge on signed character 3-to-5-gram hashing
 at 512, 2,048, and 8,192 dimensions with alpha 1, 10, or 100, and paired-difference kNN at k 8,
 16, 32, or 64. Ridge sends to the expensive arm when predicted expensive-minus-cheap reward
 exceeds one of -0.10, 0, 0.02, 0.05, 0.10, or 0.20. kNN uses the same asymmetric paired guard as
