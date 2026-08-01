@@ -54,6 +54,7 @@ RIDGE_ALPHAS = (1.0, 10.0, 100.0)
 QUALITY_THRESHOLDS = (0.0, 0.02, 0.05, 0.10, 0.20)
 IRT_WEIGHTS = (0.70, 0.80, 0.90, 0.95, 0.98, 0.99)
 KNN_COUNTS = (8, 16, 32, 64)
+KNN_RELATIVE_THRESHOLD = 0.95
 KNN_Z = (0.0, 0.5, 1.0, 1.645, 2.0)
 PICK_LAMS = (0.0, 0.01, 0.02, 0.03)
 QUALITY_TOLERANCE = 0.005
@@ -114,7 +115,9 @@ class Candidate:
             "irt_weight": self.irt_weight,
             "guard": self.guard,
             "rag_num": self.rag_num,
-            "rag_thres": 0.0,
+            "rag_thres": KNN_RELATIVE_THRESHOLD,
+            "floor_q": 0.0,
+            "floor_sim": None,
             "z": self.z,
             "min_pairs": 8,
             "se_floor": True,
@@ -472,7 +475,9 @@ def _tune_knn(base: RoutingPolicy, candidate: Candidate) -> RoutingPolicy:
             "default_model": candidate.guard,
             "guard_model": candidate.guard,
             "rag_num": candidate.rag_num,
-            "rag_thres": 0.0,
+            "rag_thres": KNN_RELATIVE_THRESHOLD,
+            "floor_q": 0.0,
+            "floor_sim": None,
             "knn_z": candidate.z,
             "knn_min_pairs": 8,
             "guard_mode": "asymmetric",
@@ -637,7 +642,7 @@ def evaluate_grid(source: SourceData, work_dir: Path) -> list[CandidateResult]:
                 embed_with=embedder,
                 guard_model=ARMS[0],
                 rag_num=64,
-                rag_thres=0.0,
+                rag_thres=KNN_RELATIVE_THRESHOLD,
                 z=0.0,
                 min_pairs=8,
                 se_floor=True,
@@ -851,7 +856,7 @@ def _fit_knn_router(
         embed_with=embedder,
         guard_model=candidate.guard,
         rag_num=candidate.rag_num,
-        rag_thres=0.0,
+        rag_thres=KNN_RELATIVE_THRESHOLD,
         z=candidate.z,
         min_pairs=8,
         se_floor=True,

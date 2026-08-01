@@ -42,7 +42,9 @@ def test_candidate_grid_is_complete_and_has_no_similarity_floor() -> None:
     assert {candidate.rag_num for candidate in knn} == {8, 16, 32, 64}
     assert {candidate.z for candidate in knn} == {0.0, 0.5, 1.0, 1.645, 2.0}
     assert {candidate.pick_lam for candidate in knn} == {0.0, 0.01, 0.02, 0.03}
-    assert {candidate.config()["rag_thres"] for candidate in knn} == {0.0}
+    assert {candidate.config()["rag_thres"] for candidate in knn} == {0.95}
+    assert {candidate.config()["floor_q"] for candidate in knn} == {0.0}
+    assert {candidate.config()["floor_sim"] for candidate in knn} == {None}
 
 
 def test_grouped_folds_have_zero_repository_overlap() -> None:

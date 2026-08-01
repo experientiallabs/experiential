@@ -245,9 +245,10 @@ heads select the cheapest arm within predicted reward 0, 0.02, 0.05, 0.10, or
 quality weights 0.70, 0.80, 0.90, 0.95, 0.98, and 0.99 against min-max
 normalized fit-only arm cost. kNN crosses all three hash dimensions, all five
 fixed guard arms, the registered `k`, `knn_z`, and `pick_lam` values, fixes
-`min_pairs=8`, enables the standard-error floor, and sets both the absolute
-similarity threshold and floor quantile to zero. This is 1,389 candidate
-points. No candidate is added after the development matrix is complete.
+`min_pairs=8`, enables the standard-error floor, fixes the relative neighborhood
+threshold at 0.95, and disables the absolute novelty floor with `floor_q=0` and
+`floor_sim=None`. This is 1,389 candidate points. No candidate is added after
+the development matrix is complete.
 
 Within five development outer folds grouped by repository, fit-only selection
 chooses the least costly point within 0.5 reward points of the fold's strongest
