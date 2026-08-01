@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import coding_model_router_swerebench_execute as execute
 
@@ -132,3 +133,77 @@ def test_whole_task_exclusion_requires_audited_zero_reruns() -> None:
     assert execute._task_excluded(state)
     state["exclusion"]["scientific_cells_rerun"] = 1
     assert not execute._task_excluded(state)
+
+
+def test_durable_eval_starts_once_and_polls_atomic_exit_marker(tmp_path: Path) -> None:
+    class FakeHandle:
+        pid = 314
+
+        def __init__(self) -> None:
+            self.disconnected = False
+
+        def disconnect(self) -> None:
+            self.disconnected = True
+
+    class FakeCommands:
+        def __init__(self, handle: FakeHandle) -> None:
+            self.handle = handle
+            self.starts: list[str] = []
+            self.polls = 0
+
+        def run(self, command: str, *, background: bool, timeout: int) -> FakeHandle:
+            assert background is True
+            assert timeout == 120
+            self.starts.append(command)
+            return self.handle
+
+        def list(self, *, request_timeout: int) -> list[SimpleNamespace]:
+            assert request_timeout == 60
+            self.polls += 1
+            return [SimpleNamespace(pid=314)]
+
+    class FakeFiles:
+        def __init__(self, commands: FakeCommands) -> None:
+            self.commands = commands
+
+        def exists(self, path: str, *, request_timeout: int) -> bool:
+            assert path == "/remote/xhigh.eval-exit-status"
+            assert request_timeout == 60
+            return self.commands.polls > 0
+
+        def read(self, path: str) -> str:
+            assert path == "/remote/xhigh.eval-exit-status"
+            return "0\n"
+
+    handle = FakeHandle()
+    commands = FakeCommands(handle)
+    sandbox = SimpleNamespace(
+        sandbox_id="sandbox-1",
+        commands=commands,
+        files=FakeFiles(commands),
+    )
+    state = {"stage": "running-xhigh"}
+    attempt: dict[str, object] = {}
+    state_path = tmp_path / "state.json"
+
+    result, active = execute._run_durable_eval(
+        sandbox,
+        "scientific-eval --frozen",
+        effort="xhigh",
+        exit_status_path="/remote/xhigh.eval-exit-status",
+        state=state,
+        state_path=state_path,
+        attempt=attempt,
+        timeout=5,
+        poll_interval=0,
+    )
+
+    assert active is sandbox
+    assert result.exit_code == 0
+    assert handle.disconnected is True
+    assert len(commands.starts) == 1
+    assert commands.starts[0].count("scientific-eval --frozen") == 1
+    process = attempt["effort_processes"]["xhigh"]
+    assert process["pid"] == 314
+    assert process["scientific_command_starts"] == 1
+    assert process["completed"] is True

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -320,6 +321,100 @@ def _run(
     return result
 
 
+def _run_durable_eval(
+    sandbox: Sandbox,
+    command: str,
+    *,
+    effort: str,
+    exit_status_path: str,
+    state: dict[str, Any],
+    state_path: Path,
+    attempt: dict[str, Any],
+    timeout: float,
+    poll_interval: float = 10.0,
+) -> tuple[CommandResult, Sandbox]:
+    """Run one scientific command once and poll its persisted exit status.
+
+    Long-lived E2B output streams have intermittently failed at the HTTP/2
+    control plane while the remote command kept running. Starting the command
+    in the background gives it an exact PID, while an atomic remote exit marker
+    makes completion recoverable without ever issuing the scientific command a
+    second time.
+    """
+    temporary_status_path = f"{exit_status_path}.tmp"
+    wrapped = (
+        "set +e\n"
+        f"{command}\n"
+        "router_eval_status=$?\n"
+        f"printf '%s\\n' \"$router_eval_status\" > {temporary_status_path}\n"
+        f"mv {temporary_status_path} {exit_status_path}\n"
+        'exit "$router_eval_status"'
+    )
+    handle = sandbox.commands.run(wrapped, background=True, timeout=120)
+    process = {
+        "pid": handle.pid,
+        "exit_status_path": exit_status_path,
+        "scientific_command_starts": 1,
+    }
+    processes = attempt.setdefault("effort_processes", {})
+    if not isinstance(processes, dict):
+        raise ValueError("invalid durable effort process state")
+    processes[effort] = process
+    _write_json(state_path, state)
+    handle.disconnect()
+
+    deadline = time.monotonic() + timeout
+    active = sandbox
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"durable eval timed out effort={effort} pid={handle.pid}; "
+                "the scientific command was not rerun"
+            )
+        try:
+            if active.files.exists(exit_status_path, request_timeout=60):
+                raw_status = active.files.read(exit_status_path).strip()
+                exit_code = int(raw_status)
+                if exit_code < 0 or exit_code > 255:
+                    raise ValueError(f"invalid durable eval exit status: {raw_status!r}")
+                process["exit_code"] = exit_code
+                process["completed"] = True
+                _write_json(state_path, state)
+                return (
+                    CommandResult(
+                        stdout="",
+                        stderr="",
+                        exit_code=exit_code,
+                        error=None,
+                    ),
+                    active,
+                )
+            running = any(
+                remote_process.pid == handle.pid
+                for remote_process in active.commands.list(request_timeout=60)
+            )
+        except Exception as error:  # noqa: BLE001 - reconnect exact remote PID state
+            logger.warning(
+                "durable eval poll reconnect effort=%s pid=%d error=%r",
+                effort,
+                handle.pid,
+                error,
+            )
+            poll_errors = process.setdefault("poll_errors", [])
+            if isinstance(poll_errors, list):
+                poll_errors.append(repr(error))
+            _write_json(state_path, state)
+            active = Sandbox.connect(sandbox.sandbox_id, request_timeout=60)
+        else:
+            if not running:
+                raise RuntimeError(
+                    f"durable eval pid={handle.pid} ended without exit marker; "
+                    "the scientific command was not rerun"
+                )
+        time.sleep(min(poll_interval, remaining))
+
+
 def _sync(sandbox: Sandbox, remote: str, local: Path) -> None:
     stream = sandbox.files.read(
         remote,
@@ -567,11 +662,15 @@ def _run_task(
             )
             state["stage"] = f"running-{effort}"
             _write_json(state_path, state)
-            eval_result = _run(
+            eval_result, sandbox = _run_durable_eval(
                 sandbox,
                 f"cd /opt/verifiers && sudo -E .venv/bin/eval @ {config_path}",
+                effort=effort,
+                exit_status_path=f"{remote_root}/{effort}.eval-exit-status",
+                state=state,
+                state_path=state_path,
+                attempt=attempt,
                 timeout=3 * 3_600,
-                check=False,
             )
             _run(
                 sandbox,
